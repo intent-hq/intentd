@@ -1158,6 +1158,10 @@ pub struct Services {
     /// instead of racing it to the store (whose primary key is the last line
     /// of defence). Entries are dropped once no caller holds them.
     attachment_idempotency_inflight: Arc<Mutex<attachment_upload::IdempotencyInflight>>,
+    /// Per-`(workspace, idempotencyKey)` in-flight guard behind
+    /// [`with_idempotency`]: same-key first-use callers serialize on the
+    /// key so one runs the operation and the rest replay its stored result.
+    idempotency_inflight: Arc<IdempotencyInflight>,
     /// In-flight source-side exports (`workspace.export.*`, keyed by
     /// `exportId`): build state + sealed archive + WIP bookkeeping between
     /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
@@ -1343,6 +1347,7 @@ impl Services {
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
             attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
+            idempotency_inflight: Arc::new(IdempotencyInflight::default()),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
@@ -13847,6 +13852,95 @@ async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Opti
     })
 }
 
+/// Per-key in-flight async locks: callers on one key serialize on that key's
+/// lock while unrelated keys never wait on each other, and an entry is dropped
+/// once no caller holds it (no unbounded growth). The generic form of the
+/// attachment placement guard (`attachment_upload::IdempotencyInflight`);
+/// [`IdempotencyInflight`] is its `(workspace_id, key)` instance behind
+/// [`with_idempotency`].
+pub(crate) struct KeyedInflight<K> {
+    locks: Mutex<HashMap<K, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl<K> Default for KeyedInflight<K> {
+    fn default() -> Self {
+        Self {
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
+    /// Take (or join) `key`'s lock. The returned slot drops the map entry on
+    /// drop once no other caller holds it.
+    fn enter(&self, key: K) -> KeyedInflightSlot<'_, K> {
+        let lock = self
+            .locks
+            .lock()
+            .expect("keyed inflight registry poisoned")
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        KeyedInflightSlot {
+            registry: self,
+            key,
+            lock,
+        }
+    }
+
+    /// Callers currently holding or waiting on `key`.
+    #[cfg(test)]
+    pub(crate) fn holders(&self, key: &K) -> usize {
+        self.locks
+            .lock()
+            .expect("keyed inflight registry poisoned")
+            .get(key)
+            .map_or(0, |lock| Arc::strong_count(lock) - 1)
+    }
+
+    /// `true` when no key is held or awaited.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.locks
+            .lock()
+            .expect("keyed inflight registry poisoned")
+            .is_empty()
+    }
+}
+
+/// One caller's hold on a [`KeyedInflight`] entry (see `enter`).
+struct KeyedInflightSlot<'a, K: std::hash::Hash + Eq> {
+    registry: &'a KeyedInflight<K>,
+    key: K,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
+    fn drop(&mut self) {
+        let mut locks = self
+            .registry
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Two strong refs = the map's and ours; anyone else waiting on the
+        // key holds a third.
+        if Arc::strong_count(&self.lock) <= 2 {
+            locks.remove(&self.key);
+        }
+    }
+}
+
+/// `(workspace_id, idempotency_key)` — the dedupe identity of one
+/// [`with_idempotency`] call (`workspace_id` is `""` for global methods).
+pub(crate) type IdempotencyIdent = (String, String);
+
+/// The [`with_idempotency`] in-flight registry: a same-key caller racing the
+/// first use waits on the key's lock, so its lookup runs after the winner's
+/// result is stored and replays it instead of running `op` a second time (the
+/// store's primary key stays the last line of defence). Shared across
+/// [`Services`] clones.
+pub(crate) type IdempotencyInflight = KeyedInflight<IdempotencyIdent>;
+
 /// Idempotency wrapper for create/commit/PR-merge methods (design note TB-0 §5).
 ///
 /// When `key` is present and already recorded for `(workspace_id, key)`, returns
@@ -13855,9 +13949,16 @@ async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Opti
 /// and returns it (errors are not cached). When `key` is absent this is a
 /// SOFT-LAUNCH (R5): log a warn and execute normally — never reject.
 ///
+/// The lookup → `op` → store sequence runs under the key's [`IdempotencyInflight`]
+/// lock, so concurrent first-use callers on one key are serialized: the second
+/// caller's lookup sees the first's stored result and replays it rather than
+/// running `op` again. A failed `op` releases the key without storing, so the
+/// next same-key caller runs `op` itself.
+///
 /// `workspace_id` is the `""` sentinel for global methods that carry no
 /// workspaceId (e.g. `workspace.create`).
 pub(crate) async fn with_idempotency<T, F, Fut>(
+    inflight: &IdempotencyInflight,
     store: &Store,
     workspace_id: &str,
     key: Option<String>,
@@ -13876,6 +13977,8 @@ where
         );
         return op().await;
     };
+    let slot = inflight.enter((workspace_id.to_string(), key.clone()));
+    let _held = slot.lock.lock().await;
     if let Some(stored) = store.get_idempotent(workspace_id, &key).await? {
         let value: T = serde_json::from_str(&stored)
             .map_err(|e| Error::Internal(format!("decode idempotent result failed: {e}")))?;
@@ -17825,7 +17928,9 @@ impl WorkspaceApi for Services {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let wrapper_bus = bus.clone();
+            let inflight = services.idempotency_inflight.clone();
             let result = with_idempotency(
+                &inflight,
                 &store,
                 "",
                 idempotency_key,
@@ -22297,7 +22402,9 @@ impl WorkspaceApi for Services {
             }
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
+            let inflight = services.idempotency_inflight.clone();
             with_idempotency(
+                &inflight,
                 &store,
                 &ws_scope,
                 idempotency_key,
@@ -24243,7 +24350,9 @@ impl WorkspaceApi for Services {
             // Emission lives inside the idempotency scope so a replayed add
             // (same idempotencyKey) returns the cached result without a second
             // `comment:added` (design note TB-0 §5).
+            let inflight = services.idempotency_inflight.clone();
             let result = with_idempotency(
+                &inflight,
                 &store,
                 &ws_scope,
                 idempotency_key,
@@ -26258,7 +26367,9 @@ impl WorkspaceApi for Services {
             let event_bus = bus.clone();
             let event_message = message.clone();
             let status_cache = this.git_status_invalidator();
+            let inflight = this.idempotency_inflight.clone();
             with_idempotency(
+                &inflight,
                 &store,
                 &ws_scope,
                 idempotency_key,
@@ -27306,6 +27417,7 @@ impl WorkspaceApi for Services {
             // nothing commits unless the user explicitly asks.
             let skip_auto_commit = !self.effective_auto_commit(&workspace_id).await;
             with_idempotency(
+                &self.idempotency_inflight,
                 &self.store,
                 &ws_scope,
                 idempotency_key,
