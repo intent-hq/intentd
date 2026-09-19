@@ -17523,8 +17523,9 @@ pub(crate) mod pr {
 
     /// Loopback GitHub API stub for the identity-proof glue: `GET /user`
     /// reports `scopes` (header omitted when `None`) and `login`, `POST
-    /// /gists` answers `gist_id`, `DELETE /gists/{gist_id}` is 204 and any
-    /// other gist 404. Returns its base URI.
+    /// /gists` answers `gist_id`, `GET /gists/{gist_id}` reads it back as a
+    /// proof gist (same scopes header), `DELETE /gists/{gist_id}` is 204 and
+    /// any other gist 404. Returns its base URI.
     async fn spawn_gist_api(scopes: Option<&'static str>, gist_id: &'static str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -17570,9 +17571,21 @@ pub(crate) mod pr {
                         (200, extra, r#"{"login":"octocat","id":1}"#.to_string())
                     } else if line.starts_with("POST /gists ") {
                         (201, String::new(), format!(r#"{{"id":"{gist_id}"}}"#))
+                    } else if line.starts_with(&format!("GET /gists/{gist_id} ")) {
+                        let extra = scopes
+                            .map(|s| format!("X-OAuth-Scopes: {s}\r\n"))
+                            .unwrap_or_default();
+                        (
+                            200,
+                            extra,
+                            format!(
+                                r#"{{"id":"{gist_id}","files":{{"intent-join-proof.txt":{{"filename":"intent-join-proof.txt"}}}}}}"#
+                            ),
+                        )
                     } else if line.starts_with(&format!("DELETE /gists/{gist_id} ")) {
                         (204, String::new(), String::new())
-                    } else if line.starts_with("DELETE /gists/") {
+                    } else if line.starts_with("GET /gists/") || line.starts_with("DELETE /gists/")
+                    {
                         (404, String::new(), r#"{"message":"Not Found"}"#.to_string())
                     } else {
                         (

@@ -241,13 +241,19 @@ where
 // `/login/oauth/access_token` (login side — answers `authorization_pending`
 // until `authorize` is flipped, then answers every subsequent token poll with
 // the access token; the daemon's poll loop stops after the first Authorized),
-// plus the API-side `GET /user` / `POST /gists` / `DELETE /gists/{id}` the
-// gist identity proof needs (`GET /user` reports the `gist` scope in
-// `X-OAuth-Scopes` while `gist_scope` is set).
+// plus the API-side `GET /user` / `POST /gists` / `GET /gists/{id}` /
+// `DELETE /gists/{id}` the gist identity proof needs (`GET /user` and
+// `GET /gists/{id}` report the `gist` scope in `X-OAuth-Scopes` while
+// `gist_scope` is set; the minted gist reads back as a proof gist, the
+// `OTHER_GIST_ID` gist as an unrelated one-file gist).
 // ---------------------------------------------------------------------------
 
 /// The gist id the mock mints for every `POST /gists`.
 const GIST_ID: &str = "e2e0000000000000000000000000abcd";
+
+/// An unrelated gist of the same account (not a proof gist): the mock would
+/// happily `DELETE` it, so the daemon's read-back guard is what protects it.
+const OTHER_GIST_ID: &str = "e2e000000000000000000000000other";
 
 struct MockGithub {
     base_uri: String,
@@ -359,10 +365,31 @@ async fn serve_conn(
     } else if method == "POST" && path == "/gists" {
         status = 201;
         json!({ "id": GIST_ID, "public": false })
-    } else if method == "DELETE" && path == format!("/gists/{GIST_ID}") {
+    } else if method == "GET" && path == format!("/gists/{GIST_ID}") {
+        let scopes = if gist_scope.load(Ordering::SeqCst) {
+            "repo, read:org, workflow, gist"
+        } else {
+            "repo, read:org, workflow"
+        };
+        extra_headers = format!("X-OAuth-Scopes: {scopes}\r\n");
+        json!({
+            "id": GIST_ID,
+            "public": false,
+            "files": { "intent-join-proof.txt": { "filename": "intent-join-proof.txt" } },
+        })
+    } else if method == "GET" && path == format!("/gists/{OTHER_GIST_ID}") {
+        extra_headers = "X-OAuth-Scopes: repo, read:org, workflow, gist\r\n".to_string();
+        json!({
+            "id": OTHER_GIST_ID,
+            "public": false,
+            "files": { "notes.md": { "filename": "notes.md" } },
+        })
+    } else if method == "DELETE"
+        && (path == format!("/gists/{GIST_ID}") || path == format!("/gists/{OTHER_GIST_ID}"))
+    {
         status = 204;
         Value::Null
-    } else if method == "DELETE" && path.starts_with("/gists/") {
+    } else if path.starts_with("/gists/") {
         status = 404;
         json!({ "message": "Not Found" })
     } else {
@@ -559,8 +586,10 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
 /// the secrets file and the API host pointed at the mock, create returns the
 /// mock's `{ gistId, login }`, delete is idempotent (`{ ok: true }` for a
 /// live AND an unknown gist), a token that lacks the `gist` scope is refused
-/// with `github-scope-missing`, missing params are `-32602`, and once the
-/// token is revoked create is refused with `github-not-connected`.
+/// with `github-scope-missing` on create and delete alike, a gist that is
+/// not a proof gist is refused with `-32602` and left alone, missing params
+/// are `-32602`, and once the token is revoked create is refused with
+/// `github-not-connected`.
 #[tokio::test]
 async fn github_identity_proof_create_and_delete_over_wss() {
     let mock = spawn_mock_github().await;
@@ -653,7 +682,40 @@ async fn github_identity_proof_create_and_delete_over_wss() {
     .await;
     assert_eq!(v["error"]["code"], json!(-32603), "scope-missing: {v}");
     assert_eq!(v["error"]["data"]["code"], json!("github-scope-missing"));
+    //    Delete checks the same scope (read back from `GET /gists/{id}`)
+    //    before sending any `DELETE`.
+    let v = wss_rpc(
+        &mut rpc,
+        28,
+        "github.identityProof.delete",
+        json!({ "gistId": GIST_ID }),
+    )
+    .await;
+    assert_eq!(
+        v["error"]["code"],
+        json!(-32603),
+        "delete scope-missing: {v}"
+    );
+    assert_eq!(v["error"]["data"]["code"], json!("github-scope-missing"));
     mock.gist_scope.store(true, Ordering::SeqCst);
+
+    // 5b. A gist of the account that is not a proof gist is refused with
+    //     `-32602` — the mock would have answered the `DELETE` with 204, so
+    //     the refusal proves the read-back guard fired first.
+    let v = wss_rpc(
+        &mut rpc,
+        29,
+        "github.identityProof.delete",
+        json!({ "gistId": OTHER_GIST_ID }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602), "not a proof gist: {v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("nothing deleted")),
+        "{v}"
+    );
 
     // 6. revoke drops the stored token → create is `github-not-connected`
     //    (the env / `gh` fallbacks never count for the proof).
