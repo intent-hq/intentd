@@ -258,13 +258,18 @@ pub(crate) async fn load_stored_token(
 /// Map an engine identity-proof failure onto the bounded wire codes: a token
 /// GitHub rejects is reported like no token (`github-not-connected` — the
 /// remedy is the same sign-in), a missing `gist` scope is
-/// `github-scope-missing`, a transport failure `github-unreachable`; any other
-/// forge error stays a plain `-32603` with its message.
+/// `github-scope-missing`, a transport failure `github-unreachable`; a
+/// `gistId` that names a gist other than an Intent proof gist is a caller
+/// error (`-32602`, nothing deleted); any other forge error stays a plain
+/// `-32603` with its message.
 pub(crate) fn map_identity_proof_err(e: IdentityProofError) -> Error {
     match e {
         IdentityProofError::ScopeMissing { .. } => {
             Error::IdentityProof(IdentityProofErrorKind::ScopeMissing)
         }
+        IdentityProofError::NotProofGist { gist_id } => Error::InvalidParams(format!(
+            "gistId {gist_id:?} does not name an Intent identity-proof gist (nothing deleted)"
+        )),
         IdentityProofError::Unauthorized(_) => {
             Error::IdentityProof(IdentityProofErrorKind::NotConnected)
         }
@@ -531,6 +536,14 @@ mod tests {
                 "{code}: {err:?}"
             );
         }
+        let not_proof = map_identity_proof_err(IdentityProofError::NotProofGist {
+            gist_id: "abc".into(),
+        });
+        assert_eq!(not_proof.code(), -32602, "{not_proof:?}");
+        assert!(
+            matches!(&not_proof, Error::InvalidParams(msg) if msg.contains("\"abc\"") && msg.contains("nothing deleted")),
+            "{not_proof:?}"
+        );
         let other = map_identity_proof_err(IdentityProofError::Other(
             intent_sourcecontrol::Error::Api("500: boom".into()),
         ));
