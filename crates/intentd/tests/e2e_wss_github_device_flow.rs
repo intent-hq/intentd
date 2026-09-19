@@ -586,7 +586,8 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
 /// the secrets file and the API host pointed at the mock, create returns the
 /// mock's `{ gistId, login }`, delete is idempotent (`{ ok: true }` for a
 /// live AND an unknown gist), a token that lacks the `gist` scope is refused
-/// with `github-scope-missing` on create and delete alike, a gist that is
+/// with `github-scope-missing` on create and delete alike (on delete even for
+/// an unknown gist — the scope decides before the gist's 404), a gist that is
 /// not a proof gist is refused with `-32602` and left alone, missing params
 /// are `-32602`, and once the token is revoked create is refused with
 /// `github-not-connected`.
@@ -682,8 +683,8 @@ async fn github_identity_proof_create_and_delete_over_wss() {
     .await;
     assert_eq!(v["error"]["code"], json!(-32603), "scope-missing: {v}");
     assert_eq!(v["error"]["data"]["code"], json!("github-scope-missing"));
-    //    Delete checks the same scope (read back from `GET /gists/{id}`)
-    //    before sending any `DELETE`.
+    //    Delete runs the same `GET /user` preflight before reading the gist
+    //    or sending any `DELETE`.
     let v = wss_rpc(
         &mut rpc,
         28,
@@ -695,6 +696,22 @@ async fn github_identity_proof_create_and_delete_over_wss() {
         v["error"]["code"],
         json!(-32603),
         "delete scope-missing: {v}"
+    );
+    assert_eq!(v["error"]["data"]["code"], json!("github-scope-missing"));
+    //    …and the scope decides before the gist's `404` can: an unknown gist
+    //    without the scope is the same refusal, not the `{ ok: true }` a
+    //    scoped 404 means (step 3).
+    let v = wss_rpc(
+        &mut rpc,
+        30,
+        "github.identityProof.delete",
+        json!({ "gistId": "0000000000000000000000000000dead" }),
+    )
+    .await;
+    assert_eq!(
+        v["error"]["code"],
+        json!(-32603),
+        "delete scope-missing on unknown gist: {v}"
     );
     assert_eq!(v["error"]["data"]["code"], json!("github-scope-missing"));
     mock.gist_scope.store(true, Ordering::SeqCst);
