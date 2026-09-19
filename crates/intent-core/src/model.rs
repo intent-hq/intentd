@@ -108,6 +108,23 @@ impl PullRequestInfo {
         self.head_sha = None;
         self.author = None;
     }
+
+    /// Whether `other` names the same pull request as `self`. Identity is
+    /// the repository-qualified `url` — the key the emit-path merge dedups
+    /// on — never `id` / `number`: the merged `pullRequests` pool carries
+    /// the workspace's own PRs plus git-root and PR-monitor entries from
+    /// other repositories, and both `pr_ops::build_pr_info` and the monitor
+    /// fold derive `id` from the bare number, so `o/main#1` and `o/sub#1`
+    /// share an `id`. Only when either side has no URL to compare does the
+    /// bare `number` decide.
+    #[must_use]
+    pub fn same_pull_request(&self, other: &Self) -> bool {
+        if self.url.is_empty() || other.url.is_empty() {
+            self.number == other.number
+        } else {
+            self.url == other.url
+        }
+    }
 }
 
 /// Kind of a workspace context link (§5.1). Wire values are lowercase
@@ -408,7 +425,9 @@ pub const WORKSPACE_LIST_ROW_BUDGET_BYTES: usize = 7_680;
 /// [`WORKSPACE_LIST_ROW_BUDGET_BYTES`] was sized from a five-entry pool
 /// (≈ 390 B per slimmed entry). Survivors are the most recently updated
 /// entries (`updatedAt` descending, `number` descending on ties), with the
-/// entry matching `activePullRequest` always retained and moved to the
+/// entry matching `activePullRequest` — by repository-qualified `url`
+/// ([`PullRequestInfo::same_pull_request`]; PR numbers collide across the
+/// repositories the merged pool spans) — always retained and moved to the
 /// front; a truncated row reports the pre-cap length as
 /// `pullRequestsTotal`. `workspace.get` serves the full pool.
 pub const WORKSPACE_LIST_PR_CAP: usize = 5;
@@ -492,8 +511,13 @@ pub const WORKSPACE_LIST_PR_KEYS: &[&str] = &[
 impl Workspace {
     /// List-frame slimming for `workspace.list` and the lite
     /// `workspace.subscribe` seq-0 snapshot (monorepo#3041, extended): drop
-    /// the detail-only fields so a list row costs O(card) bytes regardless
-    /// of how much a workspace has accumulated. `workspace.get` never calls
+    /// the detail-only fields so a list row stays within the documented
+    /// worst-case-realistic fixture budget
+    /// ([`WORKSPACE_LIST_ROW_BUDGET_BYTES`] — ten agents, a capped PR pool)
+    /// rather than growing with everything a workspace has accumulated; an
+    /// ACTIVE row's `agentSummary` is deliberately left uncapped, so the
+    /// budget is a fixture bound, not a universal per-row ceiling.
+    /// `workspace.get` never calls
     /// this and keeps serving every field. Following the v4.2 `diskUsage`
     /// precedent, every stripped field is optional on the wire and simply
     /// absent on list rows (never `null`) — no wire-shape change.
@@ -518,11 +542,12 @@ impl Workspace {
     ///   fields via [`PullRequestInfo::slim_for_list`].
     /// - `pullRequests[]` length: capped at [`WORKSPACE_LIST_PR_CAP`]
     ///   entries — the most recently updated (`updatedAt` desc, `number`
-    ///   desc on ties), the `activePullRequest` match always kept and moved
-    ///   to the front — with the pre-cap length reported as
-    ///   `pullRequestsTotal`. A pool within the cap is left untouched (no
-    ///   reorder, `pullRequestsTotal` absent). `activePullRequest` itself is
-    ///   never touched.
+    ///   desc on ties), the `activePullRequest` match (by
+    ///   repository-qualified `url`, [`PullRequestInfo::same_pull_request`])
+    ///   always kept and moved to the front — with the pre-cap length
+    ///   reported as `pullRequestsTotal`. A pool within the cap is left
+    ///   untouched (no reorder, `pullRequestsTotal` absent).
+    ///   `activePullRequest` itself is never removed (only slimmed, above).
     ///
     /// Fixed-size scalars stay even when only detail surfaces read them
     /// (`baseCommitSha`, `path` / `repositoryPath` / `worktreePath`): a
@@ -558,8 +583,8 @@ impl Workspace {
                         .cmp(&a.updated_at)
                         .then_with(|| b.number.cmp(&a.number))
                 });
-                if let Some(active_id) = self.active_pull_request.as_ref().map(|pr| &pr.id) {
-                    if let Some(pos) = prs.iter().position(|pr| &pr.id == active_id) {
+                if let Some(active) = self.active_pull_request.as_ref() {
+                    if let Some(pos) = prs.iter().position(|pr| pr.same_pull_request(active)) {
                         let active = prs.remove(pos);
                         prs.insert(0, active);
                     }
@@ -4176,8 +4201,10 @@ impl AgentLite {
     /// the row budget in production, intent-hq/intent#5383) at the preview
     /// budget, `name` / `model` at [`AGENT_LIST_NAME_CAP_BYTES`], and
     /// `metadata.sandboxPath` / `metadata.sandboxBranch` at
-    /// [`AGENT_LIST_PATH_CAP_BYTES`] — so no string field on a list row is
-    /// unbounded. `lastToolUse` keeps the documented §5.5
+    /// [`AGENT_LIST_PATH_CAP_BYTES`] — so every free-text string a list row
+    /// carries is bounded (`lastToolUse.name` is the one string left
+    /// untouched: it is a tool identifier, not free text, and the FE keys
+    /// its tool classification on it). `lastToolUse` keeps the documented §5.5
     /// preview contract (`{ name, input?, inputTruncated?, inputBytes? }`):
     /// only an over-budget `input` is replaced by [`cap_json_value`]'s
     /// structure-preserving preview, with `inputTruncated: true` stamped
@@ -5617,6 +5644,80 @@ mod tests {
         let mut row = list_cap_workspace(8, Some(42));
         row.slim_for_list();
         assert_eq!(pr_numbers(&row), vec![107, 106, 105, 104, 103]);
+    }
+
+    /// The active-PR match is by repository-qualified `url`, not `id` /
+    /// `number`: the merged pool spans repositories (workspace, git-root and
+    /// monitor entries), and the merge derives `id` from the bare number, so
+    /// an old active `o/main#1` and a newer `o/sub#1` share `id` and
+    /// `number`. The old active entry must lead the survivors and count
+    /// toward the five; matching on `id` would keep `o/sub#1` and drop it.
+    #[test]
+    fn workspace_list_cap_retains_active_pull_request_by_url_across_repos() {
+        let mut active = list_cap_pr(1);
+        active.id = "1".to_string();
+        active.number = 1;
+        active.url = "https://github.com/o/main/pull/1".to_string();
+        let mut sub_copy = list_cap_pr(2);
+        sub_copy.id = "1".to_string();
+        sub_copy.number = 1;
+        sub_copy.url = "https://github.com/o/sub/pull/1".to_string();
+
+        let mut row = list_cap_workspace(8, None);
+        row.active_pull_request = Some(active.clone());
+        {
+            let pool = row.pull_requests.as_mut().unwrap();
+            pool[1] = active.clone();
+            pool[2] = sub_copy.clone();
+        }
+        let full = row.clone();
+        row.slim_for_list();
+
+        let urls: Vec<&str> = row
+            .pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.url.as_str())
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/main/pull/1",
+                "https://github.com/intent-hq/intentd/pull/107",
+                "https://github.com/intent-hq/intentd/pull/106",
+                "https://github.com/intent-hq/intentd/pull/105",
+                "https://github.com/intent-hq/intentd/pull/104",
+            ],
+            "the same-URL active entry leads and counts toward the cap; the \
+             same-number entry from another repository is an ordinary candidate"
+        );
+        assert_eq!(row.pull_requests_total, Some(8));
+        assert_eq!(
+            row.active_pull_request.as_ref().unwrap().url,
+            "https://github.com/o/main/pull/1"
+        );
+        // Detail projection untouched: both same-number entries still present.
+        assert_eq!(
+            full.pull_requests
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|pr| pr.number == 1)
+                .count(),
+            2
+        );
+
+        // Identity falls back to the bare number only when a URL is missing.
+        assert!(active.same_pull_request(&active));
+        assert!(!active.same_pull_request(&sub_copy));
+        let mut blank = active.clone();
+        blank.url.clear();
+        assert!(blank.same_pull_request(&active));
+        assert!(blank.same_pull_request(&sub_copy));
+        let mut other_number = blank.clone();
+        other_number.number = 2;
+        assert!(!other_number.same_pull_request(&active));
     }
 
     /// A pool within the cap is left as stored: no reorder, no truncation,
