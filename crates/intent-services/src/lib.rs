@@ -96,6 +96,7 @@ mod github_auth_ops;
 mod github_browse_ops;
 
 mod agent_list_cache;
+mod codex_home;
 mod harness;
 mod history_xml;
 mod hook_manager;
