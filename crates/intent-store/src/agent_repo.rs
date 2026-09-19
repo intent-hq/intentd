@@ -5936,6 +5936,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -6059,6 +6060,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -6220,6 +6222,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -9733,6 +9736,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -9865,6 +9869,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -9949,6 +9954,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -10147,6 +10153,7 @@ mod tests {
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
+                membership: None,
             };
             store.insert_workspace(&workspace).await.expect("insert");
         }
@@ -10442,6 +10449,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store.insert_workspace(&workspace).await.expect("insert");
 
@@ -14772,6 +14780,7 @@ mod tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)

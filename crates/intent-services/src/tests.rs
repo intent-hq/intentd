@@ -176,6 +176,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -212,6 +213,135 @@ pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, Note
         .expect("note");
     let services = Services::new(store);
     (tmp, services, ws, id)
+}
+
+/// The transport bearer seam resolves an active credential to its principal
+/// and records the use, and rejects a revoked one — through the single
+/// atomic store statement, so no lookup-then-touch window exists in which a
+/// concurrent revoke is still admitted (intent-hq/intentd#1868).
+#[tokio::test]
+async fn resolve_principal_credential_admits_active_and_rejects_revoked() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "e".repeat(64);
+    store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+    let services = Services::new(store.clone());
+
+    assert_eq!(
+        services
+            .resolve_principal_credential("f".repeat(64))
+            .await
+            .expect("resolve unknown"),
+        None
+    );
+    assert_eq!(
+        services
+            .resolve_principal_credential(hash.clone())
+            .await
+            .expect("resolve active"),
+        Some(primary.id.clone())
+    );
+    assert!(
+        store
+            .lookup_principal_credential(&hash)
+            .await
+            .expect("lookup")
+            .expect("present")
+            .last_used_at
+            .is_some(),
+        "an admitted credential records last_used_at"
+    );
+
+    assert!(store
+        .revoke_principal_credential(&hash)
+        .await
+        .expect("revoke"));
+    assert_eq!(
+        services
+            .resolve_principal_credential(hash)
+            .await
+            .expect("resolve revoked"),
+        None,
+        "a revoked credential is never admitted"
+    );
+}
+
+/// Regression (intent-hq/intentd#1868 review): a credential revoked while a
+/// resolution is already in flight is NOT admitted. The pre-fix seam read the
+/// row on the read pool, saw it active, then parked on the write pool to
+/// `touch`; a revoke landing in that window flipped the touch to `false`,
+/// which was ignored, and the stale principal was returned. Holding the sole
+/// write-pool connection reproduces that interleaving deterministically: the
+/// resolve is driven until it parks on the write pool, the revoke lands via
+/// the held connection, and only then is the resolve released.
+///
+/// Negative control: with only the service body restored to e8083cbd
+/// (lookup → `is_active` → touch ignoring `false`) this test fails at the
+/// `None` assertion with `Some(<primary id>)`; with the atomic body from
+/// 80585837 it passes.
+#[tokio::test]
+async fn resolve_principal_credential_rejects_revoke_landing_mid_resolution() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "a".repeat(64);
+    store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+    let services = Services::new(store.clone());
+
+    // The sole write-pool connection: any resolve parks on its touch/UPDATE.
+    let mut held = store.write_pool().acquire().await.expect("hold write conn");
+
+    // Drive the resolve past its (read-pool) lookup up to the write gate. Each
+    // poll is separated by a real read-pool round trip, so the pre-fix body has
+    // observed the active row and is waiting to touch by the time we revoke.
+    let mut fut = services.resolve_principal_credential(hash.clone());
+    let parked = poll_until(&mut fut, 20, || async {
+        assert!(store
+            .lookup_principal_credential(&hash)
+            .await
+            .expect("lookup")
+            .expect("present")
+            .is_active());
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    // Revoke through the held connection while the resolve is still gated.
+    let revoked = sqlx::query(
+        "UPDATE principal_credential SET revoked_at = ? \
+         WHERE token_hash = ? AND revoked_at IS NULL",
+    )
+    .bind(now_iso())
+    .bind(&hash)
+    .execute(&mut *held)
+    .await
+    .expect("revoke via held conn");
+    assert_eq!(revoked.rows_affected(), 1);
+    drop(held);
+
+    assert_eq!(
+        fut.await.expect("resolve"),
+        None,
+        "a credential revoked mid-resolution must not be admitted"
+    );
+    let after = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("row kept after revoke");
+    assert!(!after.is_active());
+    assert!(
+        after.last_used_at.is_none(),
+        "a rejected resolve does not record a use"
+    );
 }
 
 #[tokio::test]
@@ -1205,6 +1335,7 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
         if row.archived {
             row.agent_summary = None;
         }
+        svc.attach_workspace_membership(row).await;
     }
 
     let actual = svc.list_workspaces(true).await.unwrap();
@@ -26694,6 +26825,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -26842,6 +26974,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -26981,6 +27114,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -27115,6 +27249,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -27248,6 +27383,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -27386,6 +27522,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -28247,6 +28384,7 @@ mod known_repo {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 

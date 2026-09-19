@@ -38,6 +38,7 @@ mod note_line_attribution_repo;
 mod note_repo;
 mod note_version_repo;
 mod pr_monitor_repo;
+mod principal_repo;
 mod sandbox_repo;
 mod script_repo;
 mod settings_repo;
