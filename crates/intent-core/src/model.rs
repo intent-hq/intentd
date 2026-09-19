@@ -115,14 +115,18 @@ impl PullRequestInfo {
     /// the workspace's own PRs plus git-root and PR-monitor entries from
     /// other repositories, and both `pr_ops::build_pr_info` and the monitor
     /// fold derive `id` from the bare number, so `o/main#1` and `o/sub#1`
-    /// share an `id`. Only when either side has no URL to compare does the
-    /// bare `number` decide.
+    /// share an `id`. The fallback is repository + `number`, and the only
+    /// repository this struct knows is the one in the URL: two entries that
+    /// both lack a URL share an (unknown) repository, so their `number`
+    /// decides; an entry with a URL is matched by its exact URL only — a
+    /// blank-URL entry never satisfies a lookup for it, whatever its
+    /// `number`.
     #[must_use]
     pub fn same_pull_request(&self, other: &Self) -> bool {
-        if self.url.is_empty() || other.url.is_empty() {
-            self.number == other.number
-        } else {
-            self.url == other.url
+        match (self.url.is_empty(), other.url.is_empty()) {
+            (false, false) => self.url == other.url,
+            (true, true) => self.number == other.number,
+            _ => false,
         }
     }
 }
@@ -419,15 +423,17 @@ pub const WORKSPACE_LIST_ROW_BUDGET_BYTES: usize = 7_680;
 
 /// Maximum number of `pullRequests[]` entries a `workspace.list` row (and
 /// the identical lite `workspace.subscribe` seq-0 row) carries after
-/// [`Workspace::slim_for_list`]. The pool is the one list-row field whose
-/// length is unbounded in production (every PR ever opened from the
-/// workspace's branch, plus the folded git-root PRs), and
+/// [`Workspace::slim_for_list`]. The pool's length is unbounded in
+/// production (every PR ever opened from the workspace's branch, plus the
+/// folded git-root PRs) — unlike the active row's `agentSummary`, which is
+/// deliberately left uncapped, it is cheap to bound here — and
 /// [`WORKSPACE_LIST_ROW_BUDGET_BYTES`] was sized from a five-entry pool
 /// (≈ 390 B per slimmed entry). Survivors are the most recently updated
 /// entries (`updatedAt` descending, `number` descending on ties), with the
 /// entry matching `activePullRequest` — by repository-qualified `url`
 /// ([`PullRequestInfo::same_pull_request`]; PR numbers collide across the
-/// repositories the merged pool spans) — always retained and moved to the
+/// repositories the merged pool spans, and a blank-URL entry never stands
+/// in for an active PR that has a URL) — always retained and moved to the
 /// front; a truncated row reports the pre-cap length as
 /// `pullRequestsTotal`. `workspace.get` serves the full pool.
 pub const WORKSPACE_LIST_PR_CAP: usize = 5;
@@ -5708,16 +5714,107 @@ mod tests {
             2
         );
 
-        // Identity falls back to the bare number only when a URL is missing.
+        // Identity falls back to the number only between entries that both
+        // lack a URL; a blank-URL entry never matches one that has a URL.
         assert!(active.same_pull_request(&active));
         assert!(!active.same_pull_request(&sub_copy));
         let mut blank = active.clone();
         blank.url.clear();
-        assert!(blank.same_pull_request(&active));
-        assert!(blank.same_pull_request(&sub_copy));
+        assert!(!blank.same_pull_request(&active));
+        assert!(!active.same_pull_request(&blank));
+        assert!(!blank.same_pull_request(&sub_copy));
+        assert!(blank.same_pull_request(&blank));
         let mut other_number = blank.clone();
         other_number.number = 2;
-        assert!(!other_number.same_pull_request(&active));
+        assert!(!other_number.same_pull_request(&blank));
+    }
+
+    /// A newer blank-URL entry with the active PR's `number` must not stand
+    /// in for the active entry: the exact URL match is found across the whole
+    /// pool, leads the survivors and counts toward the five, while the
+    /// blank-URL and other-repository same-number entries are ordinary
+    /// candidates. The previous fallback (bare `number` when either URL was
+    /// blank) let the newer blank-URL entry win `position()` and truncated
+    /// the real active PR.
+    #[test]
+    fn workspace_list_cap_exact_url_active_beats_newer_blank_url_same_number() {
+        let mut active = list_cap_pr(1);
+        active.id = "1".to_string();
+        active.number = 1;
+        active.url = "https://github.com/o/main/pull/1".to_string();
+        let mut blank_copy = list_cap_pr(6);
+        blank_copy.id = "1".to_string();
+        blank_copy.number = 1;
+        blank_copy.url.clear();
+        let mut sub_copy = list_cap_pr(4);
+        sub_copy.id = "1".to_string();
+        sub_copy.number = 1;
+        sub_copy.url = "https://github.com/o/sub/pull/1".to_string();
+
+        let mut row = list_cap_workspace(8, None);
+        row.active_pull_request = Some(active.clone());
+        {
+            let pool = row.pull_requests.as_mut().unwrap();
+            pool[1] = active.clone();
+            pool[4] = sub_copy;
+            pool[6] = blank_copy;
+        }
+        row.slim_for_list();
+
+        let urls: Vec<&str> = row
+            .pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.url.as_str())
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/main/pull/1",
+                "https://github.com/intent-hq/intentd/pull/107",
+                "",
+                "https://github.com/intent-hq/intentd/pull/105",
+                "https://github.com/o/sub/pull/1",
+            ],
+            "the exact-URL active entry leads; the newer blank-URL #1 and the \
+             other-repository #1 are ordinary candidates ordered by updatedAt"
+        );
+        assert_eq!(row.pull_requests_total, Some(8));
+        assert_eq!(
+            row.active_pull_request.as_ref().unwrap().url,
+            "https://github.com/o/main/pull/1"
+        );
+
+        // Without a URL on the active PR, only a blank-URL pool entry with
+        // the same number can stand in for it; URL-bearing entries never do.
+        let mut blank_active = active.clone();
+        blank_active.url.clear();
+        let mut row = list_cap_workspace(8, None);
+        row.active_pull_request = Some(blank_active.clone());
+        {
+            let pool = row.pull_requests.as_mut().unwrap();
+            pool[1] = active.clone();
+            pool[2] = blank_active;
+        }
+        row.slim_for_list();
+        let survivors: Vec<(u64, &str)> = row
+            .pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| (pr.number, pr.url.as_str()))
+            .collect();
+        assert_eq!(
+            survivors,
+            vec![
+                (1, ""),
+                (107, "https://github.com/intent-hq/intentd/pull/107"),
+                (106, "https://github.com/intent-hq/intentd/pull/106"),
+                (105, "https://github.com/intent-hq/intentd/pull/105"),
+                (104, "https://github.com/intent-hq/intentd/pull/104"),
+            ]
+        );
     }
 
     /// A pool within the cap is left as stored: no reorder, no truncation,
