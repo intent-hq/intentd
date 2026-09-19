@@ -1181,9 +1181,12 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     let r = challenge(&mut prover, 84, &third_invite, &third_secret).await;
     let nonce_2 = r["nonce"].as_str().expect("nonce").to_string();
     assert_ne!(nonce_2, nonce);
-    // A gist that predates its nonce is `proof-invalid` (the `now` above was
-    // taken before this challenge); the one created after it verifies.
-    mock.script_gist("stale", "guest", &now, Some(&nonce_2));
+    // A gist that predates its nonce is `proof-invalid`; the one created
+    // after it verifies. The verifier floors `issuedAt` to whole seconds, so
+    // the stale timestamp sits a full minute in the past rather than at a
+    // `now` that could share the challenge's UTC second.
+    let stale_at = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+    mock.script_gist("stale", "guest", &stale_at, Some(&nonce_2));
     let v = prove(
         &mut prover,
         87,
