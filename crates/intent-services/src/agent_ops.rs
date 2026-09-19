@@ -2653,11 +2653,11 @@ impl Services {
     /// threshold; the row-budget / key-allowlist goldens in `tests.rs` pin
     /// the resulting shape.
     ///
-    /// Deliberate asymmetry: the agent channel's seq-0 snapshot goes through
-    /// this op (capped rows), while per-agent deltas re-read via `agent.get`
-    /// (full values) — the bound is a property of list-shaped reads, not a
-    /// channel invariant. Delta frames are single-agent, so the size goal
-    /// holds.
+    /// The agent channel's seq-0 snapshot goes through this op (capped,
+    /// stripped rows); its per-agent deltas re-read via `agent.get` and the
+    /// transport applies the same strip + cap pass before push
+    /// (`intent_transport::subscriptions::agent_delta`), so pushed rows
+    /// satisfy the same allowlist and row budget as list rows.
     ///
     /// Soft retire: the default read excludes retired sessions (SQL-side
     /// `retired_at IS NULL` filter — cost stays O(rows returned)); the wire

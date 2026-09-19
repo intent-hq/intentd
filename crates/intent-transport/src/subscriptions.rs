@@ -26,8 +26,9 @@ use intent_core::events::{
     WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
-    extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, ConversationProjection, Event,
-    Note, NoteId, NoteListProjection, WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
+    extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, AgentLite, ConversationProjection,
+    Event, Note, NoteId, NoteListProjection, Workspace, WorkspaceApi, WorkspaceId,
+    SLIM_PAGE_BUDGET_BYTES,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -1967,6 +1968,12 @@ pub(crate) async fn task_delta(
 /// retired rows — deltas must converge on the same state a fresh snapshot
 /// would serve. The agent id is read from `data.agentId` (falling back to
 /// the agent-scoped `sessionId`).
+///
+/// The re-read goes through `agent.get` (a detail read), so the row is
+/// projected onto the list shape here ([`agent_list_row`]): a pushed delta
+/// row carries exactly the keys and byte budget an `agent.list` row does
+/// (intent-hq/intent#5383), rather than re-hydrating detail-only fields
+/// the seq-0 snapshot stripped.
 pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
     let agent_id = event
         .data
@@ -1977,15 +1984,27 @@ pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option
         AGENT_DELETED | AGENT_RETIRED => Some(json!({ "removedIds": [agent_id] })),
         AGENT_CREATED | AGENT_RESTORED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
-            Some(json!({ "added": [serde_json::to_value(agent).ok()?] }))
+            Some(json!({ "added": [agent_list_row(agent)?] }))
         }
         AGENT_STARTED | AGENT_COMPLETED | AGENT_FAILED | AGENT_IDLE | AGENT_STATUS_CHANGED
         | AGENT_RENAMED | AGENT_UPDATED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
-            Some(json!({ "updated": [serde_json::to_value(agent).ok()?] }))
+            Some(json!({ "updated": [agent_list_row(agent)?] }))
         }
         _ => None,
     }
+}
+
+/// Project an `agent.get` re-read onto the `agent.list` row shape — the same
+/// [`AgentLite::strip_detail_only_fields`] + [`AgentLite::cap_list_previews`]
+/// pass `agent.list` applies to every row — so an `agent` channel delta row
+/// satisfies the [`intent_core::AGENT_LIST_ROW_KEYS`] allowlist and the
+/// [`intent_core::AGENT_LIST_ROW_BUDGET_BYTES`] budget like the seq-0
+/// snapshot rows it upserts into.
+fn agent_list_row(mut agent: AgentLite) -> Option<Value> {
+    agent.strip_detail_only_fields();
+    agent.cap_list_previews();
+    serde_json::to_value(agent).ok()
 }
 
 /// Map a `workspace` channel event by re-reading the [`Workspace`]. The channel
@@ -1997,6 +2016,13 @@ pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option
 /// `workspace.list` and the seq-0 snapshot filter it at the store, and
 /// `workspace.get` synthesizes it, so without this guard a Chief-scoped status
 /// event would upsert Chief into subscribed clients' lists.
+///
+/// The re-read goes through `workspace.get` (a detail read), so the row is
+/// slimmed here with the same [`Workspace::slim_for_list`] pass the seq-0
+/// snapshot (`list_workspaces_lite`) applies: a pushed delta row carries the
+/// [`intent_core::WORKSPACE_LIST_ROW_KEYS`] allowlist keys within
+/// [`intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES`], never the detail-only
+/// `tokenUsage` / `setupScript` / `contextLinks` / uncapped PR pool.
 pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
     let workspace_id = WorkspaceId::from(
         event
@@ -2012,7 +2038,7 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         WORKSPACE_DELETED => Some(json!({ "removedIds": [workspace_id.as_str()] })),
         WORKSPACE_CREATED => {
             let ws = api.get_workspace(workspace_id).await.ok()?;
-            Some(json!({ "added": [serde_json::to_value(ws).ok()?] }))
+            Some(json!({ "added": [workspace_list_row(ws)?] }))
         }
         WORKSPACE_UPDATED
         | WORKSPACE_ACTIVITY_CHANGED
@@ -2023,10 +2049,18 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         | PR_UPDATED
         | PR_UNLINKED => {
             let ws = api.get_workspace(workspace_id).await.ok()?;
-            Some(json!({ "updated": [serde_json::to_value(ws).ok()?] }))
+            Some(json!({ "updated": [workspace_list_row(ws)?] }))
         }
         _ => None,
     }
+}
+
+/// Project a `workspace.get` re-read onto the `workspace.list` row shape
+/// ([`Workspace::slim_for_list`]) so a `workspace` channel delta row matches
+/// the lite seq-0 snapshot rows it upserts into.
+fn workspace_list_row(mut ws: Workspace) -> Option<Value> {
+    ws.slim_for_list();
+    serde_json::to_value(ws).ok()
 }
 
 /// Map a `comment` channel event by re-reading the affected thread summary. A
