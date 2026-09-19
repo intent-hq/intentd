@@ -9640,6 +9640,13 @@ mod wsapi4_bindings_tests {
         /// lock BEFORE recording the call — stands in for the daemon-side
         /// enqueue outliving the eval budget (intent-hq/intent#5387).
         agent_send_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
+        /// When set, `agent_get_queue` awaits this lock — stands in for the
+        /// single-pending-message guard's store read stalling ahead of the
+        /// enqueue (intent-hq/intent#5387).
+        agent_get_queue_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
+        /// Signalled once per recorded `agent_send_message` call, so a test
+        /// can await a send that lands after the binding already returned.
+        agent_send_landed: tokio::sync::Notify,
         /// The `message_id` each `agent_send_message` call carried, recorded
         /// synchronously (before any hold) so a timed-out send's id is
         /// observable.
@@ -9782,7 +9789,13 @@ mod wsapi4_bindings_tests {
             _workspace_id: Option<WorkspaceId>,
         ) -> BoxFuture<'_, Result<Value>> {
             let queue = self.queue_entries.lock().unwrap().clone();
-            Box::pin(async move { Ok(json!({ "success": true, "queue": queue })) })
+            let hold = self.agent_get_queue_hold.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    drop(hold.lock_owned().await);
+                }
+                Ok(json!({ "success": true, "queue": queue }))
+            })
         }
 
         fn agent_remove_queued_message_owned(
@@ -9876,6 +9889,7 @@ mod wsapi4_bindings_tests {
                     message_metadata,
                 ));
                 self.call_order.lock().unwrap().push("send");
+                self.agent_send_landed.notify_one();
                 if let Some(e) = error {
                     return Err(Error::Internal(e));
                 }
@@ -10958,6 +10972,57 @@ mod wsapi4_bindings_tests {
         assert_eq!(calls.len(), 1, "the send must land after a timed-out call");
         assert_eq!(calls[0].0, "tn-1");
         assert_eq!(calls[0].2.as_deref(), Some("normal"));
+    }
+
+    /// intent-hq/intent#5387: the stall need not be the enqueue itself — the
+    /// binding's own pre-send reads (the single-pending-message guard's
+    /// `agent_get_queue`, the sender-name `agent_get`) run ahead of it and
+    /// were equally cancelled by the eval-timeout drop. With the guard read
+    /// held past the budget, the send must still land once it is released,
+    /// and the timed-out result must already name the pre-minted id.
+    #[tokio::test]
+    async fn agent_send_stalled_on_pending_guard_read_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_get_queue_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("user-msg-") && t.contains("agent-target"),
+            "timeout error must name the pre-minted message id and target: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the send is still parked behind the held guard read"
+        );
+
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must land after the guard read is released");
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one enqueue: {calls:?}");
+        assert_eq!(calls[0].0, "agent-target");
+        assert_eq!(calls[0].1, "hello");
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "error named the id that landed: {t}");
     }
 
     /// Omitted `priority` defaults to INTERRUPT delivery: the binding
