@@ -35107,6 +35107,58 @@ mod clone_orchestration {
         );
     }
 
+    /// Two concurrent first-use `workspace.create` calls carrying the same
+    /// `idempotencyKey` are exactly-once: `with_idempotency` serializes
+    /// same-key callers, so one provisions and the other replays the stored
+    /// result — identical ids, one workspace row, one `workspace:created`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_creates_yield_one_workspace() {
+        let repo = seed_repo("intentd-idem-race-src");
+        let root = unique_dir("intentd-idem-race-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let input = WorkspaceCreate {
+            repository_path: Some(repo.0.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let key = Some("idem-key-race-1".to_string());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let (first, second) = tokio::join!(
+            svc.create_workspace(input.clone(), key.clone()),
+            svc.create_workspace(input, key)
+        );
+        let first = first.expect("first create");
+        let second = second.expect("second create");
+        assert_eq!(
+            first.workspace.id, second.workspace.id,
+            "both callers observe the same workspace"
+        );
+
+        let rows = store.list_workspaces(true).await.expect("list workspaces");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one workspace row: {:?}",
+            rows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>()
+        );
+        let created = drain_event_types(&mut sub)
+            .await
+            .into_iter()
+            .filter(|t| t == intent_core::events::WORKSPACE_CREATED)
+            .count();
+        assert_eq!(created, 1, "exactly one workspace:created");
+        assert!(
+            svc.idempotency_inflight.is_empty(),
+            "in-flight key entry is dropped after both callers finish"
+        );
+    }
+
     /// Pinned `CoW` coverage (probe-gated like the checkout-mode tests): with
     /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
     /// create streams the `cow-copy 30` milestone (not `worktree`) with the
@@ -45115,5 +45167,321 @@ mod local_changes {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+}
+
+/// `with_idempotency` under concurrency: same-key first-use callers are
+/// serialized per `(workspace_id, key)` so `op` runs exactly once and every
+/// caller observes the stored result; errors stay uncached; unrelated keys
+/// never wait on each other.
+mod idempotency_serialization {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use intent_core::{Error, Result};
+    use intent_store::Store;
+
+    use super::TempDb;
+    use crate::{with_idempotency, IdempotencyInflight};
+
+    /// A racing caller's observable checkpoints: `entered` fires
+    /// synchronously right before `with_idempotency` is called, `started`
+    /// fires from inside `op`, and `op` then parks until `release` opens.
+    struct Race {
+        store: Store,
+        inflight: Arc<IdempotencyInflight>,
+        calls: Arc<AtomicUsize>,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    struct Checkpoints {
+        entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+        started: tokio::sync::mpsc::UnboundedReceiver<()>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    fn race(store: Store) -> (Arc<Race>, Checkpoints) {
+        let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        (
+            Arc::new(Race {
+                store,
+                inflight: Arc::new(IdempotencyInflight::default()),
+                calls: Arc::new(AtomicUsize::new(0)),
+                entered: entered_tx,
+                started: started_tx,
+                release: release_rx,
+            }),
+            Checkpoints {
+                entered: entered_rx,
+                started: started_rx,
+                release: release_tx,
+            },
+        )
+    }
+
+    async fn wait_open(mut release: tokio::sync::watch::Receiver<bool>) {
+        while !*release.borrow_and_update() {
+            release.changed().await.expect("release gate dropped");
+        }
+    }
+
+    impl Race {
+        /// Spawn a caller on `key` whose `op` (call number `n`, 1-based)
+        /// yields `outcome(n)` once the gate opens.
+        fn spawn(
+            self: &Arc<Self>,
+            key: &str,
+            outcome: fn(usize) -> Result<serde_json::Value>,
+        ) -> tokio::task::JoinHandle<Result<serde_json::Value>> {
+            let race = self.clone();
+            let key = key.to_string();
+            tokio::spawn(async move {
+                let op_race = race.clone();
+                race.entered.send(()).expect("entered checkpoint");
+                with_idempotency(
+                    &race.inflight,
+                    &race.store,
+                    "",
+                    Some(key),
+                    "test.op",
+                    move || async move {
+                        let n = op_race.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        op_race.started.send(()).expect("started checkpoint");
+                        wait_open(op_race.release.clone()).await;
+                        outcome(n)
+                    },
+                )
+                .await
+            })
+        }
+
+        /// Yield until `n` callers hold or await `key`'s lock — i.e. a
+        /// second caller is provably parked behind the first.
+        async fn wait_holders(&self, key: &str, n: usize) {
+            while self.holders(key) < n {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        fn holders(&self, key: &str) -> usize {
+            self.inflight.holders(&(String::new(), key.to_string()))
+        }
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the `outcome` fn-pointer shape"
+    )]
+    fn winner(n: usize) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({ "call": n }))
+    }
+
+    /// Two callers racing one fresh key while the first `op` is provably in
+    /// flight: the second must wait on the key and then observe the stored
+    /// result, never run `op` a second time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_first_use_runs_op_once() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store.clone());
+
+        let first = race.spawn("race-key", winner);
+        cp.entered.recv().await.expect("first entered");
+        cp.started.recv().await.expect("first op in flight");
+        let second = race.spawn("race-key", winner);
+        cp.entered
+            .recv()
+            .await
+            .expect("second caller entered while the first op is parked");
+        race.wait_holders("race-key", 2).await;
+        cp.release.send(true).expect("open gate");
+
+        let first = first.await.expect("join").expect("first result");
+        let second = second.await.expect("join").expect("second result");
+        assert_eq!(
+            race.calls.load(Ordering::SeqCst),
+            1,
+            "op ran more than once for one key"
+        );
+        assert_eq!(first, second, "both callers observe the stored result");
+        assert_eq!(first["call"], 1);
+        assert_eq!(
+            store.get_idempotent("", "race-key").await.expect("lookup"),
+            Some(serde_json::to_string(&first).unwrap()),
+            "the single result is what was persisted"
+        );
+        assert!(
+            race.inflight.is_empty(),
+            "in-flight entry is dropped once every caller is done"
+        );
+    }
+
+    /// Errors are not cached: when the first caller's `op` fails, a same-key
+    /// caller that was waiting runs `op` itself and its success is stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_first_op_does_not_poison_waiting_caller() {
+        fn fail_first(n: usize) -> Result<serde_json::Value> {
+            if n == 1 {
+                Err(Error::Internal("first attempt failed".to_string()))
+            } else {
+                Ok(serde_json::json!({ "call": n }))
+            }
+        }
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store.clone());
+
+        let first = race.spawn("fail-key", fail_first);
+        cp.entered.recv().await.expect("first entered");
+        cp.started.recv().await.expect("first op in flight");
+        let second = race.spawn("fail-key", fail_first);
+        cp.entered.recv().await.expect("second entered");
+        race.wait_holders("fail-key", 2).await;
+        cp.release.send(true).expect("open gate");
+
+        let first = first.await.expect("join");
+        let second = second.await.expect("join");
+        assert!(
+            matches!(first, Err(Error::Internal(_))),
+            "first caller surfaces its op error: {first:?}"
+        );
+        let second = second.expect("waiting caller runs op itself");
+        assert_eq!(second["call"], 2);
+        assert_eq!(race.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store.get_idempotent("", "fail-key").await.expect("lookup"),
+            Some(serde_json::to_string(&second).unwrap()),
+            "only the success is persisted"
+        );
+        assert!(race.inflight.is_empty());
+    }
+
+    /// The lock is per key: a caller on an unrelated key completes while
+    /// another key's first `op` is still parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unrelated_keys_do_not_serialize() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store.clone());
+
+        let held = race.spawn("held-key", winner);
+        cp.entered.recv().await.expect("held entered");
+        cp.started.recv().await.expect("held op in flight");
+
+        let other = tokio::time::timeout(
+            Duration::from_secs(30),
+            with_idempotency(
+                &race.inflight,
+                &store,
+                "",
+                Some("other-key".to_string()),
+                "test.op",
+                || async { Ok::<_, Error>(serde_json::json!({ "other": true })) },
+            ),
+        )
+        .await
+        .expect("unrelated key must not wait on the held key")
+        .expect("other result");
+        assert_eq!(other["other"], true);
+
+        assert_eq!(
+            race.holders("held-key"),
+            1,
+            "the unrelated call never touched the held key"
+        );
+
+        cp.release.send(true).expect("open gate");
+        let held = held.await.expect("join").expect("held result");
+        assert_eq!(held["call"], 1);
+        assert!(race.inflight.is_empty());
+    }
+
+    /// A waiter cancelled while parked on the key's lock releases its hold
+    /// at once (the holder's count drops back to 1), and the entry is pruned
+    /// when the holder itself finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_waiter_releases_hold_and_entry_is_pruned() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store);
+
+        let holder = race.spawn("k", winner);
+        cp.entered.recv().await.expect("holder entered");
+        cp.started.recv().await.expect("holder op in flight");
+
+        let waiter = race.spawn("k", winner);
+        cp.entered.recv().await.expect("waiter entered");
+        race.wait_holders("k", 2).await;
+
+        waiter.abort();
+        assert!(
+            waiter.await.expect_err("aborted").is_cancelled(),
+            "waiter was cancelled while parked"
+        );
+        assert_eq!(
+            race.holders("k"),
+            1,
+            "the cancelled waiter no longer holds the key"
+        );
+
+        cp.release.send(true).expect("open gate");
+        let held = holder.await.expect("join").expect("holder result");
+        assert_eq!(held["call"], 1);
+        assert_eq!(race.calls.load(Ordering::SeqCst), 1, "op ran once");
+        assert!(
+            race.inflight.is_empty(),
+            "entry pruned once the last holder released"
+        );
+    }
+
+    /// Same-key slots dropped at the same instant must leave the registry
+    /// empty. Pruning has to release the dropping slot's ref under the
+    /// registry mutex: checking the count first and letting the ref drop
+    /// after `Drop::drop` returned lets two concurrent drops each see the
+    /// other's ref, both skip removal, and leak the entry for good.
+    #[test]
+    fn concurrent_slot_drops_prune_the_entry() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 2_000;
+
+        let inflight = IdempotencyInflight::default();
+        let key = (String::new(), "k".to_string());
+        // Three phases per round: all entered → all dropped → checked.
+        let barrier = std::sync::Barrier::new(THREADS + 1);
+
+        // Recorded rather than asserted inside the scope so a failure does
+        // not leave the workers parked on the barrier.
+        let mut leaked_round = None;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        let slot = inflight.enter(key.clone());
+                        barrier.wait();
+                        drop(slot);
+                        barrier.wait();
+                        barrier.wait();
+                    }
+                });
+            }
+            for round in 0..ROUNDS {
+                barrier.wait();
+                barrier.wait();
+                if leaked_round.is_none() && !inflight.is_empty() {
+                    leaked_round = Some((round, inflight.holders(&key)));
+                }
+                barrier.wait();
+            }
+        });
+        assert_eq!(
+            leaked_round, None,
+            "(round, holders): entry leaked after every slot dropped"
+        );
     }
 }
