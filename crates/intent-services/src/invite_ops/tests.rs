@@ -1,8 +1,8 @@
-//! Unit tests for the invite / identity-only join surface (multiplayer w4):
-//! the primary-identity reconnect guard, invite create/list/revoke, the
-//! redemption phases, the join itself, `members.leave` and
-//! `principal.revokeSelf`. Everything below `complete_invite_join` is
-//! exercised without a forge: the identity is passed in directly.
+//! Unit tests for the invite / join surface (multiplayer w4): the
+//! primary-identity reconnect guard, invite create/list/revoke, the link
+//! validation, the join itself, `members.leave` and `principal.revokeSelf`.
+//! Everything below `complete_invite_join` is exercised without a forge: the
+//! identity is passed in directly.
 
 use super::*;
 use crate::tests::pr::StubForge;
@@ -841,56 +841,6 @@ async fn invite_list_omits_the_url_when_no_link_can_be_built() {
     assert!(rows.iter().all(|r| r.get("url").is_none()), "{listed}");
 }
 
-/// A waiter whose budget runs out while the poll task is committing the
-/// join stays attached and collects the outcome: the grant is spent and the
-/// credential stored, and this outcome is the only copy of the token.
-#[tokio::test]
-async fn timed_out_waiter_collects_a_committing_join() {
-    let tmp = TempDb::new();
-    let f = fixture(&tmp).await;
-    let permit = f
-        .services
-        .invite_flow_permits
-        .clone()
-        .try_acquire_owned()
-        .expect("permit");
-    let (done, _) = watch::channel(false);
-    let flow_id = "committing-flow".to_string();
-    f.services.invite_flows.lock().await.insert(
-        flow_id.clone(),
-        InviteFlowSlot {
-            invite_id: "invite".to_string(),
-            deadline: Instant::now(),
-            settled_at: None,
-            committing: true,
-            outcome: None,
-            done,
-            _permit: permit,
-        },
-    );
-    let services = f.services.clone();
-    let settle = tokio::spawn({
-        let flow_id = flow_id.clone();
-        async move {
-            // Past the waiter's own budget (deadline + 5 s).
-            tokio::time::sleep(Duration::from_millis(5_500)).await;
-            let mut flows = services.invite_flows.lock().await;
-            let slot = flows.get_mut(&flow_id).expect("slot kept while committing");
-            slot.outcome = Some(Ok(json!({ "status": "authorized", "token": "t" })));
-            slot.settled_at = Some(Instant::now());
-            let _ = slot.done.send(true);
-        }
-    });
-    let outcome = f
-        .services
-        .invite_redeem_wait_op(&flow_id)
-        .await
-        .expect("outcome collected after the commit");
-    assert_eq!(outcome["token"], json!("t"));
-    settle.await.expect("settle task");
-    assert!(!f.services.invite_flows.lock().await.contains_key(&flow_id));
-}
-
 /// Owner-only: a collaborator cannot mint or list; an out-of-range TTL is
 /// `InvalidParams`; revoking an invite through another workspace is
 /// `NotFound`; an owner without a GitHub identity cannot mint.
@@ -949,23 +899,22 @@ async fn invite_create_guards() {
     assert_eq!(invite_kind(&r), InviteErrorKind::GithubIdentityRequired);
 }
 
-// --- redeem ----------------------------------------------------------------
+// --- link validation / first-time join --------------------------------------
 
-/// Phase 1 never reaches the device flow for a bad link: an unknown id or a
-/// wrong secret is `NotFound` (indistinguishable), an expired invite
-/// `Expired`, a revoked one `Revoked`; phase 2 on an unknown flow is
-/// `FlowNotFound`.
+/// The link validation every `/invite` method starts with refuses a bad
+/// link: an unknown id or a wrong secret is `NotFound` (indistinguishable),
+/// an expired invite `Expired`, a revoked one `Revoked`.
 #[tokio::test]
-async fn redeem_start_refuses_closed_or_unknown_invites() {
+async fn open_invite_refuses_closed_or_unknown_invites() {
     let tmp = TempDb::new();
     let f = fixture(&tmp).await;
     let created = f.create_invite(None).await;
     let id = id_of(&created);
     let secret = created["secret"].as_str().expect("secret").to_string();
 
-    let r = f.services.invite_redeem_start_op("missing", &secret).await;
+    let r = f.services.invite_inspect_op("missing", &secret).await;
     assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
-    let r = f.services.invite_redeem_start_op(&id, "wrong").await;
+    let r = f.services.invite_inspect_op(&id, "wrong").await;
     assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
 
     let mut expired = f
@@ -983,16 +932,13 @@ async fn redeem_start_refuses_closed_or_unknown_invites() {
         .expect("insert expired");
     let r = f
         .services
-        .invite_redeem_start_op("expired", "expired-secret")
+        .invite_inspect_op("expired", "expired-secret")
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Expired);
 
     f.store.revoke_workspace_invite(&id).await.expect("revoke");
-    let r = f.services.invite_redeem_start_op(&id, &secret).await;
+    let r = f.services.invite_inspect_op(&id, &secret).await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
-
-    let r = f.services.invite_redeem_wait_op("no-such-flow").await;
-    assert_eq!(invite_kind(&r), InviteErrorKind::FlowNotFound);
 }
 
 /// The join: a fresh principal keyed by the GitHub account id, a
@@ -1136,7 +1082,7 @@ impl Fixture {
         (ws, id_of(&created), secret)
     }
 
-    /// The device-flow join of `identity` on a fresh invite of the fixture
+    /// The first-time join of `identity` on a fresh invite of the fixture
     /// workspace: the returning guest's first credential.
     async fn first_join(&self, user: &UserIdentity) -> (PrincipalId, String) {
         let created = self.create_invite(None).await;
@@ -1153,15 +1099,15 @@ impl Fixture {
 }
 
 /// `invite.inspect` answers the workspace hint for an open link with the
-/// same refusals as a redeem start — and takes no flow permit, so a
-/// daemon whose flow capacity is fully spent still answers it.
+/// same refusals as a challenge — and takes no nonce permit, so a daemon
+/// whose nonce capacity is fully spent still answers it.
 #[tokio::test]
-async fn inspect_previews_an_open_invite_without_a_flow() {
+async fn inspect_previews_an_open_invite_without_a_nonce() {
     let tmp = TempDb::new();
     let f = fixture(&tmp).await;
     let (ws2, invite_id, secret) = f.second_workspace_invite().await;
 
-    let permits_before = f.services.invite_flow_permits.available_permits();
+    let permits_before = f.services.invite_nonce_permits.available_permits();
     let r = f
         .services
         .invite_inspect_op(&invite_id, &secret)
@@ -1173,29 +1119,29 @@ async fn inspect_previews_an_open_invite_without_a_flow() {
         "{r}"
     );
     assert_eq!(
-        f.services.invite_flow_permits.available_permits(),
+        f.services.invite_nonce_permits.available_permits(),
         permits_before,
-        "inspect never touches the flow permits"
+        "inspect never touches the nonce permits"
     );
-    assert!(f.services.invite_flows.lock().await.is_empty());
+    assert!(f.services.invite_nonces.lock().await.is_empty());
 
-    // Spent flow capacity does not affect inspect.
+    // Spent nonce capacity does not affect inspect.
     let _all: Vec<_> = (0..permits_before)
         .map(|_| {
             f.services
-                .invite_flow_permits
+                .invite_nonce_permits
                 .clone()
                 .try_acquire_owned()
                 .expect("permit")
         })
         .collect();
-    assert_eq!(f.services.invite_flow_permits.available_permits(), 0);
+    assert_eq!(f.services.invite_nonce_permits.available_permits(), 0);
     f.services
         .invite_inspect_op(&invite_id, &secret)
         .await
-        .expect("inspect with no flow capacity");
+        .expect("inspect with no nonce capacity");
 
-    // Same refusals as a redeem start; the invite stays open throughout.
+    // Same refusals as a challenge; the invite stays open throughout.
     let r = f.services.invite_inspect_op("missing", &secret).await;
     assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
     let r = f.services.invite_inspect_op(&invite_id, "wrong").await;
@@ -1208,7 +1154,7 @@ async fn inspect_previews_an_open_invite_without_a_flow() {
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
 }
 
-/// `invite.accept` with the credential a prior redeem minted: the same
+/// `invite.accept` with the credential a prior join minted: the same
 /// principal joins the second workspace as a collaborator, a fresh
 /// credential comes back (the earlier one is untouched), the invite is
 /// redeemed by that principal, the stored profile is not refreshed, no
@@ -1288,7 +1234,7 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
         4,
         "no new principal row"
     );
-    assert!(f.services.invite_flows.lock().await.is_empty());
+    assert!(f.services.invite_nonces.lock().await.is_empty());
 
     let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
         .await
@@ -1304,7 +1250,7 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
     // owner + the demoted primary + the guest
     assert_eq!(ev.data["changes"]["memberCount"], json!(3));
 
-    // Single use, like the device-flow join (with the live credential; the
+    // Single use, like the first-time join (with the live credential; the
     // rotated-out one is refused before the invite is even looked at).
     let again = f
         .services
@@ -1665,10 +1611,9 @@ async fn challenge_issues_a_nonce_without_a_flow() {
         assert_eq!(nonces.len(), 2);
         assert!(nonces.values().all(|s| s.invite_id == invite_id));
     }
-    assert!(f.services.invite_flows.lock().await.is_empty());
     assert_eq!(
-        f.services.invite_flow_permits.available_permits(),
-        MAX_INFLIGHT_INVITE_FLOWS
+        f.services.invite_nonce_permits.available_permits(),
+        MAX_OUTSTANDING_NONCES - 2
     );
 
     let r = f.services.invite_challenge_op(&invite_id, "wrong").await;
@@ -1730,9 +1675,8 @@ async fn challenge_bounds_outstanding_nonces_per_invite() {
 
 /// The happy path: a gist owned by the claimed login (case-insensitively),
 /// whose proof file starts with the nonce and which postdates the nonce,
-/// mints the principal, membership and credential exactly like the device
-/// flow, consumes the nonce and publishes the member event. The gist is
-/// read exactly once.
+/// mints the principal, membership and credential, consumes the nonce and
+/// publishes the member event. The gist is read exactly once.
 #[tokio::test]
 async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
     let tmp = TempDb::new();
@@ -1791,7 +1735,6 @@ async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
         f.services.invite_nonce_permits.available_permits(),
         MAX_OUTSTANDING_NONCES
     );
-    assert!(f.services.invite_flows.lock().await.is_empty());
     let invite = f
         .store
         .get_workspace_invite(&invite_id)
