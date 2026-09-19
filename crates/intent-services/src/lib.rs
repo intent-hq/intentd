@@ -9052,7 +9052,13 @@ impl Services {
 /// the published `agent:idle` carries the child's `notificationsMuted` stamp
 /// for notification clients, and copying it verbatim here would hand a
 /// watching agent the user's mute preference despite the MCP-side scrub.
-fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
+///
+/// `pub` + `#[doc(hidden)]` only so the `intent-acp` egress contract test
+/// (`tests_hidden_field_egress.rs`, the `AGENT_HIDDEN_FIELDS` registry) can
+/// drive the real builder; not part of the crate's supported API.
+#[doc(hidden)]
+#[must_use]
+pub fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut event_types: Vec<String> = Vec::new();
     for e in events {

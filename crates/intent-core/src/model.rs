@@ -2708,10 +2708,19 @@ pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
 /// [`strip_agent_hidden_fields`] at every agent-facing boundary: the MCP
 /// `ws.agent.*` / `ws.event.*` results and the per-event `data` copied into
 /// parent-wake message metadata.
+///
+/// Every agent-facing egress that serves session or event data is listed in
+/// the egress registry of the contract test
+/// `crates/intent-acp/src/tests_hidden_field_egress.rs`, which proves no key
+/// here survives any of them. Adding a key needs no test edit (the fixture
+/// reads this const); adding a NEW egress requires a registry entry there.
 pub const AGENT_HIDDEN_FIELDS: &[&str] = &["notificationsMuted"];
 
 /// Recursively remove [`AGENT_HIDDEN_FIELDS`] from `value` (however deeply
-/// nested in objects or arrays).
+/// nested in objects or arrays). Call it at the dispatch boundary of any new
+/// agent-facing egress and register that egress in
+/// `crates/intent-acp/src/tests_hidden_field_egress.rs` (see
+/// [`AGENT_HIDDEN_FIELDS`]).
 pub fn strip_agent_hidden_fields(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(obj) => {
