@@ -1311,6 +1311,32 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            // The fake refuses a sentinel nonce with the bounded scope error
+            // so the wire mapping (`-32603` + `data.code`) is exercised.
+            if nonce == "no-scope" {
+                return Err(Error::IdentityProof(
+                    intent_core::IdentityProofErrorKind::ScopeMissing,
+                ));
+            }
+            Ok(serde_json::json!({
+                "gistId": "g1",
+                "login": "octocat",
+                "echoNonce": nonce,
+                "echoHostLabel": host_label,
+            }))
+        })
+    }
+
+    fn github_identity_proof_delete(&self, gist_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "echoGistId": gist_id })) })
+    }
+
     fn git_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -4612,6 +4638,66 @@ async fn github_repos_search_routes_query() {
 #[tokio::test]
 async fn github_users_search_requires_query() {
     let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.users.search","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn github_identity_proof_create_routes_nonce_and_host_label() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{"nonce":"n1","hostLabel":"Studio"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["gistId"], serde_json::json!("g1"));
+    assert_eq!(v["result"]["login"], serde_json::json!("octocat"));
+    assert_eq!(v["result"]["echoNonce"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["echoHostLabel"], serde_json::json!("Studio"));
+}
+
+#[tokio::test]
+async fn github_identity_proof_create_requires_nonce_and_host_label() {
+    for params in ["{}", r#"{"nonce":"n1"}"#, r#"{"hostLabel":"h"}"#] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
+}
+
+#[tokio::test]
+async fn github_identity_proof_refusal_carries_bounded_data_code() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{"nonce":"no-scope","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "github-scope-missing" })
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("gist")),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn github_identity_proof_delete_routes_gist_id_and_requires_it() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.delete","params":{"gistId":"g1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["echoGistId"], serde_json::json!("g1"));
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.delete","params":{}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
