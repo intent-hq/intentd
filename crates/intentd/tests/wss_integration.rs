@@ -1488,7 +1488,7 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
 /// (workspace-wide, non-retired) next to `retiredCount`, the default
 /// response is otherwise byte-identical to `scope: "all"`, and the invalid
 /// combinations are `-32602` with the documented messages.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wss_agent_list_scope_bins_and_counts() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
