@@ -2329,6 +2329,7 @@ dependencies = [
  "intent-sentry",
  "intent-sourcecontrol",
  "intent-store",
+ "intent-test-macros",
  "intent-voice",
  "libc",
  "nix 0.31.3",
@@ -2385,6 +2386,14 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "intent-test-macros"
+version = "0.9.55"
+dependencies = [
+ "intent-core",
+ "tokio",
 ]
 
 [[package]]
@@ -2461,6 +2470,7 @@ dependencies = [
  "intent-services",
  "intent-sourcecontrol",
  "intent-store",
+ "intent-test-macros",
  "intent-transport",
  "intent-voice",
  "intentd-sitter",

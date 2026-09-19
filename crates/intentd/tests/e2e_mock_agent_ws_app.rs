@@ -94,7 +94,7 @@ fn gate() -> Option<String> {
 
 /// Gap 1 (P2): Chief-workspace agent calls ws.app.workspaces.list via MCP and
 /// receives 2+ seeded user workspaces (never __chief__).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_workspaces_list() {
     let Some(script) = gate() else { return };
 
@@ -273,7 +273,7 @@ async fn chief_agent_ws_app_workspaces_list() {
 /// Gap 2 (P2): Chief-workspace agent calls ws.app.proposal.show and the
 /// persisted transcript contains the application/vnd.intent.proposal+json
 /// resource content item.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_resource_persisted() {
     let Some(script) = gate() else { return };
 
@@ -444,7 +444,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
 /// content items into `{ output: "<stringified {ok, proposal}>" }` (auggie's
 /// shape — the resource item is dropped entirely) still yields the standalone
 /// proposal-resource block in the persisted transcript via the fallback lift.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     let Some(script) = gate() else { return };
 
@@ -615,7 +615,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
 /// `ws.app.proposal.show`'s dispatch registered the canonical payload in the
 /// turn-attachment registry in-process and the transcript writer claims it
 /// when the tool call completes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     let Some(script) = gate() else { return };
 
@@ -789,7 +789,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
 /// Drives the full mock-ACP path (`tool_call_update` → transcript writer) and
 /// asserts the standalone proposal-resource block is still persisted from
 /// the binding-time registration + FIFO claim.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     let Some(script) = gate() else { return };
 
@@ -965,7 +965,7 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
 /// JS saw `ok: true`. Asserts the completed `agent:tool:call` event carries
 /// `registeredAttachments` + `proposalBlockIds`, records the call as
 /// `workspace_api`, and the transcript has the standalone proposal block.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
     let Some(script) = gate() else { return };
 
@@ -1192,7 +1192,7 @@ async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
 
 /// Gap 3 (P3): Non-chief workspace agent calls ws.app.* and receives the
 /// gating error through the MCP tool result.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn non_chief_agent_ws_app_gating_error() {
     let Some(script) = gate() else { return };
 

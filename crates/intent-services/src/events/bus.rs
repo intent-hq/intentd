@@ -131,7 +131,7 @@ impl EventBus {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
         // Spawn the writer task that drains events and batch-persists them.
-        tokio::spawn(writer_task(store.clone(), writer_rx, tx.clone()));
+        intent_core::spawn_daemon(writer_task(store.clone(), writer_rx, tx.clone()));
         Self {
             store,
             tx,
@@ -293,7 +293,7 @@ impl EventBus {
     pub fn subscribe(&self, filter: SubscriptionFilter) -> Subscription {
         let rx = self.tx.subscribe();
         let (out_tx, out_rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
-        let handle = tokio::spawn(delivery_task(rx, filter, out_tx));
+        let handle = intent_core::spawn_daemon(delivery_task(rx, filter, out_tx));
         Subscription { rx: out_rx, handle }
     }
 }

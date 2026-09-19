@@ -118,7 +118,7 @@ async fn wss_rpc_err(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
 
 /// STAB-69: `workspace.create` with `initialAgent.imageBlocks` threads the images
 /// into the first turn so the ACP receives them.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_threads_image_blocks_to_first_turn() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -226,7 +226,7 @@ async fn workspace_create_threads_image_blocks_to_first_turn() {
 /// `agent.sendMessage`; persisted AS a reference (no bytes on the session or
 /// transcript row); and rejected with `-32602` for unknown ids and
 /// both/neither shape violations.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn image_reference_blocks_accepted_and_validated() {
     use base64::Engine as _;
 

@@ -89,7 +89,7 @@ impl SpecialistsWatcher {
             );
         }
 
-        let task = tokio::spawn(debounce_loop(bus, workspaces, user_dir, raw_rx));
+        let task = intent_core::spawn_daemon(debounce_loop(bus, workspaces, user_dir, raw_rx));
 
         Self {
             hub: Arc::clone(hub),

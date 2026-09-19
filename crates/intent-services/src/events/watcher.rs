@@ -612,7 +612,8 @@ impl FileWatcher {
             }
             None => (None, None),
         };
-        let task = tokio::spawn(debounce_loop(bus, workspace_id, root, raw_rx, exclude_rx));
+        let task =
+            intent_core::spawn_daemon(debounce_loop(bus, workspace_id, root, raw_rx, exclude_rx));
         Self {
             _sub: sub,
             _exclude_sub: exclude_sub,

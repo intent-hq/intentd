@@ -1749,7 +1749,7 @@ pub(super) fn watch_tiers(
         })
         .collect();
     let registration = Arc::clone(&sub.registration);
-    let task = tokio::spawn(async move {
+    let task = intent_core::spawn_daemon(async move {
         wait_settled(&registration, ESTABLISH_TIMEOUT).await;
         on_change();
         while let Some(event) = rx.recv().await {

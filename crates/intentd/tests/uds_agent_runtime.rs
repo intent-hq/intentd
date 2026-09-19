@@ -176,7 +176,7 @@ async fn rpc(
     resp["result"].clone()
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -362,7 +362,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
 /// the single terminal `agent:stream:end`. We then prove keep-alive by sending a
 /// follow-up message that RESUMES the same child/session (the mock reports
 /// `turn=2`, which a respawned process — fresh `promptCount` — could never do).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_stop_interrupts_keep_alive_and_emits_terminal_stream_end_over_uds() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(

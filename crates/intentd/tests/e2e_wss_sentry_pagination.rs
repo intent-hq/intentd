@@ -318,7 +318,7 @@ fn wire_next_token(cursor: &str) -> String {
 /// envelope with the engine's cursor wrapped into the opaque wire `nextToken`;
 /// passing that token back decodes onto the engine cursor, and the last page
 /// carries an explicit `nextToken: null`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_issues_next_token_round_trips() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -355,7 +355,7 @@ async fn list_issues_next_token_round_trips() {
 
 /// `sentry.searchIssues`: same envelope and cursor semantics, with the wire
 /// `query` + `project` forwarded alongside the token.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn search_issues_next_token_round_trips() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;

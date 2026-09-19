@@ -221,7 +221,7 @@ impl WatcherRegistry {
         let specialists = SpecialistsWatcher::start(&hub, bus.clone(), initial);
         tracing::info!("specialists watcher started");
 
-        let task = tokio::spawn(lifecycle_loop(
+        let task = intent_core::spawn_daemon(lifecycle_loop(
             Arc::clone(&hub),
             Arc::clone(&git_common),
             bus,
