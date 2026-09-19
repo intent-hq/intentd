@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.80] - 2026-09-19
+
+### 🚀 Features
+
+- *(acp)* Add ws.workspace.applyProposal binding for agent-applied sibling proposals ([#1995](https://github.com/intent-hq/intentd/pull/1995))
+
+### 🐛 Bug Fixes
+
+- *(acp)* Make queued ws.agent.send durable past the eval budget ([#1994](https://github.com/intent-hq/intentd/pull/1994))
+- *(rpc_profile)* Budget agent.sendQueuedMessageNow / agent.resolveProposal on the compound tier ([#1993](https://github.com/intent-hq/intentd/pull/1993))
+
+### 🧪 Testing
+
+- *(acp)* Egress registry + contract test for AGENT_HIDDEN_FIELDS ([#1996](https://github.com/intent-hq/intentd/pull/1996))
+
+
 ## [0.9.79] - 2026-09-18
 
 ### 🚀 Features
