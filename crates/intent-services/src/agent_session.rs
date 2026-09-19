@@ -4888,20 +4888,22 @@ impl Services {
                 // Internal chat-channel delta (§7.1): the full content-bearing
                 // payload the per-agent `chat.subscribe` forwarder accumulates
                 // into block deltas (D4 block identity kept).
-                self.publish_agent_event(
-                    workspace_id,
-                    agent_id,
-                    CHAT_STREAM_DELTA,
-                    json!({
-                        "agentId": agent_id.0,
-                        "content": content,
-                        "messageId": message_id,
-                        "blockIndex": block_index,
-                        "blockId": transcript.block_id(block_index),
-                        "blockType": block_type,
-                    }),
-                )
-                .await;
+                let mut delta = json!({
+                    "agentId": agent_id.0,
+                    "content": content,
+                    "messageId": message_id,
+                    "blockIndex": block_index,
+                    "blockId": transcript.block_id(block_index),
+                    "blockType": block_type,
+                });
+                if let Some(t) = &text {
+                    // UTF-8 byte position within this block, not the turn.
+                    // A recovery snapshot can already contain this chunk by
+                    // the time a standing subscriber consumes its event.
+                    delta["textOffset"] = json!(transcript.text.len() - t.len());
+                }
+                self.publish_agent_event(workspace_id, agent_id, CHAT_STREAM_DELTA, delta)
+                    .await;
                 // External activity signal (§7): leading-edge throttled per
                 // agent — the first chunk of a turn emits immediately
                 // (preserves the FE's pre-first-token status-hint clearing

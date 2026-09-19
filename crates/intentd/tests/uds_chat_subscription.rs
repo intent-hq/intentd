@@ -1787,6 +1787,7 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     want_obj.insert("isWaitingOnTool".into(), json!(false));
     want_obj.insert("isWaitingForOtherAgents".into(), json!(false));
     want_obj.insert("waitingForAgentIds".into(), json!([]));
+    want_obj.insert("resumed".into(), json!(false));
     assert_eq!(
         recovery["params"]["snapshot"], want,
         "recovery snapshot equals a fresh getConversation page"

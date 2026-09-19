@@ -9,7 +9,7 @@
 //! transports handle by draining the two-lane outbound queue
 //! ([`OutboundSender`] / [`OutboundReceiver`], priority lane first).
 
-use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
+use intent_core::events::{AGENT_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
 use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
@@ -1197,6 +1197,11 @@ async fn forward_note_subscription(
 /// after that id (`resumed: true`) or falls back to the standard full page
 /// (`resumed: false`) — see [`subscriptions::chat_snapshot`].
 ///
+/// Transcript edits and replacements also re-emit a bounded snapshot at the
+/// next seq. Recovery snapshots carry `resumed: false` so clients discard old
+/// cached rows, including history outside the served page. Metadata-only
+/// `agent:updated` events do not invalidate the transcript.
+///
 /// **Lag self-heal.** The broadcast ring drops this subscriber's oldest
 /// undelivered events when it falls behind (slow consumer — e.g. the bulk lane
 /// starved by large priority-lane responses). The loss is silent on the wire:
@@ -1309,8 +1314,8 @@ async fn chat_subscription_loop(
     // its turn's terminal frame.
     let mut buffer: ConflationBuffer<ChatItem> = ConflationBuffer::new();
     let mut seq: u64 = 1;
-    // `Some(skipped)` while a lag recovery snapshot is owed but not yet
-    // emitted (read failed persistently); cleared once a good page goes out.
+    // Some(skipped) while a recovery snapshot is owed; zero denotes an
+    // explicit transcript invalidation rather than a lag marker.
     let mut pending_recovery: Option<u64> = None;
     loop {
         tokio::select! {
@@ -1396,6 +1401,28 @@ async fn chat_subscription_loop(
                         continue;
                     }
                 };
+                // Transcript edits/replacements invalidate both the client's
+                // accumulated rows and this forwarder's per-turn block state.
+                // Coalesce the already-published backlog before reading, just
+                // like lag recovery: replaying it after the snapshot could
+                // restore deleted rows or append incremental text twice.
+                if batch.iter().any(|event| {
+                    event.session_id.as_deref() == Some(agent_id.as_str())
+                        && event.event_type == AGENT_UPDATED
+                        && (event.data.get("truncatedCount").is_some()
+                            || event.data.get("replacedCount").is_some())
+                }) {
+                    while subscription.try_recv_delivery().is_some() {}
+                    buffer = ConflationBuffer::new();
+                    pending_recovery = Some(0);
+                    if !attempt_chat_recovery(
+                        api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
+                        &mut seq, &out_tx, &mut state, &mut pending_recovery,
+                    ).await {
+                        return "client_closed";
+                    }
+                    continue;
+                }
                 for event in batch {
                     // Cross-agent isolation: only this agent's stream events
                     // belong to this subscription.
@@ -1462,13 +1489,13 @@ async fn chat_subscription_loop(
     }
 }
 
-/// Retry cadence for a pending lag recovery whose bounded page read keeps
+/// Retry cadence for a pending recovery whose bounded page read keeps
 /// failing (see [`forward_chat_subscription`]). Long enough to give a
 /// transient store failure room to clear, short enough that a quiet bus does
 /// not leave the client stale for long.
 const CHAT_RECOVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// One attempt at the owed lag-recovery snapshot: read the bounded page
+/// One attempt at the owed recovery snapshot: read the bounded page
 /// (fallibly — see [`subscriptions::chat_recovery_snapshot`]), and on success
 /// emit it at the next `seq`, reseed the mapper, and clear the pending flag.
 /// On a failed read the recovery stays pending for the caller to re-attempt.
@@ -1489,11 +1516,15 @@ async fn attempt_chat_recovery(
     else {
         tracing::warn!(
             agent = %agent_id,
-            "chat lag recovery read failed; keeping recovery pending"
+            "chat recovery read failed; keeping recovery pending"
         );
         return true;
     };
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
+    // Recovery invalidates the whole cached transcript, including older pages.
+    // Lag may itself have swallowed a truncation event, so this also applies
+    // when recovery was triggered by lost delivery rather than a known edit.
+    snapshot["resumed"] = Value::Bool(false);
     let frame = subscriptions::build_snapshot_push(subscription_id, *seq, &snapshot);
     *seq += 1;
     if out_tx.send(frame).await.is_err() {

@@ -688,6 +688,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_TOOL_CALL,
             AGENT_STREAM_END,
             AGENT_MESSAGE,
+            AGENT_UPDATED,
         ],
     };
     types.iter().map(std::string::ToString::to_string).collect()
@@ -1088,6 +1089,9 @@ pub(crate) struct ChatDeltaState {
     /// in both modes — a fragment there would clobber the client's
     /// accumulation.
     text_acc: HashMap<String, String>,
+    /// Completed snapshot rows can overlap queued chunks too. Keep their
+    /// bounded-page text across turn finalization, separate from live state.
+    snapshot_text: HashMap<String, String>,
     /// `blockId`s emitted at least once this turn (added vs updated discriminator).
     seen_ids: HashSet<String>,
     /// `blockId`s emitted live this turn (to compute orphan `removedIds` at end).
@@ -1118,6 +1122,7 @@ impl ChatDeltaState {
             encoding,
             projection,
             text_acc: HashMap::new(),
+            snapshot_text: HashMap::new(),
             seen_ids: HashSet::new(),
             emitted_ids: HashSet::new(),
             message_id: None,
@@ -1136,11 +1141,30 @@ impl ChatDeltaState {
     /// (monorepo#2675) deltas carry only the post-snapshot fragment, so the
     /// pre-load doesn't shape the wire — but the accumulation still backs the
     /// DEGRADED terminal frame's best-effort full text, so seeding is identical
-    /// in both modes. No-op when the snapshot has no in-flight message.
+    /// in both modes. Completed rows also seed overlap text without becoming
+    /// the mapper's active turn: their queued chunks can race the page read.
     pub(crate) fn seed_from_snapshot(&mut self, snapshot: &Value) {
         let Some(messages) = snapshot.get("messages").and_then(Value::as_array) else {
             return;
         };
+        self.snapshot_text.clear();
+        for msg in messages {
+            if let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) {
+                for block in blocks {
+                    if matches!(
+                        block.get("type").and_then(Value::as_str),
+                        Some("text" | "thinking")
+                    ) {
+                        if let (Some(id), Some(text)) = (
+                            block.get("id").and_then(Value::as_str),
+                            block.get("text").and_then(Value::as_str),
+                        ) {
+                            self.snapshot_text.insert(id.to_string(), text.to_string());
+                        }
+                    }
+                }
+            }
+        }
         let Some(msg) = messages
             .iter()
             .find(|m| m.get("isStreaming") == Some(&Value::Bool(true)))
@@ -1322,12 +1346,31 @@ impl ChatDeltaState {
         let d = &event.data;
         let block_id = d.get("blockId").and_then(Value::as_str)?.to_string();
         let message_id = d.get("messageId").and_then(Value::as_str)?.to_string();
-        self.message_id = Some(message_id.clone());
         let block_type = d.get("blockType").and_then(Value::as_str).unwrap_or("text");
         let content = d.get("content")?;
         let block = if block_type == "text" || block_type == "thinking" {
             let chunk = content.as_str().unwrap_or_default();
-            let acc = self.text_acc.entry(block_id.clone()).or_default();
+            let snapshot_text = self.snapshot_text.get(&block_id);
+            let acc = self
+                .text_acc
+                .entry(block_id.clone())
+                .or_insert_with(|| snapshot_text.cloned().unwrap_or_default());
+            if snapshot_text.is_some() {
+                self.seen_ids.insert(block_id.clone());
+            }
+            // The snapshot read and bus delivery overlap: queued chunks may
+            // already be included in the seeded prefix. Producer offsets let
+            // us discard precisely that overlap, even for repeated text.
+            let chunk = if let Some(offset) = d.get("textOffset").and_then(Value::as_u64) {
+                let offset = usize::try_from(offset).ok()?;
+                let overlap = acc.len().saturating_sub(offset);
+                if overlap >= chunk.len() {
+                    return None;
+                }
+                chunk.get(overlap..)?
+            } else {
+                chunk
+            };
             acc.push_str(chunk);
             let block = match self.encoding {
                 DeltaEncoding::Full => {
@@ -1353,6 +1396,7 @@ impl ChatDeltaState {
             self.remember_block(&block_id, &block);
             block
         };
+        self.message_id = Some(message_id.clone());
         let added = self.note_block(&block_id);
         let entity = self.entity(&message_id, block, None, None, false);
         Some(single_delta(added, &entity))
