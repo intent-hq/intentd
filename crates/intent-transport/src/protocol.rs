@@ -499,14 +499,17 @@
 //! within 10.3, ephemeral presence (multiplayer w5): `presence.update` /
 //! `note.presence.update` (fast path), `presence.snapshot`, and the
 //! `note.presence.subscribe` / `note.presence.unsubscribe` channel pair.
-//! Also within 10.2, the collaborator picker's `github.users.search`
+//! Also within 10.3, the collaborator picker's `github.users.search`
 //! router method (additive; §5.27, administrator-only): login-prefix user
 //! search over `GET /search/users` — `{ query, limit? }` → `{ users: [{ id,
 //! login, avatarUrl, htmlUrl }] }`. `query` is required (`-32602` when
-//! missing; a blank query answers `{ users: [] }` without a forge call);
-//! `limit` defaults to 8 and is clamped into `[1, 10]`. The catalog
-//! contains 324 router methods, 53 fast-path methods, and two aliases: 379
-//! client-callable names.
+//! missing; a blank query answers `{ users: [] }` without a forge call); the
+//! forge request keeps only the leading run of login characters (ASCII
+//! alphanumerics and `-`), so search qualifiers / booleans typed after it
+//! never reach GitHub's search parser and a query with no such prefix
+//! answers `{ users: [] }`; `limit` defaults to 8 and is clamped into
+//! `[1, 10]`. The catalog contains 324 router methods, 53 fast-path
+//! methods, and two aliases: 379 client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release
