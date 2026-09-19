@@ -469,6 +469,192 @@ async fn transient_prompt_fetch_failure_retries_in_place_over_wss() {
     );
 }
 
+/// Regression for intent-hq/intent#5419 over the real WSS transport: the
+/// provider streams one chunk and THEN fails `session/prompt` with the
+/// transient fetch shape (`-32603` wrapping EPIPE + `apiStatus: unavailable`).
+/// The post-output guard blocks the in-place retry, so the turn stays terminal
+/// (`agent:failed`, session parked in `error`) — but the dying agent must now
+/// raise a blocker-style attention request: `agent:attention-requested`
+/// (kind `blocker`, reason naming the cause) arrives BEFORE `agent:failed`,
+/// and `agent.getSession` carries `attentionRequestKind: "blocker"`.
+#[tokio::test]
+async fn post_output_transient_fetch_failure_raises_blocker_attention_over_wss() {
+    let Some(script) = gate("WSS post-output transient failure attention E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Transient shape WITH streamed output: the chunk arms the post-output
+    // guard, so no retry — and no attempt gating, so the single dispatch is
+    // the terminal one.
+    let behavior = json!({
+        "promptRpcError": {
+            "code": -32603,
+            "message": "Internal error",
+            "data": FETCH_EPIPE_UNAVAILABLE,
+        },
+        "streamBeforeErrorText": "partial output before the blip",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10"),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-5419-ATTENTION", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "prompt that blips after output" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect this agent's event types in arrival order until agent:failed.
+    let mut order: Vec<String> = Vec::new();
+    let mut attention: Option<Value> = None;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        let ty = event["type"].as_str().unwrap_or_default().to_string();
+        if ty == "agent:attention-requested" {
+            attention = Some(event["data"].clone());
+        }
+        let done = ty == "agent:failed";
+        order.push(ty);
+        if done {
+            break;
+        }
+    }
+    let attention = attention.expect("agent:attention-requested emitted for the dying agent");
+    assert_eq!(
+        attention["kind"], "blocker",
+        "attention event kind: {attention}"
+    );
+    assert_eq!(
+        attention["workspaceId"],
+        json!(ws_id),
+        "attention event carries workspaceId: {attention}"
+    );
+    let reason = attention["reason"].as_str().expect("attention reason");
+    assert!(
+        reason.contains("transient provider fetch failure after streamed output"),
+        "reason names the cause: {reason}"
+    );
+    assert!(
+        reason.contains("attempt 1 of 3"),
+        "reason carries the dispatched attempt count: {reason}"
+    );
+    let attention_idx = order
+        .iter()
+        .position(|t| t == "agent:attention-requested")
+        .expect("attention in order");
+    let failed_idx = order
+        .iter()
+        .position(|t| t == "agent:failed")
+        .expect("agent:failed observed over WSS");
+    assert!(
+        attention_idx < failed_idx,
+        "agent:attention-requested precedes agent:failed on the wire: {order:?}"
+    );
+
+    // The session is parked in error AND carries the pending blocker.
+    let got = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(session["status"], "error", "session parked in error: {got}");
+    assert_eq!(
+        session["attentionRequestKind"], "blocker",
+        "session attentionRequestKind: {got}"
+    );
+    assert_eq!(
+        session["attentionRequestReason"],
+        json!(reason),
+        "session attentionRequestReason matches the event: {got}"
+    );
+
+    // Transcript: the streamed partial persisted, and the blocker notice
+    // landed AFTER it.
+    let convo = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = convo["messages"]
+        .as_array()
+        .expect("conversation messages array");
+    let partial_idx = messages
+        .iter()
+        .position(|m| {
+            m["role"] == "assistant" && blocks_text(m).contains("partial output before the blip")
+        })
+        .expect("pre-failure partial persisted");
+    let notice_idx = messages
+        .iter()
+        .position(|m| {
+            m["role"] == "system" && m["contentBlocks"][0]["meta"]["kind"] == "blocker-report"
+        })
+        .expect("blocker notice persisted");
+    assert!(
+        partial_idx < notice_idx,
+        "blocker notice lands after the persisted partial: {convo}"
+    );
+}
+
 /// PROMPTERR-1 (#479): provider streams a warning chunk then fails the prompt
 /// with a JSON-RPC -32603 carrying the real detail in `data`. The daemon must
 /// (1) persist the pre-error chunk so `agent.getConversation` returns it,

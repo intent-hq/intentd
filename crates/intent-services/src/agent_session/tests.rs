@@ -4919,12 +4919,18 @@ async fn post_output_transient_fetch_failure_raises_blocker_attention() {
         messages[1].content[0]["meta"]["kind"],
         json!("blocker-report")
     );
-    // The parent received the blocker wake immediately.
+    // The parent received the DIRECT blocker wake immediately. Scope: this
+    // parent holds no completion watch and only `run_prompt_turn` runs here,
+    // so the assertion proves exactly one attention wake from the raise
+    // itself. In production an armed parent watch stays armed across the
+    // raise and `agent:failed` then delivers the ordinary completion wake
+    // (a grouped parent later gets the aggregate) — that is the existing
+    // attention contract, not exercised by this test.
     let parent = services.store.get_agent_session(&parent_id).await.unwrap();
     assert_eq!(
         parent.messages.len(),
         1,
-        "the parent gets exactly one attention wake for the dying child"
+        "the raise itself delivers exactly one direct attention wake to the parent"
     );
     let wake_text = serde_json::to_string(&parent.messages[0].content).unwrap();
     assert!(
@@ -5178,10 +5184,17 @@ where
 /// is NOT retried — the handler may have side-effected (file written,
 /// terminal command run), so re-dispatching is no longer provably idempotent
 /// even though no `session/update` streamed.
+///
+/// intent-hq/intent#5419 (PR #2004 review): this side-effect-only fall-through
+/// raises the same blocker-style attention request as the streamed-output
+/// path, and its reason names the guard that actually tripped — "after a
+/// side-effecting client request", never "after streamed output" — with
+/// `agent:attention-requested` ahead of `agent:failed`.
 #[tokio::test]
 async fn transient_fetch_failure_after_client_request_is_not_retried() {
     std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
-    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
     let (_agent, prompt_calls) = spawn_mock_agent_with_client_request_then_transient_failure(
@@ -5220,6 +5233,64 @@ async fn transient_fetch_failure_after_client_request_is_not_retried() {
         1,
         "no retry after a side-effecting client request"
     );
+
+    // The side-effect-only path raises the blocker too, naming ITS cause.
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error);
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "client-request fall-through raises a blocker attention request (intent#5419)"
+    );
+    let reason = stored
+        .attention_request_reason
+        .as_deref()
+        .expect("attention reason recorded");
+    assert!(
+        reason.contains("transient provider fetch failure after a side-effecting client request"),
+        "reason names the client-request guard: {reason}"
+    );
+    assert!(
+        !reason.contains("after streamed output"),
+        "no output streamed, so the reason must not claim it did: {reason}"
+    );
+    assert!(
+        reason.contains("attempt 1 of 3"),
+        "reason carries the dispatched attempt count: {reason}"
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "system" && m.content[0]["meta"]["kind"] == json!("blocker-report")),
+        "blocker notice appended to the transcript: {messages:?}"
+    );
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:failed") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let attention_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:attention-requested")
+        .expect("agent:attention-requested emitted for the client-request fall-through");
+    let failed_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:failed")
+        .expect("agent:failed emitted");
+    assert!(
+        attention_idx < failed_idx,
+        "attention surfaces before the terminal failure: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+    assert_eq!(events[attention_idx].data["kind"], json!("blocker"));
 }
 
 /// Injectable [`SuspendOverlapQuery`](crate::SuspendOverlapQuery) for the

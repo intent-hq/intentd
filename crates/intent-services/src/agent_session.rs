@@ -2888,8 +2888,17 @@ impl Services {
         // number of `session/prompt` dispatches actually made (the failing
         // attempt's ordinal), captured at each fall-through site because
         // `fetch_retry_attempt` is bumped BEFORE the backoff and so overcounts
-        // on the abandon-during-backoff path.
-        let mut post_output_transient_fetch_failure: Option<u32> = None;
+        // on the abandon-during-backoff path — plus which guard tripped
+        // (streamed output vs. a side-effecting client request), so the
+        // user-visible reason names the actual cause.
+        let mut post_output_transient_fetch_failure: Option<(u32, &'static str)> = None;
+        let retry_guard_cause = |any_update_received: bool| -> &'static str {
+            if any_update_received {
+                "streamed output"
+            } else {
+                "a side-effecting client request"
+            }
+        };
         // Mid-turn stall detection (intent-hq/monorepo#3402): a timer arm in
         // the select loop below samples `activity.idle_ms()` on a fraction of
         // the stall threshold (clamped to 15s at the 5-minute default) and
@@ -3008,7 +3017,8 @@ impl Services {
                         // `fetch_retry_attempt` was already bumped for the
                         // retry that is now abandoned: the failing attempt is
                         // the one dispatched BEFORE that bump.
-                        post_output_transient_fetch_failure = Some(fetch_retry_attempt);
+                        post_output_transient_fetch_failure =
+                            Some((fetch_retry_attempt, retry_guard_cause(any_update_received)));
                         break attempt_result;
                     }
                 }
@@ -3017,7 +3027,10 @@ impl Services {
                         || conn.client_request_seq() != client_request_watermark)
                         && intent_acp::is_transient_provider_fetch_failure(e) =>
                 {
-                    post_output_transient_fetch_failure = Some(fetch_retry_attempt + 1);
+                    post_output_transient_fetch_failure = Some((
+                        fetch_retry_attempt + 1,
+                        retry_guard_cause(any_update_received),
+                    ));
                     break attempt_result;
                 }
                 _ => break attempt_result,
@@ -3481,19 +3494,21 @@ impl Services {
         // other; `park_attention_write` guards only the workspace-level
         // `raise_attention` flag, which this path never touches. Best-effort:
         // a failed raise logs and the terminal path proceeds unchanged.
-        if let Some(attempts) = post_output_transient_fetch_failure {
+        if let Some((attempts, cause)) = post_output_transient_fetch_failure {
             if let Err(e) = &result {
                 tracing::warn!(
                     agent = %agent_id,
                     error = %e,
                     attempts,
-                    "transient provider fetch failure after streamed output — not retrying in place; attention raised (monorepo#5419)"
+                    cause,
+                    "transient provider fetch failure after output/side effect — not retrying in place; attention raised (monorepo#5419)"
                 );
                 let reason = format!(
-                    "Turn failed with a transient provider fetch failure after streamed output \
+                    "Turn failed with a transient provider fetch failure after {cause} \
                      (attempt {attempts} of {}; error class: transient provider fetch failure). \
-                     The in-place retry only applies to output-free attempts, so the turn was not \
-                     retried and the agent is stopping with status error. Provider error: {e}",
+                     The in-place retry only applies to attempts with no streamed output and no \
+                     side-effecting client request, so the turn was not retried and the agent is \
+                     stopping with status error. Provider error: {e}",
                     MAX_TRANSIENT_PROMPT_FETCH_RETRIES + 1
                 );
                 if let Err(raise_err) = self
