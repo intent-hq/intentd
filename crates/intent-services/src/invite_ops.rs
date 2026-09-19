@@ -671,6 +671,12 @@ impl Services {
             .await?
             .ok_or(Error::Invite(InviteErrorKind::CredentialInvalid))?;
         let principal = self.store.get_principal(&principal_id).await?;
+        // The host owner's own account cannot join as a guest: a credential
+        // that resolves to the primary row (minted before this guard
+        // existed) identifies the owner, not a guest.
+        if principal.is_primary {
+            return Err(Error::Invite(InviteErrorKind::OwnerSelfJoin));
+        }
         // Only a GitHub-verified guest can join by invite (the join is keyed
         // by `github_user_id`); a credential bound to any other principal
         // does not identify one.
@@ -821,13 +827,19 @@ impl Services {
     }
 
     /// The first-time join, once the invitee's GitHub identity is proven:
-    /// re-check the invite (pin, still open), map the resolved account onto
-    /// a fresh principal row and commit through [`Self::commit_invite_join`].
+    /// refuse the host owner's own account
+    /// ([`InviteErrorKind::OwnerSelfJoin`] — the earliest point the identity
+    /// is known, so the owner never receives a guest credential), re-check
+    /// the invite (pin, still open), map the resolved account onto a fresh
+    /// principal row and commit through [`Self::commit_invite_join`].
     async fn complete_invite_join(&self, invite_id: &str, user: &UserIdentity) -> Result<Value> {
         let github_user_id = user
             .id
             .and_then(|id| i64::try_from(id).ok())
             .ok_or_else(|| Error::Internal("github identity carries no account id".to_string()))?;
+        if self.store.get_primary_principal().await?.github_user_id == Some(github_user_id) {
+            return Err(Error::Invite(InviteErrorKind::OwnerSelfJoin));
+        }
         let invite = self
             .store
             .get_workspace_invite(invite_id)
@@ -865,7 +877,10 @@ impl Services {
     /// `rotate_from_hash` (the credential an `invite.accept` presented) when
     /// given — a hash that is not exactly one active credential of the
     /// joining principal at that moment refuses the whole join as
-    /// [`InviteErrorKind::CredentialInvalid`] with nothing written. The
+    /// [`InviteErrorKind::CredentialInvalid`] with nothing written, and an
+    /// account that resolves to the primary principal as
+    /// [`InviteErrorKind::OwnerSelfJoin`] (the transaction-level guard
+    /// behind the early checks above). The
     /// event is published only after the commit; the credential is returned
     /// exactly once, in the `authorized` result.
     async fn commit_invite_join(
@@ -903,6 +918,9 @@ impl Services {
             }
             InviteJoinOutcome::CredentialInvalid => {
                 return Err(Error::Invite(InviteErrorKind::CredentialInvalid));
+            }
+            InviteJoinOutcome::OwnerSelfJoin => {
+                return Err(Error::Invite(InviteErrorKind::OwnerSelfJoin));
             }
         };
         let member_count = self.member_count(&invite.workspace_id).await?;

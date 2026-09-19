@@ -1200,6 +1200,30 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     )
     .await;
     assert_eq!(v["error"]["data"]["code"], json!("proof-invalid"), "{v}");
+    // The host owner's own account (the primary principal, `GITHUB_TOKEN`
+    // resolves to "owner") proving a valid gist is `owner-self-join`: the
+    // owner cannot join its own host as a guest, no credential is minted,
+    // and the invite stays open (the guest joins it below).
+    let r = challenge(&mut prover, 89, &third_invite, &third_secret).await;
+    let nonce_owner = r["nonce"].as_str().expect("nonce").to_string();
+    let owner_after = chrono::Utc::now().to_rfc3339();
+    mock.script_gist("ownerproof", "owner", &owner_after, Some(&nonce_owner));
+    let v = prove(
+        &mut prover,
+        90,
+        &third_invite,
+        &third_secret,
+        &nonce_owner,
+        "ownerproof",
+        "owner",
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602), "{v}");
+    assert_eq!(v["error"]["data"]["code"], json!("owner-self-join"), "{v}");
+    assert!(
+        v.get("result").is_none(),
+        "an error envelope carries no `result` member (not even null): {v}"
+    );
     let r = challenge(&mut prover, 88, &third_invite, &third_secret).await;
     let nonce_2 = r["nonce"].as_str().expect("nonce").to_string();
     let after = chrono::Utc::now().to_rfc3339();
@@ -1240,6 +1264,7 @@ async fn invite_link_identity_join_and_removal_over_wss() {
                 "guestproof2",
                 "intruderjoin",
                 "intruderproof",
+                "ownerproof",
                 "stale",
             ],
             "every named gist was read, the too-late ones never were: {reads:?}"
