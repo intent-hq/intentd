@@ -12,7 +12,7 @@ use std::sync::Arc;
 use intent_core::{AgentId, AgentStatus, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
-use crate::mcp_server::bindings::{map_err, opt_bool, opt_i64, opt_str};
+use crate::mcp_server::bindings::{map_err, opt_bool, opt_i64, opt_str, strip_agent_hidden_fields};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -40,7 +40,23 @@ const MAX_READ_LIMIT: i64 = 100;
 /// message limit. 100 messages at worst-case one message per 512 KiB page.
 const READ_PAGE_WALK_CAP: usize = 100;
 
+/// Every `ws.app.agents.*` result passes through
+/// [`strip_agent_hidden_fields`] (see `bindings/mod.rs`), like `ws.agent.*` /
+/// `ws.event.*`: `readConversation` copies message rows verbatim, so a hidden
+/// key in `messageMetadata` would otherwise reach the chief agent.
 pub(crate) async fn dispatch(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    caller: Option<&AgentId>,
+    method: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let mut out = dispatch_inner(api, workspace_id, caller, method, args).await?;
+    strip_agent_hidden_fields(&mut out);
+    Ok(out)
+}
+
+async fn dispatch_inner(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
     caller: Option<&AgentId>,
