@@ -1297,6 +1297,20 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn github_users_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "users": [],
+                "echoQuery": query,
+                "echoLimit": limit,
+            }))
+        })
+    }
+
     fn git_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -4593,6 +4607,31 @@ async fn github_repos_search_routes_query() {
     .await
     .unwrap();
     assert_eq!(v["result"]["echoQuery"], serde_json::json!("react"));
+}
+
+#[tokio::test]
+async fn github_users_search_requires_query() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.users.search","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn github_users_search_routes_query_and_optional_limit() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.users.search","params":{"query":"octo","limit":3}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoQuery"], serde_json::json!("octo"));
+    assert_eq!(v["result"]["echoLimit"], serde_json::json!(3));
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"github.users.search","params":{"query":"octo"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoLimit"], Value::Null);
 }
 
 #[tokio::test]
