@@ -697,10 +697,11 @@ async fn wss_workspace_auto_commit_round_trip() {
 }
 
 /// `workspace.create` `contextLinks` over WSS (§5.1): a valid list persists
-/// and returns on the created workspace and on `workspace.get` /
-/// `workspace.list` rows in the documented camelCase + lowercase-kind wire
-/// shape; a workspace created without the param omits the field; a malformed
-/// list rejects `-32602` before any state change.
+/// and returns on the created workspace and on `workspace.get` in the
+/// documented camelCase + lowercase-kind wire shape, while `workspace.list`
+/// rows omit it (detail-only list-row slimming, `Workspace::slim_for_list`);
+/// a workspace created without the param omits the field; a malformed list
+/// rejects `-32602` before any state change.
 #[tokio::test]
 async fn wss_workspace_create_context_links_round_trip_and_validation() {
     let srv = start(WsOptions::default()).await;
@@ -748,7 +749,8 @@ async fn wss_workspace_create_context_links_round_trip_and_validation() {
     .await;
     assert_eq!(got["result"]["workspace"]["contextLinks"], links);
 
-    // `workspace.list` rows carry it too.
+    // `workspace.list` rows omit it (absent, never null): the links are an
+    // open-time detail read served by `workspace.get`.
     let listed = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -761,7 +763,10 @@ async fn wss_workspace_create_context_links_round_trip_and_validation() {
         .iter()
         .find(|w| w["id"] == ws_id.as_str())
         .expect("created row listed");
-    assert_eq!(row["contextLinks"], links);
+    assert!(
+        row.get("contextLinks").is_none(),
+        "list rows omit contextLinks: {row}"
+    );
 
     // A create without the param omits the field (absent, never null/[]).
     let plain = wss_call(

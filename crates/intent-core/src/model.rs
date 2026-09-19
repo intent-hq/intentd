@@ -95,6 +95,23 @@ pub struct PullRequestInfo {
     pub is_draft: Option<bool>,
 }
 
+impl PullRequestInfo {
+    /// Strip the detail-only PR fields from a `workspace.list` row entry
+    /// (`activePullRequest` / `pullRequests[]`); see
+    /// [`Workspace::slim_for_list`]. The list-context readers (sidebar PR
+    /// dropdown, card status, delete warning) need `number` / `url` /
+    /// `title` / `status` / `isDraft` plus the timestamps used for ordering;
+    /// `headSha`, `author`, `mergeable` and `mergeableState` feed hover
+    /// tooltips and the daemon-side `displayStatus` derivation (which runs
+    /// before the slimming pass), so they stay `workspace.get`-only.
+    pub fn slim_for_list(&mut self) {
+        self.head_sha = None;
+        self.author = None;
+        self.mergeable = None;
+        self.mergeable_state = None;
+    }
+}
+
 /// Kind of a workspace context link (§5.1). Wire values are lowercase
 /// (`"issue"` / `"pr"`); the set is deliberately extensible for future
 /// link kinds.
@@ -228,7 +245,8 @@ pub struct Workspace {
     pub skip_worktree: bool,
     /// Durable worktree setup script (§5.25): the persisted `SetupScript` record
     /// read/written via `workspace.getSetupScript`/`saveSetupScript`. Omitted (not
-    /// `null`) until a script has been saved.
+    /// `null`) until a script has been saved, and always omitted on list rows
+    /// ([`Workspace::slim_for_list`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_script: Option<SetupScript>,
     pub is_remote: bool,
@@ -250,8 +268,9 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_requests: Option<Vec<PullRequestInfo>>,
     /// Issue/PR context links supplied at `workspace.create` (§5.1), persisted
-    /// on the row and returned on every `Workspace` payload. Omitted (not
-    /// `null`) when the workspace was created without links.
+    /// on the row and returned on every detail `Workspace` payload (omitted on
+    /// list rows, [`Workspace::slim_for_list`]). Omitted (not `null`) when the
+    /// workspace was created without links.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_links: Option<Vec<ContextLink>>,
     pub archived: bool,
@@ -336,7 +355,165 @@ pub struct Workspace {
     pub pending_delete_at: Option<String>,
 }
 
+/// Whole-row byte budget for one serialized `workspace.list` row (and the
+/// identical lite `workspace.subscribe` seq-0 row): a worst-case-realistic
+/// ACTIVE row after [`Workspace::slim_for_list`] — several PRs, a
+/// `diffSummary`, an `agentSummary` of ten agents, every small optional
+/// scalar present — must serialize at or under this many bytes, enforced by
+/// the row-budget golden test in intent-services (`tests.rs`), which prints
+/// a per-field byte table on failure.
+///
+/// Arithmetic. The transport warns on outbound frames over 1 MiB
+/// (1,048,576 B); ~500 workspaces under that line means ≈ 2,097 B/row
+/// averaged over the fleet, and the fleet is mostly archived rows (the
+/// dogfooding set that motivated the slimming, monorepo#3041, was ~85%
+/// archived). The golden's worst-case active row measures ≈ 6.8 KB:
+/// `agentSummary` ≈ 3.5 KB (≈ 300 B per agent — id, name, status,
+/// specialist, lastActivity, parentAgentId, the two liveness flags — plus
+/// ≈ 46 B per `agentIds` entry, ×10), the five-entry PR pool ≈ 1.8 KB
+/// (≈ 350 B per slimmed entry), and ≈ 1.5 KB of fixed fields (ids, paths,
+/// timestamps, a long title / status message, `taskStats`,
+/// `diffSummary` totals). `agentSummary` is the only field that scales
+/// with accumulated state, which is why archived rows drop it: the same
+/// worst case archived is ≈ 3.3 KB, and a typical row (one to three
+/// agents, one PR, short paths) is ≈ 1.5–2 KB — under the fleet average
+/// the 1 MiB goal needs, as the 130-row realistic-fleet test alongside
+/// the golden shows. The budget below is the measured worst case plus a
+/// small margin; the key allowlist ([`WORKSPACE_LIST_ROW_KEYS`] /
+/// [`WORKSPACE_LIST_PR_KEYS`]) keeps the fixed part from regrowing
+/// field-by-field. Shrinking further means slimming `agentSummary` (e.g.
+/// dropping the redundant `agentIds` mirror once the TS consumer reads
+/// `agents[].id`) — a separate protocol decision.
+pub const WORKSPACE_LIST_ROW_BUDGET_BYTES: usize = 7_168;
+
+/// Key allowlist golden for a serialized `workspace.list` row: the
+/// top-level keys a list row may carry after [`Workspace::slim_for_list`].
+/// The row-budget golden test compares every key of a worst-case row
+/// against this list — an unlisted key fails with guidance to either add
+/// it here (list-relevant AND small) or serve it on `workspace.get` only.
+/// Detail-only fields (`setupScript`, `contextLinks`, `tokenUsage`,
+/// `diskUsage`) are deliberately absent. Adding a key here is a
+/// wire-contract change — update `docs/protocol/methods/workspace.md` in
+/// the same commit and state which rung of the derived-field ladder the
+/// field sits on.
+pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
+    "id",
+    "title",
+    "branch",
+    "baseRef",
+    "baseCommitSha",
+    "status",
+    "statusMessage",
+    "statusImageAssetId",
+    "activity",
+    "attention",
+    "createdAt",
+    "updatedAt",
+    "lastActivity",
+    "tags",
+    "path",
+    "repositoryPath",
+    "repositoryOwner",
+    "repositoryName",
+    "worktreePath",
+    "scope",
+    "skipWorktree",
+    "isRemote",
+    "defaultModel",
+    "prNumber",
+    "prUrl",
+    "prStatus",
+    "activePullRequest",
+    "pullRequests",
+    "archived",
+    "archivedAt",
+    "taskStats",
+    "agentSummary",
+    "diffSummary",
+    "displayStatus",
+    "waiting",
+    "cowSupported",
+    "checkoutMode",
+    "browserClientId",
+    "pendingDeleteAt",
+];
+
+/// Key allowlist golden for an `activePullRequest` / `pullRequests[]` entry
+/// of a `workspace.list` row; companion of [`WORKSPACE_LIST_ROW_KEYS`] with
+/// the same rules. `headSha`, `author`, `mergeable` and `mergeableState`
+/// are detail-only (see [`PullRequestInfo::slim_for_list`]) and
+/// deliberately absent.
+pub const WORKSPACE_LIST_PR_KEYS: &[&str] = &[
+    "id",
+    "number",
+    "url",
+    "title",
+    "status",
+    "createdAt",
+    "updatedAt",
+    "baseRef",
+    "headRef",
+    "isDraft",
+];
+
 impl Workspace {
+    /// List-frame slimming for `workspace.list` and the lite
+    /// `workspace.subscribe` seq-0 snapshot (monorepo#3041, extended): drop
+    /// the detail-only fields so a list row costs O(card) bytes regardless
+    /// of how much a workspace has accumulated. `workspace.get` never calls
+    /// this and keeps serving every field. Following the v4.2 `diskUsage`
+    /// precedent, every stripped field is optional on the wire and simply
+    /// absent on list rows (never `null`) — no wire-shape change.
+    ///
+    /// - `tokenUsage`: clients read it via `workspace.getTokenUsage` + the
+    ///   tokenUsage-changed event, never off list rows; dominated large
+    ///   frames (~26% of a real 180-workspace payload).
+    /// - `agentSummary` on ARCHIVED rows: archived workspaces render no
+    ///   HUD/coverflow agent cards, yet their accumulated sessions made
+    ///   archived rows the bulk of the aggregate (~65% of `agentSummary`
+    ///   bytes measured). Active rows keep the full summary.
+    /// - `setupScript`: an unbounded script body read only by the open
+    ///   workspace's chat/setup surfaces; `workspace.getSetupScript` is the
+    ///   dedicated read.
+    /// - `contextLinks`: consumed once, when a client opens the workspace
+    ///   and seeds its layout from the linked pages — `workspace.get`
+    ///   serves it there.
+    /// - `diskUsage` and `diffSummary.files`: never populated on the list
+    ///   path today (`workspace.diskUsage` / the diff RPCs serve them);
+    ///   cleared here so the guarantee holds by construction.
+    /// - `activePullRequest` / `pullRequests[]` entries: per-PR detail
+    ///   fields via [`PullRequestInfo::slim_for_list`].
+    ///
+    /// Fixed-size scalars stay even when only detail surfaces read them
+    /// (`baseCommitSha`, `path` / `repositoryPath` / `worktreePath`): a
+    /// 40-hex SHA buys nothing per row, and the FE store hydrates open
+    /// workspaces from list rows.
+    ///
+    /// Applied as the FINAL pass over the merged list — after enrichment
+    /// and after the emit-path PR merge — so a row degraded by an
+    /// enrichment failure, and externally merged PR entries, are slimmed
+    /// the same way.
+    pub fn slim_for_list(&mut self) {
+        self.token_usage = None;
+        if self.archived {
+            self.agent_summary = None;
+        }
+        self.setup_script = None;
+        self.context_links = None;
+        self.disk_usage = None;
+        if let Some(diff) = self.diff_summary.as_mut() {
+            diff.files.clear();
+        }
+        if let Some(pr) = self.active_pull_request.as_mut() {
+            pr.slim_for_list();
+        }
+        if let Some(prs) = self.pull_requests.as_mut() {
+            for pr in prs {
+                pr.slim_for_list();
+            }
+        }
+    }
+
     /// The workspace's on-disk root: `path`, else `worktreePath`, else
     /// `repositoryPath` — direct-checkout workspaces (`skipIsolation`) may
     /// persist only `repositoryPath` (monorepo#3778). Empty strings are

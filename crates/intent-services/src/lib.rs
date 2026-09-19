@@ -17578,27 +17578,6 @@ impl WorkspaceApi for Services {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, true)
                     .await;
             }
-            // List-frame slimming (monorepo#3041), following the v4.2
-            // `diskUsage` precedent — optional fields simply never present on
-            // list rows, no wire-shape change. Applied after the join-merge so
-            // the guarantee also covers base rows served on the panic
-            // degradation path above (a base row still carries its persisted
-            // `tokenUsage`):
-            // - `tokenUsage` is detail-only (clients read it via
-            //   `workspace.getTokenUsage` + the tokenUsage-changed event,
-            //   never off list rows) and dominated large frames (~26% of a
-            //   real 180-workspace payload).
-            // - `agentSummary` on ARCHIVED rows: archived workspaces render
-            //   no HUD/coverflow agent cards, yet their accumulated sessions
-            //   made archived rows the bulk of the aggregate (~65% of
-            //   agentSummary bytes measured). Active rows keep the full
-            //   summary; `workspace.get` keeps both fields for detail reads.
-            for ws in &mut list {
-                ws.token_usage = None;
-                if ws.archived {
-                    ws.agent_summary = None;
-                }
-            }
             tracing::debug!(
                 workspaces = count,
                 total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -17615,6 +17594,14 @@ impl WorkspaceApi for Services {
             // derivation and the wire merge.
             this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
+            // List-frame slimming (monorepo#3041): the final pass, after
+            // enrichment and the PR merge, so base rows served on the panic
+            // degradation path above (still carrying persisted `tokenUsage` /
+            // `setupScript`) and externally merged PR entries are slimmed
+            // alike. `workspace.get` keeps every field for detail reads.
+            for ws in &mut list {
+                ws.slim_for_list();
+            }
             Ok(list)
         })
     }
@@ -17643,9 +17630,6 @@ impl WorkspaceApi for Services {
             for ws in &mut list {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, false)
                     .await;
-                // Detail-only on the wire (monorepo#3041): list rows never
-                // carry `tokenUsage` — same rationale as the full list path.
-                ws.token_usage = None;
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
@@ -17654,6 +17638,10 @@ impl WorkspaceApi for Services {
             // now moves out of the snapshot into the merge).
             this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
+            // Same final slimming pass as the full list path (monorepo#3041).
+            for ws in &mut list {
+                ws.slim_for_list();
+            }
             Ok(list)
         })
     }

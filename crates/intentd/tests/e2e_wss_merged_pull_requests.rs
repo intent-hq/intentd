@@ -504,7 +504,13 @@ fn assert_merged_rows(rows: &[Value], ws_merge: &WorkspaceId, ws_plain: &Workspa
     // Snapshot-backed monitor entry: fields synthesized off the snapshot.
     assert_eq!(prs[1]["title"], json!("Monitored PR"), "{path}");
     assert_eq!(prs[1]["number"], json!(2), "{path}");
-    assert_eq!(prs[1]["headSha"], json!("abc123"), "{path}");
+    // The snapshot's headSha fed the merge, but list rows strip the per-PR
+    // detail fields as a final pass (`Workspace::slim_for_list`).
+    assert!(
+        prs[1].get("headSha").is_none(),
+        "{path}: headSha slimmed off list rows: {}",
+        prs[1]
+    );
     assert_eq!(prs[1]["isDraft"], json!(false), "{path}");
     // Snapshotless completed monitor: synthesized identity; terminal
     // without a verdict reads closed, never merged.

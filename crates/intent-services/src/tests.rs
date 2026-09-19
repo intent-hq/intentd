@@ -433,20 +433,60 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(v.get("diskUsage").is_none());
 }
 
-/// List-frame slimming (monorepo#3041): `workspace.list` rows never carry
-/// `tokenUsage` (detail-only — clients read it via `workspace.getTokenUsage`
-/// and the tokenUsage-changed event), and ARCHIVED rows additionally omit
-/// `agentSummary` (no HUD/coverflow agent card renders for an archived
-/// workspace). Active rows keep the full `agentSummary`, and `workspace.get`
-/// keeps serving both fields for detail reads.
+/// List-frame slimming (monorepo#3041, `Workspace::slim_for_list`):
+/// `workspace.list` rows never carry `tokenUsage` (detail-only — clients read
+/// it via `workspace.getTokenUsage` and the tokenUsage-changed event),
+/// `setupScript` (`workspace.getSetupScript`), `contextLinks` (read once on
+/// open via `workspace.get`), nor the per-PR `headSha` / `author` /
+/// `mergeable` / `mergeableState` on `activePullRequest` / `pullRequests[]`;
+/// ARCHIVED rows additionally omit `agentSummary` (no HUD/coverflow agent
+/// card renders for an archived workspace). Active rows keep the full
+/// `agentSummary`, and `workspace.get` keeps serving every field.
 #[tokio::test]
 async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     use std::collections::BTreeMap;
 
-    use intent_core::{AgentId, AgentSession, AgentStatus, TokenUsage, TokenUsageTotals};
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, ContextLink, ContextLinkKind, PullRequestInfo,
+        PullRequestStatus, SetupScript, TokenUsage, TokenUsageTotals,
+    };
 
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
+
+    let detail_pr = PullRequestInfo {
+        id: "pr-1".to_string(),
+        number: 1,
+        url: "https://github.com/intent-hq/intentd/pull/1".to_string(),
+        title: "feat: slim list rows".to_string(),
+        status: PullRequestStatus::Open,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        base_ref: Some("main".to_string()),
+        head_ref: Some("feat/slim".to_string()),
+        head_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()),
+        author: Some("dev".to_string()),
+        mergeable: Some(true),
+        mergeable_state: Some("clean".to_string()),
+        is_draft: Some(false),
+    };
+    let with_detail_fields = |ws: &mut Workspace| {
+        ws.setup_script = Some(SetupScript {
+            script: "#!/bin/bash\nnpm ci\n".to_string(),
+            project_type: None,
+            updated_at: 1,
+            generated_by: None,
+        });
+        ws.context_links = Some(vec![ContextLink {
+            kind: ContextLinkKind::Issue,
+            url: "https://github.com/intent-hq/intent/issues/3041".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intent".to_string(),
+            number: 3041,
+        }]);
+        ws.active_pull_request = Some(detail_pr.clone());
+        ws.pull_requests = Some(vec![detail_pr.clone()]);
+    };
 
     let usage = TokenUsage {
         by_agent_id: BTreeMap::from([(
@@ -475,6 +515,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     let ws_active = WorkspaceId::new();
     let mut active = workspace(&ws_active);
     active.token_usage = Some(usage.clone());
+    with_detail_fields(&mut active);
     store.insert_workspace(&active).await.expect("active ws");
 
     let ws_archived = WorkspaceId::new();
@@ -482,6 +523,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     archived.archived = true;
     archived.archived_at = Some(now_iso());
     archived.token_usage = Some(usage);
+    with_detail_fields(&mut archived);
     store
         .insert_workspace(&archived)
         .await
@@ -573,20 +615,371 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert!(v.get("tokenUsage").is_none());
     assert!(v.get("agentSummary").is_none());
 
-    // Lite list (workspace.subscribe seq-0): tokenUsage stripped the same way.
+    // The other detail-only fields are stripped on every list row, active
+    // and archived alike; the PR entries keep their list-context keys.
+    let assert_detail_stripped = |row: &Workspace, path: &str| {
+        assert!(row.setup_script.is_none(), "{path}: setupScript omitted");
+        assert!(row.context_links.is_none(), "{path}: contextLinks omitted");
+        let active_pr = row
+            .active_pull_request
+            .as_ref()
+            .expect("activePullRequest kept");
+        let pool_pr = &row.pull_requests.as_ref().expect("pullRequests kept")[0];
+        for pr in [active_pr, pool_pr] {
+            assert_eq!(pr.number, 1);
+            assert_eq!(pr.status, PullRequestStatus::Open);
+            assert_eq!(pr.is_draft, Some(false));
+            assert_eq!(pr.head_ref.as_deref(), Some("feat/slim"));
+            assert!(pr.head_sha.is_none(), "{path}: PR headSha omitted");
+            assert!(pr.author.is_none(), "{path}: PR author omitted");
+            assert!(pr.mergeable.is_none(), "{path}: PR mergeable omitted");
+            assert!(
+                pr.mergeable_state.is_none(),
+                "{path}: PR mergeableState omitted"
+            );
+        }
+    };
+    assert_detail_stripped(row_active, "list/active");
+    assert_detail_stripped(row_archived, "list/archived");
+    assert!(v.get("setupScript").is_none());
+    assert!(v.get("contextLinks").is_none());
+    assert!(v["activePullRequest"].get("mergeableState").is_none());
+
+    // Lite list (workspace.subscribe seq-0): slimmed the same way.
     let lite = svc.list_workspaces_lite(true).await.expect("lite list");
     assert!(lite.iter().all(|w| w.token_usage.is_none()));
+    for row in &lite {
+        assert_detail_stripped(row, "lite");
+    }
 
-    // workspace.get keeps both fields for detail reads — archived included.
+    // workspace.get keeps every field for detail reads — archived included.
     let got_active = svc.get_workspace(ws_active).await.expect("get active");
     assert!(got_active.token_usage.is_some(), "get keeps tokenUsage");
     assert!(got_active.agent_summary.is_some());
+    assert!(got_active.setup_script.is_some(), "get keeps setupScript");
+    assert!(got_active.context_links.is_some(), "get keeps contextLinks");
+    assert_eq!(
+        got_active
+            .active_pull_request
+            .as_ref()
+            .and_then(|pr| pr.mergeable_state.as_deref()),
+        Some("clean"),
+        "get keeps the per-PR detail fields"
+    );
+    assert_eq!(
+        got_active.pull_requests.as_ref().unwrap()[0].head_sha,
+        detail_pr.head_sha
+    );
     let got_archived = svc.get_workspace(ws_archived).await.expect("get archived");
     assert!(got_archived.token_usage.is_some());
     assert!(
         got_archived.agent_summary.is_some(),
         "get keeps agentSummary on archived workspaces"
     );
+}
+
+/// Build the worst-case-realistic ACTIVE `workspace.list` row the row-budget
+/// golden measures: every small optional scalar present, a long title /
+/// status message, four PRs in the pool plus a linked `activePullRequest`
+/// (all detail fields populated so the slimming has something to strip), a
+/// saved setup script, context links, a fat `tokenUsage`, and ten live agent
+/// sessions (coordinator + nine sub-agents) so the enrichment builds a
+/// ten-agent `agentSummary`. Returns the row as served by `list_workspaces`.
+async fn worst_case_workspace_list_row() -> Workspace {
+    use std::collections::BTreeMap;
+
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, CheckoutMode, ClientId, ContextLink, ContextLinkKind,
+        PullRequestInfo, PullRequestStatus, SetupScript, TokenUsage, TokenUsageTotals,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let totals = |n: u64| TokenUsageTotals {
+        input_tokens: 1_000_000 + n,
+        output_tokens: 500_000 + n,
+        cache_read_tokens: 2_000_000 + n,
+        cache_creation_tokens: 300_000 + n,
+        thought_tokens: 0,
+        cost: None,
+    };
+    let pr = |n: u64, status: PullRequestStatus| PullRequestInfo {
+        id: format!("PR_kwDOLxyz{n:08}"),
+        number: 1_000 + n,
+        url: format!("https://github.com/intent-hq/intentd/pull/{}", 1_000 + n),
+        title: format!("feat(workspace): slim list rows and add the row-budget golden ({n})"),
+        status,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        base_ref: Some("main".to_string()),
+        head_ref: Some(format!("feat/slim-list-rows-{n}")),
+        head_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()),
+        author: Some("octocat-developer".to_string()),
+        mergeable: Some(true),
+        mergeable_state: Some("blocked".to_string()),
+        is_draft: Some(false),
+    };
+
+    let ws = WorkspaceId::new();
+    let mut row = workspace(&ws);
+    row.title = "Fix the workspace panel focus regression after the modal closes".to_string();
+    row.branch = "feat/fix-workspace-panel-focus-regression-after-modal-close".to_string();
+    row.base_ref = Some("origin/main".to_string());
+    row.base_commit_sha = Some("f759124bdeadbeefdeadbeefdeadbeefdeadbeef".to_string());
+    row.status_message = Some(
+        "PR #1234 for the panel focus fix is open and waiting for review after \
+         addressing every reviewer thread."
+            .to_string(),
+    );
+    row.status_image_asset_id = Some(format!("asset-{}", uuid::Uuid::new_v4()));
+    row.last_activity = Some(now_iso());
+    row.tags = vec!["frontend".to_string(), "regression".to_string()];
+    row.path = Some(format!(
+        "/home/user/intent/workspaces/{}/monorepo",
+        ws.as_str()
+    ));
+    row.repository_path = Some("/home/user/src/intent/monorepo".to_string());
+    row.repository_owner = Some("intent-hq".to_string());
+    row.repository_name = Some("intent".to_string());
+    row.worktree_path = row.path.clone();
+    row.scope = Some("intent-hq/intent".to_string());
+    row.default_model = Some("anthropic:claude-opus-4-1-20250805".to_string());
+    row.pr_number = Some(1_000);
+    row.pr_url = Some("https://github.com/intent-hq/intentd/pull/1000".to_string());
+    row.pr_status = Some(PullRequestStatus::Open);
+    row.active_pull_request = Some(pr(0, PullRequestStatus::Open));
+    row.pull_requests = Some(vec![
+        pr(0, PullRequestStatus::Open),
+        pr(1, PullRequestStatus::Merged),
+        pr(2, PullRequestStatus::Closed),
+        pr(3, PullRequestStatus::Draft),
+    ]);
+    row.setup_script = Some(SetupScript {
+        script: "#!/usr/bin/env bash\nset -euo pipefail\n".repeat(40),
+        project_type: None,
+        updated_at: 1_700_000_000_000,
+        generated_by: None,
+    });
+    row.context_links = Some(
+        (0..3)
+            .map(|n| ContextLink {
+                kind: ContextLinkKind::Issue,
+                url: format!("https://github.com/intent-hq/intent/issues/{}", 3_000 + n),
+                owner: "intent-hq".to_string(),
+                repo: "intent".to_string(),
+                number: 3_000 + n,
+            })
+            .collect(),
+    );
+    row.token_usage = Some(TokenUsage {
+        by_agent_id: (0..10)
+            .map(|n| (format!("agent-{}", uuid::Uuid::new_v4()), totals(n)))
+            .collect(),
+        totals: totals(9),
+        by_model: BTreeMap::from([("claude-opus-4-1".to_string(), totals(1))]),
+        last_scan_at: Some(now_iso()),
+    });
+    row.cow_supported = Some(true);
+    row.browser_client_id = Some(ClientId::from(
+        format!("client-{}", uuid::Uuid::new_v4()).as_str(),
+    ));
+    row.checkout_mode = Some(CheckoutMode::Worktree);
+    store.insert_workspace(&row).await.expect("ws");
+
+    let coordinator = AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str());
+    for n in 0..10u64 {
+        let id = if n == 0 {
+            coordinator.clone()
+        } else {
+            AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str())
+        };
+        store
+            .insert_agent_session(&AgentSession {
+                harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+                harness_features: None,
+                id,
+                workspace_id: ws.clone(),
+                parent_agent_id: (n > 0).then(|| coordinator.clone()),
+                backend_session_id: None,
+                acp_session_id: None,
+                name: format!("Implement the sidebar dropdown ({n})"),
+                name_explicitly_set: true,
+                model: None,
+                reasoning_effort: None,
+                effort_levels: None,
+                provider: None,
+                system_prompt: None,
+                specialist: Some("implementor".to_string()),
+                status: AgentStatus::Idle,
+                is_active: false,
+                messages: vec![],
+                stats: None,
+                task_note_id: None,
+                skip_auto_commit: false,
+                completion_report: None,
+                completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                file_blocks: None,
+                is_background: n > 0,
+                metadata: None,
+                created_at: now_iso(),
+                updated_at: now_iso(),
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+                stop_reason: None,
+                stop_reason_timestamp: None,
+                session_corrupted: false,
+                pending_delete_at: None,
+                retired_at: None,
+                notifications_muted: false,
+            })
+            .await
+            .expect("session");
+    }
+
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let list = svc.list_workspaces(true).await.expect("list");
+    let mut served = list
+        .into_iter()
+        .find(|w| w.id == ws)
+        .expect("worst-case row listed");
+    // The list path never populates `diffSummary` today, but it is part of
+    // the wire shape; charge its totals so the budget covers it if a future
+    // rung-1/2 rollup lands (`files` stays empty on list rows by contract).
+    served.diff_summary = Some(intent_core::WorkspaceDiffSummary {
+        schema_version: 1,
+        updated_at: now_iso(),
+        total_files: 12,
+        total_additions: 1_234,
+        total_deletions: 567,
+        files: vec![],
+    });
+    served
+}
+
+/// Row-budget golden: the worst-case-realistic ACTIVE `workspace.list` row
+/// serializes at or under [`intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES`] —
+/// the failure message is the per-field byte table so the offending field
+/// is named, not guessed.
+#[tokio::test]
+async fn workspace_list_row_stays_within_row_budget() {
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, WORKSPACE_LIST_ROW_BUDGET_BYTES,
+    };
+
+    let row = worst_case_workspace_list_row().await;
+    let summary = row
+        .agent_summary
+        .as_ref()
+        .expect("active row keeps agentSummary");
+    assert_eq!(summary.count, 10, "worst case carries ten agents");
+    assert_eq!(row.pull_requests.as_ref().unwrap().len(), 4);
+    assert!(row.active_pull_request.is_some());
+    assert!(row.task_stats.is_some(), "list rows carry taskStats");
+    assert!(
+        row.display_status.is_some(),
+        "list rows carry displayStatus"
+    );
+
+    let measured = serde_json::to_value(&row).unwrap();
+    let (total, per_key) = serialized_key_bytes(&measured);
+    let (summary_total, summary_per_key) = serialized_key_bytes(&measured["agentSummary"]);
+    let table = format!(
+        "{}\nagentSummary breakdown:\n{}",
+        format_key_bytes_table(total, &per_key),
+        format_key_bytes_table(summary_total, &summary_per_key)
+    );
+    assert!(
+        total <= WORKSPACE_LIST_ROW_BUDGET_BYTES,
+        "worst-case workspace.list row is {total} B, over WORKSPACE_LIST_ROW_BUDGET_BYTES \
+         ({WORKSPACE_LIST_ROW_BUDGET_BYTES} B). Shrink or drop the largest fields below \
+         (detail-only data belongs on workspace.get / a dedicated RPC), or justify a new \
+         budget in intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES's arithmetic.\n{table}"
+    );
+}
+
+/// Key-allowlist golden: every top-level key of the worst-case
+/// `workspace.list` row is in [`intent_core::WORKSPACE_LIST_ROW_KEYS`], every
+/// key of its `activePullRequest` / `pullRequests[]` entries is in
+/// [`intent_core::WORKSPACE_LIST_PR_KEYS`], and — since the worst case
+/// populates every allowlisted field — each allowlisted key is present, so
+/// a stale allowlist entry fails too. The only allowlisted keys an active,
+/// idle row legitimately lacks are the state-conditional ones:
+/// `archivedAt` (archived rows), `pendingDeleteAt` (a running delete grace
+/// window) and `waiting` (omitted when `false`).
+#[tokio::test]
+async fn workspace_list_row_keys_match_allowlist_golden() {
+    use std::collections::BTreeSet;
+
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, WORKSPACE_LIST_PR_KEYS,
+        WORKSPACE_LIST_ROW_KEYS,
+    };
+
+    const STATE_CONDITIONAL_KEYS: &[&str] = &["archivedAt", "pendingDeleteAt", "waiting"];
+
+    let row = worst_case_workspace_list_row().await;
+    let measured = serde_json::to_value(&row).unwrap();
+
+    let check = |object: &serde_json::Value, allowlist: &[&str], what: &str| {
+        let keys: BTreeSet<&str> = object
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let allowed: BTreeSet<&str> = allowlist.iter().copied().collect();
+        let (total, per_key) = serialized_key_bytes(object);
+        let table = format_key_bytes_table(total, &per_key);
+        let unlisted: Vec<&str> = keys.difference(&allowed).copied().collect();
+        assert!(
+            unlisted.is_empty(),
+            "{what} carries keys outside the list-row allowlist: {unlisted:?}. Either add \
+             each to intent_core::WORKSPACE_LIST_ROW_KEYS / WORKSPACE_LIST_PR_KEYS (only if \
+             list-context UI renders it AND it is small; update \
+             docs/protocol/methods/workspace.md in the same commit) or strip it in \
+             Workspace::slim_for_list so it is served on workspace.get only.\n{table}"
+        );
+        let missing: Vec<&str> = allowed
+            .difference(&keys)
+            .copied()
+            .filter(|key| !STATE_CONDITIONAL_KEYS.contains(key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{what} allowlist names keys the worst-case row does not carry: {missing:?}. \
+             Populate them in worst_case_workspace_list_row or drop them from the \
+             allowlist.\n{table}"
+        );
+    };
+
+    check(&measured, WORKSPACE_LIST_ROW_KEYS, "workspace.list row");
+    check(
+        &measured["activePullRequest"],
+        WORKSPACE_LIST_PR_KEYS,
+        "workspace.list row activePullRequest",
+    );
+    for (i, entry) in measured["pullRequests"]
+        .as_array()
+        .expect("pullRequests array")
+        .iter()
+        .enumerate()
+    {
+        check(
+            entry,
+            WORKSPACE_LIST_PR_KEYS,
+            &format!("workspace.list row pullRequests[{i}]"),
+        );
+    }
 }
 
 /// Frame-size regression guard for monorepo#3041: ~130 realistic rows —
@@ -1201,10 +1594,7 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
         row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
         svc.enrich_workspace_aggregates_with_unread(row, Some(unread.contains(row.id.as_str())))
             .await;
-        row.token_usage = None;
-        if row.archived {
-            row.agent_summary = None;
-        }
+        row.slim_for_list();
     }
 
     let actual = svc.list_workspaces(true).await.unwrap();
@@ -1469,7 +1859,13 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
             intent_core::PullRequestStatus::Open,
             "{path}"
         );
-        assert_eq!(prs[1].head_sha.as_deref(), Some("abc123"), "{path}");
+        // The merged entry carried the snapshot's headSha, but the final
+        // list-row slimming (`Workspace::slim_for_list`) strips the per-PR
+        // detail fields from externally merged entries too.
+        assert_eq!(
+            prs[1].head_sha, None,
+            "{path}: headSha slimmed off list rows"
+        );
         assert_eq!(prs[1].is_draft, Some(false), "{path}");
         // Snapshotless completed monitor: URL/title synthesized from the
         // repo identity; terminal without a verdict reads closed, not merged.
@@ -1707,6 +2103,14 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
         WorkspaceGitRootId, WorkspaceGitRootSource,
     };
 
+    type Lifecycle = (
+        PullRequestStatus,
+        String,
+        Option<bool>,
+        Option<bool>,
+        Option<String>,
+    );
+
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let root = WorkspacesRoot::new();
@@ -1759,7 +2163,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
         created_at: format!("2026-02-0{nth}T00:00:00Z"),
         updated_at: format!("2026-02-0{nth}T00:00:00Z"),
     };
-    let lifecycle = |p: &PullRequestInfo| {
+    let lifecycle = |p: &PullRequestInfo| -> Lifecycle {
         (
             p.status,
             p.updated_at.clone(),
@@ -1767,6 +2171,18 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             p.mergeable,
             p.mergeable_state.clone(),
         )
+    };
+    // The list surfaces strip the per-PR detail fields as a final pass
+    // (`Workspace::slim_for_list`) AFTER the derivation selected the copy,
+    // so on `workspace.list` / the lite list the served lifecycle is the
+    // canonical one minus `mergeable` / `mergeableState`; `workspace.get`
+    // serves it whole.
+    let served = |surface: &str, canonical: &Lifecycle| -> Lifecycle {
+        if surface == "workspace.get" {
+            canonical.clone()
+        } else {
+            (canonical.0, canonical.1.clone(), canonical.2, None, None)
+        }
     };
 
     // Repro A, both root orders: linked + pooled stale `open` copy of the
@@ -1908,7 +2324,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             assert_eq!(active.title, "Workspace copy", "{ctx}: identity kept");
             assert_eq!(
                 lifecycle(active),
-                merged_canonical,
+                served(surface, &merged_canonical),
                 "{ctx}: activePullRequest"
             );
             let prs = ws.pull_requests.as_ref().expect("pullRequests");
@@ -1918,7 +2334,11 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
                 "{ctx}: root copies dedupe into the pooled copy"
             );
             assert_eq!(prs[0].title, "Workspace copy", "{ctx}: identity kept");
-            assert_eq!(lifecycle(&prs[0]), merged_canonical, "{ctx}: pullRequests");
+            assert_eq!(
+                lifecycle(&prs[0]),
+                served(surface, &merged_canonical),
+                "{ctx}: pullRequests"
+            );
         }
     }
 
@@ -1943,7 +2363,11 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
                 "{ctx}: root copies dedupe into the pooled copy"
             );
             assert_eq!(prs[0].title, "Workspace copy", "{ctx}: identity kept");
-            assert_eq!(lifecycle(&prs[0]), clean_canonical, "{ctx}: pullRequests");
+            assert_eq!(
+                lifecycle(&prs[0]),
+                served(surface, &clean_canonical),
+                "{ctx}: pullRequests"
+            );
         }
     }
 
@@ -1969,7 +2393,11 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             }
             let prs = ws.pull_requests.as_ref().expect("pullRequests");
             assert_eq!(prs.len(), 1, "{ctx}: root copies dedupe into one entry");
-            assert_eq!(lifecycle(&prs[0]), tied_canonical, "{ctx}: pullRequests");
+            assert_eq!(
+                lifecycle(&prs[0]),
+                served(surface, &tied_canonical),
+                "{ctx}: pullRequests"
+            );
         }
     }
 
@@ -1990,7 +2418,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             assert_eq!(active.title, "Workspace linked", "{ctx}: identity kept");
             assert_eq!(
                 lifecycle(active),
-                pooled_canonical,
+                served(surface, &pooled_canonical),
                 "{ctx}: activePullRequest"
             );
             let prs = ws.pull_requests.as_ref().expect("pullRequests");
@@ -2000,7 +2428,11 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
                 "{ctx}: root copies dedupe into the pooled copy"
             );
             assert_eq!(prs[0].title, "Workspace pooled", "{ctx}: identity kept");
-            assert_eq!(lifecycle(&prs[0]), pooled_canonical, "{ctx}: pullRequests");
+            assert_eq!(
+                lifecycle(&prs[0]),
+                served(surface, &pooled_canonical),
+                "{ctx}: pullRequests"
+            );
             assert_eq!(
                 lifecycle(active),
                 lifecycle(&prs[0]),
