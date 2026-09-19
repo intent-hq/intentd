@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.84] - 2026-09-19
+
+### 🧪 Testing
+
+- *(events)* Drain FSEvents replay before the negative git-metadata assertion on macOS ([#2008](https://github.com/intent-hq/intentd/pull/2008))
+
+
 ## [0.9.83] - 2026-09-19
 
 ### 🚀 Features
