@@ -41,8 +41,9 @@
 //! statement count doesn't drown out the N+1 signal, a compound op whose
 //! legitimate ceiling exceeds even that tier carries its own budget
 //! ([`PER_METHOD_STATEMENT_BUDGETS`] — `agent.sendMessage`,
-//! `agent.sendToTask`), and every other method keeps the default budget
-//! ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
+//! `agent.sendToTask`, `agent.sendQueuedMessageNow`,
+//! `agent.resolveProposal`), and every other method keeps the default
+//! budget ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
 //!
 //! All tier thresholds are overridable via [`STATEMENT_THRESHOLD_ENV`],
 //! [`COMPOUND_STATEMENT_THRESHOLD_ENV`], [`DURATION_THRESHOLD_ENV`], and
@@ -172,9 +173,19 @@ fn is_compound_statement_method(method: &str) -> bool {
 /// routes through the same delivery path (`agent_send_to_task_op` mirrors
 /// `agent.sendMessage`'s `manager.send_message` / `interrupt_send_message`
 /// routing, DELIV-1), so it carries the same content-scaled shape plus a
-/// task lookup and gets the same budget.
-const PER_METHOD_STATEMENT_BUDGETS: &[(&str, u64)] =
-    &[("agent.sendMessage", 250), ("agent.sendToTask", 250)];
+/// task lookup and gets the same budget. `agent.sendQueuedMessageNow`
+/// drains one queued entry through that same delivery path (queue shrink,
+/// user-row persist, turn start / interrupt) and `agent.resolveProposal`
+/// persists the resolution and then delivers the proposal-resolved notice
+/// through the shared wake/delivery machinery — 27–28 statements observed
+/// on both, deterministically over the flat budget
+/// (intent-hq/monorepo#5376) — so both ride the same tier.
+const PER_METHOD_STATEMENT_BUDGETS: &[(&str, u64)] = &[
+    ("agent.sendMessage", 250),
+    ("agent.sendToTask", 250),
+    ("agent.sendQueuedMessageNow", 250),
+    ("agent.resolveProposal", 250),
+];
 
 /// The per-method statement budget for `method`, if it has one (see
 /// [`PER_METHOD_STATEMENT_BUDGETS`]). Takes precedence over the tier
@@ -1046,6 +1057,14 @@ mod tests {
             per_method_statement_budget("agent.sendToTask").unwrap()
         );
         assert_eq!(
+            layer.statement_threshold_for("agent.sendQueuedMessageNow"),
+            per_method_statement_budget("agent.sendQueuedMessageNow").unwrap()
+        );
+        assert_eq!(
+            layer.statement_threshold_for("agent.resolveProposal"),
+            per_method_statement_budget("agent.resolveProposal").unwrap()
+        );
+        assert_eq!(
             layer.statement_threshold_for("workspace.list"),
             DEFAULT_STATEMENT_WARN_THRESHOLD
         );
@@ -1055,7 +1074,16 @@ mod tests {
     fn per_method_budget_matches_exact_members_only() {
         assert_eq!(per_method_statement_budget("agent.sendMessage"), Some(250));
         assert_eq!(per_method_statement_budget("agent.sendToTask"), Some(250));
+        assert_eq!(
+            per_method_statement_budget("agent.sendQueuedMessageNow"),
+            Some(250)
+        );
+        assert_eq!(
+            per_method_statement_budget("agent.resolveProposal"),
+            Some(250)
+        );
         assert_eq!(per_method_statement_budget("agent.list"), None);
+        assert_eq!(per_method_statement_budget("agent.dismissQuestions"), None);
         assert_eq!(per_method_statement_budget("workspace.create"), None);
     }
 
@@ -1099,6 +1127,88 @@ mod tests {
             }
         });
         assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn send_queued_message_now_at_observed_ceiling_emits_no_warn_under_defaults() {
+        // `agent.sendQueuedMessageNow` drains a queued entry through the
+        // same delivery path as `agent.sendMessage` (queue shrink + user-row
+        // persist + turn start), so the same content-scaled ceiling
+        // (intent-hq/monorepo#3492) must fit its budget; 28 observed
+        // (intent-hq/monorepo#5376) tripped the flat budget.
+        let layer = RpcProfileLayer::from_env_with(|_| None);
+        let warns = run_dispatch(layer, "agent.sendQueuedMessageNow", || {
+            for _ in 0..150 {
+                sqlx_event();
+            }
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn resolve_proposal_at_observed_ceiling_emits_no_warn_under_defaults() {
+        // `agent.resolveProposal` persists the resolution and then delivers
+        // the proposal-resolved notice through the same wake/delivery path,
+        // so the same content-scaled ceiling (intent-hq/monorepo#3492) must
+        // fit its budget; 27 observed (intent-hq/monorepo#5376) tripped the
+        // flat budget.
+        let layer = RpcProfileLayer::from_env_with(|_| None);
+        let warns = run_dispatch(layer, "agent.resolveProposal", || {
+            for _ in 0..150 {
+                sqlx_event();
+            }
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn send_queued_message_now_over_per_method_budget_still_warns() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let budget = per_method_statement_budget("agent.sendQueuedMessageNow").unwrap();
+        let warns = run_dispatch(layer, "agent.sendQueuedMessageNow", || {
+            for _ in 0..=budget {
+                sqlx_event();
+            }
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(
+            warns[0].contains("method=agent.sendQueuedMessageNow"),
+            "{warns:?}"
+        );
+        assert!(
+            warns[0].contains(&format!("threshold={budget}")),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_proposal_over_per_method_budget_still_warns() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let budget = per_method_statement_budget("agent.resolveProposal").unwrap();
+        let warns = run_dispatch(layer, "agent.resolveProposal", || {
+            for _ in 0..=budget {
+                sqlx_event();
+            }
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(
+            warns[0].contains("method=agent.resolveProposal"),
+            "{warns:?}"
+        );
+        assert!(
+            warns[0].contains(&format!("threshold={budget}")),
+            "{warns:?}"
+        );
     }
 
     #[test]
