@@ -569,12 +569,24 @@ case_name="unresolvable BASE"
 reset_repo
 edit crates/alpha/tests/one.rs
 BASE=origin/nope run_script
-[[ "$status" -eq 2 ]] || fail "$case_name exited $status (expected 2): $stderr"
+[[ "$status" -eq 4 ]] || fail "$case_name exited $status (expected 4): $stderr"
 [[ -z "$stdout" ]] || fail "$case_name printed '$stdout'"
 [[ "$stderr" == "[test-changed] cannot resolve BASE 'origin/nope'; run 'git fetch origin main' or set BASE=<ref>" ]] || fail "$case_name stderr: $stderr"
 [[ -z "$cargo_log" ]] || fail "$case_name invoked cargo: $cargo_log"
 run_script --base origin/nope
-[[ "$status" -eq 2 ]] || fail "$case_name (--base) exited $status (expected 2): $stderr"
+[[ "$status" -eq 4 ]] || fail "$case_name (--base) exited $status (expected 4): $stderr"
+
+# intent-hq/intent#5414: the BASE object exists (fetched at depth 1) but shares
+# no history with HEAD, so merge-base fails; distinct from a usage error.
+case_name="BASE disconnected from HEAD"
+reset_repo
+edit crates/alpha/tests/one.rs
+orphan=$(g commit-tree -m orphan "$(g write-tree)")
+run_script --base "$orphan"
+[[ "$status" -eq 4 ]] || fail "$case_name exited $status (expected 4): $stderr"
+[[ -z "$stdout" ]] || fail "$case_name printed '$stdout'"
+[[ "$stderr" == "[test-changed] cannot resolve BASE '$orphan'; run 'git fetch origin main' or set BASE=<ref>" ]] || fail "$case_name stderr: $stderr"
+[[ -z "$cargo_log" ]] || fail "$case_name invoked cargo: $cargo_log"
 
 case_name="explicit BASE"
 reset_repo
