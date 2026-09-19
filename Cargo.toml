@@ -114,6 +114,8 @@ debug = "line-tables-only"
 debug = "line-tables-only"
 [profile.dev.package.intentd-sitter]
 debug = "line-tables-only"
+[profile.dev.package.intentd-microvm-helper]
+debug = "line-tables-only"
 
 # Skip debuginfo for all external dependencies. `debug = false` alone makes
 # cargo pass `-C strip=debuginfo`, and the stripped proc-macro dylibs (e.g.

@@ -90,26 +90,27 @@ pub use model::{
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
     CommentType, CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
     CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
-    GitStatus, Hook, HookListRow, HookState, HookSummary, KnownRepo, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus,
-    ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode, SaveAssetResult,
-    Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats,
-    SetupScript, SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult,
+    EventSubscribeResult, EventUnsubscribeResult, ExecutionEnvironmentRepoConfig, FileActivity,
+    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
+    GitMergeConflicts, GitPullResult, GitStatus, GuestImageRef, Hook, HookListRow, HookState,
+    HookSummary, KnownRepo, LineAttributionAuthor, LineAttributionComputeResult,
+    LineAttributionData, LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
+    NoteEditResult, NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow,
+    NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary,
+    NoteVisibility, PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo,
+    PullRequestStatus, ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode,
+    SaveAssetResult, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus,
+    SessionStats, SetupScript, SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult,
     TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
     TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
     TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, Workspace, WorkspaceActivity,
-    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus,
-    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
+    TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, VmResources, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage,
+    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{
@@ -125,7 +126,7 @@ pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
 pub use server_control::ServerControl;
 pub use settings_file::{
-    FlushQueuedMessagesMode, LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE,
+    FlushQueuedMessagesMode, LegacySettings, SandboxType, SettingsFile, DEFAULT_CONFIG_TEMPLATE,
     LEGACY_SETTINGS_PATHS,
 };
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};

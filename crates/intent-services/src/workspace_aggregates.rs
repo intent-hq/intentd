@@ -125,6 +125,15 @@ impl WorkspaceAggregateCache {
     /// backfills the cache for the next poll. Failed probes are not cached,
     /// so a later call retries.
     pub(crate) async fn cow_supported(self: &Arc<Self>, workspaces_root: PathBuf) -> Option<bool> {
+        // CoW sandboxes are temporarily locked to macOS: on every other OS
+        // report unsupported without running the filesystem probe (and
+        // without creating the root dir). This is the single choke point, so
+        // the lock propagates to compute_cow_supported, cow_capable_hint,
+        // system.capabilities.cowSupported, Workspace.cowSupported, and the
+        // provisioning fallbacks.
+        if cfg!(not(target_os = "macos")) {
+            return Some(false);
+        }
         let key = workspaces_root;
         if let Some(v) = self.cow.lock().unwrap().get(&key) {
             return Some(*v);
@@ -242,13 +251,21 @@ mod tests {
         let cache = Arc::new(WorkspaceAggregateCache::new());
         let first = cache.cow_supported(root.clone()).await;
         assert!(first.is_some(), "same-volume probe should succeed");
-        assert_eq!(cache.cow.lock().unwrap().len(), 1);
+        if cfg!(target_os = "macos") {
+            assert_eq!(cache.cow.lock().unwrap().len(), 1);
+        } else {
+            // Temporarily locked to macOS: the platform gate answers before
+            // the probe/cache is involved.
+            assert_eq!(first, Some(false));
+        }
         let second = cache.cow_supported(root.clone()).await;
         assert_eq!(first, second);
     }
 
     /// A fresh configured `workspaces.root` may not exist on disk yet; the
-    /// probe must create it rather than omit `cowSupported`.
+    /// probe must create it rather than omit `cowSupported`. (macOS-only:
+    /// elsewhere the temporary platform lock answers without touching disk.)
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn cow_supported_creates_missing_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -260,6 +277,24 @@ mod tests {
         assert!(root.exists());
     }
 
+    /// Temporary platform lock: on non-macOS the choke point reports
+    /// unsupported without probing or creating the root.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn cow_supported_locked_off_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-yet-created").join("workspaces");
+        assert!(!root.exists());
+        let cache = Arc::new(WorkspaceAggregateCache::new());
+        let result = cache.cow_supported(root.clone()).await;
+        assert_eq!(result, Some(false), "locked platforms report unsupported");
+        assert!(!root.exists(), "the lock must not create the root dir");
+    }
+
+    /// A cold caller joins the startup prewarm's flight instead of racing it.
+    /// (macOS-only: elsewhere the temporary platform lock answers before the
+    /// flight table is touched, so the prewarm never enters a flight.)
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn cow_supported_joins_in_flight_prewarm() {
         let dir = tempfile::tempdir().unwrap();

@@ -475,6 +475,17 @@
 //! update check (SIGUSR2, rate-limited, only while no turn is in flight) and
 //! exits for a staged update only once idle; `system.requestUpdate`
 //! (SIGUSR1) still restarts immediately. No method-catalog change.
+//!
+//! Version 10.3 adds the execution-environment surface (additive;
+//! §5.1, §5.5b): the `sandbox.profiles.list` /
+//! `sandbox.profiles.update` / `sandbox.options` / `sandbox.image.check`
+//! router methods, the `system.capabilities.microvmSupported` field (§5.7),
+//! the `workspace.create` `executionEnvironment` param with the persisted
+//! `Workspace.executionEnvironment` field, and the structured
+//! `execution-environment-unavailable` / `execution-environment-not-implemented`
+//! error payloads (§9). The catalog contains 319 router methods, 49
+//! fast-path methods, and two aliases: 370 client-callable names. The five
+//! reverse methods are counted separately.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release

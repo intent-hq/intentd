@@ -337,7 +337,7 @@ impl Services {
     /// timeout, unparseable output, no uncommitted changes), logging the failure
     /// at debug/warn level. The caller should fall back to
     /// [`Self::build_auto_commit_subject`] when `None` is returned.
-    async fn generate_auto_commit_message(
+    pub(crate) async fn generate_auto_commit_message(
         &self,
         worktree_path: &std::path::Path,
         session: &AgentSession,

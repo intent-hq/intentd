@@ -2637,6 +2637,7 @@ mod tests {
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
+            execution_environment: None,
             pending_delete_at: None,
         }
     }

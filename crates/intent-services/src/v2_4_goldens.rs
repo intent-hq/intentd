@@ -127,6 +127,7 @@ const COMPARED_SURFACES: &[&str] = &[
     "user_rules_wrapper",
     "rtk_instruction_line",
     "sandboxed_implementor_hint",
+    "microvm_isolation_hint",
     "coordinator_cow_hint",
     "specialist_role_section",
     "commit_policy_clause",
@@ -264,7 +265,12 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(rtk_instruction_line(&subs));
     same!(rtk_instruction_line(&[]));
     same!(sandboxed_implementor_hint("/sb", "sb/x"));
-    same!(coordinator_cow_hint());
+    same!(microvm_isolation_hint("/guest"));
+    for uniform in [false, true] {
+        for standalone in [false, true] {
+            same!(coordinator_cow_hint(uniform, standalone));
+        }
+    }
     same!(specialist_role_section("Implement."));
     same!(commit_policy_clause());
     same!(role_reminder_footer("Implementor", Some("Stay in scope.")));

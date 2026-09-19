@@ -1,0 +1,30 @@
+# Upstream pins for the GPU-less libkrun bundle shipped next to intentd on
+# macOS (aarch64) — consumed by .github/workflows/libkrun-bundle.yml, which
+# rebuilds and republishes the bundle whenever this file changes on main
+# (and on workflow_dispatch). The release tag is derived from the two
+# versions: libkrun-bundle-v<libkrun>+<libkrunfw>.
+#
+# Bump both entries together with their sha256s: the source tarball hash is
+# from the GitHub tag archive (also pinned by libkrun/homebrew-krun's
+# Formula/libkrun.rb); the libkrunfw hash is from the upstream release's
+# libkrunfw-prebuilt-aarch64.tgz (kernel.c bundle + Makefile, compiled into
+# libkrunfw.5.dylib on the runner — no kernel build involved).
+#
+# The versions pinned here are the ones intentd-microvm-helper was validated
+# against on a dev host with the Homebrew tap installed.
+
+[libkrun]
+# containers/libkrun git tag. Built with `make BLK=1 NET=1 TIMESYNC=1`: GPU
+# stays off so the dylib links only Hypervisor.framework / libiconv /
+# libSystem (no libvirglrenderer / libepoxy from the Homebrew tap's GPU=1
+# build) and dlopens libkrunfw.5.dylib by bare name at boot.
+tag = "v1.19.4"
+source_url = "https://github.com/containers/libkrun/archive/refs/tags/v1.19.4.tar.gz"
+source_sha256 = "e8775fab2b460972a67ca6cd936296bb79cdb078d852d712a283cb290dd0b284"
+
+[libkrunfw]
+# containers/libkrunfw git tag; the prebuilt tgz is the aarch64 kernel bundle
+# that upstream publishes on the release.
+tag = "v5.5.0"
+prebuilt_url = "https://github.com/containers/libkrunfw/releases/download/v5.5.0/libkrunfw-prebuilt-aarch64.tgz"
+prebuilt_sha256 = "5bfae6efee63dbdf04a8fac2a69d772d9f900af2f54c4429b4acdfd6d86b9979"
