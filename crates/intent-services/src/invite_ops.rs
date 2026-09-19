@@ -892,8 +892,11 @@ impl Services {
     /// account that resolves to the primary principal as
     /// [`InviteErrorKind::OwnerSelfJoin`] (the transaction-level guard
     /// behind the early checks above). The
-    /// event is published only after the commit; the credential is returned
-    /// exactly once, in the `authorized` result.
+    /// event is published only after the commit — `members: true` +
+    /// `addedPrincipalId` when a membership was added, `invites: true` alone
+    /// for a member's re-join (only the invite's last-redemption stamp
+    /// moved); the credential is returned exactly once, in the `authorized`
+    /// result.
     async fn commit_invite_join(
         &self,
         invite: &WorkspaceInvite,
@@ -902,7 +905,7 @@ impl Services {
     ) -> Result<Value> {
         let invite_id = invite.id.as_str();
         let token = random_hex_secret();
-        let principal = match self
+        let (principal, member_added) = match self
             .store
             .join_workspace_by_invite(
                 invite_id,
@@ -914,7 +917,8 @@ impl Services {
             )
             .await?
         {
-            InviteJoinOutcome::Joined(principal) => principal,
+            InviteJoinOutcome::Joined(principal) => (principal, true),
+            InviteJoinOutcome::Rejoined(principal) => (principal, false),
             InviteJoinOutcome::Closed => {
                 let kind = self
                     .store
@@ -935,17 +939,19 @@ impl Services {
             }
         };
         let member_count = self.member_count(&invite.workspace_id).await?;
+        let changes = if member_added {
+            json!({
+                "members": true,
+                "invites": true,
+                "addedPrincipalId": principal.id,
+                "memberCount": member_count,
+            })
+        } else {
+            json!({ "invites": true, "memberCount": member_count })
+        };
         crate::publish_event(
             self.event_bus.as_ref(),
-            crate::workspace_updated_event(
-                &invite.workspace_id,
-                &json!({
-                    "members": true,
-                    "invites": true,
-                    "addedPrincipalId": principal.id,
-                    "memberCount": member_count,
-                }),
-            ),
+            crate::workspace_updated_event(&invite.workspace_id, &changes),
         )
         .await;
         Ok(json!({

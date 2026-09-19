@@ -68,9 +68,14 @@ impl WorkspaceGuestCount {
 /// Result of [`Store::join_workspace_by_invite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InviteJoinOutcome {
-    /// The join committed; the principal is the joined one (existing row
-    /// refreshed, or the minted one).
+    /// The join committed and added a membership; the principal is the
+    /// joined one (existing row refreshed, or the minted one).
     Joined(Principal),
+    /// The join committed for an account that was already a member of the
+    /// workspace: the principal row was refreshed, a fresh credential was
+    /// minted and the invite's last-redemption stamp moved, but no
+    /// membership was added and the redemption was not counted.
+    Rejoined(Principal),
     /// The invite was no longer open at redemption; nothing was written.
     Closed,
     /// The workspace's collaborators already reach the guest cap; nothing
@@ -910,7 +915,10 @@ impl Store {
     /// `identity.id` is used only when no principal has linked the account;
     /// `identity.is_primary` / `created_at` likewise. Returns
     /// [`InviteJoinOutcome::Joined`] with the principal (existing row
-    /// refreshed, or the minted one); [`InviteJoinOutcome::Closed`] when the
+    /// refreshed, or the minted one) when a membership was added, or
+    /// [`InviteJoinOutcome::Rejoined`] when the account was already a member
+    /// (so the caller can tell a membership change from a mere credential
+    /// mint); [`InviteJoinOutcome::Closed`] when the
     /// invite was no longer open at redemption; or
     /// [`InviteJoinOutcome::WorkspaceFull`] when the workspace already has
     /// `max_guests` collaborators and the joining account is not one of them
@@ -1124,7 +1132,11 @@ impl Store {
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("invite join insert credential failed: {e}")))?;
-            Ok(InviteJoinOutcome::Joined(principal))
+            Ok(if already_member {
+                InviteJoinOutcome::Rejoined(principal)
+            } else {
+                InviteJoinOutcome::Joined(principal)
+            })
         }
         .await;
 
