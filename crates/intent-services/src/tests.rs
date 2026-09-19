@@ -35283,7 +35283,7 @@ mod clone_orchestration {
     /// `idempotencyKey` are exactly-once: `with_idempotency` serializes
     /// same-key callers, so one provisions and the other replays the stored
     /// result — identical ids, one workspace row, one `workspace:created`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_same_key_creates_yield_one_workspace() {
         let repo = seed_repo("intentd-idem-race-src");
         let root = unique_dir("intentd-idem-race-root");
@@ -43063,7 +43063,7 @@ mod bulk_delete_pool_pressure {
     /// Concurrent deletes (checkouts present and absent) while the bus keeps
     /// publishing: every delete succeeds, every publish resolves `Ok` (no
     /// dropped batch), and the writer never logs a drop.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn concurrent_deletes_do_not_drop_event_batches() {
         const DELETES: usize = 12;
         const PUBLISHES: usize = 200;
@@ -43127,7 +43127,10 @@ mod bulk_delete_pool_pressure {
         for id in &ids {
             let svc = svc.clone();
             let id = id.clone();
-            deletes.spawn(async move { (id.clone(), svc.delete_workspace(id).await) });
+            deletes.spawn(intent_core::with_caller(
+                intent_core::Caller::Daemon,
+                async move { (id.clone(), svc.delete_workspace(id).await) },
+            ));
         }
         let mut done = 0;
         while let Some(joined) = deletes.join_next().await {
