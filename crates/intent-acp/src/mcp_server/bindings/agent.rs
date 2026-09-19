@@ -99,6 +99,23 @@ fn new_send_message_id() -> String {
     format!("user-msg-{}", uuid::Uuid::new_v4())
 }
 
+/// The retired-caller guard `workspace_host_dispatch` applies to every other
+/// frame, run here as the first step of a spawned send operation
+/// (`RETIRED_SEND_METHODS`, intent-hq/intent#5387) so the store read cannot
+/// be cancelled by the eval-timeout drop. `Err` carries the same retired
+/// error the dispatch guard returns; the caller enqueues nothing after it.
+async fn refuse_if_caller_retired(
+    api: &Arc<dyn WorkspaceApi>,
+    caller: Option<&AgentId>,
+) -> Result<(), String> {
+    if let Some(caller) = caller {
+        if api.agent_is_retired(caller.clone()).await {
+            return Err(crate::mcp_server::dispatch::retired_caller_error());
+        }
+    }
+    Ok(())
+}
+
 /// Run the daemon-side half of a `send` / `sendToTask` on a spawned task so
 /// dropping the host future (the eval-budget timeout in `intent-js` cancels
 /// every pending `await`) cannot cancel the delivery mid-flight
@@ -705,23 +722,24 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// silently-queued is unambiguous even to a sender that only glances at
 /// the result.
 ///
-/// The ENTIRE daemon-side sequence — pending guard read → sender-name read →
-/// send → replace retraction → sender watch — runs on a spawned task under a
-/// pre-minted `messageId` ([`spawn_send_within_budget`],
-/// intent-hq/intent#5387): the eval-budget timeout drops the host future,
-/// and any directly-awaited step would be cancelled at whatever await it
-/// was parked on — the message never reaching the queue. Nothing in this
-/// function awaits before the spawn; only synchronous argument parsing runs
-/// inline. (The one await upstream of every binding — the retired-caller
-/// `agent_is_retired` read in `workspace_host_dispatch` — precedes the id
-/// mint and the spawn, so a drop there means no send was ever attempted:
-/// the caller gets the generic eval timeout and nothing is in flight.) When
-/// the delivery outlives [`send_wait_ceiling`] of the eval's REMAINING
+/// The ENTIRE daemon-side sequence — retired-caller read → pending guard
+/// read → sender-name read → send → replace retraction → sender watch —
+/// runs on a spawned task under a pre-minted `messageId`
+/// ([`spawn_send_within_budget`], intent-hq/intent#5387): the eval-budget
+/// timeout drops the host future, and any directly-awaited step would be
+/// cancelled at whatever await it was parked on — the message never
+/// reaching the queue. Nothing awaits before the spawn, in this function or
+/// upstream of it: `workspace_host_dispatch` skips its own retired-caller
+/// read for this method ([`super::RETIRED_SEND_METHODS`]) and
+/// [`refuse_if_caller_retired`] runs it as the spawned task's first step.
+/// When the delivery outlives [`send_wait_ceiling`] of the eval's REMAINING
 /// budget, the binding returns an explicit error naming the in-flight
 /// `messageId` as an UNCONFIRMED attempt — it may still land or fail late,
 /// and [`log_late_send_outcome`] records which under that id — so the
 /// caller checks `ws.agent.getQueue` / `ws.agent.status` for it instead of
-/// re-sending blindly.
+/// re-sending blindly. A generic eval timeout on a LATER frame of the same
+/// eval says nothing about a send that already returned: check the target's
+/// queue for the `messageId` before re-sending.
 async fn send(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -742,6 +760,7 @@ async fn send(
     let in_flight_id = message_id.clone();
     let in_flight_target = agent_id_str.clone();
     let delivery = async move {
+        refuse_if_caller_retired(&api, caller.as_ref()).await?;
         let mut pending_to_replace: Option<String> = None;
         if let Some(refusal) = pending_send_refusal(&api, &ws, caller.as_ref(), &agent_id).await {
             if !replace_pending {
@@ -819,11 +838,12 @@ async fn send(
 /// `replaceOutcome: "reassigned"`. An agent caller passing
 /// `replacePending: true` always gets a replace report — the fall-through
 /// paths report `replaceOutcome: "none"` rather than silently ignoring the
-/// option. The entire daemon-side sequence (task resolution → guard read →
-/// sender-name read → send → retraction → watch) is spawned and
-/// budget-bounded exactly like [`send`] (intent-hq/intent#5387) — nothing
-/// awaits before the spawn; the op mints the message id itself, so the
-/// in-flight error (and the late-outcome log line) names the task instead.
+/// option. The entire daemon-side sequence (retired-caller read → task
+/// resolution → guard read → sender-name read → send → retraction → watch)
+/// is spawned and budget-bounded exactly like [`send`]
+/// (intent-hq/intent#5387) — nothing awaits before the spawn; the op mints
+/// the message id itself, so the in-flight error (and the late-outcome log
+/// line) names the task instead.
 async fn send_to_task(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -842,6 +862,7 @@ async fn send_to_task(
     let args = args.clone();
     let in_flight_task = task_note_id.clone();
     let delivery = async move {
+        refuse_if_caller_retired(&api, caller.as_ref()).await?;
         let mut guard_target: Option<AgentId> = None;
         let mut pending_to_replace: Option<String> = None;
         if caller.is_some() {

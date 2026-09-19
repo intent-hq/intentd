@@ -816,14 +816,15 @@ async fn workspace_host_dispatch(
     // boundary), so without this check the retiring turn could keep issuing
     // workspace_api calls after the mark landed. Fail closed on every
     // subsequent frame from a retired caller — the same inertness the
-    // service layer enforces for inbound interaction.
-    if let Some(caller) = caller_agent_id.as_ref() {
-        if api.agent_is_retired(caller.clone()).await {
-            return Err(
-                "host: this agent session is retired — the session is inert and no further \
-                 workspace_api calls run (only the user can restore it via agent.restore)"
-                    .to_string(),
-            );
+    // service layer enforces for inbound interaction. The send bindings run
+    // this same read INSIDE their spawned, budget-bounded delivery
+    // (`RETIRED_SEND_METHODS`): awaited here it would be one more
+    // cancellable store read on the send path (intent-hq/intent#5387).
+    if !super::bindings::RETIRED_SEND_METHODS.contains(&method) {
+        if let Some(caller) = caller_agent_id.as_ref() {
+            if api.agent_is_retired(caller.clone()).await {
+                return Err(retired_caller_error());
+            }
         }
     }
     let args = arg.get("args").cloned().unwrap_or(Value::Null);
@@ -843,6 +844,14 @@ async fn workspace_host_dispatch(
         return Ok(v);
     }
     Err(format!("host: unknown method `{method}`"))
+}
+
+/// The error every `workspace_api` frame from a retired caller fails with —
+/// shared by the dispatch guard above and the send bindings' deferred check.
+pub(crate) fn retired_caller_error() -> String {
+    "host: this agent session is retired — the session is inert and no further \
+     workspace_api calls run (only the user can restore it via agent.restore)"
+        .to_string()
 }
 
 /// Success MCP tool result for `workspace_api`: a single text content block

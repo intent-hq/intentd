@@ -9644,6 +9644,10 @@ mod wsapi4_bindings_tests {
         /// single-pending-message guard's store read stalling ahead of the
         /// enqueue (intent-hq/intent#5387).
         agent_get_queue_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
+        /// When set, `agent_is_retired` awaits this lock — stands in for the
+        /// retired-caller store read stalling ahead of the enqueue
+        /// (intent-hq/intent#5387).
+        agent_is_retired_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
         /// Signalled once per recorded `agent_send_message` call, so a test
         /// can await a send that lands after the binding already returned.
         agent_send_landed: tokio::sync::Notify,
@@ -10104,7 +10108,13 @@ mod wsapi4_bindings_tests {
                 .lock()
                 .unwrap()
                 .contains(&agent_id.as_str().to_string());
-            Box::pin(async move { retired })
+            let hold = self.agent_is_retired_hold.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    drop(hold.lock_owned().await);
+                }
+                retired
+            })
         }
 
         fn event_query(
@@ -11023,6 +11033,87 @@ mod wsapi4_bindings_tests {
         let ids = api.agent_send_message_ids.lock().unwrap().clone();
         let id = ids[0].clone().expect("pre-minted id passed through");
         assert!(t.contains(&id), "error named the id that landed: {t}");
+    }
+
+    /// intent-hq/intent#5387: the retired-caller guard's `agent_is_retired`
+    /// store read is part of the send path too — it used to run in
+    /// `workspace_host_dispatch` ahead of the spawn, where a stall past the
+    /// budget surfaced the generic eval timeout and no send existed to land.
+    /// With the read held past the budget, the binding must still return the
+    /// named in-flight error inside the budget, and the send must land once
+    /// the read is released.
+    #[tokio::test]
+    async fn agent_send_stalled_on_retired_read_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_is_retired_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("user-msg-") && t.contains("agent-target"),
+            "timeout error must name the pre-minted message id and target: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the send is still parked behind the held retired read"
+        );
+
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must land after the retired read is released");
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one enqueue: {calls:?}");
+        assert_eq!(calls[0].0, "agent-target");
+        assert_eq!(calls[0].1, "hello");
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "error named the id that landed: {t}");
+    }
+
+    /// Control for the deferred retired read: a retired caller's `send` and
+    /// `sendToTask` are still refused through the spawned path — the same
+    /// retired error every other frame gets, and nothing is enqueued.
+    #[tokio::test]
+    async fn agent_send_from_retired_caller_refuses_without_enqueue() {
+        let (srv, api) = server_with_caller("caller-1");
+        api.retired_agent_ids
+            .lock()
+            .unwrap()
+            .push("caller-1".to_string());
+
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('agent-target', 'hello', 'queue');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(text(&resp).contains("retired"), "{}", text(&resp));
+        assert!(api.agent_send_calls.lock().unwrap().is_empty());
+
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('task-1', 'hello', 'queue');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(text(&resp).contains("retired"), "{}", text(&resp));
+        assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
     }
 
     /// intent-hq/intent#5387: the send's wait is bounded by the eval budget's

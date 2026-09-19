@@ -151,6 +151,15 @@ impl EvalBudget {
     }
 }
 
+/// Methods whose binding runs the retired-caller `agent_is_retired` read
+/// itself, inside its spawned, budget-bounded send operation (after the
+/// message-id mint), instead of `workspace_host_dispatch` awaiting it ahead
+/// of the binding. The read is a store round-trip on the send path, and an
+/// eval-timeout drop while it is parked would surface the generic timeout
+/// with no send to land (intent-hq/intent#5387). The outcome is identical: a
+/// retired caller's send returns the retired error and enqueues nothing.
+pub(crate) const RETIRED_SEND_METHODS: [&str; 2] = ["agent.send", "agent.sendToTask"];
+
 /// Dispatch one `host({ method, args })` frame to the matching per-namespace
 /// handler. Returns `Ok(None)` when the namespace is not owned here (unknown
 /// method); `Ok(Some(v))` on success and `Err(msg)` on a JS-visible failure.
