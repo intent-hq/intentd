@@ -4379,7 +4379,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// `github.identityProof.delete`: delete a proof gist created by
     /// `github.identityProof.create` → `{ ok: true }`. Idempotent (an
     /// already-deleted gist is `ok`); same bounded `Error::IdentityProof`
-    /// codes as create. Owner-client only.
+    /// codes as create, the `gist`-scope check included. The gist is read
+    /// back before the delete and must be a proof gist (exactly one file,
+    /// `intent-join-proof.txt`); any other gist of the account is refused
+    /// with `-32602` and nothing is deleted. Owner-client only.
     fn github_identity_proof_delete(
         &self,
         gist_id: String,
