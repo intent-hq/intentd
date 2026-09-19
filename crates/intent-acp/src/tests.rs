@@ -9853,10 +9853,7 @@ mod wsapi4_bindings_tests {
             message_metadata: Option<Value>,
             _origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
-            self.agent_send_message_ids
-                .lock()
-                .unwrap()
-                .push(message_id);
+            self.agent_send_message_ids.lock().unwrap().push(message_id);
             let hold = self.agent_send_hold.lock().unwrap().clone();
             let error = self.agent_send_error.lock().unwrap().clone();
             let result = self
@@ -10884,7 +10881,7 @@ mod wsapi4_bindings_tests {
         let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
         let hold = Arc::new(tokio::sync::Mutex::new(()));
         *api.agent_send_hold.lock().unwrap() = Some(hold.clone());
-        let held = hold.lock().await;
+        let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -10911,13 +10908,17 @@ mod wsapi4_bindings_tests {
             "the enqueue is still parked behind the held lock"
         );
 
-        drop(held);
+        drop(guard);
         // The tokio mutex is FIFO: the parked send acquires it first and
         // records the call while holding it, so re-acquiring here observes
         // the landed enqueue without polling.
         let _observed = hold.lock().await;
         let calls = api.agent_send_calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 1, "the enqueue must land after a timed-out send");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the enqueue must land after a timed-out send"
+        );
         assert_eq!(calls[0].0, "agent-target");
         assert_eq!(calls[0].1, "hello");
         assert_eq!(calls[0].2.as_deref(), Some("normal"));
@@ -10932,7 +10933,7 @@ mod wsapi4_bindings_tests {
         let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
         let hold = Arc::new(tokio::sync::Mutex::new(()));
         *api.agent_send_hold.lock().unwrap() = Some(hold.clone());
-        let held = hold.lock().await;
+        let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -10951,7 +10952,7 @@ mod wsapi4_bindings_tests {
         );
         assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
 
-        drop(held);
+        drop(guard);
         let _observed = hold.lock().await;
         let calls = api.agent_send_to_task_calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "the send must land after a timed-out call");

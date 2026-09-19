@@ -10,6 +10,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 
 use intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS;
 use intent_core::settings_file::AgentFeaturesSettings;
@@ -26,6 +27,49 @@ use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str, strip_agent_hidden
 /// subscribed to the target's completion (parity with the TS `SendMessageTool`
 /// and the identical constant in `dispatch.rs`).
 const SENDER_WATCH_NOTIFICATION: &str = "You will be notified when the agent responds.";
+
+/// Time held back from the `workspace_api` eval budget so a `send` /
+/// `sendToTask` whose daemon-side delivery is still in flight returns its
+/// explicit in-flight error before the transport aborts the eval
+/// (intent-hq/intent#5387). Capped at half the budget so a compressed test
+/// budget still leaves a real wait.
+const SEND_WAIT_MARGIN: Duration = Duration::from_secs(2);
+
+/// How long a `send` / `sendToTask` binding waits for the daemon-side
+/// delivery under `budget` before returning the in-flight error.
+fn send_wait_ceiling(budget: Duration) -> Duration {
+    budget.saturating_sub(SEND_WAIT_MARGIN.min(budget / 2))
+}
+
+/// Mint the durable message id for a `ws.agent.send` BEFORE the daemon-side
+/// delivery starts (same `user-msg-<uuid>` shape the services layer mints),
+/// so a timed-out send can name the id its queue entry / transcript row
+/// carries.
+fn new_send_message_id() -> String {
+    format!("user-msg-{}", uuid::Uuid::new_v4())
+}
+
+/// Run the daemon-side half of a `send` / `sendToTask` on a spawned task so
+/// dropping the host future (the eval-budget timeout in `intent-js` cancels
+/// every pending `await`) cannot cancel the delivery mid-flight
+/// (intent-hq/intent#5387). Waits at most [`send_wait_ceiling`] for the
+/// result; past that, returns `in_flight_error` while the task keeps running
+/// to completion.
+async fn spawn_send_within_budget<F>(
+    eval_budget: Duration,
+    fut: F,
+    in_flight_error: impl FnOnce() -> String,
+) -> Result<Value, String>
+where
+    F: std::future::Future<Output = Result<Value, String>> + Send + 'static,
+{
+    let handle = tokio::spawn(fut);
+    match tokio::time::timeout(send_wait_ceiling(eval_budget), handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_err)) => Err(format!("agent send task failed: {join_err}")),
+        Err(_elapsed) => Err(in_flight_error()),
+    }
+}
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -117,15 +161,18 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str>
 
 /// Every `ws.agent.*` result passes through
 /// [`strip_agent_hidden_fields`] (see `bindings/mod.rs`): the agent must never
-/// read the user's `notificationsMuted` preference.
+/// read the user's `notificationsMuted` preference. `eval_budget` is the
+/// caller's `workspace_api` wall-clock budget; `send` / `sendToTask` bound
+/// their wait on the daemon-side delivery by it (intent-hq/intent#5387).
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
+    eval_budget: Duration,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    let mut out = dispatch_inner(api, ws, caller, method, args).await?;
+    let mut out = dispatch_inner(api, ws, caller, eval_budget, method, args).await?;
     strip_agent_hidden_fields(&mut out);
     Ok(out)
 }
@@ -134,14 +181,15 @@ async fn dispatch_inner(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
+    eval_budget: Duration,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
     match method {
         "create" => create(api, ws, caller, args).await,
         "delegate" => delegate(api, ws, caller, args).await,
-        "send" => send(api, ws, caller, args).await,
-        "sendToTask" => send_to_task(api, ws, caller, args).await,
+        "send" => send(api, ws, caller, eval_budget, args).await,
+        "sendToTask" => send_to_task(api, ws, caller, eval_budget, args).await,
         "subscribe" => subscribe(api, ws, caller, args).await,
         "unsubscribe" => unsubscribe(api, ws, args).await,
         "watch" => watch(api, ws, caller, args).await,
@@ -598,10 +646,21 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// top-level `delivery` outcome ([`delivery_outcome`]) so `ok: true` +
 /// silently-queued is unambiguous even to a sender that only glances at
 /// the result.
+///
+/// The daemon-side delivery (send → replace retraction → sender watch) runs
+/// on a spawned task under a pre-minted `messageId`
+/// ([`spawn_send_within_budget`], intent-hq/intent#5387): the eval-budget
+/// timeout drops the host future, and a directly-awaited send would be
+/// cancelled at whatever await it was parked on — the message never
+/// reaching the queue. When the delivery outlives [`send_wait_ceiling`], the
+/// binding returns an explicit error naming the in-flight `messageId` so
+/// the caller checks `ws.agent.getQueue` / `ws.agent.status` for it instead
+/// of re-sending blindly; the send itself completes regardless.
 async fn send(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
+    eval_budget: Duration,
     args: &Value,
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
@@ -618,45 +677,63 @@ async fn send(
             .and_then(Value::as_str)
             .map(str::to_string);
     }
-    let mut result = api
-        .agent_send_message(
-            ws.clone(),
-            agent_id.clone(),
-            message,
-            None,
-            None,
-            None,
-            effective_priority(args),
-            None,
-            None,
-            None,
-            sender_metadata(api, ws, caller, args).await,
-            MessageOrigin::Automatic,
+    let priority = effective_priority(args);
+    let metadata = sender_metadata(api, ws, caller, args).await;
+    let message_id = new_send_message_id();
+    let api = api.clone();
+    let ws = ws.clone();
+    let caller = caller.cloned();
+    let in_flight_id = message_id.clone();
+    let in_flight_target = agent_id_str.clone();
+    let wait_ms = send_wait_ceiling(eval_budget).as_millis();
+    let delivery = async move {
+        let mut result = api
+            .agent_send_message(
+                ws.clone(),
+                agent_id.clone(),
+                message,
+                Some(message_id.clone()),
+                None,
+                None,
+                priority,
+                None,
+                None,
+                None,
+                metadata,
+                MessageOrigin::Automatic,
+            )
+            .await
+            .map_err(map_err)?;
+        let mut replace_report: Option<Value> = None;
+        if replace_pending {
+            if let Some(caller) = caller.as_ref() {
+                replace_report = Some(match &pending_to_replace {
+                    Some(pid) => replace_pending_entry(&api, caller, &agent_id, pid).await,
+                    None => json!({ "replaced": false, "replaceOutcome": "none" }),
+                });
+            }
+        }
+        if let Some(sub) = watch_sender(&api, &ws, caller.as_ref(), &agent_id).await {
+            result["subscriptionId"] = json!(sub);
+            result["message"] = json!(SENDER_WATCH_NOTIFICATION);
+        }
+        let mut out = merge_ok(result);
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("agentId".to_string(), json!(agent_id_str));
+            obj.entry("messageId").or_insert_with(|| json!(message_id));
+            if let Some(delivery) = delivery_outcome(obj) {
+                obj.insert("delivery".to_string(), json!(delivery));
+            }
+            merge_replace_report(obj, replace_report);
+        }
+        Ok(out)
+    };
+    spawn_send_within_budget(eval_budget, delivery, move || {
+        format!(
+            "agent.send to {in_flight_target} is still in flight after {wait_ms}ms: the daemon has not yet confirmed delivery of messageId {in_flight_id}. The send was NOT cancelled and is not lost — it completes in the background. Do NOT re-send blindly: check ws.agent.getQueue(\"{in_flight_target}\") (queued entry) or ws.agent.status(\"{in_flight_target}\") for that messageId first."
         )
-        .await
-        .map_err(map_err)?;
-    let mut replace_report: Option<Value> = None;
-    if replace_pending {
-        if let Some(caller) = caller {
-            replace_report = Some(match &pending_to_replace {
-                Some(pid) => replace_pending_entry(api, caller, &agent_id, pid).await,
-                None => json!({ "replaced": false, "replaceOutcome": "none" }),
-            });
-        }
-    }
-    if let Some(sub) = watch_sender(api, ws, caller, &agent_id).await {
-        result["subscriptionId"] = json!(sub);
-        result["message"] = json!(SENDER_WATCH_NOTIFICATION);
-    }
-    let mut out = merge_ok(result);
-    if let Some(obj) = out.as_object_mut() {
-        obj.insert("agentId".to_string(), json!(agent_id_str));
-        if let Some(delivery) = delivery_outcome(obj) {
-            obj.insert("delivery".to_string(), json!(delivery));
-        }
-        merge_replace_report(obj, replace_report);
-    }
-    Ok(out)
+    })
+    .await
 }
 
 /// `ws.agent.sendToTask`. Same single-pending-message guard as [`send`],
@@ -675,11 +752,14 @@ async fn send(
 /// `replaceOutcome: "reassigned"`. An agent caller passing
 /// `replacePending: true` always gets a replace report — the fall-through
 /// paths report `replaceOutcome: "none"` rather than silently ignoring the
-/// option.
+/// option. The daemon-side delivery is spawned and budget-bounded exactly
+/// like [`send`] (intent-hq/intent#5387); the op mints the message id
+/// itself, so the in-flight error names the task instead.
 async fn send_to_task(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
+    eval_budget: Duration,
     args: &Value,
 ) -> Result<Value, String> {
     let task_note_id =
@@ -710,53 +790,68 @@ async fn send_to_task(
             }
         }
     }
-    let mut result = api
-        .agent_send_to_task(
-            ws.clone(),
-            NoteId::from_string(&task_note_id),
-            message,
-            effective_priority(args),
-            sender_metadata(api, ws, caller, args).await,
+    let priority = effective_priority(args);
+    let metadata = sender_metadata(api, ws, caller, args).await;
+    let api = api.clone();
+    let ws = ws.clone();
+    let caller = caller.cloned();
+    let in_flight_task = task_note_id.clone();
+    let wait_ms = send_wait_ceiling(eval_budget).as_millis();
+    let delivery = async move {
+        let mut result = api
+            .agent_send_to_task(
+                ws.clone(),
+                NoteId::from_string(&task_note_id),
+                message,
+                priority,
+                metadata,
+            )
+            .await
+            .map_err(map_err)?;
+        let target = result
+            .get("agentId")
+            .and_then(Value::as_str)
+            .map(AgentId::from);
+        let mut replace_report: Option<Value> = None;
+        if replace_pending {
+            if let Some(caller_id) = caller.as_ref() {
+                replace_report = Some(match (&pending_to_replace, &guard_target) {
+                    (Some(pid), Some(gt)) if target.as_ref() == Some(gt) => {
+                        replace_pending_entry(&api, caller_id, gt, pid).await
+                    }
+                    (Some(_), Some(_)) => {
+                        // The op resolved a different assignee (or none) than the
+                        // guard did — the pending entry sits in the old assignee's
+                        // queue while the new message went elsewhere. Retract
+                        // nothing and say so instead of reporting a false replace.
+                        json!({ "replaced": false, "replaceOutcome": "reassigned" })
+                    }
+                    _ => json!({ "replaced": false, "replaceOutcome": "none" }),
+                });
+            }
+        }
+        if let Some(target) = target {
+            if let Some(sub) = watch_sender(&api, &ws, caller.as_ref(), &target).await {
+                result["subscriptionId"] = json!(sub);
+                result["message"] = json!(SENDER_WATCH_NOTIFICATION);
+            }
+        }
+        let mut out = merge_ok(result);
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("taskNoteId".to_string(), json!(task_note_id));
+            if let Some(delivery) = delivery_outcome(obj) {
+                obj.insert("delivery".to_string(), json!(delivery));
+            }
+            merge_replace_report(obj, replace_report);
+        }
+        Ok(out)
+    };
+    spawn_send_within_budget(eval_budget, delivery, move || {
+        format!(
+            "agent.sendToTask for task {in_flight_task} is still in flight after {wait_ms}ms: the daemon has not yet confirmed delivery to the assignee. The send was NOT cancelled and is not lost — it completes in the background. Do NOT re-send blindly: check the assignee's queue via ws.agent.getQueue (or ws.agent.status) for your message first."
         )
-        .await
-        .map_err(map_err)?;
-    let target = result
-        .get("agentId")
-        .and_then(Value::as_str)
-        .map(AgentId::from);
-    let mut replace_report: Option<Value> = None;
-    if replace_pending {
-        if let Some(caller_id) = caller {
-            replace_report = Some(match (&pending_to_replace, &guard_target) {
-                (Some(pid), Some(gt)) if target.as_ref() == Some(gt) => {
-                    replace_pending_entry(api, caller_id, gt, pid).await
-                }
-                (Some(_), Some(_)) => {
-                    // The op resolved a different assignee (or none) than the
-                    // guard did — the pending entry sits in the old assignee's
-                    // queue while the new message went elsewhere. Retract
-                    // nothing and say so instead of reporting a false replace.
-                    json!({ "replaced": false, "replaceOutcome": "reassigned" })
-                }
-                _ => json!({ "replaced": false, "replaceOutcome": "none" }),
-            });
-        }
-    }
-    if let Some(target) = target {
-        if let Some(sub) = watch_sender(api, ws, caller, &target).await {
-            result["subscriptionId"] = json!(sub);
-            result["message"] = json!(SENDER_WATCH_NOTIFICATION);
-        }
-    }
-    let mut out = merge_ok(result);
-    if let Some(obj) = out.as_object_mut() {
-        obj.insert("taskNoteId".to_string(), json!(task_note_id));
-        if let Some(delivery) = delivery_outcome(obj) {
-            obj.insert("delivery".to_string(), json!(delivery));
-        }
-        merge_replace_report(obj, replace_report);
-    }
-    Ok(out)
+    })
+    .await
 }
 
 async fn subscribe(
@@ -2007,6 +2102,30 @@ mod tests {
         assert_eq!(outcome(&json!({ "ok": false, "refused": true })), None);
     }
 
+    /// intent-hq/intent#5387: the send wait holds back a margin from the
+    /// eval budget (28s on the 30s default) and never collapses to zero on a
+    /// compressed budget (half of it at most).
+    #[test]
+    fn send_wait_ceiling_holds_back_margin_but_never_collapses() {
+        assert_eq!(
+            send_wait_ceiling(Duration::from_secs(30)),
+            Duration::from_secs(28)
+        );
+        assert_eq!(
+            send_wait_ceiling(Duration::from_millis(400)),
+            Duration::from_millis(200)
+        );
+        assert_eq!(send_wait_ceiling(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// The pre-minted send id has the services-side `user-msg-<uuid>` shape.
+    #[test]
+    fn new_send_message_id_has_user_msg_shape() {
+        let id = new_send_message_id();
+        let suffix = id.strip_prefix("user-msg-").expect("user-msg- prefix");
+        assert!(uuid::Uuid::parse_str(suffix).is_ok(), "{id}");
+    }
+
     /// The store-only fallback's persist-only success (`queued: false`, no
     /// `turnId`) drives no turn — it must NOT claim `"delivered"`.
     #[test]
@@ -2139,9 +2258,16 @@ mod tests {
             });
             let api: Arc<dyn WorkspaceApi> = fake.clone();
             let ws = WorkspaceId::from_string("ws-1");
-            let out = dispatch(&api, &ws, None, "listSpecialists", &json!({}))
-                .await
-                .unwrap();
+            let out = dispatch(
+                &api,
+                &ws,
+                None,
+                Duration::from_secs(30),
+                "listSpecialists",
+                &json!({}),
+            )
+            .await
+            .unwrap();
             // The workspace's effective path reached the loader (project tier).
             assert_eq!(
                 *fake.received_path.lock().unwrap(),
@@ -2199,9 +2325,16 @@ mod tests {
                 received_path: std::sync::Mutex::new(None),
             });
             let ws = WorkspaceId::from_string("ws-1");
-            let err = dispatch(&api, &ws, None, "listSpecialistsX", &json!({}))
-                .await
-                .unwrap_err();
+            let err = dispatch(
+                &api,
+                &ws,
+                None,
+                Duration::from_secs(30),
+                "listSpecialistsX",
+                &json!({}),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err, "host: unknown method `agent.listSpecialistsX`");
         }
     }

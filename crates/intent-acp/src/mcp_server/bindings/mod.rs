@@ -136,7 +136,8 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
 /// to the top-level-only rule instead of a settings toggle.
 /// `eval_budget` is the caller's effective `workspace_api` wall-clock budget,
 /// so bindings that wait on a process (`ws.script.run`) can refuse a wait the
-/// transport could never honor.
+/// transport could never honor, and `ws.agent.send` / `sendToTask` can bound
+/// their wait on the (spawned, cancellation-safe) daemon-side delivery.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -193,7 +194,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("agent.") {
-        return agent::dispatch(api, workspace_id, caller_agent_id, rest, args)
+        return agent::dispatch(api, workspace_id, caller_agent_id, eval_budget, rest, args)
             .await
             .map(Some);
     }
