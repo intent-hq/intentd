@@ -5,15 +5,16 @@ use std::path::PathBuf;
 use git2::{Repository, Signature};
 use intent_core::events::AGENT_IDLE;
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Event, EventActor, Note, NoteId,
-    NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, Event, EventActor, Note,
+    NoteId, NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_store::{NewTrackedChange, Store};
 use serde_json::json;
 
 use crate::auto_commit::{
-    is_meaningful_agent_name, is_normal_finish_reason, normalize_subject, parse_commit_message_json,
+    is_generation_timeout, is_meaningful_agent_name, is_normal_finish_reason, normalize_subject,
+    parse_commit_message_json,
 };
 use crate::Services;
 
@@ -789,6 +790,203 @@ async fn generation_timeout_falls_back_to_subject() {
     let (_a, _l, message) = last_commit_trailers(&repo.dir);
     // Fell back to the agent name.
     assert!(message.starts_with("Timeout Agent"), "got: {message}");
+}
+
+/// intent-hq/intent#5454: the generation budget is 60 s (up from 30 s) so a
+/// loaded host produces a real message instead of the fallback subject. The
+/// §5.32 120 s `timeoutMs` cap is a compile-time assertion next to the constant.
+#[test]
+fn generation_budget_is_sixty_seconds() {
+    assert_eq!(crate::auto_commit::GENERATION_TIMEOUT_MS, 60_000);
+}
+
+/// intent-hq/intent#5454: only budget exhaustion (auggie / ACP timeouts, or
+/// the whole budget spent queued for an adapter slot) starts the cool-down.
+/// The ACP route wraps transport / JSON-RPC failures as `Error::Internal`
+/// too, so a provider error that merely *mentions* a timeout must not count.
+#[test]
+fn is_generation_timeout_classifies_budget_exhaustion_only() {
+    assert!(is_generation_timeout(&Error::Internal(
+        "One-shot completion timed out after 60000ms".into()
+    )));
+    assert!(is_generation_timeout(&Error::Internal(
+        "claude: one-shot prompt timed out".into()
+    )));
+    assert!(is_generation_timeout(&Error::Internal(
+        "claude: one-shot session setup timed out".into()
+    )));
+    assert!(is_generation_timeout(&Error::AdapterBusy {
+        provider: "auggie".into(),
+        waited_ms: 60_000,
+        limit: 4,
+    }));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "auggie exited with status 3".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "auggie binary not found".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "claude: one-shot transport failed: request timed out".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "claude: adapter returned an error: upstream request timed out (-32000)".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "claude: adapter exited before completing the turn: exit status: 1; stderr: timed out"
+            .into()
+    )));
+}
+
+/// Fake auggie that counts its invocations in a `calls` file beside the
+/// script, hangs on the FIRST call (so the compressed budget times it out) and
+/// answers a well-formed commit message on every later call. Lets the
+/// cool-down tests tell "skipped up front" (call count unchanged, fallback
+/// subject) from "generation ran again" (call count grew, generated subject).
+#[cfg(unix)]
+fn fake_auggie_hang_once(tag: &str) -> (tempfile::TempDir, PathBuf) {
+    fake_auggie(
+        tag,
+        r#"calls="$(dirname "$0")/calls"
+n=$(cat "$calls" 2>/dev/null || echo 0)
+echo $((n+1)) > "$calls"
+if [ "$n" -eq 0 ]; then sleep 60; fi
+printf '{"subject": "feat: generated after cool-down"}'"#,
+    )
+}
+
+#[cfg(unix)]
+fn fake_auggie_calls(bin_dir: &tempfile::TempDir) -> u32 {
+    std::fs::read_to_string(bin_dir.path().join("calls"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Re-dirty `change.txt` after an auto-commit landed it, and re-attribute it
+/// so the next idle has something to commit again.
+#[cfg(unix)]
+async fn redirty_change(repo: &GitRepo, svc: &Services, ws: &WorkspaceId, agent: &str) {
+    std::fs::write(repo.dir.join("change.txt"), "agent edit, again\n").unwrap();
+    attribute_dirty_change(svc, ws, agent).await;
+}
+
+/// intent-hq/intent#5454: after a generation timeout the workspace enters a
+/// cool-down — the next idle within the window skips generation up front (no
+/// CLI spawn, no second wait on the budget) and commits the fallback subject.
+#[cfg(unix)]
+#[tokio::test]
+async fn generation_timeout_starts_cooldown_that_skips_next_generation() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (bin_dir, bin) = fake_auggie_hang_once("cooldown");
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc
+        .with_auggie_bin(bin)
+        .with_settings_registry(registry)
+        .with_auto_commit_timeout_ms(250)
+        .with_auto_commit_cooldown_ms(60_000);
+    let agent = session("agent-c1", &ws_id, None, false, "Cooldown Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-c1").await;
+
+    // First idle: the CLI hangs, the budget elapses, fallback subject lands.
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c1", "end_turn"))
+        .await;
+    assert_eq!(fake_auggie_calls(&bin_dir), 1);
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("Cooldown Agent"), "got: {message}");
+
+    // Second idle inside the window: generation is skipped up front — the CLI
+    // (which would now answer successfully) is never spawned.
+    redirty_change(&repo, &svc, &ws_id, "agent-c1").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c1", "end_turn"))
+        .await;
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        1,
+        "generation ran again inside the cool-down window"
+    );
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("Cooldown Agent"), "got: {message}");
+}
+
+/// intent-hq/intent#5454: the cool-down expires — once the window has passed
+/// the next idle attempts generation again (and, here, succeeds).
+#[cfg(unix)]
+#[tokio::test]
+async fn generation_cooldown_expires_and_generation_resumes() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (bin_dir, bin) = fake_auggie_hang_once("cooldown-expiry");
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc
+        .with_auggie_bin(bin)
+        .with_settings_registry(registry)
+        .with_auto_commit_timeout_ms(250)
+        .with_auto_commit_cooldown_ms(300);
+    let agent = session("agent-c2", &ws_id, None, false, "Expiry Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-c2").await;
+
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c2", "end_turn"))
+        .await;
+    assert_eq!(fake_auggie_calls(&bin_dir), 1);
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("Expiry Agent"), "got: {message}");
+
+    // Outlive the compressed 300 ms window, then idle again: generation runs
+    // and this time the CLI answers.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    redirty_change(&repo, &svc, &ws_id, "agent-c2").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c2", "end_turn"))
+        .await;
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        2,
+        "generation did not resume after the cool-down expired"
+    );
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(
+        message.starts_with("feat: generated after cool-down"),
+        "got: {message}"
+    );
+}
+
+/// intent-hq/intent#5454: a non-timeout generation failure (here: a
+/// non-zero exit) does NOT start the cool-down — only timeouts do.
+#[cfg(unix)]
+#[tokio::test]
+async fn non_timeout_generation_failure_does_not_start_cooldown() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (bin_dir, bin) = fake_auggie(
+        "cooldown-exit",
+        r#"calls="$(dirname "$0")/calls"
+n=$(cat "$calls" 2>/dev/null || echo 0)
+echo $((n+1)) > "$calls"
+exit 3"#,
+    );
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc
+        .with_auggie_bin(bin)
+        .with_settings_registry(registry)
+        .with_auto_commit_cooldown_ms(60_000);
+    let agent = session("agent-c3", &ws_id, None, false, "Exit Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-c3").await;
+
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c3", "end_turn"))
+        .await;
+    assert_eq!(fake_auggie_calls(&bin_dir), 1);
+    redirty_change(&repo, &svc, &ws_id, "agent-c3").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c3", "end_turn"))
+        .await;
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        2,
+        "a non-timeout failure must not suppress the next generation"
+    );
 }
 
 #[cfg(unix)]

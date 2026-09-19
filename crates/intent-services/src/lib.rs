@@ -486,9 +486,20 @@ pub struct Services {
     one_shot_npx: Option<Option<PathBuf>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
-    /// idle auto-commit path uses its ~30s default; tests compress it so the
+    /// idle auto-commit path uses its 60s default; tests compress it so the
     /// timeout-fallback path completes in milliseconds.
     auto_commit_timeout_ms: Option<u64>,
+    /// Test-only override (milliseconds) for the per-workspace auto-commit
+    /// generation cool-down (intent-hq/intent#5454). Production composition
+    /// leaves this `None` and the idle auto-commit path resolves the window
+    /// from `INTENTD_AUTO_COMMIT_COOLDOWN_MS` or its 10-minute default.
+    auto_commit_cooldown_ms: Option<u64>,
+    /// Per-workspace auto-commit generation cool-down: the instant the last
+    /// generation for that workspace timed out (intent-hq/intent#5454). While
+    /// an entry is younger than the cool-down window the idle path skips
+    /// generation up front and commits the fallback subject. In-memory only,
+    /// shared across clones like the other registries.
+    auto_commit_cooldowns: Arc<Mutex<HashMap<WorkspaceId, std::time::Instant>>>,
     /// Daemon-global parent→child completion-watch registry (AS-2). One table
     /// for all workspaces: each watch/group carries its own workspace anchors
     /// (parent home + child workspace), so the same code path serves
@@ -1242,6 +1253,8 @@ impl Services {
             branches_ls_remote_base: None,
             one_shot_npx: None,
             auto_commit_timeout_ms: None,
+            auto_commit_cooldown_ms: None,
+            auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
@@ -4124,12 +4137,23 @@ impl Services {
     }
 
     /// Override the auto-commit message generation timeout (defaults to the
-    /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
+    /// 60s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
     /// the timeout-fallback path completes in milliseconds. Its only callers
     /// spawn a fake CLI via a shell script, so they (and it) are unix-only.
     #[cfg(all(test, unix))]
     pub(crate) fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
         self.auto_commit_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Override the per-workspace auto-commit generation cool-down window
+    /// (defaults to `GENERATION_COOLDOWN_MS` in `auto_commit`, or the
+    /// `INTENTD_AUTO_COMMIT_COOLDOWN_MS` env seam). Tests compress it so the
+    /// cool-down expiry path completes in milliseconds; unix-only for the same
+    /// reason as [`Self::with_auto_commit_timeout_ms`].
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_auto_commit_cooldown_ms(mut self, ms: u64) -> Self {
+        self.auto_commit_cooldown_ms = Some(ms);
         self
     }
 

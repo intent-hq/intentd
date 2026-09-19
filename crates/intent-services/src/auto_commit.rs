@@ -10,11 +10,17 @@
 //! monorepo#4223), the session opted out via `skip_auto_commit`, or the
 //! `agent:idle` finish reason is non-normal (`error`/`cancelled`/
 //! `provider_stopped`/`refusal`).
+//!
+//! Commit-message generation is bounded by [`GENERATION_TIMEOUT_MS`] and,
+//! after a timeout, skipped for the workspace for [`GENERATION_COOLDOWN_MS`]
+//! (intent-hq/intent#5454); either way the commit lands with the
+//! deterministic fallback subject (monorepo#4032).
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use intent_core::events::AGENT_IDLE;
-use intent_core::{AgentId, AgentSession, Error, Event, NoteId, WorkspaceApi};
+use intent_core::{AgentId, AgentSession, Error, Event, NoteId, WorkspaceApi, WorkspaceId};
 use intent_git::commit::{CLEAN_TREE_ERROR, PARTIAL_MERGE_COMMIT_ERROR};
 
 use crate::events::SubscriptionFilter;
@@ -39,8 +45,11 @@ const DIFF_CAP_BYTES: usize = 64 * 1024;
 const AGENTS_MD_CAP_BYTES: usize = 8 * 1024;
 /// Recent commit subjects for style mimicry (~10 commits).
 const RECENT_COMMITS_LIMIT: usize = 10;
-/// Generation timeout (~30 s) — acceptable latency on idle before falling
-/// back. Tests compress it via [`crate::Services::with_auto_commit_timeout_ms`].
+/// Generation timeout (60 s) — acceptable latency on idle before falling
+/// back. Raised from 30 s (intent-hq/intent#5454): under host load the
+/// one-shot completion was routinely slower than the old budget, so every
+/// affected idle paid the wait AND landed the fallback subject. Tests
+/// compress it via [`crate::Services::with_auto_commit_timeout_ms`].
 ///
 /// This is auto-commit's OWN budget, passed as `agent.completeOnce`'s
 /// `timeoutMs` (§5.32) — generation never runs through the interactive
@@ -48,7 +57,18 @@ const RECENT_COMMITS_LIMIT: usize = 10;
 /// deterministic [`Services::build_auto_commit_subject`] fallback rather than
 /// failing the commit (monorepo#4032). Must stay within §5.32's 120 s
 /// `timeoutMs` cap, which the op silently applies.
-const GENERATION_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const GENERATION_TIMEOUT_MS: u64 = 60_000;
+const _: () = assert!(GENERATION_TIMEOUT_MS <= crate::enhance_ops::MAX_TIMEOUT_MS);
+/// Per-workspace cool-down after a generation timeout (10 min): while the
+/// previous generation for the same workspace timed out this recently, the
+/// idle path skips generation up front and commits the fallback subject, so a
+/// host that still cannot finish within the budget does not pay the full wait
+/// on every idle (intent-hq/intent#5454). In-memory only; overridable via
+/// `INTENTD_AUTO_COMMIT_COOLDOWN_MS` (`0` disables the cool-down) and, in
+/// tests, [`crate::Services::with_auto_commit_cooldown_ms`].
+const GENERATION_COOLDOWN_MS: u64 = 10 * 60 * 1000;
+/// Env seam for [`GENERATION_COOLDOWN_MS`] (milliseconds).
+const GENERATION_COOLDOWN_ENV: &str = "INTENTD_AUTO_COMMIT_COOLDOWN_MS";
 
 /// Cap on the raw LLM output logged (at debug level) when parsing fails.
 const RAW_OUTPUT_LOG_CAP_CHARS: usize = 500;
@@ -62,6 +82,30 @@ fn is_normal_finish_reason(reason: Option<&str>) -> bool {
         reason,
         Some("end_turn" | "max_tokens" | "max_turn_requests" | "stream_complete")
     )
+}
+
+/// Whether a `agent.completeOnce` failure is the generation budget running
+/// out — the only failure that starts the per-workspace cool-down. Matches
+/// the exact shapes the two routes emit: the auggie route's
+/// `run_auggie_print` timeout ("One-shot completion timed out after Nms"),
+/// the ACP route's `OneShotError::SetupTimeout` / `PromptTimeout` wrapped
+/// as `"{provider}: {err}"`, and [`Error::AdapterBusy`] (the whole budget
+/// spent queued for an adapter slot: the same "loaded host" symptom, nothing
+/// was ever generated). The ACP route also wraps transport / JSON-RPC
+/// failures as `Error::Internal`, and their free-text bodies may mention a
+/// timeout, so a bare `contains("timed out")` is deliberately not used:
+/// non-budget failures (missing CLI, non-zero exit, RPC errors) do not cool
+/// down — retrying them next idle is cheap.
+fn is_generation_timeout(err: &Error) -> bool {
+    match err {
+        Error::AdapterBusy { .. } => true,
+        Error::Internal(msg) => {
+            msg.starts_with("One-shot completion timed out after ")
+                || msg.ends_with(": one-shot session setup timed out")
+                || msg.ends_with(": one-shot prompt timed out")
+        }
+        _ => false,
+    }
 }
 
 /// Whether an agent's display name was set explicitly by an `agent.rename` /
@@ -343,6 +387,18 @@ impl Services {
         session: &AgentSession,
         linked_note_id: Option<&NoteId>,
     ) -> Option<String> {
+        // Cool-down (intent-hq/intent#5454): the previous generation for this
+        // workspace timed out recently, so skip up front instead of paying the
+        // budget again on every idle. Expired entries are dropped here.
+        if let Some(remaining) = self.auto_commit_cooldown_remaining(&session.workspace_id) {
+            tracing::debug!(
+                workspace = %session.workspace_id.0,
+                cooldown_remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+                "generate_auto_commit_message: skipped, cool-down active after a recent timeout"
+            );
+            return None;
+        }
+
         // Skip generation entirely when there are no uncommitted changes.
         // Use diff_index_to_workdir (includes untracked) since auto-commit
         // stages everything via git_agent_commit.
@@ -440,6 +496,8 @@ impl Services {
         // Call agent_complete_once_op. With no explicit model, the `commit`
         // quick-action type lets the op apply the user's
         // `quickActions.typeOverrides["commit"]` (monorepo#1734).
+        let timeout_ms = self.auto_commit_timeout_ms.unwrap_or(GENERATION_TIMEOUT_MS);
+        let started = Instant::now();
         let result = self
             .agent_complete_once_op(
                 prompt,
@@ -447,9 +505,10 @@ impl Services {
                 None,
                 Some("commit".to_string()),
                 Some(session.workspace_id.clone()),
-                Some(self.auto_commit_timeout_ms.unwrap_or(GENERATION_TIMEOUT_MS)),
+                Some(timeout_ms),
             )
             .await;
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         match result {
             Ok(value) => {
@@ -457,12 +516,14 @@ impl Services {
                 if let Some(msg) = parse_commit_message_json(text) {
                     tracing::debug!(
                         workspace = %session.workspace_id.0,
+                        elapsed_ms,
                         "generate_auto_commit_message: success"
                     );
                     Some(msg)
                 } else {
                     tracing::warn!(
                         workspace = %session.workspace_id.0,
+                        elapsed_ms,
                         "generate_auto_commit_message: unparseable output (no JSON object with a non-empty subject)"
                     );
                     let raw: String = text.chars().take(RAW_OUTPUT_LOG_CAP_CHARS).collect();
@@ -475,14 +536,66 @@ impl Services {
                 }
             }
             Err(e) => {
+                // A timeout arms the per-workspace cool-down so the next idles
+                // fall straight to the fallback subject instead of waiting out
+                // the budget again; the warn line says whether it did so the
+                // log scan can tell "slow host" from "broken generation".
+                let cooldown_active = is_generation_timeout(&e)
+                    && self.arm_auto_commit_cooldown(&session.workspace_id);
                 tracing::warn!(
                     workspace = %session.workspace_id.0,
                     error = %e,
+                    elapsed_ms,
+                    timeout_ms,
+                    cooldown_active,
                     "generate_auto_commit_message: generation failed"
                 );
                 None
             }
         }
+    }
+
+    /// The configured cool-down window: test override → env seam → default.
+    fn auto_commit_cooldown(&self) -> Duration {
+        let ms = self.auto_commit_cooldown_ms.unwrap_or_else(|| {
+            std::env::var(GENERATION_COOLDOWN_ENV)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(GENERATION_COOLDOWN_MS)
+        });
+        Duration::from_millis(ms)
+    }
+
+    /// Time left on the workspace's cool-down, or `None` when no generation
+    /// timed out within the window (an expired entry is removed on the way).
+    fn auto_commit_cooldown_remaining(&self, workspace_id: &WorkspaceId) -> Option<Duration> {
+        let window = self.auto_commit_cooldown();
+        let mut cooldowns = self
+            .auto_commit_cooldowns
+            .lock()
+            .expect("auto-commit cool-down registry poisoned");
+        let timed_out_at = cooldowns.get(workspace_id)?;
+        match window.checked_sub(timed_out_at.elapsed()) {
+            Some(remaining) if !remaining.is_zero() => Some(remaining),
+            _ => {
+                cooldowns.remove(workspace_id);
+                None
+            }
+        }
+    }
+
+    /// Record a generation timeout for `workspace_id`, starting its cool-down.
+    /// Returns whether a cool-down is now active (`false` when the window is
+    /// configured to zero, i.e. disabled).
+    fn arm_auto_commit_cooldown(&self, workspace_id: &WorkspaceId) -> bool {
+        if self.auto_commit_cooldown().is_zero() {
+            return false;
+        }
+        self.auto_commit_cooldowns
+            .lock()
+            .expect("auto-commit cool-down registry poisoned")
+            .insert(workspace_id.clone(), Instant::now());
+        true
     }
 }
 
