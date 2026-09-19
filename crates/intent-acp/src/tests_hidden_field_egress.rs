@@ -51,22 +51,47 @@ fn poison_map(obj: &mut Map<String, Value>) {
     }
 }
 
+/// Candidate sentinel values for a hidden key on a TYPED struct, tried in
+/// order until the round trip type-checks: `bool`, `String`, number, array,
+/// object. All are non-null so an `Option<_>` field is populated (a `None`
+/// would be skipped on serialization and never reach the egress).
+fn typed_sentinel_candidates() -> [Value; 5] {
+    [
+        json!(true),
+        json!(SENTINEL),
+        json!(1),
+        json!([SENTINEL]),
+        json!({ "sentinel": SENTINEL }),
+    ]
+}
+
 /// Poison a typed wire struct: serialize, inject every hidden key, and
-/// deserialize back. A key that is a real (typed) field lands as `true` so
-/// the round trip type-checks — `serde` ignores keys the struct does not
-/// carry, which is the correct outcome for a hidden key that has no field on
-/// this type (it cannot reach the egress through it).
+/// deserialize back. For each key the first candidate from
+/// [`typed_sentinel_candidates`] that deserializes is kept, so a hidden key
+/// that is a real field of any common type lands populated without a fixture
+/// edit. `serde` ignores keys the struct does not carry (the first candidate
+/// then trivially succeeds), which is the correct outcome for a hidden key
+/// with no field on this type: it cannot reach the egress through it.
 fn poison_typed<T: serde::Serialize + serde::de::DeserializeOwned>(value: T) -> T {
     let type_name = std::any::type_name::<T>();
     let mut v = serde_json::to_value(value).expect("fixture serializes");
-    if let Some(obj) = v.as_object_mut() {
+    if v.is_object() {
         for key in AGENT_HIDDEN_FIELDS {
-            obj.insert((*key).to_string(), json!(true));
+            let accepted = typed_sentinel_candidates().into_iter().find(|candidate| {
+                let mut probe = v.clone();
+                probe[*key] = candidate.clone();
+                serde_json::from_value::<T>(probe).is_ok()
+            });
+            match accepted {
+                Some(candidate) => v[*key] = candidate,
+                None => panic!(
+                    "poison_typed: {type_name} field `{key}` accepts none of the sentinel candidates — extend `typed_sentinel_candidates`"
+                ),
+            }
         }
     }
-    serde_json::from_value(v).unwrap_or_else(|e| {
-        panic!("poison_typed: {type_name} rejected a `true` sentinel for a hidden field — extend the fixture: {e}")
-    })
+    serde_json::from_value(v)
+        .unwrap_or_else(|e| panic!("poison_typed: {type_name} round trip failed: {e}"))
 }
 
 /// Recursively find the first surviving hidden key; returns `(json_path, key)`.
@@ -712,17 +737,16 @@ fn fixture_is_poisoned_with_every_hidden_field() {
     let ws = WorkspaceId::from_string(WS);
     let agent = serde_json::to_value(stub_agent(TARGET, &ws)).unwrap();
     // Typed: only hidden keys that are real `AgentLite` fields can be
-    // present; each of those must carry the `true` sentinel, and at least
-    // one must exist or the typed egresses (`status` / `list`) are never
-    // really exercised.
+    // present; each of those must carry a populated (non-null) sentinel, and
+    // at least one must exist or the typed egresses (`status` / `list`) are
+    // never really exercised.
     let typed_hits = AGENT_HIDDEN_FIELDS
         .iter()
         .filter(|key| agent.get(**key).is_some())
         .inspect(|key| {
-            assert_eq!(
-                agent[**key],
-                json!(true),
-                "AgentLite fixture must carry {key}=true"
+            assert!(
+                !agent[**key].is_null(),
+                "AgentLite fixture must carry a populated {key}"
             );
         })
         .count();
