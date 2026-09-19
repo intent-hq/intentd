@@ -219,9 +219,10 @@ pub enum InviteErrorKind {
     /// The primary user's GitHub identity cannot change while other
     /// principals or open invites exist (reconnect guard).
     IdentityLocked,
-    /// Too many unauthenticated invite requests are in flight (the
-    /// transport's admission budget or the outstanding-nonce cap); retry
-    /// later.
+    /// The host is throttling unauthenticated invite requests: the
+    /// listener-wide start budget (a token bucket, so a burst of serial
+    /// requests trips it with nothing in flight) or the outstanding-nonce
+    /// cap is spent; retry later.
     FlowBusy,
     /// The workspace's guest cap (`sharing.maxGuestsPerWorkspace`) is spent
     /// by its collaborators plus open invites; no further invite is minted.
@@ -291,7 +292,7 @@ impl InviteErrorKind {
                  principals or open invites exist"
             }
             InviteErrorKind::FlowBusy => {
-                "internal error: too many invite requests in flight; retry shortly"
+                "internal error: the host is throttling invite requests; retry shortly"
             }
             InviteErrorKind::GuestLimit => {
                 "invalid params: this workspace has reached its guest limit (collaborators \
