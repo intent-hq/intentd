@@ -2018,11 +2018,25 @@ fn agent_list_row(mut agent: AgentLite) -> Option<Value> {
 /// event would upsert Chief into subscribed clients' lists.
 ///
 /// The re-read goes through `workspace.get` (a detail read), so the row is
-/// slimmed here with the same [`Workspace::slim_for_list`] pass the seq-0
-/// snapshot (`list_workspaces_lite`) applies: a pushed delta row carries the
-/// [`intent_core::WORKSPACE_LIST_ROW_KEYS`] allowlist keys within
-/// [`intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES`], never the detail-only
-/// `tokenUsage` / `setupScript` / `contextLinks` / uncapped PR pool.
+/// projected onto the `workspace.list` row shape with the same
+/// [`Workspace::slim_for_list`] pass `workspace.list` and the seq-0 snapshot
+/// (`list_workspaces_lite`) apply as their final step: a pushed delta row
+/// carries the [`intent_core::WORKSPACE_LIST_ROW_KEYS`] allowlist keys within
+/// [`intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES`], `pullRequests` capped at
+/// [`intent_core::WORKSPACE_LIST_PR_CAP`], `agentSummary` kept on active rows
+/// and dropped on archived ones, and never the detail-only `tokenUsage` /
+/// `setupScript` / `contextLinks` / uncapped PR pool.
+///
+/// The seq-0 snapshot rows are lighter than that on purpose: the lite path
+/// never computes `agentSummary` at all (intentd#743 — no sessions
+/// enrichment on the snapshot, on active rows too), and the documented
+/// contract (`docs/protocol/06-events.md`, `workspace.subscribe`) is that the
+/// omitted aggregate arrives via the enriched delta re-read. A delta row
+/// upserting `agentSummary` into an active snapshot row is therefore the
+/// intended rehydration, not a leak past the list shape — the FE HUD reads it
+/// from workspace-channel updates — and `agentSummary` is allowlisted and
+/// counted inside the row budget (the budget golden's worst case carries a
+/// ten-agent summary).
 pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
     let workspace_id = WorkspaceId::from(
         event
@@ -2056,8 +2070,13 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
 }
 
 /// Project a `workspace.get` re-read onto the `workspace.list` row shape
-/// ([`Workspace::slim_for_list`]) so a `workspace` channel delta row matches
-/// the lite seq-0 snapshot rows it upserts into.
+/// ([`Workspace::slim_for_list`]: allowlist keys, row budget, PR cap, active-row
+/// `agentSummary` kept / archived dropped) so a `workspace` channel delta row
+/// is a `workspace.list` row. The lite seq-0 snapshot rows it upserts into
+/// additionally omit `agentSummary` on every row (`list_workspaces_lite`,
+/// intentd#743) — see [`workspace_delta`]: the delta is the documented path
+/// by which that aggregate reaches the client, so it is deliberately not
+/// stripped here.
 fn workspace_list_row(mut ws: Workspace) -> Option<Value> {
     ws.slim_for_list();
     serde_json::to_value(ws).ok()
