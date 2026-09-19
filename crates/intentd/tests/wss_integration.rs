@@ -2528,6 +2528,295 @@ async fn wss_agent_list_caps_previews_get_serves_full() {
     srv.ws.stop().await;
 }
 
+/// Wait up to 10 s for the next `subscription.push` notification on `ws`,
+/// answering pings and skipping unrelated frames; returns its `params`
+/// (`{ subscriptionId, kind, seq, snapshot|delta }`).
+async fn next_subscription_push(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for subscription.push"
+        );
+        let next = tokio::time::timeout(remaining, ws.next())
+            .await
+            .expect("subscription.push timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "subscription.push" {
+                    return v["params"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// Assert `row` is an `agent.list`-projected row: every row / `metadata`
+/// key is inside the allowlist goldens (so no detail-only field such as
+/// `harnessFeatures` rides along), every render preview is capped to
+/// `AGENT_LIST_PREVIEW_BUDGET_BYTES`, and the serialized row fits
+/// `AGENT_LIST_ROW_BUDGET_BYTES`.
+fn assert_agent_list_projected_row(label: &str, row: &Value) {
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        AGENT_LIST_ROW_BUDGET_BYTES, AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS,
+    };
+    let obj = row.as_object().expect("row object");
+    let meta = row["metadata"].as_object().expect("metadata object");
+    assert!(
+        obj.get("harnessFeatures").is_none(),
+        "{label}: row must omit the detail-only harnessFeatures snapshot: {row}"
+    );
+    for (part, object, allow) in [
+        ("row", obj, AGENT_LIST_ROW_KEYS),
+        ("metadata", meta, AGENT_LIST_ROW_METADATA_KEYS),
+    ] {
+        let unlisted: Vec<&str> = object
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !allow.contains(k))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "{label}: {part} carries keys outside the agent.list allowlist golden: \
+             {unlisted:?}: {row}"
+        );
+    }
+    for (field, s) in [
+        ("lastAgentResponse", &row["lastAgentResponse"]),
+        ("lastUserMessage", &row["lastUserMessage"]),
+        ("digest", &row["digest"]),
+        (
+            "metadata.completionReport",
+            &row["metadata"]["completionReport"],
+        ),
+    ] {
+        assert_eq!(
+            s.as_str().map(str::len),
+            Some(AGENT_LIST_PREVIEW_BUDGET_BYTES),
+            "{label}: `{field}` must be capped like an agent.list row: {row}"
+        );
+    }
+    assert_eq!(
+        row["lastToolUse"]["inputTruncated"].as_bool(),
+        Some(true),
+        "{label}: lastToolUse preview must be capped: {row}"
+    );
+    let (total, per_key) = serialized_key_bytes(row);
+    assert!(
+        total <= AGENT_LIST_ROW_BUDGET_BYTES,
+        "{label}: row is {total} B, over AGENT_LIST_ROW_BUDGET_BYTES \
+         ({AGENT_LIST_ROW_BUDGET_BYTES} B)\n{}",
+        format_key_bytes_table(total, &per_key)
+    );
+}
+
+/// Push side of the list projection over the real WSS wire (§6.9 `agent`
+/// channel): a subscribed client whose agent's unprojected `agent.get` row
+/// carries `harnessFeatures` and exceeds `AGENT_LIST_ROW_BUDGET_BYTES`
+/// receives a seq-0 snapshot row AND a pushed `updated` delta row that both
+/// satisfy the `agent.list` key allowlist and row budget, while `agent.get`
+/// keeps serving the full detail.
+#[tokio::test]
+async fn wss_agent_subscribe_delta_rows_use_the_list_projection() {
+    const BUDGET: usize = intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES;
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Delta Cap"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Delta"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Grow the unprojected row well past the list row budget.
+    let long_user = format!("user ask starts {}", "u".repeat(BUDGET * 4));
+    let long_line = format!("final answer {}", "a".repeat(BUDGET * 4));
+    let long_digest = format!("digest {}", "d".repeat(BUDGET * 4));
+    let long_report = format!("report {}", "r".repeat(BUDGET * 4));
+    let user_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "agent.appendMessage",
+        "params": {
+            "agentId": agent_id, "role": "user",
+            "contentBlocks": [{ "type": "text", "text": long_user }],
+        },
+    });
+    wss_call(srv.port, srv.cfg.clone(), &user_frame.to_string()).await;
+    let assistant_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "agent.appendMessage",
+        "params": {
+            "agentId": agent_id, "role": "assistant",
+            "contentBlocks": [
+                {
+                    "type": "tool_use", "id": "m:0", "name": "write_file",
+                    "input": { "path": "/tmp/a.txt", "content": "x".repeat(BUDGET * 4) },
+                    "toolCallId": "t1",
+                },
+                {
+                    "type": "text",
+                    "text": format!("{long_line}\n<agent_digest>{long_digest}</agent_digest>"),
+                },
+            ],
+        },
+    });
+    wss_call(srv.port, srv.cfg.clone(), &assistant_frame.to_string()).await;
+    let update_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 5, "method": "agent.update",
+        "params": { "agentId": agent_id, "changes": { "completionReport": long_report } },
+    });
+    wss_call(srv.port, srv.cfg.clone(), &update_frame.to_string()).await;
+
+    // Sanity: the unprojected detail row carries `harnessFeatures` and is
+    // over budget, so the projection below is load-bearing.
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let detail = &got["result"]["agent"];
+    assert!(
+        detail["harnessFeatures"].is_object(),
+        "agent.get serves harnessFeatures: {detail}"
+    );
+    assert!(
+        intent_core::serialized_key_bytes(detail).0 > intent_core::AGENT_LIST_ROW_BUDGET_BYTES,
+        "fixture detail row must exceed AGENT_LIST_ROW_BUDGET_BYTES: {detail}"
+    );
+
+    // Subscribe to the workspace's `agent` collection channel on a held
+    // connection: `{ subscriptionId }` response, then the seq-0 snapshot.
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    let sub_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.subscribe","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    sub.send(Message::Text(sub_frame.into()))
+        .await
+        .expect("send agent.subscribe");
+    let mut sub_id: Option<String> = None;
+    let mut snapshot: Option<Value> = None;
+    while sub_id.is_none() || snapshot.is_none() {
+        let next = tokio::time::timeout(Duration::from_secs(10), sub.next())
+            .await
+            .expect("agent.subscribe frame timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "subscription.push" {
+                    snapshot = Some(v["params"].clone());
+                } else if v["id"] == 7 {
+                    sub_id = Some(
+                        v["result"]["subscriptionId"]
+                            .as_str()
+                            .expect("subscriptionId")
+                            .to_string(),
+                    );
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sub.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let sub_id = sub_id.unwrap();
+    let snapshot = snapshot.unwrap();
+    assert_eq!(snapshot["subscriptionId"], sub_id.as_str(), "{snapshot}");
+    assert_eq!(snapshot["kind"], "snapshot", "{snapshot}");
+    assert_eq!(snapshot["seq"], 0, "{snapshot}");
+    let snap_row = snapshot["snapshot"]
+        .as_array()
+        .expect("snapshot array")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("agent in seq-0 snapshot")
+        .clone();
+    assert_agent_list_projected_row("seq-0 snapshot row", &snap_row);
+
+    // Trigger a delta: `agent.rename` publishes `agent:renamed`, which the
+    // channel maps to `updated: [<agent.get re-read>]`.
+    let rename_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"agent.rename","params":{{"agentId":"{agent_id}","name":"Delta Renamed"}}}}"#
+    );
+    let renamed = wss_call(srv.port, srv.cfg.clone(), &rename_frame).await;
+    assert!(renamed["result"].is_object(), "agent.rename: {renamed}");
+
+    let delta = next_subscription_push(&mut sub).await;
+    assert_eq!(delta["subscriptionId"], sub_id.as_str(), "{delta}");
+    assert_eq!(delta["kind"], "delta", "{delta}");
+    let updated = delta["delta"]["updated"].as_array().expect("updated array");
+    let delta_row = updated
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("renamed agent in the pushed delta");
+    assert_eq!(delta_row["name"], "Delta Renamed", "{delta_row}");
+    assert_eq!(
+        delta_row["harnessVersion"].as_str(),
+        Some(intent_core::CURRENT_HARNESS_VERSION),
+        "delta rows keep the small harnessVersion label: {delta_row}"
+    );
+    assert_agent_list_projected_row("pushed delta row", delta_row);
+
+    // The detail read is unchanged: full previews and the harnessFeatures
+    // snapshot still come back from `agent.get`.
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let detail = &got["result"]["agent"];
+    assert_eq!(detail["name"], "Delta Renamed", "{detail}");
+    assert!(
+        detail["harnessFeatures"].is_object(),
+        "agent.get still serves harnessFeatures after the delta: {detail}"
+    );
+    assert_eq!(
+        detail["lastAgentResponse"].as_str(),
+        Some(long_line.as_str()),
+        "agent.get keeps the full lastAgentResponse"
+    );
+    assert_eq!(
+        detail["lastUserMessage"].as_str(),
+        Some(long_user.as_str()),
+        "agent.get keeps the full lastUserMessage"
+    );
+    assert_eq!(
+        detail["digest"].as_str(),
+        Some(long_digest.as_str()),
+        "agent.get keeps the full digest"
+    );
+    assert_eq!(
+        detail["metadata"]["completionReport"].as_str(),
+        Some(long_report.as_str()),
+        "agent.get keeps the full metadata.completionReport"
+    );
+    assert_eq!(
+        detail["lastToolUse"]["input"]["content"]
+            .as_str()
+            .map(str::len),
+        Some(BUDGET * 4),
+        "agent.get keeps the full lastToolUse input"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// monorepo#3041 over the real WSS wire (§5.1): `workspace.list` rows omit
 /// `tokenUsage` entirely (absent, never null) and archived rows additionally
 /// omit `agentSummary`, while active rows keep it; the `workspace.subscribe`
