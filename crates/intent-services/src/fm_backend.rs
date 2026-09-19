@@ -198,6 +198,11 @@ impl FmBackend {
         FmAvailability::unavailable("fm backend requires macOS 27 (host is not macOS)")
     }
 
+    /// Recording happens inside the initializer, so exactly one waiter — the
+    /// one whose probe actually runs — records the verdict, before the
+    /// in-flight slot is released. Followers only clone the shared result: a
+    /// late-polled follower can never re-record an old verdict over a newer
+    /// probe's, nor extend its freshness.
     async fn run_and_record(&self, bin: &Path, cell: &InflightCell) -> FmAvailability {
         let verdict = cell
             .get_or_init(|| async {
@@ -209,14 +214,14 @@ impl FmBackend {
                     bin = %bin.display(),
                     "fm probe completed"
                 );
+                *self.cache.lock().expect("fm cache poisoned") = Some(CachedVerdict {
+                    verdict: verdict.clone(),
+                    probed_at: Instant::now(),
+                });
                 verdict
             })
             .await
             .clone();
-        *self.cache.lock().expect("fm cache poisoned") = Some(CachedVerdict {
-            verdict: verdict.clone(),
-            probed_at: Instant::now(),
-        });
         self.finish_inflight(cell);
         verdict
     }
@@ -294,14 +299,27 @@ async fn run_fm(bin: &Path, args: &[&str], timeout: Duration) -> FmRun {
     }
 }
 
-/// First non-empty stderr line, for a compact reason string.
+/// Longest stderr excerpt carried into a reason string (and thus into logs).
+const STDERR_SUMMARY_MAX_CHARS: usize = 200;
+
+/// First non-empty stderr line, sanitized for a reason string that reaches
+/// clients and logs: control characters (and any embedded newline / escape
+/// sequence) are dropped and the line is bounded at
+/// [`STDERR_SUMMARY_MAX_CHARS`] characters with a `…` marker.
 fn stderr_summary(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .to_string()
+    let raw = String::from_utf8_lossy(&output.stderr);
+    let Some(line) = raw.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return String::new();
+    };
+    let mut out: String = line
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(STDERR_SUMMARY_MAX_CHARS)
+        .collect();
+    if line.chars().filter(|c| !c.is_control()).count() > STDERR_SUMMARY_MAX_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 /// Run one probe subcommand and map its outcome to an unavailability reason,
@@ -538,6 +556,92 @@ mod tests {
         assert!(a.available && b.available && c.available);
         assert_eq!(calls(&log), vec!["available", "license --status"]);
         assert!(backend.inflight.lock().unwrap().is_none(), "slot released");
+    }
+
+    /// Drive `f` through exactly one poll; `Some` when it completed.
+    async fn poll_once<F: std::future::Future + Unpin>(f: &mut F) -> Option<F::Output> {
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match std::pin::Pin::new(&mut *f).poll(cx) {
+                std::task::Poll::Ready(v) => Some(v),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await
+    }
+
+    async fn wait_until_cached_available(backend: &FmBackend) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !backend.cached().is_some_and(|v| v.available) {
+            assert!(Instant::now() < deadline, "refresh never landed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn late_follower_does_not_overwrite_newer_verdict() {
+        let (dir, bin, log) = fake_fm(
+            "late-follower",
+            "echo \"$*\" >> \"$LOG\"\n[ -e \"$(dirname \"$LOG\")/ready\" ] || exit 1\nexit 0",
+        );
+        let backend = backend(bin, Duration::ZERO);
+
+        let a = backend.probe();
+        let follower = backend.probe();
+        tokio::pin!(a);
+        tokio::pin!(follower);
+        assert!(poll_once(&mut a).await.is_none(), "A is in flight");
+        assert!(
+            poll_once(&mut follower).await.is_none(),
+            "follower joined A's cell"
+        );
+
+        let first = a.await;
+        assert!(!first.available);
+        assert_eq!(backend.cached(), Some(first.clone()));
+        assert_eq!(calls(&log).len(), 1);
+        assert!(
+            backend.inflight.lock().unwrap().is_none(),
+            "A released the slot"
+        );
+
+        std::fs::write(dir.path().join("ready"), "").unwrap();
+        let served = backend.probe().await;
+        assert_eq!(served, first, "stale A is served while B refreshes");
+        wait_until_cached_available(&backend).await;
+        let b = backend.cached().unwrap();
+        assert_eq!(b, FmAvailability::available());
+
+        let late = follower.await;
+        assert_eq!(late, first, "follower still sees the verdict it joined");
+        assert_eq!(backend.cached(), Some(b), "B must not be overwritten by A");
+        assert_eq!(
+            calls(&log),
+            vec!["available", "available", "license --status"],
+            "the follower spawned nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_summary_is_single_line_bounded_and_control_free() {
+        let long = "x".repeat(STDERR_SUMMARY_MAX_CHARS + 50);
+        let (_dir, bin, _log) = fake_fm(
+            "stderr",
+            &format!(
+                "printf '\\n  \\033[31mbad\\tthing\\033[0m {long}\\nsecond line\\n' >&2\nexit 7"
+            ),
+        );
+        let v = backend(bin, LONG_TTL).probe().await;
+        let reason = v.reason.unwrap();
+        assert!(
+            reason.starts_with("`fm available` exited with code 7: "),
+            "{reason}"
+        );
+        let summary = reason.split_once(": ").unwrap().1;
+        assert!(summary.starts_with("[31mbad"), "{summary}");
+        assert!(!summary.contains("second line"), "{summary}");
+        assert!(summary.ends_with('…'), "{summary}");
+        assert_eq!(summary.chars().count(), STDERR_SUMMARY_MAX_CHARS + 1);
+        assert!(summary.chars().all(|c| !c.is_control()), "{summary}");
     }
 
     #[test]
