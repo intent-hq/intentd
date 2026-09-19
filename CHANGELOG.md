@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.83] - 2026-09-19
+
+### 🚀 Features
+
+- *(rpc)* Slim agent.list / workspace.list rows, scope filter, push-side projection ([#2001](https://github.com/intent-hq/intentd/pull/2001))
+
+### 🐛 Bug Fixes
+
+- *(agent_session)* Raise blocker attention on post-output transient fetch failure ([#2004](https://github.com/intent-hq/intentd/pull/2004))
+
+
 ## [0.9.82] - 2026-09-19
 
 ### 🐛 Bug Fixes
