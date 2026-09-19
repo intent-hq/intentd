@@ -11025,6 +11025,134 @@ mod wsapi4_bindings_tests {
         assert!(t.contains(&id), "error named the id that landed: {t}");
     }
 
+    /// intent-hq/intent#5387: the send's wait is bounded by the eval budget's
+    /// REMAINING time, not a fresh full budget. An earlier host frame in the
+    /// same eval (`getQueue`, held by the test) spends 1.8 s of a 3 s budget
+    /// before the send starts. A full-budget wait (3 s − 1.5 s margin) would
+    /// end at 3.3 s — past the eval timeout — and the caller would get the
+    /// generic timeout instead of the in-flight id; the remaining-time wait
+    /// (1.2 s − 0.6 s margin) returns the named error inside the budget, and
+    /// the send still lands once released.
+    #[tokio::test]
+    async fn agent_send_after_budget_partly_spent_still_names_in_flight_id() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(3000));
+        let queue_hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_get_queue_hold.lock().unwrap() = Some(queue_hold.clone());
+        let send_hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(send_hold.clone());
+        let queue_guard = queue_hold.lock().await;
+        let send_guard = send_hold.lock().await;
+
+        // Elapsed eval time is the condition under test: nothing observable
+        // stands in for the wall clock, so the earlier frame is held for a
+        // fixed slice of the budget before it is released.
+        let spend_budget_then_release = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+            drop(queue_guard);
+        };
+        let (resp, ()) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                call(
+                    &srv,
+                    "await ws.agent.getQueue('agent-target'); \
+                     return await ws.agent.send('agent-target', 'hello', 'queue');",
+                ),
+            ),
+            spend_budget_then_release,
+        );
+        let resp = resp.expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("user-msg-") && t.contains("agent-target"),
+            "the in-flight error must still name the id when budget was already spent: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the send is still parked behind the held enqueue"
+        );
+
+        drop(send_guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must land after the enqueue is released");
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one enqueue: {calls:?}");
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "error named the id that landed: {t}");
+    }
+
+    /// intent-hq/intent#5387: once the binding has returned the in-flight
+    /// error, the detached send's eventual outcome must stay observable. The
+    /// error must describe an UNCONFIRMED attempt (no delivery guarantee),
+    /// and a send that then FAILS is logged as a WARN naming the pre-minted
+    /// id and the failure, not silently dropped with the `JoinHandle`.
+    #[tokio::test]
+    async fn agent_send_late_failure_after_timeout_is_logged_not_swallowed() {
+        let capture = crate::tests::WarnCapture::default();
+        let _subscriber = capture.set_as_default();
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(hold.clone());
+        *api.agent_send_error.lock().unwrap() = Some("store pool exhausted".to_string());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("UNCONFIRMED") && t.contains("fail late"),
+            "the in-flight error must not promise delivery: {t}"
+        );
+        assert!(
+            !t.contains("is not lost"),
+            "the in-flight error must not guarantee the message survives: {t}"
+        );
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "{t}");
+
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must reach the op after release");
+        // The late outcome is logged by a follower task that runs once the
+        // detached send resolves; on this current-thread runtime a bounded
+        // number of yields lets it run.
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            lines = capture.lines();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            lines.iter().any(|l| l.contains(&id)
+                && l.contains("store pool exhausted")
+                && l.contains("FAILED")),
+            "late failure must be logged under the message id: {lines:?}"
+        );
+    }
+
     /// Omitted `priority` defaults to INTERRUPT delivery: the binding
     /// resolves the absent argument to `"interrupt"` before hitting the
     /// service layer (binding-local — wire RPC defaults are untouched).
