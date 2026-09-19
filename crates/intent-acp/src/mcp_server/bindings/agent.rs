@@ -849,6 +849,15 @@ async fn unwatch(
 
 /// `ws.agent.list` scope filter: `"top-level"` keeps only rows with no
 /// `parentAgentId`, `"subagents"` only rows with one.
+///
+/// `"subagents"` (and a bare `parentAgentId`) map onto the wire's
+/// `agent.list { scope: "delegated", parentAgentId? }` (§5.5) — the
+/// semantics match exactly (`parent_agent_id IS NOT NULL`, optionally
+/// `= ?`), so the daemon filters SQL-side and the binding never loads the
+/// full workspace list. `"top-level"` stays a client-side filter over the
+/// default read: the binding's "no parent" is WIDER than the wire's
+/// `topLevel` bin (which also excludes unparented background agents), and
+/// the option names / semantics are frozen for callers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AgentListScope {
     TopLevel,
@@ -930,10 +939,25 @@ async fn list(
     args: &Value,
 ) -> Result<Value, String> {
     let filter = parse_agent_list_filter(args)?;
-    // Soft retire: `agent_list` excludes retired sessions by default, so the
-    // agent-facing list never shows them (the wire `includeRetired` escape
-    // hatch is FE-only by design).
-    let rows = api.agent_list(ws.clone()).await.map_err(map_err)?;
+    // Soft retire: both reads exclude retired sessions, so the agent-facing
+    // list never shows them (the wire `includeRetired` escape hatch is
+    // FE-only by design). A `subagents` / `parentAgentId` read is served
+    // by the wire's SQL-side `delegated` scope (see [`AgentListScope`]);
+    // the client-side `retains` pass below then only applies the status
+    // filter (its parent predicates are already satisfied).
+    let rows =
+        if filter.scope == Some(AgentListScope::Subagents) || filter.parent_agent_id.is_some() {
+            api.agent_list_scoped(
+                ws.clone(),
+                intent_core::AgentListRowScope::Delegated {
+                    parent_agent_id: filter.parent_agent_id.as_deref().map(AgentId::from),
+                },
+            )
+            .await
+            .map_err(map_err)?
+        } else {
+            api.agent_list(ws.clone()).await.map_err(map_err)?
+        };
     let rows: Vec<_> = rows
         .into_iter()
         .filter(|r| filter.retains(r.status, r.parent_agent_id.as_ref().map(AgentId::as_str)))
@@ -2082,6 +2106,7 @@ mod tests {
                         token_usage: None,
                         cow_supported: None,
                         browser_client_id: None,
+                        pull_requests_total: None,
                         display_status: None,
                         waiting: false,
                         checkout_mode: None,
@@ -2106,7 +2131,6 @@ mod tests {
                                 "prompt": "You are an implementor",
                                 "behaviorPrompt": "You are an implementor",
                                 "source": "bundled",
-                        pull_requests_total: None,
                                 "isCustomized": false,
                                 "aliases": ["builder"],
                                 "resolvedProvider": "claude",

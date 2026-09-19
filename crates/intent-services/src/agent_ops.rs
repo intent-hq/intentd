@@ -16,11 +16,11 @@ use intent_core::events::{
     AGENT_QUEUE_UPDATED, AGENT_UPDATED,
 };
 use intent_core::{
-    now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ConversationProjection, Error, Event, EventActor, MessageOrigin, NoteId, PullRequestInfo,
-    PullRequestStatus, Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId,
-    MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED,
+    now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentListRowScope, AgentLite,
+    AgentMessage, AgentScopeCounts, AgentSession, AgentStatus, AgentWakeCreateOptions,
+    AgentWakeOrCreateInput, ConversationProjection, Error, Event, EventActor, MessageOrigin,
+    NoteId, PullRequestInfo, PullRequestStatus, Result, SessionStats, TaskStatus, WorkspaceApi,
+    WorkspaceId, MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED,
     SLIM_PAGE_BUDGET_BYTES,
 };
 use intent_sourcecontrol::RepoRef;
@@ -75,7 +75,7 @@ use uuid::Uuid;
 use crate::Services;
 
 /// Row scope selecting which sessions an `agent.list` read serves (§5.5).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum AgentListScope {
     /// Default read: active (not soft-retired) sessions only.
     Active,
@@ -83,6 +83,9 @@ enum AgentListScope {
     All,
     /// `retiredOnly: true`: soft-retired sessions only.
     RetiredOnly,
+    /// `scope: "topLevel" | "delegated" | "background"`: one bin of the
+    /// active sessions ([`AgentListRowScope`]).
+    Scoped(AgentListRowScope),
 }
 
 /// "Running a turn" statuses for the retire guard (§5.5, confirmed
@@ -2700,12 +2703,41 @@ impl Services {
         self.store.count_retired_agent_sessions(&workspace_id).await
     }
 
+    /// `agent.list` with `scope: "topLevel" | "delegated" | "background"`
+    /// (PROTOCOL §5.5): ONLY the non-retired sessions in that bin (a
+    /// `delegated` read optionally narrowed to one parent's direct
+    /// sub-agents). SQL-side predicate on both the summary read AND the
+    /// message-projection aggregate ([`intent_store::Store::
+    /// list_scoped_agent_session_summaries`]), so cost stays O(rows returned)
+    /// and the active-only projection cache is bypassed — a scoped read never
+    /// loads the full workspace's projections.
+    pub(crate) async fn agent_list_scoped_op(
+        &self,
+        workspace_id: WorkspaceId,
+        scope: AgentListRowScope,
+    ) -> Result<Vec<AgentLite>> {
+        self.agent_list_impl(workspace_id, AgentListScope::Scoped(scope))
+            .await
+    }
+
+    /// `scopeCounts` (PROTOCOL §5.5): per-bin counts of the workspace's
+    /// non-retired sessions — one grouped SQL aggregate attached to every
+    /// `agent.list` response variant by the router.
+    pub(crate) async fn agent_scope_counts_op(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<AgentScopeCounts> {
+        self.store
+            .count_agent_sessions_by_scope(&workspace_id)
+            .await
+    }
+
     async fn agent_list_impl(
         &self,
         workspace_id: WorkspaceId,
         scope: AgentListScope,
     ) -> Result<Vec<AgentLite>> {
-        let sessions = match scope {
+        let sessions = match &scope {
             AgentListScope::All => {
                 self.store
                     .list_agent_session_summaries(&workspace_id)
@@ -2721,6 +2753,11 @@ impl Services {
                     .list_retired_agent_session_summaries(&workspace_id)
                     .await?
             }
+            AgentListScope::Scoped(row_scope) => {
+                self.store
+                    .list_scoped_agent_session_summaries(&workspace_id, row_scope)
+                    .await?
+            }
         };
         // Message projections are the expensive half (full-workspace COUNT
         // aggregate + preview columns). Each scope loads a projection set
@@ -2730,8 +2767,9 @@ impl Services {
         // create/delete); `retiredOnly` loads the retired-only SQL variant
         // directly (never the full-workspace superset); `includeRetired`
         // loads the full set directly, bypassing the cache in both
-        // directions.
-        let mut projections = match scope {
+        // directions; a `scope` read loads its bin's SQL variant directly
+        // (never the active-only superset).
+        let mut projections = match &scope {
             AgentListScope::Active => {
                 self.agent_list_cache
                     .get_or_load(&self.store, &workspace_id)
@@ -2745,6 +2783,11 @@ impl Services {
             AgentListScope::All => {
                 self.store
                     .get_agent_session_message_projections(&workspace_id)
+                    .await?
+            }
+            AgentListScope::Scoped(row_scope) => {
+                self.store
+                    .get_scoped_agent_session_message_projections(&workspace_id, row_scope)
                     .await?
             }
         };

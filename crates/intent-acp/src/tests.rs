@@ -9576,6 +9576,10 @@ mod wsapi4_bindings_tests {
     #[derive(Default)]
     struct FakeApi {
         agent_list_calls: Mutex<u32>,
+        /// `agent_list_scoped` calls, recorded as `(scope wire name,
+        /// parentAgentId)` — the `ws.agent.list` subagents / parent
+        /// filters must go through the SQL-side scope, not `agent_list`.
+        agent_list_scoped_calls: Mutex<Vec<(String, Option<String>)>>,
         agent_get_calls: Mutex<Vec<String>>,
         agent_send_calls: Mutex<Vec<SendCall>>,
         agent_send_to_task_calls: Mutex<Vec<SendToTaskCall>>,
@@ -9744,6 +9748,47 @@ mod wsapi4_bindings_tests {
                     row.notifications_muted = muted.contains(&row.id.as_str().to_string());
                 }
                 Ok(rows)
+            })
+        }
+
+        /// The seeded rows narrowed by the scope's SQL predicate (the store
+        /// does this in SQL; the fake mirrors it in memory).
+        fn agent_list_scoped(
+            &self,
+            ws: WorkspaceId,
+            scope: intent_core::AgentListRowScope,
+        ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+            use intent_core::AgentListRowScope;
+            self.agent_list_scoped_calls.lock().unwrap().push((
+                scope.wire_name().to_string(),
+                match &scope {
+                    AgentListRowScope::Delegated {
+                        parent_agent_id: Some(p),
+                    } => Some(p.as_str().to_string()),
+                    _ => None,
+                },
+            ));
+            let rows = self.agent_list_rows.lock().unwrap().clone();
+            Box::pin(async move {
+                let rows =
+                    rows.unwrap_or_else(|| vec![stub_agent("a-1", &ws), stub_agent("a-2", &ws)]);
+                Ok(rows
+                    .into_iter()
+                    .filter(|r| match &scope {
+                        AgentListRowScope::TopLevel => {
+                            r.parent_agent_id.is_none() && !r.metadata.is_background
+                        }
+                        AgentListRowScope::Delegated { parent_agent_id } => {
+                            r.parent_agent_id.is_some()
+                                && parent_agent_id
+                                    .as_ref()
+                                    .is_none_or(|p| r.parent_agent_id.as_ref() == Some(p))
+                        }
+                        AgentListRowScope::Background => {
+                            r.parent_agent_id.is_none() && r.metadata.is_background
+                        }
+                    })
+                    .collect())
             })
         }
 
@@ -10223,6 +10268,11 @@ mod wsapi4_bindings_tests {
         );
     }
 
+    /// `scope: 'subagents'` and a bare `parentAgentId` are served by the wire's
+    /// SQL-side `delegated` scope (`agent_list_scoped`, never the full
+    /// `agent_list` read); `'top-level'` stays a client-side filter over the
+    /// default read because its "no parent" semantics are wider than the
+    /// wire's `topLevel` bin (it keeps unparented background agents).
     #[tokio::test]
     async fn agent_list_scope_and_parent_filters() {
         let (srv, api) = server();
@@ -10231,6 +10281,9 @@ mod wsapi4_bindings_tests {
             agent_list_ids(&srv, "return await ws.agent.list({ scope: 'top-level' });").await,
             ["a-top"]
         );
+        assert_eq!(*api.agent_list_calls.lock().unwrap(), 1);
+        assert!(api.agent_list_scoped_calls.lock().unwrap().is_empty());
+
         assert_eq!(
             agent_list_ids(&srv, "return await ws.agent.list({ scope: 'subagents' });").await,
             ["a-child"]
@@ -10246,10 +10299,51 @@ mod wsapi4_bindings_tests {
         assert_eq!(
             agent_list_ids(
                 &srv,
+                "return await ws.agent.list({ scope: 'subagents', parentAgentId: 'a-top' });"
+            )
+            .await,
+            ["a-child"]
+        );
+        assert_eq!(
+            agent_list_ids(
+                &srv,
                 "return await ws.agent.list({ parentAgentId: 'a-other' });"
             )
             .await,
             Vec::<String>::new()
+        );
+        assert_eq!(
+            *api.agent_list_calls.lock().unwrap(),
+            1,
+            "subagents / parentAgentId reads must not load the full list"
+        );
+        assert_eq!(
+            *api.agent_list_scoped_calls.lock().unwrap(),
+            vec![
+                ("delegated".to_string(), None),
+                ("delegated".to_string(), Some("a-top".to_string())),
+                ("delegated".to_string(), Some("a-top".to_string())),
+                ("delegated".to_string(), Some("a-other".to_string())),
+            ]
+        );
+    }
+
+    /// An unparented BACKGROUND agent is `'top-level'` for the binding (no
+    /// parent) even though the wire's `topLevel` bin excludes it — the
+    /// binding's public semantics are unchanged.
+    #[tokio::test]
+    async fn agent_list_top_level_keeps_unparented_background_agents() {
+        let (srv, api) = server();
+        let ws = WorkspaceId::from_string("amber-forest");
+        let top = stub_agent("a-top", &ws);
+        let mut bg = stub_agent("a-bg", &ws);
+        bg.metadata.is_background = true;
+        let mut child = stub_agent("a-child", &ws);
+        child.parent_agent_id = Some(AgentId::from("a-top"));
+        *api.agent_list_rows.lock().unwrap() = Some(vec![top, bg, child]);
+        assert_eq!(
+            agent_list_ids(&srv, "return await ws.agent.list({ scope: 'top-level' });").await,
+            ["a-top", "a-bg"]
         );
     }
 
@@ -12037,6 +12131,7 @@ mod workspace_api_output_limit_tests {
                     token_usage: None,
                     cow_supported: None,
                     browser_client_id: None,
+                    pull_requests_total: None,
                     display_status: None,
                     waiting: false,
                     checkout_mode: None,
@@ -12131,7 +12226,6 @@ mod workspace_api_output_limit_tests {
         assert!(!folder.path().join("tool-outputs").exists());
     }
 
-                    pull_requests_total: None,
     #[tokio::test]
     async fn over_limit_output_redirects_to_tool_outputs_file() {
         let (folder, checkout) = temp_workspace_layout();

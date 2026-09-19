@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 use crate::model::{
-    AgentDelegateInput, AgentLite, AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo,
-    CommentAddResult, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
-    CommentResolveThreadResult, CommentRespondResult, ContextItem, Draft, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus,
-    GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
+    AgentDelegateInput, AgentListRowScope, AgentLite, AgentScopeCounts, AgentSession, BrowserTab,
+    BrowserTabInput, ClientHostInfo, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
+    CommentListResult, CommentResolveThreadResult, CommentRespondResult, ContextItem, Draft,
+    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, GitAgentCommitResult,
+    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
     LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
     NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
@@ -1494,6 +1494,36 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_retired_count not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.list { scope }` (PROTOCOL §5.5): ONLY the non-retired sessions
+    /// in one [`AgentListRowScope`] bin (`topLevel` / `delegated` /
+    /// `background`), filtered SQL-side so cost stays O(rows returned).
+    fn agent_list_scoped(
+        &self,
+        workspace_id: WorkspaceId,
+        scope: AgentListRowScope,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        let _ = (workspace_id, scope);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_scoped not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Per-bin non-retired session counts — the `scopeCounts` field attached
+    /// to every `agent.list` response variant (PROTOCOL §5.5).
+    fn agent_scope_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<AgentScopeCounts>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_scope_counts not implemented".to_string(),
             ))
         })
     }

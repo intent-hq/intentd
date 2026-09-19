@@ -2915,6 +2915,51 @@ pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
     value
 }
 
+/// `agent.list { scope }` row scope (§5.5): which bin of the workspace's
+/// NON-retired sessions a scoped read serves. The three bins partition the
+/// `retired_at IS NULL` rows exactly — `topLevel ∪ delegated ∪ background`
+/// is the default read's row set and the bins are pairwise disjoint — so a
+/// client can render the collapsed bins from [`AgentScopeCounts`] alone and
+/// fetch a bin's rows only on expand (the same pattern as the v8.3 retired
+/// bin). Retired sessions are their own bin (`retiredOnly`), never part of
+/// any scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentListRowScope {
+    /// `parent_agent_id IS NULL AND is_background = 0` — the rows the FE
+    /// lists by default.
+    TopLevel,
+    /// `parent_agent_id IS NOT NULL`, optionally narrowed to one parent's
+    /// direct sub-agents (`parent_agent_id = ?`).
+    Delegated { parent_agent_id: Option<AgentId> },
+    /// `parent_agent_id IS NULL AND is_background <> 0` — unparented
+    /// background agents.
+    Background,
+}
+
+impl AgentListRowScope {
+    /// The wire `scope` value naming this bin.
+    #[must_use]
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            Self::TopLevel => "topLevel",
+            Self::Delegated { .. } => "delegated",
+            Self::Background => "background",
+        }
+    }
+}
+
+/// Per-bin counts of a workspace's non-retired sessions — the always-present
+/// `scopeCounts` field on every `agent.list` response variant (§5.5), one
+/// grouped SQL aggregate. `delegated` is the workspace-wide count even when
+/// the rows read was narrowed by `parentAgentId`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentScopeCounts {
+    pub top_level: u64,
+    pub delegated: u64,
+    pub background: u64,
+}
+
 /// Per-field byte budget for `agent.list` row previews (list-payload cost
 /// contract, extending monorepo#2932): the preview fields exist to render a
 /// one-line summary in list contexts (sidebar rows, HUD cells), so each is
@@ -5441,51 +5486,6 @@ mod tests {
         assert_eq!(row["contentLength"], NOTE_LIST_PREVIEW_CHARS * 3);
     }
 
-    /// [`last_tool_use_preview`] derivation: the LAST `tool_use` block wins,
-    /// an under-budget input passes through whole (no flags), an over-budget
-    /// input is capped with the additive `inputTruncated`/`inputBytes`
-    /// flags, a tool-less / non-array content yields `None`, and a missing
-    /// `input` omits the field.
-    #[test]
-    fn last_tool_use_preview_shapes() {
-        // Last block wins; small input passes through whole.
-        let content = json!([
-            { "type": "tool_use", "id": "m:0", "name": "old", "input": {"a": 1}, "toolCallId": "t0" },
-            { "type": "text", "text": "between" },
-            { "type": "tool_use", "id": "m:2", "name": "view", "input": {"path": "/x"}, "toolCallId": "t2" },
-        ]);
-        assert_eq!(
-            last_tool_use_preview(&content),
-            Some(json!({"name": "view", "input": {"path": "/x"}}))
-        );
-
-        // Over-budget input: capped preview + flags; small scalar keys
-        // survive the giant sibling (smallest-value-first admission).
-        let big = json!([{
-            "type": "tool_use", "id": "m:0", "name": "write_file",
-            "input": {
-                "path": "/tmp/a.txt",
-                "content": "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 8),
-            },
-            "toolCallId": "tb",
-        }]);
-        let preview = last_tool_use_preview(&big).unwrap();
-        assert_eq!(preview["name"], "write_file");
-        assert_eq!(preview["inputTruncated"], true);
-        assert!(
-            usize::try_from(preview["inputBytes"].as_u64().unwrap()).expect("value fits in usize")
-                > SLIM_PROJECTION_BUDGET_BYTES
-        );
-        assert_eq!(preview["input"]["path"], "/tmp/a.txt");
-        let served = serde_json::to_string(&preview["input"]).unwrap();
-        assert!(
-            served.len() <= SLIM_PROJECTION_BUDGET_BYTES * 2,
-            "capped input stays near the budget, got {} bytes",
-            served.len()
-        );
-
-        // A write-time extraction placeholder (0108/0109): the block's
-        // `input` is already the capped preview and fits the budget here —
     /// A `pullRequests[]` entry whose `updatedAt` orders it `n`-th: entry
     /// `n` was updated `n` minutes into the hour, so a higher `n` is more
     /// recent.
@@ -5593,6 +5593,51 @@ mod tests {
         assert!(WORKSPACE_LIST_ROW_KEYS.contains(&"pullRequestsTotal"));
     }
 
+    /// [`last_tool_use_preview`] derivation: the LAST `tool_use` block wins,
+    /// an under-budget input passes through whole (no flags), an over-budget
+    /// input is capped with the additive `inputTruncated`/`inputBytes`
+    /// flags, a tool-less / non-array content yields `None`, and a missing
+    /// `input` omits the field.
+    #[test]
+    fn last_tool_use_preview_shapes() {
+        // Last block wins; small input passes through whole.
+        let content = json!([
+            { "type": "tool_use", "id": "m:0", "name": "old", "input": {"a": 1}, "toolCallId": "t0" },
+            { "type": "text", "text": "between" },
+            { "type": "tool_use", "id": "m:2", "name": "view", "input": {"path": "/x"}, "toolCallId": "t2" },
+        ]);
+        assert_eq!(
+            last_tool_use_preview(&content),
+            Some(json!({"name": "view", "input": {"path": "/x"}}))
+        );
+
+        // Over-budget input: capped preview + flags; small scalar keys
+        // survive the giant sibling (smallest-value-first admission).
+        let big = json!([{
+            "type": "tool_use", "id": "m:0", "name": "write_file",
+            "input": {
+                "path": "/tmp/a.txt",
+                "content": "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 8),
+            },
+            "toolCallId": "tb",
+        }]);
+        let preview = last_tool_use_preview(&big).unwrap();
+        assert_eq!(preview["name"], "write_file");
+        assert_eq!(preview["inputTruncated"], true);
+        assert!(
+            usize::try_from(preview["inputBytes"].as_u64().unwrap()).expect("value fits in usize")
+                > SLIM_PROJECTION_BUDGET_BYTES
+        );
+        assert_eq!(preview["input"]["path"], "/tmp/a.txt");
+        let served = serde_json::to_string(&preview["input"]).unwrap();
+        assert!(
+            served.len() <= SLIM_PROJECTION_BUDGET_BYTES * 2,
+            "capped input stays near the budget, got {} bytes",
+            served.len()
+        );
+
+        // A write-time extraction placeholder (0108/0109): the block's
+        // `input` is already the capped preview and fits the budget here —
         // the flags must propagate rather than be recomputed away, so the
         // session preview keeps saying the input is truncated.
         let placeholder = json!([{
@@ -6178,6 +6223,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -6223,7 +6269,6 @@ mod tests {
         let ts = "2026-01-01T00:00:00Z".to_string();
         let agent = WorkspaceAgentInfo {
             id: AgentId::from("agent-1"),
-            pull_requests_total: None,
             name: "Builder".to_string(),
             status: AgentStatus::Active,
             specialist: Some("implementor".to_string()),

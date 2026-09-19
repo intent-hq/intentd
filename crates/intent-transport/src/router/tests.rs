@@ -3758,6 +3758,67 @@ async fn singular_event_subscribe_aliases_are_not_routable() {
     }
 }
 
+/// `agent.list` row-scope params (§5.5): an unknown or non-string `scope` is
+/// `-32602` (never coerced, unlike the lenient retired flags), a bin scope
+/// cannot ride with either retired flag, and `parentAgentId` must be a
+/// canonical `agent-{uuid}` paired with `scope: "delegated"`.
+#[tokio::test]
+async fn agent_list_scope_params_are_validated() {
+    let scope_msg = "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"";
+    for (frame, expected) in [
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"bogus"}}"#,
+            scope_msg,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"top-level"}}"#,
+            scope_msg,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":true}}"#,
+            scope_msg,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","includeRetired":true}}"#,
+            "scope \"topLevel\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","retiredOnly":true}}"#,
+            "scope \"delegated\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","parentAgentId":"a-top"}}"#,
+            "parentAgentId must be a canonical agent-{uuid} id",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","parentAgentId":7}}"#,
+            "parentAgentId must be a canonical agent-{uuid} id",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+            "parentAgentId requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+            "parentAgentId requires scope \"delegated\"",
+        ),
+    ] {
+        let v = call(frame).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "{frame}: {v}");
+        assert_eq!(v["error"]["message"], serde_json::json!(expected), "{frame}");
+    }
+    // The retired-flag contradiction still wins over a scope combination.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","includeRetired":true,"retiredOnly":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("includeRetired and retiredOnly are mutually exclusive")
+    );
+}
+
 #[tokio::test]
 async fn agent_methods_validate_required_params() {
     // agent.list without workspaceId.

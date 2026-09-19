@@ -27096,6 +27096,21 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_retired_count_op(workspace_id).await })
     }
 
+    fn agent_list_scoped(
+        &self,
+        workspace_id: WorkspaceId,
+        scope: intent_core::AgentListRowScope,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        Box::pin(async move { self.agent_list_scoped_op(workspace_id, scope).await })
+    }
+
+    fn agent_scope_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::AgentScopeCounts>> {
+        Box::pin(async move { self.agent_scope_counts_op(workspace_id).await })
+    }
+
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_list_active_op().await })
     }

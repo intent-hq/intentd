@@ -8,8 +8,8 @@
 //! a derived snapshot and is never persisted — sessions load with `stats: None`.
 
 use intent_core::{
-    AgentId, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result, TokenUsageTotals,
-    UsageCost, WorkspaceId, PENDING_QUESTIONS_MESSAGE_ID_KEY,
+    AgentId, AgentListRowScope, AgentMessage, AgentScopeCounts, AgentSession, AgentStatus, Error,
+    NoteId, Result, TokenUsageTotals, UsageCost, WorkspaceId, PENDING_QUESTIONS_MESSAGE_ID_KEY,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -113,6 +113,63 @@ pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
         FROM agent_session s \
         WHERE s.workspace_id = ?{retired_filter}"
     )
+}
+
+/// SQL predicate fragment (leading ` AND`, unqualified column names so it
+/// applies to both the summary read and the `agent_session s` projection
+/// read) selecting one `agent.list { scope }` bin (§5.5), plus the extra
+/// bind it needs (`parent_agent_id = ?` for a parent-narrowed `delegated`
+/// read). The three bins partition the non-retired rows:
+/// `parent_agent_id IS NULL` splits on `is_background` (`= 0` / `<> 0`,
+/// always written as 0/1), `parent_agent_id IS NOT NULL` is `delegated`.
+/// Every fragment carries `retired_at IS NULL` — retired sessions are their
+/// own bin. Compile-time fragments only, never caller input.
+pub(crate) fn scope_predicate(scope: &AgentListRowScope) -> (&'static str, Option<&str>) {
+    match scope {
+        AgentListRowScope::TopLevel => (
+            " AND parent_agent_id IS NULL AND is_background = 0 AND retired_at IS NULL",
+            None,
+        ),
+        AgentListRowScope::Delegated {
+            parent_agent_id: None,
+        } => (
+            " AND parent_agent_id IS NOT NULL AND retired_at IS NULL",
+            None,
+        ),
+        AgentListRowScope::Delegated {
+            parent_agent_id: Some(parent),
+        } => (
+            " AND parent_agent_id = ? AND retired_at IS NULL",
+            Some(parent.as_str()),
+        ),
+        AgentListRowScope::Background => (
+            " AND parent_agent_id IS NULL AND is_background <> 0 AND retired_at IS NULL",
+            None,
+        ),
+    }
+}
+
+/// SQL behind [`Store::list_scoped_agent_session_summaries`], extracted so
+/// the plan-shape test runs `EXPLAIN` on the exact production statement.
+pub(crate) fn scoped_session_summaries_sql(scope: &AgentListRowScope) -> String {
+    let (predicate, _) = scope_predicate(scope);
+    format!(
+        "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+         WHERE workspace_id = ?{predicate} ORDER BY created_at"
+    )
+}
+
+/// SQL behind [`Store::count_agent_sessions_by_scope`] — ONE statement over
+/// the workspace's non-retired rows yielding all three `scopeCounts` (§5.5).
+/// The three conditional sums use the same predicates as
+/// [`scope_predicate`], so `topLevel + delegated + background` always equals
+/// the row count of the default `agent.list` read.
+pub(crate) fn scope_counts_sql() -> &'static str {
+    "SELECT \
+        COALESCE(SUM(parent_agent_id IS NULL AND is_background = 0), 0) AS top_level, \
+        COALESCE(SUM(parent_agent_id IS NOT NULL), 0) AS delegated, \
+        COALESCE(SUM(parent_agent_id IS NULL AND is_background <> 0), 0) AS background \
+     FROM agent_session WHERE workspace_id = ? AND retired_at IS NULL"
 }
 
 /// SQL predicate selecting an **unread top-level session** row (§5.1): a
@@ -1171,6 +1228,61 @@ impl Store {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    /// [`Store::list_agent_session_summaries`] restricted to ONE
+    /// `agent.list { scope }` bin of the non-retired sessions (§5.5) — see
+    /// [`scope_predicate`]. The filter runs in SQL over the same summary
+    /// projection as the retired reads, so the handler cost stays O(rows
+    /// returned) per the RPC cost contract; the row visit is an
+    /// `idx_agent_workspace` (or, parent-narrowed, `idx_agent_parent`) index
+    /// search, never a table scan (plan-shape test below).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_scoped_agent_session_summaries(
+        &self,
+        workspace_id: &WorkspaceId,
+        scope: &AgentListRowScope,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = scoped_session_summaries_sql(scope);
+        let (_, extra_bind) = scope_predicate(scope);
+        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        if let Some(bind) = extra_bind {
+            query = query.bind(bind);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            Error::Internal(format!("list scoped agent session summaries failed: {e}"))
+        })?;
+        rows.iter().map(map_session_summary_row).collect()
+    }
+
+    /// Per-bin counts of the workspace's non-retired sessions — the
+    /// `scopeCounts` field served on every `agent.list` response variant
+    /// (§5.5). One grouped statement ([`scope_counts_sql`]) over the
+    /// workspace's `idx_agent_workspace` entries — O(workspace sessions),
+    /// the same order as the default rows read it accompanies. No rows are
+    /// hydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_agent_sessions_by_scope(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<AgentScopeCounts> {
+        let row = sqlx::query(scope_counts_sql())
+            .bind(&workspace_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("count agent sessions by scope failed: {e}")))?;
+        let count = |col: &str| -> u64 { u64::try_from(row.get::<i64, _>(col)).unwrap_or(0) };
+        Ok(AgentScopeCounts {
+            top_level: count("top_level"),
+            delegated: count("delegated"),
+            background: count("background"),
+        })
+    }
+
     /// Get message count, whether any assistant message exists, and the total
     /// persisted conversation size in bytes for each session in a workspace,
     /// without hydrating message bodies (finding F1/F3: lightweight
@@ -1235,7 +1347,8 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, "").await
+        self.session_message_projections(workspace_id, "", None)
+            .await
     }
 
     /// [`Store::get_agent_session_message_projections`] restricted to ACTIVE
@@ -1251,7 +1364,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, " AND s.retired_at IS NULL")
+        self.session_message_projections(workspace_id, " AND s.retired_at IS NULL", None)
             .await
     }
 
@@ -1270,20 +1383,44 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, " AND s.retired_at IS NOT NULL")
+        self.session_message_projections(workspace_id, " AND s.retired_at IS NOT NULL", None)
             .await
     }
 
-    /// Shared body of the workspace projection reads; `retired_filter` is
-    /// one of the compile-time SQL fragments above (never caller input).
+    /// [`Store::get_agent_session_message_projections`] restricted to ONE
+    /// `agent.list { scope }` bin (§5.5) — the variant the scoped read
+    /// loads, so its aggregate cost scales with the rows that read returns
+    /// rather than with every active session in the workspace (RPC cost
+    /// contract). The filter is [`scope_predicate`], run in SQL.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_scoped_agent_session_message_projections(
+        &self,
+        workspace_id: &WorkspaceId,
+        scope: &AgentListRowScope,
+    ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
+        let (predicate, extra_bind) = scope_predicate(scope);
+        self.session_message_projections(workspace_id, predicate, extra_bind)
+            .await
+    }
+
+    /// Shared body of the workspace projection reads; `filter` is one of the
+    /// compile-time SQL fragments above (never caller input) and
+    /// `extra_bind` its optional second positional bind.
     async fn session_message_projections(
         &self,
         workspace_id: &WorkspaceId,
-        retired_filter: &str,
+        filter: &str,
+        extra_bind: Option<&str>,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        let sql = session_message_projections_sql(retired_filter);
-        let rows = sqlx::query(&sql)
-            .bind(&workspace_id.0)
+        let sql = session_message_projections_sql(filter);
+        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        if let Some(bind) = extra_bind {
+            query = query.bind(bind);
+        }
+        let rows = query
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("session message projections failed: {e}")))?;
@@ -5354,6 +5491,72 @@ mod tests {
         }
     }
 
+    /// The `agent.list { scope }` reads and the grouped `scopeCounts`
+    /// aggregate (§5.5) must be answered by an index SEARCH on the workspace
+    /// (or, parent-narrowed, on `idx_agent_parent`) — never a full
+    /// `agent_session` SCAN — so their cost is bounded by the workspace's own
+    /// sessions like the default read they replace. No dedicated covering
+    /// index: the three bins split the same `idx_agent_workspace` entries
+    /// the default read visits, and a covering index over
+    /// `(workspace_id, retired_at, parent_agent_id, is_background)` would
+    /// only trade a row fetch per session for write amplification on every
+    /// session mutation.
+    #[tokio::test]
+    async fn scoped_reads_use_an_index_search_not_a_scan() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let parent = AgentId::from("agent-00000000-0000-4000-8000-000000000001");
+        let scopes = [
+            AgentListRowScope::TopLevel,
+            AgentListRowScope::Delegated {
+                parent_agent_id: None,
+            },
+            AgentListRowScope::Delegated {
+                parent_agent_id: Some(parent),
+            },
+            AgentListRowScope::Background,
+        ];
+        let mut statements: Vec<(String, String, Option<String>)> =
+            vec![("counts".to_string(), scope_counts_sql().to_string(), None)];
+        for scope in &scopes {
+            let (predicate, bind) = scope_predicate(scope);
+            statements.push((
+                format!("rows/{}", scope.wire_name()),
+                scoped_session_summaries_sql(scope),
+                bind.map(str::to_string),
+            ));
+            statements.push((
+                format!("projections/{}", scope.wire_name()),
+                session_message_projections_sql(predicate),
+                bind.map(str::to_string),
+            ));
+        }
+        for (label, sql, bind) in statements {
+            let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut plan = sqlx::query(&plan_sql).bind("ws-plan");
+            if let Some(bind) = &bind {
+                plan = plan.bind(bind);
+            }
+            let details: Vec<String> = plan
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.contains("SEARCH") && d.contains("INDEX idx_agent_")),
+                "{label} must be an index search on agent_session, plan: {details:?}"
+            );
+            assert!(
+                !details.iter().any(|d| d.contains("SCAN")),
+                "{label} must not scan agent_session, plan: {details:?}"
+            );
+        }
+    }
+
     /// The three unread-derivation statements (single-workspace EXISTS
     /// probe, workspace.list batch derivation, guarded settle-clear) must be
     /// answered entirely from the 0114/0122 partial covering index
@@ -5931,6 +6134,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -6054,6 +6258,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -6134,7 +6339,6 @@ mod tests {
             .set_agent_session_token_usage(&ws_id, &agent_id, &first)
             .await
             .expect("set first");
-            pull_requests_total: None,
         let second = TokenUsageTotals {
             input_tokens: 100,
             output_tokens: 80,
@@ -6216,6 +6420,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -6258,7 +6463,6 @@ mod tests {
             completion_report: None,
             completion_report_timestamp: None,
             attention_request_kind: None,
-            pull_requests_total: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
             delegation_depth: None,
@@ -6420,7 +6624,6 @@ mod tests {
             .bind(&msg.id)
             .fetch_one(store.read_pool())
             .await
-            pull_requests_total: None,
             .expect("raw content");
         assert!(
             raw.len() < serde_json::to_string(&content).expect("encode").len() / 2,
@@ -9731,6 +9934,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -9863,6 +10067,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -9934,7 +10139,6 @@ mod tests {
             is_remote: false,
             default_model: None,
             pr_number: None,
-            pull_requests_total: None,
             pr_url: None,
             pr_status: None,
             active_pull_request: None,
@@ -9948,6 +10152,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -10067,7 +10272,6 @@ mod tests {
         assert_eq!(summaries[0].id, agent_id, "id should match");
         assert_eq!(summaries[0].name, "Test Agent", "name should match");
         assert_eq!(
-            pull_requests_total: None,
             summaries[0].system_prompt, None,
             "summary reads should not load system_prompt"
         );
@@ -10147,12 +10351,12 @@ mod tests {
                 token_usage: None,
                 cow_supported: None,
                 browser_client_id: None,
+                pull_requests_total: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
-            pull_requests_total: None,
             };
             store.insert_workspace(&workspace).await.expect("insert");
         }
@@ -10351,7 +10555,6 @@ mod tests {
                 &agent_id,
                 "prompt",
             )
-                pull_requests_total: None,
             .await
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
@@ -10444,6 +10647,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -10647,7 +10851,6 @@ mod tests {
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-stats-counters".to_string());
         store
-            pull_requests_total: None,
             .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
             .await
             .expect("insert workspace");
@@ -14775,6 +14978,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -14978,7 +15182,6 @@ mod tests {
             );
         }
     }
-            pull_requests_total: None,
 
     /// Plan-shape regression guard (monorepo#4127): the ranking subquery
     /// must resolve filters and rank adjustments from the dense

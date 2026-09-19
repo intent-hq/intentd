@@ -1480,6 +1480,221 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `agent.list { scope }` over the real WSS transport (§5.5): on a workspace
+/// with top-level, delegated (foreground AND background children), an
+/// orphaned background and a retired session, `scope: "topLevel"` /
+/// `"delegated"` / `"background"` each return exactly their bin, the bins
+/// partition the default read, `parentAgentId` narrows `delegated` to one
+/// parent's direct sub-agents, every variant carries `scopeCounts`
+/// (workspace-wide, non-retired) next to `retiredCount`, the default
+/// response is otherwise byte-identical to `scope: "all"`, and the invalid
+/// combinations are `-32602` with the documented messages.
+#[tokio::test]
+async fn wss_agent_list_scope_bins_and_counts() {
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Scope Bins"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let workspace_id = WorkspaceId(ws_id.clone());
+    let create_agent = |name: &str, background: bool, id: i64| {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"{name}","isBackground":{background}}}}}"#
+        );
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        async move {
+            let created = wss_call(port, cfg, &frame).await;
+            created["result"]["agent"]["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("agent id: {created}"))
+                .to_string()
+        }
+    };
+    let top_a = create_agent("top-a", false, 2).await;
+    let top_b = create_agent("top-b", false, 3).await;
+    let alpha_child = create_agent("under-a-fg", false, 4).await;
+    let alpha_bg_child = create_agent("under-a-bg", true, 5).await;
+    let beta_child = create_agent("under-b-fg", false, 6).await;
+    let orphan_bg = create_agent("orphan-bg", true, 7).await;
+    let retired_top = create_agent("retired-top", false, 8).await;
+    // The wire front door creates parentless agents; link the children
+    // through the store seam the delegate path writes.
+    for (child, parent) in [
+        (&alpha_child, &top_a),
+        (&alpha_bg_child, &top_a),
+        (&beta_child, &top_b),
+    ] {
+        let child_id = intent_core::AgentId::from(child.as_str());
+        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        session.parent_agent_id = Some(intent_core::AgentId::from(parent.as_str()));
+        srv.store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("link child to parent");
+    }
+    srv.api
+        .agent_retire(
+            intent_core::AgentId::from(retired_top.as_str()),
+            Some(workspace_id.clone()),
+            None,
+        )
+        .await
+        .expect("retire");
+
+    let list = |params: String, id: i64| {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.list","params":{{"workspaceId":"{ws_id}"{params}}}}}"#
+        );
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        async move { wss_call(port, cfg, &frame).await }
+    };
+    let ids = |v: &Value| -> std::collections::BTreeSet<String> {
+        v["result"]["agents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("agents array: {v}"))
+            .iter()
+            .map(|a| a["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    let set = |xs: &[&String]| -> std::collections::BTreeSet<String> {
+        xs.iter().map(|s| (*s).clone()).collect()
+    };
+
+    let default = list(String::new(), 10).await;
+    let all = list(r#","scope":"all""#.to_string(), 11).await;
+    let top = list(r#","scope":"topLevel""#.to_string(), 12).await;
+    let delegated = list(r#","scope":"delegated""#.to_string(), 13).await;
+    let background = list(r#","scope":"background""#.to_string(), 14).await;
+    let under_a = list(
+        format!(r#","scope":"delegated","parentAgentId":"{top_a}""#),
+        15,
+    )
+    .await;
+
+    // Envelope: every variant is `{ agents, retiredCount, scopeCounts }`.
+    let expected_counts = serde_json::json!({ "topLevel": 2, "delegated": 3, "background": 1 });
+    for (label, v) in [
+        ("default", &default),
+        ("all", &all),
+        ("topLevel", &top),
+        ("delegated", &delegated),
+        ("background", &background),
+        ("delegated/parent", &under_a),
+    ] {
+        assert_eq!(v["jsonrpc"], "2.0", "{label}: {v}");
+        assert!(v.get("error").is_none(), "{label}: {v}");
+        let keys: Vec<&str> = v["result"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: result object: {v}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["agents", "retiredCount", "scopeCounts"],
+            "{label}: envelope keys: {v}"
+        );
+        assert_eq!(v["result"]["retiredCount"], 1, "{label}: {v}");
+        assert_eq!(
+            v["result"]["scopeCounts"], expected_counts,
+            "{label}: scopeCounts are workspace-wide and non-retired: {v}"
+        );
+    }
+    // `scope: "all"` IS the default read.
+    assert_eq!(default["result"], all["result"]);
+
+    // Bins.
+    assert_eq!(ids(&top), set(&[&top_a, &top_b]));
+    assert_eq!(
+        ids(&delegated),
+        set(&[&alpha_child, &alpha_bg_child, &beta_child]),
+        "a background CHILD is delegated, not background"
+    );
+    assert_eq!(ids(&background), set(&[&orphan_bg]));
+    assert_eq!(ids(&under_a), set(&[&alpha_child, &alpha_bg_child]));
+    // Partition of the default read: union equal, pairwise disjoint, and
+    // the retired row is in no bin.
+    let union: std::collections::BTreeSet<String> = ids(&top)
+        .into_iter()
+        .chain(ids(&delegated))
+        .chain(ids(&background))
+        .collect();
+    assert_eq!(union, ids(&default));
+    assert_eq!(
+        ids(&top).len() + ids(&delegated).len() + ids(&background).len(),
+        ids(&default).len()
+    );
+    assert!(!union.contains(&retired_top));
+    // Scoped rows are the default read's rows, unchanged.
+    for v in [&top, &delegated, &background, &under_a] {
+        for row in v["result"]["agents"].as_array().unwrap() {
+            let default_row = default["result"]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["id"] == row["id"])
+                .expect("row in default read");
+            assert_eq!(row, default_row);
+        }
+    }
+
+    // Invalid combinations: -32602 with the documented messages.
+    let expect_invalid = |params: &'static str, id: i64, message: &'static str| {
+        let call = list(params.to_string(), id);
+        async move {
+            let v = call.await;
+            assert_eq!(v["error"]["code"], -32602, "{params}: {v}");
+            assert_eq!(v["error"]["message"], message, "{params}: {v}");
+        }
+    };
+    let scope_msg = "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"";
+    expect_invalid(r#","scope":"bogus""#, 20, scope_msg).await;
+    expect_invalid(r#","scope":"top-level""#, 21, scope_msg).await;
+    expect_invalid(r#","scope":1"#, 22, scope_msg).await;
+    expect_invalid(
+        r#","scope":"topLevel","includeRetired":true"#,
+        23,
+        "scope \"topLevel\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+    )
+    .await;
+    expect_invalid(
+        r#","scope":"background","retiredOnly":true"#,
+        24,
+        "scope \"background\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+    )
+    .await;
+    expect_invalid(
+        r#","scope":"delegated","parentAgentId":"not-an-agent""#,
+        25,
+        "parentAgentId must be a canonical agent-{uuid} id",
+    )
+    .await;
+    let parent_needs_delegated = format!(r#","scope":"topLevel","parentAgentId":"{top_a}""#);
+    let v = list(parent_needs_delegated, 26).await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["message"], "parentAgentId requires scope \"delegated\"",
+        "{v}"
+    );
+    let v = list(format!(r#","parentAgentId":"{top_a}""#), 27).await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["message"], "parentAgentId requires scope \"delegated\"",
+        "{v}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Retired agents drop out of attention and unread over the real WSS
 /// transport (§5.1 derived `attention`, §5.5 "Retire cascade & cleanup",
 /// §6.5): a top-level foreground agent with an unseen assistant tail and a
@@ -7928,6 +8143,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -8143,7 +8359,6 @@ async fn wss_task_list_empty_workspace_emits_zero_stats() {
     srv.ws.stop().await;
 }
 
-        pull_requests_total: None,
 /// `workspace.update` with the clearable `statusImageAssetId` field
 /// (intent-hq/monorepo#997 part 1) over the real WSS wire: setting an asset id
 /// persists it, surfaces it on `workspace.get`, and emits a self-sufficient

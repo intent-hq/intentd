@@ -1350,7 +1350,21 @@ async fn dispatch(
                     "includeRetired and retiredOnly are mutually exclusive",
                 ));
             }
-            let agents = if retired_only {
+            // Row scope (§5.5): `scope` selects ONE bin of the non-retired
+            // sessions — `"topLevel"` / `"delegated"` / `"background"` —
+            // while absent / null / `"all"` keep today's read. Unlike the
+            // lenient retired flags, an unknown or non-string `scope` is
+            // `-32602`, never coerced, and a bin scope cannot be combined
+            // with either retired flag (retired is its own bin). Every
+            // variant additionally carries `scopeCounts` (one grouped SQL
+            // aggregate over the non-retired rows) under the same
+            // no-snapshot-isolation tolerance as `retiredCount`.
+            let scope = parse_agent_list_scope(params, include_retired || retired_only)?;
+            let agents = if let Some(scope) = scope {
+                api.agent_list_scoped(ws.clone(), scope)
+                    .await
+                    .map_err(domain_to_rpc)?
+            } else if retired_only {
                 api.agent_list_retired_only(ws.clone())
                     .await
                     .map_err(domain_to_rpc)?
@@ -1361,8 +1375,16 @@ async fn dispatch(
             } else {
                 api.agent_list(ws.clone()).await.map_err(domain_to_rpc)?
             };
-            let retired_count = api.agent_retired_count(ws).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "agents": agents, "retiredCount": retired_count }))
+            let retired_count = api
+                .agent_retired_count(ws.clone())
+                .await
+                .map_err(domain_to_rpc)?;
+            let scope_counts = api.agent_scope_counts(ws).await.map_err(domain_to_rpc)?;
+            Ok(json!({
+                "agents": agents,
+                "retiredCount": retired_count,
+                "scopeCounts": scope_counts,
+            }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
         "agent.get" => {
@@ -4449,6 +4471,65 @@ fn parse_projection(
         }
         Some(_) => Err(invalid_params("projection must be \"slim\"")),
     }
+}
+
+/// Parse the optional `agent.list` `scope` + `parentAgentId` params (§5.5).
+/// Absent / `null` / `"all"` is `None` — today's read; `"topLevel"` /
+/// `"delegated"` / `"background"` select one bin of the non-retired rows.
+/// Any other value (unknown string OR non-string) is `-32602`, never
+/// coerced. `parentAgentId` (a canonical `agent-{uuid}`) narrows a
+/// `delegated` read to that parent's direct sub-agents and is `-32602` with
+/// any other scope, including the default. A bin scope combined with
+/// `includeRetired` / `retiredOnly` (`retired_flag`) is `-32602`: retired
+/// sessions are their own bin.
+fn parse_agent_list_scope(
+    params: &Map<String, Value>,
+    retired_flag: bool,
+) -> Result<Option<intent_core::AgentListRowScope>, RpcErr> {
+    use intent_core::AgentListRowScope;
+    let parent_agent_id = match params.get("parentAgentId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let id = AgentId::from(s.as_str());
+            if !id.is_canonical() {
+                return Err(invalid_params(
+                    "parentAgentId must be a canonical agent-{uuid} id",
+                ));
+            }
+            Some(id)
+        }
+        Some(_) => {
+            return Err(invalid_params(
+                "parentAgentId must be a canonical agent-{uuid} id",
+            ));
+        }
+    };
+    let scope = match params.get("scope") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "all" => None,
+        Some(Value::String(s)) if s == "topLevel" => Some(AgentListRowScope::TopLevel),
+        Some(Value::String(s)) if s == "delegated" => Some(AgentListRowScope::Delegated {
+            parent_agent_id: parent_agent_id.clone(),
+        }),
+        Some(Value::String(s)) if s == "background" => Some(AgentListRowScope::Background),
+        Some(_) => {
+            return Err(invalid_params(
+                "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"",
+            ));
+        }
+    };
+    if let Some(scope) = &scope {
+        if retired_flag {
+            return Err(invalid_params(format!(
+                "scope \"{}\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+                scope.wire_name()
+            )));
+        }
+    }
+    if parent_agent_id.is_some() && !matches!(scope, Some(AgentListRowScope::Delegated { .. })) {
+        return Err(invalid_params("parentAgentId requires scope \"delegated\""));
+    }
+    Ok(scope)
 }
 
 /// Parse the optional `projection` param on `note.list` (§5.2): absent /

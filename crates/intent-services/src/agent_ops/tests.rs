@@ -398,6 +398,229 @@ async fn retired_agents_are_inert_until_restored() {
     assert_eq!(r2["restored"], json!(false));
 }
 
+/// Create a session with the given parent / background flag through the real
+/// create path, so the row's `parent_agent_id` / `is_background` columns are
+/// what `agent.create` persists.
+async fn create_scoped_agent(
+    svc: &Services,
+    ws: &WorkspaceId,
+    name: &str,
+    parent: Option<&AgentId>,
+    background: bool,
+) -> AgentId {
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("auggie".into()),
+        is_background: Some(background),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some(name.to_string()),
+            Some("sonnet4.5".into()),
+            None,
+            parent.cloned(),
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create scoped agent");
+    AgentId::from(created["agent"]["id"].as_str().unwrap())
+}
+
+/// `agent.list { scope }` (§5.5) on the fixture the task note names — top-level,
+/// delegated (foreground AND background children), an orphaned background
+/// agent and a retired session in every bin: each scope returns exactly its
+/// bin, the three bins partition the default (non-retired) read — union
+/// equal, pairwise disjoint — `scopeCounts` matches the bins, retired rows
+/// are in no bin, and `parentAgentId` narrows `delegated` to one parent's
+/// direct sub-agents while `scopeCounts.delegated` stays workspace-wide.
+#[tokio::test]
+async fn agent_list_scopes_partition_the_non_retired_rows() {
+    use intent_core::{AgentListRowScope, AgentScopeCounts};
+    use std::collections::BTreeSet;
+
+    let (_t, svc, ws) = setup().await;
+    let top_a = create_scoped_agent(&svc, &ws, "top-a", None, false).await;
+    let top_b = create_scoped_agent(&svc, &ws, "top-b", None, false).await;
+    let alpha_child = create_scoped_agent(&svc, &ws, "child-a1", Some(&top_a), false).await;
+    let alpha_bg_child = create_scoped_agent(&svc, &ws, "child-a2-bg", Some(&top_a), true).await;
+    let beta_child = create_scoped_agent(&svc, &ws, "child-b1", Some(&top_b), false).await;
+    let orphan_bg = create_scoped_agent(&svc, &ws, "orphan-bg", None, true).await;
+    // One retired session per bin: none of them may surface in any scope.
+    for (name, parent, bg) in [
+        ("retired-top", None, false),
+        ("retired-child", Some(&top_b), false),
+        ("retired-bg", None, true),
+    ] {
+        let id = create_scoped_agent(&svc, &ws, name, parent, bg).await;
+        svc.agent_retire_op(id, Some(ws.clone()), None)
+            .await
+            .expect("retire");
+    }
+
+    let ids = |rows: &[intent_core::AgentLite]| -> BTreeSet<String> {
+        rows.iter().map(|a| a.id.0.clone()).collect()
+    };
+    let expect = |xs: &[&AgentId]| -> BTreeSet<String> { xs.iter().map(|a| a.0.clone()).collect() };
+
+    let all = svc.agent_list_op(ws.clone()).await.expect("default list");
+    let top = svc
+        .agent_list_scoped_op(ws.clone(), AgentListRowScope::TopLevel)
+        .await
+        .expect("topLevel");
+    let delegated = svc
+        .agent_list_scoped_op(
+            ws.clone(),
+            AgentListRowScope::Delegated {
+                parent_agent_id: None,
+            },
+        )
+        .await
+        .expect("delegated");
+    let background = svc
+        .agent_list_scoped_op(ws.clone(), AgentListRowScope::Background)
+        .await
+        .expect("background");
+
+    assert_eq!(ids(&top), expect(&[&top_a, &top_b]));
+    assert_eq!(
+        ids(&delegated),
+        expect(&[&alpha_child, &alpha_bg_child, &beta_child]),
+        "a background CHILD is delegated, not background"
+    );
+    assert_eq!(ids(&background), expect(&[&orphan_bg]));
+
+    // Partition: union == default read, pairwise disjoint.
+    let union: BTreeSet<String> = ids(&top)
+        .union(&ids(&delegated))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .union(&ids(&background))
+        .cloned()
+        .collect();
+    assert_eq!(union, ids(&all), "topLevel ∪ delegated ∪ background == all");
+    assert_eq!(top.len() + delegated.len() + background.len(), all.len());
+    assert!(ids(&top).is_disjoint(&ids(&delegated)));
+    assert!(ids(&top).is_disjoint(&ids(&background)));
+    assert!(ids(&delegated).is_disjoint(&ids(&background)));
+
+    // Scoped rows are the same list projection as the default read.
+    for row in top.iter().chain(&delegated).chain(&background) {
+        let default_row = all
+            .iter()
+            .find(|a| a.id == row.id)
+            .expect("row in default read");
+        assert_eq!(
+            serde_json::to_value(row).unwrap(),
+            serde_json::to_value(default_row).unwrap(),
+            "scoped row differs from the default read's row"
+        );
+    }
+
+    // scopeCounts: one grouped aggregate over the non-retired rows.
+    assert_eq!(
+        svc.agent_scope_counts_op(ws.clone())
+            .await
+            .expect("scope counts"),
+        AgentScopeCounts {
+            top_level: 2,
+            delegated: 3,
+            background: 1,
+        }
+    );
+    assert_eq!(
+        svc.agent_retired_count_op(ws.clone())
+            .await
+            .expect("retired count"),
+        3
+    );
+
+    // parentAgentId narrows delegated to that parent's direct sub-agents.
+    let under_a = svc
+        .agent_list_scoped_op(
+            ws.clone(),
+            AgentListRowScope::Delegated {
+                parent_agent_id: Some(top_a.clone()),
+            },
+        )
+        .await
+        .expect("delegated under top-a");
+    assert_eq!(ids(&under_a), expect(&[&alpha_child, &alpha_bg_child]));
+    let under_b = svc
+        .agent_list_scoped_op(
+            ws.clone(),
+            AgentListRowScope::Delegated {
+                parent_agent_id: Some(top_b.clone()),
+            },
+        )
+        .await
+        .expect("delegated under top-b");
+    assert_eq!(
+        ids(&under_b),
+        expect(&[&beta_child]),
+        "the retired child under top-b is excluded"
+    );
+    let under_orphan = svc
+        .agent_list_scoped_op(
+            ws.clone(),
+            AgentListRowScope::Delegated {
+                parent_agent_id: Some(orphan_bg.clone()),
+            },
+        )
+        .await
+        .expect("delegated under a childless parent");
+    assert!(under_orphan.is_empty());
+
+    // Retiring the (childless) orphan background agent moves it out of its
+    // bin and count only.
+    svc.agent_retire_op(orphan_bg.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire orphan-bg");
+    let background = svc
+        .agent_list_scoped_op(ws.clone(), AgentListRowScope::Background)
+        .await
+        .expect("background after retire");
+    assert!(background.is_empty());
+    assert_eq!(
+        svc.agent_scope_counts_op(ws.clone())
+            .await
+            .expect("scope counts after retire"),
+        AgentScopeCounts {
+            top_level: 2,
+            delegated: 3,
+            background: 0,
+        }
+    );
+}
+
+/// An empty workspace answers zero counts and empty bins (no rows, no error).
+#[tokio::test]
+async fn agent_list_scopes_on_empty_workspace() {
+    use intent_core::{AgentListRowScope, AgentScopeCounts};
+    let (_t, svc, ws) = setup().await;
+    assert_eq!(
+        svc.agent_scope_counts_op(ws.clone())
+            .await
+            .expect("scope counts"),
+        AgentScopeCounts::default()
+    );
+    for scope in [
+        AgentListRowScope::TopLevel,
+        AgentListRowScope::Delegated {
+            parent_agent_id: None,
+        },
+        AgentListRowScope::Background,
+    ] {
+        assert!(svc
+            .agent_list_scoped_op(ws.clone(), scope)
+            .await
+            .expect("scoped list")
+            .is_empty());
+    }
+}
+
 /// Projection-cost contract (PR review): the default `agent.list` projection
 /// load excludes soft-retired sessions at the SQL layer, so its cost stays
 /// O(rows returned) instead of growing with every retired session kept. The
