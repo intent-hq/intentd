@@ -13481,6 +13481,804 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     }
 }
 
+/// Multiplayer — the collaborator sender preamble matrix (content-level
+/// counterpart of the stamp matrix above). A human message from a wire
+/// caller whose role in the target workspace is `collaborator` is persisted
+/// / enqueued with the harness preamble naming the guest (login + display
+/// name) above the caller's text, on every human-authored entry point;
+/// the owner-role wire caller, the administrator, an absent (UDS / legacy)
+/// caller and an agent caller persist byte-identical content; a second
+/// application (layered front doors) is a no-op.
+#[intent_test_macros::daemon_test]
+async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
+    use intent_core::{with_caller, AgentWakeOrCreateInput, Caller, Principal, PrincipalId};
+
+    let (_t, svc, ws) = setup().await;
+    // The workspace's one owner is the primary principal seeded by `setup`;
+    // it is exercised below as a non-administrator wire caller (role `owner`)
+    // and as the administrator.
+    let owner = svc
+        .store()
+        .get_workspace_owner_principal_id(&ws)
+        .await
+        .expect("owner lookup")
+        .expect("workspace owner");
+    let guest = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("octocat".into()),
+            display_name: Some("The Octocat".into()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    svc.store()
+        .add_workspace_member(&ws, &guest, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    let wire = |p: &PrincipalId| Caller::Wire {
+        principal_id: p.clone(),
+        is_administrator: false,
+    };
+    let preamble = crate::harness::latest().collaborator_sender_preamble(
+        Some("octocat"),
+        Some("The Octocat"),
+        &guest.0,
+    );
+    assert!(preamble.contains("@octocat") && preamble.contains("The Octocat"));
+    let annotated = |text: &str| format!("{preamble}\n\n{text}");
+    let row_text = |svc: &Services, agent: &AgentId, id: &str| {
+        let svc = svc.clone();
+        let agent = agent.clone();
+        let id = id.to_string();
+        async move {
+            let row = svc
+                .store()
+                .get_agent_session(&agent)
+                .await
+                .expect("session")
+                .messages
+                .into_iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("row {id}"));
+            crate::search_ops::message_text(&row.content)
+        }
+    };
+    let latest_user_text_containing = |svc: &Services, agent: &AgentId, text: &str| {
+        let svc = svc.clone();
+        let agent = agent.clone();
+        let text = text.to_string();
+        async move {
+            let row = svc
+                .store()
+                .get_agent_session(&agent)
+                .await
+                .expect("session")
+                .messages
+                .into_iter()
+                .rev()
+                .find(|m| m.role == "user" && m.content.to_string().contains(&text))
+                .unwrap_or_else(|| panic!("user row containing {text:?}"));
+            crate::search_ops::message_text(&row.content)
+        }
+    };
+    let queue_text = |svc: &Services, agent: &AgentId, id: &str| {
+        svc.queue_snapshot(agent)
+            .into_iter()
+            .find(|q| q["id"] == id)
+            .unwrap_or_else(|| panic!("queue entry {id}"))["content"]
+            .as_str()
+            .expect("content")
+            .to_string()
+    };
+
+    let agent = create_agent(&svc, &ws, "Preambled").await;
+    let note_id = seed_task(&svc, &ws, "preamble matrix").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), agent.0.clone(), None)
+        .await
+        .expect("assign");
+
+    // agent.sendMessage (user origin) by the collaborator: direct persist.
+    let sent = with_caller(wire(&guest), async {
+        svc.agent_send_message(
+            ws.clone(),
+            agent.clone(),
+            "send".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            MessageOrigin::User,
+        )
+        .await
+    })
+    .await
+    .expect("sendMessage");
+    let sent_id = sent["messageId"].as_str().expect("messageId").to_string();
+    assert_eq!(
+        row_text(&svc, &agent, &sent_id).await,
+        annotated("send"),
+        "collaborator sendMessage carries the preamble"
+    );
+
+    // Byte-identical controls on the same entry point: the owner-role wire
+    // caller, the administrator, an absent (UDS / legacy-token) caller, an
+    // agent caller, and a collaborator's non-user-origin send.
+    let admin = Caller::Wire {
+        principal_id: owner.clone(),
+        is_administrator: true,
+    };
+    let peer = Caller::Agent {
+        agent_id: AgentId::from("agent-peer"),
+    };
+    for (label, caller, origin) in [
+        ("owner role", Some(wire(&owner)), MessageOrigin::User),
+        ("administrator", Some(admin), MessageOrigin::User),
+        ("absent caller", None, MessageOrigin::User),
+        ("agent caller", Some(peer), MessageOrigin::Automatic),
+        (
+            "collaborator automatic origin",
+            Some(wire(&guest)),
+            MessageOrigin::Automatic,
+        ),
+    ] {
+        let text = format!("control {label}");
+        let send = svc.agent_send_message(
+            ws.clone(),
+            agent.clone(),
+            text.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            origin,
+        );
+        let out = match caller {
+            Some(caller) => with_caller(caller, send).await,
+            None => send.await,
+        }
+        .unwrap_or_else(|e| panic!("{label}: sendMessage: {e:?}"));
+        let id = out["messageId"].as_str().expect("messageId").to_string();
+        assert_eq!(
+            row_text(&svc, &agent, &id).await,
+            text,
+            "{label}: content must stay byte-identical"
+        );
+    }
+
+    // agent.sendToTask (store-only delivery persists the row).
+    let to_task = with_caller(wire(&guest), async {
+        svc.agent_send_to_task(ws.clone(), note_id.clone(), "to task".into(), None, None)
+            .await
+    })
+    .await
+    .expect("sendToTask");
+    assert_eq!(to_task["ok"], true, "{to_task}");
+    assert_eq!(
+        row_text(
+            &svc,
+            &agent,
+            to_task["result"]["messageId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("sendToTask messageId: {to_task}")),
+        )
+        .await,
+        annotated("to task"),
+        "sendToTask"
+    );
+
+    // agent.wakeOrCreate (wake branch, store-only delivery).
+    let woke = with_caller(wire(&guest), async {
+        svc.agent_wake_or_create(
+            ws.clone(),
+            note_id.clone(),
+            "wake".into(),
+            AgentWakeOrCreateInput::default(),
+        )
+        .await
+    })
+    .await
+    .expect("wakeOrCreate");
+    assert_eq!(woke["ok"], true, "{woke}");
+    assert_eq!(
+        latest_user_text_containing(&svc, &agent, "wake").await,
+        annotated("wake"),
+        "wakeOrCreate"
+    );
+
+    // agent.editAndRegenerate: the edited message is a fresh row by the
+    // editor. Its content is the already-annotated row text re-submitted
+    // (the client echoes what it rendered), so the layered front door
+    // (`editAndRegenerate` → `agent_send_message_op`) must annotate once.
+    let regenerated = with_caller(wire(&guest), async {
+        svc.agent_edit_and_regenerate(
+            ws.clone(),
+            agent.clone(),
+            sent_id.clone(),
+            annotated("send (edited)"),
+            None,
+            None,
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("editAndRegenerate");
+    assert_eq!(
+        row_text(&svc, &agent, regenerated["messageId"].as_str().expect("id")).await,
+        annotated("send (edited)"),
+        "editAndRegenerate is idempotent over an already-annotated content"
+    );
+
+    // agent.queueMessage: the queue entry captures the preamble …
+    let queued = with_caller(wire(&guest), async {
+        svc.agent_queue_message(agent.clone(), "queued".into(), None, None, None)
+            .await
+    })
+    .await
+    .expect("queueMessage");
+    let queued_id = queued["queuedMessage"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("queued id: {queued}"))
+        .to_string();
+    assert_eq!(
+        queue_text(&svc, &agent, &queued_id),
+        annotated("queued"),
+        "queueMessage"
+    );
+    // … the owner's queue entry does not …
+    let owner_queued = with_caller(wire(&owner), async {
+        svc.agent_queue_message(agent.clone(), "owner queued".into(), None, None, None)
+            .await
+    })
+    .await
+    .expect("owner queueMessage");
+    let owner_queued_id = owner_queued["queuedMessage"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    assert_eq!(
+        queue_text(&svc, &agent, &owner_queued_id),
+        "owner queued",
+        "owner queueMessage stays byte-identical"
+    );
+    // … a collaborator's agent.editQueuedMessage of a human-authored entry
+    // carries the editor's preamble (the owner's entry becomes the guest's) …
+    with_caller(wire(&guest), async {
+        svc.agent_edit_queued_message(
+            agent.clone(),
+            owner_queued_id.clone(),
+            "owner queued (edited)".into(),
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("editQueuedMessage");
+    assert_eq!(
+        queue_text(&svc, &agent, &owner_queued_id),
+        annotated("owner queued (edited)"),
+        "editQueuedMessage by a collaborator"
+    );
+    // … an owner edit of the guest's entry drops it (content replaced,
+    // no preamble for the owner) …
+    with_caller(wire(&owner), async {
+        svc.agent_edit_queued_message(
+            agent.clone(),
+            queued_id.clone(),
+            "queued (owner)".into(),
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("owner editQueuedMessage");
+    assert_eq!(
+        queue_text(&svc, &agent, &queued_id),
+        "queued (owner)",
+        "editQueuedMessage by the owner stays byte-identical"
+    );
+    // … and a collaborator's edit of an agent-to-agent entry (not
+    // human-authored) gains no preamble — an intentional exception: the
+    // entry's sender stays the originating agent (A2A header), so the sender
+    // preamble would misattribute it; the edit is recorded by the stamp.
+    let (a2a, _) = svc.enqueue_message(
+        &agent,
+        "from agent".into(),
+        None,
+        None,
+        Some(json!({ "type": "agent_message", "fromAgentId": "agent-peer" })),
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    with_caller(wire(&guest), async {
+        svc.agent_edit_queued_message(
+            agent.clone(),
+            a2a.id.clone(),
+            "from agent (edited)".into(),
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("edit a2a");
+    assert_eq!(
+        queue_text(&svc, &agent, &a2a.id),
+        "from agent (edited)",
+        "an agent-authored entry never gains the preamble"
+    );
+
+    // Drain: agent.sendQueuedMessageNow persists the enqueue-time content —
+    // the preamble captured on the entry, not the drainer's.
+    let drained = with_caller(wire(&owner), async {
+        svc.agent_send_queued_message_now(ws.clone(), agent.clone(), owner_queued_id.clone())
+            .await
+    })
+    .await
+    .expect("sendQueuedMessageNow");
+    assert_eq!(
+        row_text(&svc, &agent, drained["messageId"].as_str().expect("id")).await,
+        annotated("owner queued (edited)"),
+        "sendQueuedMessageNow keeps the enqueue-time content"
+    );
+}
+
+/// Multiplayer — `agent.delegate` is a human-authored front door too when
+/// the caller supplies the child's first message: a collaborator's
+/// `agentInstructions` / `taskText` reach the child's model with the sender
+/// preamble at the top (ahead of the TASK-C task-note wrapper when a note is
+/// linked); the task-note fallback is note content, not the caller's text,
+/// and stays byte-identical, as does every free-text delegation by the
+/// owner-role wire caller, the administrator, an absent caller and an agent
+/// caller.
+#[intent_test_macros::daemon_test]
+async fn collaborator_sender_preamble_on_delegate_free_text() {
+    use intent_core::{with_caller, Caller, ConversationProjection, Principal, PrincipalId};
+
+    let (_t, svc, ws) = setup().await;
+    let owner = svc
+        .store()
+        .get_workspace_owner_principal_id(&ws)
+        .await
+        .expect("owner lookup")
+        .expect("workspace owner");
+    let guest = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("octocat".into()),
+            display_name: Some("The Octocat".into()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    svc.store()
+        .add_workspace_member(&ws, &guest, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    let wire = |p: &PrincipalId| Caller::Wire {
+        principal_id: p.clone(),
+        is_administrator: false,
+    };
+    let preamble = crate::harness::latest().collaborator_sender_preamble(
+        Some("octocat"),
+        Some("The Octocat"),
+        &guest.0,
+    );
+    let annotated = |text: &str| format!("{preamble}\n\n{text}");
+    // The child's first user row: its text, its persisted principal stamp,
+    // and the author the conversation read serves for it.
+    let first_user_row = |svc: &Services, out: &serde_json::Value| {
+        let svc = svc.clone();
+        let child = AgentId::from(out["agentId"].as_str().expect("agentId"));
+        async move {
+            let row = svc
+                .store()
+                .get_agent_session(&child)
+                .await
+                .expect("child session")
+                .messages
+                .into_iter()
+                .find(|m| m.role == "user")
+                .unwrap_or_else(|| panic!("child {child} has a first user row"));
+            let stamp = row
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("fromPrincipalId"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let page = svc
+                .agent_get_conversation_op(
+                    child.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(ConversationProjection::Slim),
+                    false,
+                )
+                .await
+                .expect("child conversation");
+            let served = page["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .find(|m| m["id"] == row.id)
+                .unwrap_or_else(|| panic!("child {child} serves row {}", row.id));
+            (
+                crate::search_ops::message_text(&row.content),
+                stamp,
+                served["author"]["principalId"].as_str().map(str::to_string),
+            )
+        }
+    };
+    // agentInstructions by the collaborator (no note): delivered verbatim
+    // otherwise, so the preamble is the whole difference — and the row is
+    // stamped with (and served as authored by) the collaborator, not the
+    // workspace owner the resolver falls back to for unstamped rows.
+    let out = with_caller(wire(&guest), async {
+        svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("delegate agentInstructions");
+    let (text, stamp, author) = first_user_row(&svc, &out).await;
+    assert_eq!(
+        text,
+        annotated("do the thing"),
+        "collaborator agentInstructions carry the preamble"
+    );
+    assert_eq!(
+        stamp.as_deref(),
+        Some(guest.0.as_str()),
+        "collaborator agentInstructions persist the collaborator's stamp"
+    );
+    assert_eq!(
+        author.as_deref(),
+        Some(guest.0.as_str()),
+        "the served author is the collaborator, not the workspace owner"
+    );
+
+    // taskText by the collaborator (no note): same free-text source.
+    let out = with_caller(wire(&guest), async {
+        svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                task_text: Some("tick the box".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("delegate taskText");
+    let (text, stamp, author) = first_user_row(&svc, &out).await;
+    assert_eq!(
+        text,
+        annotated("tick the box"),
+        "collaborator taskText carries the preamble"
+    );
+    assert_eq!(
+        stamp.as_deref(),
+        Some(guest.0.as_str()),
+        "collaborator taskText persists the collaborator's stamp"
+    );
+    assert_eq!(
+        author.as_deref(),
+        Some(guest.0.as_str()),
+        "the served taskText author is the collaborator"
+    );
+    assert_eq!(
+        out["name"], "tick the box",
+        "the child's task-derived name stays unannotated: {out}"
+    );
+
+    // agentInstructions + linked task note: the preamble heads the message,
+    // ahead of the TASK-C task-note wrapper.
+    let note_id = seed_task(&svc, &ws, "delegate preamble").await;
+    let out = with_caller(wire(&guest), async {
+        svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(note_id.clone()),
+                agent_instructions: Some("with note".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("delegate agentInstructions + taskNoteId");
+    let (text, stamp, author) = first_user_row(&svc, &out).await;
+    assert_eq!(
+        text,
+        crate::harness::latest().delegation_first_message(
+            Some(&annotated("with note")),
+            "delegate preamble",
+            &note_id.0,
+        ),
+        "the preamble sits above the caller's text, inside the TASK-C wrapper"
+    );
+    assert_eq!(
+        stamp.as_deref(),
+        Some(guest.0.as_str()),
+        "the wrapped free text keeps the collaborator's stamp"
+    );
+    assert_eq!(
+        author.as_deref(),
+        Some(guest.0.as_str()),
+        "the wrapped free text is served as the collaborator's"
+    );
+
+    // Task-note fallback (no free text): the note's content is not the
+    // caller's text and stays byte-identical.
+    let fallback_note = seed_task(&svc, &ws, "delegate fallback").await;
+    let out = with_caller(wire(&guest), async {
+        svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(fallback_note.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("delegate taskNoteId");
+    let (text, stamp, author) = first_user_row(&svc, &out).await;
+    assert_eq!(
+        text,
+        crate::harness::latest().delegation_first_message(
+            Some("delegate fallback body"),
+            "delegate fallback",
+            &fallback_note.0,
+        ),
+        "the task-note fallback gains no preamble"
+    );
+    assert_eq!(
+        stamp, None,
+        "the task-note fallback is note content and carries no principal stamp"
+    );
+    assert_eq!(
+        author.as_deref(),
+        Some(owner.0.as_str()),
+        "an unstamped fallback row keeps resolving to the workspace owner"
+    );
+
+    // Byte-identical controls on free text: owner role, administrator,
+    // absent (UDS / legacy-token) caller, agent caller. The stamp follows
+    // the `agent.sendMessage` rule (bound wire principal stamped, agents and
+    // absent callers not); every control is served as the owner.
+    let admin = Caller::Wire {
+        principal_id: owner.clone(),
+        is_administrator: true,
+    };
+    let peer = Caller::Agent {
+        agent_id: AgentId::from("agent-peer"),
+    };
+    for (label, caller, expected_stamp) in [
+        ("owner role", Some(wire(&owner)), Some(owner.0.clone())),
+        ("administrator", Some(admin), Some(owner.0.clone())),
+        ("absent caller", None, None),
+        ("agent caller", Some(peer), None),
+    ] {
+        let text = format!("control {label}");
+        let delegate = svc.agent_delegate(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some(text.clone()),
+                ..Default::default()
+            },
+            None,
+        );
+        let out = match caller {
+            Some(caller) => with_caller(caller, delegate).await,
+            None => delegate.await,
+        }
+        .unwrap_or_else(|e| panic!("{label}: delegate: {e:?}"));
+        let (served_text, stamp, author) = first_user_row(&svc, &out).await;
+        assert_eq!(
+            served_text, text,
+            "{label}: agentInstructions must stay byte-identical"
+        );
+        assert_eq!(
+            stamp, expected_stamp,
+            "{label}: the delegate row carries the sendMessage stamp"
+        );
+        assert_eq!(
+            author.as_deref(),
+            Some(owner.0.as_str()),
+            "{label}: the delegate row is served as the owner"
+        );
+    }
+}
+
+/// Multiplayer — `agent.appendMessage` with `role: user` is human-authored
+/// and model-facing on the next turn: a collaborator's row carries the
+/// sender preamble in every supported `content` shape (string, block array
+/// on its first text block, text-less block array via a leading text block;
+/// exact-match idempotent), while the owner-role wire caller, the
+/// administrator, an absent caller, an agent caller and every non-`user`
+/// role stay byte-identical.
+#[intent_test_macros::daemon_test]
+async fn collaborator_sender_preamble_on_append_message_user_rows() {
+    use intent_core::{with_caller, Caller, Principal, PrincipalId};
+
+    let (_t, svc, ws) = setup().await;
+    let owner = svc
+        .store()
+        .get_workspace_owner_principal_id(&ws)
+        .await
+        .expect("owner lookup")
+        .expect("workspace owner");
+    let guest = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("octocat".into()),
+            display_name: Some("The Octocat".into()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    svc.store()
+        .add_workspace_member(&ws, &guest, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    let wire = |p: &PrincipalId| Caller::Wire {
+        principal_id: p.clone(),
+        is_administrator: false,
+    };
+    let preamble = crate::harness::latest().collaborator_sender_preamble(
+        Some("octocat"),
+        Some("The Octocat"),
+        &guest.0,
+    );
+    let annotated = |text: &str| format!("{preamble}\n\n{text}");
+    let agent = create_agent(&svc, &ws, "Appended").await;
+    let append = |caller: Option<Caller>, role: &str, content: serde_json::Value| {
+        let svc = svc.clone();
+        let agent = agent.clone();
+        let ws = ws.clone();
+        let role = role.to_string();
+        async move {
+            let call = svc.agent_append_message(agent, Some(ws), role, content, None);
+            match caller {
+                Some(caller) => with_caller(caller, call).await,
+                None => call.await,
+            }
+            .expect("appendMessage")["message"]["contentBlocks"]
+                .clone()
+        }
+    };
+
+    // String content.
+    assert_eq!(
+        append(Some(wire(&guest)), "user", json!("plain")).await,
+        json!(annotated("plain")),
+        "collaborator user row (string) carries the preamble"
+    );
+    // Block array: the first text block is annotated, the rest untouched.
+    assert_eq!(
+        append(
+            Some(wire(&guest)),
+            "user",
+            json!([
+                { "type": "image", "data": "AAAA", "mimeType": "image/png" },
+                { "type": "text", "text": "first" },
+                { "type": "text", "text": "second" },
+            ]),
+        )
+        .await,
+        json!([
+            { "type": "image", "data": "AAAA", "mimeType": "image/png" },
+            { "type": "text", "text": annotated("first") },
+            { "type": "text", "text": "second" },
+        ]),
+        "collaborator user row (blocks) annotates the first text block"
+    );
+    // Text-less block array: a leading text block carries the preamble in
+    // its canonical `{preamble}\n\n` shape.
+    let image_only = json!([{ "type": "image", "data": "AAAA", "mimeType": "image/png" }]);
+    let image_only_annotated = json!([
+        { "type": "text", "text": annotated("") },
+        { "type": "image", "data": "AAAA", "mimeType": "image/png" },
+    ]);
+    assert_eq!(
+        append(Some(wire(&guest)), "user", image_only.clone()).await,
+        image_only_annotated,
+        "collaborator user row without text gains a leading preamble block"
+    );
+    // Idempotent: an already-annotated body is not annotated twice — a
+    // string, and a second pass over the leading block a text-less / empty
+    // array gained (the block must be recognised as already applied).
+    assert_eq!(
+        append(Some(wire(&guest)), "user", json!(annotated("again"))).await,
+        json!(annotated("again")),
+        "exact-match idempotency"
+    );
+    assert_eq!(
+        append(Some(wire(&guest)), "user", image_only_annotated.clone()).await,
+        image_only_annotated,
+        "second pass over a text-less array's leading block is a no-op"
+    );
+    let empty_annotated = json!([{ "type": "text", "text": annotated("") }]);
+    assert_eq!(
+        append(Some(wire(&guest)), "user", json!([])).await,
+        empty_annotated,
+        "an empty array gains the canonical leading block"
+    );
+    assert_eq!(
+        append(Some(wire(&guest)), "user", empty_annotated.clone()).await,
+        empty_annotated,
+        "second pass over an empty array's leading block is a no-op"
+    );
+
+    // Byte-identical controls: non-user roles by the collaborator; user rows
+    // by the owner role, the administrator, an absent caller, an agent.
+    for role in ["assistant", "system"] {
+        let content = json!([{ "type": "text", "text": format!("{role} row") }]);
+        assert_eq!(
+            append(Some(wire(&guest)), role, content.clone()).await,
+            content,
+            "collaborator {role} row must stay byte-identical"
+        );
+    }
+    let admin = Caller::Wire {
+        principal_id: owner.clone(),
+        is_administrator: true,
+    };
+    let peer = Caller::Agent {
+        agent_id: AgentId::from("agent-peer"),
+    };
+    for (label, caller) in [
+        ("owner role", Some(wire(&owner))),
+        ("administrator", Some(admin)),
+        ("absent caller", None),
+        ("agent caller", Some(peer)),
+    ] {
+        let content = json!([{ "type": "text", "text": format!("control {label}") }]);
+        assert_eq!(
+            append(caller, "user", content.clone()).await,
+            content,
+            "{label}: user row must stay byte-identical"
+        );
+    }
+}
+
 /// Multiplayer w2: a non-object `messageMetadata` cannot carry the principal
 /// stamp, so every user-origin entry point rejects it as `InvalidParams`
 /// instead of persisting an unattributed human message (which would be
