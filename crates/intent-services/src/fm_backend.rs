@@ -357,7 +357,10 @@ enum FmRun {
 
 /// Spawn `bin args…` — `stdin` piped in when given, else closed — bounded by
 /// `timeout`; on expiry the whole process group is killed (`kill_on_drop`
-/// covers the direct child on non-unix).
+/// covers the direct child on non-unix). The stdin write runs inside the
+/// timed section, concurrently with the output drain: a child that never
+/// reads a prompt larger than the pipe capacity (16 KiB on macOS) would
+/// otherwise block the write forever and the timeout would never fire.
 async fn run_fm(bin: &Path, args: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> FmRun {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
@@ -377,12 +380,20 @@ async fn run_fm(bin: &Path, args: &[&str], stdin: Option<&[u8]>, timeout: Durati
         Err(e) => return FmRun::Spawn(e),
     };
     let pid = child.id();
-    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        // A failed write is non-fatal — the child may have already exited.
-        // Dropping the pipe closes it so a read-to-EOF child proceeds.
-        let _ = pipe.write_all(bytes).await;
-    }
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    let pipe = child.stdin.take();
+    let run = async {
+        let feed = async {
+            if let (Some(bytes), Some(mut pipe)) = (stdin, pipe) {
+                // A failed write is non-fatal — the child may have already
+                // exited. Dropping the pipe closes it so a read-to-EOF child
+                // proceeds.
+                let _ = pipe.write_all(bytes).await;
+            }
+        };
+        let ((), output) = tokio::join!(feed, child.wait_with_output());
+        output
+    };
+    match tokio::time::timeout(timeout, run).await {
         Ok(Ok(output)) => FmRun::Exited(output),
         Ok(Err(e)) => FmRun::Spawn(e),
         Err(_) => {
@@ -812,6 +823,26 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "child was reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_times_out_when_child_never_drains_a_large_prompt() {
+        // Regression: the stdin write used to run before the timed section,
+        // so a child that never reads a prompt above the pipe capacity
+        // (16 KiB macOS, 64 KiB Linux) blocked the write forever. Well over
+        // both so the test reproduces on either host.
+        let (_dir, bin, _log) = fake_fm("respond-no-drain", "sleep 30");
+        let prompt = "x".repeat(256 * 1024);
+        let started = Instant::now();
+        let err = backend(bin, LONG_TTL)
+            .respond(None, &prompt, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(err, FmRespondFailure::TimedOut(Duration::from_millis(200)));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out and reaped despite the blocked stdin write"
         );
     }
 

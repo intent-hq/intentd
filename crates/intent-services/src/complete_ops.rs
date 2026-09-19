@@ -1960,6 +1960,31 @@ rl.on('line', (line) => {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn complete_once_fm_never_draining_stdin_falls_back_within_timeout() {
+        // Regression: an fm that hangs without reading stdin must still hit
+        // the timeout fallback for a prompt above the pipe capacity (the
+        // largest eligible prompt is the 24 KiB budget; macOS pipes hold
+        // 16 KiB), instead of blocking on the stdin write forever.
+        let (_auggie_dir, auggie) = fake_auggie("fm-no-drain", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, log) = fake_fm_available("no-drain", "sleep 30");
+        let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        let prompt = "x".repeat(FM_PROMPT_BYTE_BUDGET - 1);
+        let started = std::time::Instant::now();
+        let v = services
+            .agent_complete_once_op(prompt, None, None, None, None, Some(200))
+            .await
+            .unwrap();
+        assert_eq!(v["text"], "from-auggie");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(
+            fm_calls(&log).last().map(String::as_str),
+            Some("respond --no-stream --greedy"),
+            "fm was attempted first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn complete_once_setting_off_never_spawns_fm() {
         let (_auggie_dir, auggie) = fake_auggie("fm-off", "printf '🤖\\nfrom-auggie\\n'");
         let (_fm_dir, fm, log) = fake_fm_available("off", "cat");
