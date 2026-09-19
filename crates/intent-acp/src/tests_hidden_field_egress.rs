@@ -69,9 +69,12 @@ fn typed_sentinel_candidates() -> [Value; 5] {
 /// deserialize back. For each key the first candidate from
 /// [`typed_sentinel_candidates`] that deserializes is kept, so a hidden key
 /// that is a real field of any common type lands populated without a fixture
-/// edit. `serde` ignores keys the struct does not carry (the first candidate
-/// then trivially succeeds), which is the correct outcome for a hidden key
-/// with no field on this type: it cannot reach the egress through it.
+/// edit. When no candidate fits (an enum or structured required field) the
+/// struct's own already-serialized non-null value is kept — the key is
+/// present either way, which is all the egress assertion needs. `serde`
+/// ignores keys the struct does not carry (the first candidate then trivially
+/// succeeds), which is the correct outcome for a hidden key with no field on
+/// this type: it cannot reach the egress through it.
 fn poison_typed<T: serde::Serialize + serde::de::DeserializeOwned>(value: T) -> T {
     let type_name = std::any::type_name::<T>();
     let mut v = serde_json::to_value(value).expect("fixture serializes");
@@ -84,8 +87,9 @@ fn poison_typed<T: serde::Serialize + serde::de::DeserializeOwned>(value: T) -> 
             });
             match accepted {
                 Some(candidate) => v[*key] = candidate,
+                None if v.get(*key).is_some_and(|orig| !orig.is_null()) => {}
                 None => panic!(
-                    "poison_typed: {type_name} field `{key}` accepts none of the sentinel candidates — extend `typed_sentinel_candidates`"
+                    "poison_typed: {type_name} field `{key}` accepts none of the sentinel candidates and the fixture leaves it unset — populate it in the fixture or extend `typed_sentinel_candidates`"
                 ),
             }
         }
