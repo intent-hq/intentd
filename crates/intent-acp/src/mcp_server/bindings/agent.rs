@@ -647,15 +647,17 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// silently-queued is unambiguous even to a sender that only glances at
 /// the result.
 ///
-/// The daemon-side delivery (send → replace retraction → sender watch) runs
-/// on a spawned task under a pre-minted `messageId`
-/// ([`spawn_send_within_budget`], intent-hq/intent#5387): the eval-budget
-/// timeout drops the host future, and a directly-awaited send would be
-/// cancelled at whatever await it was parked on — the message never
-/// reaching the queue. When the delivery outlives [`send_wait_ceiling`], the
-/// binding returns an explicit error naming the in-flight `messageId` so
-/// the caller checks `ws.agent.getQueue` / `ws.agent.status` for it instead
-/// of re-sending blindly; the send itself completes regardless.
+/// The ENTIRE daemon-side sequence — pending guard read → sender-name read →
+/// send → replace retraction → sender watch — runs on a spawned task under a
+/// pre-minted `messageId` ([`spawn_send_within_budget`],
+/// intent-hq/intent#5387): the eval-budget timeout drops the host future,
+/// and any directly-awaited step would be cancelled at whatever await it
+/// was parked on — the message never reaching the queue. Nothing in this
+/// function awaits before the spawn; only synchronous argument parsing runs
+/// inline. When the delivery outlives [`send_wait_ceiling`], the binding
+/// returns an explicit error naming the in-flight `messageId` so the caller
+/// checks `ws.agent.getQueue` / `ws.agent.status` for it instead of
+/// re-sending blindly; the send itself completes regardless.
 async fn send(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -667,26 +669,27 @@ async fn send(
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
     let replace_pending = opt_bool(args, "replacePending").unwrap_or(false);
-    let mut pending_to_replace: Option<String> = None;
-    if let Some(refusal) = pending_send_refusal(api, ws, caller, &agent_id).await {
-        if !replace_pending {
-            return Ok(refusal);
-        }
-        pending_to_replace = refusal
-            .get("pendingMessageId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-    }
     let priority = effective_priority(args);
-    let metadata = sender_metadata(api, ws, caller, args).await;
     let message_id = new_send_message_id();
     let api = api.clone();
     let ws = ws.clone();
     let caller = caller.cloned();
+    let args = args.clone();
     let in_flight_id = message_id.clone();
     let in_flight_target = agent_id_str.clone();
     let wait_ms = send_wait_ceiling(eval_budget).as_millis();
     let delivery = async move {
+        let mut pending_to_replace: Option<String> = None;
+        if let Some(refusal) = pending_send_refusal(&api, &ws, caller.as_ref(), &agent_id).await {
+            if !replace_pending {
+                return Ok(refusal);
+            }
+            pending_to_replace = refusal
+                .get("pendingMessageId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        let metadata = sender_metadata(&api, &ws, caller.as_ref(), &args).await;
         let mut result = api
             .agent_send_message(
                 ws.clone(),
@@ -752,9 +755,11 @@ async fn send(
 /// `replaceOutcome: "reassigned"`. An agent caller passing
 /// `replacePending: true` always gets a replace report — the fall-through
 /// paths report `replaceOutcome: "none"` rather than silently ignoring the
-/// option. The daemon-side delivery is spawned and budget-bounded exactly
-/// like [`send`] (intent-hq/intent#5387); the op mints the message id
-/// itself, so the in-flight error names the task instead.
+/// option. The entire daemon-side sequence (task resolution → guard read →
+/// sender-name read → send → retraction → watch) is spawned and
+/// budget-bounded exactly like [`send`] (intent-hq/intent#5387) — nothing
+/// awaits before the spawn; the op mints the message id itself, so the
+/// in-flight error names the task instead.
 async fn send_to_task(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -766,38 +771,41 @@ async fn send_to_task(
         req_str(args, "taskNoteId").map_err(|_| "taskNoteId is required".to_string())?;
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
     let replace_pending = opt_bool(args, "replacePending").unwrap_or(false);
-    let mut guard_target: Option<AgentId> = None;
-    let mut pending_to_replace: Option<String> = None;
-    if caller.is_some() {
-        if let Ok(task) = api
-            .get_my_task(ws.clone(), NoteId::from_string(&task_note_id))
-            .await
-        {
-            if let Some(target) = task.assigned_agents.first() {
-                if let Some(mut refusal) = pending_send_refusal(api, ws, caller, target).await {
-                    if !replace_pending {
-                        if let Some(obj) = refusal.as_object_mut() {
-                            obj.insert("taskNoteId".to_string(), json!(task_note_id));
-                        }
-                        return Ok(refusal);
-                    }
-                    pending_to_replace = refusal
-                        .get("pendingMessageId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    guard_target = Some(target.clone());
-                }
-            }
-        }
-    }
     let priority = effective_priority(args);
-    let metadata = sender_metadata(api, ws, caller, args).await;
     let api = api.clone();
     let ws = ws.clone();
     let caller = caller.cloned();
+    let args = args.clone();
     let in_flight_task = task_note_id.clone();
     let wait_ms = send_wait_ceiling(eval_budget).as_millis();
     let delivery = async move {
+        let mut guard_target: Option<AgentId> = None;
+        let mut pending_to_replace: Option<String> = None;
+        if caller.is_some() {
+            if let Ok(task) = api
+                .get_my_task(ws.clone(), NoteId::from_string(&task_note_id))
+                .await
+            {
+                if let Some(target) = task.assigned_agents.first() {
+                    if let Some(mut refusal) =
+                        pending_send_refusal(&api, &ws, caller.as_ref(), target).await
+                    {
+                        if !replace_pending {
+                            if let Some(obj) = refusal.as_object_mut() {
+                                obj.insert("taskNoteId".to_string(), json!(task_note_id));
+                            }
+                            return Ok(refusal);
+                        }
+                        pending_to_replace = refusal
+                            .get("pendingMessageId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        guard_target = Some(target.clone());
+                    }
+                }
+            }
+        }
+        let metadata = sender_metadata(&api, &ws, caller.as_ref(), &args).await;
         let mut result = api
             .agent_send_to_task(
                 ws.clone(),
