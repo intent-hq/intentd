@@ -50,10 +50,13 @@ fn classify_picks_the_two_invite_methods_only() {
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": {}, "method": "invite.redeem" })).is_none());
 }
 
-/// Records which redeem phase ran and returns a canned invite error.
+/// Records which redeem phase ran; phase 1 returns the service payload for
+/// the `GOOD_SECRET` and a canned invite error otherwise.
 struct RedeemStub {
     calls: std::sync::Mutex<Vec<String>>,
 }
+
+const GOOD_SECRET: &str = "good";
 
 impl WorkspaceApi for RedeemStub {
     fn invite_redeem_start(
@@ -65,7 +68,21 @@ impl WorkspaceApi for RedeemStub {
             .lock()
             .unwrap()
             .push(format!("start:{invite_id}:{secret}"));
-        Box::pin(async { Err(intent_core::Error::Invite(InviteErrorKind::Expired)) })
+        Box::pin(async move {
+            if secret == GOOD_SECRET {
+                Ok(json!({
+                    "flowId": "flow-1",
+                    "userCode": "ABCD-1234",
+                    "verificationUri": "https://github.com/login/device",
+                    "expiresIn": 900,
+                    "interval": 5,
+                    "workspaceId": "ws-1",
+                    "workspaceTitle": "Shared",
+                }))
+            } else {
+                Err(intent_core::Error::Invite(InviteErrorKind::Expired))
+            }
+        })
     }
     fn invite_redeem_wait(
         &self,
@@ -88,7 +105,12 @@ async fn redeem_routes_phases_and_maps_invite_errors_to_data_code() {
         "params": { "inviteId": "inv", "secret": "sec" }
     }))
     .unwrap();
-    let frame: Value = serde_json::from_str(&handle_redeem(req, &api).await.unwrap()).unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_redeem(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(frame["id"], json!(7));
     assert_eq!(frame["error"]["data"]["code"], json!("invite-expired"));
     assert_eq!(
@@ -101,19 +123,36 @@ async fn redeem_routes_phases_and_maps_invite_errors_to_data_code() {
         "params": { "flowId": " flow-1 " }
     }))
     .unwrap();
-    let frame: Value = serde_json::from_str(&handle_redeem(req, &api).await.unwrap()).unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_redeem(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(frame["result"]["status"], json!("authorized"));
+    assert!(
+        frame["result"].get("hostname").is_none()
+            && frame["result"].get("prettyHostname").is_none(),
+        "phase 2 carries no host identity: {frame}"
+    );
 
     let req =
         classify(&json!({ "jsonrpc": "2.0", "id": 9, "method": "invite.redeem", "params": {} }))
             .unwrap();
-    let frame: Value = serde_json::from_str(&handle_redeem(req, &api).await.unwrap()).unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_redeem(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(frame["error"]["code"], json!(-32602));
 
     let req =
         classify(&json!({ "jsonrpc": "2.0", "method": "invite.redeem", "params": {} })).unwrap();
     assert!(
-        handle_redeem(req, &api).await.is_none(),
+        handle_redeem(req, &api, host_identity(None, None))
+            .await
+            .is_none(),
         "notification: no frame"
     );
 
@@ -121,6 +160,53 @@ async fn redeem_routes_phases_and_maps_invite_errors_to_data_code() {
         *stub.calls.lock().unwrap(),
         vec!["start:inv:sec".to_string(), "wait:flow-1".to_string()]
     );
+}
+
+/// The phase-1 result names the host from the identity the caller hands in
+/// — the listener's cached `HostEnvironment` (the one `system.status` /
+/// `server.pairingInfo` report), never a fresh OS probe on the RPC path.
+#[tokio::test]
+async fn redeem_start_extends_the_service_result_with_the_cached_host_identity() {
+    let api: Arc<dyn WorkspaceApi> = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "invite.redeem",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET }
+    }))
+    .unwrap();
+    let cached = crate::host_env::HostEnvironment {
+        hostname: "cached-host".to_string(),
+        pretty_hostname: "Cached Host".to_string(),
+        device_kind: Some("desktop".to_string()),
+        hardware_model: None,
+    };
+    let frame: Value =
+        serde_json::from_str(&handle_redeem(req, &api, cached).await.unwrap()).unwrap();
+    let result = &frame["result"];
+    assert_eq!(result["flowId"], json!("flow-1"), "{frame}");
+    assert_eq!(result["workspaceTitle"], json!("Shared"));
+    assert_eq!(result["hostname"], json!("cached-host"), "{frame}");
+    assert_eq!(result["prettyHostname"], json!("Cached Host"), "{frame}");
+    assert!(
+        result.get("deviceKind").is_none(),
+        "only the two name fields are stamped: {frame}"
+    );
+}
+
+/// `host_identity` reads the cached identity from the control surface first,
+/// then the pairing provider; the OS probes back the result only when the
+/// listener has neither (test harnesses).
+#[test]
+fn host_identity_prefers_the_cached_environment_over_the_os_probes() {
+    let (provider, _dir) = stub_provider(Some(1), None);
+    let from_provider = host_identity(None, Some(&provider));
+    assert_eq!(from_provider.hostname, "test");
+    assert_eq!(from_provider.pretty_hostname, "test");
+
+    let probed = host_identity(None, None);
+    assert_eq!(probed.hostname, crate::local_hostname());
+    assert_eq!(probed.pretty_hostname, crate::pretty_hostname());
 }
 
 #[tokio::test]
@@ -428,7 +514,7 @@ async fn throttled_starts_make_no_upstream_calls_and_waits_pass() {
     for i in 0..20 {
         match admit_redeem(&start_req(500 + i), &throttle, t0) {
             Ok(()) => {
-                handle_redeem(start_req(500 + i), &api).await;
+                handle_redeem(start_req(500 + i), &api, host_identity(None, None)).await;
             }
             Err(_) => refusals += 1,
         }
@@ -444,7 +530,12 @@ async fn throttled_starts_make_no_upstream_calls_and_waits_pass() {
     }))
     .unwrap();
     assert_eq!(admit_redeem(&wait, &throttle, t0), Ok(()));
-    let frame: Value = serde_json::from_str(&handle_redeem(wait, &api).await.unwrap()).unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_redeem(wait, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(frame["result"]["status"], json!("authorized"));
     assert_eq!(*stub.calls.lock().unwrap(), vec!["wait:flow-1".to_string()]);
 }

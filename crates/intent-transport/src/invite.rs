@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::control::SystemControl;
 use crate::events::{error_frame, error_frame_with_data, success_frame};
+use crate::host_env::HostEnvironment;
 use crate::pairing::encode_query_value;
 use crate::server::{pairing_hosts, ServerPairingInfo};
 use intent_core::{
@@ -402,19 +404,48 @@ async fn create_json(
     Ok(result)
 }
 
+/// The host identity stamped on `/invite` results: the cached
+/// [`HostEnvironment`] behind `system.status` / `server.pairingInfo`
+/// (refreshed by the composition root off the RPC path) from the listener's
+/// control surface, else its pairing provider; the OS probes run only when
+/// neither is wired (test harnesses), never on a production request.
+pub(crate) fn host_identity(
+    control: Option<&Arc<dyn SystemControl>>,
+    provider: Option<&Arc<dyn ServerPairingInfo>>,
+) -> HostEnvironment {
+    control
+        .map(|control| control.host_environment())
+        .or_else(|| provider.map(|provider| provider.host_environment()))
+        .unwrap_or_else(|| HostEnvironment {
+            hostname: crate::local_hostname(),
+            pretty_hostname: crate::pretty_hostname(),
+            device_kind: None,
+            hardware_model: None,
+        })
+}
+
 /// Handle a classified `invite.redeem` on the `/invite` endpoint. Phase 1
-/// (`{ inviteId, secret }`) starts the identity-only device flow; phase 2
-/// (`{ flowId }`) blocks until the grant settles (the caller runs this on a
-/// detached task so heartbeats keep flowing) and yields the credential once.
+/// (`{ inviteId, secret }`) starts the identity-only device flow and extends
+/// the service result with the host's `hostname` / `prettyHostname` (`host`,
+/// the same cached identity `system.status` / `server.pairingInfo` report —
+/// see [`host_identity`]) so the guest's consent prompt can name the machine
+/// before the authenticated connect; phase 2 (`{ flowId }`) blocks until the
+/// grant settles (the caller runs this on a detached task so heartbeats keep
+/// flowing) and yields the credential once.
 pub(crate) async fn handle_redeem(
     req: InviteRequest,
     api: &Arc<dyn WorkspaceApi>,
+    host: HostEnvironment,
 ) -> Option<String> {
-    let result = redeem_json(&req.params, api).await;
+    let result = redeem_json(&req.params, api, host).await;
     respond(&req, result)
 }
 
-async fn redeem_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Value> {
+async fn redeem_json(
+    params: &Value,
+    api: &Arc<dyn WorkspaceApi>,
+    host: HostEnvironment,
+) -> Result<Value> {
     match opt_str_param(params, "flowId")? {
         Some(flow_id) if !flow_id.trim().is_empty() => {
             api.invite_redeem_wait(flow_id.trim().to_string()).await
@@ -422,7 +453,13 @@ async fn redeem_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Valu
         _ => {
             let invite_id = str_param(params, "inviteId")?;
             let secret = str_param(params, "secret")?;
-            api.invite_redeem_start(invite_id, secret).await
+            let mut result = api.invite_redeem_start(invite_id, secret).await?;
+            let obj = result.as_object_mut().ok_or_else(|| {
+                Error::Internal("invite.redeem start result is not an object".to_string())
+            })?;
+            obj.insert("hostname".into(), host.hostname.into());
+            obj.insert("prettyHostname".into(), host.pretty_hostname.into());
+            Ok(result)
         }
     }
 }
