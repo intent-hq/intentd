@@ -21,7 +21,9 @@ use intent_core::{
 };
 use serde_json::{json, Value};
 
-use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str, strip_agent_hidden_fields};
+use super::{
+    map_err, opt_bool, opt_str, opt_vec_str, req_str, strip_agent_hidden_fields, EvalBudget,
+};
 
 /// SUB-1 blurb surfaced by `send` / `sendToTask` when the sender is auto-
 /// subscribed to the target's completion (parity with the TS `SendMessageTool`
@@ -31,14 +33,62 @@ const SENDER_WATCH_NOTIFICATION: &str = "You will be notified when the agent res
 /// Time held back from the `workspace_api` eval budget so a `send` /
 /// `sendToTask` whose daemon-side delivery is still in flight returns its
 /// explicit in-flight error before the transport aborts the eval
-/// (intent-hq/intent#5387). Capped at half the budget so a compressed test
-/// budget still leaves a real wait.
+/// (intent-hq/intent#5387). Capped at half the remaining budget so a
+/// compressed test budget still leaves a real wait.
 const SEND_WAIT_MARGIN: Duration = Duration::from_secs(2);
 
 /// How long a `send` / `sendToTask` binding waits for the daemon-side
-/// delivery under `budget` before returning the in-flight error.
-fn send_wait_ceiling(budget: Duration) -> Duration {
-    budget.saturating_sub(SEND_WAIT_MARGIN.min(budget / 2))
+/// delivery when `remaining` is left of the eval budget before returning
+/// the in-flight error.
+fn send_wait_ceiling(remaining: Duration) -> Duration {
+    remaining.saturating_sub(SEND_WAIT_MARGIN.min(remaining / 2))
+}
+
+/// Whether a send that completed AFTER its binding already returned the
+/// in-flight error ended in a non-delivery the caller never saw: the op's
+/// `ok: false` / `success: false` shapes (e.g. `sendToTask` with no assignee)
+/// or a single-pending-message refusal.
+fn is_send_non_delivery(result: &Value) -> bool {
+    result.get("ok").and_then(Value::as_bool) == Some(false)
+        || result.get("success").and_then(Value::as_bool) == Some(false)
+        || result.get("refused").and_then(Value::as_bool) == Some(true)
+}
+
+/// The observable tail of a detached send (intent-hq/intent#5387): once the
+/// binding has returned the in-flight error nothing else awaits the spawned
+/// delivery, so its eventual outcome is logged here under `send` (the
+/// pre-minted `messageId` / task the error named) — a late failure is a
+/// WARN the operator can correlate, not a silently dropped `Result`.
+async fn log_late_send_outcome(
+    send: String,
+    waited_ms: u128,
+    handle: tokio::task::JoinHandle<Result<Value, String>>,
+) {
+    match handle.await {
+        Ok(Ok(result)) if is_send_non_delivery(&result) => tracing::warn!(
+            %send,
+            waited_ms,
+            %result,
+            "agent send completed WITHOUT delivering after its binding timed out"
+        ),
+        Ok(Ok(_)) => tracing::info!(
+            %send,
+            waited_ms,
+            "agent send completed after its binding timed out"
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            %send,
+            waited_ms,
+            %error,
+            "agent send FAILED after its binding timed out"
+        ),
+        Err(join_err) => tracing::warn!(
+            %send,
+            waited_ms,
+            error = %join_err,
+            "agent send task panicked or was cancelled after its binding timed out"
+        ),
+    }
 }
 
 /// Mint the durable message id for a `ws.agent.send` BEFORE the daemon-side
@@ -52,22 +102,30 @@ fn new_send_message_id() -> String {
 /// Run the daemon-side half of a `send` / `sendToTask` on a spawned task so
 /// dropping the host future (the eval-budget timeout in `intent-js` cancels
 /// every pending `await`) cannot cancel the delivery mid-flight
-/// (intent-hq/intent#5387). Waits at most [`send_wait_ceiling`] for the
-/// result; past that, returns `in_flight_error` while the task keeps running
-/// to completion.
+/// (intent-hq/intent#5387). Waits at most [`send_wait_ceiling`] of the
+/// eval's REMAINING budget for the result — earlier host frames in the same
+/// eval already spent part of it; past that, returns `in_flight_error` (fed
+/// the milliseconds waited) while the task keeps running to completion and
+/// [`log_late_send_outcome`] records how it ended under `send_label`.
 async fn spawn_send_within_budget<F>(
-    eval_budget: Duration,
+    eval_budget: EvalBudget,
+    send_label: String,
     fut: F,
-    in_flight_error: impl FnOnce() -> String,
+    in_flight_error: impl FnOnce(u128) -> String,
 ) -> Result<Value, String>
 where
     F: std::future::Future<Output = Result<Value, String>> + Send + 'static,
 {
-    let handle = tokio::spawn(fut);
-    match tokio::time::timeout(send_wait_ceiling(eval_budget), handle).await {
+    let wait = send_wait_ceiling(eval_budget.remaining());
+    let mut handle = tokio::spawn(fut);
+    match tokio::time::timeout(wait, &mut handle).await {
         Ok(Ok(result)) => result,
         Ok(Err(join_err)) => Err(format!("agent send task failed: {join_err}")),
-        Err(_elapsed) => Err(in_flight_error()),
+        Err(_elapsed) => {
+            let waited_ms = wait.as_millis();
+            tokio::spawn(log_late_send_outcome(send_label, waited_ms, handle));
+            Err(in_flight_error(waited_ms))
+        }
     }
 }
 
@@ -168,7 +226,7 @@ pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
-    eval_budget: Duration,
+    eval_budget: EvalBudget,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -181,7 +239,7 @@ async fn dispatch_inner(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
-    eval_budget: Duration,
+    eval_budget: EvalBudget,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -654,15 +712,21 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// and any directly-awaited step would be cancelled at whatever await it
 /// was parked on — the message never reaching the queue. Nothing in this
 /// function awaits before the spawn; only synchronous argument parsing runs
-/// inline. When the delivery outlives [`send_wait_ceiling`], the binding
-/// returns an explicit error naming the in-flight `messageId` so the caller
-/// checks `ws.agent.getQueue` / `ws.agent.status` for it instead of
-/// re-sending blindly; the send itself completes regardless.
+/// inline. (The one await upstream of every binding — the retired-caller
+/// `agent_is_retired` read in `workspace_host_dispatch` — precedes the id
+/// mint and the spawn, so a drop there means no send was ever attempted:
+/// the caller gets the generic eval timeout and nothing is in flight.) When
+/// the delivery outlives [`send_wait_ceiling`] of the eval's REMAINING
+/// budget, the binding returns an explicit error naming the in-flight
+/// `messageId` as an UNCONFIRMED attempt — it may still land or fail late,
+/// and [`log_late_send_outcome`] records which under that id — so the
+/// caller checks `ws.agent.getQueue` / `ws.agent.status` for it instead of
+/// re-sending blindly.
 async fn send(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
-    eval_budget: Duration,
+    eval_budget: EvalBudget,
     args: &Value,
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
@@ -677,7 +741,6 @@ async fn send(
     let args = args.clone();
     let in_flight_id = message_id.clone();
     let in_flight_target = agent_id_str.clone();
-    let wait_ms = send_wait_ceiling(eval_budget).as_millis();
     let delivery = async move {
         let mut pending_to_replace: Option<String> = None;
         if let Some(refusal) = pending_send_refusal(&api, &ws, caller.as_ref(), &agent_id).await {
@@ -731,9 +794,10 @@ async fn send(
         }
         Ok(out)
     };
-    spawn_send_within_budget(eval_budget, delivery, move || {
+    let send_label = format!("messageId {in_flight_id} to {in_flight_target}");
+    spawn_send_within_budget(eval_budget, send_label, delivery, move |wait_ms| {
         format!(
-            "agent.send to {in_flight_target} is still in flight after {wait_ms}ms: the daemon has not yet confirmed delivery of messageId {in_flight_id}. The send was NOT cancelled and is not lost — it completes in the background. Do NOT re-send blindly: check ws.agent.getQueue(\"{in_flight_target}\") (queued entry) or ws.agent.status(\"{in_flight_target}\") for that messageId first."
+            "agent.send to {in_flight_target} is still in flight after {wait_ms}ms (the eval budget's remaining time): the daemon has not confirmed delivery of messageId {in_flight_id}. The attempt was NOT cancelled and keeps running in the background, but its outcome is UNCONFIRMED — it may still land or fail late. Do NOT re-send blindly: check ws.agent.getQueue(\"{in_flight_target}\") (queued entry) or ws.agent.status(\"{in_flight_target}\") for that messageId first; if it never appears, the daemon log records the late outcome under messageId {in_flight_id}."
         )
     })
     .await
@@ -759,12 +823,12 @@ async fn send(
 /// sender-name read → send → retraction → watch) is spawned and
 /// budget-bounded exactly like [`send`] (intent-hq/intent#5387) — nothing
 /// awaits before the spawn; the op mints the message id itself, so the
-/// in-flight error names the task instead.
+/// in-flight error (and the late-outcome log line) names the task instead.
 async fn send_to_task(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
-    eval_budget: Duration,
+    eval_budget: EvalBudget,
     args: &Value,
 ) -> Result<Value, String> {
     let task_note_id =
@@ -777,7 +841,6 @@ async fn send_to_task(
     let caller = caller.cloned();
     let args = args.clone();
     let in_flight_task = task_note_id.clone();
-    let wait_ms = send_wait_ceiling(eval_budget).as_millis();
     let delivery = async move {
         let mut guard_target: Option<AgentId> = None;
         let mut pending_to_replace: Option<String> = None;
@@ -854,9 +917,10 @@ async fn send_to_task(
         }
         Ok(out)
     };
-    spawn_send_within_budget(eval_budget, delivery, move || {
+    let send_label = format!("sendToTask for task {in_flight_task}");
+    spawn_send_within_budget(eval_budget, send_label, delivery, move |wait_ms| {
         format!(
-            "agent.sendToTask for task {in_flight_task} is still in flight after {wait_ms}ms: the daemon has not yet confirmed delivery to the assignee. The send was NOT cancelled and is not lost — it completes in the background. Do NOT re-send blindly: check the assignee's queue via ws.agent.getQueue (or ws.agent.status) for your message first."
+            "agent.sendToTask for task {in_flight_task} is still in flight after {wait_ms}ms (the eval budget's remaining time): the daemon has not confirmed delivery to the assignee. The attempt was NOT cancelled and keeps running in the background, but its outcome is UNCONFIRMED — it may still land or fail late (e.g. no assignee). Do NOT re-send blindly: check the assignee's queue via ws.agent.getQueue (or ws.agent.status) for your message first; if it never appears, the daemon log records the late outcome for task {in_flight_task}."
         )
     })
     .await
@@ -2126,6 +2190,42 @@ mod tests {
         assert_eq!(send_wait_ceiling(Duration::ZERO), Duration::ZERO);
     }
 
+    /// `EvalBudget::remaining` counts down from the eval's start, so a send
+    /// dispatched late in the eval waits on what is left, not a fresh
+    /// `total` (intent-hq/intent#5387).
+    #[test]
+    fn eval_budget_remaining_counts_down_from_start() {
+        let budget = EvalBudget::starting_now(Duration::from_secs(30));
+        let remaining = budget.remaining();
+        assert!(remaining <= Duration::from_secs(30), "{remaining:?}");
+        assert!(remaining > Duration::from_secs(29), "{remaining:?}");
+        assert_eq!(budget.total, Duration::from_secs(30));
+        assert_eq!(
+            EvalBudget::starting_now(Duration::ZERO).remaining(),
+            Duration::ZERO
+        );
+    }
+
+    /// A late-completing send is a WARN-worthy non-delivery when the op
+    /// reported `ok: false` / `success: false` or the pending guard refused;
+    /// a plain success (including a merely queued one) is not.
+    #[test]
+    fn is_send_non_delivery_classifies_op_shapes() {
+        assert!(is_send_non_delivery(
+            &json!({ "ok": false, "error": "No agent assigned to task" })
+        ));
+        assert!(is_send_non_delivery(&json!({ "success": false })));
+        assert!(is_send_non_delivery(
+            &json!({ "ok": false, "refused": true })
+        ));
+        assert!(!is_send_non_delivery(
+            &json!({ "ok": true, "queued": true })
+        ));
+        assert!(!is_send_non_delivery(
+            &json!({ "success": true, "turnId": "t1" })
+        ));
+    }
+
     /// The pre-minted send id has the services-side `user-msg-<uuid>` shape.
     #[test]
     fn new_send_message_id_has_user_msg_shape() {
@@ -2270,7 +2370,7 @@ mod tests {
                 &api,
                 &ws,
                 None,
-                Duration::from_secs(30),
+                EvalBudget::starting_now(Duration::from_secs(30)),
                 "listSpecialists",
                 &json!({}),
             )
@@ -2337,7 +2437,7 @@ mod tests {
                 &api,
                 &ws,
                 None,
-                Duration::from_secs(30),
+                EvalBudget::starting_now(Duration::from_secs(30)),
                 "listSpecialistsX",
                 &json!({}),
             )

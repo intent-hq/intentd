@@ -658,7 +658,10 @@ pub fn make_workspace_host_for_bridge(
 /// and collected immediately, so `dispatch_workspace_api` registers them at
 /// the tool result regardless of what the agent's JS returns. Private —
 /// only the `workspace_api` dispatch wires a collector. `eval_budget` is the
-/// wall-clock budget of the enclosing eval, threaded to the bindings.
+/// wall-clock budget of the enclosing eval, threaded to the bindings; its
+/// clock starts HERE (both callers build the host immediately before the
+/// eval), so a binding dispatched late in the eval sees only the remaining
+/// time (intent-hq/intent#5387).
 #[expect(clippy::too_many_arguments)]
 fn make_workspace_host_with_pending(
     api: Arc<dyn WorkspaceApi>,
@@ -671,6 +674,7 @@ fn make_workspace_host_with_pending(
     pending: Option<PendingAttachments>,
 ) -> HostFn {
     let features = Arc::new(agent_features);
+    let eval_budget = super::bindings::EvalBudget::starting_now(eval_budget);
     Arc::new(move |arg| {
         let api = api.clone();
         let workspace_id = workspace_id.clone();
@@ -761,7 +765,7 @@ async fn workspace_host_dispatch(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: &AgentFeaturesSettings,
     is_sub_agent: bool,
-    eval_budget: Duration,
+    eval_budget: super::bindings::EvalBudget,
     arg: Value,
 ) -> std::result::Result<Value, String> {
     let method = arg

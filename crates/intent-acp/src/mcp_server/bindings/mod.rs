@@ -12,7 +12,7 @@
 //! without touching the shared bootstrap.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{AgentId, TurnAttachmentRegistry, WorkspaceApi, WorkspaceId};
@@ -118,6 +118,39 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
     out
 }
 
+/// The enclosing eval's wall-clock budget: its total duration and the
+/// absolute deadline it counts toward. One eval issues many host frames,
+/// and every frame before this one already consumed budget, so a binding
+/// that bounds a wait must use [`EvalBudget::remaining`] — a fresh
+/// `total`-sized wait started late in the eval would outlive the transport's
+/// timeout and lose its explicit result to the generic eval timeout
+/// (intent-hq/intent#5387).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EvalBudget {
+    /// The eval's full wall-clock budget.
+    pub(crate) total: Duration,
+    /// `start + total`; `None` only when that addition overflows `Instant`,
+    /// in which case [`Self::remaining`] reports the full `total`.
+    deadline: Option<Instant>,
+}
+
+impl EvalBudget {
+    /// A budget of `total` whose clock starts now — call it when the eval
+    /// starts (host construction), not when a frame is dispatched.
+    pub(crate) fn starting_now(total: Duration) -> Self {
+        Self {
+            total,
+            deadline: Instant::now().checked_add(total),
+        }
+    }
+
+    /// Wall-clock time left before the eval's deadline (zero once passed).
+    pub(crate) fn remaining(&self) -> Duration {
+        self.deadline
+            .map_or(self.total, |d| d.saturating_duration_since(Instant::now()))
+    }
+}
+
 /// Dispatch one `host({ method, args })` frame to the matching per-namespace
 /// handler. Returns `Ok(None)` when the namespace is not owned here (unknown
 /// method); `Ok(Some(v))` on success and `Err(msg)` on a JS-visible failure.
@@ -137,7 +170,8 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
 /// `eval_budget` is the caller's effective `workspace_api` wall-clock budget,
 /// so bindings that wait on a process (`ws.script.run`) can refuse a wait the
 /// transport could never honor, and `ws.agent.send` / `sendToTask` can bound
-/// their wait on the (spawned, cancellation-safe) daemon-side delivery.
+/// their wait on the (spawned, cancellation-safe) daemon-side delivery by
+/// the budget's REMAINING time.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -146,7 +180,7 @@ pub(crate) async fn try_dispatch(
     turn_attachments: Option<&Arc<TurnAttachmentRegistry>>,
     features: &AgentFeaturesSettings,
     is_sub_agent: bool,
-    eval_budget: Duration,
+    eval_budget: EvalBudget,
     method: &str,
     args: &Value,
 ) -> Result<Option<Value>, String> {
@@ -219,7 +253,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("script.") {
-        return script::dispatch(api, workspace_id, eval_budget, rest, args)
+        return script::dispatch(api, workspace_id, eval_budget.total, rest, args)
             .await
             .map(Some);
     }

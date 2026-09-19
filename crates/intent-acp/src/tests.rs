@@ -11036,7 +11036,7 @@ mod wsapi4_bindings_tests {
     #[tokio::test]
     async fn agent_send_after_budget_partly_spent_still_names_in_flight_id() {
         let (srv, api) = server_with_caller("caller-1");
-        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(3000));
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_secs(3));
         let queue_hold = Arc::new(tokio::sync::Mutex::new(()));
         *api.agent_get_queue_hold.lock().unwrap() = Some(queue_hold.clone());
         let send_hold = Arc::new(tokio::sync::Mutex::new(()));
