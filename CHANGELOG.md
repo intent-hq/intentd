@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.82] - 2026-09-19
+
+### 🐛 Bug Fixes
+
+- *(services)* Serialize same-key first-use in with_idempotency ([#2000](https://github.com/intent-hq/intentd/pull/2000))
+
+
 ## [0.9.81] - 2026-09-19
 
 ### 🚀 Features
