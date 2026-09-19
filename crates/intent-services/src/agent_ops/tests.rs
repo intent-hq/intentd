@@ -9545,7 +9545,9 @@ const DETAIL_ONLY_METADATA_KEYS: &[&str] = &["pendingProposals", "proposalResolu
 /// model/effort, sandbox + attention + completion-report metadata, every
 /// raw-metadata marker, stop reason, context references / file blocks,
 /// cached session stats), every preview string AND the attention reason
-/// over the cap, an over-cap `lastToolUse` input, two active hooks, two
+/// over the preview cap, `name` / `model` over their 128-byte cap,
+/// `sandboxPath` / `sandboxBranch` over their 256-byte cap, an over-cap
+/// `lastToolUse` input, two active hooks, two
 /// active PR monitors, a live context-usage report, an outgoing completion
 /// watch and a pending delete — then read back through the real list path
 /// (`agent_list_op` → `agent_list_impl` → `strip_detail_only_fields` +
@@ -9561,7 +9563,10 @@ async fn worst_case_agent_list_row(
     svc: &Services,
     ws: &WorkspaceId,
 ) -> (AgentId, intent_core::AgentLite) {
-    use intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET;
+    use intent_core::{
+        AGENT_LIST_NAME_CAP_BYTES as NAME_CAP, AGENT_LIST_PATH_CAP_BYTES as PATH_CAP,
+        AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET,
+    };
     let parent = create_agent(svc, ws, "Parent").await;
     let child = create_agent(svc, ws, "Child").await;
     let id = create_agent(svc, ws, "Worst-case row").await;
@@ -9601,8 +9606,12 @@ async fn worst_case_agent_list_row(
     s.parent_agent_id = Some(parent.clone());
     s.backend_session_id = Some(AgentId::from("agent-11111111-2222-3333-4444-555555555555"));
     s.acp_session_id = Some("acp-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
+    s.name = format!("Worst-case row {}", "n".repeat(NAME_CAP));
     s.name_explicitly_set = true;
-    s.model = Some("claude-sonnet-4-5-20250929".into());
+    s.model = Some(format!(
+        "claude-sonnet-4-5-20250929-{}",
+        "m".repeat(NAME_CAP)
+    ));
     s.reasoning_effort = Some("medium".into());
     s.specialist = Some("implementor".into());
     s.task_note_id = Some(intent_core::NoteId::from(
@@ -9614,8 +9623,14 @@ async fn worst_case_agent_list_row(
     s.context_references = Some(json!([{ "type": "file", "path": "src/lib.rs" }]));
     s.file_blocks = Some(json!([{ "type": "file", "path": "docs/a.md", "size": 1200 }]));
     s.sandbox_id = Some("sbx-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
-    s.sandbox_path = Some("/home/user/intent/workspaces/agent-list/.sandboxes/sbx-01HZY8Q6".into());
-    s.sandbox_branch = Some("sandbox/agent-list/sbx-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
+    s.sandbox_path = Some(format!(
+        "/home/user/intent/workspaces/agent-list/.sandboxes/sbx-01HZY8Q6/{}",
+        "p".repeat(PATH_CAP)
+    ));
+    s.sandbox_branch = Some(format!(
+        "sandbox/agent-list/sbx-01HZY8Q6W1V2K3M4N5P6R7S8T9/{}",
+        "b".repeat(PATH_CAP)
+    ));
     s.stop_reason = Some("end_turn".into());
     s.stop_reason_timestamp = Some(ts.clone());
     s.metadata = Some(json!({
@@ -9800,13 +9815,14 @@ async fn agent_list_strips_detail_only_fields_get_keeps_them() {
 /// [`intent_core::AGENT_LIST_ROW_BUDGET_BYTES`] — the failure message is the
 /// per-field byte table, so the field that blew the budget is named. Also
 /// pins the fixture as genuinely worst-case: every preview slot and the
-/// attention reason sit at the cap and both idle-visibility lists carry two
-/// entries.
+/// attention reason sit at the preview cap, `name` / `model` at the
+/// 128-byte cap, `sandboxPath` / `sandboxBranch` at the 256-byte cap, and
+/// both idle-visibility lists carry two entries.
 #[tokio::test]
 async fn agent_list_row_stays_within_row_budget() {
     use intent_core::{
-        format_key_bytes_table, serialized_key_bytes, AGENT_LIST_PREVIEW_BUDGET_BYTES,
-        AGENT_LIST_ROW_BUDGET_BYTES,
+        format_key_bytes_table, serialized_key_bytes, AGENT_LIST_NAME_CAP_BYTES,
+        AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
     };
     let (_t, svc, ws) = setup().await;
     let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
@@ -9833,6 +9849,19 @@ async fn agent_list_row_stays_within_row_budget() {
             .as_deref()
             .map(str::len),
         Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(row.name.len(), AGENT_LIST_NAME_CAP_BYTES);
+    assert_eq!(
+        row.model.as_deref().map(str::len),
+        Some(AGENT_LIST_NAME_CAP_BYTES)
+    );
+    assert_eq!(
+        row.metadata.sandbox_path.as_deref().map(str::len),
+        Some(AGENT_LIST_PATH_CAP_BYTES)
+    );
+    assert_eq!(
+        row.metadata.sandbox_branch.as_deref().map(str::len),
+        Some(AGENT_LIST_PATH_CAP_BYTES)
     );
     assert_eq!(
         row.last_tool_use.as_ref().unwrap()["inputTruncated"],

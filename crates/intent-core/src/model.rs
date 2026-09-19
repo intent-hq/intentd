@@ -2976,12 +2976,34 @@ pub struct AgentScopeCounts {
 /// enough for its one-line render.
 pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
 
+/// List-row byte cap for the short identifying strings `name` and `model`
+/// (intent-hq/intent#5383): neither is a preview, so the render-sized
+/// 400-byte preview budget would over-provision them. A session name is a
+/// 1–5 word label (the daemon's own naming guidance) and a model id is a
+/// provider slug (`claude-sonnet-4-5-20250929`, ~26 B); 128 B keeps every
+/// realistic value intact and bounds a pathological one. Same
+/// JSON-serialized-bytes, char-boundary-safe truncation as the previews
+/// ([`AgentLite::cap_list_previews`]); `agent.get` serves full values.
+pub const AGENT_LIST_NAME_CAP_BYTES: usize = 128;
+
+/// List-row byte cap for `metadata.sandboxPath` and `metadata.sandboxBranch`
+/// (intent-hq/intent#5383): filesystem paths and branch names run longer
+/// than labels but well under a preview — a sandbox checkout under a
+/// deep home directory is ≈ 70 B, a `sandbox/<workspace>/<sbx-id>` branch
+/// ≈ 50 B — so 256 B keeps every realistic value intact while bounding the
+/// row. Same truncation as [`AGENT_LIST_NAME_CAP_BYTES`]; `agent.get`
+/// serves full values.
+pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
+
 /// Whole-row byte budget for one serialized `agent.list` row
-/// (intent-hq/intent#5383): the per-field preview cap above bounds each
-/// preview, but the row is the unit the transport frames, so a
+/// (intent-hq/intent#5383): the per-field caps above bound each string,
+/// but the row is the unit the transport frames, so a
 /// worst-case-realistic row — every optional field present, every capped
-/// string at [`AGENT_LIST_PREVIEW_BUDGET_BYTES`], two active hooks and two
-/// PR monitors, the detail-only fields stripped
+/// string at its cap ([`AGENT_LIST_PREVIEW_BUDGET_BYTES`] for the previews
+/// and `metadata.attentionRequestReason`, [`AGENT_LIST_NAME_CAP_BYTES`]
+/// for `name` / `model`, [`AGENT_LIST_PATH_CAP_BYTES`] for
+/// `metadata.sandboxPath` / `metadata.sandboxBranch`), two active hooks
+/// and two PR monitors, the detail-only fields stripped
 /// ([`AgentLite::strip_detail_only_fields`]) — must serialize at or under
 /// this many bytes, enforced by the row-budget golden test in
 /// intent-services (`agent_ops::tests`), which prints a per-field byte
@@ -2991,19 +3013,20 @@ pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
 /// (1,048,576 B); the `agent.list` envelope
 /// (`{"jsonrpc":"2.0","id":…,"result":{"agents":[…]}}` plus one comma per
 /// row) costs about 1,060 B for 1,000 rows, so the frame goal is
-/// ≈ 1,047 B/row. The preview cap alone puts the worst-case row above
-/// that: six capped slots (`lastAgentResponse`, `lastUserMessage`,
-/// `digest`, `metadata.completionReport`, `lastToolUse.input`,
+/// ≈ 1,047 B/row. The caps alone put the worst-case row above that: six
+/// preview-capped slots (`lastAgentResponse`, `lastUserMessage`, `digest`,
+/// `metadata.completionReport`, `lastToolUse.input`,
 /// `metadata.attentionRequestReason`) × 400 B ≈ 2,600 B on the wire (keys,
-/// quotes and the `lastToolUse` preview flags included) before a single
-/// fixed field. The measured worst-case row is ≈ 5,220 B (it drifts by a
-/// few bytes with RFC-3339 sub-second precision): those ≈ 2,600 B of
-/// capped strings plus ≈ 2,620 B of fixed fields — eight `agent-<uuid>`
+/// quotes and the `lastToolUse` preview flags included), plus the four
+/// smaller caps (2 × 128 B + 2 × 256 B ≈ 800 B with keys) before a single
+/// fixed field. The measured worst-case row is ≈ 5,840 B (it drifts by a
+/// few bytes with RFC-3339 sub-second precision): those ≈ 3,400 B of
+/// capped strings plus ≈ 2,440 B of fixed fields — eight `agent-<uuid>`
 /// ids (≈ 470 B), nine RFC-3339 timestamps (≈ 470 B), four message ids
 /// (≈ 230 B), two hook entries (326 B), two PR-monitor entries (206 B),
-/// sandbox path/branch/id (≈ 190 B), and the boolean/enum flags. This
-/// budget is that measurement rounded up to the next half KiB (5.5 KiB,
-/// ≈ 8% margin); a row that regrows past it fails the golden with the
+/// the sandbox id (≈ 40 B), and the boolean/enum flags. This budget is
+/// that measurement rounded up to the next half KiB (6 KiB, ≈ 5%
+/// margin); a row that regrows past it fails the golden with the
 /// per-field table. Typical rows are far smaller (the issue's 404-row
 /// measurement averaged 2.6 KB/row BEFORE slimming; few sessions carry an
 /// attention request, sandbox fields, hooks AND monitors at once, and
@@ -3013,7 +3036,7 @@ pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
 /// rows would require lowering the preview cap (each 100 B off
 /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] takes ≈ 600 B off this budget) or
 /// paging `agent.list` — separate protocol decisions.
-pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 5 * 1024 + 512;
+pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 6 * 1024;
 
 /// Key allowlist golden for a serialized `agent.list` row
 /// (intent-hq/intent#5383): the top-level keys a list row may carry. The
@@ -4139,11 +4162,13 @@ impl AgentLite {
     /// truncated char-boundary safe against their JSON-SERIALIZED size
     /// (escaping-heavy content cannot defeat the wire-frame goal by
     /// expanding 6x on serialization). The remaining free-text strings a
-    /// list row carries — `metadata.attentionRequestReason` (a long reason
-    /// blew the row budget in production, intent-hq/intent#5383) and,
-    /// defensively, `name`, `model`, `metadata.sandboxPath` and
-    /// `metadata.sandboxBranch` — get the same silent truncation, so no
-    /// string field on a list row is unbounded. `lastToolUse` keeps the documented §5.5
+    /// list row carries get the same silent truncation at a cap sized for
+    /// the field — `metadata.attentionRequestReason` (a long reason blew
+    /// the row budget in production, intent-hq/intent#5383) at the preview
+    /// budget, `name` / `model` at [`AGENT_LIST_NAME_CAP_BYTES`], and
+    /// `metadata.sandboxPath` / `metadata.sandboxBranch` at
+    /// [`AGENT_LIST_PATH_CAP_BYTES`] — so no string field on a list row is
+    /// unbounded. `lastToolUse` keeps the documented §5.5
     /// preview contract (`{ name, input?, inputTruncated?, inputBytes? }`):
     /// only an over-budget `input` is replaced by [`cap_json_value`]'s
     /// structure-preserving preview, with `inputTruncated: true` stamped
@@ -4176,39 +4201,48 @@ impl AgentLite {
             let mut sink = CountingSink(0);
             serde_json::to_writer(&mut sink, s).map_or(0, |()| sink.0.saturating_sub(2))
         }
-        fn cap_str(s: &mut String) {
-            let mut end = s.len().min(AGENT_LIST_PREVIEW_BUDGET_BYTES);
+        fn cap_str(s: &mut String, budget: usize) {
+            let mut end = s.len().min(budget);
             loop {
                 while end > 0 && !s.is_char_boundary(end) {
                     end -= 1;
                 }
                 let escaped = escaped_len(&s[..end]);
-                if escaped <= AGENT_LIST_PREVIEW_BUDGET_BYTES || end == 0 {
+                if escaped <= budget || end == 0 {
                     break;
                 }
                 // Proportional shrink: `escaped > budget` makes the new
                 // end strictly smaller, so the loop converges without
                 // overshooting escaping-heavy content to zero.
-                end = end * AGENT_LIST_PREVIEW_BUDGET_BYTES / escaped;
+                end = end * budget / escaped;
             }
             if end < s.len() {
                 s.truncate(end);
             }
         }
-        fn cap_string(field: &mut Option<String>) {
+        fn cap_string(field: &mut Option<String>, budget: usize) {
             if let Some(s) = field {
-                cap_str(s);
+                cap_str(s, budget);
             }
         }
-        cap_string(&mut self.last_agent_response);
-        cap_string(&mut self.last_user_message);
-        cap_string(&mut self.digest);
-        cap_string(&mut self.metadata.completion_report);
-        cap_string(&mut self.metadata.attention_request_reason);
-        cap_str(&mut self.name);
-        cap_string(&mut self.model);
-        cap_string(&mut self.metadata.sandbox_path);
-        cap_string(&mut self.metadata.sandbox_branch);
+        cap_string(
+            &mut self.last_agent_response,
+            AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        );
+        cap_string(&mut self.last_user_message, AGENT_LIST_PREVIEW_BUDGET_BYTES);
+        cap_string(&mut self.digest, AGENT_LIST_PREVIEW_BUDGET_BYTES);
+        cap_string(
+            &mut self.metadata.completion_report,
+            AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        );
+        cap_string(
+            &mut self.metadata.attention_request_reason,
+            AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        );
+        cap_str(&mut self.name, AGENT_LIST_NAME_CAP_BYTES);
+        cap_string(&mut self.model, AGENT_LIST_NAME_CAP_BYTES);
+        cap_string(&mut self.metadata.sandbox_path, AGENT_LIST_PATH_CAP_BYTES);
+        cap_string(&mut self.metadata.sandbox_branch, AGENT_LIST_PATH_CAP_BYTES);
         match self.last_tool_use.as_mut() {
             Some(Value::Object(preview)) => {
                 if let Some(input) = preview.get("input") {
@@ -6860,7 +6894,10 @@ mod tests {
     /// preview string is truncated to [`AGENT_LIST_PREVIEW_BUDGET_BYTES`]
     /// char-boundary safe, an over-budget `lastToolUse` collapses to the
     /// bounded [`cap_json_value`] preview with the small `name` key
-    /// surviving, and under-budget values pass through untouched.
+    /// surviving, and under-budget values pass through untouched. The
+    /// non-preview strings get their own smaller caps: `name` / `model` at
+    /// [`AGENT_LIST_NAME_CAP_BYTES`], `sandboxPath` / `sandboxBranch` at
+    /// [`AGENT_LIST_PATH_CAP_BYTES`].
     #[test]
     fn agent_lite_cap_list_previews_bounds_preview_fields() {
         let session = AgentSession {
@@ -6871,9 +6908,9 @@ mod tests {
             parent_agent_id: None,
             backend_session_id: None,
             acp_session_id: None,
-            name: "Builder".to_string(),
+            name: "n".repeat(AGENT_LIST_NAME_CAP_BYTES + 1),
             name_explicitly_set: true,
-            model: None,
+            model: Some("claude-sonnet-4-5-20250929".to_string()),
             reasoning_effort: None,
             effort_levels: None,
             provider: None,
@@ -6911,8 +6948,8 @@ mod tests {
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
+            sandbox_path: Some("/p/".repeat(AGENT_LIST_PATH_CAP_BYTES)),
+            sandbox_branch: Some("sandbox/short".to_string()),
         };
         let mut lite = AgentLite::from_session(
             session,
@@ -6943,6 +6980,18 @@ mod tests {
         );
         // Under-budget values pass through untouched.
         assert_eq!(lite.last_user_message.as_deref(), Some("short user ask"));
+        // The non-preview strings land on their own smaller caps; realistic
+        // values (a model slug, a short branch) pass through untouched.
+        assert_eq!(lite.name.len(), AGENT_LIST_NAME_CAP_BYTES);
+        assert_eq!(lite.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
+        assert_eq!(
+            lite.metadata.sandbox_path.as_deref().map(str::len),
+            Some(AGENT_LIST_PATH_CAP_BYTES)
+        );
+        assert_eq!(
+            lite.metadata.sandbox_branch.as_deref(),
+            Some("sandbox/short")
+        );
         // The multi-byte report truncates on a char boundary at or under the
         // budget (never mid-`é`).
         let report = lite.metadata.completion_report.as_deref().unwrap();
