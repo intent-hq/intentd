@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::{
-    current_caller, lift_from_principal_id, now_iso, Caller, Error, Principal, PrincipalId, Result,
-    Workspace, WorkspaceId, FROM_PRINCIPAL_ID_KEY,
+    current_caller, lift_from_principal_id, now_iso, Caller, Error, InviteErrorKind, Principal,
+    PrincipalId, Result, Workspace, WorkspaceId, FROM_PRINCIPAL_ID_KEY,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -36,6 +36,15 @@ const IDENTITY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Last successful/attempted identity refresh instant, shared across clones.
 pub(crate) type IdentityRefreshState = Arc<tokio::sync::Mutex<Option<Instant>>>;
+
+/// Serialises the primary identity transition (multiplayer w4). The
+/// reconnect guard's "is the identity locked?" read and its row write are
+/// two awaits, and an invite is what locks the identity — so without this,
+/// `workspace.invite.create` could commit an invite between the two and the
+/// switch would land on an identity a fresh link was just minted from.
+/// [`Services::apply_primary_identity`] holds it across check + write;
+/// invite minting holds it across its own identity revalidation + insert.
+pub(crate) type IdentityTransitionLock = Arc<tokio::sync::Mutex<()>>;
 
 /// The forbidden error for a request with no bound caller.
 pub(crate) fn no_caller() -> Error {
@@ -62,6 +71,25 @@ fn stamping_principal_id() -> Option<PrincipalId> {
         Some(Caller::Wire { principal_id, .. }) => Some(principal_id),
         Some(Caller::Agent { .. } | Caller::Daemon) | None => None,
     }
+}
+
+/// The bound wire principal — the owner over UDS or its own wire
+/// credential as much as a collaborator — whose requests the daemon
+/// attributes authoritatively (multiplayer w4): comment authorship and
+/// every non-agent-actored event. Agents, the daemon and an absent caller
+/// are not people and attribute nothing.
+pub(crate) fn attributed_caller_id() -> Option<PrincipalId> {
+    stamping_principal_id()
+}
+
+/// The name a principal is attributed by: GitHub login, else display name,
+/// else the principal id.
+pub(crate) fn principal_attribution_name(principal: &Principal) -> String {
+    principal
+        .login
+        .clone()
+        .or_else(|| principal.display_name.clone())
+        .unwrap_or_else(|| principal.id.0.clone())
 }
 
 /// Daemon-authoritative principal stamp on a user-origin message payload
@@ -361,6 +389,31 @@ pub(crate) fn principal_to_wire(p: &Principal, is_administrator: bool) -> Value 
 }
 
 impl Services {
+    /// Authoritative `(author, authorType)` for a comment written by a
+    /// bound wire principal: its attribution name and `"user"`, replacing
+    /// whatever the client supplied so nobody signs as someone else or as
+    /// an agent. The one pass-through is the primary principal with no
+    /// GitHub identity attached — a single-user daemon that never connected
+    /// GitHub keeps rendering the author its client always supplied.
+    /// Agents and the daemon are not people; their supplied values pass.
+    pub(crate) async fn attribute_comment_author(
+        &self,
+        author: Option<String>,
+        author_type: Option<String>,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let Some(principal_id) = attributed_caller_id() else {
+            return Ok((author, author_type));
+        };
+        let principal = self.store.get_principal(&principal_id).await?;
+        if principal.is_primary && principal.login.is_none() {
+            return Ok((author, author_type));
+        }
+        Ok((
+            Some(principal_attribution_name(&principal)),
+            Some("user".to_string()),
+        ))
+    }
+
     /// `principal.me`: see [`intent_core::WorkspaceApi::principal_me`].
     pub(crate) async fn principal_me_op(&self) -> Result<Value> {
         let caller = current_caller().ok_or_else(no_caller)?;
@@ -394,42 +447,167 @@ impl Services {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            this.refresh_primary_identity(principal).await;
+            if let Err(e) = this.refresh_primary_identity(principal).await {
+                tracing::debug!(error = %e, "principal.me: github identity refresh skipped");
+            }
         });
     }
 
-    async fn refresh_primary_identity(&self, principal: Principal) {
+    /// Refresh the primary principal's cached GitHub profile from `GET /user`
+    /// and persist it. Returns the (possibly unchanged) row.
+    ///
+    /// Reconnect guard (multiplayer w4): once other principals or open
+    /// invites exist, the primary identity is load-bearing — invites were
+    /// minted from it and collaborators joined *this* person's daemon — so a
+    /// `GET /user` that names a **different** `github_user_id` (the user
+    /// reconnected GitHub as another account) leaves the cached identity
+    /// untouched and fails with [`InviteErrorKind::IdentityLocked`]. While
+    /// the daemon is still single-user the switch is applied as before.
+    pub(crate) async fn refresh_primary_identity(&self, principal: Principal) -> Result<Principal> {
         let fetched = tokio::time::timeout(IDENTITY_REFRESH_TIMEOUT, async {
-            let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+            let sc = self.identity_source_control().await?;
             if !sc.check_auth().await.is_ok_and(|s| s.authenticated) {
                 return Err(Error::Internal("github auth not configured".to_string()));
             }
             sc.get_user().await.map_err(pr_ops::map_sc_err)
         })
-        .await;
-        let user = match fetched {
-            Ok(Ok(user)) => user,
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, "principal.me: github identity refresh skipped");
-                return;
-            }
-            Err(_) => {
-                tracing::debug!("principal.me: github identity refresh timed out");
-                return;
-            }
-        };
+        .await
+        .map_err(|_| Error::Internal("github identity refresh timed out".to_string()))??;
+        self.apply_primary_identity(principal, &fetched).await
+    }
+
+    /// True once the primary identity is load-bearing: another principal
+    /// row exists or an invite is open (multiplayer w4).
+    pub(crate) async fn primary_identity_locked(&self) -> Result<bool> {
+        Ok(self.store.count_principals().await? > 1
+            || self.store.count_open_workspace_invites().await? > 0)
+    }
+
+    /// The pre-persist hook `github.connect` installs on its device flow
+    /// (multiplayer w4): the granted token's account is resolved through
+    /// the token-bound client and applied via
+    /// [`Self::apply_primary_identity_locked`] *before* the engine writes
+    /// the token, so a reconnect as a different account is refused (the
+    /// stored credential and cached identity stay) while the identity is
+    /// locked. When the daemon is still single-user the switch is applied
+    /// and the token persisted as before. A failed `GET /user` refuses the
+    /// grant only while locked: unverifiable is unsafe exactly when there is
+    /// something to protect. Every other failure — the lock state or the
+    /// principal row unreadable, the apply failing — refuses too: the token
+    /// is only persisted once the identity has been positively applied.
+    ///
+    /// The whole decision runs under the [`IdentityTransitionLock`], and an
+    /// admission hands that lock back to the flow as its
+    /// [`IdentityLease`](intent_sourcecontrol::device_flow::IdentityLease),
+    /// held until the token write completes: the lock state consulted here
+    /// (including by the failed-`GET /user` fallback) cannot change, and no
+    /// other switch can interleave, between the verdict and the credential
+    /// landing on disk.
+    pub(crate) fn connect_identity_guard(
+        &self,
+    ) -> intent_sourcecontrol::device_flow::IdentityGuard {
+        let this = self.clone();
+        Arc::new(
+            move |client: Arc<dyn intent_sourcecontrol::SourceControl>| {
+                let this = this.clone();
+                Box::pin(async move {
+                    let transition = this.identity_transition.clone().lock_owned().await;
+                    let primary = this
+                        .store
+                        .get_primary_principal()
+                        .await
+                        .map_err(|e| format!("primary principal unavailable: {e}"))?;
+                    let lease: intent_sourcecontrol::device_flow::IdentityLease =
+                        Box::new(transition);
+                    match client.get_user().await {
+                        Ok(user) => {
+                            match this.apply_primary_identity_locked(primary, &user).await {
+                                Ok(_) => Ok(lease),
+                                Err(Error::Invite(InviteErrorKind::IdentityLocked)) => {
+                                    Err(format!(
+                                "authorized as GitHub account {} while collaborators or open \
+                             invites depend on the current identity; disconnect them first",
+                                user.login
+                            ))
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "github.connect: identity apply failed");
+                                    Err(format!(
+                                        "could not apply the authorized GitHub identity: {e}"
+                                    ))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if this.primary_identity_locked().await.unwrap_or(true) {
+                                Err(format!(
+                                    "could not verify the authorized GitHub account ({e}) while \
+                                 the primary identity is locked"
+                                ))
+                            } else {
+                                Ok(lease)
+                            }
+                        }
+                    }
+                })
+            },
+        )
+    }
+
+    /// Persist a fetched GitHub profile onto the primary principal's row,
+    /// subject to the reconnect guard described on
+    /// [`Self::refresh_primary_identity`]. While locked, only a profile
+    /// carrying the cached stable account id is applied: a different id
+    /// and a missing one (an unverifiable account) are both refused, and a
+    /// lock state that cannot be read propagates as an error rather than
+    /// admitting the change. The lock check and the write run under the
+    /// [`IdentityTransitionLock`], so no invite is minted in between, and
+    /// the cached identity is re-read under that lock: `principal` is the
+    /// caller's snapshot, which a switch that landed while `GET /user` was
+    /// in flight may have outdated, and a stale snapshot must not decide
+    /// the same-account check or be written back over the current row.
+    pub(crate) async fn apply_primary_identity(
+        &self,
+        principal: Principal,
+        user: &intent_sourcecontrol::UserIdentity,
+    ) -> Result<Principal> {
+        let _transition = self.identity_transition.lock().await;
+        self.apply_primary_identity_locked(principal, user).await
+    }
+
+    /// [`Self::apply_primary_identity`] for a caller that already holds the
+    /// [`IdentityTransitionLock`] (the connect guard, which keeps it across
+    /// the token write). Re-reads the current row under that lock exactly
+    /// as the locking variant does.
+    pub(crate) async fn apply_primary_identity_locked(
+        &self,
+        principal: Principal,
+        user: &intent_sourcecontrol::UserIdentity,
+    ) -> Result<Principal> {
+        let principal = self.store.get_principal(&principal.id).await?;
+        let fetched_id = user.id.and_then(|id| i64::try_from(id).ok());
+        let same_account =
+            principal.github_user_id.is_some() && principal.github_user_id == fetched_id;
+        if !same_account && self.primary_identity_locked().await? {
+            tracing::warn!(
+                cached_github_user_id = principal.github_user_id,
+                fetched_github_user_id = fetched_id,
+                "primary GitHub identity changed or is unverifiable while other \
+                 principals or open invites exist; keeping the cached identity"
+            );
+            return Err(Error::Invite(InviteErrorKind::IdentityLocked));
+        }
         let mut updated = principal.clone();
-        updated.github_user_id = user.id.and_then(|id| i64::try_from(id).ok());
-        updated.login = Some(user.login);
-        updated.display_name = user.name;
-        updated.avatar_url = user.avatar_url;
+        updated.github_user_id = fetched_id;
+        updated.login = Some(user.login.clone());
+        updated.display_name = user.name.clone();
+        updated.avatar_url = user.avatar_url.clone();
         if updated == principal {
-            return;
+            return Ok(principal);
         }
         updated.updated_at = now_iso();
-        if let Err(e) = self.store.upsert_principal(&updated).await {
-            tracing::warn!(error = %e, "principal.me: github identity persist failed");
-        }
+        self.store.upsert_principal(&updated).await?;
+        Ok(updated)
     }
 
     /// Attach the membership summary to one `workspace.get` row, relative

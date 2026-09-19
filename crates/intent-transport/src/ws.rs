@@ -27,8 +27,8 @@ use intent_services::EventBus;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::AbortHandle;
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{AbortHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
 use tokio_tungstenite::tungstenite::extensions::{Extensions, ExtensionsConfig};
@@ -52,6 +52,31 @@ use crate::tls::TlsCertificate;
 
 /// Maximum bytes accepted for an HTTP request head before `\r\n\r\n`.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
+
+/// The unauthenticated invite-redemption endpoint (multiplayer w4).
+pub(crate) const INVITE_PATH: &str = "/invite";
+
+/// Concurrent `/invite` connections the listener admits; the endpoint is
+/// reachable without a credential, so it must not be able to exhaust the
+/// connection registry. Excess upgrades are refused with `503`. Each
+/// admitted connection holds one semaphore permit for exactly as long as
+/// its task lives (returned on any exit, including a heartbeat abort).
+pub(crate) const MAX_INVITE_CONNECTIONS: usize = 32;
+
+/// Concurrent `invite.redeem` requests one `/invite` connection may have in
+/// flight (a well-behaved client needs two: a start and its wait). Excess
+/// requests are refused with `flow-busy` immediately instead of spawning
+/// work; the response queue is sized so every admitted request always has a
+/// slot to answer into, so no task ever blocks on a full queue.
+pub(crate) const MAX_INFLIGHT_INVITE_REQUESTS: usize = 4;
+
+/// Inbound message cap on `/invite`: an `invite.redeem` envelope is a few
+/// hundred bytes; anything larger is an anonymous peer wasting memory.
+pub(crate) const MAX_INVITE_MESSAGE_BYTES: usize = 16 * 1024;
+
+/// Upper bound on how long a revoked connection keeps draining in-flight RPC
+/// responses (its own `principal.revokeSelf` result) before the policy close.
+const REVOKE_FLUSH_GRACE: Duration = Duration::from_secs(5);
 
 /// Tuning for a [`WsApiServer`]. [`Default`] mirrors the production posture:
 /// bind `127.0.0.1:5181` (loopback; `server.bindAddress` widens it
@@ -187,6 +212,14 @@ pub(crate) struct WsInner {
     pub cleanup_gate: Option<watch::Receiver<bool>>,
     /// Test-only reaper gate (from [`WsOptions::heartbeat_gate`]).
     pub heartbeat_gate: Option<watch::Receiver<bool>>,
+    /// Admission permits for `/invite` connections
+    /// ([`MAX_INVITE_CONNECTIONS`]); a permit is acquired before the `101`
+    /// and travels with the connection task.
+    pub invite_permits: Arc<Semaphore>,
+    /// Listener-wide rate limit over phase-1 `invite.redeem` starts
+    /// ([`crate::invite::RedeemThrottle`]); shared by every `/invite`
+    /// connection so a reconnect never resets it.
+    pub redeem_throttle: crate::invite::SharedRedeemThrottle,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -239,6 +272,8 @@ impl WsApiServer {
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
+            invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            redeem_throttle: crate::invite::new_redeem_throttle(),
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -279,6 +314,8 @@ impl WsApiServer {
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
+            invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            redeem_throttle: crate::invite::new_redeem_throttle(),
         };
         Self {
             inner: Arc::new(inner),
@@ -533,16 +570,44 @@ impl WsInner {
         if method.eq_ignore_ascii_case("GET") && path == "/health" {
             return self.write_health(&mut stream).await;
         }
-        if path != "/ws" && path != "/tunnel" {
+        if path != "/ws" && path != "/tunnel" && path != INVITE_PATH {
             return reject(&mut stream, 404, "Not Found").await;
         }
-        // §5.3 upgrade gate (shared by `/ws` and `/tunnel`): enable flag,
-        // origin allow-list, then bearer token.
+        // §5.3 upgrade gate (shared by `/ws`, `/tunnel` and `/invite`):
+        // enable flag, origin allow-list, then bearer token.
         if !self.enabled {
             return reject(&mut stream, 403, "Forbidden").await;
         }
         if !is_allowed_origin(origin.as_deref()) {
             return reject(&mut stream, 403, "Forbidden").await;
+        }
+        // `/invite` (multiplayer w4): the ONE unauthenticated endpoint. It
+        // has no bearer token by construction — the invitee holds only the
+        // link — so it skips credential resolution and gets a dedicated loop
+        // that serves `invite.redeem` and nothing else. Bounded: the accept
+        // is refused with 503 once `MAX_INVITE_CONNECTIONS` permits are held;
+        // the permit is taken atomically here, before the `101`, and rides
+        // with the connection task so an aborted (heartbeat-reaped) task
+        // returns it like a clean exit does.
+        if path == INVITE_PATH {
+            let Some(key) = ws_key else {
+                return reject(&mut stream, 400, "Bad Request").await;
+            };
+            let Ok(permit) = self.invite_permits.clone().try_acquire_owned() else {
+                return reject(&mut stream, 503, "Service Unavailable").await;
+            };
+            let accept = derive_accept_key(key.as_bytes());
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await?;
+            stream.flush().await?;
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(MAX_INVITE_MESSAGE_BYTES))
+                .max_frame_size(Some(MAX_INVITE_MESSAGE_BYTES));
+            let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
+            self.spawn_invite_connection(ws, permit);
+            return Ok(());
         }
         // The credential resolved at the gate binds the connection's caller
         // for its whole lifetime (multiplayer w1): the legacy file token is
@@ -705,6 +770,161 @@ impl WsInner {
         );
     }
 
+    /// Register a new `/invite` client and spawn its redemption loop. Invite
+    /// connections share the registry with `/ws` clients (heartbeat reaper,
+    /// `stop()` close, `/health` count) and additionally hold one
+    /// [`MAX_INVITE_CONNECTIONS`] permit for their lifetime: it is owned by
+    /// the task's future, so it is released when the loop returns *and* when
+    /// the reaper aborts the task.
+    fn spawn_invite_connection<S>(
+        self: &Arc<Self>,
+        ws: WebSocketStream<S>,
+        permit: OwnedSemaphorePermit,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
+        let last_pong = Arc::new(AtomicI64::new(mono_ms()));
+        let this = self.clone();
+        let handle = tokio::spawn({
+            let last_pong = last_pong.clone();
+            async move {
+                let _permit = permit;
+                this.clone()
+                    .invite_connection_loop(ws, cmd_rx, last_pong)
+                    .await;
+                this.deregister(id);
+            }
+        });
+        let abort = handle.abort_handle();
+        self.clients.lock().expect("ws clients poisoned").insert(
+            id,
+            ClientHandle {
+                cmd_tx,
+                last_pong,
+                abort,
+            },
+        );
+    }
+
+    /// Drive one `/invite` connection (multiplayer w4). No caller is bound
+    /// and nothing but `invite.redeem` is served: every other frame that
+    /// carries an id is answered `-32001`, and the `events.`/subscription
+    /// fast paths, the router and the reverse channel are never reached. Each
+    /// `invite.redeem` runs on its own task (phase 2 blocks for up to the
+    /// device-code lifetime) so pings keep flowing and the reaper never
+    /// mistakes a waiting invitee for a dead peer — but that work is bounded
+    /// per connection: at most [`MAX_INFLIGHT_INVITE_REQUESTS`] tasks, each
+    /// holding a pre-reserved response slot (so none ever waits to send), all
+    /// owned by a [`JoinSet`] that aborts them when the connection ends.
+    /// Phase-1 starts additionally pass the listener-wide
+    /// [`crate::invite::RedeemThrottle`] before any store or upstream work.
+    /// Frames the loop answers itself (parse errors, throttle and non-invite
+    /// refusals) go straight to the sink and never contend for those slots.
+    async fn invite_connection_loop<S>(
+        self: Arc<Self>,
+        ws: WebSocketStream<S>,
+        mut cmd_rx: mpsc::Receiver<ConnCmd>,
+        last_pong: Arc<AtomicI64>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut sink, mut stream) = ws.split();
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(MAX_INFLIGHT_INVITE_REQUESTS);
+        let admission = Arc::new(Semaphore::new(MAX_INFLIGHT_INVITE_REQUESTS));
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        loop {
+            tokio::select! {
+                incoming = stream.next() => match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            let frame = crate::events::error_frame(
+                                &serde_json::Value::Null, -32700, "Parse error");
+                            if sink.send(Message::Text(frame.into())).await.is_err() { break; }
+                            continue;
+                        };
+                        match crate::invite::classify(&value) {
+                            Some(req) if req.method == crate::invite::InviteMethod::Redeem => {
+                                if let Err(refusal) = crate::invite::admit_redeem(
+                                    &req, &self.redeem_throttle, Instant::now())
+                                {
+                                    if let Some(frame) = refusal {
+                                        if sink.send(Message::Text(frame.into())).await.is_err() { break; }
+                                    }
+                                    continue;
+                                }
+                                let admitted = match admission.clone().try_acquire_owned() {
+                                    Ok(permit) => out_tx
+                                        .clone()
+                                        .try_reserve_owned()
+                                        .ok()
+                                        .map(|slot| (permit, slot)),
+                                    Err(_) => None,
+                                };
+                                let Some((permit, slot)) = admitted else {
+                                    if let Some(frame) = crate::invite::refuse_busy(&req) {
+                                        if sink.send(Message::Text(frame.into())).await.is_err() { break; }
+                                    }
+                                    continue;
+                                };
+                                let api = self.api.clone();
+                                tasks.spawn(async move {
+                                    let _permit = permit;
+                                    if let Some(frame) = crate::invite::handle_redeem(req, &api).await {
+                                        slot.send(frame);
+                                    }
+                                });
+                            }
+                            _ => {
+                                if let Some(frame) = crate::invite::refuse_non_invite(&value) {
+                                    if sink.send(Message::Text(frame.into())).await.is_err() { break; }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if sink.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => last_pong.store(mono_ms(), Ordering::Relaxed),
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
+                },
+                Some(frame) = out_rx.recv() => {
+                    if sink.send(Message::Text(frame.into())).await.is_err() {
+                        break;
+                    }
+                }
+                // Reap finished redeem tasks so the set never accumulates
+                // results across a long-lived connection.
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                cmd = cmd_rx.recv() => match cmd {
+                    None => break,
+                    Some(ConnCmd::Ping) => {
+                        if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(ConnCmd::Close) => {
+                        let _ = sink
+                            .send(Message::Close(Some(CloseFrame {
+                                code: CloseCode::Away,
+                                reason: "Server shutting down".into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        }
+        // Dropping the set aborts every redeem still in flight for this
+        // peer (the reaper's task abort drops it too).
+        tasks.abort_all();
+        let _ = sink.close().await;
+    }
+
     /// Remove a client from the registry (idempotent).
     fn deregister(&self, id: u64) {
         self.clients
@@ -751,8 +971,57 @@ impl WsInner {
             .register(reverse.clone(), ReverseTransport::Wss);
         // Per-connection logical-client binding (§16): `None` until `client.hello`.
         let mut client_id: Option<intent_core::ClientId> = None;
+        // Credential revocation (multiplayer w4): a connection bound to a
+        // non-administrator principal closes the moment that principal's
+        // credentials are revoked (`principal.revokeSelf`), instead of
+        // lingering until its next RPC fails. Administrator and unbound
+        // connections never subscribe.
+        let revoked_principal = match &caller {
+            Some(Caller::Wire {
+                principal_id,
+                is_administrator: false,
+            }) => Some(principal_id.clone()),
+            _ => None,
+        };
+        let mut revocations = revoked_principal
+            .as_ref()
+            .and_then(|_| self.api.subscribe_principal_revocations());
         loop {
             tokio::select! {
+                revoked = recv_revocation(&mut revocations) => {
+                    match revoked {
+                        Some(id) if Some(&id) == revoked_principal.as_ref() => {
+                            // Deliver in-flight RPC responses before the
+                            // close: when the revocation is the caller's own
+                            // `principal.revokeSelf`, the broadcast fires
+                            // inside the handler, so its response may not be
+                            // queued yet — it holds a reserved priority slot
+                            // until it is. Drain until the lane is idle,
+                            // bounded so a stuck handler cannot keep a revoked
+                            // connection open.
+                            let deadline = tokio::time::Instant::now() + REVOKE_FLUSH_GRACE;
+                            while !app_tx.priority_idle() {
+                                let next = tokio::time::timeout_at(deadline, app_rx.recv()).await;
+                                let Ok(Some(frame)) = next else { break };
+                                if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
+                                    continue;
+                                }
+                                if sink.send(Message::Text(frame.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = sink
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: CloseCode::Policy,
+                                    reason: "credential revoked".into(),
+                                })))
+                                .await;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => revocations = None,
+                    }
+                }
                 incoming = stream.next() => match incoming {
                     Some(Err(e)) => {
                         // Over-limit inbound message or frame (monorepo#495):
@@ -840,6 +1109,26 @@ impl WsInner {
         }
         let _ = sink.close().await;
         self.deregister(id);
+    }
+}
+
+/// Await the next principal revocation on an optional feed: `Some(id)` per
+/// revoked principal (a lagged receiver skips ahead — a missed close only
+/// means that connection fails on its next RPC instead), `None` once the
+/// feed is closed, and pending forever when there is no feed so the
+/// `select!` branch never fires for administrator/unbound connections.
+async fn recv_revocation(
+    rx: &mut Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
+) -> Option<intent_core::PrincipalId> {
+    let Some(rx) = rx.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        match rx.recv().await {
+            Ok(id) => return Some(id),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
     }
 }
 

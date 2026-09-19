@@ -237,6 +237,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "primitive.addPatch",
     "primitive.addReference",
     "principal.me",
+    "principal.revokeSelf",
     "providers.catalog",
     "repo.list",
     "repo.remove",
@@ -340,9 +341,12 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.import.chunk",
     "workspace.import.commit",
     "workspace.initializeRepository",
+    "workspace.invite.list",
+    "workspace.invite.revoke",
     "workspace.list",
     "workspace.localChanges",
     "workspace.markSeen",
+    "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
     "workspace.restore",
@@ -378,9 +382,9 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 49 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 51 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
-/// `pairing.rs`, `server.rs`) before reaching the main router. They share the same JSON-RPC
+/// `pairing.rs`, `server.rs`, `invite.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
 /// performance or to access per-connection state (e.g., `client_id` binding for
 /// drafts and the host-only `browser.*Tab*` registry reports).
@@ -423,6 +427,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
+    "invite.redeem",
     "pairing.getInfo",
     "providers.setup.cancel",
     "providers.setup.login",
@@ -435,6 +440,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "system.requestUpdate",
     "system.shutdown",
     "system.status",
+    "workspace.invite.create",
 ];
 
 /// Server→client notifications.
@@ -622,6 +628,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("primitive.addPatch", "Edit: adds a patch block to a note. Note content only; nothing applies."),
     ("primitive.addReference", "Edit: adds a code-reference block to a note. Note content only."),
     ("principal.me", "Guest lifecycle: the caller's own principal record and role."),
+    ("principal.revokeSelf", "Guest lifecycle: the caller revokes its OWN credentials and leaves its workspaces; the administrator is refused in the service layer. Self-directed only, no target parameter."),
     ("providers.catalog", "Client boot: static provider catalog for the composer. No credentials."),
     ("search.cancel", "Read: cancels the caller's own search."),
     ("search.codebase", "Read: workspace-scoped code search."),
@@ -662,6 +669,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("workspace.list", "Client boot: the workspaces the caller can see (membership-filtered in the service layer) with myRole."),
     ("workspace.localChanges", "Read: the workspace's local git change summary."),
     ("workspace.markSeen", "Steer: clears the workspace unseen marker."),
+    ("workspace.members.leave", "Guest lifecycle: the caller drops its OWN collaborator membership of a workspace; owners cannot leave. Self-directed only, no target parameter; removal of others stays owner-only."),
     ("workspace.members.list", "Read: the membership roster (principal fields + role) of a member workspace. Removal stays owner-only."),
     ("workspace.subscribe", "Client boot: the workspace channel fast path; rows membership-filtered, removals delivered on unshare."),
     ("workspace.unsubscribe", "Client boot: drops the workspace channel subscription."),

@@ -487,6 +487,19 @@
 //! to the caller), `memberCount`, `openInviteCount`. The catalog contains
 //! 316 router methods, 49 fast-path methods, and two aliases: 367
 //! client-callable names.
+//!
+//! Version 9.15 adds invite links and the identity-only join (additive;
+//! multiplayer w4): `workspace.invite.create` (fast path; returns the
+//! `intent://invite?…` link — the pair envelope minus the bearer token plus
+//! `inviteId` / `secret`, the secret exactly once), `workspace.invite.list` /
+//! `workspace.invite.revoke`, `workspace.members.leave`, `principal.revokeSelf`
+//! (closes the caller's own connections), and the unauthenticated `/invite`
+//! WSS endpoint serving only `invite.redeem` (`{ inviteId, secret }` → device
+//! codes; `{ flowId }` → the collaborator credential once). Invite refusals
+//! carry `error.data.code` (`invite-expired`, `invite-revoked`,
+//! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-denied`, …). The
+//! catalog contains 322 router methods, 51 fast-path methods, and two
+//! aliases: 375 client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release

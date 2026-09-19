@@ -189,6 +189,24 @@ where
     v["result"].clone()
 }
 
+/// The actor the daemon stamps on this connection's own actions: every
+/// bound wire principal's event carries `{ type: user, id: principalId,
+/// name }` (multiplayer w4), the name being the GitHub login, else the
+/// display name, else the id — `principal.me` projected accordingly.
+async fn caller_actor<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let me = wss_rpc(ws, id, "principal.me", json!({})).await;
+    let principal_id = me["id"].as_str().expect("principal id").to_string();
+    let name = me["login"]
+        .as_str()
+        .or(me["displayName"].as_str())
+        .unwrap_or(&principal_id)
+        .to_string();
+    json!({ "type": "user", "id": principal_id, "name": name })
+}
+
 /// Like [`wss_rpc`] but returns the full response envelope so tests can
 /// assert `error.code` / `error.message` for expected-failure paths.
 async fn wss_rpc_envelope<S>(
@@ -339,10 +357,7 @@ async fn workspace_update_emits_workspace_updated_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert!(evt["id"].is_string(), "event id: {evt}");
     assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    assert_eq!(
-        evt["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(evt["actor"], caller_actor(&mut rpc, 90).await);
     // `changes` is the applied delta only; `skip_serializing_if = "Option::is_none"`
     // keeps un-supplied fields out of the payload (reference-parity emitter).
     // The skip toggle round-trips under its canonical `skipIsolation` name
@@ -1135,10 +1150,7 @@ async fn task_created_emitted_on_every_creation_path_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert!(evt["id"].is_string(), "event id: {evt}");
     assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    assert_eq!(
-        evt["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(evt["actor"], caller_actor(&mut rpc, 90).await);
     assert_eq!(evt["data"]["noteId"], json!(child_id));
     assert_eq!(evt["data"]["noteTitle"], json!("Converted Task"));
     assert_eq!(evt["data"]["status"], json!("not_started"));
@@ -1545,10 +1557,7 @@ async fn comment_respond_emits_comment_added_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert!(evt["id"].is_string(), "event id: {evt}");
     assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    assert_eq!(
-        evt["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(evt["actor"], caller_actor(&mut rpc, 90).await);
     assert_eq!(
         evt["data"],
         json!({ "noteId": note_id, "commentId": reply_id })
