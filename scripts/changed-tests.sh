@@ -28,7 +28,10 @@
 #
 # The changed set is `git diff --name-only $(git merge-base HEAD BASE)`
 # (committed, staged and unstaged edits) plus the untracked files from
-# `git ls-files --others`. Paths map to per-crate nextest selections:
+# `git ls-files --others`. In a shallow checkout whose boundary hides the
+# merge base (CI's depth-2 checkout of a stacked PR's merge ref) the script
+# deepens from HEAD via origin until it resolves. Paths map to per-crate
+# nextest selections:
 #   crates/<c>/tests/<t>.rs          -p <c> --test <t>   (--tests once deleted)
 #   crates/<c>/tests/<dir>/**        -p <c> --tests
 #   crates/<c>/src/**                -p <c> --lib --bins --tests
@@ -117,7 +120,28 @@ die() {
 
 cd "$repo_root"
 git rev-parse --git-dir >/dev/null 2>&1 || die 2 "$repo_root is not a git checkout"
-merge_base=$(git merge-base HEAD "$base" 2>/dev/null) ||
+resolve_merge_base() {
+  merge_base=$(git merge-base HEAD "$base" 2>/dev/null)
+}
+if ! resolve_merge_base && [[ "$(git rev-parse --is-shallow-repository 2>/dev/null)" == true ]]; then
+  # CI checks out refs/pull/N/merge at depth 2. For a stacked PR GitHub builds
+  # that merge ref on the parent PR's merge ref, so BASE (the parent PR head)
+  # is HEAD's grandparent and lies past the shallow boundary
+  # (intent-hq/intentd#1869). Deepen from HEAD in bounded steps, then
+  # unshallow; a main-based PR never gets here (BASE is a parent of HEAD).
+  head_sha=$(git rev-parse HEAD)
+  for step in 1 8 64; do
+    log "deepening shallow checkout by $step to reach BASE '$base'"
+    git fetch -q --no-tags --deepen="$step" origin "$head_sha" 2>/dev/null || break
+    resolve_merge_base && break
+  done
+  if [[ -z "$merge_base" ]]; then
+    log "unshallowing checkout to reach BASE '$base'"
+    git fetch -q --no-tags --unshallow origin "$head_sha" 2>/dev/null || true
+    resolve_merge_base || true
+  fi
+fi
+[[ -n "$merge_base" ]] ||
   die 2 "cannot resolve BASE '$base'; run 'git fetch origin main' or set BASE=<ref>"
 
 # Paths outside crates/ that no test can observe.

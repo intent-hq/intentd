@@ -1127,7 +1127,10 @@ jobs:
       # Depth 2 keeps both parents of the PR merge commit (base and head), so
       # the selection's merge base resolves to the PR base; the explicit
       # fetch below pins the base commit even when the merge ref is the
-      # branch head itself (no merge commit).
+      # branch head itself (no merge commit). For a stacked PR the merge ref
+      # is built on the parent PR's merge ref, so BASE_SHA is HEAD's
+      # grandparent: changed-tests.sh deepens the checkout itself until the
+      # merge base resolves (intent-hq/intentd#1869).
       - uses: actions/checkout@v7
         with:
           fetch-depth: 2

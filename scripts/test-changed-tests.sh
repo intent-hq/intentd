@@ -701,6 +701,78 @@ run_script
 expect_ok
 expect_cargo "-p intentd --test auggie_context_e2e --test e2e_wss_agent_lifecycle"
 
+# CI runs the script in a depth-2 checkout of refs/pull/N/merge plus a depth-1
+# fetch of the PR base sha. For a stacked PR GitHub builds that merge ref on
+# the parent PR's merge ref, so the base (the parent PR head) is HEAD's
+# grandparent -- past the shallow boundary (intent-hq/intentd#1869). The
+# script must deepen the checkout until the merge base resolves. The upstream
+# allows sha fetches like GitHub does; main moves on so both parents of every
+# merge commit lie beyond the boundary.
+reset_repo
+g config uploadpack.allowReachableSHA1InWant true
+g checkout -q -b w1 "$base_sha"
+edit crates/beta/tests/smoke.rs
+commit_all "w1: beta smoke"
+w1_head=$(g rev-parse HEAD)
+g checkout -q -b w2
+edit crates/alpha/tests/one.rs
+commit_all "w2: alpha one"
+g checkout -q --detach "$base_sha"
+edit crates/gamma/tests/smoke.rs
+commit_all "main moved on"
+main_head=$(g rev-parse HEAD)
+g merge -q --no-ff -m "Merge w1 into main" w1
+g update-ref refs/pull/1/merge HEAD
+g merge -q --no-ff -m "Merge w2 into pull/1/merge" w2
+g update-ref refs/pull/2/merge HEAD
+g checkout -q feature
+g branch -q -D w1 w2
+
+# Mirrors actions/checkout with fetch-depth: 2 followed by the workflow's
+# depth-1 fetch of BASE_SHA; the shallow clone's own copy of the script runs.
+shallow="$temp_dir/shallow"
+shallow_checkout() {
+  local merge_ref=$1 base_ref=$2
+  rm -rf "$shallow"
+  git init -q "$shallow"
+  git -C "$shallow" remote add origin "file://$repo"
+  git -C "$shallow" fetch -q --no-tags --depth=2 origin "+$merge_ref:refs/remotes/$merge_ref"
+  git -C "$shallow" checkout -q --force "refs/remotes/$merge_ref"
+  git -C "$shallow" fetch -q --no-tags --depth=1 origin "$base_ref"
+}
+fixture_script=$script
+script="$shallow/scripts/changed-tests.sh"
+
+case_name="stacked PR merge ref in a depth-2 shallow checkout"
+shallow_checkout refs/pull/2/merge "$w1_head"
+[[ "$(git -C "$shallow" rev-list --count HEAD)" -eq 3 ]] || fail "$case_name: fixture clone is not depth 2"
+RUN_CWD="$shallow" run_script --instrumented --dry-run --base "$w1_head"
+expect_ok
+expect_cov_plan "-p alpha --test one" "-p gamma --test smoke"
+[[ "$(grep -c '^\[coverage-changed\] deepening shallow checkout by 1 ' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one deepen-by-1 notice: $stdout"
+[[ "$stdout" != *"unshallowing"* ]] || fail "$case_name: fell through to unshallow: $stdout"
+[[ "$(git -C "$shallow" rev-list --count HEAD)" -gt 3 ]] || fail "$case_name: checkout was not deepened"
+
+case_name="main-based PR merge ref in a depth-2 shallow checkout resolves without deepening"
+shallow_checkout refs/pull/1/merge "$main_head"
+RUN_CWD="$shallow" run_script --instrumented --dry-run --base "$main_head"
+expect_ok
+expect_cov_plan "-p beta --test smoke"
+[[ "$stdout" != *"deepening"* ]] || fail "$case_name: deepened needlessly: $stdout"
+[[ "$(git -C "$shallow" rev-list --count HEAD)" -eq 3 ]] || fail "$case_name: checkout was deepened"
+
+case_name="unresolvable BASE in a shallow checkout still exits 2"
+shallow_checkout refs/pull/1/merge "$main_head"
+RUN_CWD="$shallow" run_script --instrumented --dry-run --base origin/nope
+[[ "$status" -eq 2 ]] || fail "$case_name exited $status (expected 2): $stderr"
+[[ "$stderr" == *"cannot resolve BASE 'origin/nope'"* ]] || fail "$case_name stderr: $stderr"
+
+script=$fixture_script
+rm -rf "$shallow"
+g update-ref -d refs/pull/1/merge
+g update-ref -d refs/pull/2/merge
+g config --unset uploadpack.allowReachableSHA1InWant
+
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0
 
