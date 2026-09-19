@@ -16205,8 +16205,10 @@ pub(crate) mod pr {
         /// (`Unsupported`), so unrelated tests keep their behaviour.
         pub(crate) users_by_login: std::collections::HashMap<String, UserIdentity>,
         /// What `get_proof_gist` answers per gist id: `Ok(view)` or the
-        /// scripted error (`Err("not-found")` → `NotFound`, anything else →
-        /// `Api`). An unknown id is `NotFound`. Exercises `invite.prove`.
+        /// scripted error (`Err("not-found")` → `NotFound`,
+        /// `Err("anonymous")` → `Decode` — a gist without `owner.login` /
+        /// `created_at` — anything else → `Api`). An unknown id is
+        /// `NotFound`. Exercises `invite.prove`.
         pub(crate) proof_gists: std::collections::HashMap<
             String,
             std::result::Result<intent_sourcecontrol::identity_proof::ProofGistView, String>,
@@ -16323,6 +16325,9 @@ pub(crate) mod pr {
                 Some(Err(kind)) if kind == "not-found" => {
                     Err(ScError::NotFound(format!("gist {gist_id:?}")))
                 }
+                Some(Err(kind)) if kind == "anonymous" => Err(ScError::Decode(
+                    "GET /gists/{id} response missing `owner.login`".to_string(),
+                )),
                 Some(Err(kind)) => Err(ScError::Api(format!("502: {kind}"))),
                 None => Err(ScError::NotFound(format!("gist {gist_id:?}"))),
             }
