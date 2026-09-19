@@ -150,7 +150,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
 /// counted with the other subscription channels, not here.
 ///
-/// Also within 10.2: +1 router method (`github.users.search`, the
+/// Also within 10.3: +1 router method (`github.users.search`, the
 /// collaborator picker's login-prefix user search).
 const EXPECTED_TOTAL_METHODS: usize = 379;
 
