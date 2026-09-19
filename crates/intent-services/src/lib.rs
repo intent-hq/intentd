@@ -83,6 +83,7 @@ mod event_ops;
 mod event_subscriptions;
 pub mod events;
 mod file_ops;
+pub mod fm_backend;
 mod git_diff_singleflight;
 mod git_ops;
 mod git_status_cache;

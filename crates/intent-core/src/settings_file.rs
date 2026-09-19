@@ -136,6 +136,20 @@ pub struct QuickActionsSettings {
     /// `quickActions.providerSettings` — per-provider quick-action settings
     /// (opaque FE-owned bags; validated structurally as a table only).
     pub provider_settings: toml::Table,
+    /// `quickActions.localModel` — whether one-shot completions may run on
+    /// the on-device macOS `fm` model when it is available.
+    pub local_model: QuickActionsLocalModel,
+}
+
+/// `quickActions.localModel` values. `off` (the default) never consults the
+/// on-device `fm` backend; `auto` uses it for eligible one-shot completions
+/// when the daemon-side probe reports it usable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QuickActionsLocalModel {
+    #[default]
+    Off,
+    Auto,
 }
 
 /// `[specialists]` — specialist selection (`specialists.*`).
@@ -1530,6 +1544,9 @@ providerDefaults = {}
 typeOverrides = {}
 # Quick action provider settings -- per-provider quick-action settings.
 providerSettings = {}
+# Local model -- run eligible one-shot completions on the on-device macOS
+# `fm` model when it is available: "off" or "auto".
+localModel = "off"
 
 [specialists]
 # Default specialist -- specialist applied when none is chosen.
@@ -1901,6 +1918,7 @@ mod tests {
         assert_eq!(d.model.default_provider, None);
         assert_eq!(d.model.default_reasoning_effort, None);
         assert!(d.quick_actions.provider_settings.is_empty());
+        assert_eq!(d.quick_actions.local_model, QuickActionsLocalModel::Off);
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
         assert!(d.mcp.enable_user_servers);

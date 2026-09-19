@@ -1082,6 +1082,16 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "providers",
             Some(json!({})),
         ),
+        enumerated(
+            "quickActions.localModel",
+            "Local model for quick actions",
+            "Run eligible one-shot completions on the on-device macOS fm model when it \
+             is available: off never uses it, auto uses it when the daemon probe \
+             reports it usable",
+            "providers",
+            &["off", "auto"],
+            "off",
+        ),
         string(
             "specialists.default",
             "Default specialist",

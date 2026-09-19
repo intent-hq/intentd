@@ -55,6 +55,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "quickActions.defaultModel",
     "quickActions.typeOverrides",
     "quickActions.providerSettings",
+    "quickActions.localModel",
     "specialists.default",
     "specialists.dir",
     "workspace.branchPrefix",
