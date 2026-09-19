@@ -4572,8 +4572,12 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `workspace.invite.create` (multiplayer w4), service half: mint a
-    /// single-use invite for `workspace_id` → `{ invite, secret }` where
-    /// `secret` is returned exactly once (only its hash is stored). Owner-only.
+    /// single-use invite for `workspace_id` → `{ invite, secret }`. The
+    /// plaintext `secret` is persisted next to its hash (migration `0128`)
+    /// so the owner can copy the link again later, but it never serialises
+    /// as a field: this result carries it exactly once, and afterwards it
+    /// reaches the wire only inside the rebuilt `url` of
+    /// `workspace_invite_list`. Owner-only.
     /// Refused with `InviteErrorKind::GithubIdentityRequired` unless the
     /// owner's GitHub identity is linked; `pin_login` (a GitHub login) is
     /// resolved to its account id and stored as the pin
@@ -4596,8 +4600,12 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `workspace.invite.list` (multiplayer w4): the open invites of a
-    /// workspace → `{ invites: [WorkspaceInvite] }` (secrets never included).
-    /// Owner-only.
+    /// workspace → `{ invites: [WorkspaceInvite + url?] }` — each row is the
+    /// serialised `WorkspaceInvite` (secrets never included as fields) plus
+    /// the additive `url`, the invite's `intent://invite?…` link rebuilt from
+    /// the stored secret; `url` is omitted when the row predates the stored
+    /// secret or no link can be built right now (listener down, no dialable
+    /// route). Owner-only.
     fn workspace_invite_list(
         &self,
         workspace_id: WorkspaceId,
