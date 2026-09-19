@@ -3,8 +3,11 @@
 //! owner side, `invite.redeem` (start + wait) on the unauthenticated
 //! `/invite` side, plus `workspace.members.leave` / `principal.revokeSelf`.
 //!
-//! An invite is a single-use, expiring `(id, secret)` pair; only the hex
-//! SHA-256 of the secret is stored. Redemption runs the same GitHub device
+//! An invite is a single-use, expiring `(id, secret)` pair; redemption
+//! matches the hex SHA-256 of the secret, and the plaintext is kept only so
+//! the owner can copy the link again (`invites[].url` on `.list`, built
+//! through the transport's [`intent_core::InviteLinkBuilder`]; the secret
+//! itself never serialises). Redemption runs the same GitHub device
 //! grant as `github.connect` but with **no scopes** and through
 //! [`intent_sourcecontrol::IdentityFlow`], whose access token is spent on
 //! one `GET /user` inside the engine and never persisted — the daemon
@@ -18,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::{
-    current_caller, iso_ms_from_now, now_iso, Caller, Error, InviteErrorKind, Principal,
-    PrincipalId, Result, WorkspaceId, WorkspaceInvite, WorkspaceRole,
+    current_caller, iso_ms_from_now, now_iso, Caller, Error, InviteErrorKind, InviteLinkEnvelope,
+    Principal, PrincipalId, Result, WorkspaceId, WorkspaceInvite, WorkspaceRole,
 };
 use intent_sourcecontrol::{IdentityFlow, IdentityPollStatus, UserIdentity};
 use serde_json::{json, Value};
@@ -116,9 +119,19 @@ pub(crate) fn hash_secret(secret: &str) -> String {
     )
 }
 
-/// The invite's wire shape (`secret` never included).
-pub(crate) fn invite_to_wire(invite: &WorkspaceInvite) -> Value {
-    serde_json::to_value(invite).unwrap_or_else(|_| json!({ "id": invite.id }))
+/// The invite's wire shape (`secret` / `secretHash` never included), plus
+/// `url` when the row still holds its secret and a link envelope resolved.
+pub(crate) fn invite_to_wire(
+    invite: &WorkspaceInvite,
+    envelope: Option<&dyn InviteLinkEnvelope>,
+) -> Value {
+    let mut wire = serde_json::to_value(invite).unwrap_or_else(|_| json!({ "id": invite.id }));
+    if let (Some(env), Some(secret), Some(obj)) =
+        (envelope, invite.secret.as_deref(), wire.as_object_mut())
+    {
+        obj.insert("url".into(), env.invite_url(&invite.id, secret).into());
+    }
+    wire
 }
 
 /// RFC-3339 UTC timestamp `secs` seconds from now (same formatter as every
@@ -249,8 +262,18 @@ impl Services {
             .map_or(0, |m| m.member_count))
     }
 
+    /// The listener's link envelope for stamping listed invites with `url`,
+    /// once per call: `None` (never an error) when no builder is attached or
+    /// no link can be built right now — the invite rows are still answered.
+    async fn invite_link_envelope(&self) -> Option<Box<dyn InviteLinkEnvelope>> {
+        self.invite_links.get()?.invite_link_envelope().await
+    }
+
     /// `workspace.invite.create`: see
-    /// [`intent_core::WorkspaceApi::workspace_invite_create`].
+    /// [`intent_core::WorkspaceApi::workspace_invite_create`]. The returned
+    /// `invite` carries no `url`: the transport resolves the link envelope
+    /// exactly once per create and stamps the same link as both the top-level
+    /// `url` and `invite.url`, so this path never resolves it a second time.
     pub(crate) async fn workspace_invite_create_op(
         &self,
         workspace_id: &WorkspaceId,
@@ -291,6 +314,7 @@ impl Services {
             id: uuid::Uuid::new_v4().to_string(),
             workspace_id: workspace_id.clone(),
             secret_hash: hash_secret(&secret),
+            secret: Some(secret.clone()),
             created_by_principal_id: creator.id.clone(),
             pin_github_user_id,
             pin_login,
@@ -334,11 +358,15 @@ impl Services {
             crate::workspace_updated_event(workspace_id, &json!({ "invites": true })),
         )
         .await;
-        Ok(json!({ "invite": invite_to_wire(&invite), "secret": secret }))
+        Ok(json!({
+            "invite": invite_to_wire(&invite, None),
+            "secret": secret,
+        }))
     }
 
     /// `workspace.invite.list`: see
-    /// [`intent_core::WorkspaceApi::workspace_invite_list`].
+    /// [`intent_core::WorkspaceApi::workspace_invite_list`]. The envelope is
+    /// resolved once per call, so the cost stays O(rows) formatting.
     pub(crate) async fn workspace_invite_list_op(
         &self,
         workspace_id: &WorkspaceId,
@@ -347,7 +375,13 @@ impl Services {
             .await?;
         self.store.get_workspace(workspace_id).await?;
         let invites = self.store.list_open_workspace_invites(workspace_id).await?;
-        Ok(json!({ "invites": invites.iter().map(invite_to_wire).collect::<Vec<_>>() }))
+        let envelope = self.invite_link_envelope().await;
+        Ok(json!({
+            "invites": invites
+                .iter()
+                .map(|i| invite_to_wire(i, envelope.as_deref()))
+                .collect::<Vec<_>>(),
+        }))
     }
 
     /// `workspace.invite.revoke`: see
