@@ -437,8 +437,9 @@ async fn workspace_list_and_get_populate_card_aggregates() {
 /// `workspace.list` rows never carry `tokenUsage` (detail-only — clients read
 /// it via `workspace.getTokenUsage` and the tokenUsage-changed event),
 /// `setupScript` (`workspace.getSetupScript`), `contextLinks` (read once on
-/// open via `workspace.get`), nor the per-PR `headSha` / `author` /
-/// `mergeable` / `mergeableState` on `activePullRequest` / `pullRequests[]`;
+/// open via `workspace.get`), nor the per-PR `headSha` / `author` on
+/// `activePullRequest` / `pullRequests[]` (`mergeable` / `mergeableState`
+/// stay: the FE derives the PR lifecycle display status from them);
 /// ARCHIVED rows additionally omit `agentSummary` (no HUD/coverflow agent
 /// card renders for an archived workspace). Active rows keep the full
 /// `agentSummary`, and `workspace.get` keeps serving every field.
@@ -632,10 +633,11 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
             assert_eq!(pr.head_ref.as_deref(), Some("feat/slim"));
             assert!(pr.head_sha.is_none(), "{path}: PR headSha omitted");
             assert!(pr.author.is_none(), "{path}: PR author omitted");
-            assert!(pr.mergeable.is_none(), "{path}: PR mergeable omitted");
-            assert!(
-                pr.mergeable_state.is_none(),
-                "{path}: PR mergeableState omitted"
+            assert_eq!(pr.mergeable, Some(true), "{path}: PR mergeable kept");
+            assert_eq!(
+                pr.mergeable_state.as_deref(),
+                Some("clean"),
+                "{path}: PR mergeableState kept"
             );
         }
     };
@@ -643,7 +645,8 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert_detail_stripped(row_archived, "list/archived");
     assert!(v.get("setupScript").is_none());
     assert!(v.get("contextLinks").is_none());
-    assert!(v["activePullRequest"].get("mergeableState").is_none());
+    assert!(v["activePullRequest"].get("headSha").is_none());
+    assert_eq!(v["activePullRequest"]["mergeableState"], "clean");
 
     // Lite list (workspace.subscribe seq-0): slimmed the same way.
     let lite = svc.list_workspaces_lite(true).await.expect("lite list");
@@ -2103,14 +2106,6 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
         WorkspaceGitRootId, WorkspaceGitRootSource,
     };
 
-    type Lifecycle = (
-        PullRequestStatus,
-        String,
-        Option<bool>,
-        Option<bool>,
-        Option<String>,
-    );
-
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let root = WorkspacesRoot::new();
@@ -2163,7 +2158,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
         created_at: format!("2026-02-0{nth}T00:00:00Z"),
         updated_at: format!("2026-02-0{nth}T00:00:00Z"),
     };
-    let lifecycle = |p: &PullRequestInfo| -> Lifecycle {
+    let lifecycle = |p: &PullRequestInfo| {
         (
             p.status,
             p.updated_at.clone(),
@@ -2172,18 +2167,10 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             p.mergeable_state.clone(),
         )
     };
-    // The list surfaces strip the per-PR detail fields as a final pass
-    // (`Workspace::slim_for_list`) AFTER the derivation selected the copy,
-    // so on `workspace.list` / the lite list the served lifecycle is the
-    // canonical one minus `mergeable` / `mergeableState`; `workspace.get`
-    // serves it whole.
-    let served = |surface: &str, canonical: &Lifecycle| -> Lifecycle {
-        if surface == "workspace.get" {
-            canonical.clone()
-        } else {
-            (canonical.0, canonical.1.clone(), canonical.2, None, None)
-        }
-    };
+    // `Workspace::slim_for_list` runs AFTER the derivation on the list
+    // surfaces and keeps the whole lifecycle tuple (`mergeable` /
+    // `mergeableState` included — the FE derives the PR display status from
+    // them off list rows), so every surface serves the canonical copy.
 
     // Repro A, both root orders: linked + pooled stale `open` copy of the
     // URL; one root still `open` (newer than the workspace copy), one root
@@ -2324,7 +2311,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             assert_eq!(active.title, "Workspace copy", "{ctx}: identity kept");
             assert_eq!(
                 lifecycle(active),
-                served(surface, &merged_canonical),
+                merged_canonical,
                 "{ctx}: activePullRequest"
             );
             let prs = ws.pull_requests.as_ref().expect("pullRequests");
@@ -2334,11 +2321,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
                 "{ctx}: root copies dedupe into the pooled copy"
             );
             assert_eq!(prs[0].title, "Workspace copy", "{ctx}: identity kept");
-            assert_eq!(
-                lifecycle(&prs[0]),
-                served(surface, &merged_canonical),
-                "{ctx}: pullRequests"
-            );
+            assert_eq!(lifecycle(&prs[0]), merged_canonical, "{ctx}: pullRequests");
         }
     }
 
@@ -2363,11 +2346,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
                 "{ctx}: root copies dedupe into the pooled copy"
             );
             assert_eq!(prs[0].title, "Workspace copy", "{ctx}: identity kept");
-            assert_eq!(
-                lifecycle(&prs[0]),
-                served(surface, &clean_canonical),
-                "{ctx}: pullRequests"
-            );
+            assert_eq!(lifecycle(&prs[0]), clean_canonical, "{ctx}: pullRequests");
         }
     }
 
@@ -2393,11 +2372,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             }
             let prs = ws.pull_requests.as_ref().expect("pullRequests");
             assert_eq!(prs.len(), 1, "{ctx}: root copies dedupe into one entry");
-            assert_eq!(
-                lifecycle(&prs[0]),
-                served(surface, &tied_canonical),
-                "{ctx}: pullRequests"
-            );
+            assert_eq!(lifecycle(&prs[0]), tied_canonical, "{ctx}: pullRequests");
         }
     }
 
@@ -2418,7 +2393,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             assert_eq!(active.title, "Workspace linked", "{ctx}: identity kept");
             assert_eq!(
                 lifecycle(active),
-                served(surface, &pooled_canonical),
+                pooled_canonical,
                 "{ctx}: activePullRequest"
             );
             let prs = ws.pull_requests.as_ref().expect("pullRequests");
@@ -2428,11 +2403,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
                 "{ctx}: root copies dedupe into the pooled copy"
             );
             assert_eq!(prs[0].title, "Workspace pooled", "{ctx}: identity kept");
-            assert_eq!(
-                lifecycle(&prs[0]),
-                served(surface, &pooled_canonical),
-                "{ctx}: pullRequests"
-            );
+            assert_eq!(lifecycle(&prs[0]), pooled_canonical, "{ctx}: pullRequests");
             assert_eq!(
                 lifecycle(active),
                 lifecycle(&prs[0]),

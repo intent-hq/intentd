@@ -365,11 +365,12 @@ pub struct Workspace {
 /// (1,048,576 B); ~500 workspaces under that line means ≈ 2,097 B/row
 /// averaged over the fleet, and the fleet is mostly archived rows (the
 /// dogfooding set that motivated the slimming, monorepo#3041, was ~85%
-/// archived). The golden's worst-case active row measures ≈ 6.8 KB:
+/// archived). The golden's worst-case active row measures ≈ 7.0 KB:
 /// `agentSummary` ≈ 3.5 KB (≈ 300 B per agent — id, name, status,
 /// specialist, lastActivity, parentAgentId, the two liveness flags — plus
-/// ≈ 46 B per `agentIds` entry, ×10), the five-entry PR pool ≈ 1.8 KB
-/// (≈ 350 B per slimmed entry), and ≈ 1.5 KB of fixed fields (ids, paths,
+/// ≈ 46 B per `agentIds` entry, ×10), the five-entry PR pool ≈ 2.0 KB
+/// (≈ 390 B per slimmed entry, `mergeable` / `mergeableState` kept for
+/// the client's lifecycle display status), and ≈ 1.5 KB of fixed fields (ids, paths,
 /// timestamps, a long title / status message, `taskStats`,
 /// `diffSummary` totals). `agentSummary` is the only field that scales
 /// with accumulated state, which is why archived rows drop it: the same
