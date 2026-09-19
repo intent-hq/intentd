@@ -822,7 +822,13 @@ impl Services {
         let sc = self.proof_source_control().await?;
         let gist = match sc.get_proof_gist(gist_id).await {
             Ok(gist) => gist,
-            Err(intent_sourcecontrol::Error::NotFound(_)) => {
+            // An unknown gist, or one GitHub served without an `owner.login`
+            // / `created_at` (anonymous or malformed — it can never establish
+            // the claimed identity), is an invalid proof: the nonce stays
+            // spent, no retry is owed.
+            Err(
+                intent_sourcecontrol::Error::NotFound(_) | intent_sourcecontrol::Error::Decode(_),
+            ) => {
                 return Err(Error::Invite(InviteErrorKind::ProofInvalid));
             }
             Err(e) => {
