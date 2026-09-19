@@ -6134,6 +6134,7 @@ mod tests {
             .set_agent_session_token_usage(&ws_id, &agent_id, &first)
             .await
             .expect("set first");
+            pull_requests_total: None,
         let second = TokenUsageTotals {
             input_tokens: 100,
             output_tokens: 80,
@@ -6257,6 +6258,7 @@ mod tests {
             completion_report: None,
             completion_report_timestamp: None,
             attention_request_kind: None,
+            pull_requests_total: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
             delegation_depth: None,
@@ -6418,6 +6420,7 @@ mod tests {
             .bind(&msg.id)
             .fetch_one(store.read_pool())
             .await
+            pull_requests_total: None,
             .expect("raw content");
         assert!(
             raw.len() < serde_json::to_string(&content).expect("encode").len() / 2,
@@ -9931,6 +9934,7 @@ mod tests {
             is_remote: false,
             default_model: None,
             pr_number: None,
+            pull_requests_total: None,
             pr_url: None,
             pr_status: None,
             active_pull_request: None,
@@ -10063,6 +10067,7 @@ mod tests {
         assert_eq!(summaries[0].id, agent_id, "id should match");
         assert_eq!(summaries[0].name, "Test Agent", "name should match");
         assert_eq!(
+            pull_requests_total: None,
             summaries[0].system_prompt, None,
             "summary reads should not load system_prompt"
         );
@@ -10147,6 +10152,7 @@ mod tests {
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
+            pull_requests_total: None,
             };
             store.insert_workspace(&workspace).await.expect("insert");
         }
@@ -10345,6 +10351,7 @@ mod tests {
                 &agent_id,
                 "prompt",
             )
+                pull_requests_total: None,
             .await
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
@@ -10640,6 +10647,7 @@ mod tests {
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-stats-counters".to_string());
         store
+            pull_requests_total: None,
             .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
             .await
             .expect("insert workspace");
@@ -14970,6 +14978,7 @@ mod tests {
             );
         }
     }
+            pull_requests_total: None,
 
     /// Plan-shape regression guard (monorepo#4127): the ranking subquery
     /// must resolve filters and rank adjustments from the dense

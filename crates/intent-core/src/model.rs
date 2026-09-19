@@ -262,9 +262,19 @@ pub struct Workspace {
     pub active_pull_request: Option<PullRequestInfo>,
     /// Persisted list of PR snapshots discovered for the workspace's baseRef
     /// (§7.6). Distinct from `activePullRequest` (the currently-linked PR); the
-    /// FE reconciles stale PR links against this collection.
+    /// FE reconciles stale PR links against this collection. List rows carry
+    /// at most [`WORKSPACE_LIST_PR_CAP`] entries ([`Workspace::slim_for_list`]);
+    /// `workspace.get` serves the full pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_requests: Option<Vec<PullRequestInfo>>,
+    /// List-only (`workspace.list` / lite `workspace.subscribe` seq-0): the
+    /// pre-cap length of `pullRequests` when [`Workspace::slim_for_list`]
+    /// truncated the pool to [`WORKSPACE_LIST_PR_CAP`] entries. Derived on the
+    /// list emit path from the row already in hand (no extra read); never
+    /// persisted. Omitted (not `null`) when the pool fit — and always omitted
+    /// on `workspace.get`, which serves the full pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_requests_total: Option<u32>,
     /// Issue/PR context links supplied at `workspace.create` (§5.1), persisted
     /// on the row and returned on every detail `Workspace` payload (omitted on
     /// list rows, [`Workspace::slim_for_list`]). Omitted (not `null`) when the
@@ -365,25 +375,43 @@ pub struct Workspace {
 /// (1,048,576 B); ~500 workspaces under that line means ≈ 2,097 B/row
 /// averaged over the fleet, and the fleet is mostly archived rows (the
 /// dogfooding set that motivated the slimming, monorepo#3041, was ~85%
-/// archived). The golden's worst-case active row measures ≈ 7.0 KB:
+/// archived). The golden's worst-case active row measures ≈ 7.4 KB:
 /// `agentSummary` ≈ 3.5 KB (≈ 300 B per agent — id, name, status,
 /// specialist, lastActivity, parentAgentId, the two liveness flags — plus
-/// ≈ 46 B per `agentIds` entry, ×10), the five-entry PR pool ≈ 2.0 KB
-/// (≈ 390 B per slimmed entry, `mergeable` / `mergeableState` kept for
-/// the client's lifecycle display status), and ≈ 1.5 KB of fixed fields (ids, paths,
-/// timestamps, a long title / status message, `taskStats`,
-/// `diffSummary` totals). `agentSummary` is the only field that scales
-/// with accumulated state, which is why archived rows drop it: the same
-/// worst case archived is ≈ 3.3 KB, and a typical row (one to three
-/// agents, one PR, short paths) is ≈ 1.5–2 KB — under the fleet average
-/// the 1 MiB goal needs, as the 130-row realistic-fleet test alongside
-/// the golden shows. The budget below is the measured worst case plus a
-/// small margin; the key allowlist ([`WORKSPACE_LIST_ROW_KEYS`] /
-/// [`WORKSPACE_LIST_PR_KEYS`]) keeps the fixed part from regrowing
-/// field-by-field. Shrinking further means slimming `agentSummary` (e.g.
-/// dropping the redundant `agentIds` mirror once the TS consumer reads
-/// `agents[].id`) — a separate protocol decision.
-pub const WORKSPACE_LIST_ROW_BUDGET_BYTES: usize = 7_168;
+/// ≈ 46 B per `agentIds` entry, ×10), the PR pool at its cap plus the
+/// linked `activePullRequest` ≈ 2.3 KB (six slimmed entries at ≈ 390 B
+/// each, `mergeable` / `mergeableState` kept for the client's lifecycle
+/// display status, plus `pullRequestsTotal`), and ≈ 1.5 KB of fixed
+/// fields (ids, paths, timestamps, a long title / status message,
+/// `taskStats`, `diffSummary` totals). The five-entry PR pool is an
+/// enforced bound, not a fixture assumption: [`Workspace::slim_for_list`]
+/// keeps at most [`WORKSPACE_LIST_PR_CAP`] `pullRequests` entries on a list
+/// row (the golden fixture stores eight so the cap is exercised), so
+/// `agentSummary` is the only field that scales with accumulated state,
+/// which is why archived rows drop it: the same worst case archived is
+/// ≈ 3.9 KB, and a typical row (one to three agents, one PR, short paths)
+/// is ≈ 1.5–2 KB — under the fleet average the 1 MiB goal needs, as the
+/// 130-row realistic-fleet test alongside the golden shows. The budget
+/// below is the measured worst case plus a small margin; the key allowlist
+/// ([`WORKSPACE_LIST_ROW_KEYS`] / [`WORKSPACE_LIST_PR_KEYS`]) keeps the
+/// fixed part from regrowing field-by-field. Shrinking further means
+/// slimming `agentSummary` (e.g. dropping the redundant `agentIds` mirror
+/// once the TS consumer reads `agents[].id`) — a separate protocol
+/// decision.
+pub const WORKSPACE_LIST_ROW_BUDGET_BYTES: usize = 7_680;
+
+/// Maximum number of `pullRequests[]` entries a `workspace.list` row (and
+/// the identical lite `workspace.subscribe` seq-0 row) carries after
+/// [`Workspace::slim_for_list`]. The pool is the one list-row field whose
+/// length is unbounded in production (every PR ever opened from the
+/// workspace's branch, plus the folded git-root PRs), and
+/// [`WORKSPACE_LIST_ROW_BUDGET_BYTES`] was sized from a five-entry pool
+/// (≈ 390 B per slimmed entry). Survivors are the most recently updated
+/// entries (`updatedAt` descending, `number` descending on ties), with the
+/// entry matching `activePullRequest` always retained and moved to the
+/// front; a truncated row reports the pre-cap length as
+/// `pullRequestsTotal`. `workspace.get` serves the full pool.
+pub const WORKSPACE_LIST_PR_CAP: usize = 5;
 
 /// Key allowlist golden for a serialized `workspace.list` row: the
 /// top-level keys a list row may carry after [`Workspace::slim_for_list`].
@@ -391,7 +419,9 @@ pub const WORKSPACE_LIST_ROW_BUDGET_BYTES: usize = 7_168;
 /// against this list — an unlisted key fails with guidance to either add
 /// it here (list-relevant AND small) or serve it on `workspace.get` only.
 /// Detail-only fields (`setupScript`, `contextLinks`, `tokenUsage`,
-/// `diskUsage`) are deliberately absent. Adding a key here is a
+/// `diskUsage`) are deliberately absent; `pullRequestsTotal` is the one
+/// list-only key (set by the [`WORKSPACE_LIST_PR_CAP`] truncation, never on
+/// `workspace.get`). Adding a key here is a
 /// wire-contract change — update `docs/protocol/methods/workspace.md` in
 /// the same commit and state which rung of the derived-field ladder the
 /// field sits on.
@@ -424,6 +454,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "prStatus",
     "activePullRequest",
     "pullRequests",
+    "pullRequestsTotal",
     "archived",
     "archivedAt",
     "taskStats",
@@ -485,6 +516,13 @@ impl Workspace {
     ///   cleared here so the guarantee holds by construction.
     /// - `activePullRequest` / `pullRequests[]` entries: per-PR detail
     ///   fields via [`PullRequestInfo::slim_for_list`].
+    /// - `pullRequests[]` length: capped at [`WORKSPACE_LIST_PR_CAP`]
+    ///   entries — the most recently updated (`updatedAt` desc, `number`
+    ///   desc on ties), the `activePullRequest` match always kept and moved
+    ///   to the front — with the pre-cap length reported as
+    ///   `pullRequestsTotal`. A pool within the cap is left untouched (no
+    ///   reorder, `pullRequestsTotal` absent). `activePullRequest` itself is
+    ///   never touched.
     ///
     /// Fixed-size scalars stay even when only detail surfaces read them
     /// (`baseCommitSha`, `path` / `repositoryPath` / `worktreePath`): a
@@ -510,8 +548,23 @@ impl Workspace {
             pr.slim_for_list();
         }
         if let Some(prs) = self.pull_requests.as_mut() {
-            for pr in prs {
+            for pr in prs.iter_mut() {
                 pr.slim_for_list();
+            }
+            if prs.len() > WORKSPACE_LIST_PR_CAP {
+                self.pull_requests_total = Some(u32::try_from(prs.len()).unwrap_or(u32::MAX));
+                prs.sort_by(|a, b| {
+                    b.updated_at
+                        .cmp(&a.updated_at)
+                        .then_with(|| b.number.cmp(&a.number))
+                });
+                if let Some(active_id) = self.active_pull_request.as_ref().map(|pr| &pr.id) {
+                    if let Some(pos) = prs.iter().position(|pr| &pr.id == active_id) {
+                        let active = prs.remove(pos);
+                        prs.insert(0, active);
+                    }
+                }
+                prs.truncate(WORKSPACE_LIST_PR_CAP);
             }
         }
     }
@@ -633,6 +686,7 @@ pub fn chief_workspace() -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        pull_requests_total: None,
         context_links: None,
         archived: false,
         archived_at: None,
@@ -5432,6 +5486,113 @@ mod tests {
 
         // A write-time extraction placeholder (0108/0109): the block's
         // `input` is already the capped preview and fits the budget here —
+    /// A `pullRequests[]` entry whose `updatedAt` orders it `n`-th: entry
+    /// `n` was updated `n` minutes into the hour, so a higher `n` is more
+    /// recent.
+    fn list_cap_pr(n: u64) -> PullRequestInfo {
+        PullRequestInfo {
+            id: format!("PR_{n}"),
+            number: 100 + n,
+            url: format!("https://github.com/intent-hq/intentd/pull/{}", 100 + n),
+            title: format!("PR {n}"),
+            status: PullRequestStatus::Open,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: format!("2026-01-01T00:{n:02}:00Z"),
+            base_ref: None,
+            head_ref: None,
+            head_sha: Some("deadbeef".to_string()),
+            author: Some("dev".to_string()),
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: None,
+        }
+    }
+
+    fn list_cap_workspace(pool: u64, active: Option<u64>) -> Workspace {
+        let mut ws = chief_workspace();
+        ws.active_pull_request = active.map(list_cap_pr);
+        ws.pull_requests = Some((0..pool).map(list_cap_pr).collect());
+        ws
+    }
+
+    fn pr_numbers(ws: &Workspace) -> Vec<u64> {
+        ws.pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.number)
+            .collect()
+    }
+
+    /// [`Workspace::slim_for_list`] caps `pullRequests` at
+    /// [`WORKSPACE_LIST_PR_CAP`]: eight entries → the five most recently
+    /// updated survive in `updatedAt`-descending order and the row reports
+    /// `pullRequestsTotal: 8`; the clone taken before slimming (what
+    /// `workspace.get` serves) still carries all eight with no total.
+    #[test]
+    fn workspace_list_caps_pull_requests_to_most_recent() {
+        let full = list_cap_workspace(8, None);
+        let mut row = full.clone();
+        row.slim_for_list();
+
+        assert_eq!(pr_numbers(&row), vec![107, 106, 105, 104, 103]);
+        assert_eq!(row.pull_requests_total, Some(8));
+        assert!(row
+            .pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|pr| pr.head_sha.is_none()));
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["pullRequestsTotal"], 8);
+        assert_eq!(
+            v["pullRequests"].as_array().unwrap().len(),
+            WORKSPACE_LIST_PR_CAP
+        );
+
+        // The detail projection is untouched: full pool, no total.
+        assert_eq!(pr_numbers(&full), (100..108).collect::<Vec<_>>());
+        assert_eq!(full.pull_requests_total, None);
+        let detail = serde_json::to_value(&full).unwrap();
+        assert!(detail.get("pullRequestsTotal").is_none());
+        assert_eq!(detail["pullRequests"].as_array().unwrap().len(), 8);
+    }
+
+    /// The `activePullRequest` match is always retained — even when it is
+    /// the 7th most recently updated of eight — counts toward the cap, and
+    /// leads the survivors; `activePullRequest` itself is untouched.
+    #[test]
+    fn workspace_list_cap_keeps_active_pull_request_first() {
+        let mut row = list_cap_workspace(8, Some(1));
+        row.slim_for_list();
+
+        assert_eq!(pr_numbers(&row), vec![101, 107, 106, 105, 104]);
+        assert_eq!(row.pull_requests_total, Some(8));
+        assert_eq!(row.active_pull_request.as_ref().unwrap().number, 101);
+
+        // An active PR outside the pool changes nothing about the survivors.
+        let mut row = list_cap_workspace(8, Some(42));
+        row.slim_for_list();
+        assert_eq!(pr_numbers(&row), vec![107, 106, 105, 104, 103]);
+    }
+
+    /// A pool within the cap is left as stored: no reorder, no truncation,
+    /// `pullRequestsTotal` absent — on the wire too.
+    #[test]
+    fn workspace_list_cap_leaves_small_pool_untouched() {
+        for pool in [0, 1, 4, 5] {
+            let mut row = list_cap_workspace(pool, Some(0));
+            row.pull_requests.as_mut().unwrap().reverse();
+            let before = pr_numbers(&row);
+            row.slim_for_list();
+            assert_eq!(pr_numbers(&row), before, "pool of {pool} untouched");
+            assert_eq!(row.pull_requests_total, None);
+            let v = serde_json::to_value(&row).unwrap();
+            assert!(v.get("pullRequestsTotal").is_none());
+        }
+        assert!(WORKSPACE_LIST_ROW_KEYS.contains(&"pullRequestsTotal"));
+    }
+
         // the flags must propagate rather than be recomputed away, so the
         // session preview keeps saying the input is truncated.
         let placeholder = json!([{
@@ -6062,6 +6223,7 @@ mod tests {
         let ts = "2026-01-01T00:00:00Z".to_string();
         let agent = WorkspaceAgentInfo {
             id: AgentId::from("agent-1"),
+            pull_requests_total: None,
             name: "Builder".to_string(),
             status: AgentStatus::Active,
             specialist: Some("implementor".to_string()),

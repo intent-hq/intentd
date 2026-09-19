@@ -8143,6 +8143,7 @@ async fn wss_task_list_empty_workspace_emits_zero_stats() {
     srv.ws.stop().await;
 }
 
+        pull_requests_total: None,
 /// `workspace.update` with the clearable `statusImageAssetId` field
 /// (intent-hq/monorepo#997 part 1) over the real WSS wire: setting an asset id
 /// persists it, surfaces it on `workspace.get`, and emits a self-sufficient

@@ -2106,6 +2106,7 @@ mod tests {
                                 "prompt": "You are an implementor",
                                 "behaviorPrompt": "You are an implementor",
                                 "source": "bundled",
+                        pull_requests_total: None,
                                 "isCustomized": false,
                                 "aliases": ["builder"],
                                 "resolvedProvider": "claude",

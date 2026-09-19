@@ -171,6 +171,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -683,11 +684,13 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
 
 /// Build the worst-case-realistic ACTIVE `workspace.list` row the row-budget
 /// golden measures: every small optional scalar present, a long title /
-/// status message, four PRs in the pool plus a linked `activePullRequest`
-/// (all detail fields populated so the slimming has something to strip), a
-/// saved setup script, context links, a fat `tokenUsage`, and ten live agent
-/// sessions (coordinator + nine sub-agents) so the enrichment builds a
-/// ten-agent `agentSummary`. Returns the row as served by `list_workspaces`.
+/// status message, eight PRs in the pool (so the
+/// `WORKSPACE_LIST_PR_CAP` truncation is exercised and `pullRequestsTotal`
+/// is present) plus a linked `activePullRequest` (all detail fields
+/// populated so the slimming has something to strip), a saved setup script,
+/// context links, a fat `tokenUsage`, and ten live agent sessions
+/// (coordinator + nine sub-agents) so the enrichment builds a ten-agent
+/// `agentSummary`. Returns the row as served by `list_workspaces`.
 async fn worst_case_workspace_list_row() -> Workspace {
     use std::collections::BTreeMap;
 
@@ -714,7 +717,9 @@ async fn worst_case_workspace_list_row() -> Workspace {
         title: format!("feat(workspace): slim list rows and add the row-budget golden ({n})"),
         status,
         created_at: now_iso(),
-        updated_at: now_iso(),
+        // Entry `n` was updated `n` minutes into the hour: a higher `n` is
+        // more recent, so the list cap keeps the highest-numbered entries.
+        updated_at: format!("2026-01-01T00:{n:02}:00Z"),
         base_ref: Some("main".to_string()),
         head_ref: Some(format!("feat/slim-list-rows-{n}")),
         head_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()),
@@ -757,6 +762,10 @@ async fn worst_case_workspace_list_row() -> Workspace {
         pr(1, PullRequestStatus::Merged),
         pr(2, PullRequestStatus::Closed),
         pr(3, PullRequestStatus::Draft),
+        pr(4, PullRequestStatus::Merged),
+        pr(5, PullRequestStatus::Closed),
+        pr(6, PullRequestStatus::Open),
+        pr(7, PullRequestStatus::Merged),
     ]);
     row.setup_script = Some(SetupScript {
         script: "#!/usr/bin/env bash\nset -euo pipefail\n".repeat(40),
@@ -885,7 +894,18 @@ async fn workspace_list_row_stays_within_row_budget() {
         .as_ref()
         .expect("active row keeps agentSummary");
     assert_eq!(summary.count, 10, "worst case carries ten agents");
-    assert_eq!(row.pull_requests.as_ref().unwrap().len(), 4);
+    // The eight-entry pool is capped to the five most recently updated with
+    // the linked PR (the oldest, `pr(0)`) retained and moved to the front.
+    assert_eq!(
+        row.pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>(),
+        vec![1_000, 1_007, 1_006, 1_005, 1_004]
+    );
+    assert_eq!(row.pull_requests_total, Some(8));
     assert!(row.active_pull_request.is_some());
     assert!(row.task_stats.is_some(), "list rows carry taskStats");
     assert!(
@@ -983,6 +1003,73 @@ async fn workspace_list_row_keys_match_allowlist_golden() {
             &format!("workspace.list row pullRequests[{i}]"),
         );
     }
+}
+
+/// `pullRequests` cap (`intent_core::WORKSPACE_LIST_PR_CAP`): both list
+/// surfaces (`workspace.list`, lite `workspace.subscribe` seq-0) serve the
+/// five most recently updated entries of an eight-entry pool plus
+/// `pullRequestsTotal: 8`, while `workspace.get` keeps the full pool in
+/// stored order with `pullRequestsTotal` absent — the cap is applied only by
+/// the final list-row slimming pass, never on the detail read.
+#[tokio::test]
+async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
+    use intent_core::{PullRequestInfo, PullRequestStatus, WORKSPACE_LIST_PR_CAP};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let pr = |n: u64| PullRequestInfo {
+        id: format!("PR_{n}"),
+        number: 500 + n,
+        url: format!("https://github.com/intent-hq/intentd/pull/{}", 500 + n),
+        title: format!("PR {n}"),
+        status: PullRequestStatus::Open,
+        created_at: now_iso(),
+        updated_at: format!("2026-01-01T00:{n:02}:00Z"),
+        base_ref: None,
+        head_ref: None,
+        head_sha: None,
+        author: None,
+        mergeable: None,
+        mergeable_state: None,
+        is_draft: None,
+    };
+    let numbers = |ws: &Workspace| -> Vec<u64> {
+        ws.pull_requests
+            .as_ref()
+            .expect("pullRequests")
+            .iter()
+            .map(|pr| pr.number)
+            .collect()
+    };
+
+    let ws = WorkspaceId::new();
+    let mut row = workspace(&ws);
+    row.pull_requests = Some((0..8).map(pr).collect());
+    store.insert_workspace(&row).await.expect("ws");
+
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+
+    let list = svc.list_workspaces(true).await.expect("list");
+    let listed = list.iter().find(|w| w.id == ws).expect("listed");
+    assert_eq!(numbers(listed), vec![507, 506, 505, 504, 503]);
+    assert_eq!(
+        listed.pull_requests.as_ref().unwrap().len(),
+        WORKSPACE_LIST_PR_CAP
+    );
+    assert_eq!(listed.pull_requests_total, Some(8));
+
+    let lite = svc.list_workspaces_lite(true).await.expect("lite list");
+    let lite_row = lite.iter().find(|w| w.id == ws).expect("lite row");
+    assert_eq!(numbers(lite_row), vec![507, 506, 505, 504, 503]);
+    assert_eq!(lite_row.pull_requests_total, Some(8));
+
+    let got = svc.get_workspace(ws).await.expect("get");
+    assert_eq!(numbers(&got), (500..508).collect::<Vec<_>>());
+    assert_eq!(got.pull_requests_total, None);
+    let detail = serde_json::to_value(&got).unwrap();
+    assert!(detail.get("pullRequestsTotal").is_none());
 }
 
 /// Frame-size regression guard for monorepo#3041: ~130 realistic rows —
@@ -27092,6 +27179,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -27240,6 +27328,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -27379,6 +27468,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -27513,6 +27603,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -27646,6 +27737,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -27784,6 +27876,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -28645,6 +28738,7 @@ mod known_repo {
             diff_summary: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,

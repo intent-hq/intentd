@@ -115,7 +115,10 @@ pub use model::{
     BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
     BrowserTabVisibility,
 };
-pub use model::{WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES, WORKSPACE_LIST_ROW_KEYS};
+pub use model::{
+    WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,
+    WORKSPACE_LIST_ROW_KEYS,
+};
 pub use path_utils::prewarm_login_shell_path;
 pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};

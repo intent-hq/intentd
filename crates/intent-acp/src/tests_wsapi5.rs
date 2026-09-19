@@ -117,6 +117,7 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,

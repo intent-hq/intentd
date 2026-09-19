@@ -965,5 +965,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         // disk_usage is computed on the emit path (intent-services), never persisted.
         disk_usage: None,
         pending_delete_at: None,
+        // pull_requests_total is set by the list-row slimming (intent-core), never persisted.
+        pull_requests_total: None,
     })
 }

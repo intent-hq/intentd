@@ -6403,6 +6403,7 @@ mod workspace_api_tool_tests {
                 token_usage: None,
                 cow_supported: None,
                 browser_client_id: None,
+                pull_requests_total: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
@@ -12130,6 +12131,7 @@ mod workspace_api_output_limit_tests {
         assert!(!folder.path().join("tool-outputs").exists());
     }
 
+                    pull_requests_total: None,
     #[tokio::test]
     async fn over_limit_output_redirects_to_tool_outputs_file() {
         let (folder, checkout) = temp_workspace_layout();
