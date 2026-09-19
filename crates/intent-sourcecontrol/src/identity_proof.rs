@@ -10,7 +10,13 @@
 //! `gist` OAuth scope (read from the `X-OAuth-Scopes` response header); a
 //! token without it — or one whose scopes GitHub does not report, e.g. a
 //! fine-grained PAT, which cannot create gists at all — fails with
-//! [`IdentityProofError::ScopeMissing`] before anything is written.
+//! [`IdentityProofError::ScopeMissing`] before anything is written. Delete
+//! is bounded the same way: it reads the gist back first (`GET
+//! /gists/{id}`, whose response carries the same scope header), refuses a
+//! token without the scope, and refuses to delete anything that is not a
+//! proof gist — exactly one file named [`PROOF_FILE_NAME`] — so the RPC can
+//! never be turned against the account's other gists
+//! ([`IdentityProofError::NotProofGist`]).
 
 use serde_json::{json, Value};
 
@@ -40,6 +46,10 @@ pub enum IdentityProofError {
     /// The token lacks the `gist` scope (or GitHub reported no scopes).
     #[error("github token lacks the `{REQUIRED_SCOPE}` oauth scope (granted: {granted:?})")]
     ScopeMissing { granted: String },
+    /// The gist named for deletion exists but is not an Intent proof gist
+    /// (its files are not exactly one [`PROOF_FILE_NAME`]); nothing deleted.
+    #[error("gist {gist_id:?} is not an Intent identity-proof gist")]
+    NotProofGist { gist_id: String },
     /// GitHub rejected the token (`401` / `403`).
     #[error("github rejected the token: {0}")]
     Unauthorized(String),
@@ -146,10 +156,54 @@ pub async fn create_proof_gist(
     Ok(ProofGist { gist_id, login })
 }
 
-/// Delete a proof gist. Idempotent: an already-deleted gist (`404`) is `Ok`.
+/// Whether a gist body (as `GET /gists/{id}` returns it) is an Intent proof
+/// gist: exactly one file, named [`PROOF_FILE_NAME`].
+#[must_use]
+pub fn is_proof_gist(gist: &Value) -> bool {
+    gist.get("files")
+        .and_then(Value::as_object)
+        .is_some_and(|files| files.len() == 1 && files.contains_key(PROOF_FILE_NAME))
+}
+
+/// `GET /gists/{id}`: the gist body plus the granted-scopes header, or
+/// `None` when the gist no longer exists (`404`).
+async fn gist_and_scopes(
+    crab: &octocrab::Octocrab,
+    gist_id: &str,
+) -> Result<Option<(Value, Option<String>)>> {
+    let response = crab
+        ._get(format!("/gists/{gist_id}"))
+        .await
+        .map_err(map_octocrab)?;
+    let response = match octocrab::map_github_error(response)
+        .await
+        .map_err(map_octocrab)
+    {
+        Ok(response) => response,
+        Err(IdentityProofError::Other(Error::NotFound(_))) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let scopes = response
+        .headers()
+        .get(OAUTH_SCOPES_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = crab.body_to_string(response).await.map_err(map_octocrab)?;
+    let gist: Value = serde_json::from_str(&body).map_err(Error::from)?;
+    Ok(Some((gist, scopes)))
+}
+
+/// Delete a proof gist. Reads the gist back first: an already-deleted gist
+/// (`404`) is `Ok` (idempotent); otherwise the token must carry the `gist`
+/// scope and the gist must be a proof gist ([`is_proof_gist`]) before the
+/// `DELETE` is sent, so the call can never remove another gist of the
+/// account.
 ///
 /// # Errors
 ///
+/// [`IdentityProofError::ScopeMissing`] when the token lacks `gist`;
+/// [`IdentityProofError::NotProofGist`] when `gist_id` names a gist that is
+/// not an Intent proof gist (nothing deleted);
 /// [`IdentityProofError::Unauthorized`] when GitHub rejects the token;
 /// [`IdentityProofError::Unreachable`] on transport failure.
 pub async fn delete_proof_gist(
@@ -158,13 +212,21 @@ pub async fn delete_proof_gist(
     gist_id: &str,
 ) -> Result<()> {
     let sc = client(token, api_base_url)?;
-    match sc
-        .client()
-        .gists()
-        .delete(gist_id)
-        .await
-        .map_err(map_octocrab)
-    {
+    let crab = sc.client();
+    let Some((gist, scopes)) = gist_and_scopes(crab, gist_id).await? else {
+        return Ok(());
+    };
+    if !has_gist_scope(scopes.as_deref()) {
+        return Err(IdentityProofError::ScopeMissing {
+            granted: scopes.unwrap_or_default(),
+        });
+    }
+    if !is_proof_gist(&gist) {
+        return Err(IdentityProofError::NotProofGist {
+            gist_id: gist_id.to_string(),
+        });
+    }
+    match crab.gists().delete(gist_id).await.map_err(map_octocrab) {
         Ok(()) | Err(IdentityProofError::Other(Error::NotFound(_))) => Ok(()),
         Err(e) => Err(e),
     }
@@ -403,15 +465,49 @@ mod tests {
         assert!(matches!(err, IdentityProofError::Unreachable(_)), "{err:?}");
     }
 
+    /// `GET /gists/{id}` answer: a gist with the given files, reporting the
+    /// given scopes (header absent when `None`).
+    fn gist_answer(files: &[&str], scopes: Option<&str>) -> Answer {
+        let files: serde_json::Map<String, Value> = files
+            .iter()
+            .map(|name| ((*name).to_string(), json!({ "filename": name })))
+            .collect();
+        Answer {
+            status: 200,
+            headers: scopes
+                .map(|s| vec![("X-OAuth-Scopes", s.to_string())])
+                .unwrap_or_default(),
+            body: json!({ "id": "live", "public": false, "files": files }).to_string(),
+        }
+    }
+
+    fn no_content() -> Answer {
+        Answer {
+            status: 204,
+            headers: Vec::new(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn proof_gist_shape_is_exactly_the_one_proof_file() {
+        assert!(is_proof_gist(
+            &json!({ "files": { PROOF_FILE_NAME: { "filename": PROOF_FILE_NAME } } })
+        ));
+        assert!(!is_proof_gist(
+            &json!({ "files": { PROOF_FILE_NAME: {}, "notes.md": {} } })
+        ));
+        assert!(!is_proof_gist(&json!({ "files": { "notes.md": {} } })));
+        assert!(!is_proof_gist(&json!({ "files": {} })));
+        assert!(!is_proof_gist(&json!({ "id": "x" })));
+    }
+
     #[tokio::test]
-    async fn delete_is_idempotent_on_404() {
+    async fn delete_reads_the_gist_back_then_deletes_and_is_idempotent_on_404() {
         let (base, seen) = spawn_mock(|line| match line {
-            "DELETE /gists/live" => Answer {
-                status: 204,
-                headers: Vec::new(),
-                body: String::new(),
-            },
-            "DELETE /gists/gone" => json_answer(404, &json!({ "message": "Not Found" })),
+            "GET /gists/live" => gist_answer(&[PROOF_FILE_NAME], Some("repo, gist")),
+            "DELETE /gists/live" => no_content(),
+            "GET /gists/gone" => json_answer(404, &json!({ "message": "Not Found" })),
             other => json_answer(500, &json!({ "message": format!("unexpected {other}") })),
         })
         .await;
@@ -422,8 +518,67 @@ mod tests {
             .await
             .expect("404 is ok");
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0].0, "DELETE /gists/live");
-        assert_eq!(seen[1].0, "DELETE /gists/gone");
+        let lines: Vec<&str> = seen.iter().map(|(line, _)| line.as_str()).collect();
+        assert_eq!(
+            lines,
+            ["GET /gists/live", "DELETE /gists/live", "GET /gists/gone"],
+            "no DELETE for a gist that is already gone"
+        );
+    }
+
+    /// The RPC cannot be turned against the account's other gists: a gist
+    /// whose files are not exactly the proof file is refused before any
+    /// `DELETE` is sent.
+    #[tokio::test]
+    async fn delete_refuses_a_gist_that_is_not_a_proof_gist() {
+        let (base, seen) = spawn_mock(|line| match line {
+            "GET /gists/notes" => gist_answer(&["notes.md"], Some("gist")),
+            "GET /gists/mixed" => gist_answer(&[PROOF_FILE_NAME, "notes.md"], Some("gist")),
+            other => json_answer(500, &json!({ "message": format!("unexpected {other}") })),
+        })
+        .await;
+        for id in ["notes", "mixed"] {
+            let err = delete_proof_gist("tok", Some(&base), id)
+                .await
+                .expect_err("not a proof gist");
+            assert!(
+                matches!(&err, IdentityProofError::NotProofGist { gist_id } if gist_id == id),
+                "{err:?}"
+            );
+        }
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|(line, _)| line.starts_with("GET ")),
+            "nothing deleted: {seen:?}"
+        );
+    }
+
+    /// Like create, delete needs the `gist` scope: a token without it (or
+    /// one whose scopes GitHub does not report) is `ScopeMissing`, not a
+    /// silent success or a `403` misreported as a rejected token.
+    #[tokio::test]
+    async fn delete_without_gist_scope_is_scope_missing_before_deleting() {
+        let (base, seen) = spawn_mock(|line| match line {
+            "GET /gists/live" => gist_answer(&[PROOF_FILE_NAME], Some("repo, read:org")),
+            "GET /gists/pat" => gist_answer(&[PROOF_FILE_NAME], None),
+            other => json_answer(500, &json!({ "message": format!("unexpected {other}") })),
+        })
+        .await;
+        let err = delete_proof_gist("tok", Some(&base), "live")
+            .await
+            .expect_err("scope missing");
+        assert!(
+            matches!(&err, IdentityProofError::ScopeMissing { granted } if granted == "repo, read:org"),
+            "{err:?}"
+        );
+        let err = delete_proof_gist("tok", Some(&base), "pat")
+            .await
+            .expect_err("scope missing");
+        assert!(
+            matches!(&err, IdentityProofError::ScopeMissing { granted } if granted.is_empty()),
+            "{err:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2, "no DELETE without the scope");
     }
 
     #[tokio::test]
