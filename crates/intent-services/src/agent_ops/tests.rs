@@ -9304,6 +9304,311 @@ async fn list_caps_previews_get_serves_full_values() {
     assert!(long_report.starts_with(row.metadata.completion_report.as_deref().unwrap()));
 }
 
+/// Detail-only `agent.list` row keys the list projection is being taught to
+/// strip (intent-hq/intent#5383, "Strip detail-only fields from agent.list
+/// rows"). Until that lands they still ride list rows, so the allowlist
+/// check tolerates them and the budget check measures the row WITHOUT them
+/// (the shape the budget is sized for). The slimming change deletes both
+/// sets so the goldens in intent-core become the only source of truth.
+const DETAIL_ONLY_ROW_KEYS_PENDING_STRIP: &[&str] = &[
+    "harnessFeatures",
+    "effortLevels",
+    "contextReferences",
+    "fileBlocks",
+    "stats",
+];
+const DETAIL_ONLY_METADATA_KEYS_PENDING_STRIP: &[&str] =
+    &["pendingProposals", "proposalResolutions"];
+
+/// Build the worst-case-realistic `agent.list` row for the budget /
+/// allowlist goldens: one session with every optional field populated (ids,
+/// model/effort, sandbox + attention + completion-report metadata, every
+/// raw-metadata marker, stop reason, context references / file blocks),
+/// every preview string over the cap, an over-cap `lastToolUse` input, two
+/// active hooks, two active PR monitors, a live context-usage report, an
+/// outgoing completion watch and a pending delete — then read back through
+/// the real list path (`agent_list_op` → `agent_list_impl` →
+/// `cap_list_previews`). The only fields not seedable without a live ACP
+/// turn (`isResponding` / `isWaitingOnTool` / `turnInFlight` /
+/// `lastStreamActivityAt`, all overlaid from the live-turn slot) and
+/// `sessionCorrupted` (derived from the in-memory poison set) are set on
+/// the projected row afterwards; `retiredAt` is set the same way because a
+/// retired row leaves the default scope (and retire cancels its hooks and
+/// monitors). `cap_list_previews` is idempotent, so re-running it after the
+/// overlay keeps the row on the exact list-path shape.
+async fn worst_case_agent_list_row(
+    svc: &Services,
+    ws: &WorkspaceId,
+) -> (AgentId, intent_core::AgentLite) {
+    use intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET;
+    let parent = create_agent(svc, ws, "Parent").await;
+    let child = create_agent(svc, ws, "Child").await;
+    let id = create_agent(svc, ws, "Worst-case row").await;
+
+    let user = json!([{ "type": "text", "text": format!("ask {}", "u".repeat(BUDGET * 3)) }]);
+    svc.store()
+        .append_agent_message(&id, "user", &user, &now_iso())
+        .await
+        .expect("append user");
+    let assistant = json!([
+        {
+            "type": "tool_use", "id": "m:0", "name": "str-replace-editor",
+            "input": {
+                "path": "packages/intentd/crates/intent-services/src/agent_ops.rs",
+                "command": "str_replace",
+                "old_str_1": "x".repeat(BUDGET * 3),
+                "new_str_1": "y".repeat(BUDGET * 3),
+            },
+            "toolCallId": "toolu_01",
+        },
+        {
+            "type": "text",
+            "text": format!(
+                "answer {}\n<agent_digest>digest {}</agent_digest>",
+                "a".repeat(BUDGET * 3),
+                "d".repeat(BUDGET * 3)
+            ),
+        },
+    ]);
+    svc.store()
+        .append_agent_message(&id, "assistant", &assistant, &now_iso())
+        .await
+        .expect("append assistant");
+
+    let ts = now_iso();
+    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    s.parent_agent_id = Some(parent.clone());
+    s.backend_session_id = Some(AgentId::from("agent-11111111-2222-3333-4444-555555555555"));
+    s.acp_session_id = Some("acp-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
+    s.name_explicitly_set = true;
+    s.model = Some("claude-sonnet-4-5-20250929".into());
+    s.reasoning_effort = Some("medium".into());
+    s.specialist = Some("implementor".into());
+    s.task_note_id = Some(intent_core::NoteId::from(
+        "1d8c1e09-41fb-4b83-834a-781d012e2707",
+    ));
+    s.completion_report = Some(format!("report {}", "r".repeat(BUDGET * 3)));
+    s.completion_report_timestamp = Some(ts.clone());
+    s.delegation_depth = Some(2);
+    s.context_references = Some(json!([{ "type": "file", "path": "src/lib.rs" }]));
+    s.file_blocks = Some(json!([{ "type": "file", "path": "docs/a.md", "size": 1200 }]));
+    s.sandbox_id = Some("sbx-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
+    s.sandbox_path = Some("/home/user/intent/workspaces/agent-list/.sandboxes/sbx-01HZY8Q6".into());
+    s.sandbox_branch = Some("sandbox/agent-list/sbx-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
+    s.stop_reason = Some("end_turn".into());
+    s.stop_reason_timestamp = Some(ts.clone());
+    s.metadata = Some(json!({
+        intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-01HZY8Q6W1V2K3M4N5P6R7S8T9",
+        intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY: "msg-01HZY8Q6W1V2K3M4N5P6R7S8U0",
+        intent_core::LAST_SEEN_MESSAGE_ID_KEY: "msg-01HZY8Q6W1V2K3M4N5P6R7S8U1",
+        intent_core::PENDING_PROPOSALS_KEY: [
+            { "proposalId": "prop-01", "messageId": "msg-01HZY8Q6W1V2K3M4N5P6R7S8U2" },
+            { "proposalId": "prop-02", "messageId": "msg-01HZY8Q6W1V2K3M4N5P6R7S8U3" },
+        ],
+        intent_core::PROPOSAL_RESOLUTIONS_KEY: {
+            "prop-00": intent_core::PROPOSAL_OUTCOME_APPLIED,
+            "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
+        },
+        "isInitialAgent": true,
+        "sponsorAgentId": parent.0,
+    }));
+    svc.store()
+        .update_agent_session(ws, &s)
+        .await
+        .expect("populate session");
+    svc.store()
+        .set_attention_request(
+            ws,
+            &id,
+            "discussion",
+            "Need a decision on the row budget before tightening the golden.",
+            &ts,
+        )
+        .await
+        .expect("attention request");
+    svc.store()
+        .set_agent_effort_levels(
+            ws,
+            &id,
+            Some(&["low".to_string(), "medium".to_string(), "high".to_string()]),
+            &ts,
+        )
+        .await
+        .expect("effort levels");
+    svc.store()
+        .set_agent_notifications_muted(ws, &id, true, &ts)
+        .await
+        .expect("mute");
+
+    seed_active_hook(svc, ws, &id, "Wait for CI on intentd PR").await;
+    seed_active_hook(svc, ws, &id, "Wait for shipped alpha").await;
+    seed_active_pr_monitor(svc, ws, &id, 1993).await;
+    seed_active_pr_monitor(svc, ws, &id, 5383).await;
+    svc.record_context_usage(&id, 123_456, 200_000);
+    svc.register_completion_watch(ws, ws, id.clone(), "Worst-case row".into(), child, None)
+        .expect("outgoing watch");
+    svc.agent_schedule_delete_op(id.clone(), Some(ws.clone()), 60_000)
+        .await
+        .expect("pending delete");
+
+    let rows = svc.agent_list_op(ws.clone()).await.expect("list");
+    let mut row = rows
+        .into_iter()
+        .find(|a| a.id == id)
+        .expect("worst-case row listed");
+    row.is_responding = true;
+    row.is_waiting_on_tool = true;
+    row.turn_in_flight = true;
+    row.last_stream_activity_at = Some(ts.clone());
+    row.session_corrupted = true;
+    row.retired_at = Some(ts);
+    row.cap_list_previews();
+    (id, row)
+}
+
+/// Strip the pending-removal keys (see
+/// [`DETAIL_ONLY_ROW_KEYS_PENDING_STRIP`]) from a serialized row so the
+/// budget is measured on the shape it is sized for.
+fn without_pending_strip_keys(row: &serde_json::Value) -> serde_json::Value {
+    let mut slim = row.clone();
+    if let Some(obj) = slim.as_object_mut() {
+        for key in DETAIL_ONLY_ROW_KEYS_PENDING_STRIP {
+            obj.remove(*key);
+        }
+        if let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            for key in DETAIL_ONLY_METADATA_KEYS_PENDING_STRIP {
+                meta.remove(*key);
+            }
+        }
+    }
+    slim
+}
+
+/// Row-budget golden (intent-hq/intent#5383): the worst-case-realistic
+/// `agent.list` row serializes at or under
+/// [`intent_core::AGENT_LIST_ROW_BUDGET_BYTES`] — the failure message is the
+/// per-field byte table, so the field that blew the budget is named. Also
+/// pins the fixture as genuinely worst-case: every preview slot sits at the
+/// cap and both idle-visibility lists carry two entries.
+#[tokio::test]
+async fn agent_list_row_stays_within_row_budget() {
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        AGENT_LIST_ROW_BUDGET_BYTES,
+    };
+    let (_t, svc, ws) = setup().await;
+    let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
+
+    assert_eq!(
+        row.last_agent_response.as_deref().map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(
+        row.last_user_message.as_deref().map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(
+        row.digest.as_deref().map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(
+        row.metadata.completion_report.as_deref().map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(
+        row.last_tool_use.as_ref().unwrap()["inputTruncated"],
+        json!(true)
+    );
+    assert_eq!(row.waiting_on_hooks.len(), 2);
+    assert_eq!(row.waiting_on_pr_monitors.len(), 2);
+    assert_eq!(row.waiting_for_agent_ids.len(), 1);
+    assert!(row.context_usage.is_some());
+    assert!(row.pending_delete_at.is_some());
+    assert!(row.metadata.attention_request_kind.is_some());
+    assert!(row.metadata.sandbox_id.is_some());
+
+    let wire = serde_json::to_value(&row).unwrap();
+    let measured = without_pending_strip_keys(&wire);
+    let (total, per_key) = serialized_key_bytes(&measured);
+    let (meta_total, meta_per_key) = serialized_key_bytes(&measured["metadata"]);
+    let table = format!(
+        "{}metadata breakdown:\n{}",
+        format_key_bytes_table(total, &per_key),
+        format_key_bytes_table(meta_total, &meta_per_key)
+    );
+    assert!(
+        total <= AGENT_LIST_ROW_BUDGET_BYTES,
+        "worst-case agent.list row is {total} B, over AGENT_LIST_ROW_BUDGET_BYTES \
+         ({AGENT_LIST_ROW_BUDGET_BYTES} B). Shrink or drop the largest fields below \
+         (detail-only data belongs on agent.get / agent.getSession), or justify a \
+         budget change in the const's doc comment.\n{table}"
+    );
+}
+
+/// Key-allowlist golden (intent-hq/intent#5383): every top-level key and
+/// every `metadata` key of the worst-case `agent.list` row is listed in
+/// [`intent_core::AGENT_LIST_ROW_KEYS`] / [`intent_core::AGENT_LIST_ROW_METADATA_KEYS`]
+/// (or in the pending-strip sets above until the slimming change lands),
+/// and — the other direction — the fixture populates every allowlisted key,
+/// so the budget test above really measures the worst case.
+#[tokio::test]
+async fn agent_list_row_keys_match_allowlist_golden() {
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, AGENT_LIST_ROW_KEYS,
+        AGENT_LIST_ROW_METADATA_KEYS,
+    };
+    let (_t, svc, ws) = setup().await;
+    let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
+    let wire = serde_json::to_value(&row).unwrap();
+
+    let check = |label: &str, object: &serde_json::Value, allow: &[&str], pending: &[&str]| {
+        let (total, per_key) = serialized_key_bytes(object);
+        let table = format_key_bytes_table(total, &per_key);
+        let keys: Vec<&str> = object
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let unlisted: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| !allow.contains(k) && !pending.contains(k))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "agent.list {label} carries keys outside the allowlist golden: {unlisted:?}. \
+             Either add each to intent_core::AGENT_LIST_ROW_KEYS / \
+             AGENT_LIST_ROW_METADATA_KEYS (only if list-context UI renders it AND it \
+             is small — then document it in docs/protocol/methods/agents.md) or serve \
+             it on agent.get / agent.getSession only.\n{table}"
+        );
+        let missing: Vec<&str> = allow
+            .iter()
+            .copied()
+            .filter(|k| !keys.contains(k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the worst-case {label} fixture does not populate allowlisted keys \
+             {missing:?}; extend worst_case_agent_list_row so the budget golden \
+             measures every field.\n{table}"
+        );
+    };
+    check(
+        "row",
+        &wire,
+        AGENT_LIST_ROW_KEYS,
+        DETAIL_ONLY_ROW_KEYS_PENDING_STRIP,
+    );
+    check(
+        "metadata",
+        &wire["metadata"],
+        AGENT_LIST_ROW_METADATA_KEYS,
+        DETAIL_ONLY_METADATA_KEYS_PENDING_STRIP,
+    );
+}
+
 /// The top-level `isBackground` param wins over the `metadata` fallback, and
 /// an agent created with neither defaults to foreground (G-A1/P3-1.2c).
 #[tokio::test]

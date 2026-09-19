@@ -100,15 +100,13 @@ impl PullRequestInfo {
     /// (`activePullRequest` / `pullRequests[]`); see
     /// [`Workspace::slim_for_list`]. The list-context readers (sidebar PR
     /// dropdown, card status, delete warning) need `number` / `url` /
-    /// `title` / `status` / `isDraft` plus the timestamps used for ordering;
-    /// `headSha`, `author`, `mergeable` and `mergeableState` feed hover
-    /// tooltips and the daemon-side `displayStatus` derivation (which runs
-    /// before the slimming pass), so they stay `workspace.get`-only.
+    /// `title` / `status` / `isDraft` plus the timestamps used for ordering,
+    /// and `mergeable` / `mergeableState` — the FE derives the PR lifecycle
+    /// display status from them on list rows, so both stay. `headSha` and
+    /// `author` feed hover tooltips only, so they are `workspace.get`-only.
     pub fn slim_for_list(&mut self) {
         self.head_sha = None;
         self.author = None;
-        self.mergeable = None;
-        self.mergeable_state = None;
     }
 }
 
@@ -440,9 +438,10 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
 
 /// Key allowlist golden for an `activePullRequest` / `pullRequests[]` entry
 /// of a `workspace.list` row; companion of [`WORKSPACE_LIST_ROW_KEYS`] with
-/// the same rules. `headSha`, `author`, `mergeable` and `mergeableState`
-/// are detail-only (see [`PullRequestInfo::slim_for_list`]) and
-/// deliberately absent.
+/// the same rules. `headSha` and `author` are detail-only (see
+/// [`PullRequestInfo::slim_for_list`]) and deliberately absent;
+/// `mergeable` / `mergeableState` stay because the FE derives the PR
+/// lifecycle display status from them on list rows.
 pub const WORKSPACE_LIST_PR_KEYS: &[&str] = &[
     "id",
     "number",
@@ -454,6 +453,8 @@ pub const WORKSPACE_LIST_PR_KEYS: &[&str] = &[
     "baseRef",
     "headRef",
     "isDraft",
+    "mergeable",
+    "mergeableState",
 ];
 
 impl Workspace {
@@ -2874,6 +2875,161 @@ pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
 /// transport's 1 MiB large-frame warn — while keeping each preview long
 /// enough for its one-line render.
 pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
+
+/// Whole-row byte budget for one serialized `agent.list` row
+/// (intent-hq/intent#5383): the per-field preview cap above bounds each
+/// preview, but the row is the unit the transport frames, so a
+/// worst-case-realistic row — every optional field present, every preview
+/// at [`AGENT_LIST_PREVIEW_BUDGET_BYTES`], two active hooks and two PR
+/// monitors — must serialize at or under this many bytes, enforced by the
+/// row-budget golden test in intent-services (`agent_ops::tests`), which
+/// prints a per-field byte table on failure.
+///
+/// Arithmetic. The transport warns on outbound frames over 1 MiB
+/// (1,048,576 B); the `agent.list` envelope
+/// (`{"jsonrpc":"2.0","id":…,"result":{"agents":[…]}}` plus one comma per
+/// row) costs about 1,060 B for 1,000 rows, so the frame goal is
+/// ≈ 1,047 B/row. The preview cap alone puts the worst-case row above
+/// that: five preview slots (`lastAgentResponse`, `lastUserMessage`,
+/// `digest`, `metadata.completionReport`, `lastToolUse.input`) × 400 B ≈
+/// 2,170 B on the wire (keys, quotes and the `lastToolUse` preview flags
+/// included) before a single fixed field. The measured worst-case row with
+/// the detail-only fields stripped is 4,886 B: those ≈ 2,170 B of previews
+/// plus ≈ 2,700 B of fixed fields — eight `agent-<uuid>` ids (≈ 470 B),
+/// nine RFC-3339 timestamps (≈ 470 B), four message ids (≈ 230 B), two
+/// hook entries (326 B), two PR-monitor entries (206 B), sandbox
+/// path/branch/id (≈ 190 B), a one-sentence attention reason, and the
+/// boolean/enum flags. This budget is that measurement rounded up to the
+/// next 1 KiB (≈ 5% margin); a row that regrows past it fails the golden
+/// with the per-field table. Typical rows are far smaller (the issue's
+/// 404-row measurement averaged 2.6 KB/row BEFORE slimming; few sessions
+/// carry an attention request, sandbox fields, hooks AND monitors at once,
+/// and previews rarely all hit the cap), and the per-key allowlist
+/// ([`AGENT_LIST_ROW_KEYS`]) keeps the fixed part from regrowing
+/// field-by-field. Meeting the ≈ 1 KB/row frame goal for 1,000 worst-case
+/// rows would require lowering the preview cap (each 100 B off
+/// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] takes ≈ 500 B off this budget) or
+/// paging `agent.list` — separate protocol decisions.
+pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 5 * 1024;
+
+/// Key allowlist golden for a serialized `agent.list` row
+/// (intent-hq/intent#5383): the top-level keys a list row may carry. The
+/// row-budget golden test compares every key of a worst-case row against
+/// this list — an unlisted key fails with guidance to either add it here
+/// (list-relevant AND small) or serve it on `agent.get` / `agent.getSession`
+/// only. Detail-only fields (`harnessFeatures`, `effortLevels`,
+/// `contextReferences`, `fileBlocks`, `stats`) are deliberately absent: the
+/// list projection strips them and the detail reads keep serving them.
+/// Adding a key here is a wire-contract change — update
+/// `docs/protocol/methods/agents.md` in the same commit and state which
+/// rung of the derived-field ladder the field sits on.
+pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
+    "id",
+    "workspaceId",
+    "parentAgentId",
+    "backendSessionId",
+    "acpSessionId",
+    "name",
+    "nameExplicitlySet",
+    "model",
+    "reasoningEffort",
+    "provider",
+    "status",
+    "isActive",
+    "isStreaming",
+    "isProcessing",
+    "isResponding",
+    "isWaitingOnTool",
+    "isWaitingForOtherAgents",
+    "waitingForAgentIds",
+    "waitingOnHooks",
+    "waitingOnPrMonitors",
+    "turnInFlight",
+    "lastStreamActivityAt",
+    "contextUsage",
+    "createdAt",
+    "updatedAt",
+    "lastActivity",
+    "messageCount",
+    "lastAgentResponse",
+    "lastUserMessage",
+    "lastMessageRole",
+    "lastMessageId",
+    "lastToolUse",
+    "digest",
+    "stopReason",
+    "stopReasonTimestamp",
+    "sessionCorrupted",
+    "pendingDeleteAt",
+    "retiredAt",
+    "notificationsMuted",
+    "harnessVersion",
+    "metadata",
+];
+
+/// Key allowlist golden for the nested `metadata` object of an `agent.list`
+/// row; companion of [`AGENT_LIST_ROW_KEYS`] with the same rules.
+/// `pendingProposals` / `proposalResolutions` are detail-only (the open
+/// chat's proposal cards read them via `agent.get`) and deliberately
+/// absent.
+pub const AGENT_LIST_ROW_METADATA_KEYS: &[&str] = &[
+    "isBackground",
+    "specialist",
+    "createdByAgentId",
+    "taskNoteId",
+    "completionReport",
+    "completionReportTimestamp",
+    "attentionRequestKind",
+    "attentionRequestReason",
+    "attentionRequestTimestamp",
+    "delegationDepth",
+    "sandboxId",
+    "sandboxPath",
+    "sandboxBranch",
+    "dismissedQuestionsMessageId",
+    "pendingQuestionsMessageId",
+    "lastSeenMessageId",
+    "isInitialAgent",
+    "sponsorAgentId",
+];
+
+/// Serialized-size attribution of one JSON object for list-row budget
+/// tests: `(total_bytes, per_key)` where `total_bytes` is the compact
+/// serialized length of `value` and `per_key` charges each top-level entry
+/// its serialized key, the `:` separator, its serialized value, and one
+/// byte of `,`/`}` punctuation, sorted largest-first (ties by key). A
+/// non-object value attributes everything to a single `<value>` entry.
+/// Shared by the `agent.list` / `workspace.list` row-budget goldens so
+/// their failure messages name the fields that blew the budget.
+#[must_use]
+pub fn serialized_key_bytes(value: &serde_json::Value) -> (usize, Vec<(String, usize)>) {
+    let total = serde_json::to_vec(value).map_or(0, |v| v.len());
+    let mut per_key: Vec<(String, usize)> = match value {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| {
+                let key_bytes = serde_json::to_vec(k).map_or(0, |b| b.len());
+                let value_bytes = serde_json::to_vec(v).map_or(0, |b| b.len());
+                (k.clone(), key_bytes + 1 + value_bytes + 1)
+            })
+            .collect(),
+        _ => vec![("<value>".to_string(), total)],
+    };
+    per_key.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    (total, per_key)
+}
+
+/// Render a [`serialized_key_bytes`] breakdown as an aligned
+/// `bytes  key` table (largest first) for assertion messages.
+#[must_use]
+pub fn format_key_bytes_table(total: usize, per_key: &[(String, usize)]) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("total {total} B\n");
+    for (key, bytes) in per_key {
+        let _ = writeln!(out, "{bytes:>7} B  {key}");
+    }
+    out
+}
 
 /// Per-session fields an agent must never learn about. `notificationsMuted`
 /// is a user-facing notification preference served on the wire [`AgentLite`]

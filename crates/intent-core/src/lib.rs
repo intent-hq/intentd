@@ -72,9 +72,11 @@ pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
-    cap_json_value, last_tool_use_preview, note_list_slim_row, slim_body_size, slim_heavy_body,
-    ConversationProjection, NoteListProjection, AGENT_LIST_PREVIEW_BUDGET_BYTES,
-    NOTE_LIST_PREVIEW_CHARS, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
+    cap_json_value, format_key_bytes_table, last_tool_use_preview, note_list_slim_row,
+    serialized_key_bytes, slim_body_size, slim_heavy_body, ConversationProjection,
+    NoteListProjection, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
+    AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS,
+    SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
@@ -113,9 +115,9 @@ pub use model::{
     BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
     BrowserTabVisibility,
 };
+pub use model::{WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES, WORKSPACE_LIST_ROW_KEYS};
 pub use path_utils::prewarm_login_shell_path;
 pub use repo_ref::RepoRef;
-pub use model::{WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES, WORKSPACE_LIST_ROW_KEYS};
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
 pub use server_control::ServerControl;
 pub use settings_file::{
