@@ -264,7 +264,32 @@ async fn propose_sibling(
         },
         "preview": preview,
     });
-    super::app::workspaces::proposal_result(&proposal)
+    let mut result = super::app::workspaces::proposal_result(&proposal)?;
+    // Surface the stable handle applyProposal accepts across resolution
+    // (additive): the idempotencyKey only addresses the proposal while pending.
+    if let Some(proposal_id) = proposal_identity(&proposal).map(str::to_string) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("proposalId".to_string(), json!(proposal_id));
+        }
+        if let Some(text) = result
+            .get_mut("__mcpContentItems")
+            .and_then(Value::as_array_mut)
+            .and_then(|items| items.first_mut())
+            .and_then(|item| item.get_mut("text"))
+        {
+            if let Some(mut body) = text
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("proposalId".to_string(), json!(proposal_id));
+                }
+                *text =
+                    json!(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()));
+            }
+        }
+    }
+    Ok(result)
 }
 
 const APPLY_PROPOSAL_ALLOWED_KEYS: &[&str] = &["userRequested", "title", "initialPrompt"];
@@ -441,7 +466,8 @@ async fn apply_proposal(
                 "proposal `{proposal_ref}` was dismissed by the user; propose it again with ws.workspace.proposeSibling if still wanted"
             )),
             _ => Err(format!(
-                "no pending proposal `{proposal_ref}` on this agent (matched neither a pending proposalId nor a pending proposal's idempotencyKey). \
+                "proposal `{proposal_ref}` matched neither a pending proposalId/idempotencyKey nor a resolved proposalId on this agent. \
+                 An idempotencyKey only addresses a proposal while it is pending; if the card may already have been applied or dismissed, retry with the `proposalId` from the proposeSibling result. \
                  A proposal emitted in the CURRENT turn is recorded as pending only at turn end — end your turn and wait for the user's instruction before applying it."
             )),
         };
@@ -514,7 +540,10 @@ async fn apply_proposal(
         created.workspace.id.as_str(),
         created.workspace.title
     );
-    let resolve_warning = api
+    // The resolver echoes the persisted outcome (no rewrite) when the card was
+    // resolved concurrently, so a UI dismissal that landed during create is
+    // reported rather than silently overwritten.
+    let (outcome, resolve_warning) = match api
         .agent_resolve_proposal(
             ws.clone(),
             caller,
@@ -523,18 +552,33 @@ async fn apply_proposal(
             Some(detail),
         )
         .await
-        .err()
-        .map(|e| {
-            format!(
+    {
+        Ok(resolved) => match resolved.get("outcome").and_then(Value::as_str) {
+            Some(persisted) if persisted != PROPOSAL_OUTCOME_APPLIED => (
+                persisted.to_string(),
+                Some(format!(
+                    "workspace {} exists (it was created by this call), but the proposal had \
+                     already been resolved '{persisted}' from the UI while it was being created; \
+                     that resolution was kept and the card does not show applied — tell the user \
+                     the workspace exists",
+                    created.workspace.id.as_str()
+                )),
+            ),
+            _ => (PROPOSAL_OUTCOME_APPLIED.to_string(), None),
+        },
+        Err(e) => (
+            PROPOSAL_OUTCOME_APPLIED.to_string(),
+            Some(format!(
                 "workspace {} was created but the proposal could not be marked applied: {e}",
                 created.workspace.id.as_str()
-            )
-        });
+            )),
+        ),
+    };
 
     let mut out = json!({
         "ok": true,
         "proposalId": proposal_id,
-        "outcome": PROPOSAL_OUTCOME_APPLIED,
+        "outcome": outcome,
         "workspace": {
             "id": created.workspace.id.as_str(),
             "title": created.workspace.title,

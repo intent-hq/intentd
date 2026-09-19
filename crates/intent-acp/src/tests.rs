@@ -6522,6 +6522,11 @@ mod workspace_api_tool_tests {
 
         assert_eq!(proposal["kind"], "workspace-create");
         assert_eq!(proposal["payload"]["operation"], "workspace.create");
+        assert_eq!(
+            first["proposalId"], "Create workspace: Follow up",
+            "top-level proposalId is the applyProposal handle (preview.title, no applyToolCallId)"
+        );
+        assert_eq!(first["proposalId"], proposal["preview"]["title"]);
         assert_eq!(create["mode"], "sibling");
         assert_eq!(create["title"], "Follow up");
         assert_eq!(
@@ -12314,6 +12319,9 @@ mod workspace_apply_proposal_tests {
         create_error: Mutex<Option<Error>>,
         resolve_calls: Mutex<Vec<ResolveCall>>,
         resolve_error: Mutex<Option<Error>>,
+        /// Outcome the fake resolver echoes back instead of the requested one
+        /// (models the real resolver's "already resolved" idempotent path).
+        resolve_persisted_outcome: Mutex<Option<String>>,
     }
 
     fn workspace(id: &str, title: &str) -> Workspace {
@@ -12556,10 +12564,12 @@ mod workspace_apply_proposal_tests {
                 detail,
             ));
             let error = self.resolve_error.lock().unwrap().take();
+            let persisted = self.resolve_persisted_outcome.lock().unwrap().clone();
             Box::pin(async move {
                 if let Some(e) = error {
                     return Err(e);
                 }
+                let outcome = persisted.unwrap_or(outcome);
                 Ok(json!({ "success": true, "proposalId": proposal_id, "outcome": outcome }))
             })
         }
@@ -12898,7 +12908,10 @@ mod workspace_apply_proposal_tests {
             "return await ws.workspace.applyProposal('Create workspace: Other', { userRequested: true });",
         )
         .await;
-        assert_error_contains(&resp, "no pending proposal `Create workspace: Other`");
+        assert_error_contains(
+            &resp,
+            "proposal `Create workspace: Other` matched neither a pending proposalId/idempotencyKey nor a resolved proposalId",
+        );
         assert_error_contains(&resp, "recorded as pending only at turn end");
         assert!(api.create_calls.lock().unwrap().is_empty());
         assert!(api.resolve_calls.lock().unwrap().is_empty());
@@ -12911,8 +12924,61 @@ mod workspace_apply_proposal_tests {
             &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
         )
         .await;
-        assert_error_contains(&resp, "no pending proposal");
+        assert_error_contains(&resp, "matched neither a pending proposalId/idempotencyKey");
         assert!(api.conversation_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_no_longer_addresses_a_resolved_proposal() {
+        // Resolved: gone from pending, present in resolutions under its id.
+        // The key is not a lookup handle any more — the error must say so and
+        // point at the proposalId instead of the misleading turn-end hint alone.
+        for outcome in ["applied", "dismissed"] {
+            let api = Arc::new(FakeApi::default());
+            api.resolutions
+                .lock()
+                .unwrap()
+                .insert(PENDING_ID.to_string(), json!(outcome));
+            let srv = server(api.clone());
+            let resp = call(
+                &srv,
+                &format!(
+                    "return await ws.workspace.applyProposal({KEY:?}, {{ userRequested: true }});"
+                ),
+            )
+            .await;
+            assert_error_contains(
+                &resp,
+                &format!("proposal `{KEY}` matched neither a pending proposalId/idempotencyKey nor a resolved proposalId"),
+            );
+            assert_error_contains(
+                &resp,
+                "An idempotencyKey only addresses a proposal while it is pending",
+            );
+            assert_error_contains(
+                &resp,
+                "retry with the `proposalId` from the proposeSibling result",
+            );
+            assert_error_contains(&resp, "recorded as pending only at turn end");
+            assert!(api.create_calls.lock().unwrap().is_empty());
+            assert!(api.resolve_calls.lock().unwrap().is_empty());
+
+            // The id still addresses the resolved proposal.
+            let resp = call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await;
+            if outcome == "applied" {
+                assert_eq!(
+                    tool_json(&resp),
+                    json!({ "ok": true, "proposalId": PENDING_ID, "outcome": "applied", "alreadyResolved": true })
+                );
+            } else {
+                assert_error_contains(&resp, "was dismissed by the user");
+            }
+            assert!(api.create_calls.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -13011,6 +13077,61 @@ mod workspace_apply_proposal_tests {
         assert!(warning.contains("ws-new"));
         assert!(warning.contains("could not be marked applied"));
         assert!(warning.contains("store closed"));
+    }
+
+    #[tokio::test]
+    async fn resolve_echoing_applied_is_a_clean_apply() {
+        let api = api_with_pending(&sibling_proposal());
+        *api.resolve_persisted_outcome.lock().unwrap() = Some("applied".to_string());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["outcome"], "applied");
+        assert_eq!(out["workspace"]["id"], "ws-new");
+        assert!(out.get("resolveWarning").is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_dismissal_during_create_is_reported_not_overwritten() {
+        let api = api_with_pending(&sibling_proposal());
+        *api.resolve_persisted_outcome.lock().unwrap() = Some("dismissed".to_string());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await,
+        );
+        assert_eq!(
+            out["ok"], true,
+            "the workspace exists, so the call succeeds"
+        );
+        assert_eq!(out["proposalId"], PENDING_ID);
+        assert_eq!(
+            out["outcome"], "dismissed",
+            "the persisted resolution is echoed, never reported as applied"
+        );
+        assert_eq!(out["workspace"]["id"], "ws-new");
+        assert_eq!(out["workspace"]["title"], "Follow up");
+        let warning = out["resolveWarning"].as_str().unwrap();
+        assert!(warning.contains("ws-new"), "{warning}");
+        assert!(warning.contains("exists"), "{warning}");
+        assert!(warning.contains("'dismissed'"), "{warning}");
+        assert!(warning.contains("does not show applied"), "{warning}");
+        assert!(warning.contains("tell the user"), "{warning}");
+
+        // Exactly one resolve attempt, still requesting applied — the binding
+        // never issues a second write to overturn the dismissal.
+        let resolves = api.resolve_calls.lock().unwrap().clone();
+        assert_eq!(resolves.len(), 1);
+        assert_eq!(resolves[0].3, "applied");
     }
 
     #[tokio::test]
