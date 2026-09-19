@@ -372,9 +372,11 @@ impl Services {
     /// resolves to a `(provider, model)` pair, so a legacy compound value
     /// naming another registered provider routes the one-shot there.
     ///
-    /// Once the provider gate is open, an eligible call is first offered to
-    /// the on-device `fm` backend ([`Self::try_fm_completion`]); any `fm`
-    /// miss falls through to the resolved provider route unchanged.
+    /// Before the provider gate, an eligible call is first offered to the
+    /// on-device `fm` backend ([`Self::try_fm_completion`]), so a host with
+    /// no decidable default provider still gets `{ text }` from `fm`; any
+    /// `fm` miss falls through to the provider gate and route unchanged, and
+    /// `{ available: false }` is returned only when both miss.
     pub(crate) async fn agent_complete_once_op(
         &self,
         prompt: String,
@@ -385,6 +387,28 @@ impl Services {
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
         let settings = self.effective_settings();
+        // A blank system prompt counts as none. The auggie CLI route composes
+        // it into the prompt text; the ACP route decides per provider
+        // (`one_shot_session_shape`); `fm` passes it as `-i`.
+        let system_prompt = system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
+
+        if let Some(text) = self
+            .try_fm_completion(
+                &settings,
+                quick_action_type.as_deref(),
+                system_prompt,
+                &prompt,
+                timeout,
+            )
+            .await
+        {
+            return Ok(json!({ "text": text }));
+        }
+
         let effective_provider = crate::agent_session::derived_default_provider(&settings);
 
         // An explicit client model always wins, but it is bare and so needs
@@ -428,27 +452,6 @@ impl Services {
             }
             None => None,
         };
-        // A blank system prompt counts as none. The auggie CLI route composes
-        // it into the prompt text; the ACP route decides per provider
-        // (`one_shot_session_shape`).
-        let system_prompt = system_prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
-
-        if let Some(text) = self
-            .try_fm_completion(
-                &settings,
-                quick_action_type.as_deref(),
-                system_prompt,
-                &prompt,
-                timeout,
-            )
-            .await
-        {
-            return Ok(json!({ "text": text }));
-        }
 
         if run_provider != "auggie" {
             return self
@@ -1796,21 +1799,35 @@ rl.on('line', (line) => {
         fm: PathBuf,
         local_model: &str,
     ) -> (TempDb, Services) {
-        let (tmp, services) = services_with_bin(auggie).await;
+        services_with_fm_and_provider(auggie, fm, local_model, Some("auggie")).await
+    }
+
+    /// [`services_with_fm`] with `model.defaultProvider` left unset when
+    /// `default_provider` is `None`, so the provider gate resolves CLOSED
+    /// (a fresh registry: `services_with_bin` would seed auggie).
+    #[cfg(unix)]
+    async fn services_with_fm_and_provider(
+        auggie: PathBuf,
+        fm: PathBuf,
+        local_model: &str,
+        default_provider: Option<&str>,
+    ) -> (TempDb, Services) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store).with_auggie_bin(auggie);
         let registry = crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
             .expect("load registry");
-        registry
-            .apply(&[
-                (
-                    "model.defaultProvider".to_string(),
-                    serde_json::json!("auggie"),
-                ),
-                (
-                    "quickActions.localModel".to_string(),
-                    serde_json::json!(local_model),
-                ),
-            ])
-            .expect("apply fm settings");
+        let mut keys = vec![(
+            "quickActions.localModel".to_string(),
+            serde_json::json!(local_model),
+        )];
+        if let Some(provider) = default_provider {
+            keys.push((
+                "model.defaultProvider".to_string(),
+                serde_json::json!(provider),
+            ));
+        }
+        registry.apply(&keys).expect("apply fm settings");
         let backend = std::sync::Arc::new(crate::fm_backend::FmBackend::new(
             Some(fm),
             Duration::from_secs(3600),
@@ -1972,6 +1989,57 @@ rl.on('line', (line) => {
             fm_calls(&log).is_empty(),
             "commit/pr/review never probe or spawn fm"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_no_default_provider_still_answers_from_fm() {
+        // The fm attempt runs BEFORE the provider gate: with no decidable
+        // default provider an eligible call still returns `{ text }` from fm.
+        let (_auggie_dir, auggie) = fake_auggie("fm-no-provider", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, log) = fake_fm_available("no-provider", "printf 'fm says: '\ncat");
+        let (_tmp, services) = services_with_fm_and_provider(auggie, fm, "auto", None).await;
+        let v = services
+            .agent_complete_once_op("make a slug".into(), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(v, serde_json::json!({ "text": "fm says: make a slug" }));
+        assert_eq!(
+            fm_calls(&log).last().map(String::as_str),
+            Some("respond --no-stream --greedy")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_no_default_provider_and_fm_miss_is_unavailable() {
+        // Only when fm also misses does the closed gate answer
+        // `{ available: false }`; an ineligible type never tries fm.
+        let (_auggie_dir, auggie) =
+            fake_auggie("fm-no-provider-miss", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, log) = fake_fm_available("no-provider-miss", "cat > /dev/null\nexit 1");
+        let (_tmp, services) = services_with_fm_and_provider(auggie, fm, "auto", None).await;
+        let unavailable = serde_json::json!({
+            "available": false,
+            "reason": "completeOnce requires a decidable effective default provider"
+        });
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(v, unavailable, "fm exit ⇒ gate closed");
+        assert_eq!(
+            fm_calls(&log).last().map(String::as_str),
+            Some("respond --no-stream --greedy"),
+            "fm was attempted before the gate"
+        );
+
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, Some("commit".into()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(v, unavailable, "type: commit ⇒ gate closed without fm");
+        assert_eq!(fm_calls(&log).len(), 3, "commit spawned no fm");
     }
 
     #[test]
