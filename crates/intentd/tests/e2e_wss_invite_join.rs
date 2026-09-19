@@ -3,7 +3,9 @@
 //! over the unauthenticated `/invite` endpoint → a pin mismatch is refused →
 //! the pinned account joins and receives its own credential → that credential
 //! connects to `/ws`, `principal.me` shows the GitHub identity and
-//! `workspace.get` the collaborator role → the owner's `github.connect`
+//! `workspace.get` the collaborator role → the same guest previews a second
+//! workspace's link with `invite.inspect` and joins it with `invite.accept`
+//! on that credential (no device flow) → the owner's `github.connect`
 //! authorised as a different account is refused (`identity-locked`) while
 //! the guest depends on the primary identity → the owner removes the member →
 //! `workspace.get` is `NotFound` → `principal.revokeSelf` closes the
@@ -825,6 +827,129 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         "collaborator minting: {v}"
     );
 
+    // 6a. Returning guest: the owner shares a SECOND workspace. On `/invite`
+    //     the guest previews the link with `invite.inspect` (phase-1
+    //     validation + host identity, no device flow) and joins with
+    //     `invite.accept` on the credential minted in 5 — no GitHub call at
+    //     all: the mock's flow counter stays where step 5 left it. A bogus
+    //     credential is `credential-invalid`. The result is the phase-2
+    //     shape with a fresh credential for the same principal; both
+    //     credentials authenticate, and the owner's subscriber sees the
+    //     membership change on the second workspace.
+    let flows_before = mock.flows.load(Ordering::SeqCst);
+    let v = wss_rpc(
+        &mut owner,
+        16,
+        "workspace.create",
+        json!({ "title": "Second E2E" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "workspace.create #2: {v}");
+    let second_ws = v["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let v = wss_rpc(
+        &mut owner,
+        17,
+        "workspace.invite.create",
+        json!({ "workspaceId": second_ws, "pinLogin": "guest" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "invite.create #2: {v}");
+    let second_invite = v["result"]["invite"]["id"]
+        .as_str()
+        .expect("invite id")
+        .to_string();
+    let second_secret = v["result"]["secret"].as_str().expect("secret").to_string();
+
+    let mut returning = connect_invite(port, cfg.clone()).await;
+    let v = wss_rpc(
+        &mut returning,
+        60,
+        "invite.inspect",
+        json!({ "inviteId": second_invite, "secret": second_secret }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "invite.inspect: {v}");
+    let r = &v["result"];
+    assert_eq!(r["workspaceId"], json!(second_ws));
+    assert_eq!(r["workspaceTitle"], json!("Second E2E"));
+    assert!(
+        r["hostname"].as_str().is_some_and(|h| !h.is_empty()),
+        "hostname: {r}"
+    );
+    assert!(
+        r["prettyHostname"].as_str().is_some_and(|h| !h.is_empty()),
+        "prettyHostname: {r}"
+    );
+    assert!(r.get("flowId").is_none(), "no device flow: {r}");
+    assert!(r.get("userCode").is_none(), "no device flow: {r}");
+    let v = wss_rpc(
+        &mut returning,
+        61,
+        "invite.accept",
+        json!({ "inviteId": second_invite, "secret": second_secret, "credential": "not-a-credential" }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602), "{v}");
+    assert_eq!(
+        v["error"]["data"]["code"],
+        json!("credential-invalid"),
+        "{v}"
+    );
+    let v = wss_rpc(
+        &mut returning,
+        62,
+        "invite.accept",
+        json!({ "inviteId": second_invite, "secret": second_secret, "credential": guest_token }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "invite.accept: {v}");
+    let r = &v["result"];
+    assert_eq!(r["status"], json!("authorized"));
+    assert_eq!(r["principalId"], json!(guest_id));
+    assert_eq!(r["login"], json!("guest"));
+    assert_eq!(r["workspaceId"], json!(second_ws));
+    let guest_token_2 = r["token"].as_str().expect("credential").to_string();
+    assert_eq!(guest_token_2.len(), 64);
+    assert_ne!(guest_token_2, guest_token);
+    assert!(r.get("hostname").is_none(), "{r}");
+    assert_eq!(
+        mock.flows.load(Ordering::SeqCst),
+        flows_before,
+        "inspect / accept never started a device flow"
+    );
+    drop(returning);
+    let ev = await_workspace_updated(&mut sub, "accept", |c| {
+        c["addedPrincipalId"] == json!(guest_id) && c["memberCount"] == json!(2)
+    })
+    .await;
+    assert_eq!(ev["data"]["workspaceId"], json!(second_ws));
+    assert_eq!(ev["data"]["changes"]["members"], json!(true));
+
+    // The fresh credential connects; the earlier one still does too.
+    let mut guest2 = connect_ws(port, cfg.clone(), &guest_token_2).await;
+    let v = wss_rpc(&mut guest2, 70, "principal.me", json!({})).await;
+    assert_eq!(v["result"]["id"], json!(guest_id), "{v}");
+    let v = wss_rpc(
+        &mut guest2,
+        71,
+        "workspace.get",
+        json!({ "workspaceId": second_ws }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "workspace.get #2 as guest: {v}");
+    assert_eq!(v["result"]["workspace"]["myRole"], json!("collaborator"));
+    assert_eq!(v["result"]["workspace"]["memberCount"], json!(2));
+    drop(guest2);
+    let v = wss_rpc(&mut guest, 36, "workspace.list", json!({})).await;
+    assert_eq!(
+        v["result"]["workspaces"].as_array().map(Vec::len),
+        Some(2),
+        "the first credential still lists both workspaces: {v}"
+    );
+
     // 6b. Reconnect guard at the OAuth commit boundary: with the guest a
     //     member, the primary identity is load-bearing. The owner runs
     //     github.connect and a DIFFERENT account (the intruder) authorises →
@@ -884,15 +1009,21 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         "removed member reads: {v}"
     );
     let v = wss_rpc(&mut guest, 34, "workspace.list", json!({})).await;
-    assert_eq!(v["result"]["workspaces"], json!([]), "{v}");
+    assert_eq!(
+        v["result"]["workspaces"].as_array().map(Vec::len),
+        Some(1),
+        "only the second workspace remains: {v}"
+    );
+    assert_eq!(v["result"]["workspaces"][0]["id"], json!(second_ws), "{v}");
 
-    // 8. principal.revokeSelf: the credential is revoked, the connection is
-    //    closed by the daemon (policy close), and the token no longer
-    //    authenticates an upgrade.
+    // 8. principal.revokeSelf: both credentials (the device-flow one and the
+    //    one `invite.accept` minted) are revoked, the remaining membership
+    //    (the second workspace) is left, the connection is closed by the
+    //    daemon (policy close), and neither token authenticates an upgrade.
     let v = wss_rpc(&mut guest, 35, "principal.revokeSelf", json!({})).await;
     assert_eq!(
         v["result"],
-        json!({ "revoked": true, "credentials": 1, "workspaces": 0 }),
+        json!({ "revoked": true, "credentials": 2, "workspaces": 1 }),
         "{v}"
     );
     let closed = timeout(Duration::from_secs(15), async {
@@ -914,11 +1045,13 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         Some(CloseCode::Policy),
         "policy close after revokeSelf"
     );
-    let line = upgrade_status_line(port, cfg.clone(), &guest_token).await;
-    assert!(
-        line.starts_with("HTTP/1.1 401"),
-        "revoked credential upgrade: {line}"
-    );
+    for token in [&guest_token, &guest_token_2] {
+        let line = upgrade_status_line(port, cfg.clone(), token).await;
+        assert!(
+            line.starts_with("HTTP/1.1 401"),
+            "revoked credential upgrade: {line}"
+        );
+    }
 
     // The owner's session is untouched.
     let v = wss_rpc(&mut owner, 13, "principal.me", json!({})).await;
