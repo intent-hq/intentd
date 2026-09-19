@@ -13905,7 +13905,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     // … and agent.sendQueuedMessageNow re-delivers the entry with the stamp
     // captured at enqueue (the drainer is not the author). agent.retry needs
     // a manager-driven failure/redrive and is covered end to end by
-    // `guest_wake_stamp_survives_terminal_failure_requeue_over_wss`
+    // `wake_stamp_survives_terminal_failure_requeue_over_wss`
     // (crates/intentd/tests/e2e_wss_wake_or_create.rs).
     let drained = with_caller(wire(&alice), async {
         svc.agent_send_queued_message_now(ws.clone(), agent.clone(), queued_id.clone())

@@ -438,7 +438,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
     ),
     (
         "agent.retry",
-        "re-delivers the requeued entry with the stamp captured at enqueue / wake delivery — the retrier is never the author (`guest_wake_stamp_survives_terminal_failure_requeue_over_wss`)",
+        "re-delivers the requeued entry with the stamp captured at enqueue / wake delivery — the retrier is never the author (`wake_stamp_survives_terminal_failure_requeue_over_wss`)",
     ),
     (
         "agent.sendMessage",
@@ -1112,8 +1112,10 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// and `system.status`),
 /// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
-/// `git.agentCommit` (agent-only), agent deletion / proposals / one-shot
-/// completions, `agent.replaceMessages` (persists client-supplied user rows
+/// `git.agentCommit` (agent-only), agent creation / delegation (decided
+/// 2026-09-19: guests steer existing agents only — `agent.create`,
+/// `agent.delegate`, `agent.wakeOrCreate`), agent deletion / proposals /
+/// one-shot completions, `agent.replaceMessages` (persists client-supplied user rows
 /// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
 /// PR-monitor cancel/flush, daemon-wide metrics, and the `accept-changes.*` /
 /// `file-tracking.*` publishing flow (stages, commits, pushes and merges as
@@ -1126,6 +1128,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.prepare",
     "agent.cancelDelete",
     "agent.completeOnce",
+    "agent.create",
+    "agent.delegate",
     "agent.delete",
     "agent.diagnostics",
     "agent.enhancePrompt",
@@ -1133,6 +1137,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveProposal",
+    "agent.wakeOrCreate",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -1464,7 +1469,8 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "presence.snapshot",
         "presence.update",
         "note.presence.subscribe",
-        "agent.create",
+        "agent.rename",
+        "agent.update",
         "agent.stop",
         "agent.sendMessage",
         "agent.setModel",
@@ -1492,7 +1498,11 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "voice.transcribe",
         "workspace.create",
         "git.clone",
+        "agent.create",
+        "agent.delegate",
+        "agent.wakeOrCreate",
         "agent.delete",
+        "agent.cancelDelete",
         "agent.replaceMessages",
         "terminal.list",
         "script.list",
@@ -1708,6 +1718,11 @@ mod unbound_owner_only_methods {
                 "agent.completeOnce",
                 json!({ "prompt": "p", "timeoutMs": 1 }),
             ),
+            ("agent.create", json!({ "workspaceId": ws })),
+            (
+                "agent.delegate",
+                json!({ "workspaceId": ws, "taskNoteId": "t1" }),
+            ),
             ("agent.delete", json!({ "agentId": "a1" })),
             ("agent.diagnostics", json!({ "workspaceId": ws })),
             (
@@ -1726,6 +1741,10 @@ mod unbound_owner_only_methods {
             (
                 "agent.resolveProposal",
                 json!({ "workspaceId": ws, "agentId": "a1", "proposalId": "p1", "outcome": "reject" }),
+            ),
+            (
+                "agent.wakeOrCreate",
+                json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
             ),
             ("client.list", json!({})),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),

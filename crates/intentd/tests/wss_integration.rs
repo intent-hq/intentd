@@ -3608,10 +3608,27 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
 
     // Owner-only stays refused with -32003 for a collaborator member —
     // including `agent.replaceMessages`, which would persist client-supplied
-    // user rows (and their `fromPrincipalId`) verbatim.
+    // user rows (and their `fromPrincipalId`) verbatim, and agent creation /
+    // delegation (decided 2026-09-19: guests steer existing agents only).
     for (method, params) in [
         (
+            "agent.create",
+            json!({ "workspaceId": ws_id, "name": "Guest Spawn" }),
+        ),
+        (
+            "agent.delegate",
+            json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+        ),
+        (
+            "agent.wakeOrCreate",
+            json!({ "workspaceId": ws_id, "taskNoteId": note_id, "contextMessage": "guest kickoff" }),
+        ),
+        (
             "agent.delete",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        ),
+        (
+            "agent.cancelDelete",
             json!({ "workspaceId": ws_id, "agentId": agent_id }),
         ),
         (
@@ -3638,6 +3655,32 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         assert_eq!(v["error"]["code"], -32003, "collaborator {method}: {v}");
         assert_eq!(v["error"]["message"], "Forbidden", "{v}");
         assert!(v.get("result").is_none(), "{v}");
+    }
+
+    // Steering an existing agent stays a member capability: none of these
+    // is refused at the transport gate or narrowed to NotFound.
+    for (method, params) in [
+        (
+            "agent.rename",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "name": "Steered by guest" }),
+        ),
+        (
+            "agent.setModel",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "modelId": "default" }),
+        ),
+        (
+            "agent.stop",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        ),
+    ] {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_ne!(v["error"]["code"], -32003, "collaborator {method}: {v}");
+        assert_ne!(
+            v["error"]["data"]["code"], "not-found",
+            "collaborator {method}: {v}"
+        );
     }
 
     // `agent.update`: display metadata is a member edit; anything else
