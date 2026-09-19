@@ -286,6 +286,30 @@ pub struct PrMonitorListEntry {
     pub snapshot_mergeable: Option<bool>,
 }
 
+/// The [`PrMonitorListEntry`] projection query over the non-cancelled rows,
+/// with `extra_filter` appended to the inner `WHERE` (an archived-workspace
+/// exclusion or a `workspace_id = ?` scope). The blob columns are never
+/// selected: the few `last_snapshot` scalars the merge consumes are
+/// `json_extract`ed in SQL, guarded by `json_valid` so a malformed blob
+/// degrades to NULL scalars instead of failing the query.
+fn non_cancelled_list_entry_sql(extra_filter: &str) -> String {
+    format!(
+        "SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
+         updated_at, \
+         json_extract(snapshot, '$.url') AS snapshot_url, \
+         json_extract(snapshot, '$.title') AS snapshot_title, \
+         json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
+         json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
+         json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
+         json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable \
+         FROM (SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
+         updated_at, \
+         CASE WHEN json_valid(last_snapshot) THEN last_snapshot END AS snapshot \
+         FROM pr_monitor WHERE state != 'cancelled'{extra_filter}) \
+         ORDER BY created_at"
+    )
+}
+
 fn list_entry_from_row(r: &SqliteRow) -> Result<PrMonitorListEntry> {
     let err =
         |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor list row: {e}"));
@@ -689,26 +713,38 @@ impl Store {
         } else {
             " AND workspace_id IN (SELECT id FROM workspace WHERE archived = 0)"
         };
-        let sql = format!(
-            "SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
-             updated_at, \
-             json_extract(snapshot, '$.url') AS snapshot_url, \
-             json_extract(snapshot, '$.title') AS snapshot_title, \
-             json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
-             json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
-             json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
-             json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable \
-             FROM (SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
-             updated_at, \
-             CASE WHEN json_valid(last_snapshot) THEN last_snapshot END AS snapshot \
-             FROM pr_monitor WHERE state != 'cancelled'{archived_filter}) \
-             ORDER BY created_at"
-        );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(&non_cancelled_list_entry_sql(archived_filter))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| {
                 intent_core::Error::Internal(format!("load pr monitor list entries failed: {e}"))
+            })?;
+        rows.iter().map(list_entry_from_row).collect()
+    }
+
+    /// One workspace's non-cancelled (active or completed) monitors, oldest
+    /// first, as the same narrow [`PrMonitorListEntry`] projection as
+    /// [`Store::load_non_cancelled_pr_monitor_list_entries`] — the scoped
+    /// single-row counterpart backing the `workspace.get` PR merge, so the
+    /// detail read serves the same merged pool the list paths do
+    /// (`idx_pr_monitor_workspace` SEARCH; blob columns never selected).
+    /// No archived filter: `workspace.get` serves archived workspaces too.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn load_non_cancelled_pr_monitor_list_entries_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<PrMonitorListEntry>> {
+        let rows = sqlx::query(&non_cancelled_list_entry_sql(" AND workspace_id = ?"))
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!(
+                    "load pr monitor list entries for workspace failed: {e}"
+                ))
             })?;
         rows.iter().map(list_entry_from_row).collect()
     }
@@ -1188,7 +1224,9 @@ mod tests {
     /// them, so the shape is enforced at compile time. A missing or malformed
     /// `last_snapshot` degrades to NULL scalars instead of failing the query,
     /// cancelled rows are excluded, and archived-workspace rows are filtered
-    /// unless `include_archived`.
+    /// unless `include_archived`. The per-workspace read behind the
+    /// `workspace.get` merge serves the same projection scoped to one
+    /// workspace, archived or not.
     #[tokio::test]
     async fn list_entries_project_snapshot_scalars_without_blobs() {
         let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
@@ -1298,6 +1336,35 @@ mod tests {
             numbers,
             vec![1, 2, 3, 5],
             "include_archived adds the archived workspace's row; cancelled stays excluded"
+        );
+
+        // Per-workspace scope: the same projection, only this workspace's
+        // non-cancelled rows, with the archived workspace served regardless.
+        let scoped = store
+            .load_non_cancelled_pr_monitor_list_entries_for_workspace(&ws_id)
+            .await
+            .expect("scoped entries");
+        assert_eq!(
+            scoped.iter().map(|e| e.pr_number).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "scoped read: this workspace's rows, cancelled excluded, oldest first"
+        );
+        assert_eq!(
+            scoped[0].snapshot_url.as_deref(),
+            Some("https://github.com/o/r/pull/1")
+        );
+        assert_eq!(scoped[0].snapshot_state.as_deref(), Some("merged"));
+        let scoped_archived = store
+            .load_non_cancelled_pr_monitor_list_entries_for_workspace(&archived_ws)
+            .await
+            .expect("scoped archived entries");
+        assert_eq!(
+            scoped_archived
+                .iter()
+                .map(|e| e.pr_number)
+                .collect::<Vec<_>>(),
+            vec![5],
+            "scoped read has no archived filter"
         );
     }
 

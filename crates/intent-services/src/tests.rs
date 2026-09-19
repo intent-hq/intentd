@@ -1010,10 +1010,18 @@ async fn workspace_list_row_keys_match_allowlist_golden() {
 /// five most recently updated entries of an eight-entry pool plus
 /// `pullRequestsTotal: 8`, while `workspace.get` keeps the full pool in
 /// stored order with `pullRequestsTotal` absent — the cap is applied only by
-/// the final list-row slimming pass, never on the detail read.
+/// the final list-row slimming pass, never on the detail read. The same
+/// holds whatever the pool's source: a pool held entirely on a registered
+/// git root, or entirely on PR monitors, is merged onto `workspace.get`
+/// exactly as onto the list rows (batch-1b verification defect: the
+/// documented `workspace.get` recovery read served `0` entries for an
+/// eight-PR git root the list capped to five).
 #[tokio::test]
 async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
-    use intent_core::{PullRequestInfo, PullRequestStatus, WORKSPACE_LIST_PR_CAP};
+    use intent_core::{
+        PrMonitor, PrMonitorId, PrMonitorState, PullRequestInfo, PullRequestStatus,
+        WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource, WORKSPACE_LIST_PR_CAP,
+    };
 
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -1043,33 +1051,169 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
             .collect()
     };
 
-    let ws = WorkspaceId::new();
-    let mut row = workspace(&ws);
+    // own_ws: the eight-entry pool is the workspace's own.
+    let own_ws = WorkspaceId::new();
+    let mut row = workspace(&own_ws);
     row.pull_requests = Some((0..8).map(pr).collect());
-    store.insert_workspace(&row).await.expect("ws");
+    store.insert_workspace(&row).await.expect("own ws");
+
+    // root_ws: no own PRs; the eight-entry pool lives on one git root.
+    let root_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&root_ws))
+        .await
+        .expect("root ws");
+    let ts = now_iso();
+    store
+        .upsert_workspace_git_root(&WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: root_ws.clone(),
+            path: "/tmp/root-pool".into(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("intent-hq".into()),
+            repo_name: Some("intentd".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some((0..8).map(pr).collect()),
+            created_at: ts.clone(),
+            updated_at: ts,
+        })
+        .await
+        .expect("git root");
+
+    // monitor_ws: no own PRs; eight completed, snapshotless monitors (one
+    // per PR number — the synthesized URL is the merge identity).
+    let monitor_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&monitor_ws))
+        .await
+        .expect("monitor ws");
+    // Monitor rows FK onto agent_session; one session covers every monitor.
+    let owner = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from("agent-pool-mon"),
+        workspace_id: monitor_ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Monitor Owner".into(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+        retired_at: None,
+        notifications_muted: false,
+    };
+    store.insert_agent_session(&owner).await.expect("owner");
+    for n in 0..8_i64 {
+        store
+            .insert_pr_monitor(&PrMonitor {
+                monitor_id: PrMonitorId::new(),
+                workspace_id: monitor_ws.clone(),
+                agent_id: owner.id.clone(),
+                repo_owner: "intent-hq".into(),
+                repo_name: "intentd".into(),
+                pr_number: 500 + n,
+                state: PrMonitorState::Completed,
+                last_snapshot: None,
+                baseline_snapshot: None,
+                pending_changes: vec![],
+                pending_since: None,
+                last_change_at: None,
+                last_polled_at: None,
+                last_error: None,
+                created_at: format!("2026-01-02T00:{n:02}:00Z"),
+                updated_at: format!("2026-01-02T00:{n:02}:01Z"),
+            })
+            .await
+            .expect("monitor");
+    }
 
     let root = tempfile::tempdir().expect("temp workspaces root");
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
     let list = svc.list_workspaces(true).await.expect("list");
-    let listed = list.iter().find(|w| w.id == ws).expect("listed");
-    assert_eq!(numbers(listed), vec![507, 506, 505, 504, 503]);
-    assert_eq!(
-        listed.pull_requests.as_ref().unwrap().len(),
-        WORKSPACE_LIST_PR_CAP
-    );
-    assert_eq!(listed.pull_requests_total, Some(8));
-
     let lite = svc.list_workspaces_lite(true).await.expect("lite list");
-    let lite_row = lite.iter().find(|w| w.id == ws).expect("lite row");
-    assert_eq!(numbers(lite_row), vec![507, 506, 505, 504, 503]);
-    assert_eq!(lite_row.pull_requests_total, Some(8));
+    // Entry `n` was updated `n` minutes into the hour on every source (a
+    // snapshotless monitor's entry carries the monitor row's `updated_at`),
+    // so the cap keeps the five newest on each; `get` serves the source's
+    // own order (stored / git-root / monitor creation order).
+    for (label, ws) in [
+        ("own", &own_ws),
+        ("git-root", &root_ws),
+        ("monitor", &monitor_ws),
+    ] {
+        let listed = list.iter().find(|w| &w.id == ws).expect("listed");
+        assert_eq!(
+            numbers(listed),
+            vec![507, 506, 505, 504, 503],
+            "{label}: workspace.list caps the pool"
+        );
+        assert_eq!(
+            listed.pull_requests.as_ref().unwrap().len(),
+            WORKSPACE_LIST_PR_CAP
+        );
+        assert_eq!(listed.pull_requests_total, Some(8), "{label}: list total");
+        let lite_row = lite.iter().find(|w| &w.id == ws).expect("lite row");
+        assert_eq!(
+            numbers(lite_row),
+            vec![507, 506, 505, 504, 503],
+            "{label}: lite list caps the pool"
+        );
+        assert_eq!(lite_row.pull_requests_total, Some(8), "{label}: lite total");
 
-    let got = svc.get_workspace(ws).await.expect("get");
-    assert_eq!(numbers(&got), (500..508).collect::<Vec<_>>());
-    assert_eq!(got.pull_requests_total, None);
-    let detail = serde_json::to_value(&got).unwrap();
-    assert!(detail.get("pullRequestsTotal").is_none());
+        let got = svc.get_workspace(ws.clone()).await.expect("get");
+        assert_eq!(
+            numbers(&got),
+            (500..508).collect::<Vec<_>>(),
+            "{label}: workspace.get serves the full merged pool"
+        );
+        assert_eq!(got.pull_requests_total, None, "{label}");
+        let detail = serde_json::to_value(&got).unwrap();
+        assert!(detail.get("pullRequestsTotal").is_none(), "{label}");
+        // Every capped list entry is recoverable from the detail read.
+        let served: Vec<u64> = numbers(&got);
+        for n in numbers(listed) {
+            assert!(
+                served.contains(&n),
+                "{label}: list entry {n} missing on get"
+            );
+        }
+    }
 }
 
 /// Frame-size regression guard for monorepo#3041: ~130 realistic rows —
@@ -1696,12 +1840,15 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
 }
 
 /// Both list emit paths (`workspace.list` and the lite path behind
-/// `workspace.subscribe` seq-0) merge externally known PRs into each row's
-/// `pullRequests`: git-root PRs (`workspace_git_root.pull_requests`) and
-/// monitor-derived PRs (active + completed; cancelled excluded), deduped by
-/// URL with workspace > git-root > monitor priority. Purely an emit-path
-/// merge — nothing is persisted, and a row with no external sources keeps
-/// its stored value untouched.
+/// `workspace.subscribe` seq-0) AND the `workspace.get` detail read merge
+/// externally known PRs into the row's `pullRequests`: git-root PRs
+/// (`workspace_git_root.pull_requests`) and monitor-derived PRs (active +
+/// completed; cancelled excluded), deduped by URL with workspace > git-root
+/// > monitor priority — the same pool on every surface, so a capped list
+/// row's `pullRequestsTotal` is always recoverable from `get` (which alone
+/// keeps the per-PR detail fields the list slimming strips). Purely an
+/// emit-path merge — nothing is persisted, and a row with no external
+/// sources keeps its stored value untouched.
 #[tokio::test]
 async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     use intent_core::{
@@ -1927,6 +2074,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
     let assert_merged = |list: &[Workspace], path: &str| {
+        let detail = path == "workspace.get";
         let r1 = list.iter().find(|w| w.id == ws1).expect("ws1 row");
         let prs = r1.pull_requests.as_ref().expect("ws1 pullRequests");
         let urls: Vec<_> = prs.iter().map(|p| p.url.as_str()).collect();
@@ -1949,12 +2097,14 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
             intent_core::PullRequestStatus::Open,
             "{path}"
         );
-        // The merged entry carried the snapshot's headSha, but the final
+        // The merged entry carried the snapshot's headSha: the final
         // list-row slimming (`Workspace::slim_for_list`) strips the per-PR
-        // detail fields from externally merged entries too.
+        // detail fields from externally merged entries too, while the
+        // detail read keeps them.
         assert_eq!(
-            prs[1].head_sha, None,
-            "{path}: headSha slimmed off list rows"
+            prs[1].head_sha.as_deref(),
+            if detail { Some("abc123") } else { None },
+            "{path}: headSha slimmed off list rows only"
         );
         assert_eq!(prs[1].is_draft, Some(false), "{path}");
         // Snapshotless completed monitor: URL/title synthesized from the
@@ -1998,13 +2148,26 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     assert_merged(&full, "workspace.list");
     let lite = svc.list_workspaces_lite(false).await.expect("lite list");
     assert_merged(&lite, "lite list");
+    // The detail read merges the same pool per workspace (scoped reads).
+    let mut gets = Vec::new();
+    for ws in [&ws1, &ws2, &ws3, &ws4] {
+        gets.push(svc.get_workspace(ws.clone()).await.expect("get"));
+    }
+    assert_merged(&gets, "workspace.get");
 
-    // Archived-inclusive list: the archived row's git-root PR merges in.
+    // Archived-inclusive list: the archived row's git-root PR merges in —
+    // and `get`, which serves archived workspaces regardless, merges it too.
     let all = svc.list_workspaces_lite(true).await.expect("archived list");
     let r5 = all.iter().find(|w| w.id == ws5).expect("ws5 row");
     let prs5 = r5.pull_requests.as_ref().expect("ws5 pullRequests");
     assert_eq!(prs5.len(), 1);
     assert_eq!(prs5[0].title, "Archived root PR");
+    let got5 = svc.get_workspace(ws5.clone()).await.expect("get ws5");
+    assert_eq!(
+        got5.pull_requests.as_ref().map(|p| p[0].title.as_str()),
+        Some("Archived root PR"),
+        "workspace.get merges the archived workspace's git-root PR"
+    );
 
     // Archived-excluding bulk reads filter archived-workspace rows in SQL.
     let roots = store
@@ -2451,12 +2614,8 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
                 "{ctx}"
             );
             assert!(ws.active_pull_request.is_none(), "{ctx}");
-            // Root-only URLs are appended by the list paths' external merge
-            // only; `workspace.get` has no workspace-owned copy to serve.
-            if surface == "workspace.get" {
-                assert!(ws.pull_requests.is_none(), "{ctx}");
-                continue;
-            }
+            // Root-only URLs are appended by the external merge on every
+            // surface — the list paths and `workspace.get` alike.
             let prs = ws.pull_requests.as_ref().expect("pullRequests");
             assert_eq!(prs.len(), 1, "{ctx}: root copies dedupe into one entry");
             assert_eq!(lifecycle(&prs[0]), tied_canonical, "{ctx}: pullRequests");

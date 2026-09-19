@@ -3006,33 +3006,43 @@ impl Services {
         for ws in list.iter_mut() {
             let roots = git_root_prs.remove(&ws.id).unwrap_or_default();
             let monitored = monitor_prs.remove(&ws.id).unwrap_or_default();
-            if roots.is_empty() && monitored.is_empty() {
-                continue;
-            }
-            let merged = ws.pull_requests.get_or_insert_with(Vec::new);
-            for mut info in roots {
-                // The derivation's same-URL step: the linked and pooled
-                // copies of this URL move to the canonical snapshot; a URL
-                // the pool does not carry is appended, itself canonicalized
-                // (it may duplicate the linked `activePullRequest`, and a
-                // URL's copies always agree).
-                let copies = workspace_status::canonicalize_pr_url_copies(
-                    ws.active_pull_request.as_mut(),
-                    merged,
-                    &info,
-                );
-                if !copies.pooled {
-                    workspace_status::canonicalize_pr_lifecycle(&mut info, &copies.canonical);
-                    merged.push(info);
-                }
-            }
-            for info in monitored {
-                match merged.iter_mut().find(|p| p.url == info.url) {
-                    None => merged.push(info),
-                    Some(present) => workspace_status::upgrade_pr_lifecycle(present, &info),
-                }
-            }
+            merge_workspace_pull_requests(ws, roots, monitored);
         }
+    }
+
+    /// The single-row counterpart of [`Self::merge_external_pull_requests`]
+    /// for `workspace.get`: fold the workspace's git-root PRs and
+    /// monitor-derived PRs into its `pullRequests` with the same source
+    /// priority, dedup and lifecycle rules, so the detail read serves the
+    /// full merged pool the list rows were capped from
+    /// (`WORKSPACE_LIST_PR_CAP` + `pullRequestsTotal`) — uncapped and
+    /// unslimmed. Two scoped store reads (the git-root read the
+    /// displayStatus derivation also issues on this path, and the
+    /// per-workspace [`intent_store::PrMonitorListEntry`] projection); no
+    /// forge calls, nothing persisted. Runs after enrichment for the same
+    /// reason the list merge does: the derivation must not see the merged
+    /// entries a second time. A read failure degrades to the unmerged row.
+    pub(crate) async fn merge_workspace_external_pull_requests(&self, ws: &mut Workspace) {
+        let roots = self.workspace_git_root_prs(&ws.id).await;
+        let monitored = match self
+            .store
+            .load_non_cancelled_pr_monitor_list_entries_for_workspace(&ws.id)
+            .await
+        {
+            Ok(monitors) => monitors
+                .iter()
+                .map(pr_monitor::pr_monitor_pr_info)
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %ws.id.0,
+                    error = %e,
+                    "workspace.get: pr monitor read failed; skipping"
+                );
+                Vec::new()
+            }
+        };
+        merge_workspace_pull_requests(ws, roots, monitored);
     }
 
     /// Start the one-time repository owner/name backfill after daemon listeners
@@ -9759,6 +9769,46 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
         }
     }
     best.map(|(_, s)| s)
+}
+
+/// Fold one workspace's externally known PRs into its `pullRequests` — the
+/// per-row body shared by the list emit merge
+/// ([`Services::merge_external_pull_requests`]) and the `workspace.get`
+/// merge ([`Services::merge_workspace_external_pull_requests`]), so both
+/// surfaces apply the same source priority (workspace > git-root >
+/// monitor), URL dedup and lifecycle rules. A row with nothing to merge is
+/// left untouched (a `None` stays omitted on the wire; empty inputs never
+/// materialize `[]`).
+fn merge_workspace_pull_requests(
+    ws: &mut Workspace,
+    roots: Vec<PullRequestInfo>,
+    monitored: Vec<PullRequestInfo>,
+) {
+    if roots.is_empty() && monitored.is_empty() {
+        return;
+    }
+    let merged = ws.pull_requests.get_or_insert_with(Vec::new);
+    for mut info in roots {
+        // The derivation's same-URL step: the linked and pooled copies of
+        // this URL move to the canonical snapshot; a URL the pool does not
+        // carry is appended, itself canonicalized (it may duplicate the
+        // linked `activePullRequest`, and a URL's copies always agree).
+        let copies = workspace_status::canonicalize_pr_url_copies(
+            ws.active_pull_request.as_mut(),
+            merged,
+            &info,
+        );
+        if !copies.pooled {
+            workspace_status::canonicalize_pr_lifecycle(&mut info, &copies.canonical);
+            merged.push(info);
+        }
+    }
+    for info in monitored {
+        match merged.iter_mut().find(|p| p.url == info.url) {
+            None => merged.push(info),
+            Some(present) => workspace_status::upgrade_pr_lifecycle(present, &info),
+        }
+    }
 }
 
 /// Trailing-edge debounce window for `workspace:updated { lastActivity }` event
@@ -17668,6 +17718,12 @@ impl WorkspaceApi for Services {
             // pending-deletion deadline; O(1) map read, never persisted.
             ws.pending_delete_at = this.pending_workspace_deletes.deadline(id.as_str());
             this.enrich_workspace_aggregates(&mut ws).await;
+            // Same external PR merge as the list paths, after enrichment
+            // for the same reason, so the detail read serves the full
+            // merged pool a capped list row (`pullRequestsTotal`) points
+            // at — uncapped and unslimmed: `workspace.get` keeps every
+            // field for detail reads.
+            this.merge_workspace_external_pull_requests(&mut ws).await;
             Ok(ws)
         })
     }
