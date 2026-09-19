@@ -1220,7 +1220,10 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     .await;
     assert_eq!(v["error"]["code"], json!(-32602), "{v}");
     assert_eq!(v["error"]["data"]["code"], json!("owner-self-join"), "{v}");
-    assert!(v["result"].is_null(), "no credential for the owner: {v}");
+    assert!(
+        v.get("result").is_none(),
+        "an error envelope carries no `result` member (not even null): {v}"
+    );
     let r = challenge(&mut prover, 88, &third_invite, &third_secret).await;
     let nonce_2 = r["nonce"].as_str().expect("nonce").to_string();
     let after = chrono::Utc::now().to_rfc3339();
