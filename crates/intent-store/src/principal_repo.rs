@@ -69,6 +69,10 @@ pub enum InviteJoinOutcome {
     /// The workspace's collaborators already reach the guest cap; nothing
     /// was written and the invite stays open.
     WorkspaceFull,
+    /// `rotate_from_hash` was not an active credential of the joining
+    /// principal at the moment of the join (unknown, revoked, or another
+    /// principal's); nothing was written and the invite stays open.
+    CredentialInvalid,
 }
 
 impl Store {
@@ -895,10 +899,21 @@ impl Store {
     /// invite was no longer open at redemption; or
     /// [`InviteJoinOutcome::WorkspaceFull`] when the workspace already has
     /// `max_guests` collaborators and the joining account is not one of them
-    /// (a returning collaborator re-joining takes no new seat). Both refusals
-    /// are checked first, inside the transaction, so they write nothing at
-    /// all — and, under `BEGIN IMMEDIATE`, two concurrent joins cannot both
-    /// pass the cap check and overshoot it.
+    /// (a returning collaborator re-joining takes no new seat). Every refusal
+    /// (including [`InviteJoinOutcome::CredentialInvalid`] below) is decided
+    /// first, inside the transaction, so it writes nothing at all — and,
+    /// under `BEGIN IMMEDIATE`, two concurrent joins cannot both pass the cap
+    /// check and overshoot it.
+    ///
+    /// `rotate_from_hash` is the credential a returning guest presented as
+    /// its proof of identity (`invite.accept`): it is validated and consumed
+    /// inside this transaction — the revoke must flip exactly one
+    /// still-active row of the joining principal, otherwise the join is
+    /// refused as [`InviteJoinOutcome::CredentialInvalid`] before anything
+    /// is written. Under `BEGIN IMMEDIATE` that makes the presented
+    /// credential single-use across concurrent joins: of two accepts
+    /// presenting the same credential exactly one mints, and a revoke that
+    /// lands between the caller's lookup and the join refuses the mint.
     ///
     /// # Errors
     ///
@@ -911,6 +926,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         identity: &Principal,
         credential_hash: &str,
+        rotate_from_hash: Option<&str>,
         max_guests: u32,
     ) -> Result<InviteJoinOutcome> {
         let github_user_id = identity
@@ -979,6 +995,30 @@ impl Store {
                 .map_err(|e| Error::Internal(format!("invite join guest count failed: {e}")))?;
                 if u64::try_from(collaborators).unwrap_or(u64::MAX) >= u64::from(max_guests) {
                     return Ok(InviteJoinOutcome::WorkspaceFull);
+                }
+            }
+            // Consume the presented credential before any write: a miss
+            // (unknown, revoked, foreign, or no principal for the account)
+            // refuses with nothing written; a hit is the single authoritative
+            // check that the credential was still active at join time.
+            if let Some(previous) = rotate_from_hash {
+                let Some(holder) = &existing else {
+                    return Ok(InviteJoinOutcome::CredentialInvalid);
+                };
+                let rotated = sqlx::query(
+                    "UPDATE principal_credential SET revoked_at = ? \
+                     WHERE token_hash = ? AND principal_id = ? AND revoked_at IS NULL",
+                )
+                .bind(&now)
+                .bind(previous)
+                .bind(&holder.id.0)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("invite join rotate credential failed: {e}"))
+                })?;
+                if rotated.rows_affected() != 1 {
+                    return Ok(InviteJoinOutcome::CredentialInvalid);
                 }
             }
             let mut principal = existing.unwrap_or_else(|| identity.clone());

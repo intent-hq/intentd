@@ -528,9 +528,17 @@
 //! no device flow) and `invite.accept` (`{ inviteId, secret, credential }`
 //! → the phase-2 `authorized` shape, joining with a per-principal
 //! credential this host already minted; an unknown / revoked credential is
-//! `error.data.code` `credential-invalid`). The catalog contains 324 router
-//! methods, 55 fast-path methods, and two aliases: 381 client-callable
-//! names.
+//! `error.data.code` `credential-invalid`). Also within 10.3, the gist
+//! identity proof's `/invite` methods (additive): `invite.challenge`
+//! (`{ inviteId, secret }` → the `invite.inspect` result plus a single-use
+//! `nonce` and its `nonceExpiresAt`, 10 minutes out) and `invite.prove`
+//! (`{ inviteId, secret, nonce, gistId, login }` → the phase-2 `authorized`
+//! shape once the host has read a gist owned by `login` whose
+//! `intent-join-proof.txt` starts with the nonce and postdates it; the
+//! nonce is spent by the first attempt; `error.data.code` `proof-invalid`
+//! / `proof-expired` / `github-unreachable`). The catalog contains 326
+//! router methods, 57 fast-path methods, and two aliases: 385
+//! client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release

@@ -62,6 +62,29 @@ impl GitHubSourceControl {
         Ok(Self { client })
     }
 
+    /// Build a client with **no** credential (same base URI and timeouts as
+    /// [`Self::new`]): the host's fallback for reading a guest's public or
+    /// secret proof gist when it holds no GitHub token of its own. Every
+    /// authenticated read on it fails with `Auth`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the octocrab client cannot be built (e.g. an
+    /// invalid `api_base_url`).
+    pub fn anonymous(api_base_url: Option<&str>) -> Result<Self> {
+        let mut builder = octocrab::Octocrab::builder()
+            .set_connect_timeout(Some(CONNECT_TIMEOUT))
+            .set_read_timeout(Some(READ_WRITE_TIMEOUT))
+            .set_write_timeout(Some(READ_WRITE_TIMEOUT));
+        if let Some(base) = api_base_url {
+            builder = builder
+                .base_uri(base)
+                .map_err(|e| Error::Config(format!("invalid github apiBaseUrl {base:?}: {e}")))?;
+        }
+        let client = builder.build()?;
+        Ok(Self { client })
+    }
+
     /// The underlying octocrab client (token + base URI + timeouts), for
     /// crate-internal callers outside the [`SourceControl`] surface.
     pub(crate) fn client(&self) -> &octocrab::Octocrab {
@@ -1452,6 +1475,18 @@ impl SourceControl for GitHubSourceControl {
             .get(format!("/users/{login}"), None::<&()>)
             .await?;
         map_user_identity(v)
+    }
+
+    async fn get_proof_gist(&self, gist_id: &str) -> Result<crate::identity_proof::ProofGistView> {
+        let gist_id = gist_id.trim();
+        if gist_id.is_empty() || !gist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::NotFound(format!("gist {gist_id:?}")));
+        }
+        let v: Value = self
+            .client
+            .get(format!("/gists/{gist_id}"), None::<&()>)
+            .await?;
+        crate::identity_proof::proof_gist_view(&v)
     }
 
     async fn search_users(&self, query: &str, limit: u8) -> Result<Vec<UserIdentity>> {
