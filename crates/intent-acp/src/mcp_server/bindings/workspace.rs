@@ -10,12 +10,14 @@
 use std::sync::Arc;
 
 use intent_core::{
-    AgentId, AgentStatus, Error, WorkspaceApi, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
-    WORKSPACE_STATUS_MESSAGE_MAX_LENGTH,
+    AgentId, AgentStatus, ConversationProjection, Error, WorkspaceApi, WorkspaceCreate,
+    WorkspaceId, WorkspaceStatus, WorkspaceUpdate, PROPOSAL_OUTCOME_APPLIED,
+    PROPOSAL_OUTCOME_DISMISSED, WORKSPACE_STATUS_MESSAGE_MAX_LENGTH,
 };
 use serde_json::{json, Value};
 
-use super::{map_err, req_str};
+use super::app::proposal::PROPOSAL_RESOURCE_MIME_TYPE;
+use super::{map_err, req_str, strip_agent_hidden_fields};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -32,6 +34,8 @@ pub(crate) const PRELUDE: &str = r"
         unarchive: () => host({ method: 'workspace.unarchive' }),
         proposeSibling: (params) =>
             host({ method: 'workspace.proposeSibling', args: params || {} }),
+        applyProposal: (proposalId, options) =>
+            host({ method: 'workspace.applyProposal', args: { proposalId, options } }),
         context: () => host({ method: 'workspace.context' }),
         timeline: (limit, type) =>
             host({ method: 'workspace.timeline', args: { limit, type } }),
@@ -43,10 +47,13 @@ pub(crate) const PRELUDE: &str = r"
 ";
 
 const PROPOSE_SIBLING_PRELUDE: &str = "        proposeSibling: (params) =>\n            host({ method: 'workspace.proposeSibling', args: params || {} }),\n";
+const APPLY_PROPOSAL_PRELUDE: &str = "        applyProposal: (proposalId, options) =>\n            host({ method: 'workspace.applyProposal', args: { proposalId, options } }),\n";
 
 pub(crate) fn prelude_for(is_sub_agent: bool) -> String {
     if is_sub_agent {
-        PRELUDE.replacen(PROPOSE_SIBLING_PRELUDE, "", 1)
+        PRELUDE
+            .replacen(PROPOSE_SIBLING_PRELUDE, "", 1)
+            .replacen(APPLY_PROPOSAL_PRELUDE, "", 1)
     } else {
         PRELUDE.to_string()
     }
@@ -69,6 +76,7 @@ pub(crate) async fn dispatch(
         "archive" => archive(api, ws, caller_agent_id).await,
         "unarchive" => unarchive(api, ws).await,
         "proposeSibling" => propose_sibling(api, ws, args).await,
+        "applyProposal" => apply_proposal(api, ws, caller_agent_id, args).await,
         "context" => {
             Err("ws.workspace.context is not yet available in this daemon port".to_string())
         }
@@ -256,7 +264,346 @@ async fn propose_sibling(
         },
         "preview": preview,
     });
-    super::app::workspaces::proposal_result(&proposal)
+    let mut result = super::app::workspaces::proposal_result(&proposal)?;
+    // Surface the stable handle applyProposal accepts across resolution
+    // (additive): the idempotencyKey only addresses the proposal while pending.
+    if let Some(proposal_id) = proposal_identity(&proposal).map(str::to_string) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("proposalId".to_string(), json!(proposal_id));
+        }
+        if let Some(text) = result
+            .get_mut("__mcpContentItems")
+            .and_then(Value::as_array_mut)
+            .and_then(|items| items.first_mut())
+            .and_then(|item| item.get_mut("text"))
+        {
+            if let Some(mut body) = text
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("proposalId".to_string(), json!(proposal_id));
+                }
+                *text =
+                    json!(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()));
+            }
+        }
+    }
+    Ok(result)
+}
+
+const APPLY_PROPOSAL_ALLOWED_KEYS: &[&str] = &["userRequested", "title", "initialPrompt"];
+
+const APPLY_PROPOSAL_USER_REQUESTED_REQUIRED: &str = "applyProposal requires { userRequested: true } — only call it when the user explicitly asked to apply this proposal in chat";
+
+/// Parse one proposal-resource content block into its embedded proposal
+/// JSON; `None` for any other block (wrong type / MIME / unparseable text).
+fn proposal_in_block(block: &Value) -> Option<Value> {
+    if block.get("type").and_then(Value::as_str) != Some("resource") {
+        return None;
+    }
+    let resource = block.get("resource")?;
+    if resource.get("mimeType").and_then(Value::as_str) != Some(PROPOSAL_RESOURCE_MIME_TYPE) {
+        return None;
+    }
+    serde_json::from_str(resource.get("text")?.as_str()?).ok()
+}
+
+/// The proposal identity the pending-tracking records
+/// (`applyToolCallId ?? preview.title`, the same rule as
+/// `intent_services::tool_block::proposal_block_id`).
+fn proposal_identity(proposal: &Value) -> Option<&str> {
+    proposal
+        .get("applyToolCallId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            proposal
+                .get("preview")
+                .and_then(|p| p.get("title"))
+                .and_then(Value::as_str)
+        })
+        .filter(|id| !id.is_empty())
+}
+
+fn proposal_idempotency_key(proposal: &Value) -> Option<&str> {
+    proposal
+        .get("payload")
+        .and_then(|p| p.get("params"))
+        .and_then(|p| p.get("idempotencyKey"))
+        .and_then(Value::as_str)
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// Load the proposal blocks of ONE carrying message: a single-message seek
+/// page (`limit: 1`, `aroundMessageId`) — the same bounded pattern the
+/// service's own resolve path uses, never a transcript hydration.
+async fn proposals_in_message(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    agent_id: &AgentId,
+    message_id: &str,
+) -> Result<Vec<Value>, String> {
+    let page = api
+        .agent_get_conversation(
+            agent_id.clone(),
+            Some(1),
+            Some(ws.clone()),
+            None,
+            Some(message_id.to_string()),
+            None,
+            Some(ConversationProjection::Slim),
+            false,
+        )
+        .await
+        .map_err(map_err)?;
+    let blocks = page
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|m| m.get("id").and_then(Value::as_str) == Some(message_id))
+        })
+        .and_then(|m| m.get("contentBlocks"))
+        .and_then(Value::as_array);
+    Ok(blocks
+        .map(|blocks| blocks.iter().filter_map(proposal_in_block).collect())
+        .unwrap_or_default())
+}
+
+/// `ws.workspace.applyProposal(proposalIdOrIdempotencyKey, { userRequested:
+/// true, title?, initialPrompt? })` (intent-hq/intent#5413): apply one of the
+/// CALLER's own pending `workspace-create` proposals on explicit user
+/// instruction. The lookup is scoped to the caller's session, so another
+/// agent's proposal is never applicable. The proposal's stored
+/// `idempotencyKey` is reused verbatim (with or without overrides) so agent
+/// Apply, card Apply and card Retry converge on one workspace; on create
+/// success the proposal is resolved `applied` (same notice + `agent:updated`
+/// the UI Apply produces), on create failure nothing is recorded so the card
+/// stays pending for Retry.
+async fn apply_proposal(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let proposal_ref = match args.get("proposalId") {
+        Some(Value::String(value)) if !value.trim().is_empty() => value.clone(),
+        _ => {
+            return Err(
+                "applyProposal requires a non-empty proposal id (or the proposal's idempotencyKey) as its first argument"
+                    .to_string(),
+            )
+        }
+    };
+    let options = args
+        .get("options")
+        .and_then(Value::as_object)
+        .ok_or_else(|| APPLY_PROPOSAL_USER_REQUESTED_REQUIRED.to_string())?;
+    if let Some(key) = options
+        .keys()
+        .find(|key| !APPLY_PROPOSAL_ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "unknown applyProposal option `{key}`; allowed options are userRequested, title, initialPrompt"
+        ));
+    }
+    if options.get("userRequested") != Some(&Value::Bool(true)) {
+        return Err(APPLY_PROPOSAL_USER_REQUESTED_REQUIRED.to_string());
+    }
+    let title_override = strict_optional_string(options, "title")?;
+    let prompt_override = strict_optional_string(options, "initialPrompt")?;
+    let caller = caller_agent_id
+        .cloned()
+        .ok_or_else(|| "Could not determine agent ID from request context".to_string())?;
+
+    let lite = api
+        .agent_get(caller.clone(), Some(ws.clone()))
+        .await
+        .map_err(map_err)?;
+    let pending = &lite.metadata.pending_proposals;
+    let resolutions = &lite.metadata.proposal_resolutions;
+
+    // (a) a pending entry's `proposalId` verbatim; (b) the `idempotencyKey`
+    // of a pending entry's proposal block.
+    let mut matched: Option<(String, Value)> = None;
+    if let Some(entry) = pending.iter().find(|p| p.proposal_id == proposal_ref) {
+        let proposal = proposals_in_message(api, ws, &caller, &entry.message_id)
+            .await?
+            .into_iter()
+            .find(|p| proposal_identity(p) == Some(entry.proposal_id.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "proposal `{proposal_ref}` is pending but its proposal block could not be loaded from message {}",
+                    entry.message_id
+                )
+            })?;
+        matched = Some((entry.proposal_id.clone(), proposal));
+    } else {
+        for entry in pending {
+            let found = proposals_in_message(api, ws, &caller, &entry.message_id)
+                .await?
+                .into_iter()
+                .find(|p| {
+                    proposal_identity(p) == Some(entry.proposal_id.as_str())
+                        && proposal_idempotency_key(p) == Some(proposal_ref.as_str())
+                });
+            if let Some(proposal) = found {
+                matched = Some((entry.proposal_id.clone(), proposal));
+                break;
+            }
+        }
+    }
+    let Some((proposal_id, proposal)) = matched else {
+        return match resolutions.get(&proposal_ref).and_then(Value::as_str) {
+            Some(PROPOSAL_OUTCOME_APPLIED) => Ok(json!({
+                "ok": true,
+                "proposalId": proposal_ref,
+                "outcome": PROPOSAL_OUTCOME_APPLIED,
+                "alreadyResolved": true,
+            })),
+            Some(PROPOSAL_OUTCOME_DISMISSED) => Err(format!(
+                "proposal `{proposal_ref}` was dismissed by the user; propose it again with ws.workspace.proposeSibling if still wanted"
+            )),
+            _ => Err(format!(
+                "proposal `{proposal_ref}` matched neither a pending proposalId/idempotencyKey nor a resolved proposalId on this agent. \
+                 An idempotencyKey only addresses a proposal while it is pending; if the card may already have been applied or dismissed, retry with the `proposalId` from the proposeSibling result. \
+                 A proposal emitted in the CURRENT turn is recorded as pending only at turn end — end your turn and wait for the user's instruction before applying it."
+            )),
+        };
+    };
+
+    let kind = proposal
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let operation = proposal
+        .get("payload")
+        .and_then(|p| p.get("operation"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if kind != "workspace-create" || operation != "workspace.create" {
+        return Err(format!(
+            "proposal `{proposal_id}` is a `{kind}` proposal ({operation}); applyProposal only applies workspace-create proposals"
+        ));
+    }
+    let mut params = proposal
+        .get("payload")
+        .and_then(|p| p.get("params"))
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| format!("proposal `{proposal_id}` has no payload.params object"))?;
+    let idempotency_key = proposal_idempotency_key(&proposal)
+        .ok_or_else(|| {
+            format!("proposal `{proposal_id}` has no payload.params.idempotencyKey; it cannot be applied safely")
+        })?
+        .to_string();
+    if let Some(title) = title_override.as_deref() {
+        params.insert("title".to_string(), json!(title));
+    }
+    if let Some(prompt) = prompt_override.as_deref() {
+        let Some(initial_agent) = params
+            .get_mut("initialAgent")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(format!(
+                "proposal `{proposal_id}` has no initialAgent; initialPrompt cannot be overridden"
+            ));
+        };
+        initial_agent.insert("prompt".to_string(), json!(prompt));
+    }
+    if params
+        .get("initialAgent")
+        .and_then(|a| a.get("agentId"))
+        .is_some_and(|v| !v.is_null())
+    {
+        return Err(
+            "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted"
+                .to_string(),
+        );
+    }
+    let input: WorkspaceCreate = serde_json::from_value(Value::Object(params))
+        .map_err(|e| format!("invalid proposal params: {e}"))?;
+    let created = api
+        .create_workspace(input, Some(idempotency_key))
+        .await
+        .map_err(map_err)?;
+
+    let override_note = match (title_override.is_some(), prompt_override.is_some()) {
+        (true, true) => " with overridden title and prompt",
+        (true, false) => " with overridden title",
+        (false, true) => " with overridden prompt",
+        (false, false) => "",
+    };
+    let detail = format!(
+        "Created workspace {} ({}) via ws.workspace.applyProposal{override_note}",
+        created.workspace.id.as_str(),
+        created.workspace.title
+    );
+    // The resolver echoes the persisted outcome (no rewrite) when the card was
+    // resolved concurrently, so a UI dismissal that landed during create is
+    // reported rather than silently overwritten.
+    let (outcome, resolve_warning) = match api
+        .agent_resolve_proposal(
+            ws.clone(),
+            caller,
+            proposal_id.clone(),
+            PROPOSAL_OUTCOME_APPLIED.to_string(),
+            Some(detail),
+        )
+        .await
+    {
+        Ok(resolved) => match resolved.get("outcome").and_then(Value::as_str) {
+            Some(persisted) if persisted != PROPOSAL_OUTCOME_APPLIED => (
+                persisted.to_string(),
+                Some(format!(
+                    "workspace {} exists (it was created by this call), but the proposal had \
+                     already been resolved '{persisted}' from the UI while it was being created; \
+                     that resolution was kept and the card does not show applied — tell the user \
+                     the workspace exists",
+                    created.workspace.id.as_str()
+                )),
+            ),
+            _ => (PROPOSAL_OUTCOME_APPLIED.to_string(), None),
+        },
+        Err(e) => (
+            PROPOSAL_OUTCOME_APPLIED.to_string(),
+            Some(format!(
+                "workspace {} was created but the proposal could not be marked applied: {e}",
+                created.workspace.id.as_str()
+            )),
+        ),
+    };
+
+    let mut out = json!({
+        "ok": true,
+        "proposalId": proposal_id,
+        "outcome": outcome,
+        "workspace": {
+            "id": created.workspace.id.as_str(),
+            "title": created.workspace.title,
+            "branch": created.workspace.branch,
+            "path": created.workspace.effective_path(),
+        },
+    });
+    if let Some(mut agent) = created.initial_agent {
+        strip_agent_hidden_fields(&mut agent);
+        out["initialAgent"] = agent;
+    }
+    if title_override.is_some() || prompt_override.is_some() {
+        let mut overrides = serde_json::Map::new();
+        if title_override.is_some() {
+            overrides.insert("title".to_string(), json!(true));
+        }
+        if prompt_override.is_some() {
+            overrides.insert("initialPrompt".to_string(), json!(true));
+        }
+        out["overrides"] = Value::Object(overrides);
+    }
+    if let Some(warning) = resolve_warning {
+        out["resolveWarning"] = json!(warning);
+    }
+    Ok(out)
 }
 
 async fn info(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {

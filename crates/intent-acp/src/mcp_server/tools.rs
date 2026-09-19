@@ -171,7 +171,8 @@ API:
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the chief-of-staff workspace.
-  ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
+  ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposalId, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
+  ws.workspace.applyProposal(proposalIdOrIdempotencyKey, { userRequested: true, title?, initialPrompt? }) → { ok, proposalId, outcome, workspace, initialAgent?, overrides?, alreadyResolved?, resolveWarning? }  // Apply one of YOUR OWN pending sibling-workspace proposals on the user's explicit chat instruction (`userRequested: true` is a required attestation). Creates exactly the workspace the proposal card would — `workspace` is `{ id, title, branch?, path? }`; the stored idempotencyKey is reused, so agent Apply, card Apply and card Retry converge on one workspace — and marks the card applied. `title` / `initialPrompt` optionally override those two proposal fields (the result's `overrides` names them); repository, baseRef and specialist stay locked to the proposal. A proposal emitted in the CURRENT turn is pending only at turn end, so end your turn and wait for the user's instruction first. An already-applied id returns `alreadyResolved: true` without creating again; a dismissed one is refused; address a resolved proposal by proposalId — the idempotencyKey only matches while pending. Foreground top-level agents only.
 
   ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
 
@@ -400,7 +401,8 @@ API:
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the chief-of-staff workspace.
-  ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
+  ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposalId, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
+  ws.workspace.applyProposal(proposalIdOrIdempotencyKey, { userRequested: true, title?, initialPrompt? }) → { ok, proposalId, outcome, workspace, initialAgent?, overrides?, alreadyResolved?, resolveWarning? }  // Apply one of YOUR OWN pending sibling-workspace proposals on the user's explicit chat instruction (`userRequested: true` is a required attestation). Creates exactly the workspace the proposal card would — `workspace` is `{ id, title, branch?, path? }`; the stored idempotencyKey is reused, so agent Apply, card Apply and card Retry converge on one workspace — and marks the card applied. `title` / `initialPrompt` optionally override those two proposal fields (the result's `overrides` names them); repository, baseRef and specialist stay locked to the proposal. A proposal emitted in the CURRENT turn is pending only at turn end, so end your turn and wait for the user's instruction first. An already-applied id returns `alreadyResolved: true` without creating again; a dismissed one is refused; address a resolved proposal by proposalId — the idempotencyKey only matches while pending. Foreground top-level agents only.
 
   ws.app.agents.list({ workspaceId?, includeCompleted?, limit?, cursor? }?) → { threads, total, returned, nextCursor? }  // Chief workspace only. Lists readable agent threads across app workspaces; metadata only, no transcript content. Defaults to 50 threads, max 200.
   ws.app.agents.readConversation(workspaceId, agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }?) → { workspaceId, workspaceTitle, agentId, agentName, totalMessages, returnedMessages, startTurn, endTurn, includeToolCalls, taskNoteId?, messages }  // Chief workspace only. Reads a bounded cross-workspace agent conversation. Defaults to last 20 messages, max 100, and excludes tool-call blocks unless `includeToolCalls=true`.
@@ -865,9 +867,9 @@ fn workspace_api_description_for_bridge(
     Cow::Owned(
         base.lines()
             .filter(|line| {
-                !line
-                    .trim_start()
-                    .starts_with("ws.workspace.proposeSibling(")
+                let line = line.trim_start();
+                !line.starts_with("ws.workspace.proposeSibling(")
+                    && !line.starts_with("ws.workspace.applyProposal(")
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -1991,15 +1993,15 @@ mod tests {
     }
 
     // Size budget for the system-prompt copy: the all-defaults non-chief
-    // rendering (the common case for truncating providers) stays under 21.5k
+    // rendering (the common case for truncating providers) stays under 22k
     // chars — roughly half the ~40k full text.
     #[test]
     fn condensed_description_size_budget() {
         let condensed =
             condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
         assert!(
-            condensed.len() < 21_500,
-            "condensed all-on description is {} bytes, over the 21.5k budget",
+            condensed.len() < 22_000,
+            "condensed all-on description is {} bytes, over the 22k budget",
             condensed.len()
         );
     }

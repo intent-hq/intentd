@@ -54,6 +54,7 @@ only on `intent-services`, never on `intent-store`.
 | domain logic / `WorkspaceApi`| `crates/intent-services/`                                    |
 | SQLite schema + migrations   | `crates/intent-store/`                                       |
 | ACP streaming / permissions  | `crates/intent-acp/`                                         |
+| user-only agent field (hidden from agents) | `AGENT_HIDDEN_FIELDS` in `crates/intent-core/src/model.rs`; the egress registry + contract test in `crates/intent-acp/src/tests_hidden_field_egress.rs` — a new agent-facing egress that serves session/event data must be registered there |
 | browser tab contract / `ws.browser.docs` text | `crates/intent-acp/src/mcp_server/bindings/browser_docs/*.md` — change together with the cloudlands-fe executor (`src/features/browser/main/browser-action-executor.ts`, `embedded-browser-cdp-service.ts`, the browser-tab-registry saga) and `../../docs/protocol/methods/files-terminal-browser.md`; monorepo `make docs-check` cross-checks the shared `errorCode` / `displayed` tokens |
 | binary CLI + composition     | `crates/intentd/src/`                                        |
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
@@ -239,6 +240,7 @@ file's entry is removed or lowered).
 | `tmp_hygiene_lint` | a raw `PathBuf::from("/tmp")` / `Path::new("/tmp")` / `temp_dir().join(..)` in test code instead of `test_tempdir` | trailing `// tmp-hygiene: allow — <reason>` |
 | `repo_cache_path_lint` | a literal `".repo-cache"` in test code instead of `intent_git::repo_cache::cache_root_for` / `cache_path_for` | trailing `// repo-cache-path: allow — <reason>` |
 | `serve_spawn_lint` | a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"`, or a file calling `enable_ws_api(` without `serve_command` in code | `// serve-spawn: allow — <reason>` on the statement line, or anywhere in the file for the second rule |
+| `agent_hidden_field_egress_lint` | a `mcp_server/bindings/` file that reads session/event rows (`AgentLite` / `Event`, `agent_get(` / `agent_list(` / `event_query(` …) without a `SCRUBBED_BINDINGS` row (scrubs with `strip_agent_hidden_fields` + `EGRESS_REGISTRY` entries), or an `intent-services` fn copying `.data` wholesale into `json!` without a `WAKE_METADATA_BUILDERS` row; allowlist rows and registry entries are cross-checked for staleness | `HAND_PICKED_BINDINGS` / `SAFE_DATA_COPIES` rows in the lint (reason required) |
 | `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, or a ci.yml `check` job with no non-comment `run:` line invoking the glob | none |
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump

@@ -6523,6 +6523,11 @@ mod workspace_api_tool_tests {
 
         assert_eq!(proposal["kind"], "workspace-create");
         assert_eq!(proposal["payload"]["operation"], "workspace.create");
+        assert_eq!(
+            first["proposalId"], "Create workspace: Follow up",
+            "top-level proposalId is the applyProposal handle (preview.title, no applyToolCallId)"
+        );
+        assert_eq!(first["proposalId"], proposal["preview"]["title"]);
         assert_eq!(create["mode"], "sibling");
         assert_eq!(create["title"], "Follow up");
         assert_eq!(
@@ -9641,6 +9646,25 @@ mod wsapi4_bindings_tests {
         agent_send_result: Mutex<Option<Value>>,
         /// When set, overrides the `agent_send_to_task` result (delivery-shape tests).
         agent_send_to_task_result: Mutex<Option<Value>>,
+        /// When set, `agent_send_message` / `agent_send_to_task` await this
+        /// lock BEFORE recording the call — stands in for the daemon-side
+        /// enqueue outliving the eval budget (intent-hq/intent#5387).
+        agent_send_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
+        /// When set, `agent_get_queue` awaits this lock — stands in for the
+        /// single-pending-message guard's store read stalling ahead of the
+        /// enqueue (intent-hq/intent#5387).
+        agent_get_queue_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
+        /// When set, `agent_is_retired` awaits this lock — stands in for the
+        /// retired-caller store read stalling ahead of the enqueue
+        /// (intent-hq/intent#5387).
+        agent_is_retired_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
+        /// Signalled once per recorded `agent_send_message` call, so a test
+        /// can await a send that lands after the binding already returned.
+        agent_send_landed: tokio::sync::Notify,
+        /// The `message_id` each `agent_send_message` call carried, recorded
+        /// synchronously (before any hold) so a timed-out send's id is
+        /// observable.
+        agent_send_message_ids: Mutex<Vec<Option<String>>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -9820,7 +9844,13 @@ mod wsapi4_bindings_tests {
             _workspace_id: Option<WorkspaceId>,
         ) -> BoxFuture<'_, Result<Value>> {
             let queue = self.queue_entries.lock().unwrap().clone();
-            Box::pin(async move { Ok(json!({ "success": true, "queue": queue })) })
+            let hold = self.agent_get_queue_hold.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    drop(hold.lock_owned().await);
+                }
+                Ok(json!({ "success": true, "queue": queue }))
+            })
         }
 
         fn agent_remove_queued_message_owned(
@@ -9881,7 +9911,7 @@ mod wsapi4_bindings_tests {
             _ws: WorkspaceId,
             agent_id: AgentId,
             content: String,
-            _message_id: Option<String>,
+            message_id: Option<String>,
             _image_blocks: Option<Value>,
             _file_blocks: Option<Value>,
             priority: Option<String>,
@@ -9891,13 +9921,8 @@ mod wsapi4_bindings_tests {
             message_metadata: Option<Value>,
             _origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
-            self.agent_send_calls.lock().unwrap().push((
-                agent_id.as_str().to_string(),
-                content,
-                priority,
-                message_metadata,
-            ));
-            self.call_order.lock().unwrap().push("send");
+            self.agent_send_message_ids.lock().unwrap().push(message_id);
+            let hold = self.agent_send_hold.lock().unwrap().clone();
             let error = self.agent_send_error.lock().unwrap().clone();
             let result = self
                 .agent_send_result
@@ -9908,6 +9933,18 @@ mod wsapi4_bindings_tests {
                     || json!({ "success": true, "queued": false, "turnId": "turn-fake-1" }),
                 );
             Box::pin(async move {
+                let _held = match hold {
+                    Some(hold) => Some(hold.lock_owned().await),
+                    None => None,
+                };
+                self.agent_send_calls.lock().unwrap().push((
+                    agent_id.as_str().to_string(),
+                    content,
+                    priority,
+                    message_metadata,
+                ));
+                self.call_order.lock().unwrap().push("send");
+                self.agent_send_landed.notify_one();
                 if let Some(e) = error {
                     return Err(Error::Internal(e));
                 }
@@ -9923,15 +9960,20 @@ mod wsapi4_bindings_tests {
             priority: Option<String>,
             message_metadata: Option<Value>,
         ) -> BoxFuture<'_, Result<Value>> {
-            self.agent_send_to_task_calls.lock().unwrap().push((
-                task_note_id.as_str().to_string(),
-                message,
-                priority,
-                message_metadata,
-            ));
-            self.call_order.lock().unwrap().push("send");
+            let hold = self.agent_send_hold.lock().unwrap().clone();
             let result = self.agent_send_to_task_result.lock().unwrap().clone();
             Box::pin(async move {
+                let _held = match hold {
+                    Some(hold) => Some(hold.lock_owned().await),
+                    None => None,
+                };
+                self.agent_send_to_task_calls.lock().unwrap().push((
+                    task_note_id.as_str().to_string(),
+                    message,
+                    priority,
+                    message_metadata,
+                ));
+                self.call_order.lock().unwrap().push("send");
                 Ok(result.unwrap_or_else(|| {
                     json!({
                         "ok": true,
@@ -10117,7 +10159,13 @@ mod wsapi4_bindings_tests {
                 .lock()
                 .unwrap()
                 .contains(&agent_id.as_str().to_string());
-            Box::pin(async move { retired })
+            let hold = self.agent_is_retired_hold.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    drop(hold.lock_owned().await);
+                }
+                retired
+            })
         }
 
         fn event_query(
@@ -10942,6 +10990,478 @@ mod wsapi4_bindings_tests {
         assert_eq!(v["refused"], json!(true), "{v}");
         assert_eq!(v["taskNoteId"], json!("tn-1"), "{v}");
         assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
+    }
+
+    /// intent-hq/intent#5387: a queued-priority `ws.agent.send` whose
+    /// daemon-side enqueue outlives the eval budget is NOT lost. The mock
+    /// holds the send behind a lock for longer than the (compressed) budget:
+    /// (a) the binding returns within the budget with an explicit error
+    /// naming the pre-minted message id, and (b) once the lock is released
+    /// the enqueue still completes (the dropped eval future did not cancel
+    /// it), with the queue priority intact.
+    #[tokio::test]
+    async fn agent_send_queued_outliving_eval_budget_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 1, "exactly one daemon-side send: {ids:?}");
+        let message_id = ids[0]
+            .clone()
+            .expect("binding mints the message id before the daemon-side send");
+        let t = text(&resp);
+        assert!(
+            t.contains(&message_id) && t.contains("agent-target"),
+            "timeout error must name the in-flight message id and target: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the enqueue is still parked behind the held lock"
+        );
+
+        drop(guard);
+        // The tokio mutex is FIFO: the parked send acquires it first and
+        // records the call while holding it, so re-acquiring here observes
+        // the landed enqueue without polling.
+        let _observed = hold.lock().await;
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the enqueue must land after a timed-out send"
+        );
+        assert_eq!(calls[0].0, "agent-target");
+        assert_eq!(calls[0].1, "hello");
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+    }
+
+    /// intent-hq/intent#5387 (sendToTask): same durability — a timed-out
+    /// `ws.agent.sendToTask` returns an explicit error naming the task, and
+    /// the daemon-side send still completes once the lock is released.
+    #[tokio::test]
+    async fn agent_send_to_task_outliving_eval_budget_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.sendToTask('tn-1', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("sendToTask must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("tn-1") && t.contains("in flight"),
+            "timeout error must name the task and say the send is in flight: {t}"
+        );
+        assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
+
+        drop(guard);
+        let _observed = hold.lock().await;
+        let calls = api.agent_send_to_task_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "the send must land after a timed-out call");
+        assert_eq!(calls[0].0, "tn-1");
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+    }
+
+    /// intent-hq/intent#5387: the stall need not be the enqueue itself — the
+    /// binding's own pre-send reads (the single-pending-message guard's
+    /// `agent_get_queue`, the sender-name `agent_get`) run ahead of it and
+    /// were equally cancelled by the eval-timeout drop. With the guard read
+    /// held past the budget, the send must still land once it is released,
+    /// and the timed-out result must already name the pre-minted id.
+    #[tokio::test]
+    async fn agent_send_stalled_on_pending_guard_read_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_get_queue_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("user-msg-") && t.contains("agent-target"),
+            "timeout error must name the pre-minted message id and target: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the send is still parked behind the held guard read"
+        );
+
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must land after the guard read is released");
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one enqueue: {calls:?}");
+        assert_eq!(calls[0].0, "agent-target");
+        assert_eq!(calls[0].1, "hello");
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "error named the id that landed: {t}");
+    }
+
+    /// intent-hq/intent#5387: the retired-caller guard's `agent_is_retired`
+    /// store read is part of the send path too — it used to run in
+    /// `workspace_host_dispatch` ahead of the spawn, where a stall past the
+    /// budget surfaced the generic eval timeout and no send existed to land.
+    /// With the read held past the budget, the binding must still return the
+    /// named in-flight error inside the budget, and the send must land once
+    /// the read is released.
+    #[tokio::test]
+    async fn agent_send_stalled_on_retired_read_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_is_retired_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("user-msg-") && t.contains("agent-target"),
+            "timeout error must name the pre-minted message id and target: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the send is still parked behind the held retired read"
+        );
+
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must land after the retired read is released");
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one enqueue: {calls:?}");
+        assert_eq!(calls[0].0, "agent-target");
+        assert_eq!(calls[0].1, "hello");
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "error named the id that landed: {t}");
+    }
+
+    /// Control for the deferred retired read: a retired caller's `send` and
+    /// `sendToTask` are still refused through the spawned path — the same
+    /// retired error every other frame gets, and nothing is enqueued.
+    #[tokio::test]
+    async fn agent_send_from_retired_caller_refuses_without_enqueue() {
+        let (srv, api) = server_with_caller("caller-1");
+        api.retired_agent_ids
+            .lock()
+            .unwrap()
+            .push("caller-1".to_string());
+
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('agent-target', 'hello', 'queue');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(text(&resp).contains("retired"), "{}", text(&resp));
+        assert!(api.agent_send_calls.lock().unwrap().is_empty());
+
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('task-1', 'hello', 'queue');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(text(&resp).contains("retired"), "{}", text(&resp));
+        assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
+    }
+
+    /// intent-hq/intent#5387: the send's wait is bounded by the eval budget's
+    /// REMAINING time, not a fresh full budget. An earlier host frame in the
+    /// same eval (`getQueue`, held by the test) spends 1.8 s of a 3 s budget
+    /// before the send starts. A full-budget wait (3 s − 1.5 s margin) would
+    /// end at 3.3 s — past the eval timeout — and the caller would get the
+    /// generic timeout instead of the in-flight id; the remaining-time wait
+    /// (1.2 s − 0.6 s margin) returns the named error inside the budget, and
+    /// the send still lands once released.
+    #[tokio::test]
+    async fn agent_send_after_budget_partly_spent_still_names_in_flight_id() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_secs(3));
+        let queue_hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_get_queue_hold.lock().unwrap() = Some(queue_hold.clone());
+        let send_hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(send_hold.clone());
+        let queue_guard = queue_hold.lock().await;
+        let send_guard = send_hold.lock().await;
+
+        // Elapsed eval time is the condition under test: nothing observable
+        // stands in for the wall clock, so the earlier frame is held for a
+        // fixed slice of the budget before it is released.
+        let spend_budget_then_release = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+            drop(queue_guard);
+        };
+        let (resp, ()) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                call(
+                    &srv,
+                    "await ws.agent.getQueue('agent-target'); \
+                     return await ws.agent.send('agent-target', 'hello', 'queue');",
+                ),
+            ),
+            spend_budget_then_release,
+        );
+        let resp = resp.expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("user-msg-") && t.contains("agent-target"),
+            "the in-flight error must still name the id when budget was already spent: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the send is still parked behind the held enqueue"
+        );
+
+        drop(send_guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must land after the enqueue is released");
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one enqueue: {calls:?}");
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "error named the id that landed: {t}");
+    }
+
+    /// intent-hq/intent#5387: once the binding has returned the in-flight
+    /// error, the detached send's eventual outcome must stay observable. The
+    /// error must describe an UNCONFIRMED attempt (no delivery guarantee),
+    /// and a send that then FAILS is logged as a WARN naming the pre-minted
+    /// id and the failure, not silently dropped with the `JoinHandle`.
+    #[tokio::test]
+    async fn agent_send_late_failure_after_timeout_is_logged_not_swallowed() {
+        let capture = crate::tests::WarnCapture::default();
+        let _subscriber = capture.set_as_default();
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(hold.clone());
+        *api.agent_send_error.lock().unwrap() = Some("store pool exhausted".to_string());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("UNCONFIRMED") && t.contains("fail late"),
+            "the in-flight error must not promise delivery: {t}"
+        );
+        assert!(
+            !t.contains("is not lost"),
+            "the in-flight error must not guarantee the message survives: {t}"
+        );
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "{t}");
+
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must reach the op after release");
+        // The late outcome is logged by a follower task that runs once the
+        // detached send resolves; on this current-thread runtime a bounded
+        // number of yields lets it run.
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            lines = capture.lines();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            lines.iter().any(|l| l.contains(&id)
+                && l.contains("store pool exhausted")
+                && l.contains("FAILED")),
+            "late failure must be logged under the message id: {lines:?}"
+        );
+    }
+
+    /// intent-hq/intent#5387: outcome observation must not depend on the
+    /// waiter reaching its own timeout branch. The caller task — standing in
+    /// for the host future the eval-timeout drop cancels — is ABORTED while
+    /// the send is still held; the send then fails late, and the failure
+    /// must still be logged under the send label.
+    #[tokio::test]
+    async fn agent_send_caller_dropped_mid_wait_still_logs_late_failure() {
+        use crate::mcp_server::bindings::{agent::spawn_send_within_budget, EvalBudget};
+        let capture = crate::tests::WarnCapture::default();
+        let _subscriber = capture.set_as_default();
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = hold.lock().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let op = {
+            let hold = hold.clone();
+            let entered = entered.clone();
+            async move {
+                entered.notify_one();
+                drop(hold.lock_owned().await);
+                Err::<Value, String>("store pool exhausted".to_string())
+            }
+        };
+        let caller = tokio::spawn(spawn_send_within_budget(
+            EvalBudget::starting_now(std::time::Duration::from_secs(30)),
+            "messageId user-msg-dropped to agent-target".to_string(),
+            op,
+            |_| "in flight".to_string(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the send op must start behind the hold");
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(capture.lines().is_empty(), "nothing to log while held");
+
+        drop(guard);
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            lines = capture.lines();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("user-msg-dropped")
+                && l.contains("store pool exhausted")
+                && l.contains("FAILED")),
+            "late failure must be logged although the waiter was dropped: {lines:?}"
+        );
+    }
+
+    /// intent-hq/intent#5387: a late single-pending-message refusal is logged
+    /// as a non-delivery with bounded metadata — the pending id and queue
+    /// count — never the refusal's `queue` payload with its message previews.
+    #[tokio::test]
+    async fn agent_send_late_refusal_logs_outcome_without_queue_content() {
+        let capture = crate::tests::WarnCapture::default();
+        let _subscriber = capture.set_as_default();
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "q-pending-1",
+            "content": "SENTINEL-QUEUED-BODY",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_get_queue_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        let id = t
+            .split_whitespace()
+            .find(|w| w.starts_with("user-msg-"))
+            .map(|w| {
+                w.trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+                    .to_string()
+            })
+            .expect("in-flight error names the pre-minted id");
+
+        drop(guard);
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            lines = capture.lines();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let line = lines
+            .iter()
+            .find(|l| l.contains(&id))
+            .unwrap_or_else(|| panic!("late refusal must be logged under the id: {lines:?}"));
+        assert!(line.contains("WITHOUT delivering"), "{line}");
+        assert!(
+            line.contains("q-pending-1") && line.contains("queueLength"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("SENTINEL-QUEUED-BODY"),
+            "queued message content must not reach the log: {line}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "a refusal enqueues nothing"
+        );
     }
 
     /// Omitted `priority` defaults to INTERRUPT delivery: the binding
@@ -12368,5 +12888,913 @@ mod workspace_api_output_limit_tests {
         let head_plus_one: String = full.chars().take(51).collect();
         assert!(!text.contains(&head_plus_one));
         assert!(text.chars().count() < 500, "message must stay bounded");
+    }
+}
+
+/// `ws.workspace.applyProposal` (intent-hq/intent#5413): the proposing
+/// foreground top-level agent applies one of its OWN pending
+/// `workspace-create` proposals on explicit user instruction.
+#[cfg(test)]
+mod workspace_apply_proposal_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, PendingProposal, Result,
+        Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
+        WorkspaceCreateResult, WorkspaceId, WorkspaceStatus,
+    };
+    use serde_json::{json, Value};
+
+    use crate::mcp_server::PROPOSAL_RESOURCE_MIME_TYPE;
+    use crate::WorkspaceMcpServer;
+
+    const WS: &str = "amber-forest";
+    const CALLER: &str = "agent-77";
+    const PENDING_ID: &str = "Create workspace: Follow up";
+    const MESSAGE_ID: &str = "m-proposal";
+    const KEY: &str = "sibling-workspace-0000-key";
+
+    type ResolveCall = (String, String, String, String, Option<String>);
+    /// `(agent_id, limit, around_message_id)`.
+    type ConversationCall = (String, Option<i64>, Option<String>);
+
+    #[derive(Default)]
+    struct FakeApi {
+        pending: Mutex<Vec<PendingProposal>>,
+        resolutions: Mutex<serde_json::Map<String, Value>>,
+        /// `message_id -> contentBlocks` served by `agent_get_conversation`.
+        messages: Mutex<HashMap<String, Vec<Value>>>,
+        conversation_calls: Mutex<Vec<ConversationCall>>,
+        create_calls: Mutex<Vec<(WorkspaceCreate, Option<String>)>>,
+        create_error: Mutex<Option<Error>>,
+        resolve_calls: Mutex<Vec<ResolveCall>>,
+        resolve_error: Mutex<Option<Error>>,
+        /// Outcome the fake resolver echoes back instead of the requested one
+        /// (models the real resolver's "already resolved" idempotent path).
+        resolve_persisted_outcome: Mutex<Option<String>>,
+    }
+
+    fn workspace(id: &str, title: &str) -> Workspace {
+        let now = "2026-01-01T00:00:00Z".to_string();
+        Workspace {
+            id: WorkspaceId::from_string(id),
+            title: title.to_string(),
+            branch: format!("{id}-branch"),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_activity: None,
+            tags: Vec::new(),
+            path: Some(format!("/checkouts/{id}")),
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            context_links: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+            browser_client_id: None,
+            display_status: None,
+            waiting: false,
+            checkout_mode: None,
+            disk_usage: None,
+            pending_delete_at: None,
+        }
+    }
+
+    fn caller_lite(
+        pending: Vec<PendingProposal>,
+        resolutions: serde_json::Map<String, Value>,
+    ) -> AgentLite {
+        AgentLite {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from(CALLER),
+            workspace_id: WorkspaceId::from_string(WS),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Coordinator".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            is_streaming: false,
+            is_processing: false,
+            is_responding: true,
+            is_waiting_on_tool: false,
+            is_waiting_for_other_agents: false,
+            waiting_for_agent_ids: vec![],
+            waiting_on_hooks: vec![],
+            waiting_on_pr_monitors: vec![],
+            turn_in_flight: true,
+            last_stream_activity_at: None,
+            context_usage: None,
+            stats: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: None,
+            message_count: 0,
+            digest: None,
+            last_agent_response: None,
+            last_user_message: None,
+            last_message_role: None,
+            last_message_id: None,
+            last_tool_use: None,
+            context_references: None,
+            file_blocks: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            retired_at: None,
+            notifications_muted: false,
+            metadata: AgentMetadata {
+                is_background: false,
+                specialist: None,
+                created_by_agent_id: None,
+                task_note_id: None,
+                completion_report: None,
+                completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: None,
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+                dismissed_questions_message_id: None,
+                pending_questions_message_id: None,
+                pending_proposals: pending,
+                proposal_resolutions: resolutions,
+                last_seen_message_id: None,
+                is_initial_agent: None,
+                sponsor_agent_id: None,
+            },
+        }
+    }
+
+    impl WorkspaceApi for FakeApi {
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            Box::pin(async move { Ok(workspace(id.as_str(), "Amber Forest")) })
+        }
+
+        fn agent_get(
+            &self,
+            agent_id: AgentId,
+            workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<AgentLite>> {
+            let pending = self.pending.lock().unwrap().clone();
+            let resolutions = self.resolutions.lock().unwrap().clone();
+            Box::pin(async move {
+                assert_eq!(agent_id.as_str(), CALLER, "lookup is scoped to the caller");
+                assert_eq!(
+                    workspace_id.as_ref().map(WorkspaceId::as_str),
+                    Some(WS),
+                    "lookup is workspace-scoped"
+                );
+                Ok(caller_lite(pending, resolutions))
+            })
+        }
+
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            limit: Option<i64>,
+            workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            around_message_id: Option<String>,
+            _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.conversation_calls.lock().unwrap().push((
+                agent_id.as_str().to_string(),
+                limit,
+                around_message_id.clone(),
+            ));
+            let messages = self.messages.lock().unwrap().clone();
+            Box::pin(async move {
+                assert_eq!(workspace_id.as_ref().map(WorkspaceId::as_str), Some(WS));
+                let mid = around_message_id.expect("single-message seek");
+                let Some(blocks) = messages.get(&mid) else {
+                    return Err(Error::InvalidParams(format!("unknown message id: {mid}")));
+                };
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [{
+                        "id": mid,
+                        "agentId": agent_id.as_str(),
+                        "seq": 3,
+                        "role": "assistant",
+                        "contentBlocks": blocks,
+                        "timestamp": "2026-01-01T00:00:00Z",
+                    }],
+                    "truncated": false,
+                    "totalMessages": 4,
+                }))
+            })
+        }
+
+        fn create_workspace(
+            &self,
+            input: WorkspaceCreate,
+            idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
+            let title = input.title.clone().unwrap_or_default();
+            self.create_calls
+                .lock()
+                .unwrap()
+                .push((input, idempotency_key));
+            let error = self.create_error.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(e);
+                }
+                Ok(WorkspaceCreateResult {
+                    workspace: workspace("ws-new", &title),
+                    initial_agent: Some(json!({
+                        "id": "agent-new",
+                        "workspaceId": "ws-new",
+                        "name": "Coordinator",
+                        "notificationsMuted": false,
+                    })),
+                })
+            })
+        }
+
+        fn agent_resolve_proposal(
+            &self,
+            workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            proposal_id: String,
+            outcome: String,
+            detail: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.resolve_calls.lock().unwrap().push((
+                workspace_id.as_str().to_string(),
+                agent_id.as_str().to_string(),
+                proposal_id.clone(),
+                outcome.clone(),
+                detail,
+            ));
+            let error = self.resolve_error.lock().unwrap().take();
+            let persisted = self.resolve_persisted_outcome.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(e);
+                }
+                let outcome = persisted.unwrap_or(outcome);
+                Ok(json!({ "success": true, "proposalId": proposal_id, "outcome": outcome }))
+            })
+        }
+    }
+
+    fn sibling_proposal() -> Value {
+        json!({
+            "kind": "workspace-create",
+            "payload": {
+                "operation": "workspace.create",
+                "params": {
+                    "title": "Follow up",
+                    "repositoryPath": "/repos/intentd",
+                    "repositoryOwner": "intent-hq",
+                    "repositoryName": "intentd",
+                    "baseRef": "main",
+                    "initialAgent": {
+                        "name": "Coordinator",
+                        "prompt": "Implement the isolated follow-up and test it.",
+                        "agentType": "workspace",
+                        "specialist": "implementor",
+                        "metadata": { "isInitialAgent": true, "specialist": "implementor" },
+                    },
+                    "idempotencyKey": KEY,
+                },
+            },
+            "preview": {
+                "title": PENDING_ID,
+                "summary": "Review this follow-up workspace before creating it.",
+            },
+        })
+    }
+
+    fn proposal_block(proposal: &Value) -> Value {
+        json!({
+            "type": "resource",
+            "resource": {
+                "uri": crate::mcp_server::proposal_resource_uri(proposal),
+                "name": proposal["preview"]["title"],
+                "mimeType": PROPOSAL_RESOURCE_MIME_TYPE,
+                "text": serde_json::to_string(proposal).unwrap(),
+            },
+        })
+    }
+
+    fn api_with_pending(proposal: &Value) -> Arc<FakeApi> {
+        let api = Arc::new(FakeApi::default());
+        api.pending.lock().unwrap().push(PendingProposal {
+            proposal_id: PENDING_ID.to_string(),
+            message_id: MESSAGE_ID.to_string(),
+        });
+        api.messages.lock().unwrap().insert(
+            MESSAGE_ID.to_string(),
+            vec![
+                json!({ "type": "text", "text": "Proposing a follow-up." }),
+                proposal_block(proposal),
+            ],
+        );
+        api
+    }
+
+    fn server(api: Arc<FakeApi>) -> WorkspaceMcpServer {
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string(WS))
+            .with_caller_agent_id(Some(AgentId::from_string(CALLER)))
+    }
+
+    async fn call(srv: &WorkspaceMcpServer, code: &str) -> Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "unit test" }
+            }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    fn tool_text(resp: &Value) -> &str {
+        resp["result"]["content"][0]["text"].as_str().unwrap()
+    }
+
+    fn tool_json(resp: &Value) -> Value {
+        serde_json::from_str(tool_text(resp)).unwrap()
+    }
+
+    fn assert_error_contains(resp: &Value, needle: &str) {
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        assert!(
+            tool_text(resp).contains(needle),
+            "expected `{needle}` in `{}`",
+            tool_text(resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_false_user_requested_without_creating() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        for code in [
+            format!("return await ws.workspace.applyProposal({PENDING_ID:?});"),
+            format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{}});"),
+            format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: false }});"),
+            format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: 'true' }});"),
+        ] {
+            let resp = call(&srv, &code).await;
+            assert_error_contains(&resp, "applyProposal requires { userRequested: true }");
+        }
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_option_keys_and_empty_overrides() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, baseRef: 'x' }});"),
+        )
+        .await;
+        assert_error_contains(
+            &resp,
+            "unknown applyProposal option `baseRef`; allowed options are userRequested, title, initialPrompt",
+        );
+        for (code, field) in [
+            (format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, title: '   ' }});"), "title"),
+            (format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, initialPrompt: '' }});"), "initialPrompt"),
+            (format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, title: 7 }});"), "title"),
+        ] {
+            let resp = call(&srv, &code).await;
+            assert_error_contains(
+                &resp,
+                &format!("{field} must be a non-empty string when provided"),
+            );
+        }
+        let resp = call(
+            &srv,
+            "return await ws.workspace.applyProposal('', { userRequested: true });",
+        )
+        .await;
+        assert_error_contains(&resp, "non-empty proposal id");
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_apply_creates_with_stored_key_then_resolves_applied() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_ne!(resp["result"]["isError"], true, "{resp}");
+        let out = tool_json(&resp);
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["proposalId"], PENDING_ID);
+        assert_eq!(out["outcome"], "applied");
+        assert_eq!(out["workspace"]["id"], "ws-new");
+        assert_eq!(out["workspace"]["title"], "Follow up");
+        assert_eq!(out["workspace"]["branch"], "ws-new-branch");
+        assert_eq!(out["workspace"]["path"], "/checkouts/ws-new");
+        assert_eq!(out["initialAgent"]["id"], "agent-new");
+        assert!(
+            out["initialAgent"].get("notificationsMuted").is_none(),
+            "agent-hidden fields are stripped from the passthrough"
+        );
+        assert!(out.get("overrides").is_none());
+        assert!(out.get("alreadyResolved").is_none());
+        assert!(out.get("resolveWarning").is_none());
+
+        // Bounded message read: one single-message seek on the caller.
+        let reads = api.conversation_calls.lock().unwrap().clone();
+        assert_eq!(
+            reads,
+            vec![(CALLER.to_string(), Some(1), Some(MESSAGE_ID.to_string()))]
+        );
+
+        let creates = api.create_calls.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        let (input, key) = &creates[0];
+        assert_eq!(key.as_deref(), Some(KEY), "stored key reused verbatim");
+        assert_eq!(input.title.as_deref(), Some("Follow up"));
+        assert_eq!(input.repository_path.as_deref(), Some("/repos/intentd"));
+        assert_eq!(input.repository_owner.as_deref(), Some("intent-hq"));
+        assert_eq!(input.repository_name.as_deref(), Some("intentd"));
+        assert_eq!(input.base_ref.as_deref(), Some("main"));
+        let agent = input.initial_agent.as_ref().unwrap();
+        assert_eq!(
+            agent.prompt.as_deref(),
+            Some("Implement the isolated follow-up and test it.")
+        );
+        assert_eq!(agent.specialist.as_deref(), Some("implementor"));
+        drop(creates);
+
+        let resolves = api.resolve_calls.lock().unwrap();
+        assert_eq!(resolves.len(), 1);
+        let (ws, agent, proposal_id, outcome, detail) = &resolves[0];
+        assert_eq!(ws, WS);
+        assert_eq!(agent, CALLER);
+        assert_eq!(proposal_id, PENDING_ID);
+        assert_eq!(outcome, "applied");
+        assert_eq!(
+            detail.as_deref(),
+            Some("Created workspace ws-new (Follow up) via ws.workspace.applyProposal")
+        );
+    }
+
+    #[tokio::test]
+    async fn overrides_replace_only_title_and_prompt_and_are_named_in_result_and_detail() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!(
+                "return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, title: ' Renamed ', initialPrompt: 'Do the other thing.' }});"
+            ),
+        )
+        .await;
+        assert_ne!(resp["result"]["isError"], true, "{resp}");
+        let out = tool_json(&resp);
+        assert_eq!(
+            out["overrides"],
+            json!({ "title": true, "initialPrompt": true })
+        );
+        assert_eq!(out["workspace"]["title"], "Renamed");
+
+        let (input, key) = api.create_calls.lock().unwrap()[0].clone();
+        assert_eq!(key.as_deref(), Some(KEY), "overrides never mint a new key");
+        assert_eq!(input.title.as_deref(), Some("Renamed"));
+        let agent = input.initial_agent.as_ref().unwrap();
+        assert_eq!(agent.prompt.as_deref(), Some("Do the other thing."));
+        // Every other param is byte-identical to the proposal.
+        assert_eq!(input.repository_path.as_deref(), Some("/repos/intentd"));
+        assert_eq!(input.repository_owner.as_deref(), Some("intent-hq"));
+        assert_eq!(input.repository_name.as_deref(), Some("intentd"));
+        assert_eq!(input.base_ref.as_deref(), Some("main"));
+        assert_eq!(agent.name.as_deref(), Some("Coordinator"));
+        assert_eq!(agent.agent_type.as_deref(), Some("workspace"));
+        assert_eq!(agent.specialist.as_deref(), Some("implementor"));
+        assert_eq!(
+            agent.metadata,
+            Some(json!({ "isInitialAgent": true, "specialist": "implementor" }))
+        );
+
+        let detail = api.resolve_calls.lock().unwrap()[0].4.clone();
+        assert_eq!(
+            detail.as_deref(),
+            Some("Created workspace ws-new (Renamed) via ws.workspace.applyProposal with overridden title and prompt")
+        );
+
+        // Single overrides name only the field they touched.
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, title: 'Only title' }});"),
+            )
+            .await,
+        );
+        assert_eq!(out["overrides"], json!({ "title": true }));
+        assert!(api.resolve_calls.lock().unwrap()[0]
+            .4
+            .as_deref()
+            .unwrap()
+            .ends_with(" with overridden title"));
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, initialPrompt: 'Only prompt' }});"),
+            )
+            .await,
+        );
+        assert_eq!(out["overrides"], json!({ "initialPrompt": true }));
+        assert!(api.resolve_calls.lock().unwrap()[0]
+            .4
+            .as_deref()
+            .unwrap()
+            .ends_with(" with overridden prompt"));
+    }
+
+    #[tokio::test]
+    async fn initial_prompt_override_requires_an_initial_agent_on_the_proposal() {
+        let mut proposal = sibling_proposal();
+        proposal["payload"]["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("initialAgent");
+        let api = api_with_pending(&proposal);
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, initialPrompt: 'x' }});"),
+        )
+        .await;
+        assert_error_contains(
+            &resp,
+            "has no initialAgent; initialPrompt cannot be overridden",
+        );
+        assert!(api.create_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lookup_by_idempotency_key_resolves_the_pending_proposal_id() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!(
+                    "return await ws.workspace.applyProposal({KEY:?}, {{ userRequested: true }});"
+                ),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true);
+        assert_eq!(
+            out["proposalId"], PENDING_ID,
+            "result names the proposal id, not the key"
+        );
+        assert_eq!(api.create_calls.lock().unwrap()[0].1.as_deref(), Some(KEY));
+        assert_eq!(api.resolve_calls.lock().unwrap()[0].2, PENDING_ID);
+    }
+
+    #[tokio::test]
+    async fn unknown_proposal_id_errors_with_turn_end_hint_and_creates_nothing() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            "return await ws.workspace.applyProposal('Create workspace: Other', { userRequested: true });",
+        )
+        .await;
+        assert_error_contains(
+            &resp,
+            "proposal `Create workspace: Other` matched neither a pending proposalId/idempotencyKey nor a resolved proposalId",
+        );
+        assert_error_contains(&resp, "recorded as pending only at turn end");
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+
+        // No pending proposals at all: same not-found path, no message reads.
+        let api = Arc::new(FakeApi::default());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "matched neither a pending proposalId/idempotencyKey");
+        assert!(api.conversation_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_no_longer_addresses_a_resolved_proposal() {
+        // Resolved: gone from pending, present in resolutions under its id.
+        // The key is not a lookup handle any more — the error must say so and
+        // point at the proposalId instead of the misleading turn-end hint alone.
+        for outcome in ["applied", "dismissed"] {
+            let api = Arc::new(FakeApi::default());
+            api.resolutions
+                .lock()
+                .unwrap()
+                .insert(PENDING_ID.to_string(), json!(outcome));
+            let srv = server(api.clone());
+            let resp = call(
+                &srv,
+                &format!(
+                    "return await ws.workspace.applyProposal({KEY:?}, {{ userRequested: true }});"
+                ),
+            )
+            .await;
+            assert_error_contains(
+                &resp,
+                &format!("proposal `{KEY}` matched neither a pending proposalId/idempotencyKey nor a resolved proposalId"),
+            );
+            assert_error_contains(
+                &resp,
+                "An idempotencyKey only addresses a proposal while it is pending",
+            );
+            assert_error_contains(
+                &resp,
+                "retry with the `proposalId` from the proposeSibling result",
+            );
+            assert_error_contains(&resp, "recorded as pending only at turn end");
+            assert!(api.create_calls.lock().unwrap().is_empty());
+            assert!(api.resolve_calls.lock().unwrap().is_empty());
+
+            // The id still addresses the resolved proposal.
+            let resp = call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await;
+            if outcome == "applied" {
+                assert_eq!(
+                    tool_json(&resp),
+                    json!({ "ok": true, "proposalId": PENDING_ID, "outcome": "applied", "alreadyResolved": true })
+                );
+            } else {
+                assert_error_contains(&resp, "was dismissed by the user");
+            }
+            assert!(api.create_calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn non_workspace_create_proposal_is_refused_naming_its_kind() {
+        let proposal = json!({
+            "kind": "settings",
+            "applyToolCallId": PENDING_ID,
+            "payload": { "operation": "settings.set", "params": { "path": "a", "value": 1 } },
+            "preview": { "title": "Change a setting" },
+        });
+        let api = api_with_pending(&proposal);
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "is a `settings` proposal (settings.set)");
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn already_applied_is_idempotent_and_dismissed_is_refused() {
+        let api = Arc::new(FakeApi::default());
+        api.resolutions
+            .lock()
+            .unwrap()
+            .insert(PENDING_ID.to_string(), json!("applied"));
+        api.resolutions
+            .lock()
+            .unwrap()
+            .insert("Create workspace: Dropped".to_string(), json!("dismissed"));
+        let srv = server(api.clone());
+
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await,
+        );
+        assert_eq!(
+            out,
+            json!({ "ok": true, "proposalId": PENDING_ID, "outcome": "applied", "alreadyResolved": true })
+        );
+
+        let resp = call(
+            &srv,
+            "return await ws.workspace.applyProposal('Create workspace: Dropped', { userRequested: true });",
+        )
+        .await;
+        assert_error_contains(
+            &resp,
+            "was dismissed by the user; propose it again with ws.workspace.proposeSibling if still wanted",
+        );
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_failure_surfaces_the_error_and_records_no_resolution() {
+        let api = api_with_pending(&sibling_proposal());
+        *api.create_error.lock().unwrap() = Some(Error::InvalidParams(
+            "baseRef 'main' does not resolve".to_string(),
+        ));
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "baseRef 'main' does not resolve");
+        assert_eq!(api.create_calls.lock().unwrap().len(), 1);
+        assert!(
+            api.resolve_calls.lock().unwrap().is_empty(),
+            "the card must stay pending so the user can Retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_failure_after_create_returns_ok_with_resolve_warning() {
+        let api = api_with_pending(&sibling_proposal());
+        *api.resolve_error.lock().unwrap() = Some(Error::Internal("store closed".to_string()));
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["workspace"]["id"], "ws-new");
+        let warning = out["resolveWarning"].as_str().unwrap();
+        assert!(warning.contains("ws-new"));
+        assert!(warning.contains("could not be marked applied"));
+        assert!(warning.contains("store closed"));
+    }
+
+    #[tokio::test]
+    async fn resolve_echoing_applied_is_a_clean_apply() {
+        let api = api_with_pending(&sibling_proposal());
+        *api.resolve_persisted_outcome.lock().unwrap() = Some("applied".to_string());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["outcome"], "applied");
+        assert_eq!(out["workspace"]["id"], "ws-new");
+        assert!(out.get("resolveWarning").is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_dismissal_during_create_is_reported_not_overwritten() {
+        let api = api_with_pending(&sibling_proposal());
+        *api.resolve_persisted_outcome.lock().unwrap() = Some("dismissed".to_string());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await,
+        );
+        assert_eq!(
+            out["ok"], true,
+            "the workspace exists, so the call succeeds"
+        );
+        assert_eq!(out["proposalId"], PENDING_ID);
+        assert_eq!(
+            out["outcome"], "dismissed",
+            "the persisted resolution is echoed, never reported as applied"
+        );
+        assert_eq!(out["workspace"]["id"], "ws-new");
+        assert_eq!(out["workspace"]["title"], "Follow up");
+        let warning = out["resolveWarning"].as_str().unwrap();
+        assert!(warning.contains("ws-new"), "{warning}");
+        assert!(warning.contains("exists"), "{warning}");
+        assert!(warning.contains("'dismissed'"), "{warning}");
+        assert!(warning.contains("does not show applied"), "{warning}");
+        assert!(warning.contains("tell the user"), "{warning}");
+
+        // Exactly one resolve attempt, still requesting applied — the binding
+        // never issues a second write to overturn the dismissal.
+        let resolves = api.resolve_calls.lock().unwrap().clone();
+        assert_eq!(resolves.len(), 1);
+        assert_eq!(resolves[0].3, "applied");
+    }
+
+    #[tokio::test]
+    async fn raw_dispatch_without_caller_agent_is_rejected() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string(WS));
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "Could not determine agent ID");
+        assert!(api.create_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_is_hidden_and_raw_dispatch_denied_for_sub_agents() {
+        let top = server(api_with_pending(&sibling_proposal()));
+        let top_list = top
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        assert!(top_list["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("ws.workspace.applyProposal("));
+        let top_type = call(&top, "return typeof ws.workspace.applyProposal;").await;
+        assert_eq!(tool_text(&top_type), "\"function\"");
+
+        let api = api_with_pending(&sibling_proposal());
+        let sub = server(api.clone()).with_sub_agent(true);
+        let sub_list = sub
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        assert!(!sub_list["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("ws.workspace.applyProposal("));
+        let sub_type = call(&sub, "return typeof ws.workspace.applyProposal;").await;
+        assert_eq!(tool_text(&sub_type), "\"undefined\"");
+        let raw = call(
+            &sub,
+            &format!(
+                "return await host({{ method: 'workspace.applyProposal', args: {{ proposalId: {PENDING_ID:?}, options: {{ userRequested: true }} }} }});"
+            ),
+        )
+        .await;
+        assert_error_contains(
+            &raw,
+            "ws.workspace.applyProposal is only available to foreground top-level agents",
+        );
+        assert!(api.create_calls.lock().unwrap().is_empty());
     }
 }

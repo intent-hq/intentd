@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 mod client;
+mod exact_update;
 mod git_credential;
 mod import;
 mod legacy_import;
@@ -256,6 +257,7 @@ fn main() -> ExitCode {
         std::sync::atomic::Ordering::Relaxed,
     );
     std::env::remove_var(SITTER_IDLE_RESTART_ENV);
+    exact_update::capture_sitter_handshake();
     // Parse the CLI here too — before the tokio runtime — so `serve
     // --specialists-dir` can fold into INTENTD_SPECIALISTS_DIR while
     // `env::set_var` is still sound (the flag wins over an inherited env
@@ -2329,6 +2331,7 @@ async fn cmd_serve(
         legacy_import_bus: bus.clone(),
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
+        exact_update: exact_update::ExactUpdate::default(),
         tunnel: tunnel_supervisor.clone(),
         #[cfg(unix)]
         idle_update_state: idle_update_state.clone(),
@@ -2754,6 +2757,7 @@ struct DaemonControl {
     /// `<data_dir>/sitter/sitter.pid` — the supervising sitter's pidfile,
     /// read by `system.requestUpdate` to find the process to SIGUSR1.
     sitter_pid_path: PathBuf,
+    exact_update: exact_update::ExactUpdate,
     /// Tailcat tunnel sidecar supervisor (`server.tunnel.*`). Always present
     /// so the runtime toggle works whether or not the tunnel was boot-started.
     tunnel: Arc<tunnel::TunnelSupervisor>,
@@ -3895,7 +3899,22 @@ impl SystemControl for DaemonControl {
     }
 
     fn request_update(&self) -> Result<(), String> {
+        if self.exact_update.active() {
+            return Err("an exact-version update is already in progress".into());
+        }
         signal_sitter_update(&self.sitter_pid_path)
+    }
+
+    fn exact_update_supported(&self) -> bool {
+        exact_update::supported(&self.sitter_pid_path)
+    }
+
+    fn target_update_status(&self) -> Option<Value> {
+        self.exact_update.status()
+    }
+
+    fn request_exact_update(&self, target: &str) -> Result<(), String> {
+        self.exact_update.start(&self.sitter_pid_path, target)
     }
 
     fn import_legacy(
