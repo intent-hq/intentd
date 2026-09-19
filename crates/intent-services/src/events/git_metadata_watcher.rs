@@ -424,6 +424,7 @@ mod tests {
 
     use super::super::bus::{EventBus, Subscription};
     use super::super::filter::SubscriptionFilter;
+    use super::super::git_status_refresher::DEBOUNCE;
     use super::*;
 
     /// Self-cleaning temp directory (workspace worktrees).
@@ -1118,7 +1119,20 @@ mod tests {
         )
         .expect("git repo must gain a metadata watch");
         watcher.wait_established(crate::events::LIVENESS).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // macOS FSEvents replays mutations that landed just before the stream
+        // was created — here `init_repo`'s ref writes under `.git/refs/`,
+        // which are genuine metadata paths and legitimately schedule a
+        // debounced refresh (intent-hq/intent#3476). Drain until the
+        // refresher has been quiet for longer than its debounce so the
+        // negative assertion below only sees what `COMMIT_EDITMSG` causes.
+        while next_event(
+            &mut status_sub,
+            &ws.id,
+            DEBOUNCE + Duration::from_millis(500),
+        )
+        .await
+        .is_some()
+        {}
 
         // `COMMIT_EDITMSG` lives in `.git` but is not watched metadata.
         std::fs::write(root.path.join(".git/COMMIT_EDITMSG"), "msg\n").unwrap();
