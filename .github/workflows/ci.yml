@@ -1128,10 +1128,11 @@ jobs:
       # Depth 2 keeps both parents of the PR merge commit — HEAD^1 is the
       # base-branch tip GitHub merged against, HEAD^2 the PR head — so the
       # selection's base is HEAD^1 itself. The base is resolved from that
-      # merge commit, never from pull_request.base.sha: that SHA is frozen at
-      # event time, and once main advances before the checkout it is a
-      # disconnected depth-1 object `git merge-base` cannot connect to HEAD
-      # (intent-hq/intent#5414). Should the checkout ever be the branch head
+      # merge commit, never from pull_request.base.sha: the payload's base.sha
+      # is not guaranteed to be the first parent of the merge commit the job
+      # checks out (github.sha), and when the two differ the depth-1 fetch of
+      # base.sha is a disconnected object `git merge-base` cannot connect to
+      # HEAD (intent-hq/intent#5414). Should the checkout ever be the branch head
       # itself (no merge commit), the base branch and the PR head are fetched
       # unshallowed so origin/<base> connects to HEAD. Both changed-tests.sh
       # runs below read the same resolved BASE_SHA.
