@@ -387,6 +387,18 @@ impl Services {
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
         let settings = self.effective_settings();
+        // Optional cwd pin, resolved before any backend so an unknown
+        // workspace surfaces as -32602 (NotFound) regardless of routing; a
+        // workspace without a filesystem root just runs without a cwd
+        // (mirrors §5.31). Only the provider routes consume the cwd.
+        let cwd: Option<PathBuf> = match &workspace_id {
+            Some(id) => {
+                let ws = self.store.get_workspace(id).await?;
+                let root = file_ops::workspace_root(&ws);
+                (!root.is_empty()).then(|| PathBuf::from(root))
+            }
+            None => None,
+        };
         // A blank system prompt counts as none. The auggie CLI route composes
         // it into the prompt text; the ACP route decides per provider
         // (`one_shot_session_shape`); `fm` passes it as `-i`.
@@ -439,18 +451,6 @@ impl Services {
                     ))
                 }
             },
-        };
-
-        // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
-        // a workspace without a filesystem root just runs without a cwd
-        // (mirrors §5.31).
-        let cwd: Option<PathBuf> = match &workspace_id {
-            Some(id) => {
-                let ws = self.store.get_workspace(id).await?;
-                let root = file_ops::workspace_root(&ws);
-                (!root.is_empty()).then(|| PathBuf::from(root))
-            }
-            None => None,
         };
 
         if run_provider != "auggie" {
@@ -2040,6 +2040,29 @@ rl.on('line', (line) => {
             .unwrap();
         assert_eq!(v, unavailable, "type: commit ⇒ gate closed without fm");
         assert_eq!(fm_calls(&log).len(), 3, "commit spawned no fm");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_unknown_workspace_rejected_even_when_fm_eligible() {
+        // The §5.32 error contract does not depend on routing: an unknown
+        // workspaceId is -32602 before fm (or any provider) is consulted.
+        let (_auggie_dir, auggie) = fake_auggie("fm-unknown-ws", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, log) = fake_fm_available("unknown-ws", "cat");
+        let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        let err = services
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                None,
+                Some(WorkspaceId::from("ws-missing")),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), -32602);
+        assert!(fm_calls(&log).is_empty(), "fm never probed or spawned");
     }
 
     #[test]
