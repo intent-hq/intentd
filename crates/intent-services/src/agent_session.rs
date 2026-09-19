@@ -2876,6 +2876,16 @@ impl Services {
         // client-served handler may have side-effected on behalf of this
         // turn, so the attempt is no longer provably idempotent.
         let client_request_watermark = conn.client_request_seq();
+        // Post-output transient fetch failure (intent-hq/intent#5419): the
+        // attempt failed with a transient-shaped provider fetch error AFTER
+        // it streamed output or side-effected, so the #3007 in-place retry is
+        // off the table and the error falls through to terminal
+        // classification. Recorded here so the terminal path below can raise
+        // a blocker-style attention request on the dying agent — the death
+        // is otherwise discovered only later by a delegation-group watch or a
+        // coordinator reading the log. Deliberately NOT a redrive: whether a
+        // redrive is safe after partial output is not yet known.
+        let mut post_output_transient_fetch_failure = false;
         // Mid-turn stall detection (intent-hq/monorepo#3402): a timer arm in
         // the select loop below samples `activity.idle_ms()` on a fraction of
         // the stall threshold (clamped to 15s at the 5-minute default) and
@@ -2991,8 +3001,17 @@ impl Services {
                             attempt = fetch_retry_attempt,
                             "output arrived during retry backoff — abandoning retry (monorepo#3007)"
                         );
+                        post_output_transient_fetch_failure = true;
                         break attempt_result;
                     }
+                }
+                Err(e)
+                    if (any_update_received
+                        || conn.client_request_seq() != client_request_watermark)
+                        && intent_acp::is_transient_provider_fetch_failure(e) =>
+                {
+                    post_output_transient_fetch_failure = true;
+                    break attempt_result;
                 }
                 _ => break attempt_result,
             }
@@ -3434,6 +3453,58 @@ impl Services {
             });
             if let Ok(mut chain) = self.turn_bookkeeping.lock() {
                 chain.insert(agent_id.clone(), handle);
+            }
+        }
+        // Post-output transient fetch failure (intent-hq/intent#5419): the
+        // turn is about to fail terminally exactly as today (Error status,
+        // `agent:failed`, no redrive), but the death would otherwise only be
+        // discovered later by a delegation-group watch or a coordinator
+        // reading the log. Raise a blocker-style attention request on the
+        // dying agent through the SAME shared op `ws.agent.reportBlocker`
+        // uses — pending fields persisted on the session, linked task →
+        // `blocked`, immediate parent + watcher wakes — so whoever is waiting
+        // on the agent hears about it at once. Placed AFTER the assistant-row
+        // persist so the transcript notice lands after the streamed partial,
+        // and BEFORE the terminal persist/emits below: the agent is busy
+        // here, so the op parks the user-facing surfacing on the deferred
+        // registry and the `Err` arm's `flush_deferred_attention` surfaces it
+        // ahead of `agent:failed`. The attention columns are written by the
+        // narrow `set_attention_request` writer (not the full-row update the
+        // terminal persist uses), so the two writes cannot clobber each
+        // other; `park_attention_write` guards only the workspace-level
+        // `raise_attention` flag, which this path never touches. Best-effort:
+        // a failed raise logs and the terminal path proceeds unchanged.
+        if post_output_transient_fetch_failure {
+            if let Err(e) = &result {
+                let attempts = fetch_retry_attempt + 1;
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    attempts,
+                    "transient provider fetch failure after streamed output — not retrying in place; attention raised (monorepo#5419)"
+                );
+                let reason = format!(
+                    "Turn failed with a transient provider fetch failure after streamed output \
+                     (attempt {attempts} of {}; error class: transient provider fetch failure). \
+                     The in-place retry only applies to output-free attempts, so the turn was not \
+                     retried and the agent is stopping with status error. Provider error: {e}",
+                    MAX_TRANSIENT_PROMPT_FETCH_RETRIES + 1
+                );
+                if let Err(raise_err) = self
+                    .agent_request_attention_op(
+                        workspace_id.clone(),
+                        "blocker".to_string(),
+                        reason,
+                        Some(agent_id.clone()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %raise_err,
+                        "failed to raise attention for the post-output transient fetch failure (monorepo#5419)"
+                    );
+                }
             }
         }
         // Durable-before-observable for the streaming terminal-failure path

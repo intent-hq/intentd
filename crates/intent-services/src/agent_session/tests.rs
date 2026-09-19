@@ -4795,8 +4795,114 @@ async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
         matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
         "post-output failure keeps the terminal wrapper: {err}"
     );
-    // The streamed partial persisted as the turn's assistant row (unchanged
-    // from today's post-output failure handling).
+    // The streamed partial persisted as the turn's ONE assistant row
+    // (unchanged from today's post-output failure handling). The additional
+    // system-role blocker notice this path now appends (intent-hq/intent#5419)
+    // is asserted by `post_output_transient_fetch_failure_raises_blocker_attention`.
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.role == "assistant").count(),
+        1,
+        "streamed partial persisted, not duplicated: {messages:?}"
+    );
+}
+
+/// Regression for intent-hq/intent#5419: a transient provider-fetch failure
+/// AFTER streamed output is not retried in place (the #3007 idempotency
+/// guard) and stays terminal (`status = error`), but the dying agent now
+/// raises a blocker-style attention request naming the cause — so the
+/// parent's watch/attention surface, the delegation group, and the user
+/// learn about the death immediately instead of discovering it later. The
+/// mid-turn raise is parked (the agent is busy) and flushed by the terminal
+/// choke point, so the transcript notice lands AFTER the persisted partial
+/// assistant row and `agent:attention-requested` precedes `agent:failed`.
+#[tokio::test]
+async fn post_output_transient_fetch_failure_raises_blocker_attention() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Delegated shape: a parent session whose child is the dying agent, so
+    // the blocker path's direct parent wake has a target.
+    let parent_id = AgentId::from("parent-1");
+    services
+        .store
+        .insert_agent_session(&new_session(&parent_id, &workspace_id))
+        .await
+        .expect("insert parent session");
+    let mut child = new_session(&agent_id, &workspace_id);
+    child.parent_agent_id = Some(parent_id.clone());
+    services
+        .store
+        .update_agent_session(&workspace_id, &child)
+        .await
+        .expect("link child to parent");
+    // Production shape: the raise happens INSIDE the live turn, where the
+    // manager's busy set defers the surfacing to the turn-end flush.
+    services.set_test_busy(&agent_id, true);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(prompt_updates(), FETCH_EPIPE_UNAVAILABLE);
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a post-output transient failure stays terminal (no redrive)");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "post-output failure keeps the terminal wrapper: {err}"
+    );
+
+    // Terminal classification is unchanged: Error persisted, context stashed.
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "the post-output transient failure still parks the session in Error"
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "terminal context stashed for the worker as before"
+    );
+    // The blocker-style attention request is recorded on the dying agent
+    // and names the cause.
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "a post-output transient fetch failure raises a blocker attention request (intent#5419)"
+    );
+    let reason = stored
+        .attention_request_reason
+        .as_deref()
+        .expect("attention reason recorded");
+    assert!(
+        reason.contains("transient provider fetch failure after streamed output"),
+        "reason names the cause: {reason}"
+    );
+    assert!(
+        reason.contains("attempt 1"),
+        "reason carries the attempt count: {reason}"
+    );
+    assert!(
+        reason.contains("EPIPE"),
+        "reason carries the error class/text: {reason}"
+    );
+    // Transcript: the streamed partial persisted as the assistant row, and
+    // the blocker notice landed AFTER it (flushed at the terminal choke
+    // point, not interleaved with the turn's own output).
     let messages = services
         .store
         .get_agent_messages(&agent_id, None)
@@ -4804,8 +4910,117 @@ async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
         .unwrap();
     assert_eq!(
         messages.len(),
+        2,
+        "assistant partial + blocker notice: {messages:?}"
+    );
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(messages[1].role, "system");
+    assert_eq!(
+        messages[1].content[0]["meta"]["kind"],
+        json!("blocker-report")
+    );
+    // The parent received the blocker wake immediately.
+    let parent = services.store.get_agent_session(&parent_id).await.unwrap();
+    assert_eq!(
+        parent.messages.len(),
         1,
-        "streamed partial persisted, not duplicated"
+        "the parent gets exactly one attention wake for the dying child"
+    );
+    let wake_text = serde_json::to_string(&parent.messages[0].content).unwrap();
+    assert!(
+        wake_text.contains("transient provider fetch failure after streamed output"),
+        "parent wake names the cause: {wake_text}"
+    );
+    // Event order: `agent:attention-requested` (kind blocker) precedes
+    // `agent:failed` — never a bare failure that later grows an attention
+    // card.
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:failed") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let attention_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:attention-requested")
+        .expect("agent:attention-requested emitted for the dying agent");
+    let failed_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:failed")
+        .expect("agent:failed emitted");
+    assert!(
+        attention_idx < failed_idx,
+        "attention surfaces before the terminal failure: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+    assert_eq!(events[attention_idx].data["kind"], json!("blocker"));
+    assert_eq!(
+        events[attention_idx].data["parentAgentId"],
+        json!(parent_id.0)
+    );
+}
+
+/// Unchanged behaviour guard for intent-hq/intent#5419: a NON-transient
+/// post-output error is terminal exactly as today — no attention request is
+/// recorded, no notice appended, no `agent:attention-requested` emitted.
+#[tokio::test]
+async fn post_output_non_transient_error_raises_no_attention() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    services.set_test_busy(&agent_id, true);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(prompt_updates(), "provider rejected the request: boom");
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a post-output terminal error still fails the turn");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "terminal error keeps the wrapper: {err}"
+    );
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error, "terminal as today");
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "no attention request for a non-transient failure: {:?}",
+        stored.attention_request_kind
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1, "assistant partial only, no notice");
+    assert_eq!(messages[0].role, "assistant");
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:failed") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.event_type == "agent:attention-requested"),
+        "no attention event for a non-transient failure: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
     );
 }
 
