@@ -11,11 +11,13 @@
 //! token without it — or one whose scopes GitHub does not report, e.g. a
 //! fine-grained PAT, which cannot create gists at all — fails with
 //! [`IdentityProofError::ScopeMissing`] before anything is written. Delete
-//! is bounded the same way: it reads the gist back first (`GET
-//! /gists/{id}`, whose response carries the same scope header), refuses a
-//! token without the scope, and refuses to delete anything that is not a
-//! proof gist — exactly one file named [`PROOF_FILE_NAME`] — so the RPC can
-//! never be turned against the account's other gists
+//! is bounded the same way: it runs the same `GET /user` scope preflight
+//! first — so a token without the scope is `ScopeMissing` whatever GitHub
+//! would answer for the gist (a `404` for a gist the token cannot see must
+//! not read as "already deleted") — then reads the gist back (`GET
+//! /gists/{id}`) and refuses to delete anything that is not a proof gist —
+//! exactly one file named [`PROOF_FILE_NAME`] — so the RPC can never be
+//! turned against the account's other gists
 //! ([`IdentityProofError::NotProofGist`]).
 
 use serde_json::{json, Value};
@@ -165,12 +167,11 @@ pub fn is_proof_gist(gist: &Value) -> bool {
         .is_some_and(|files| files.len() == 1 && files.contains_key(PROOF_FILE_NAME))
 }
 
-/// `GET /gists/{id}`: the gist body plus the granted-scopes header, or
-/// `None` when the gist no longer exists (`404`).
-async fn gist_and_scopes(
-    crab: &octocrab::Octocrab,
-    gist_id: &str,
-) -> Result<Option<(Value, Option<String>)>> {
+/// `GET /gists/{id}`: the gist body, or `None` when the gist no longer
+/// exists (`404`). Only meaningful once the token's `gist` scope is
+/// established: without it GitHub answers `404` for gists it will not show
+/// the token.
+async fn read_gist(crab: &octocrab::Octocrab, gist_id: &str) -> Result<Option<Value>> {
     let response = crab
         ._get(format!("/gists/{gist_id}"))
         .await
@@ -183,21 +184,18 @@ async fn gist_and_scopes(
         Err(IdentityProofError::Other(Error::NotFound(_))) => return Ok(None),
         Err(e) => return Err(e),
     };
-    let scopes = response
-        .headers()
-        .get(OAUTH_SCOPES_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
     let body = crab.body_to_string(response).await.map_err(map_octocrab)?;
     let gist: Value = serde_json::from_str(&body).map_err(Error::from)?;
-    Ok(Some((gist, scopes)))
+    Ok(Some(gist))
 }
 
-/// Delete a proof gist. Reads the gist back first: an already-deleted gist
-/// (`404`) is `Ok` (idempotent); otherwise the token must carry the `gist`
-/// scope and the gist must be a proof gist ([`is_proof_gist`]) before the
-/// `DELETE` is sent, so the call can never remove another gist of the
-/// account.
+/// Delete a proof gist. Establishes the token's `gist` scope first (the
+/// same `GET /user` preflight as [`create_proof_gist`]), so a token without
+/// it is `ScopeMissing` before the gist's `404` / `403` can be
+/// misread; then reads the gist back: an already-deleted gist (`404`) is
+/// `Ok` (idempotent), and the gist must be a proof gist ([`is_proof_gist`])
+/// before the `DELETE` is sent, so the call can never remove another gist
+/// of the account.
 ///
 /// # Errors
 ///
@@ -213,14 +211,15 @@ pub async fn delete_proof_gist(
 ) -> Result<()> {
     let sc = client(token, api_base_url)?;
     let crab = sc.client();
-    let Some((gist, scopes)) = gist_and_scopes(crab, gist_id).await? else {
-        return Ok(());
-    };
+    let (_login, scopes) = user_and_scopes(crab).await?;
     if !has_gist_scope(scopes.as_deref()) {
         return Err(IdentityProofError::ScopeMissing {
             granted: scopes.unwrap_or_default(),
         });
     }
+    let Some(gist) = read_gist(crab, gist_id).await? else {
+        return Ok(());
+    };
     if !is_proof_gist(&gist) {
         return Err(IdentityProofError::NotProofGist {
             gist_id: gist_id.to_string(),
@@ -502,9 +501,13 @@ mod tests {
         assert!(!is_proof_gist(&json!({ "id": "x" })));
     }
 
+    /// Scoped token: the scope preflight, the read-back, then the `DELETE`;
+    /// a gist that is already gone (`404` after the scope is established) is
+    /// `Ok` with no `DELETE` sent.
     #[tokio::test]
-    async fn delete_reads_the_gist_back_then_deletes_and_is_idempotent_on_404() {
+    async fn delete_checks_scope_reads_the_gist_back_then_deletes_and_is_idempotent_on_404() {
         let (base, seen) = spawn_mock(|line| match line {
+            "GET /user" => user_answer(Some("repo, gist")),
             "GET /gists/live" => gist_answer(&[PROOF_FILE_NAME], Some("repo, gist")),
             "DELETE /gists/live" => no_content(),
             "GET /gists/gone" => json_answer(404, &json!({ "message": "Not Found" })),
@@ -516,12 +519,18 @@ mod tests {
             .expect("delete live gist");
         delete_proof_gist("tok", Some(&base), "gone")
             .await
-            .expect("404 is ok");
+            .expect("scoped 404 is ok");
         let seen = seen.lock().unwrap();
         let lines: Vec<&str> = seen.iter().map(|(line, _)| line.as_str()).collect();
         assert_eq!(
             lines,
-            ["GET /gists/live", "DELETE /gists/live", "GET /gists/gone"],
+            [
+                "GET /user",
+                "GET /gists/live",
+                "DELETE /gists/live",
+                "GET /user",
+                "GET /gists/gone"
+            ],
             "no DELETE for a gist that is already gone"
         );
     }
@@ -532,6 +541,7 @@ mod tests {
     #[tokio::test]
     async fn delete_refuses_a_gist_that_is_not_a_proof_gist() {
         let (base, seen) = spawn_mock(|line| match line {
+            "GET /user" => user_answer(Some("gist")),
             "GET /gists/notes" => gist_answer(&["notes.md"], Some("gist")),
             "GET /gists/mixed" => gist_answer(&[PROOF_FILE_NAME, "notes.md"], Some("gist")),
             other => json_answer(500, &json!({ "message": format!("unexpected {other}") })),
@@ -553,14 +563,14 @@ mod tests {
         );
     }
 
-    /// Like create, delete needs the `gist` scope: a token without it (or
-    /// one whose scopes GitHub does not report) is `ScopeMissing`, not a
-    /// silent success or a `403` misreported as a rejected token.
+    /// Like create, delete needs the `gist` scope, established by the
+    /// `GET /user` preflight before the gist is even read: a token without
+    /// it is `ScopeMissing`, never a silent success or a `403` misreported
+    /// as a rejected token.
     #[tokio::test]
-    async fn delete_without_gist_scope_is_scope_missing_before_deleting() {
+    async fn delete_without_gist_scope_is_scope_missing_before_reading_the_gist() {
         let (base, seen) = spawn_mock(|line| match line {
-            "GET /gists/live" => gist_answer(&[PROOF_FILE_NAME], Some("repo, read:org")),
-            "GET /gists/pat" => gist_answer(&[PROOF_FILE_NAME], None),
+            "GET /user" => user_answer(Some("repo, read:org")),
             other => json_answer(500, &json!({ "message": format!("unexpected {other}") })),
         })
         .await;
@@ -571,6 +581,24 @@ mod tests {
             matches!(&err, IdentityProofError::ScopeMissing { granted } if granted == "repo, read:org"),
             "{err:?}"
         );
+        let seen = seen.lock().unwrap();
+        let lines: Vec<&str> = seen.iter().map(|(line, _)| line.as_str()).collect();
+        assert_eq!(
+            lines,
+            ["GET /user"],
+            "nothing read or deleted without the scope"
+        );
+    }
+
+    /// A token whose scopes GitHub does not report (a fine-grained PAT) is
+    /// `ScopeMissing` on delete as on create.
+    #[tokio::test]
+    async fn delete_with_unreported_scopes_is_scope_missing() {
+        let (base, seen) = spawn_mock(|line| match line {
+            "GET /user" => user_answer(None),
+            other => json_answer(500, &json!({ "message": format!("unexpected {other}") })),
+        })
+        .await;
         let err = delete_proof_gist("tok", Some(&base), "pat")
             .await
             .expect_err("scope missing");
@@ -578,7 +606,55 @@ mod tests {
             matches!(&err, IdentityProofError::ScopeMissing { granted } if granted.is_empty()),
             "{err:?}"
         );
-        assert_eq!(seen.lock().unwrap().len(), 2, "no DELETE without the scope");
+        assert_eq!(seen.lock().unwrap().len(), 1, "no DELETE without the scope");
+    }
+
+    /// Without the scope GitHub answers `404` for a gist it will not show
+    /// the token: that must surface as `ScopeMissing`, not as the
+    /// "already deleted" success a scoped `404` means.
+    #[tokio::test]
+    async fn delete_without_gist_scope_on_a_404_gist_is_scope_missing_not_success() {
+        let (base, seen) = spawn_mock(|line| match line {
+            "GET /user" => user_answer(Some("repo, read:org")),
+            _ => Answer {
+                status: 404,
+                headers: vec![("X-OAuth-Scopes", "repo, read:org".to_string())],
+                body: json!({ "message": "Not Found" }).to_string(),
+            },
+        })
+        .await;
+        let result = delete_proof_gist("tok", Some(&base), "abc123").await;
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|(line, _)| line.starts_with("GET ")),
+            "no deletion should be attempted"
+        );
+        assert!(
+            matches!(result, Err(IdentityProofError::ScopeMissing { .. })),
+            "got {result:?}"
+        );
+    }
+
+    /// Same for a `403` on the gist: a missing scope is `ScopeMissing`, not
+    /// `Unauthorized`.
+    #[tokio::test]
+    async fn delete_without_gist_scope_on_a_403_gist_is_scope_missing_not_unauthorized() {
+        let (base, _seen) = spawn_mock(|line| match line {
+            "GET /user" => user_answer(Some("repo, read:org")),
+            _ => Answer {
+                status: 403,
+                headers: vec![("X-OAuth-Scopes", "repo, read:org".to_string())],
+                body: json!({ "message": "Resource not accessible by integration" }).to_string(),
+            },
+        })
+        .await;
+        let result = delete_proof_gist("tok", Some(&base), "abc123").await;
+        assert!(
+            matches!(result, Err(IdentityProofError::ScopeMissing { .. })),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
