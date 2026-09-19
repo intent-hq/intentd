@@ -11244,6 +11244,126 @@ mod wsapi4_bindings_tests {
         );
     }
 
+    /// intent-hq/intent#5387: outcome observation must not depend on the
+    /// waiter reaching its own timeout branch. The caller task — standing in
+    /// for the host future the eval-timeout drop cancels — is ABORTED while
+    /// the send is still held; the send then fails late, and the failure
+    /// must still be logged under the send label.
+    #[tokio::test]
+    async fn agent_send_caller_dropped_mid_wait_still_logs_late_failure() {
+        use crate::mcp_server::bindings::{agent::spawn_send_within_budget, EvalBudget};
+        let capture = crate::tests::WarnCapture::default();
+        let _subscriber = capture.set_as_default();
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = hold.lock().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let op = {
+            let hold = hold.clone();
+            let entered = entered.clone();
+            async move {
+                entered.notify_one();
+                drop(hold.lock_owned().await);
+                Err::<Value, String>("store pool exhausted".to_string())
+            }
+        };
+        let caller = tokio::spawn(spawn_send_within_budget(
+            EvalBudget::starting_now(std::time::Duration::from_secs(30)),
+            "messageId user-msg-dropped to agent-target".to_string(),
+            op,
+            |_| "in flight".to_string(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the send op must start behind the hold");
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(capture.lines().is_empty(), "nothing to log while held");
+
+        drop(guard);
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            lines = capture.lines();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("user-msg-dropped")
+                && l.contains("store pool exhausted")
+                && l.contains("FAILED")),
+            "late failure must be logged although the waiter was dropped: {lines:?}"
+        );
+    }
+
+    /// intent-hq/intent#5387: a late single-pending-message refusal is logged
+    /// as a non-delivery with bounded metadata — the pending id and queue
+    /// count — never the refusal's `queue` payload with its message previews.
+    #[tokio::test]
+    async fn agent_send_late_refusal_logs_outcome_without_queue_content() {
+        let capture = crate::tests::WarnCapture::default();
+        let _subscriber = capture.set_as_default();
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "q-pending-1",
+            "content": "SENTINEL-QUEUED-BODY",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_get_queue_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        let id = t
+            .split_whitespace()
+            .find(|w| w.starts_with("user-msg-"))
+            .map(|w| {
+                w.trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+                    .to_string()
+            })
+            .expect("in-flight error names the pre-minted id");
+
+        drop(guard);
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            lines = capture.lines();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let line = lines
+            .iter()
+            .find(|l| l.contains(&id))
+            .unwrap_or_else(|| panic!("late refusal must be logged under the id: {lines:?}"));
+        assert!(line.contains("WITHOUT delivering"), "{line}");
+        assert!(
+            line.contains("q-pending-1") && line.contains("queueLength"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("SENTINEL-QUEUED-BODY"),
+            "queued message content must not reach the log: {line}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "a refusal enqueues nothing"
+        );
+    }
+
     /// Omitted `priority` defaults to INTERRUPT delivery: the binding
     /// resolves the absent argument to `"interrupt"` before hitting the
     /// service layer (binding-local — wire RPC defaults are untouched).

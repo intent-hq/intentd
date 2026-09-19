@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS;
 use intent_core::settings_file::AgentFeaturesSettings;
@@ -54,39 +54,55 @@ fn is_send_non_delivery(result: &Value) -> bool {
         || result.get("refused").and_then(Value::as_bool) == Some(true)
 }
 
+/// The bounded, content-free projection of a late non-delivery result for
+/// the outcome log: outcome flags, the reason, and the pending id / queue
+/// count of a refusal — never the refusal's `queue` (it carries previews of
+/// every queued message, unrelated ones included) or any other payload.
+fn late_non_delivery_outcome(result: &Value) -> Value {
+    const KEYS: [&str; 7] = [
+        "ok",
+        "success",
+        "delivered",
+        "refused",
+        "error",
+        "pendingMessageId",
+        "queueLength",
+    ];
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = result.as_object() {
+        for key in KEYS {
+            if let Some(v) = obj.get(key) {
+                out.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
 /// The observable tail of a detached send (intent-hq/intent#5387): once the
-/// binding has returned the in-flight error nothing else awaits the spawned
-/// delivery, so its eventual outcome is logged here under `send` (the
-/// pre-minted `messageId` / task the error named) — a late failure is a
-/// WARN the operator can correlate, not a silently dropped `Result`.
-async fn log_late_send_outcome(
-    send: String,
-    waited_ms: u128,
-    handle: tokio::task::JoinHandle<Result<Value, String>>,
-) {
-    match handle.await {
-        Ok(Ok(result)) if is_send_non_delivery(&result) => tracing::warn!(
-            %send,
-            waited_ms,
-            %result,
-            "agent send completed WITHOUT delivering after its binding timed out"
+/// binding's waiter is gone — it returned the in-flight error, or the host
+/// future was dropped while it waited — nothing else sees the delivery's
+/// outcome, so it is logged here under `send` (the pre-minted `messageId` /
+/// task the error named) — a late failure is a WARN the operator can
+/// correlate, not a silently dropped `Result`.
+fn log_late_send_outcome(send: &str, elapsed_ms: u128, result: Result<Value, String>) {
+    match result {
+        Ok(result) if is_send_non_delivery(&result) => tracing::warn!(
+            send,
+            elapsed_ms,
+            outcome = %late_non_delivery_outcome(&result),
+            "agent send completed WITHOUT delivering after its binding stopped waiting"
         ),
-        Ok(Ok(_)) => tracing::info!(
-            %send,
-            waited_ms,
-            "agent send completed after its binding timed out"
+        Ok(_) => tracing::info!(
+            send,
+            elapsed_ms,
+            "agent send completed after its binding stopped waiting"
         ),
-        Ok(Err(error)) => tracing::warn!(
-            %send,
-            waited_ms,
+        Err(error) => tracing::warn!(
+            send,
+            elapsed_ms,
             %error,
-            "agent send FAILED after its binding timed out"
-        ),
-        Err(join_err) => tracing::warn!(
-            %send,
-            waited_ms,
-            error = %join_err,
-            "agent send task panicked or was cancelled after its binding timed out"
+            "agent send FAILED after its binding stopped waiting"
         ),
     }
 }
@@ -122,9 +138,13 @@ async fn refuse_if_caller_retired(
 /// (intent-hq/intent#5387). Waits at most [`send_wait_ceiling`] of the
 /// eval's REMAINING budget for the result — earlier host frames in the same
 /// eval already spent part of it; past that, returns `in_flight_error` (fed
-/// the milliseconds waited) while the task keeps running to completion and
-/// [`log_late_send_outcome`] records how it ended under `send_label`.
-async fn spawn_send_within_budget<F>(
+/// the milliseconds waited) while the task keeps running to completion.
+/// Outcome observation is attached at spawn time, independent of this
+/// waiter's lifetime: the result travels over a oneshot, and when nobody is
+/// left to receive it — the wait elapsed, or the host future holding the
+/// receiver was dropped mid-wait — the spawned side itself hands it to
+/// [`log_late_send_outcome`] under `send_label`.
+pub(crate) async fn spawn_send_within_budget<F>(
     eval_budget: EvalBudget,
     send_label: String,
     fut: F,
@@ -134,15 +154,24 @@ where
     F: std::future::Future<Output = Result<Value, String>> + Send + 'static,
 {
     let wait = send_wait_ceiling(eval_budget.remaining());
-    let mut handle = tokio::spawn(fut);
-    match tokio::time::timeout(wait, &mut handle).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(join_err)) => Err(format!("agent send task failed: {join_err}")),
-        Err(_elapsed) => {
-            let waited_ms = wait.as_millis();
-            tokio::spawn(log_late_send_outcome(send_label, waited_ms, handle));
-            Err(in_flight_error(waited_ms))
+    let started = Instant::now();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, String>>();
+    let op = tokio::spawn(fut);
+    tokio::spawn(async move {
+        let result = match op.await {
+            Ok(result) => result,
+            Err(join_err) => Err(format!(
+                "agent send task panicked or was cancelled: {join_err}"
+            )),
+        };
+        if let Err(unobserved) = tx.send(result) {
+            log_late_send_outcome(&send_label, started.elapsed().as_millis(), unobserved);
         }
+    });
+    match tokio::time::timeout(wait, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_closed)) => Err("agent send task ended without a result".to_string()),
+        Err(_elapsed) => Err(in_flight_error(wait.as_millis())),
     }
 }
 
@@ -2245,6 +2274,38 @@ mod tests {
         assert!(!is_send_non_delivery(
             &json!({ "success": true, "turnId": "t1" })
         ));
+    }
+
+    /// The late-outcome log projects a refusal to its flags, reason, pending
+    /// id and queue count — never the `queue` array (message previews).
+    #[test]
+    fn late_non_delivery_outcome_omits_queue_payload() {
+        let refusal = json!({
+            "ok": false,
+            "refused": true,
+            "agentId": "a-1",
+            "error": "send refused: pending message (id: q-1)",
+            "pendingMessageId": "q-1",
+            "queueLength": 2,
+            "queue": [{ "id": "q-1", "content": "SENTINEL" }, { "id": "q-2", "content": "SENTINEL" }],
+            "instruction": "...",
+        });
+        let out = late_non_delivery_outcome(&refusal);
+        assert_eq!(
+            out,
+            json!({
+                "ok": false,
+                "refused": true,
+                "error": "send refused: pending message (id: q-1)",
+                "pendingMessageId": "q-1",
+                "queueLength": 2,
+            })
+        );
+        assert!(!out.to_string().contains("SENTINEL"));
+        assert_eq!(
+            late_non_delivery_outcome(&json!("not an object")),
+            json!({})
+        );
     }
 
     /// The pre-minted send id has the services-side `user-msg-<uuid>` shape.
