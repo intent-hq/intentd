@@ -44741,4 +44741,87 @@ mod idempotency_serialization {
         assert_eq!(held["call"], 1);
         assert!(race.inflight.is_empty());
     }
+
+    /// A waiter cancelled while parked on the key's lock releases its hold
+    /// at once (the holder's count drops back to 1), and the entry is pruned
+    /// when the holder itself finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_waiter_releases_hold_and_entry_is_pruned() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store);
+
+        let holder = race.spawn("k", winner);
+        cp.entered.recv().await.expect("holder entered");
+        cp.started.recv().await.expect("holder op in flight");
+
+        let waiter = race.spawn("k", winner);
+        cp.entered.recv().await.expect("waiter entered");
+        race.wait_holders("k", 2).await;
+
+        waiter.abort();
+        assert!(
+            waiter.await.expect_err("aborted").is_cancelled(),
+            "waiter was cancelled while parked"
+        );
+        assert_eq!(
+            race.holders("k"),
+            1,
+            "the cancelled waiter no longer holds the key"
+        );
+
+        cp.release.send(true).expect("open gate");
+        let held = holder.await.expect("join").expect("holder result");
+        assert_eq!(held["call"], 1);
+        assert_eq!(race.calls.load(Ordering::SeqCst), 1, "op ran once");
+        assert!(
+            race.inflight.is_empty(),
+            "entry pruned once the last holder released"
+        );
+    }
+
+    /// Same-key slots dropped at the same instant must leave the registry
+    /// empty. Pruning has to release the dropping slot's ref under the
+    /// registry mutex: checking the count first and letting the ref drop
+    /// after `Drop::drop` returned lets two concurrent drops each see the
+    /// other's ref, both skip removal, and leak the entry for good.
+    #[test]
+    fn concurrent_slot_drops_prune_the_entry() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 2_000;
+
+        let inflight = IdempotencyInflight::default();
+        let key = (String::new(), "k".to_string());
+        // Three phases per round: all entered → all dropped → checked.
+        let barrier = std::sync::Barrier::new(THREADS + 1);
+
+        // Recorded rather than asserted inside the scope so a failure does
+        // not leave the workers parked on the barrier.
+        let mut leaked_round = None;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        let slot = inflight.enter(key.clone());
+                        barrier.wait();
+                        drop(slot);
+                        barrier.wait();
+                        barrier.wait();
+                    }
+                });
+            }
+            for round in 0..ROUNDS {
+                barrier.wait();
+                barrier.wait();
+                if leaked_round.is_none() && !inflight.is_empty() {
+                    leaked_round = Some((round, inflight.holders(&key)));
+                }
+                barrier.wait();
+            }
+        });
+        assert_eq!(
+            leaked_round, None,
+            "(round, holders): entry leaked after every slot dropped"
+        );
+    }
 }

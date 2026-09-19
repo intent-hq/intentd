@@ -13884,7 +13884,7 @@ impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
         KeyedInflightSlot {
             registry: self,
             key,
-            lock,
+            lock: Some(lock),
         }
     }
 
@@ -13912,7 +13912,19 @@ impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
 struct KeyedInflightSlot<'a, K: std::hash::Hash + Eq> {
     registry: &'a KeyedInflight<K>,
     key: K,
-    lock: Arc<tokio::sync::Mutex<()>>,
+    /// `Some` until `Drop`, which releases it under the registry mutex.
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl<K: std::hash::Hash + Eq> KeyedInflightSlot<'_, K> {
+    /// Acquire the key's lock; the guard must be dropped before the slot.
+    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lock
+            .as_ref()
+            .expect("keyed inflight slot lock is taken only on drop")
+            .lock()
+            .await
+    }
 }
 
 impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
@@ -13922,9 +13934,16 @@ impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
             .locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Two strong refs = the map's and ours; anyone else waiting on the
-        // key holds a third.
-        if Arc::strong_count(&self.lock) <= 2 {
+        // Release our ref while the registry is locked so the prune check
+        // below and another slot's concurrent drop cannot both see each
+        // other's ref and both skip the removal (the field would otherwise
+        // drop only after this fn returns, outside the mutex).
+        drop(self.lock.take());
+        // Only the map's ref left = nobody holds or awaits the key.
+        if locks
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
             locks.remove(&self.key);
         }
     }
@@ -13978,7 +13997,7 @@ where
         return op().await;
     };
     let slot = inflight.enter((workspace_id.to_string(), key.clone()));
-    let _held = slot.lock.lock().await;
+    let _held = slot.acquire().await;
     if let Some(stored) = store.get_idempotent(workspace_id, &key).await? {
         let value: T = serde_json::from_str(&stored)
             .map_err(|e| Error::Internal(format!("decode idempotent result failed: {e}")))?;
