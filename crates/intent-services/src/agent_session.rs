@@ -2884,8 +2884,12 @@ impl Services {
         // a blocker-style attention request on the dying agent — the death
         // is otherwise discovered only later by a delegation-group watch or a
         // coordinator reading the log. Deliberately NOT a redrive: whether a
-        // redrive is safe after partial output is not yet known.
-        let mut post_output_transient_fetch_failure = false;
+        // redrive is safe after partial output is not yet known. Carries the
+        // number of `session/prompt` dispatches actually made (the failing
+        // attempt's ordinal), captured at each fall-through site because
+        // `fetch_retry_attempt` is bumped BEFORE the backoff and so overcounts
+        // on the abandon-during-backoff path.
+        let mut post_output_transient_fetch_failure: Option<u32> = None;
         // Mid-turn stall detection (intent-hq/monorepo#3402): a timer arm in
         // the select loop below samples `activity.idle_ms()` on a fraction of
         // the stall threshold (clamped to 15s at the 5-minute default) and
@@ -3001,7 +3005,10 @@ impl Services {
                             attempt = fetch_retry_attempt,
                             "output arrived during retry backoff — abandoning retry (monorepo#3007)"
                         );
-                        post_output_transient_fetch_failure = true;
+                        // `fetch_retry_attempt` was already bumped for the
+                        // retry that is now abandoned: the failing attempt is
+                        // the one dispatched BEFORE that bump.
+                        post_output_transient_fetch_failure = Some(fetch_retry_attempt);
                         break attempt_result;
                     }
                 }
@@ -3010,7 +3017,7 @@ impl Services {
                         || conn.client_request_seq() != client_request_watermark)
                         && intent_acp::is_transient_provider_fetch_failure(e) =>
                 {
-                    post_output_transient_fetch_failure = true;
+                    post_output_transient_fetch_failure = Some(fetch_retry_attempt + 1);
                     break attempt_result;
                 }
                 _ => break attempt_result,
@@ -3474,9 +3481,8 @@ impl Services {
         // other; `park_attention_write` guards only the workspace-level
         // `raise_attention` flag, which this path never touches. Best-effort:
         // a failed raise logs and the terminal path proceeds unchanged.
-        if post_output_transient_fetch_failure {
+        if let Some(attempts) = post_output_transient_fetch_failure {
             if let Err(e) = &result {
-                let attempts = fetch_retry_attempt + 1;
                 tracing::warn!(
                     agent = %agent_id,
                     error = %e,

@@ -5024,6 +5024,88 @@ async fn post_output_non_transient_error_raises_no_attention() {
     );
 }
 
+/// Attempt-count regression for intent-hq/intent#5419 (PR #2004 review): on
+/// the abandon-during-backoff fall-through, `fetch_retry_attempt` has already
+/// been bumped for the retry that never dispatches. The blocker reason must
+/// still report the attempt that actually ran — ONE `session/prompt`, so
+/// `attempt 1 of 3` — not the abandoned retry's ordinal. Deterministic shape:
+/// the attempt fails transient with nothing buffered (arming the backoff), and
+/// the update lands 100ms into a 1s backoff, so the post-backoff drain flips
+/// `any_update_received` and abandons the retry.
+#[tokio::test]
+async fn backoff_late_output_blocker_reason_reports_dispatched_attempt() {
+    let _env = EnvGuard::set_all(&[("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "1000")]);
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "late during backoff" } }
+        }
+    })
+    .to_string();
+    let (release_error_tx, release_error_rx) = tokio::sync::oneshot::channel();
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let (_agent, prompt_calls) = spawn_stall_then_error_then_update_mock_agent(
+        c2a_agent,
+        a2c_agent,
+        chunk,
+        release_error_rx,
+    );
+    let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    // Fail the first (and only) attempt immediately.
+    release_error_tx.send(()).expect("mock alive");
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("abandoned retry surfaces the attempt's error");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "abandoned retry keeps the terminal wrapper: {err}"
+    );
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "exactly one session/prompt dispatched — the retry was abandoned"
+    );
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error);
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "abandon-during-backoff fall-through raises the blocker too"
+    );
+    let reason = stored
+        .attention_request_reason
+        .as_deref()
+        .expect("attention reason recorded");
+    assert!(
+        reason.contains("attempt 1 of 3"),
+        "reason counts the attempt that actually dispatched, not the abandoned retry: {reason}"
+    );
+}
+
 /// Mock agent that issues one side-effecting agent→client request
 /// (`fs/write_text_file`) and then fails `session/prompt` with a
 /// transient-shaped `-32603` — the request line is written BEFORE the error
@@ -5957,18 +6039,21 @@ async fn mid_turn_stall_emits_stalled_then_resumed_and_rearms() {
 /// enough for the daemon to settle into its retry backoff, far shorter than
 /// the 1s backoff), and only THEN streams `update` — so the note is
 /// guaranteed to be picked up by a buffered `try_recv` drain, never by the
-/// select-loop arm.
+/// select-loop arm. Returns the `session/prompt` dispatch counter alongside
+/// the task handle (a second prompt is counted but never answered).
 fn spawn_stall_then_error_then_update_mock_agent<R, W>(
     read: R,
     write: W,
     update: String,
     release_error: tokio::sync::oneshot::Receiver<()>,
-) -> JoinHandle<()>
+) -> (JoinHandle<()>, Arc<AtomicUsize>)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
+    let counter = prompt_calls.clone();
+    let handle = tokio::spawn(async move {
         let mut lines = BufReader::new(read).lines();
         let mut write = write;
         let mut release = Some(release_error);
@@ -5983,6 +6068,7 @@ where
                 continue;
             };
             if method == "session/prompt" {
+                counter.fetch_add(1, Ordering::SeqCst);
                 if let Some(release_error) = release.take() {
                     let _ = release_error.await;
                     let resp = json!({
@@ -6018,7 +6104,8 @@ where
                 .unwrap();
             write.flush().await.unwrap();
         }
-    })
+    });
+    (handle, prompt_calls)
 }
 
 /// Regression (PR #1462 review): `resumed` must be emitted even when the
@@ -6049,7 +6136,7 @@ async fn buffered_update_drained_after_stall_still_emits_resumed() {
     let (release_error_tx, release_error_rx) = tokio::sync::oneshot::channel();
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
-    let _agent = spawn_stall_then_error_then_update_mock_agent(
+    let (_agent, _prompt_calls) = spawn_stall_then_error_then_update_mock_agent(
         c2a_agent,
         a2c_agent,
         chunk,
