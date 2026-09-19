@@ -397,13 +397,20 @@ async fn workspace_create_derives_repository_name_over_wss() {
     drop(daemon);
 }
 
-/// Two `workspace.create` requests carrying the same fresh `idempotencyKey`,
-/// in flight at the same time on two WSS connections, are exactly-once: the
-/// daemon serializes same-key first-use callers per key, so both replies name
-/// the same workspace (the second is a byte-equal replay of the first) and
+/// Two `workspace.create` requests carrying the same fresh `idempotencyKey`
+/// over the real WSS wire shape — two connections, both frames sent before
+/// either reply is read — are exactly-once: both replies name the same
+/// workspace (the second is a byte-equal replay of the first) and
 /// `workspace.list` shows a single workspace. Regression for the lookup → op
 /// → persist window in `with_idempotency`, where two concurrent callers both
 /// missed the lookup and provisioned two workspaces for one key.
+///
+/// What this proves: the exactly-once invariant holds end to end over WSS.
+/// What it does not force: server-side handler overlap — the client cannot
+/// control when each frame is read, so the first request may already have
+/// persisted before the second is dispatched. The deterministic overlap proof
+/// is `concurrent_same_key_creates_yield_one_workspace` in `intent-services`.
+/// Empirically this test failed 10/10 against the pre-lock tree.
 #[tokio::test]
 async fn workspace_create_concurrent_same_key_is_exactly_once_over_wss() {
     if !gate() {
@@ -427,8 +434,9 @@ async fn workspace_create_concurrent_same_key_is_exactly_once_over_wss() {
         "idempotencyKey": key,
     });
 
-    // Both frames leave before either reply is read, so the two requests
-    // overlap inside the daemon rather than replaying sequentially.
+    // Both frames leave before either reply is read (the real client wire
+    // shape); whether the handlers overlap inside the daemon is up to
+    // scheduling — see the doc comment.
     wss_send(&mut ws_a, 2, "workspace.create", params.clone()).await;
     wss_send(&mut ws_b, 3, "workspace.create", params).await;
     let (first, second) = tokio::join!(
