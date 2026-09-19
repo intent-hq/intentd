@@ -1821,10 +1821,13 @@ async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
 
 /// Every `ProofInvalid` branch: a gist of another owner, a missing proof
 /// file, a first line that is not the nonce, a gist created before the
-/// nonce, an unknown gist, a nonce this host never issued, a nonce issued
-/// for another invite, a login GitHub does not know — and each attempt
-/// consumes the nonce it named (a later, otherwise-valid proof on the same
-/// nonce is refused too). Nothing joins; the invite stays open.
+/// nonce, an unknown gist, an anonymous / malformed gist GitHub serves
+/// without `owner.login` / `created_at` (a decode failure, not a transport
+/// one — it can never establish an identity, so it is not the retryable
+/// `GithubUnreachable`), a nonce this host never issued, a nonce issued for
+/// another invite, a login GitHub does not know — and each attempt consumes
+/// the nonce it named (a later, otherwise-valid proof on the same nonce is
+/// refused too). Nothing joins; the invite stays open.
 #[tokio::test]
 async fn prove_refuses_mismatched_gists_and_spends_the_nonce() {
     let tmp = TempDb::new();
@@ -1859,6 +1862,7 @@ async fn prove_refuses_mismatched_gists_and_spends_the_nonce() {
             ("nofile", Ok(gist("guest", None))),
             ("wrongline", Ok(gist("guest", Some("not-the-nonce")))),
             ("stale", Ok(stale)),
+            ("anonymous", Err("anonymous".to_string())),
             ("ok", Ok(gist("guest", Some(&n)))),
             ("unknownlogin", Ok(gist("nobody", Some(&n)))),
         ],
@@ -1880,11 +1884,20 @@ async fn prove_refuses_mismatched_gists_and_spends_the_nonce() {
         ("wrongline", "guest"),
         ("stale", "guest"),
         ("missing", "guest"),
+        ("anonymous", "guest"),
         ("unknownlogin", "nobody"),
     ] {
         let n = challenge(&f, &invite_id, &secret).await;
         let r = prove(&f, &n, gist_id, login).await;
         assert_eq!(invite_kind(&r), InviteErrorKind::ProofInvalid, "{gist_id}");
+        assert!(
+            !f.services
+                .invite_nonces
+                .lock()
+                .await
+                .contains_key(n.as_str()),
+            "{gist_id}: the nonce is spent, not restored"
+        );
         // The nonce is spent by the attempt: a matching gist is now too late.
         let again = prove(&f, &n, "ok", "guest").await;
         assert_eq!(
