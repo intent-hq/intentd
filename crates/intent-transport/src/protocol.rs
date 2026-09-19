@@ -558,10 +558,15 @@
 //! role in the target workspace is `collaborator` (`agent.sendMessage`
 //! user-origin, `agent.sendToTask`, `agent.queueMessage`,
 //! `agent.editAndRegenerate`, a collaborator's `agent.editQueuedMessage`
-//! of a human-authored entry, and a `role: user` row of
+//! of a human-authored entry, a `role: user` row of
 //! `agent.appendMessage` (string content, or the first `text` block of a
 //! block array — a text-less array gains a leading text block; other roles
-//! byte-identical)) is persisted — and delivered to the model — with the
+//! byte-identical), and the free text of `agent.wakeOrCreate`
+//! (`contextMessage`) and `agent.delegate` (`agentInstructions` /
+//! `taskText`; not the task-note fallback) — both
+//! refused to collaborators at the transport gate (`-32003`), so their
+//! service-level preamble is defense in depth) is persisted — and delivered
+//! to the model — with the
 //! daemon-prepended single-line paragraph `Message from @{login}
 //! ({displayName}), a collaborator (guest) of this workspace — not the
 //! workspace owner.` plus a blank line above the caller's text (login-only
