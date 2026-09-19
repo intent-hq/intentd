@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.81] - 2026-09-19
+
+### 🚀 Features
+
+- Support exact-version remote daemon updates ([#1941](https://github.com/intent-hq/intentd/pull/1941))
+
+
 ## [0.9.80] - 2026-09-19
 
 ### 🚀 Features

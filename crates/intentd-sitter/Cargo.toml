@@ -1,6 +1,6 @@
 [package]
 name = "intentd-sitter"
-version = "0.1.19"
+version = "0.1.20"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
