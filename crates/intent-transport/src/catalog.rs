@@ -5,9 +5,27 @@
 //! here. The golden test (`catalog/tests.rs`) enforces that any surface drift
 //! (added/removed/renamed methods) fails CI with a clear "update the catalog +
 //! docs/protocol/ + bump protocol version" message.
+//!
+//! The one runtime artifact here is [`COLLABORATOR_METHODS`]: the default-deny
+//! allowlist of methods a connection bound to a non-administrator principal
+//! may call (multiplayer w3). Its golden test asserts every cataloged method is
+//! either on the list or named in the refused remainder, so adding a method
+//! without classifying it fails CI.
+
+use std::collections::HashSet;
+use std::sync::OnceLock;
 
 #[cfg(test)]
 mod tests;
+
+/// JSON-RPC error code for a request the bound principal may not make:
+/// a non-administrator calling a method outside [`COLLABORATOR_METHODS`],
+/// or an owner-only transport surface (`host.*`, `browser.*`, `forward.*`,
+/// reverse RPCs). Server-defined range, next to `-32001 Unauthorized`.
+pub const FORBIDDEN_ERROR_CODE: i32 = -32003;
+
+/// Human message paired with [`FORBIDDEN_ERROR_CODE`].
+pub const FORBIDDEN_ERROR_MESSAGE: &str = "Forbidden";
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
@@ -325,6 +343,8 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.list",
     "workspace.localChanges",
     "workspace.markSeen",
+    "workspace.members.list",
+    "workspace.members.remove",
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
@@ -340,10 +360,21 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
 ///
 /// The daemon accepts these 2 alias forms and dispatches them to their canonical
 /// counterparts. The wire accepts both, but the canonical name is the documented
-/// form in docs/protocol/05-method-catalog.md.
-#[cfg(test)]
+/// form in docs/protocol/05-method-catalog.md. Runtime (not test-only): the
+/// collaborator allowlist lookup canonicalises through it, so an alias can
+/// never bypass the classification of its canonical method.
 pub(crate) const METHOD_ALIASES: &[(&str, &str)] =
     &[("git.diff", "git.diffs"), ("git.log", "git.commits")];
+
+/// The canonical spelling of `method`: the alias target when `method` is in
+/// [`METHOD_ALIASES`], otherwise `method` itself.
+#[must_use]
+pub(crate) fn canonical_method(method: &str) -> &str {
+    METHOD_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == method)
+        .map_or(method, |(_, canonical)| canonical)
+}
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
@@ -427,3 +458,225 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
     "host.pickApplication",
     "providers.setup.openLogin",
 ];
+
+/// Methods a connection bound to a **non-administrator** principal may call
+/// (multiplayer w3, default-deny). Every inbound method is canonicalised via
+/// [`METHOD_ALIASES`] and looked up here in `conn::process_frame` before any
+/// classify or dispatch path; a miss is refused with [`FORBIDDEN_ERROR_CODE`].
+///
+/// Each entry is `(canonical method, vetting note)`: what it reads or
+/// mutates, why a guest needs it, and why it cannot reach the host or another
+/// workspace. The list is the Read + Steer & edit classes of the capability
+/// matrix plus the client-boot / per-client set the desktop needs to connect
+/// and render, and the guest lifecycle. Per-workspace membership is enforced
+/// in the service layer on top of this gate; this list only says which
+/// methods a guest may *attempt*.
+///
+/// Owner-only by design (never listed): every `host.*` method but the two
+/// display probes, `browser.*`, `forward.*`, `terminal.*`, `script.*`,
+/// `github.*` / `linear.*` / `sentry.*` / `voice.*` (act with the primary
+/// user's third-party credentials), `settings.*`, `repo.*`, `mcp.*`,
+/// `server.*` / `pairing.*` / `system.*` (except `system.capabilities`),
+/// `workspace.create` / `git.clone` (arbitrary host paths), agent / hook /
+/// PR-monitor deletion, and `agent.replaceMessages` — it persists
+/// client-supplied user rows verbatim, so a non-owner could forge
+/// `fromPrincipalId` attribution; collaborators keep
+/// `agent.editAndRegenerate` for the edit flow. The golden test in
+/// `catalog/tests.rs` freezes the refused remainder so a new method must be
+/// classified explicitly.
+pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
+    ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows. Workspace-scoped, no host reach."),
+    ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
+    ("agent.create", "Steer: creates an agent in a workspace. The agent acts with the owner's capabilities (decided); the guest only starts it."),
+    ("agent.delegate", "Steer: delegates a task note to a new agent in the workspace. Same trust as agent.create."),
+    ("agent.dismissQuestions", "Steer: dismisses an agent's pending structured questions. Agent-scoped state only."),
+    ("agent.editAndRegenerate", "Steer: edits a user message and regenerates from it. Conversation write, workspace-scoped."),
+    ("agent.editQueuedMessage", "Steer: edits a queued message. Queue write, agent-scoped."),
+    ("agent.get", "Read: one agent record. Workspace-scoped."),
+    ("agent.getConversation", "Read: an agent's transcript page. Workspace-scoped; tool bodies are the agent's own output."),
+    ("agent.getMessageBlock", "Read: one full content block of a transcript message. Same scope as getConversation."),
+    ("agent.getModels", "Read: the model options an agent may switch to. Provider catalog projection, no credentials."),
+    ("agent.getQueue", "Read: an agent's pending message queue. Agent-scoped."),
+    ("agent.getSession", "Read: an agent's ACP session summary. Agent-scoped."),
+    ("agent.getSessionStats", "Read: token/turn counters for one agent. Usage read."),
+    ("agent.getSubscriptions", "Read: an agent's active event subscriptions. Agent-scoped."),
+    ("agent.list", "Read: agents of a workspace. Membership-filtered in the service layer."),
+    ("agent.listActive", "Read: active agents across visible workspaces. Membership-filtered in the service layer."),
+    ("agent.listInterrupted", "Read: agents interrupted by a daemon restart. Membership-filtered in the service layer."),
+    ("agent.listUserMessages", "Read: the user rows of a conversation (prompt history). Workspace-scoped."),
+    ("agent.markSeen", "Steer: clears an agent's unseen marker. Per-agent UI state."),
+    ("agent.pendingPermissions", "Read: an agent's outstanding ACP permission prompts. Agent-scoped."),
+    ("agent.queueMessage", "Steer: queues a message for an agent; stamped with the caller's principal."),
+    ("agent.removeQueuedMessage", "Steer: retracts a queued message. Queue write, agent-scoped."),
+    ("agent.rename", "Steer: renames an agent session. Metadata write."),
+    ("agent.resolveInterrupted", "Steer: resumes or dismisses an interrupted agent. Agent lifecycle, no host reach."),
+    ("agent.respondPermission", "Steer: answers an agent's ACP permission prompt. The agent already acts with the owner's capabilities; this only unblocks it."),
+    ("agent.restore", "Steer: restores a retired agent. Agent lifecycle."),
+    ("agent.retry", "Steer: retries a failed turn. Agent lifecycle."),
+    ("agent.sendMessage", "Steer: sends a message to an agent; stamped with the caller's principal (decided: agent.send* allowed)."),
+    ("agent.sendQueuedMessageNow", "Steer: promotes a queued message. Queue write, agent-scoped."),
+    ("agent.sendToTask", "Steer: messages the agent assigned to a task note. Same as sendMessage."),
+    ("agent.setModel", "Steer: switches an agent's model among the catalog (decided: allowed). No credential access."),
+    ("agent.stop", "Steer: stops an agent turn (decided: allowed)."),
+    ("agent.subscribe", "Client boot: subscribes to an agent's events (fast path when no eventTypes). Delivery is narrowed by the collaborator event allowlist."),
+    ("agent.summary", "Read: a short summary of an agent's work. Workspace-scoped."),
+    ("agent.unsubscribe", "Client boot: drops an agent subscription."),
+    ("agent.update", "Steer: updates agent metadata (name, background flag). No host reach."),
+    ("agent.wakeOrCreate", "Steer: ensures a task has a working agent. Same trust as agent.create."),
+    ("chat.subscribe", "Client boot: the chat channel fast path the desktop renders conversations from. Workspace-scoped; delivery narrowed by the event allowlist."),
+    ("chat.unsubscribe", "Client boot: drops a chat channel subscription."),
+    ("client.hello", "Client boot: binds the connection's logical client id and capabilities. Identity is never taken from it: a collaborator's client id is namespaced by its principal, and a non-administrator connection is never bound into the reverse registry (no reverse-RPC / tab-host eligibility, presence, or client:* transitions) regardless of what it advertises."),
+    ("comment.add", "Edit: anchors a comment on a note; actor recorded. Note-scoped."),
+    ("comment.delete", "Edit: deletes one comment. Note-scoped."),
+    ("comment.getThread", "Read: one comment thread. Note-scoped."),
+    ("comment.list", "Read: comment threads of a note. Note-scoped."),
+    ("comment.resolveThread", "Edit: resolves a comment thread. Note-scoped."),
+    ("comment.respond", "Edit: replies in a comment thread; actor recorded. Note-scoped."),
+    ("comment.subscribe", "Client boot: comment channel fast path. Note/workspace-scoped."),
+    ("comment.unsubscribe", "Client boot: drops a comment channel subscription."),
+    ("crossWorkspace.listNotes", "Read: notes of a sibling workspace. Membership-filtered in the service layer."),
+    ("crossWorkspace.listSiblings", "Read: sibling workspaces sharing the repo. Membership-filtered in the service layer."),
+    ("crossWorkspace.readNote", "Read: a sibling workspace note. Membership-filtered in the service layer."),
+    ("drafts.clear", "Per-client: clears the caller's own draft. Keyed by the connection's principal-scoped client id."),
+    ("drafts.get", "Per-client: reads the caller's own draft. Keyed by the connection's principal-scoped client id."),
+    ("drafts.set", "Per-client: saves the caller's own draft. Keyed by the connection's principal-scoped client id."),
+    ("event.agentActivity", "Read: durable event log for an agent. Rows are narrowed by the collaborator event allowlist."),
+    ("event.query", "Read: durable event query. Rows are narrowed by the collaborator event allowlist."),
+    ("event.workspaceSummary", "Read: aggregated workspace activity. Built from allowlisted event rows only."),
+    ("events.subscribe", "Client boot: the general event bus subscription. Non-administrator filters are narrowed to the collaborator event allowlist at fan-out."),
+    ("events.unsubscribe", "Client boot: drops an event bus subscription."),
+    ("file.attachmentUpload.abort", "Edit: aborts a chat attachment upload. Attachment store under the workspace, no arbitrary host path."),
+    ("file.attachmentUpload.begin", "Edit: starts a chat attachment upload into the workspace attachment store."),
+    ("file.attachmentUpload.chunk", "Edit: appends a chunk to an in-flight attachment upload."),
+    ("file.attachmentUpload.commit", "Edit: finalises an attachment upload."),
+    ("file.delete", "Edit: deletes a repo file. Path is confined to the workspace root by the service layer."),
+    ("file.exists", "Read: repo path existence. Workspace-root confined."),
+    ("file.getAttachmentInfo", "Read: metadata of a chat attachment. Workspace attachment store."),
+    ("file.list", "Read: repo directory listing. Workspace-root confined."),
+    ("file.mkdir", "Edit: creates a repo directory. Workspace-root confined."),
+    ("file.placeAttachment", "Edit: copies an attachment into the workspace. Workspace-root confined."),
+    ("file.read", "Read: a repo file. Workspace-root confined."),
+    ("file.readChunk", "Read: a byte range of a repo file. Workspace-root confined."),
+    ("file.rename", "Edit: renames a repo path. Both ends workspace-root confined."),
+    ("file.stat", "Read: repo path metadata. Workspace-root confined."),
+    ("file.tree", "Read: repo tree listing. Workspace-root confined."),
+    ("file.write", "Edit: writes a repo file. Workspace-root confined."),
+    ("git.branchDiff", "Read: diff between branches of the workspace repo."),
+    ("git.branchStatus", "Read: ahead/behind status of the workspace branch."),
+    ("git.changes", "Read: working-tree change list."),
+    ("git.checkMergeConflicts", "Read: merge-conflict probe against a base ref."),
+    ("git.checkoutBranch", "Edit: checks out a branch in the workspace worktree (git write family, decided)."),
+    ("git.commit", "Edit: commits staged changes with the host's git identity (everything publishes as the primary user)."),
+    ("git.commitDetails", "Read: one commit's metadata and files."),
+    ("git.commits", "Read: commit log of the workspace repo (alias git.log canonicalises here)."),
+    ("git.createBranch", "Edit: creates a branch (git write family, decided)."),
+    ("git.diffs", "Read: working-tree diffs (alias git.diff canonicalises here)."),
+    ("git.discard", "Edit: discards working-tree changes (git write family, decided)."),
+    ("git.fetch", "Edit: fetches with the primary user's credentials under the trust model (decided)."),
+    ("git.getBranches", "Read: local and remote branch names."),
+    ("git.getConfig", "Read: a git config value of the workspace repo (identity used for commits). No secret material; credentials live in the askpass helper, not git config."),
+    ("git.getRemoteUrl", "Read: the workspace remote URL."),
+    ("git.numstat", "Read: per-file change counts."),
+    ("git.pull", "Edit: pulls with the primary user's credentials under the trust model (decided)."),
+    ("git.push", "Edit: pushes with the primary user's token under the trust model (decided)."),
+    ("git.removeLockFile", "Edit: removes a stale index.lock inside the workspace .git (git write family, decided)."),
+    ("git.renameBranch", "Edit: renames a branch (git write family, decided)."),
+    ("git.showFile", "Read: a file at a ref."),
+    ("git.stage", "Edit: stages paths (git write family, decided)."),
+    ("git.stageHunk", "Edit: stages a hunk (git write family, decided)."),
+    ("git.status", "Read: porcelain status."),
+    ("git.unstage", "Edit: unstages paths (git write family, decided)."),
+    ("git.unstageHunk", "Edit: unstages a hunk (git write family, decided)."),
+    ("gitRoot.list", "Read: the workspace's registered secondary git roots (branch read live). Workspace-scoped registry, no host scan."),
+    ("hook.list", "Read: background hooks of the workspace with their scripts and state. Read only; run/cancel stay owner-only."),
+    ("host.status", "Client boot: OS / hostname / display probe the desktop needs to render locality. The one host.* read that reveals no path and runs nothing (matrix exception)."),
+    ("host.toolAvailability", "Client boot: which optional host tools are installed (booleans only). Matrix exception alongside host.status."),
+    ("metrics.getAgentStats", "Read: usage counters of one agent. Usage/stats read."),
+    ("metrics.getWorkspaceStats", "Read: usage counters of one workspace. Usage/stats read."),
+    ("models.list", "Client boot: the provider/model catalog the composer renders. No credentials in the payload."),
+    ("note.add", "Edit: appends to a note; actor recorded. Workspace-scoped."),
+    ("note.create", "Edit: creates a note. Workspace-scoped."),
+    ("note.delete", "Edit: deletes a note. Workspace-scoped."),
+    ("note.edit", "Edit: surgical text replacement in a note."),
+    ("note.editLines", "Edit: line-range replacement in a note."),
+    ("note.get", "Read: one note."),
+    ("note.getVersion", "Read: one note revision."),
+    ("note.lineAttribution.computeNow", "Read: forces the per-line attribution computation for a note (derived data, no host reach)."),
+    ("note.lineAttribution.load", "Read: per-line attribution of a note."),
+    ("note.list", "Read: notes of a workspace."),
+    ("note.listTasks", "Read: checkbox tasks of a note."),
+    ("note.listVersions", "Read: revision list of a note."),
+    ("note.readAsset", "Read: a note asset (image/video) from the workspace asset store."),
+    ("note.restoreVersion", "Edit: restores a note revision."),
+    ("note.saveAsset", "Edit: stores a note asset in the workspace asset store."),
+    ("note.setContent", "Edit: full-content note write (three-way merged on a stale rev)."),
+    ("note.subscribe", "Client boot: note channel fast path."),
+    ("note.unsubscribe", "Client boot: drops a note channel subscription."),
+    ("note.update", "Edit: versioned note write (content or metadata)."),
+    ("note.updateMetadata", "Edit: note title/tags."),
+    ("pr.refresh", "Read+: re-fetches the workspace's PR (owner/repo/number from the workspace record, no caller-controlled target) with the primary user's GitHub quota (decided) and persists the badge state on the workspace — the trio's only write."),
+    ("pr.status", "Read: the workspace PR badge summary. Target resolved from the workspace record only."),
+    ("prMonitor.list", "Read: PR monitors of the workspace. Cancel/flush stay owner-only."),
+    ("primitive.addAgentAction", "Edit: adds an agent-action block to a note. Note content only."),
+    ("primitive.addCli", "Edit: adds a CLI block to a note. Note content only; nothing runs."),
+    ("primitive.addPatch", "Edit: adds a patch block to a note. Note content only; nothing applies."),
+    ("primitive.addReference", "Edit: adds a code-reference block to a note. Note content only."),
+    ("principal.me", "Guest lifecycle: the caller's own principal record and role."),
+    ("providers.catalog", "Client boot: static provider catalog for the composer. No credentials."),
+    ("search.cancel", "Read: cancels the caller's own search."),
+    ("search.codebase", "Read: workspace-scoped code search."),
+    ("search.events", "Read: workspace-scoped event search. Rows narrowed by the collaborator event allowlist."),
+    ("search.fileNames", "Read: workspace-scoped file-name search."),
+    ("search.inFiles", "Read: workspace-scoped content search."),
+    ("search.messages", "Read: workspace-scoped chat search."),
+    ("search.notes", "Read: workspace-scoped note search."),
+    ("skill.list", "Client boot: available skills for the composer. Names and descriptions only."),
+    ("specialist.get", "Read: one specialist definition. Create/edit/delete stay daemon administration."),
+    ("specialist.list", "Client boot: the specialist catalog the delegate picker renders."),
+    ("stats.getRateHistory", "Read: usage rate history. Usage/stats read."),
+    ("stats.getUsage", "Read: usage totals. Usage/stats read."),
+    ("system.capabilities", "Client boot: the daemon's advertised capability flags. No host detail beyond feature booleans."),
+    ("task.assignAgent", "Edit: assigns an agent to a task note."),
+    ("task.convertBlocks", "Edit: converts @@@task blocks into task notes."),
+    ("task.createPrerequisite", "Edit: adds a prerequisite task."),
+    ("task.get", "Read: one task note."),
+    ("task.getMyTask", "Read: a task note with metadata and acceptance criteria."),
+    ("task.linkAgent", "Edit: links an agent to a task."),
+    ("task.list", "Read: task notes of a workspace."),
+    ("task.listAgentLinks", "Read: agent links of a task."),
+    ("task.markAsTask", "Edit: converts a note into a task note."),
+    ("task.removeAgentFromAllTasks", "Edit: unlinks an agent from every task in the workspace."),
+    ("task.setRelations", "Edit: task dependsOn/conflictsWith relations."),
+    ("task.subscribe", "Client boot: task channel fast path."),
+    ("task.unlinkAgent", "Edit: unlinks an agent from a task."),
+    ("task.unsubscribe", "Client boot: drops a task channel subscription."),
+    ("task.update", "Edit: one checkbox line; actor recorded."),
+    ("task.updateNoteStatus", "Edit: task note lifecycle status; actor recorded."),
+    ("task.updateStatus", "Edit: one checkbox status by text; actor recorded."),
+    ("workspace.dismissAttention", "Steer: clears a workspace attention marker."),
+    ("workspace.get", "Read: one workspace with the caller's role. Non-members are filtered in the service layer."),
+    ("workspace.getAutoCommit", "Read: the workspace auto-commit flag. Setting it stays owner-only."),
+    ("workspace.getContext", "Read: workspace context items (links/notes the agents see)."),
+    ("workspace.getTokenUsage", "Read: token usage of a workspace. Usage read."),
+    ("workspace.getUiContext", "Read: the shared per-workspace UI layout state the desktop hydrates."),
+    ("workspace.list", "Client boot: the workspaces the caller can see (membership-filtered in the service layer) with myRole."),
+    ("workspace.localChanges", "Read: the workspace's local git change summary."),
+    ("workspace.markSeen", "Steer: clears the workspace unseen marker."),
+    ("workspace.members.list", "Read: the membership roster (principal fields + role) of a member workspace. Removal stays owner-only."),
+    ("workspace.subscribe", "Client boot: the workspace channel fast path; rows membership-filtered, removals delivered on unshare."),
+    ("workspace.unsubscribe", "Client boot: drops the workspace channel subscription."),
+    ("workspace.update", "Steer: title / tags / status message / status image of a member workspace. No path or repository fields."),
+    ("workspace.updateContext", "Edit: workspace context items. Note/link references only, no host paths."),
+    ("workspace.updateUiContext", "Edit: the shared per-workspace UI layout state. Opaque UI JSON, no host reach."),
+];
+
+/// Whether a non-administrator principal may call `method` (alias spellings
+/// are canonicalised first). Owner-only fast-path families (`host.*`,
+/// `browser.*`, `forward.*`) are simply absent from the allowlist.
+#[must_use]
+pub(crate) fn collaborator_may_call(method: &str) -> bool {
+    static ALLOWED: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    ALLOWED
+        .get_or_init(|| COLLABORATOR_METHODS.iter().map(|(m, _)| *m).collect())
+        .contains(canonical_method(method))
+}

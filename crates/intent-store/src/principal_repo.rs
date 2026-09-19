@@ -342,6 +342,28 @@ impl Store {
         rows.iter().map(map_member_row).collect()
     }
 
+    /// A principal's role in a workspace; `None` when not a member.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_workspace_member_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<Option<WorkspaceRole>> {
+        let row = sqlx::query(
+            "SELECT role FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
+        )
+        .bind(&workspace_id.0)
+        .bind(&principal_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get workspace member role failed: {e}")))?;
+        row.map(|r| enum_from_db::<WorkspaceRole>(&r.get::<String, _>("role")))
+            .transpose()
+    }
+
     /// Add a principal to a workspace with `role`. Idempotent: an existing
     /// membership is left untouched (use
     /// [`Store::set_workspace_member_role`] to change its role). Returns
@@ -350,8 +372,10 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the database operation fails (including
-    /// an unknown workspace or principal, rejected by the FKs).
+    /// Returns `Error::InvalidInput` when `role` is `Owner` and the workspace
+    /// already has one (exactly one owner per workspace, migration `0126`)
+    /// and `Error::Internal` if the database operation fails (including an
+    /// unknown workspace or principal, rejected by the FKs).
     pub async fn add_workspace_member(
         &self,
         workspace_id: &WorkspaceId,
@@ -375,7 +399,7 @@ impl Store {
                 .bind(now_iso())
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| Error::Internal(format!("add workspace member failed: {e}")))?;
+                .map_err(|e| map_owner_violation(&e, workspace_id, "add workspace member"))?;
             sync_workspace_owner(&mut tx, workspace_id).await?;
             tx.commit()
                 .await
@@ -392,7 +416,9 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::NotFound` when the principal is not a member of the
-    /// workspace and `Error::Internal` if the database operation fails.
+    /// workspace, `Error::InvalidInput` when promoting to `Owner` while the
+    /// workspace already has one, and `Error::Internal` if the database
+    /// operation fails.
     pub async fn set_workspace_member_role(
         &self,
         workspace_id: &WorkspaceId,
@@ -412,7 +438,7 @@ impl Store {
             .bind(&principal_id.0)
             .execute(&mut *tx)
             .await
-            .map_err(|e| Error::Internal(format!("set workspace member role failed: {e}")))?;
+            .map_err(|e| map_owner_violation(&e, workspace_id, "set workspace member role"))?;
             if res.rows_affected() == 0 {
                 return Err(Error::NotFound(format!(
                     "principal {principal_id} is not a member of workspace {workspace_id}"
@@ -640,6 +666,23 @@ fn map_principal_row(r: &SqliteRow) -> Principal {
         is_primary: r.get::<i64, _>("is_primary") != 0,
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+    }
+}
+
+/// Map a membership write failure: a UNIQUE violation is the one-owner index
+/// (`workspace_member_owner_uq`, migration `0126`) — the `(workspace_id,
+/// principal_id)` primary key is handled by `ON CONFLICT` / the `UPDATE`
+/// shape and never reaches here — and surfaces as a client-facing
+/// `InvalidInput`; anything else is `Internal`.
+fn map_owner_violation(e: &sqlx::Error, workspace_id: &WorkspaceId, what: &str) -> Error {
+    if e.as_database_error()
+        .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+    {
+        Error::InvalidInput(format!(
+            "workspace {workspace_id} already has an owner; exactly one owner per workspace"
+        ))
+    } else {
+        Error::Internal(format!("{what} failed: {e}"))
     }
 }
 

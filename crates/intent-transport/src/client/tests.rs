@@ -2,10 +2,11 @@
 
 use std::sync::Mutex;
 
-use intent_core::{BoxFuture, ClientHostInfo, ClientId, Result, WorkspaceApi};
+use intent_core::{BoxFuture, ClientHostInfo, ClientId, PrincipalId, Result, WorkspaceApi};
 use serde_json::{json, Value};
 
 use super::*;
+use crate::context::{with_request_context, Caller};
 
 /// One recorded `upsert_client` call: `(clientId, name, capabilities, host)`.
 type UpsertCall = (String, Option<String>, Option<Value>, ClientHostInfo);
@@ -219,6 +220,124 @@ async fn notification_has_no_response_but_sets_binding() {
     let bound = outcome.bound.expect("notification hello still binds");
     assert_eq!(bound.client_id.as_str(), "cli-9b21");
     assert!(bound.browser_exec());
+}
+
+/// Multiplayer w3: a non-administrator principal's `clientId` is namespaced by
+/// its principal id, so an id copied from another member (as seen on that
+/// member's `draft:changed`) resolves to a distinct, caller-owned client; the
+/// namespacing is idempotent so persisting the returned id re-hellos stably;
+/// the administrator, agents, and unbound requests keep the raw id.
+#[tokio::test]
+async fn non_administrator_client_ids_are_scoped_to_their_principal() {
+    let wire = |principal: &str, is_administrator: bool| Caller::Wire {
+        principal_id: PrincipalId::from_string(principal),
+        is_administrator,
+    };
+    let hello = |id: i64, client_id: &str| {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "client.hello",
+            "params": { "clientId": client_id, "capabilities": { "browserExec": true } }
+        }))
+        .unwrap()
+    };
+
+    // Owner hellos as `cli-owner`; the raw id is kept.
+    let api = RecordingApi::default();
+    let mut owner_binding: Option<ClientId> = None;
+    let owner = parsed(
+        with_request_context(
+            true,
+            Some(wire("p-owner", true)),
+            handle(hello(1, "cli-owner"), &api, &mut owner_binding, true),
+        )
+        .await,
+    );
+    assert_eq!(owner["result"]["clientId"], json!("cli-owner"));
+    assert_eq!(owner_binding.as_ref().unwrap().as_str(), "cli-owner");
+
+    // Guest re-presents the owner's id: it lands in the guest's namespace.
+    let mut guest_binding: Option<ClientId> = None;
+    let guest = with_request_context(
+        true,
+        Some(wire("p-guest", false)),
+        handle(hello(2, "cli-owner"), &api, &mut guest_binding, true),
+    )
+    .await;
+    let bound = guest.bound.clone().expect("a successful hello binds");
+    let guest = parsed(guest);
+    assert_eq!(guest["result"]["clientId"], json!("p-guest:cli-owner"));
+    assert_eq!(
+        guest_binding.as_ref().unwrap().as_str(),
+        "p-guest:cli-owner"
+    );
+    assert_eq!(bound.client_id.as_str(), "p-guest:cli-owner");
+    let last = api.last.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        last.0, "p-guest:cli-owner",
+        "the client row is the scoped id"
+    );
+
+    // Re-hello with the returned (already scoped) id is stable.
+    let again = parsed(
+        with_request_context(
+            true,
+            Some(wire("p-guest", false)),
+            handle(
+                hello(3, "p-guest:cli-owner"),
+                &api,
+                &mut guest_binding,
+                true,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(again["result"]["clientId"], json!("p-guest:cli-owner"));
+
+    // Another guest presenting the first guest's scoped id gets its own.
+    let mut other_binding: Option<ClientId> = None;
+    let other = parsed(
+        with_request_context(
+            true,
+            Some(wire("p-other", false)),
+            handle(
+                hello(4, "p-guest:cli-owner"),
+                &api,
+                &mut other_binding,
+                true,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        other["result"]["clientId"],
+        json!("p-other:p-guest:cli-owner")
+    );
+
+    // A minted id on a guest connection is scoped as well.
+    let mut minted_binding: Option<ClientId> = None;
+    let minted = parsed(
+        with_request_context(
+            true,
+            Some(wire("p-guest", false)),
+            handle(
+                classify(&json!({ "jsonrpc": "2.0", "id": 5, "method": "client.hello" })).unwrap(),
+                &api,
+                &mut minted_binding,
+                true,
+            ),
+        )
+        .await,
+    );
+    assert!(minted["result"]["clientId"]
+        .as_str()
+        .unwrap()
+        .starts_with("p-guest:"));
+
+    // Unbound (legacy administrator token without a principal store) keeps
+    // the raw id.
+    let mut unbound_binding: Option<ClientId> = None;
+    let unbound = parsed(handle(hello(6, "cli-owner"), &api, &mut unbound_binding, true).await);
+    assert_eq!(unbound["result"]["clientId"], json!("cli-owner"));
 }
 
 #[test]
