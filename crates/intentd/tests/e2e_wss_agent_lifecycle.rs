@@ -7624,9 +7624,13 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     .await;
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second send should queue: {send2}");
-    // (a) The queued entry wire shape carries messageMetadata verbatim.
+    // (a) The queued entry wire shape carries messageMetadata verbatim, plus
+    // the daemon's `fromPrincipalId` stamp for the wire caller.
+    let me = wss_rpc(&mut rpc, 15, "principal.me", json!({})).await;
+    let mut stamped = metadata.clone();
+    stamped["fromPrincipalId"] = me["id"].clone();
     assert_eq!(
-        send2["queuedMessage"]["messageMetadata"], metadata,
+        send2["queuedMessage"]["messageMetadata"], stamped,
         "queued entry must carry messageMetadata: {send2}"
     );
 
@@ -7640,7 +7644,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     .await;
     let queue = q["queue"].as_array().expect("queue array");
     assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0]["messageMetadata"], metadata);
+    assert_eq!(queue[0]["messageMetadata"], stamped);
 
     // Wait for both turns to finish (first send + drained queued send).
     let mut stream_end_count = 0;
@@ -7675,7 +7679,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
                     .is_some_and(|t| t.starts_with("tagged queued message"))
         })
         .expect("drained user message row present");
-    for (key, want) in metadata.as_object().unwrap() {
+    for (key, want) in stamped.as_object().unwrap() {
         assert_eq!(
             &tagged["metadata"][key], want,
             "drained user row must persist messageMetadata field {key}: {tagged}"
@@ -7694,9 +7698,12 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     );
     // Both direct-delivery placements are covered: the row-level `metadata`
     // column (direct `agent.sendMessage` parity) and the in-block fold
-    // (`deliver_wake_message` parity) — the fold carries queueInfo too.
+    // (`deliver_wake_message` parity) — the fold carries queueInfo too, but
+    // the `fromPrincipalId` stamp stays row-level only.
+    let mut folded = tagged["metadata"].clone();
+    folded.as_object_mut().unwrap().remove("fromPrincipalId");
     assert_eq!(
-        tagged["contentBlocks"][0]["messageMetadata"], tagged["metadata"],
+        tagged["contentBlocks"][0]["messageMetadata"], folded,
         "drained user block must fold the same messageMetadata: {tagged}"
     );
 }
@@ -8847,6 +8854,186 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
         .filter(|m| m["role"] == "user")
         .count();
     assert_eq!(user_count, 1, "replay delivered no second prompt: {conv}");
+}
+
+/// Multiplayer w2 — `workspace.create`'s `initialAgent.prompt` is the
+/// creator's first user row, delivered daemon-side through the runtime
+/// `AgentManager` (no `agent.sendMessage` follows). A collaborator creating a
+/// workspace over WSS must be stamped as that row's author — never the
+/// workspace owner via the legacy fallback — on `agent.getSession` and
+/// `agent.getConversation` alike.
+#[tokio::test]
+async fn workspace_create_initial_agent_prompt_carries_creator_stamp_over_wss() {
+    use intent_core::{now_iso, Principal, PrincipalId};
+    use intent_store::Store;
+
+    let Some(script) = gate("WSS workspace.create creator attribution E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let behavior = json!({ "response": "initial agent ran" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // A collaborator with its own credential, seeded into the daemon's store.
+    let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    {
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open daemon store");
+        store
+            .upsert_principal(&guest)
+            .await
+            .expect("guest principal");
+        let token_hash =
+            Sha256::digest(guest_token.as_bytes())
+                .iter()
+                .fold(String::new(), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+        store
+            .insert_principal_credential(&guest.id, &token_hash)
+            .await
+            .expect("guest credential");
+    }
+
+    // SUBSCRIBER conn (owner) — the workspace id is minted by the create, so
+    // subscribe unfiltered BEFORE creating.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // The GUEST creates the workspace with an initialAgent prompt.
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
+    let created = wss_rpc(
+        &mut guest_rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Guest WS",
+            "branch": "feat/guest-initial-agent-e2e",
+            "initialAgent": {
+                "prompt": "guest kickoff",
+                "model": "default", "provider": "mock",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let agent_id = created["initialAgent"]["id"]
+        .as_str()
+        .expect("result carries the created agent")
+        .to_string();
+
+    // Wait for the initial turn to finish so the transcript is settled.
+    let mut ends = 0u32;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id.as_str() {
+            ends += 1;
+            break;
+        }
+    }
+    assert_eq!(ends, 1, "initial agent turn reached stream:end");
+
+    // The persisted kickoff row: stamped with the GUEST, served with the
+    // resolved author by both hydration routes.
+    let expected_author = json!({
+        "principalId": guest.id.0,
+        "login": "guest",
+        "displayName": "Guest User",
+        "avatarUrl": null,
+    });
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let session = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let user_rows: Vec<&Value> = session["session"]["messages"]
+        .as_array()
+        .expect("session messages")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "exactly one delivered prompt: {session}"
+    );
+    let session_row = user_rows[0];
+    assert_eq!(
+        session_row["metadata"]["fromPrincipalId"],
+        json!(guest.id.0),
+        "the initialAgent kickoff row carries the creator's principal: {session_row}"
+    );
+    assert_eq!(
+        session_row["author"], expected_author,
+        "agent.getSession serves the creator as author: {session_row}"
+    );
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let conv_row = conv["messages"]
+        .as_array()
+        .expect("conversation messages")
+        .iter()
+        .find(|m| m["id"] == session_row["id"])
+        .unwrap_or_else(|| panic!("the same row in agent.getConversation: {conv}"));
+    assert_eq!(
+        conv_row["author"], expected_author,
+        "agent.getConversation and agent.getSession agree on the creator"
+    );
 }
 
 #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
@@ -12992,23 +13179,24 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     })
     .await
     .expect("human row reached the chat channel");
-    match lean.get("metadata") {
-        None => {} // direct delivery: the lean metadata-free entity shape
-        Some(md) => {
-            // Queued delivery race: only the drain-time queueInfo stamp is
-            // allowed — human sends never gain A2A attribution metadata.
-            let keys: Vec<&String> = md
-                .as_object()
-                .unwrap_or_else(|| panic!("metadata is an object: {lean}"))
-                .keys()
-                .collect();
-            assert_eq!(
-                keys,
-                vec!["queueInfo"],
-                "a human row carries at most the queueInfo stamp: {lean}"
-            );
-        }
-    }
+    // A human row carries the daemon's `fromPrincipalId` stamp for the wire
+    // caller and, on the queued-delivery race, the drain-time queueInfo stamp
+    // — never A2A attribution metadata.
+    let md = lean["metadata"]
+        .as_object()
+        .unwrap_or_else(|| panic!("metadata is an object: {lean}"));
+    assert!(
+        md["fromPrincipalId"].is_string(),
+        "a human row carries the principal stamp: {lean}"
+    );
+    let extra: Vec<&String> = md
+        .keys()
+        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo")
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "a human row carries at most the principal + queueInfo stamps: {lean}"
+    );
 
     // Contrast: a parentless BYSTANDER sending to the CHILD — a created
     // worker target (parent linkage), not an independent top-level peer —

@@ -2418,6 +2418,14 @@ pub struct AgentMessage {
     /// `AgentMessage`) on reads. `None` for messages without a client id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_message_id: Option<String>,
+    /// Serve-time author projection of a `user` row (multiplayer w2):
+    /// `{ principalId, login, displayName, avatarUrl }` resolved from the
+    /// row's [`FROM_PRINCIPAL_ID_KEY`] stamp, else the workspace's legacy
+    /// author, else its owner. Never persisted; attached on typed reads
+    /// (`agent.getSession`) by the same resolver the JSON transcript reads
+    /// use. `None` for non-user rows and for rows that resolve no author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<serde_json::Value>,
     #[serde(rename = "timestamp")]
     pub created_at: String,
 }
@@ -2788,6 +2796,25 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Metadata key under which the daemon stamps the authoring principal on
+/// every user-origin message row and queue entry (multiplayer w2). A key of
+/// its own, distinct from the agent-origin `fromAgentId` / `fromAgentName`
+/// stamp, so client user-authorship predicates keyed on those fields are
+/// unaffected. Daemon-authoritative: a client-supplied value is always
+/// overwritten (wire caller) or stripped (agent / daemon caller).
+pub const FROM_PRINCIPAL_ID_KEY: &str = "fromPrincipalId";
+
+/// Lift the stamped authoring principal out of a persisted `metadata`
+/// payload: `Some` only when the metadata is an object carrying a non-empty
+/// string under [`FROM_PRINCIPAL_ID_KEY`].
+pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<PrincipalId> {
+    metadata
+        .and_then(|m| m.get(FROM_PRINCIPAL_ID_KEY))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| PrincipalId(s.to_string()))
 }
 
 /// The harness version stamped on every newly created agent session
@@ -6798,6 +6825,7 @@ mod tests {
                 content: json!([{ "type": "text", "text": "hi" }]),
                 metadata: None,
                 app_message_id: None,
+                author: None,
                 created_at: "t0".to_string(),
             }],
             stats: None,
@@ -6873,6 +6901,7 @@ mod tests {
             content: json!([{ "type": "text", "text": "hi" }]),
             metadata: None,
             app_message_id: None,
+            author: None,
             created_at: "t0".to_string(),
         };
         let value = serde_json::to_value(&message).unwrap();
@@ -6912,6 +6941,7 @@ mod tests {
             content: json!([{ "type": "text", "text": "hi" }]),
             metadata: Some(json!({ "userAppMessageId": "app-msg-1" })),
             app_message_id: Some("app-msg-1".to_string()),
+            author: None,
             created_at: "t0".to_string(),
         };
         let value = serde_json::to_value(&message).unwrap();
