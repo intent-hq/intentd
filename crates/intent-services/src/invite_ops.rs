@@ -25,6 +25,7 @@ use intent_core::{
     Principal, PrincipalId, Result, WorkspaceId, WorkspaceInvite, WorkspaceRole,
 };
 use intent_sourcecontrol::{IdentityFlow, IdentityPollStatus, UserIdentity};
+use intent_store::InviteJoinOutcome;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
@@ -262,6 +263,12 @@ impl Services {
             .map_or(0, |m| m.member_count))
     }
 
+    /// The effective `sharing.maxGuestsPerWorkspace` — read live, so a
+    /// settings change applies to the next mint / join without a restart.
+    pub(crate) fn max_guests_per_workspace(&self) -> u32 {
+        self.effective_settings().sharing.max_guests_per_workspace
+    }
+
     /// The listener's link envelope for stamping listed invites with `url`,
     /// once per call: `None` (never an error) when no builder is attached or
     /// no link can be built right now — the invite rows are still answered.
@@ -290,6 +297,20 @@ impl Services {
             )));
         }
         let creator = self.inviting_principal().await?;
+        // Every open invite reserves a guest seat, so the cap is spent by
+        // collaborators plus open invites — else N open links could all be
+        // redeemed against one remaining seat. Re-checked under the
+        // transition lock below, right before the insert.
+        let max_guests = self.max_guests_per_workspace();
+        if self
+            .store
+            .count_workspace_guests(workspace_id)
+            .await?
+            .committed()
+            >= u64::from(max_guests)
+        {
+            return Err(Error::Invite(InviteErrorKind::GuestLimit));
+        }
         let pin_login = pin_login
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty());
@@ -337,6 +358,12 @@ impl Services {
                 return Err(Error::Internal(
                     "the inviting GitHub identity changed while minting; retry".to_string(),
                 ));
+            }
+            // Mints are serialised by this lock, so the recount here is what
+            // keeps two concurrent mints from both taking the last seat.
+            if self.store.count_workspace_guests(&ws.id).await?.committed() >= u64::from(max_guests)
+            {
+                return Err(Error::Invite(InviteErrorKind::GuestLimit));
             }
             // The first invite of a workspace pins its legacy author:
             // content authored before anyone else could have joined is the
@@ -725,23 +752,30 @@ impl Services {
         };
         apply_identity(&mut identity, user);
         let token = random_hex_secret();
-        let Some(principal) = self
+        let principal = match self
             .store
             .join_workspace_by_invite(
                 invite_id,
                 &invite.workspace_id,
                 &identity,
                 &hash_secret(&token),
+                self.max_guests_per_workspace(),
             )
             .await?
-        else {
-            let kind = self
-                .store
-                .get_workspace_invite(invite_id)
-                .await?
-                .and_then(|i| closed_kind(&i, &now_iso()))
-                .unwrap_or(InviteErrorKind::NotFound);
-            return Err(Error::Invite(kind));
+        {
+            InviteJoinOutcome::Joined(principal) => principal,
+            InviteJoinOutcome::Closed => {
+                let kind = self
+                    .store
+                    .get_workspace_invite(invite_id)
+                    .await?
+                    .and_then(|i| closed_kind(&i, &now_iso()))
+                    .unwrap_or(InviteErrorKind::NotFound);
+                return Err(Error::Invite(kind));
+            }
+            InviteJoinOutcome::WorkspaceFull => {
+                return Err(Error::Invite(InviteErrorKind::WorkspaceFull));
+            }
         };
         let member_count = self.member_count(&invite.workspace_id).await?;
         crate::publish_event(

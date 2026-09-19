@@ -1108,6 +1108,214 @@ async fn complete_join_enforces_the_pin_by_account_id() {
     assert_eq!(joined["login"], json!("renamed-login"));
 }
 
+// --- guest caps ------------------------------------------------------------
+
+/// The fixture wired to a settings registry with
+/// `sharing.maxGuestsPerWorkspace = cap`; the registry is returned so a
+/// test can move the cap while the daemon runs (the ops read it live).
+async fn capped_fixture(
+    tmp: &TempDb,
+    cap: u32,
+) -> (Fixture, Arc<crate::SettingsRegistry>, tempfile::TempDir) {
+    let cfg_dir = crate::test_support::test_tempdir("intentd-guest-caps");
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(cfg_dir.path().join("config.toml")).expect("load registry"),
+    );
+    set_cap(&registry, cap);
+    let mut f = fixture(tmp).await;
+    f.services = Services::new(f.store.clone()).with_settings_registry(registry.clone());
+    (f, registry, cfg_dir)
+}
+
+fn set_cap(registry: &crate::SettingsRegistry, cap: u32) {
+    registry
+        .apply(&[("sharing.maxGuestsPerWorkspace".to_string(), json!(cap))])
+        .expect("apply cap");
+}
+
+async fn guest_summary(f: &Fixture) -> (u64, u64) {
+    let v = with_caller(wire(&f.owner), f.services.workspace_members_list_op(&f.ws))
+        .await
+        .expect("members.list");
+    (
+        v["guestCount"].as_u64().expect("guestCount"),
+        v["guestLimit"].as_u64().expect("guestLimit"),
+    )
+}
+
+/// `workspace.invite.create` spends the cap on collaborators PLUS open
+/// invites (the fixture seats two collaborators): at the cap it is
+/// `GuestLimit`, revoking an invite frees the seat, lowering the cap live
+/// applies to the next mint, cap `0` closes a fresh workspace to guests,
+/// and `members.list` reports the same count / limit.
+#[tokio::test]
+async fn invite_create_refuses_at_the_guest_limit() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 3).await;
+    assert_eq!(guest_summary(&f).await, (2, 3));
+
+    let created = f.create_invite(None).await;
+    assert_eq!(guest_summary(&f).await, (3, 3));
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_invite_create_op(&f.ws, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+    assert_eq!(
+        f.store
+            .list_open_workspace_invites(&f.ws)
+            .await
+            .expect("list")
+            .len(),
+        1,
+        "a refused mint leaves no row"
+    );
+
+    with_caller(
+        wire(&f.owner),
+        f.services
+            .workspace_invite_revoke_op(&f.ws, &id_of(&created)),
+    )
+    .await
+    .expect("revoke");
+    assert_eq!(guest_summary(&f).await, (2, 3));
+    f.create_invite(None).await;
+
+    // Live cap change: two collaborators already fill a cap of 2.
+    set_cap(&registry, 2);
+    assert_eq!(guest_summary(&f).await, (3, 2));
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_invite_create_op(&f.ws, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+
+    // Cap 0: even a workspace with no guest at all admits none. The owner
+    // (GitHub-linked) owns it alone; the primary seat is removed.
+    set_cap(&registry, 0);
+    let empty = WorkspaceId::new();
+    f.store
+        .insert_workspace(&workspace(&empty))
+        .await
+        .expect("empty ws");
+    let primary = f.store.get_primary_principal().await.expect("primary").id;
+    f.store
+        .remove_workspace_member(&empty, &primary)
+        .await
+        .expect("remove primary");
+    f.store
+        .add_workspace_member(&empty, &f.owner, WorkspaceRole::Owner)
+        .await
+        .expect("owner");
+    assert_eq!(
+        f.store
+            .count_workspace_guests(&empty)
+            .await
+            .expect("count")
+            .committed(),
+        0
+    );
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_invite_create_op(&empty, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+}
+
+/// The join re-checks the cap against collaborators inside the store
+/// transaction: an open invite minted under a higher cap is `WorkspaceFull`
+/// once the cap drops to the seated count — nothing is written and the
+/// invite stays open — an account that is already a member re-joins without
+/// a seat, and the same invite admits a newcomer once the cap is raised.
+#[tokio::test]
+async fn complete_join_refuses_a_full_workspace_and_keeps_the_invite_open() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 3).await;
+    let id = id_of(&f.create_invite(None).await);
+    let principals = f.store.count_principals().await.expect("count");
+
+    set_cap(&registry, 2);
+    let r = f
+        .services
+        .complete_invite_join(&id, &identity("newcomer", 7001))
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::WorkspaceFull);
+    assert_eq!(f.store.count_principals().await.expect("count"), principals);
+    let invite = f
+        .store
+        .get_workspace_invite(&id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(invite.redeemed_at.is_none(), "the invite stays open");
+
+    // A seated collaborator (github 2002) needs no new seat.
+    let rejoined = f
+        .services
+        .complete_invite_join(&id, &identity("collab", 2002))
+        .await
+        .expect("member re-joins under a full cap");
+    assert_eq!(rejoined["principalId"], json!(f.collaborator.0));
+
+    set_cap(&registry, 3);
+    let id = id_of(&f.create_invite(None).await);
+    let joined = f
+        .services
+        .complete_invite_join(&id, &identity("newcomer", 7001))
+        .await
+        .expect("join once the cap is raised");
+    assert_eq!(joined["login"], json!("newcomer"));
+    assert_eq!(guest_summary(&f).await, (3, 3));
+}
+
+/// Concurrent joins on distinct open invites for the last seat: exactly one
+/// commits, the rest are `WorkspaceFull` with their invites still open.
+#[tokio::test]
+async fn concurrent_joins_cannot_overshoot_the_guest_cap() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 5).await;
+    let mut invite_ids = Vec::new();
+    for _ in 0..3 {
+        invite_ids.push(id_of(&f.create_invite(None).await));
+    }
+    set_cap(&registry, 3);
+
+    let mut handles = Vec::new();
+    for (n, id) in (9000u64..).zip(invite_ids) {
+        let services = f.services.clone();
+        handles.push(tokio::spawn(async move {
+            services
+                .complete_invite_join(&id, &identity(&format!("racer-{n}"), n))
+                .await
+        }));
+    }
+    let mut joined = 0;
+    let mut full = 0;
+    for h in handles {
+        match h.await.expect("task") {
+            Ok(_) => joined += 1,
+            r => {
+                assert_eq!(invite_kind(&r), InviteErrorKind::WorkspaceFull);
+                full += 1;
+            }
+        }
+    }
+    assert_eq!((joined, full), (1, 2));
+    assert_eq!(
+        f.store
+            .list_open_workspace_invites(&f.ws)
+            .await
+            .expect("list")
+            .len(),
+        2,
+        "refused joins leave their invites open"
+    );
+    assert_eq!(guest_summary(&f).await, (5, 3));
+}
+
 // --- leave / revokeSelf ----------------------------------------------------
 
 /// `members.leave`: a collaborator leaves (membership gone), the owner
