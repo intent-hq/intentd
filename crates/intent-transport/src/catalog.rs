@@ -486,7 +486,10 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// display probes, `browser.*`, `forward.*`, `terminal.*`, `script.*`,
 /// `github.*` / `linear.*` / `sentry.*` / `voice.*` (act with the primary
 /// user's third-party credentials), `settings.*`, `repo.*`, `mcp.*`,
-/// `server.*` / `pairing.*` / `system.*` (except `system.capabilities`),
+/// `server.*` / `pairing.*` / `system.*` (except `system.capabilities` and
+/// `system.status`, the latter served as the guest-safe projection
+/// `control::collaborator_status_json` rather than the administrator's
+/// snapshot),
 /// `workspace.create` / `git.clone` (arbitrary host paths), agent / hook /
 /// PR-monitor deletion, and `agent.replaceMessages` — it persists
 /// client-supplied user rows verbatim, so a non-owner could forge
@@ -652,6 +655,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("stats.getRateHistory", "Read: usage rate history. Usage/stats read."),
     ("stats.getUsage", "Read: usage totals. Usage/stats read."),
     ("system.capabilities", "Client boot: the daemon's advertised capability flags. No host detail beyond feature booleans."),
+    ("system.status", "Client boot / status panel: the guest-safe projection (control::collaborator_status_json) — running / listen / version / protocol, routing (port, fingerprint, localIps, tcAddress) and host identity (hostname, prettyHostname, os / arch / locality / device), all already disclosed by the invite envelope and server.pairingInfo. Daemon-global counts (clients, agents, busyAgents) and process / disk / watcher telemetry are administrator-only: they aggregate activity outside the caller's member workspaces."),
     ("task.assignAgent", "Edit: assigns an agent to a task note."),
     ("task.convertBlocks", "Edit: converts @@@task blocks into task notes."),
     ("task.createPrerequisite", "Edit: adds a prerequisite task."),
