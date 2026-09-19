@@ -12967,6 +12967,7 @@ mod workspace_apply_proposal_tests {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            pull_requests_total: None,
             context_links: None,
             archived: false,
             archived_at: None,
