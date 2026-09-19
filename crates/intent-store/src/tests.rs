@@ -9185,8 +9185,10 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
     );
     assert_eq!(
         join(store.clone(), "second", ws.clone(), 1, 1).await,
-        crate::InviteJoinOutcome::Joined(store.get_principal(&seated.id).await.expect("principal")),
-        "an already-seated account re-joins without a new seat"
+        crate::InviteJoinOutcome::Rejoined(
+            store.get_principal(&seated.id).await.expect("principal")
+        ),
+        "an already-seated account re-joins without a new seat, reported as a re-join"
     );
     let second = store
         .get_workspace_invite("second")
@@ -9226,7 +9228,9 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
         .expect("insert invite");
     assert_eq!(
         join(store.clone(), "pinned", ws.clone(), 1, 1).await,
-        crate::InviteJoinOutcome::Joined(store.get_principal(&seated.id).await.expect("principal")),
+        crate::InviteJoinOutcome::Rejoined(
+            store.get_principal(&seated.id).await.expect("principal")
+        ),
     );
     assert_eq!(
         join(store.clone(), "pinned", ws.clone(), 1, 1).await,
@@ -9256,6 +9260,9 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
     for h in handles {
         match h.await.expect("task") {
             crate::InviteJoinOutcome::Joined(_) => joined += 1,
+            crate::InviteJoinOutcome::Rejoined(_) => {
+                panic!("a first join was reported as a re-join")
+            }
             crate::InviteJoinOutcome::WorkspaceFull => full += 1,
             crate::InviteJoinOutcome::Closed => panic!("an open invite was reported closed"),
             crate::InviteJoinOutcome::CredentialInvalid => {
@@ -9431,8 +9438,9 @@ async fn join_workspace_by_invite_rotates_the_presented_credential() {
     };
 
     // Returning join presenting `cred-a`: `cred-b` lands and `cred-a` flips
-    // in one transaction.
-    let crate::InviteJoinOutcome::Joined(again) = join("second", 1, "cred-b", Some("cred-a")).await
+    // in one transaction; the outcome says no membership was added.
+    let crate::InviteJoinOutcome::Rejoined(again) =
+        join("second", 1, "cred-b", Some("cred-a")).await
     else {
         panic!("second join");
     };
@@ -9477,7 +9485,7 @@ async fn join_workspace_by_invite_rotates_the_presented_credential() {
         .redeemed_at
         .is_none());
     // The same invite still admits the guest with its live credential.
-    let crate::InviteJoinOutcome::Joined(_) = join("third", 1, "cred-c", Some("cred-b")).await
+    let crate::InviteJoinOutcome::Rejoined(_) = join("third", 1, "cred-c", Some("cred-b")).await
     else {
         panic!("third join");
     };

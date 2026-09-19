@@ -1398,6 +1398,23 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
         1,
         "a member's re-join is not a counted redemption"
     );
+    // …and it is not announced as a membership change: only the invite's
+    // last-redemption stamp moved, so the event says `invites` alone.
+    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("event in time")
+        .expect("event batch");
+    let ev = batch
+        .iter()
+        .find(|e| e.event_type == "workspace:updated" && e.data["workspaceId"] == json!(ws2.0))
+        .unwrap_or_else(|| panic!("re-join event: {batch:?}"));
+    assert_eq!(ev.data["changes"]["invites"], json!(true), "{ev:?}");
+    assert_eq!(ev.data["changes"]["memberCount"], json!(3), "{ev:?}");
+    assert!(
+        ev.data["changes"].get("members").is_none()
+            && ev.data["changes"].get("addedPrincipalId").is_none(),
+        "a re-join adds no member and must not publish one: {ev:?}"
+    );
 
     // `revokeSelf` sees the one active credential the rotations left.
     let revoked = with_caller(wire(&guest), f.services.principal_revoke_self_op())
