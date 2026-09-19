@@ -2880,38 +2880,41 @@ pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
 /// Whole-row byte budget for one serialized `agent.list` row
 /// (intent-hq/intent#5383): the per-field preview cap above bounds each
 /// preview, but the row is the unit the transport frames, so a
-/// worst-case-realistic row — every optional field present, every preview
-/// at [`AGENT_LIST_PREVIEW_BUDGET_BYTES`], two active hooks and two PR
-/// monitors — must serialize at or under this many bytes, enforced by the
-/// row-budget golden test in intent-services (`agent_ops::tests`), which
-/// prints a per-field byte table on failure.
+/// worst-case-realistic row — every optional field present, every capped
+/// string at [`AGENT_LIST_PREVIEW_BUDGET_BYTES`], two active hooks and two
+/// PR monitors, the detail-only fields stripped
+/// ([`AgentLite::strip_detail_only_fields`]) — must serialize at or under
+/// this many bytes, enforced by the row-budget golden test in
+/// intent-services (`agent_ops::tests`), which prints a per-field byte
+/// table on failure.
 ///
 /// Arithmetic. The transport warns on outbound frames over 1 MiB
 /// (1,048,576 B); the `agent.list` envelope
 /// (`{"jsonrpc":"2.0","id":…,"result":{"agents":[…]}}` plus one comma per
 /// row) costs about 1,060 B for 1,000 rows, so the frame goal is
 /// ≈ 1,047 B/row. The preview cap alone puts the worst-case row above
-/// that: five preview slots (`lastAgentResponse`, `lastUserMessage`,
-/// `digest`, `metadata.completionReport`, `lastToolUse.input`) × 400 B ≈
-/// 2,170 B on the wire (keys, quotes and the `lastToolUse` preview flags
-/// included) before a single fixed field. The measured worst-case row with
-/// the detail-only fields stripped is 4,886 B: those ≈ 2,170 B of previews
-/// plus ≈ 2,700 B of fixed fields — eight `agent-<uuid>` ids (≈ 470 B),
-/// nine RFC-3339 timestamps (≈ 470 B), four message ids (≈ 230 B), two
-/// hook entries (326 B), two PR-monitor entries (206 B), sandbox
-/// path/branch/id (≈ 190 B), a one-sentence attention reason, and the
-/// boolean/enum flags. This budget is that measurement rounded up to the
-/// next 1 KiB (≈ 5% margin); a row that regrows past it fails the golden
-/// with the per-field table. Typical rows are far smaller (the issue's
-/// 404-row measurement averaged 2.6 KB/row BEFORE slimming; few sessions
-/// carry an attention request, sandbox fields, hooks AND monitors at once,
-/// and previews rarely all hit the cap), and the per-key allowlist
+/// that: six capped slots (`lastAgentResponse`, `lastUserMessage`,
+/// `digest`, `metadata.completionReport`, `lastToolUse.input`,
+/// `metadata.attentionRequestReason`) × 400 B ≈ 2,600 B on the wire (keys,
+/// quotes and the `lastToolUse` preview flags included) before a single
+/// fixed field. The measured worst-case row is ≈ 5,220 B (it drifts by a
+/// few bytes with RFC-3339 sub-second precision): those ≈ 2,600 B of
+/// capped strings plus ≈ 2,620 B of fixed fields — eight `agent-<uuid>`
+/// ids (≈ 470 B), nine RFC-3339 timestamps (≈ 470 B), four message ids
+/// (≈ 230 B), two hook entries (326 B), two PR-monitor entries (206 B),
+/// sandbox path/branch/id (≈ 190 B), and the boolean/enum flags. This
+/// budget is that measurement rounded up to the next half KiB (5.5 KiB,
+/// ≈ 8% margin); a row that regrows past it fails the golden with the
+/// per-field table. Typical rows are far smaller (the issue's 404-row
+/// measurement averaged 2.6 KB/row BEFORE slimming; few sessions carry an
+/// attention request, sandbox fields, hooks AND monitors at once, and
+/// previews rarely all hit the cap), and the per-key allowlist
 /// ([`AGENT_LIST_ROW_KEYS`]) keeps the fixed part from regrowing
 /// field-by-field. Meeting the ≈ 1 KB/row frame goal for 1,000 worst-case
 /// rows would require lowering the preview cap (each 100 B off
-/// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] takes ≈ 500 B off this budget) or
+/// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] takes ≈ 600 B off this budget) or
 /// paging `agent.list` — separate protocol decisions.
-pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 5 * 1024;
+pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 5 * 1024 + 512;
 
 /// Key allowlist golden for a serialized `agent.list` row
 /// (intent-hq/intent#5383): the top-level keys a list row may carry. The
@@ -3902,7 +3905,8 @@ pub struct AgentLite {
     /// Captured `agentFeatures` snapshot; mirrors
     /// [`AgentSession::harness_features`]. `None` for pre-snapshot rows here
     /// (no settings context) — the service projection overlays the current
-    /// settings so the wire always carries a value.
+    /// settings so `agent.get` always carries a value. Detail-only: stripped
+    /// from `agent.list` rows by [`Self::strip_detail_only_fields`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_features: Option<serde_json::Value>,
     pub metadata: AgentMetadata,
@@ -4007,13 +4011,40 @@ impl AgentLite {
         }
     }
 
+    /// List-path detail-field strip (intent-hq/intent#5383): drop the fields
+    /// that only the open-agent (detail) UI reads — `harnessFeatures`,
+    /// `effortLevels`, `contextReferences`, `fileBlocks`, `stats`,
+    /// `metadata.pendingProposals`, `metadata.proposalResolutions` — so an
+    /// `agent.list` row carries only what list contexts render. Every one of
+    /// these is presence-detected on the wire (`skip_serializing_if`), so a
+    /// stripped row simply omits the key (absent, never `null`). `agent.list`
+    /// applies this to every row alongside [`Self::cap_list_previews`]; the
+    /// detail reads (`agent.get` / `agent.getSession`) never call it and keep
+    /// serving the full values. Serve-time projection only — nothing changes
+    /// at write time. The key allowlist goldens [`AGENT_LIST_ROW_KEYS`] /
+    /// [`AGENT_LIST_ROW_METADATA_KEYS`] pin the resulting shape.
+    pub fn strip_detail_only_fields(&mut self) {
+        self.harness_features = None;
+        self.effort_levels = None;
+        self.context_references = None;
+        self.file_blocks = None;
+        self.stats = None;
+        self.metadata.pending_proposals.clear();
+        self.metadata.proposal_resolutions.clear();
+    }
+
     /// List-path preview capping (list-payload cost contract, extending
     /// monorepo#2932): bound every render-preview field to
     /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] — `lastAgentResponse`,
     /// `lastUserMessage`, `digest`, and `metadata.completionReport` are
     /// truncated char-boundary safe against their JSON-SERIALIZED size
     /// (escaping-heavy content cannot defeat the wire-frame goal by
-    /// expanding 6x on serialization). `lastToolUse` keeps the documented §5.5
+    /// expanding 6x on serialization). The remaining free-text strings a
+    /// list row carries — `metadata.attentionRequestReason` (a long reason
+    /// blew the row budget in production, intent-hq/intent#5383) and,
+    /// defensively, `name`, `model`, `metadata.sandboxPath` and
+    /// `metadata.sandboxBranch` — get the same silent truncation, so no
+    /// string field on a list row is unbounded. `lastToolUse` keeps the documented §5.5
     /// preview contract (`{ name, input?, inputTruncated?, inputBytes? }`):
     /// only an over-budget `input` is replaced by [`cap_json_value`]'s
     /// structure-preserving preview, with `inputTruncated: true` stamped
@@ -4046,31 +4077,39 @@ impl AgentLite {
             let mut sink = CountingSink(0);
             serde_json::to_writer(&mut sink, s).map_or(0, |()| sink.0.saturating_sub(2))
         }
+        fn cap_str(s: &mut String) {
+            let mut end = s.len().min(AGENT_LIST_PREVIEW_BUDGET_BYTES);
+            loop {
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let escaped = escaped_len(&s[..end]);
+                if escaped <= AGENT_LIST_PREVIEW_BUDGET_BYTES || end == 0 {
+                    break;
+                }
+                // Proportional shrink: `escaped > budget` makes the new
+                // end strictly smaller, so the loop converges without
+                // overshooting escaping-heavy content to zero.
+                end = end * AGENT_LIST_PREVIEW_BUDGET_BYTES / escaped;
+            }
+            if end < s.len() {
+                s.truncate(end);
+            }
+        }
         fn cap_string(field: &mut Option<String>) {
             if let Some(s) = field {
-                let mut end = s.len().min(AGENT_LIST_PREVIEW_BUDGET_BYTES);
-                loop {
-                    while end > 0 && !s.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    let escaped = escaped_len(&s[..end]);
-                    if escaped <= AGENT_LIST_PREVIEW_BUDGET_BYTES || end == 0 {
-                        break;
-                    }
-                    // Proportional shrink: `escaped > budget` makes the new
-                    // end strictly smaller, so the loop converges without
-                    // overshooting escaping-heavy content to zero.
-                    end = end * AGENT_LIST_PREVIEW_BUDGET_BYTES / escaped;
-                }
-                if end < s.len() {
-                    s.truncate(end);
-                }
+                cap_str(s);
             }
         }
         cap_string(&mut self.last_agent_response);
         cap_string(&mut self.last_user_message);
         cap_string(&mut self.digest);
         cap_string(&mut self.metadata.completion_report);
+        cap_string(&mut self.metadata.attention_request_reason);
+        cap_str(&mut self.name);
+        cap_string(&mut self.model);
+        cap_string(&mut self.metadata.sandbox_path);
+        cap_string(&mut self.metadata.sandbox_branch);
         match self.last_tool_use.as_mut() {
             Some(Value::Object(preview)) => {
                 if let Some(input) = preview.get("input") {

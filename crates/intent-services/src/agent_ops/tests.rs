@@ -9304,30 +9304,27 @@ async fn list_caps_previews_get_serves_full_values() {
     assert!(long_report.starts_with(row.metadata.completion_report.as_deref().unwrap()));
 }
 
-/// Detail-only `agent.list` row keys the list projection is being taught to
-/// strip (intent-hq/intent#5383, "Strip detail-only fields from agent.list
-/// rows"). Until that lands they still ride list rows, so the allowlist
-/// check tolerates them and the budget check measures the row WITHOUT them
-/// (the shape the budget is sized for). The slimming change deletes both
-/// sets so the goldens in intent-core become the only source of truth.
-const DETAIL_ONLY_ROW_KEYS_PENDING_STRIP: &[&str] = &[
+/// Detail-only `agent.list` row keys (intent-hq/intent#5383): populated on
+/// the worst-case fixture's SESSION so the list/detail asymmetry test below
+/// can prove they are stripped from list rows and kept on `agent.get`.
+const DETAIL_ONLY_ROW_KEYS: &[&str] = &[
     "harnessFeatures",
     "effortLevels",
     "contextReferences",
     "fileBlocks",
     "stats",
 ];
-const DETAIL_ONLY_METADATA_KEYS_PENDING_STRIP: &[&str] =
-    &["pendingProposals", "proposalResolutions"];
+const DETAIL_ONLY_METADATA_KEYS: &[&str] = &["pendingProposals", "proposalResolutions"];
 
 /// Build the worst-case-realistic `agent.list` row for the budget /
 /// allowlist goldens: one session with every optional field populated (ids,
 /// model/effort, sandbox + attention + completion-report metadata, every
-/// raw-metadata marker, stop reason, context references / file blocks),
-/// every preview string over the cap, an over-cap `lastToolUse` input, two
-/// active hooks, two active PR monitors, a live context-usage report, an
-/// outgoing completion watch and a pending delete — then read back through
-/// the real list path (`agent_list_op` → `agent_list_impl` →
+/// raw-metadata marker, stop reason, context references / file blocks,
+/// cached session stats), every preview string AND the attention reason
+/// over the cap, an over-cap `lastToolUse` input, two active hooks, two
+/// active PR monitors, a live context-usage report, an outgoing completion
+/// watch and a pending delete — then read back through the real list path
+/// (`agent_list_op` → `agent_list_impl` → `strip_detail_only_fields` +
 /// `cap_list_previews`). The only fields not seedable without a live ACP
 /// turn (`isResponding` / `isWaitingOnTool` / `turnInFlight` /
 /// `lastStreamActivityAt`, all overlaid from the live-turn slot) and
@@ -9421,7 +9418,10 @@ async fn worst_case_agent_list_row(
             ws,
             &id,
             "discussion",
-            "Need a decision on the row budget before tightening the golden.",
+            &format!(
+                "Need a decision on the row budget before tightening the golden. {}",
+                "q".repeat(BUDGET * 3)
+            ),
             &ts,
         )
         .await
@@ -9466,30 +9466,118 @@ async fn worst_case_agent_list_row(
     (id, row)
 }
 
-/// Strip the pending-removal keys (see
-/// [`DETAIL_ONLY_ROW_KEYS_PENDING_STRIP`]) from a serialized row so the
-/// budget is measured on the shape it is sized for.
-fn without_pending_strip_keys(row: &serde_json::Value) -> serde_json::Value {
-    let mut slim = row.clone();
-    if let Some(obj) = slim.as_object_mut() {
-        for key in DETAIL_ONLY_ROW_KEYS_PENDING_STRIP {
-            obj.remove(*key);
+/// List/detail asymmetry (intent-hq/intent#5383): the detail-only fields
+/// the worst-case fixture populates on the session are ABSENT (not `null`)
+/// on the `agent.list` row in every scope, and present unchanged on
+/// `agent.get` / `agent.getSession`. `stats` is never persisted (it is a
+/// derived §5.24 snapshot), so it is only asserted absent on list rows.
+#[tokio::test]
+async fn agent_list_strips_detail_only_fields_get_keeps_them() {
+    let (_t, svc, ws) = setup().await;
+    let (id, row) = worst_case_agent_list_row(&svc, &ws).await;
+    let wire = serde_json::to_value(&row).unwrap();
+    let obj = wire.as_object().expect("row object");
+    for key in DETAIL_ONLY_ROW_KEYS {
+        assert!(
+            !obj.contains_key(*key),
+            "agent.list row must not carry detail-only `{key}`: {wire}"
+        );
+    }
+    let meta = wire["metadata"].as_object().expect("metadata object");
+    for key in DETAIL_ONLY_METADATA_KEYS {
+        assert!(
+            !meta.contains_key(*key),
+            "agent.list metadata must not carry detail-only `{key}`: {wire}"
+        );
+    }
+
+    // Retired scopes go through the same list projection.
+    svc.agent_retire_op(id.clone(), None, None)
+        .await
+        .expect("retire");
+    for (label, rows) in [
+        (
+            "includeRetired",
+            svc.agent_list_including_retired_op(ws.clone())
+                .await
+                .expect("list including retired"),
+        ),
+        (
+            "retiredOnly",
+            svc.agent_list_retired_only_op(ws.clone())
+                .await
+                .expect("list retired only"),
+        ),
+    ] {
+        let listed = rows.into_iter().find(|a| a.id == id).expect("row listed");
+        let v = serde_json::to_value(&listed).unwrap();
+        for key in DETAIL_ONLY_ROW_KEYS {
+            assert!(
+                v.get(*key).is_none(),
+                "{label}: list row carries `{key}`: {v}"
+            );
         }
-        if let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            for key in DETAIL_ONLY_METADATA_KEYS_PENDING_STRIP {
-                meta.remove(*key);
-            }
+        for key in DETAIL_ONLY_METADATA_KEYS {
+            assert!(
+                v["metadata"].get(*key).is_none(),
+                "{label}: list metadata carries `{key}`: {v}"
+            );
         }
     }
-    slim
+
+    // The detail reads keep every one of them.
+    let got = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    assert!(
+        got["harnessFeatures"].is_object(),
+        "agent.get keeps harnessFeatures: {got}"
+    );
+    assert_eq!(got["effortLevels"], json!(["low", "medium", "high"]));
+    assert_eq!(
+        got["contextReferences"],
+        json!([{ "type": "file", "path": "src/lib.rs" }])
+    );
+    assert_eq!(
+        got["fileBlocks"],
+        json!([{ "type": "file", "path": "docs/a.md", "size": 1200 }])
+    );
+    assert_eq!(
+        got["metadata"]["pendingProposals"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        got["metadata"]["proposalResolutions"],
+        json!({
+            "prop-00": intent_core::PROPOSAL_OUTCOME_APPLIED,
+            "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
+        })
+    );
+    // And agent.get never applies the list caps either.
+    assert!(
+        got["metadata"]["attentionRequestReason"]
+            .as_str()
+            .map_or(0, str::len)
+            > intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        "agent.get serves the full attention reason: {got}"
+    );
+    let session = svc.agent_get_session_op(id).await.expect("get session");
+    assert!(session.harness_features.is_some());
+    assert_eq!(
+        session.effort_levels.as_deref().map(<[String]>::len),
+        Some(3)
+    );
+    assert!(session.context_references.is_some());
+    assert!(session.file_blocks.is_some());
+    assert_eq!(session.pending_proposals().len(), 2);
+    assert_eq!(session.proposal_resolutions().len(), 2);
 }
 
 /// Row-budget golden (intent-hq/intent#5383): the worst-case-realistic
 /// `agent.list` row serializes at or under
 /// [`intent_core::AGENT_LIST_ROW_BUDGET_BYTES`] — the failure message is the
 /// per-field byte table, so the field that blew the budget is named. Also
-/// pins the fixture as genuinely worst-case: every preview slot sits at the
-/// cap and both idle-visibility lists carry two entries.
+/// pins the fixture as genuinely worst-case: every preview slot and the
+/// attention reason sit at the cap and both idle-visibility lists carry two
+/// entries.
 #[tokio::test]
 async fn agent_list_row_stays_within_row_budget() {
     use intent_core::{
@@ -9516,6 +9604,13 @@ async fn agent_list_row_stays_within_row_budget() {
         Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
     );
     assert_eq!(
+        row.metadata
+            .attention_request_reason
+            .as_deref()
+            .map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(
         row.last_tool_use.as_ref().unwrap()["inputTruncated"],
         json!(true)
     );
@@ -9528,9 +9623,8 @@ async fn agent_list_row_stays_within_row_budget() {
     assert!(row.metadata.sandbox_id.is_some());
 
     let wire = serde_json::to_value(&row).unwrap();
-    let measured = without_pending_strip_keys(&wire);
-    let (total, per_key) = serialized_key_bytes(&measured);
-    let (meta_total, meta_per_key) = serialized_key_bytes(&measured["metadata"]);
+    let (total, per_key) = serialized_key_bytes(&wire);
+    let (meta_total, meta_per_key) = serialized_key_bytes(&wire["metadata"]);
     let table = format!(
         "{}metadata breakdown:\n{}",
         format_key_bytes_table(total, &per_key),
@@ -9547,8 +9641,7 @@ async fn agent_list_row_stays_within_row_budget() {
 
 /// Key-allowlist golden (intent-hq/intent#5383): every top-level key and
 /// every `metadata` key of the worst-case `agent.list` row is listed in
-/// [`intent_core::AGENT_LIST_ROW_KEYS`] / [`intent_core::AGENT_LIST_ROW_METADATA_KEYS`]
-/// (or in the pending-strip sets above until the slimming change lands),
+/// [`intent_core::AGENT_LIST_ROW_KEYS`] / [`intent_core::AGENT_LIST_ROW_METADATA_KEYS`],
 /// and — the other direction — the fixture populates every allowlisted key,
 /// so the budget test above really measures the worst case.
 #[tokio::test]
@@ -9561,7 +9654,7 @@ async fn agent_list_row_keys_match_allowlist_golden() {
     let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
     let wire = serde_json::to_value(&row).unwrap();
 
-    let check = |label: &str, object: &serde_json::Value, allow: &[&str], pending: &[&str]| {
+    let check = |label: &str, object: &serde_json::Value, allow: &[&str]| {
         let (total, per_key) = serialized_key_bytes(object);
         let table = format_key_bytes_table(total, &per_key);
         let keys: Vec<&str> = object
@@ -9573,7 +9666,7 @@ async fn agent_list_row_keys_match_allowlist_golden() {
         let unlisted: Vec<&str> = keys
             .iter()
             .copied()
-            .filter(|k| !allow.contains(k) && !pending.contains(k))
+            .filter(|k| !allow.contains(k))
             .collect();
         assert!(
             unlisted.is_empty(),
@@ -9595,18 +9688,8 @@ async fn agent_list_row_keys_match_allowlist_golden() {
              measures every field.\n{table}"
         );
     };
-    check(
-        "row",
-        &wire,
-        AGENT_LIST_ROW_KEYS,
-        DETAIL_ONLY_ROW_KEYS_PENDING_STRIP,
-    );
-    check(
-        "metadata",
-        &wire["metadata"],
-        AGENT_LIST_ROW_METADATA_KEYS,
-        DETAIL_ONLY_METADATA_KEYS_PENDING_STRIP,
-    );
+    check("row", &wire, AGENT_LIST_ROW_KEYS);
+    check("metadata", &wire["metadata"], AGENT_LIST_ROW_METADATA_KEYS);
 }
 
 /// The top-level `isBackground` param wins over the `metadata` fallback, and
@@ -32587,7 +32670,10 @@ async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
 /// summary + last-rows projection) is byte-identical to the full-transcript
 /// projection of the same seeded session — every `AgentLite` field, including
 /// `messageCount`, `lastAgentResponse`, digest, `lastUserMessage`, and the
-/// derived `sessionCorrupted` flag.
+/// derived `sessionCorrupted` flag. The `agent.list` row differs from it only
+/// by the list-payload cost contract (detail-only fields stripped, previews
+/// capped — intent-hq/intent#5383), so it is compared against the full
+/// projection with that same contract applied.
 #[tokio::test]
 async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
     let (_t, svc, ws) = setup().await;
@@ -32617,7 +32703,18 @@ async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
 
     // Old (full-transcript) projection, still used by the event-emit paths.
     let full = svc.store().get_agent_session(&id).await.expect("session");
-    let old = serde_json::to_value(svc.project_lite_with_flags(full)).unwrap();
+    let old_lite = svc.project_lite_with_flags(full);
+    let old = serde_json::to_value(&old_lite).unwrap();
+    assert!(
+        old.get("harnessFeatures").is_some(),
+        "fixture must carry a detail-only field so the list comparison is meaningful: {old}"
+    );
+    let old_as_list_row = {
+        let mut lite = old_lite;
+        lite.strip_detail_only_fields();
+        lite.cap_list_previews();
+        serde_json::to_value(lite).unwrap()
+    };
 
     // New bounded paths — `agent.get` (with the workspace scope check in
     // play) and the `agent.list` entry.
@@ -32642,7 +32739,7 @@ async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
 
     let agents = svc.agent_list_op(ws).await.expect("list");
     let listed = agents.into_iter().find(|a| a.id == id).expect("listed");
-    assert_eq!(serde_json::to_value(listed).unwrap(), old);
+    assert_eq!(serde_json::to_value(listed).unwrap(), old_as_list_row);
 }
 
 /// `lastMessageRole` derivation across both projection paths: omitted on an

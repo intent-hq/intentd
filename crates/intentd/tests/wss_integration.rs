@@ -1113,7 +1113,10 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
         got["result"]["agent"]["harnessFeatures"], *features,
         "agent.get returns the same persisted harnessFeatures snapshot: {got}"
     );
-    // agent.list projects the same stamp on its AgentLite rows.
+    // agent.list rows carry the small `harnessVersion` label but NOT the
+    // detail-only `harnessFeatures` snapshot (intent-hq/intent#5383: the
+    // list projection strips it; absent, never `null` — `agent.get` above
+    // keeps serving it).
     let list_frame = format!(
         r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
     );
@@ -1129,9 +1132,9 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
         Some(intent_core::CURRENT_HARNESS_VERSION),
         "agent.list rows carry harnessVersion: {listed}"
     );
-    assert_eq!(
-        row["harnessFeatures"], *features,
-        "agent.list rows carry the persisted harnessFeatures snapshot: {listed}"
+    assert!(
+        row.get("harnessFeatures").is_none(),
+        "agent.list rows must omit the detail-only harnessFeatures snapshot: {listed}"
     );
 
     srv.ws.stop().await;
@@ -11445,7 +11448,10 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         "no assistant reply yet: {lite2}"
     );
 
-    // agent.get — `{ agent: AgentLite }`, byte-identical to the list entry.
+    // agent.get — `{ agent: AgentLite }`, byte-identical to the list entry
+    // apart from the detail-only fields the list row strips
+    // (intent-hq/intent#5383); this fixture carries exactly one of them,
+    // `harnessFeatures`.
     let got = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -11454,9 +11460,22 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         ),
     )
     .await;
+    let mut got_agent = got["result"]["agent"].clone();
+    assert!(
+        got_agent["harnessFeatures"].is_object(),
+        "agent.get keeps the detail-only harnessFeatures: {got_agent}"
+    );
+    assert!(
+        lite.get("harnessFeatures").is_none(),
+        "agent.list row strips harnessFeatures: {lite}"
+    );
+    got_agent
+        .as_object_mut()
+        .expect("agent object")
+        .remove("harnessFeatures");
     assert_eq!(
-        got["result"]["agent"], *lite,
-        "agent.get == agent.list entry"
+        got_agent, *lite,
+        "agent.get == agent.list entry (modulo detail-only fields)"
     );
 
     // agent.getConversation — full multi-page walk. Default page (no limit) is

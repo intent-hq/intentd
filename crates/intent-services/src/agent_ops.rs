@@ -2640,8 +2640,15 @@ impl Services {
     /// capped rather than omitted) are bounded per row to the render-sized
     /// [`intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES`]
     /// ([`AgentLite::cap_list_previews`]); the detail reads keep full values.
-    /// Together these keep a ~250-session response well under the 1 MiB
-    /// outbound frame warn threshold.
+    /// The detail-only fields (`harnessFeatures`, `effortLevels`,
+    /// `contextReferences`, `fileBlocks`, `stats`,
+    /// `metadata.pendingProposals`, `metadata.proposalResolutions` — read only
+    /// by the open agent's UI, intent-hq/intent#5383) are stripped from list
+    /// rows ([`AgentLite::strip_detail_only_fields`]) and served by
+    /// `agent.get` / `agent.getSession` only. Together these keep a
+    /// ~250-session response well under the 1 MiB outbound frame warn
+    /// threshold; the row-budget / key-allowlist goldens in `tests.rs` pin
+    /// the resulting shape.
     ///
     /// Deliberate asymmetry: the agent channel's seq-0 snapshot goes through
     /// this op (capped rows), while per-agent deltas re-read via `agent.get`
@@ -2768,10 +2775,12 @@ impl Services {
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
                 lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
-                // List-payload cost contract: bound the render-preview
-                // fields per row (see the doc comment above); the detail
-                // reads keep full values. Applied AFTER the runtime overlay
-                // so live-turn preview text is capped like persisted text.
+                // List-payload cost contract: drop the detail-only fields
+                // and bound the render-preview fields per row (see the doc
+                // comment above); the detail reads keep full values.
+                // Applied AFTER the runtime overlay so live-turn preview
+                // text is capped like persisted text.
+                lite.strip_detail_only_fields();
                 lite.cap_list_previews();
                 lite
             })
