@@ -1111,9 +1111,11 @@ impl WsInner {
                                     continue;
                                 };
                                 let api = self.api.clone();
+                                let host = crate::invite::host_identity(
+                                    self.control.as_ref(), self.server_pairing_info.as_ref());
                                 tasks.spawn(async move {
                                     let _permit = permit;
-                                    if let Some(frame) = crate::invite::handle_redeem(req, &api).await {
+                                    if let Some(frame) = crate::invite::handle_redeem(req, &api, host).await {
                                         slot.send(frame);
                                     }
                                 });
