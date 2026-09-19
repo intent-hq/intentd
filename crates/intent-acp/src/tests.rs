@@ -12274,3 +12274,795 @@ mod workspace_api_output_limit_tests {
         assert!(text.chars().count() < 500, "message must stay bounded");
     }
 }
+
+/// `ws.workspace.applyProposal` (intent-hq/intent#5413): the proposing
+/// foreground top-level agent applies one of its OWN pending
+/// `workspace-create` proposals on explicit user instruction.
+#[cfg(test)]
+mod workspace_apply_proposal_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, PendingProposal, Result,
+        Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
+        WorkspaceCreateResult, WorkspaceId, WorkspaceStatus,
+    };
+    use serde_json::{json, Value};
+
+    use crate::mcp_server::PROPOSAL_RESOURCE_MIME_TYPE;
+    use crate::WorkspaceMcpServer;
+
+    const WS: &str = "amber-forest";
+    const CALLER: &str = "agent-77";
+    const PENDING_ID: &str = "Create workspace: Follow up";
+    const MESSAGE_ID: &str = "m-proposal";
+    const KEY: &str = "sibling-workspace-0000-key";
+
+    type ResolveCall = (String, String, String, String, Option<String>);
+    /// `(agent_id, limit, around_message_id)`.
+    type ConversationCall = (String, Option<i64>, Option<String>);
+
+    #[derive(Default)]
+    struct FakeApi {
+        pending: Mutex<Vec<PendingProposal>>,
+        resolutions: Mutex<serde_json::Map<String, Value>>,
+        /// `message_id -> contentBlocks` served by `agent_get_conversation`.
+        messages: Mutex<HashMap<String, Vec<Value>>>,
+        conversation_calls: Mutex<Vec<ConversationCall>>,
+        create_calls: Mutex<Vec<(WorkspaceCreate, Option<String>)>>,
+        create_error: Mutex<Option<Error>>,
+        resolve_calls: Mutex<Vec<ResolveCall>>,
+        resolve_error: Mutex<Option<Error>>,
+    }
+
+    fn workspace(id: &str, title: &str) -> Workspace {
+        let now = "2026-01-01T00:00:00Z".to_string();
+        Workspace {
+            id: WorkspaceId::from_string(id),
+            title: title.to_string(),
+            branch: format!("{id}-branch"),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_activity: None,
+            tags: Vec::new(),
+            path: Some(format!("/checkouts/{id}")),
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            context_links: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+            browser_client_id: None,
+            display_status: None,
+            waiting: false,
+            checkout_mode: None,
+            disk_usage: None,
+            pending_delete_at: None,
+        }
+    }
+
+    fn caller_lite(
+        pending: Vec<PendingProposal>,
+        resolutions: serde_json::Map<String, Value>,
+    ) -> AgentLite {
+        AgentLite {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from(CALLER),
+            workspace_id: WorkspaceId::from_string(WS),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Coordinator".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            is_streaming: false,
+            is_processing: false,
+            is_responding: true,
+            is_waiting_on_tool: false,
+            is_waiting_for_other_agents: false,
+            waiting_for_agent_ids: vec![],
+            waiting_on_hooks: vec![],
+            waiting_on_pr_monitors: vec![],
+            turn_in_flight: true,
+            last_stream_activity_at: None,
+            context_usage: None,
+            stats: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: None,
+            message_count: 0,
+            digest: None,
+            last_agent_response: None,
+            last_user_message: None,
+            last_message_role: None,
+            last_message_id: None,
+            last_tool_use: None,
+            context_references: None,
+            file_blocks: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            retired_at: None,
+            notifications_muted: false,
+            metadata: AgentMetadata {
+                is_background: false,
+                specialist: None,
+                created_by_agent_id: None,
+                task_note_id: None,
+                completion_report: None,
+                completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: None,
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+                dismissed_questions_message_id: None,
+                pending_questions_message_id: None,
+                pending_proposals: pending,
+                proposal_resolutions: resolutions,
+                last_seen_message_id: None,
+                is_initial_agent: None,
+                sponsor_agent_id: None,
+            },
+        }
+    }
+
+    impl WorkspaceApi for FakeApi {
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            Box::pin(async move { Ok(workspace(id.as_str(), "Amber Forest")) })
+        }
+
+        fn agent_get(
+            &self,
+            agent_id: AgentId,
+            workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<AgentLite>> {
+            let pending = self.pending.lock().unwrap().clone();
+            let resolutions = self.resolutions.lock().unwrap().clone();
+            Box::pin(async move {
+                assert_eq!(agent_id.as_str(), CALLER, "lookup is scoped to the caller");
+                assert_eq!(
+                    workspace_id.as_ref().map(WorkspaceId::as_str),
+                    Some(WS),
+                    "lookup is workspace-scoped"
+                );
+                Ok(caller_lite(pending, resolutions))
+            })
+        }
+
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            limit: Option<i64>,
+            workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            around_message_id: Option<String>,
+            _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.conversation_calls.lock().unwrap().push((
+                agent_id.as_str().to_string(),
+                limit,
+                around_message_id.clone(),
+            ));
+            let messages = self.messages.lock().unwrap().clone();
+            Box::pin(async move {
+                assert_eq!(workspace_id.as_ref().map(WorkspaceId::as_str), Some(WS));
+                let mid = around_message_id.expect("single-message seek");
+                let Some(blocks) = messages.get(&mid) else {
+                    return Err(Error::InvalidParams(format!("unknown message id: {mid}")));
+                };
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [{
+                        "id": mid,
+                        "agentId": agent_id.as_str(),
+                        "seq": 3,
+                        "role": "assistant",
+                        "contentBlocks": blocks,
+                        "timestamp": "2026-01-01T00:00:00Z",
+                    }],
+                    "truncated": false,
+                    "totalMessages": 4,
+                }))
+            })
+        }
+
+        fn create_workspace(
+            &self,
+            input: WorkspaceCreate,
+            idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
+            let title = input.title.clone().unwrap_or_default();
+            self.create_calls
+                .lock()
+                .unwrap()
+                .push((input, idempotency_key));
+            let error = self.create_error.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(e);
+                }
+                Ok(WorkspaceCreateResult {
+                    workspace: workspace("ws-new", &title),
+                    initial_agent: Some(json!({
+                        "id": "agent-new",
+                        "workspaceId": "ws-new",
+                        "name": "Coordinator",
+                        "notificationsMuted": false,
+                    })),
+                })
+            })
+        }
+
+        fn agent_resolve_proposal(
+            &self,
+            workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            proposal_id: String,
+            outcome: String,
+            detail: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.resolve_calls.lock().unwrap().push((
+                workspace_id.as_str().to_string(),
+                agent_id.as_str().to_string(),
+                proposal_id.clone(),
+                outcome.clone(),
+                detail,
+            ));
+            let error = self.resolve_error.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(e);
+                }
+                Ok(json!({ "success": true, "proposalId": proposal_id, "outcome": outcome }))
+            })
+        }
+    }
+
+    fn sibling_proposal() -> Value {
+        json!({
+            "kind": "workspace-create",
+            "payload": {
+                "operation": "workspace.create",
+                "params": {
+                    "title": "Follow up",
+                    "repositoryPath": "/repos/intentd",
+                    "repositoryOwner": "intent-hq",
+                    "repositoryName": "intentd",
+                    "baseRef": "main",
+                    "initialAgent": {
+                        "name": "Coordinator",
+                        "prompt": "Implement the isolated follow-up and test it.",
+                        "agentType": "workspace",
+                        "specialist": "implementor",
+                        "metadata": { "isInitialAgent": true, "specialist": "implementor" },
+                    },
+                    "idempotencyKey": KEY,
+                },
+            },
+            "preview": {
+                "title": PENDING_ID,
+                "summary": "Review this follow-up workspace before creating it.",
+            },
+        })
+    }
+
+    fn proposal_block(proposal: &Value) -> Value {
+        json!({
+            "type": "resource",
+            "resource": {
+                "uri": crate::mcp_server::proposal_resource_uri(proposal),
+                "name": proposal["preview"]["title"],
+                "mimeType": PROPOSAL_RESOURCE_MIME_TYPE,
+                "text": serde_json::to_string(proposal).unwrap(),
+            },
+        })
+    }
+
+    fn api_with_pending(proposal: &Value) -> Arc<FakeApi> {
+        let api = Arc::new(FakeApi::default());
+        api.pending.lock().unwrap().push(PendingProposal {
+            proposal_id: PENDING_ID.to_string(),
+            message_id: MESSAGE_ID.to_string(),
+        });
+        api.messages.lock().unwrap().insert(
+            MESSAGE_ID.to_string(),
+            vec![
+                json!({ "type": "text", "text": "Proposing a follow-up." }),
+                proposal_block(proposal),
+            ],
+        );
+        api
+    }
+
+    fn server(api: Arc<FakeApi>) -> WorkspaceMcpServer {
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string(WS))
+            .with_caller_agent_id(Some(AgentId::from_string(CALLER)))
+    }
+
+    async fn call(srv: &WorkspaceMcpServer, code: &str) -> Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "unit test" }
+            }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    fn tool_text(resp: &Value) -> &str {
+        resp["result"]["content"][0]["text"].as_str().unwrap()
+    }
+
+    fn tool_json(resp: &Value) -> Value {
+        serde_json::from_str(tool_text(resp)).unwrap()
+    }
+
+    fn assert_error_contains(resp: &Value, needle: &str) {
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        assert!(
+            tool_text(resp).contains(needle),
+            "expected `{needle}` in `{}`",
+            tool_text(resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_false_user_requested_without_creating() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        for code in [
+            format!("return await ws.workspace.applyProposal({PENDING_ID:?});"),
+            format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{}});"),
+            format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: false }});"),
+            format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: 'true' }});"),
+        ] {
+            let resp = call(&srv, &code).await;
+            assert_error_contains(&resp, "applyProposal requires { userRequested: true }");
+        }
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_option_keys_and_empty_overrides() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, baseRef: 'x' }});"),
+        )
+        .await;
+        assert_error_contains(
+            &resp,
+            "unknown applyProposal option `baseRef`; allowed options are userRequested, title, initialPrompt",
+        );
+        for (code, field) in [
+            (format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, title: '   ' }});"), "title"),
+            (format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, initialPrompt: '' }});"), "initialPrompt"),
+            (format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, title: 7 }});"), "title"),
+        ] {
+            let resp = call(&srv, &code).await;
+            assert_error_contains(
+                &resp,
+                &format!("{field} must be a non-empty string when provided"),
+            );
+        }
+        let resp = call(
+            &srv,
+            "return await ws.workspace.applyProposal('', { userRequested: true });",
+        )
+        .await;
+        assert_error_contains(&resp, "non-empty proposal id");
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_apply_creates_with_stored_key_then_resolves_applied() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_ne!(resp["result"]["isError"], true, "{resp}");
+        let out = tool_json(&resp);
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["proposalId"], PENDING_ID);
+        assert_eq!(out["outcome"], "applied");
+        assert_eq!(out["workspace"]["id"], "ws-new");
+        assert_eq!(out["workspace"]["title"], "Follow up");
+        assert_eq!(out["workspace"]["branch"], "ws-new-branch");
+        assert_eq!(out["workspace"]["path"], "/checkouts/ws-new");
+        assert_eq!(out["initialAgent"]["id"], "agent-new");
+        assert!(
+            out["initialAgent"].get("notificationsMuted").is_none(),
+            "agent-hidden fields are stripped from the passthrough"
+        );
+        assert!(out.get("overrides").is_none());
+        assert!(out.get("alreadyResolved").is_none());
+        assert!(out.get("resolveWarning").is_none());
+
+        // Bounded message read: one single-message seek on the caller.
+        let reads = api.conversation_calls.lock().unwrap().clone();
+        assert_eq!(
+            reads,
+            vec![(CALLER.to_string(), Some(1), Some(MESSAGE_ID.to_string()))]
+        );
+
+        let creates = api.create_calls.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        let (input, key) = &creates[0];
+        assert_eq!(key.as_deref(), Some(KEY), "stored key reused verbatim");
+        assert_eq!(input.title.as_deref(), Some("Follow up"));
+        assert_eq!(input.repository_path.as_deref(), Some("/repos/intentd"));
+        assert_eq!(input.repository_owner.as_deref(), Some("intent-hq"));
+        assert_eq!(input.repository_name.as_deref(), Some("intentd"));
+        assert_eq!(input.base_ref.as_deref(), Some("main"));
+        let agent = input.initial_agent.as_ref().unwrap();
+        assert_eq!(
+            agent.prompt.as_deref(),
+            Some("Implement the isolated follow-up and test it.")
+        );
+        assert_eq!(agent.specialist.as_deref(), Some("implementor"));
+        drop(creates);
+
+        let resolves = api.resolve_calls.lock().unwrap();
+        assert_eq!(resolves.len(), 1);
+        let (ws, agent, proposal_id, outcome, detail) = &resolves[0];
+        assert_eq!(ws, WS);
+        assert_eq!(agent, CALLER);
+        assert_eq!(proposal_id, PENDING_ID);
+        assert_eq!(outcome, "applied");
+        assert_eq!(
+            detail.as_deref(),
+            Some("Created workspace ws-new (Follow up) via ws.workspace.applyProposal")
+        );
+    }
+
+    #[tokio::test]
+    async fn overrides_replace_only_title_and_prompt_and_are_named_in_result_and_detail() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!(
+                "return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, title: ' Renamed ', initialPrompt: 'Do the other thing.' }});"
+            ),
+        )
+        .await;
+        assert_ne!(resp["result"]["isError"], true, "{resp}");
+        let out = tool_json(&resp);
+        assert_eq!(
+            out["overrides"],
+            json!({ "title": true, "initialPrompt": true })
+        );
+        assert_eq!(out["workspace"]["title"], "Renamed");
+
+        let (input, key) = api.create_calls.lock().unwrap()[0].clone();
+        assert_eq!(key.as_deref(), Some(KEY), "overrides never mint a new key");
+        assert_eq!(input.title.as_deref(), Some("Renamed"));
+        let agent = input.initial_agent.as_ref().unwrap();
+        assert_eq!(agent.prompt.as_deref(), Some("Do the other thing."));
+        // Every other param is byte-identical to the proposal.
+        assert_eq!(input.repository_path.as_deref(), Some("/repos/intentd"));
+        assert_eq!(input.repository_owner.as_deref(), Some("intent-hq"));
+        assert_eq!(input.repository_name.as_deref(), Some("intentd"));
+        assert_eq!(input.base_ref.as_deref(), Some("main"));
+        assert_eq!(agent.name.as_deref(), Some("Coordinator"));
+        assert_eq!(agent.agent_type.as_deref(), Some("workspace"));
+        assert_eq!(agent.specialist.as_deref(), Some("implementor"));
+        assert_eq!(
+            agent.metadata,
+            Some(json!({ "isInitialAgent": true, "specialist": "implementor" }))
+        );
+
+        let detail = api.resolve_calls.lock().unwrap()[0].4.clone();
+        assert_eq!(
+            detail.as_deref(),
+            Some("Created workspace ws-new (Renamed) via ws.workspace.applyProposal with overridden title and prompt")
+        );
+
+        // Single overrides name only the field they touched.
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, title: 'Only title' }});"),
+            )
+            .await,
+        );
+        assert_eq!(out["overrides"], json!({ "title": true }));
+        assert!(api.resolve_calls.lock().unwrap()[0]
+            .4
+            .as_deref()
+            .unwrap()
+            .ends_with(" with overridden title"));
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, initialPrompt: 'Only prompt' }});"),
+            )
+            .await,
+        );
+        assert_eq!(out["overrides"], json!({ "initialPrompt": true }));
+        assert!(api.resolve_calls.lock().unwrap()[0]
+            .4
+            .as_deref()
+            .unwrap()
+            .ends_with(" with overridden prompt"));
+    }
+
+    #[tokio::test]
+    async fn initial_prompt_override_requires_an_initial_agent_on_the_proposal() {
+        let mut proposal = sibling_proposal();
+        proposal["payload"]["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("initialAgent");
+        let api = api_with_pending(&proposal);
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true, initialPrompt: 'x' }});"),
+        )
+        .await;
+        assert_error_contains(
+            &resp,
+            "has no initialAgent; initialPrompt cannot be overridden",
+        );
+        assert!(api.create_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lookup_by_idempotency_key_resolves_the_pending_proposal_id() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!(
+                    "return await ws.workspace.applyProposal({KEY:?}, {{ userRequested: true }});"
+                ),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true);
+        assert_eq!(
+            out["proposalId"], PENDING_ID,
+            "result names the proposal id, not the key"
+        );
+        assert_eq!(api.create_calls.lock().unwrap()[0].1.as_deref(), Some(KEY));
+        assert_eq!(api.resolve_calls.lock().unwrap()[0].2, PENDING_ID);
+    }
+
+    #[tokio::test]
+    async fn unknown_proposal_id_errors_with_turn_end_hint_and_creates_nothing() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            "return await ws.workspace.applyProposal('Create workspace: Other', { userRequested: true });",
+        )
+        .await;
+        assert_error_contains(&resp, "no pending proposal `Create workspace: Other`");
+        assert_error_contains(&resp, "recorded as pending only at turn end");
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+
+        // No pending proposals at all: same not-found path, no message reads.
+        let api = Arc::new(FakeApi::default());
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "no pending proposal");
+        assert!(api.conversation_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_workspace_create_proposal_is_refused_naming_its_kind() {
+        let proposal = json!({
+            "kind": "settings",
+            "applyToolCallId": PENDING_ID,
+            "payload": { "operation": "settings.set", "params": { "path": "a", "value": 1 } },
+            "preview": { "title": "Change a setting" },
+        });
+        let api = api_with_pending(&proposal);
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "is a `settings` proposal (settings.set)");
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn already_applied_is_idempotent_and_dismissed_is_refused() {
+        let api = Arc::new(FakeApi::default());
+        api.resolutions
+            .lock()
+            .unwrap()
+            .insert(PENDING_ID.to_string(), json!("applied"));
+        api.resolutions
+            .lock()
+            .unwrap()
+            .insert("Create workspace: Dropped".to_string(), json!("dismissed"));
+        let srv = server(api.clone());
+
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await,
+        );
+        assert_eq!(
+            out,
+            json!({ "ok": true, "proposalId": PENDING_ID, "outcome": "applied", "alreadyResolved": true })
+        );
+
+        let resp = call(
+            &srv,
+            "return await ws.workspace.applyProposal('Create workspace: Dropped', { userRequested: true });",
+        )
+        .await;
+        assert_error_contains(
+            &resp,
+            "was dismissed by the user; propose it again with ws.workspace.proposeSibling if still wanted",
+        );
+        assert!(api.create_calls.lock().unwrap().is_empty());
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_failure_surfaces_the_error_and_records_no_resolution() {
+        let api = api_with_pending(&sibling_proposal());
+        *api.create_error.lock().unwrap() = Some(Error::InvalidParams(
+            "baseRef 'main' does not resolve".to_string(),
+        ));
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "baseRef 'main' does not resolve");
+        assert_eq!(api.create_calls.lock().unwrap().len(), 1);
+        assert!(
+            api.resolve_calls.lock().unwrap().is_empty(),
+            "the card must stay pending so the user can Retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_failure_after_create_returns_ok_with_resolve_warning() {
+        let api = api_with_pending(&sibling_proposal());
+        *api.resolve_error.lock().unwrap() = Some(Error::Internal("store closed".to_string()));
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["workspace"]["id"], "ws-new");
+        let warning = out["resolveWarning"].as_str().unwrap();
+        assert!(warning.contains("ws-new"));
+        assert!(warning.contains("could not be marked applied"));
+        assert!(warning.contains("store closed"));
+    }
+
+    #[tokio::test]
+    async fn raw_dispatch_without_caller_agent_is_rejected() {
+        let api = api_with_pending(&sibling_proposal());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string(WS));
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "Could not determine agent ID");
+        assert!(api.create_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_is_hidden_and_raw_dispatch_denied_for_sub_agents() {
+        let top = server(api_with_pending(&sibling_proposal()));
+        let top_list = top
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        assert!(top_list["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("ws.workspace.applyProposal("));
+        let top_type = call(&top, "return typeof ws.workspace.applyProposal;").await;
+        assert_eq!(tool_text(&top_type), "\"function\"");
+
+        let api = api_with_pending(&sibling_proposal());
+        let sub = server(api.clone()).with_sub_agent(true);
+        let sub_list = sub
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        assert!(!sub_list["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("ws.workspace.applyProposal("));
+        let sub_type = call(&sub, "return typeof ws.workspace.applyProposal;").await;
+        assert_eq!(tool_text(&sub_type), "\"undefined\"");
+        let raw = call(
+            &sub,
+            &format!(
+                "return await host({{ method: 'workspace.applyProposal', args: {{ proposalId: {PENDING_ID:?}, options: {{ userRequested: true }} }} }});"
+            ),
+        )
+        .await;
+        assert_error_contains(
+            &raw,
+            "ws.workspace.applyProposal is only available to foreground top-level agents",
+        );
+        assert!(api.create_calls.lock().unwrap().is_empty());
+    }
+}
