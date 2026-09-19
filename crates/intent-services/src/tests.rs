@@ -1826,8 +1826,12 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
         row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
-        svc.enrich_workspace_aggregates_with_unread(row, Some(unread.contains(row.id.as_str())))
-            .await;
+        svc.enrich_workspace_aggregates_with_unread(
+            row,
+            Some(unread.contains(row.id.as_str())),
+            None,
+        )
+        .await;
         row.slim_for_list();
     }
 

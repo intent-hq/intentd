@@ -2336,7 +2336,7 @@ impl Services {
     /// Called on `workspace.*` mutation paths (update/archive/unarchive) that
     /// return a `Workspace` on the wire so clients never have to recompute it;
     /// the `workspace.list`/`workspace.get` read paths derive the same value
-    /// inline as part of [`Services::enrich_workspace_aggregates`] to keep the
+    /// inline as part of [`Services::enrich_workspace_aggregates_with_unread`] to keep the
     /// aggregate scan single-pass. Keep the two in sync when the derivation
     /// rules change. Store failures fall back to the workspace's own
     /// timestamps rather than failing the caller.
@@ -2594,20 +2594,30 @@ impl Services {
     /// re-read path; desktop FE already treats the field as deprecated and
     /// fetches diffs on demand via `git.diffs`, and embedding the rollup on
     /// every workspace re-read pinned the blocking pool.
+    ///
+    /// Production callers go through
+    /// [`Self::enrich_workspace_aggregates_with_unread`] (the list path
+    /// threads its batch unread set, `workspace.get` its pre-read external
+    /// PR inputs); this no-argument form remains for tests.
+    #[cfg(test)]
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
-        self.enrich_workspace_aggregates_with_unread(ws, None).await;
+        self.enrich_workspace_aggregates_with_unread(ws, None, None)
+            .await;
     }
 
-    /// [`Self::enrich_workspace_aggregates`] with the caller's batch-derived
+    /// The workspace aggregate enrichment with the caller's batch-derived
     /// unread value threaded to the displayStatus derivation: the list path
     /// computes the whole list's unread set in ONE statement
     /// (`workspaces_with_unread_top_level_sessions`) and hands each row its
     /// membership here, so enrichment issues no per-row unread probe.
     /// `None` (single-row callers) keeps the bounded per-workspace probe.
+    /// `external_prs` likewise threads pre-read git-root PRs and monitor rows
+    /// (`workspace.get`) so the derivation issues no duplicate scoped read.
     pub(crate) async fn enrich_workspace_aggregates_with_unread(
         &self,
         ws: &mut Workspace,
         unread: Option<bool>,
+        external_prs: Option<workspace_status::WorkspaceExternalPrs<'_>>,
     ) {
         let cow_supported = self.compute_cow_supported().await;
         let mut activity_max = latest_activity_candidate(&[
@@ -2659,7 +2669,7 @@ impl Services {
         // Derived "current cycle" display status over the active/latest PR
         // and the taskStats computed above; never persisted. See
         // [`Services::enrich_display_status`] (workspace_status module).
-        self.enrich_display_status(ws, sessions.as_deref(), unread)
+        self.enrich_display_status(ws, sessions.as_deref(), unread, external_prs)
             .await;
     }
 
@@ -3016,33 +3026,22 @@ impl Services {
     /// priority, dedup and lifecycle rules, so the detail read serves the
     /// full merged pool the list rows were capped from
     /// (`WORKSPACE_LIST_PR_CAP` + `pullRequestsTotal`) — uncapped and
-    /// unslimmed. Two scoped store reads (the git-root read the
-    /// displayStatus derivation also issues on this path, and the
-    /// per-workspace [`intent_store::PrMonitorListEntry`] projection); no
-    /// forge calls, nothing persisted. Runs after enrichment for the same
-    /// reason the list merge does: the derivation must not see the merged
-    /// entries a second time. A read failure degrades to the unmerged row.
-    pub(crate) async fn merge_workspace_external_pull_requests(&self, ws: &mut Workspace) {
-        let roots = self.workspace_git_root_prs(&ws.id).await;
-        let monitored = match self
-            .store
-            .load_non_cancelled_pr_monitor_list_entries_for_workspace(&ws.id)
-            .await
-        {
-            Ok(monitors) => monitors
-                .iter()
-                .map(pr_monitor::pr_monitor_pr_info)
-                .collect(),
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %ws.id.0,
-                    error = %e,
-                    "workspace.get: pr monitor read failed; skipping"
-                );
-                Vec::new()
-            }
-        };
-        merge_workspace_pull_requests(ws, roots, monitored);
+    /// unslimmed. Consumes the reads the displayStatus derivation already
+    /// used ([`Services::workspace_external_pr_reads`], issued once per
+    /// call): no store reads of its own, no forge calls, nothing persisted.
+    /// Runs after enrichment for the same reason the list merge does: the
+    /// derivation must not see the merged entries a second time.
+    pub(crate) fn merge_workspace_external_pull_requests(
+        ws: &mut Workspace,
+        reads: workspace_status::WorkspaceExternalPrReads,
+    ) {
+        let monitored = reads
+            .monitors
+            .list_entries
+            .iter()
+            .map(pr_monitor::pr_monitor_pr_info)
+            .collect();
+        merge_workspace_pull_requests(ws, reads.git_root_prs, monitored);
     }
 
     /// Start the one-time repository owner/name backfill after daemon listeners
@@ -9754,7 +9753,7 @@ fn iso_to_epoch_ms(iso: &str) -> i64 {
 /// Return the latest RFC-3339 timestamp among the supplied candidates, ignoring
 /// unparsable or absent entries. Powers the `lastActivity` derivation on every
 /// `workspace.*` path that returns a `Workspace` on the wire (§9.1) — the
-/// list/get read path via [`Services::enrich_workspace_aggregates`] and the
+/// list/get read path via [`Services::enrich_workspace_aggregates_with_unread`] and the
 /// update/archive/unarchive mutation paths via [`Services::derive_last_activity`].
 /// FE `getLatestActivityCandidate` parity.
 fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
@@ -17717,13 +17716,23 @@ impl WorkspaceApi for Services {
             // Delete grace window (§5.1): surface the in-memory
             // pending-deletion deadline; O(1) map read, never persisted.
             ws.pending_delete_at = this.pending_workspace_deletes.deadline(id.as_str());
-            this.enrich_workspace_aggregates(&mut ws).await;
+            // The git-root PRs and monitor rows are read ONCE and shared by
+            // the displayStatus derivation and the PR merge below, so the
+            // detail read's statement count does not grow with the merge
+            // (`workspace_get_enrichment_stays_within_statement_budget`).
+            let external = this.workspace_external_pr_reads(&id).await;
+            this.enrich_workspace_aggregates_with_unread(
+                &mut ws,
+                None,
+                Some(external.status_inputs()),
+            )
+            .await;
             // Same external PR merge as the list paths, after enrichment
             // for the same reason, so the detail read serves the full
             // merged pool a capped list row (`pullRequestsTotal`) points
             // at — uncapped and unslimmed: `workspace.get` keeps every
             // field for detail reads.
-            this.merge_workspace_external_pull_requests(&mut ws).await;
+            Self::merge_workspace_external_pull_requests(&mut ws, external);
             Ok(ws)
         })
     }
