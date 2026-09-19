@@ -996,15 +996,18 @@ async fn users_search_forwards_query_and_clamps_limit() {
     assert_eq!(missing["error"]["code"], -32602, "{missing}");
     assert!(missing.get("result").is_none(), "{missing}");
 
-    let r = wss_rpc(
+    let ok = wss_rpc_envelope(
         &mut ws,
         2,
         "github.users.search",
         json!({ "query": "  octo " }),
     )
     .await;
+    assert_eq!(ok["jsonrpc"], "2.0");
+    assert_eq!(ok["id"], 2);
+    assert!(ok.get("error").is_none(), "{ok}");
     assert_eq!(
-        r,
+        ok["result"],
         json!({
             "users": [
                 {
