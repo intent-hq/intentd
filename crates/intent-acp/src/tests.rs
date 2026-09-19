@@ -3921,6 +3921,47 @@ mod error_tests {
             .starts_with(crate::PROMPT_IDLE_TIMEOUT_PREFIX));
     }
 
+    /// intent-hq/intent#5395: the terminal provider-stall error renders
+    /// prefix-anchored on `PROVIDER_STALL_PREFIX` in both shapes (tool-free
+    /// and open-tool, the latter naming the hung tool call), is distinct
+    /// from the warn-and-continue idle timeout, and is never classified as a
+    /// transient disconnect / fetch failure (it must fail the turn, not
+    /// route into a redrive or in-place retry).
+    #[test]
+    fn acp_error_provider_stall_display_is_prefix_anchored_and_terminal() {
+        let tool_free = AcpError::ProviderStall {
+            silent: Duration::from_secs(1200),
+            open_tool_call: None,
+        };
+        let rendered = tool_free.to_string();
+        assert!(
+            rendered.starts_with(crate::PROVIDER_STALL_PREFIX),
+            "{rendered}"
+        );
+        assert!(rendered.contains("1200s"), "{rendered}");
+        assert!(rendered.contains("no tool call in flight"), "{rendered}");
+        assert!(!rendered.starts_with(crate::PROMPT_IDLE_TIMEOUT_PREFIX));
+        assert!(!crate::is_transient_upstream_disconnect(&tool_free));
+        assert!(!crate::is_transient_provider_fetch_failure(&tool_free));
+
+        let open_tool = AcpError::ProviderStall {
+            silent: Duration::from_secs(1500),
+            open_tool_call: Some("t1 (Bash: Run tests)".to_string()),
+        };
+        let rendered = open_tool.to_string();
+        assert!(
+            rendered.starts_with(crate::PROVIDER_STALL_PREFIX),
+            "{rendered}"
+        );
+        assert!(rendered.contains("1500s"), "{rendered}");
+        assert!(
+            rendered.contains("tool call t1 (Bash: Run tests) still open"),
+            "{rendered}"
+        );
+        assert!(!crate::is_transient_upstream_disconnect(&open_tool));
+        assert!(!crate::is_transient_provider_fetch_failure(&open_tool));
+    }
+
     #[test]
     fn from_serde_error_into_acp_serde_variant() {
         let serde_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();

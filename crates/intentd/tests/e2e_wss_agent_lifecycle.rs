@@ -1316,6 +1316,209 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
     );
 }
 
+/// Terminal provider stall under a hung tool call over the real WSS wire
+/// (intent-hq/intent#5395 — the opencode/grok signature): the mock's
+/// `parkMidToolCall` mode streams ONE `tool_call` (`in_progress`) and then
+/// goes completely silent — no terminal `tool_call_update`, no prompt
+/// resolution, pipes held open — so the daemon's open-tool ceilings are the
+/// only thing that can end the turn. With the thresholds lowered to seconds
+/// (stall 1s, open-tool advisory 1.5s, tool-free terminal 2s, open-tool
+/// terminal 4s), an `events.subscribe` subscriber MUST observe, in order:
+/// the routed `agent:tool:call`, the `agent:stream:status` `phase: "stalled"`
+/// advisory (open-tool ceiling — the FE leaves "Thinking"), the blocker
+/// `agent:attention-requested`, and `agent:failed` whose `error` is the
+/// `PROVIDER_STALL_PREFIX`-anchored text naming the hung call
+/// (`tc_park_mid_tool`). `agent.getSession` then reports the persisted
+/// `status: "error"` plus the blocker attention. Exactly one terminal
+/// `agent:stream:end` rides the wire (§7: error and complete both map to it),
+/// after the stalled advisory and before `agent:failed` (the deferred
+/// mid-turn raise is flushed just ahead of `agent:failed`). Margins: the
+/// terminal fires ~4s into the park (checker cadence ~166ms), well inside
+/// the 30s collection window on saturated CI runners.
+#[tokio::test]
+async fn open_tool_call_provider_stall_fails_turn_over_wss() {
+    let Some(script) = gate("WSS open-tool provider stall terminal E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // parkMidToolCall: emit tool_call (in_progress) then hold the prompt
+    // open forever (only session/cancel would release it).
+    let behavior = json!({ "parkMidToolCall": true, "response": "never streamed" }).to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_STREAM_STALL_MS", "1000"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "1500"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "2000"),
+        ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "4000"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — events.subscribe BEFORE the turn so we miss nothing.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Hung", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hang on a tool call" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect this agent's frames until agent:failed rides the wire.
+    let events = timeout(Duration::from_secs(30), async {
+        let mut events: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+                continue;
+            }
+            let done = ev["type"] == json!("agent:failed");
+            events.push(ev.clone());
+            if done {
+                return events;
+            }
+        }
+    })
+    .await
+    .expect("hung open tool call fails the turn within the lowered terminal threshold");
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["type"].as_str().unwrap_or_default())
+        .collect();
+
+    let tool_call_idx = types
+        .iter()
+        .position(|t| *t == "agent:tool:call")
+        .unwrap_or_else(|| panic!("tool call routed over the wire: {types:?}"));
+    let stalled_idx = events
+        .iter()
+        .position(|e| {
+            e["type"] == json!("agent:stream:status") && e["data"]["phase"] == json!("stalled")
+        })
+        .unwrap_or_else(|| panic!("stalled advisory precedes the terminal stall: {types:?}"));
+    let attention_idx = types
+        .iter()
+        .position(|t| *t == "agent:attention-requested")
+        .unwrap_or_else(|| panic!("blocker attention raised over the wire: {types:?}"));
+    let failed_idx = types.len() - 1;
+    assert!(
+        tool_call_idx < stalled_idx && stalled_idx < attention_idx && attention_idx < failed_idx,
+        "tool call → stalled → attention-requested → failed: {types:?}"
+    );
+    let ends: Vec<usize> = types
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == "agent:stream:end")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(ends.len(), 1, "one terminal stream:end: {types:?}");
+    assert!(
+        stalled_idx < ends[0] && ends[0] < failed_idx,
+        "stream:end lands after the stalled advisory and before agent:failed: {types:?}"
+    );
+
+    // Payload contract. The stalled advisory fired at the open-tool ceiling
+    // (1.5s), not the tool-free threshold (1s).
+    let stalled = &events[stalled_idx]["data"];
+    assert_eq!(
+        stalled["level"],
+        json!("warn"),
+        "stalled is warn: {stalled}"
+    );
+    assert!(
+        stalled["silentMs"].as_u64().expect("silentMs") >= 1500,
+        "stalled fires at the open-tool ceiling: {stalled}"
+    );
+    let attention = &events[attention_idx]["data"];
+    assert_eq!(
+        attention["kind"],
+        json!("blocker"),
+        "attention kind: {attention}"
+    );
+    let reason = attention["reason"].as_str().expect("attention reason");
+    assert!(
+        reason.contains("provider stall") && reason.contains("tc_park_mid_tool"),
+        "attention reason names the stall and the hung call: {reason}"
+    );
+    let failed = &events[failed_idx]["data"];
+    let error = failed["error"]
+        .as_str()
+        .expect("agent:failed carries error");
+    assert!(
+        error.starts_with(intent_acp::PROVIDER_STALL_PREFIX),
+        "agent:failed error is ProviderStall-prefixed: {error}"
+    );
+    assert!(
+        error.contains("tc_park_mid_tool") && error.contains("still open"),
+        "agent:failed error names the hung tool call: {error}"
+    );
+
+    // Persisted state: the agent is in Error with the blocker attention.
+    let got = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["status"], "error",
+        "provider stall persists Error status: {session}"
+    );
+    assert_eq!(
+        session["attentionRequestKind"], "blocker",
+        "blocker attention persisted: {session}"
+    );
+    assert!(
+        session["attentionRequestReason"]
+            .as_str()
+            .is_some_and(|r| r.contains("tc_park_mid_tool")),
+        "persisted attention reason names the hung call: {session}"
+    );
+}
+
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
 /// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
 /// turn as

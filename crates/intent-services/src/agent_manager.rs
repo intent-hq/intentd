@@ -12421,6 +12421,13 @@ pub(crate) const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
 /// spec's only sanctioned cancel-error shape is code `-32800` (the message is
 /// free text there too). The "cancelled" substring heuristic remains for
 /// non-RPC renderings, which carry no data suffix.
+///
+/// A provider stall (intent-hq/intent#5395) is rejected up front: its
+/// rendering is prefix-anchored on [`intent_acp::PROVIDER_STALL_PREFIX`] and
+/// the open-tool shape embeds the provider-controlled id/title of the hung
+/// tool call, so a call titled "Inspect cancelled jobs" must not turn the
+/// terminal stall into a benign cancel (skipping Error persistence and the
+/// worker's teardown/requeue).
 pub(crate) fn prompt_cancellation_error(err: &Error) -> bool {
     let Error::Internal(msg) = err else {
         return false;
@@ -12428,7 +12435,11 @@ pub(crate) fn prompt_cancellation_error(err: &Error) -> bool {
     let Some(inner) = msg.strip_prefix(PROMPT_FAILED_PREFIX) else {
         return false;
     };
-    if let Some(rest) = inner.trim_start().strip_prefix("JSON-RPC error ") {
+    let inner_trimmed = inner.trim_start();
+    if inner_trimmed.starts_with(intent_acp::PROVIDER_STALL_PREFIX) {
+        return false;
+    }
+    if let Some(rest) = inner_trimmed.strip_prefix("JSON-RPC error ") {
         let code = rest.split(':').next().unwrap_or("").trim();
         return code == "-32800";
     }
@@ -16002,6 +16013,41 @@ mod turn_failure_tests {
     fn cancelled_rpc_error_is_benign() {
         let err = Error::Internal(
             "session/prompt failed: JSON-RPC error -32800: Request cancelled".to_string(),
+        );
+        assert!(is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn provider_stall_with_cancelled_in_tool_label_is_terminal() {
+        // intent-hq/intent#5395: the open-tool provider stall embeds the
+        // provider-controlled tool id/title. A hung call titled "Inspect
+        // cancelled jobs" must stay terminal (Error persisted, child torn
+        // down, retry requeued) — the stall prefix wins over the "cancelled"
+        // substring heuristic, for both stall shapes.
+        let stall = intent_acp::AcpError::ProviderStall {
+            silent: std::time::Duration::from_secs(1500),
+            open_tool_call: Some("cancelled-sweep (bash: Inspect cancelled jobs)".to_string()),
+        };
+        let err = Error::Internal(format!("{PROMPT_FAILED_PREFIX} {stall}"));
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("cancelled"),
+            "precondition: the label reaches the flattened wrapper: {err}"
+        );
+        assert!(!prompt_cancellation_error(&err), "{err}");
+        assert!(!is_benign_turn_error(&err), "{err}");
+
+        let stall = intent_acp::AcpError::ProviderStall {
+            silent: std::time::Duration::from_secs(1200),
+            open_tool_call: None,
+        };
+        let err = Error::Internal(format!("{PROMPT_FAILED_PREFIX} {stall}"));
+        assert!(!is_benign_turn_error(&err), "{err}");
+
+        // The prefix is anchored: a stall mention elsewhere in an otherwise
+        // benign cancel does not flip it terminal.
+        let err = Error::Internal(
+            "session/prompt failed: JSON-RPC error -32800: cancelled after provider stall"
+                .to_string(),
         );
         assert!(is_benign_turn_error(&err));
     }
