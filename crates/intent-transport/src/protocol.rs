@@ -476,20 +476,18 @@
 //! exits for a staged update only once idle; `system.requestUpdate`
 //! (SIGUSR1) still restarts immediately. No method-catalog change.
 //!
-//! Version 10.3 adds multiplayer (additive; staged as 9.14 while main moved
-//! to 10.x). Principals (multiplayer w1): every connection is bound to a
-//! principal at admission (UDS and the legacy bearer token →
+//! Version 10.3 adds multiplayer (additive; staged as 9.14 / 9.15 while
+//! main moved to 10.x). Principals (multiplayer w1): every connection
+//! is bound to a principal at admission (UDS and the legacy bearer token →
 //! the primary user; a hashed per-principal credential → its principal) and
 //! `principal.me` returns that binding
 //! (`{ id, login?, displayName?, avatarUrl?, isAdministrator }`).
 //! `workspace.get` / `workspace.list` rows carry the flattened membership
 //! summary `ownerPrincipalId?`, `myRole?` (`owner` | `collaborator`, relative
-//! to the caller), `memberCount`, `openInviteCount`. The catalog contains
-//! 316 router methods, 49 fast-path methods, and two aliases: 367
-//! client-callable names.
+//! to the caller), `memberCount`, `openInviteCount`.
 //!
-//! Version 9.15 adds invite links and the identity-only join (additive;
-//! multiplayer w4): `workspace.invite.create` (fast path; returns the
+//! Also within 10.3, invite links and the identity-only join
+//! (multiplayer w4): `workspace.invite.create` (fast path; returns the
 //! `intent://invite?…` link — the pair envelope minus the bearer token plus
 //! `inviteId` / `secret`, the secret exactly once), `workspace.invite.list` /
 //! `workspace.invite.revoke`, `workspace.members.leave`, `principal.revokeSelf`
@@ -497,9 +495,12 @@
 //! WSS endpoint serving only `invite.redeem` (`{ inviteId, secret }` → device
 //! codes; `{ flowId }` → the collaborator credential once). Invite refusals
 //! carry `error.data.code` (`invite-expired`, `invite-revoked`,
-//! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-denied`, …). The
-//! catalog contains 322 router methods, 51 fast-path methods, and two
-//! aliases: 375 client-callable names.
+//! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-denied`, …). Also
+//! within 10.3, ephemeral presence (multiplayer w5): `presence.update` /
+//! `note.presence.update` (fast path), `presence.snapshot`, and the
+//! `note.presence.subscribe` / `note.presence.unsubscribe` channel pair. The
+//! catalog contains 323 router methods, 53 fast-path methods, and two
+//! aliases: 378 client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release

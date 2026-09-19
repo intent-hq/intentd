@@ -199,7 +199,7 @@ impl Services {
     /// The agent's workspace for a membership check: the metadata-only
     /// session row (no transcript hydration — monorepo#958); an unknown
     /// agent is `NotFound`.
-    async fn agent_workspace(&self, agent_id: &AgentId) -> Result<WorkspaceId> {
+    pub(crate) async fn agent_workspace(&self, agent_id: &AgentId) -> Result<WorkspaceId> {
         Ok(self
             .store
             .get_agent_session_summary(agent_id)
@@ -866,6 +866,175 @@ mod tests {
             .await
             .expect("visible ids")
             .is_none());
+    }
+
+    /// Multiplayer w5: the presence entry points sit behind the same
+    /// fail-closed binding. Unbound, `presence.update`,
+    /// `note.presence.subscribe`, `note.presence.update` and
+    /// `presence.snapshot` are `Forbidden` (`-32003`) before any table or
+    /// membership read. Bound as a non-member, a focus on / subscribe to /
+    /// snapshot of a workspace the caller is not a member of is `NotFound`
+    /// (indistinguishable from a missing id) and a caret without a lease is
+    /// `InvalidParams`; the collaborator passes the same calls.
+    #[tokio::test]
+    async fn presence_entry_points_fail_closed_unbound_and_refuse_non_members() {
+        assert!(
+            std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none(),
+            "{ASSERT_BOUND_CALLER_ENV} must be unset for this test"
+        );
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        assert_eq!(intent_core::current_caller(), None);
+        let note = || intent_core::NoteId::from("spec");
+        let focus = json!({ "focus": [{ "workspaceId": f.ws.as_str() }] });
+        let caret = json!({ "rev": 1, "anchor": 0, "head": 0 });
+        let unbound: Vec<(&str, Result<()>)> = vec![
+            (
+                "presence.update",
+                f.services
+                    .presence_update("conn-unbound".to_string(), focus.clone())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "note.presence.subscribe",
+                f.services
+                    .note_presence_join(
+                        "conn-unbound".to_string(),
+                        "lease-1".to_string(),
+                        f.ws.clone(),
+                        note(),
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "note.presence.update",
+                f.services
+                    .note_presence_update(
+                        "conn-unbound".to_string(),
+                        f.ws.clone(),
+                        note(),
+                        caret.clone(),
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "presence.snapshot",
+                f.services.presence_snapshot(f.ws.clone()).await.map(drop),
+            ),
+        ];
+        for (gate, outcome) in unbound {
+            assert_eq!(cell(&outcome), "forbidden", "{gate} unbound: {outcome:?}");
+            assert_eq!(outcome.unwrap_err().code(), -32003, "{gate} unbound");
+        }
+
+        // A bound non-member with a hello'd connection.
+        f.run(
+            Role::NonMember,
+            f.services.presence_connect("conn-outsider".to_string()),
+        )
+        .await
+        .expect("outsider hello");
+        let refused = f
+            .run(
+                Role::NonMember,
+                f.services
+                    .presence_update("conn-outsider".to_string(), focus.clone()),
+            )
+            .await;
+        assert_eq!(
+            cell(&refused),
+            "not-found",
+            "presence.update focus: {refused:?}"
+        );
+        let refused = f
+            .run(
+                Role::NonMember,
+                f.services.note_presence_join(
+                    "conn-outsider".to_string(),
+                    "lease-1".to_string(),
+                    f.ws.clone(),
+                    note(),
+                ),
+            )
+            .await;
+        assert_eq!(
+            cell(&refused),
+            "not-found",
+            "note.presence.subscribe: {refused:?}"
+        );
+        let refused = f
+            .run(Role::NonMember, f.services.presence_snapshot(f.ws.clone()))
+            .await;
+        assert_eq!(
+            cell(&refused),
+            "not-found",
+            "presence.snapshot: {refused:?}"
+        );
+        let refused = f
+            .run(
+                Role::NonMember,
+                f.services.note_presence_update(
+                    "conn-outsider".to_string(),
+                    f.ws.clone(),
+                    note(),
+                    caret.clone(),
+                ),
+            )
+            .await;
+        assert_eq!(
+            cell(&refused),
+            "not-found",
+            "note.presence.update: {refused:?}"
+        );
+
+        // The collaborator passes every one of them.
+        f.run(
+            Role::Collaborator,
+            f.services.presence_connect("conn-collab".to_string()),
+        )
+        .await
+        .expect("collaborator hello");
+        let ok = f
+            .run(
+                Role::Collaborator,
+                f.services.presence_update("conn-collab".to_string(), focus),
+            )
+            .await;
+        assert_eq!(cell(&ok), "ok", "presence.update: {ok:?}");
+        let ok = f
+            .run(
+                Role::Collaborator,
+                f.services.note_presence_join(
+                    "conn-collab".to_string(),
+                    "lease-1".to_string(),
+                    f.ws.clone(),
+                    note(),
+                ),
+            )
+            .await;
+        assert_eq!(cell(&ok), "ok", "note.presence.subscribe: {ok:?}");
+        let ok = f
+            .run(
+                Role::Collaborator,
+                f.services.note_presence_update(
+                    "conn-collab".to_string(),
+                    f.ws.clone(),
+                    note(),
+                    caret,
+                ),
+            )
+            .await;
+        assert_eq!(cell(&ok), "ok", "note.presence.update: {ok:?}");
+        let ok = f
+            .run(
+                Role::Collaborator,
+                f.services.presence_snapshot(f.ws.clone()),
+            )
+            .await;
+        assert_eq!(cell(&ok), "ok", "presence.snapshot: {ok:?}");
     }
 
     /// Set by [`armed_seam_aborts_on_detached_unbound_gate`] when it

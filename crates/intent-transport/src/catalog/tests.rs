@@ -80,6 +80,8 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("provider_setup.rs", "providers.setup."),
         ("invite.rs", "invite."),
         ("invite.rs", "workspace.invite."),
+        ("presence.rs", "presence."),
+        ("presence.rs", "note.presence."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -137,15 +139,25 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// 355 → 366: `extract_router_methods` rejected `-` in method names, so the 11
 /// already-shipped `accept-changes.*` / `file-tracking.*` router arms were never
 /// frozen here. No protocol bump — the wire surface did not change.
-const EXPECTED_TOTAL_METHODS: usize = 375;
+///
+/// Multiplayer w4 (invite links + identity-only join): +4 router methods
+/// (`workspace.invite.list` / `workspace.invite.revoke` /
+/// `workspace.members.leave` / `principal.revokeSelf`) and +2 fast-path
+/// methods (`workspace.invite.create`, `invite.redeem`).
+///
+/// Multiplayer w5 (presence): +2 fast-path methods (`presence.update`,
+/// `note.presence.update`) and +1 router method (`presence.snapshot`); the
+/// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
+/// counted with the other subscription channels, not here.
+const EXPECTED_TOTAL_METHODS: usize = 378;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 322;
+const EXPECTED_ROUTER_METHODS: usize = 323;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 51;
+const EXPECTED_FASTPATH_METHODS: usize = 53;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -670,6 +682,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.list",
     "note.listTasks",
     "note.listVersions",
+    "note.presence.update",
     "note.readAsset",
     "note.restoreVersion",
     "note.saveAsset",
@@ -682,6 +695,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "prMonitor.cancel",
     "prMonitor.flush",
     "prMonitor.list",
+    "presence.snapshot",
+    "presence.update",
     "primitive.addAgentAction",
     "primitive.addCli",
     "primitive.addPatch",
@@ -1413,6 +1428,9 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "pr.status",
         "pr.refresh",
         "prMonitor.list",
+        "presence.snapshot",
+        "presence.update",
+        "note.presence.subscribe",
         "agent.create",
         "agent.stop",
         "agent.sendMessage",
