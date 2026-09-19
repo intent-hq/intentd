@@ -742,6 +742,11 @@ pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
 pub(super) const SUB_AGENT_PROPOSE_SIBLING_DENIED: &str =
     "ws.workspace.proposeSibling is only available to foreground top-level agents — report the opportunity to your parent with ws.agent.reportToParent";
 
+/// The dispatch-layer denial for a sub-agent's proposal apply: only the
+/// foreground top-level agent that proposed a sibling can apply it.
+pub(super) const SUB_AGENT_APPLY_PROPOSAL_DENIED: &str =
+    "ws.workspace.applyProposal is only available to foreground top-level agents — a proposal can only be applied by the agent that proposed it on the user's instruction";
+
 /// The dispatch-layer denial for a sub-agent's `agent.create` frame with
 /// `topLevel: true` — creating independent top-level agents is a
 /// top-level-agent capability.
@@ -777,6 +782,9 @@ async fn workspace_host_dispatch(
     }
     if is_sub_agent && method == "workspace.proposeSibling" {
         return Err(format!("host: {SUB_AGENT_PROPOSE_SIBLING_DENIED}"));
+    }
+    if is_sub_agent && method == "workspace.applyProposal" {
+        return Err(format!("host: {SUB_AGENT_APPLY_PROPOSAL_DENIED}"));
     }
     // Top-level-only rule for creating independent top-level agents (the
     // arg-conditional `agent.create` + `topLevel: true` path): like the
