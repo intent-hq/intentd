@@ -3,11 +3,17 @@
 //! do) so no provider install is required.
 
 use std::path::PathBuf;
+use std::task::Poll;
 use std::time::Duration;
+
+use intent_acp::{Connection, ConnectionHooks, IncomingRequest};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
+use tokio::sync::mpsc;
 
 #[cfg(unix)]
 use super::run_one_shot_acp_in;
-use super::{run_one_shot_acp, OneShotCommand, OneShotError};
+use super::{run_one_shot_acp, serve_requests_while, OneShotCommand, OneShotError};
 #[cfg(unix)]
 use crate::acp_adapter::AdapterSlots;
 use crate::test_support::test_tempdir;
@@ -237,6 +243,200 @@ const onPrompt = () => {{
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("adapter pid {pid} still alive after the one-shot timed out");
+}
+
+/// An in-memory [`Connection`] whose adapter side the test drives directly:
+/// `peer_in` yields the lines the runner writes to the adapter's stdin and
+/// `peer_out` feeds the adapter's stdout. `pipe` bounds each direction in
+/// bytes, so a peer that never reads `peer_in` saturates the writer
+/// deterministically. The unbounded receiver is the runner's client-served
+/// request queue.
+fn in_memory_connection(
+    pipe: usize,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingRequest>,
+    Lines<BufReader<DuplexStream>>,
+    DuplexStream,
+) {
+    let (runner_stdin, peer_in) = tokio::io::duplex(pipe);
+    let (peer_out, runner_stdout) = tokio::io::duplex(pipe);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        requests: Some(tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(runner_stdin, runner_stdout, None, hooks);
+    (conn, rx, BufReader::new(peer_in).lines(), peer_out)
+}
+
+/// Poll `fut` exactly once. A `Connection` request registers its pending
+/// slot and queues its line on that first poll, so this starts a phase
+/// request without driving it any further.
+async fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    let mut fut = Some(fut);
+    std::future::poll_fn(move |cx| {
+        Poll::Ready(
+            fut.take()
+                .expect("poll_once's future is polled exactly once")
+                .poll(cx),
+        )
+    })
+    .await
+}
+
+/// Regression for the bounded-send change: `serve_requests_while` may
+/// dequeue a client-served request and, on its very next iteration, see the
+/// phase future resolve before that request's send was ever polled. A
+/// permission request that arrives in the same burst as the `session/new`
+/// (or `session/set_config_option`) result does exactly this. The old inline
+/// await always answered it when the writer had room; the runner must still
+/// do so — otherwise an adapter that waits for that answer before finishing
+/// `session/prompt` gets a spurious `PromptTimeout`. Driven in memory so the
+/// burst ordering is exact, and repeated so `select!`'s random branch order
+/// visits the losing interleaving; the "next phase" continues on the same
+/// connection, as the model and prompt phases do.
+#[tokio::test]
+async fn request_dequeued_at_a_phase_boundary_is_still_answered() {
+    for round in 0..32u64 {
+        let (conn, mut requests, mut peer_in, mut peer_out) = in_memory_connection(64 * 1024);
+        let phase = conn.request_timeout("session/new", json!({}), Duration::from_secs(5));
+        tokio::pin!(phase);
+        assert!(poll_once(phase.as_mut()).await.is_pending());
+        let line = tokio::time::timeout(Duration::from_secs(5), peer_in.next_line())
+            .await
+            .expect("runner writes session/new")
+            .expect("peer read")
+            .expect("peer line");
+        let phase_id = serde_json::from_str::<Value>(&line).expect("json")["id"].clone();
+
+        // One burst: the permission request, then the phase result. Once the
+        // response watermark moves both are processed — the request sits in
+        // the queue and the phase future is ready.
+        let request_id = 9000 + round;
+        let burst = format!(
+            "{}\n{}\n",
+            json!({ "jsonrpc": "2.0", "id": request_id, "method": "session/request_permission",
+                    "params": { "sessionId": "s1", "options": [] } }),
+            json!({ "jsonrpc": "2.0", "id": phase_id, "result": { "sessionId": "s1" } }),
+        );
+        let seq = conn.response_seq();
+        peer_out
+            .write_all(burst.as_bytes())
+            .await
+            .expect("peer write");
+        assert!(conn.await_response_after(seq, Duration::from_secs(5)).await);
+
+        let out = serve_requests_while(&conn, &mut requests, phase)
+            .await
+            .expect("phase succeeds");
+        assert_eq!(out["sessionId"], "s1");
+
+        // The next phase on the same connection: the answer must reach the
+        // peer whether it was queued, in flight, or already written.
+        let answer = serve_requests_while(
+            &conn,
+            &mut requests,
+            tokio::time::timeout(Duration::from_secs(2), peer_in.next_line()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("round {round}: the request dequeued at the phase boundary was never answered")
+        })
+        .expect("peer read")
+        .expect("peer line");
+        let answer: Value = serde_json::from_str(&answer).expect("json");
+        assert_eq!(answer["id"], json!(request_id), "round {round}: {answer}");
+        assert_eq!(answer["result"]["outcome"]["outcome"], "cancelled");
+    }
+}
+
+/// Deterministic backpressure counterpart of the flood regression above: the
+/// writer is provably wedged BEFORE the phase starts, so the response send
+/// the loop starts is pending on writer capacity for the whole budget. A
+/// 1-byte pipe nobody reads blocks the writer task inside its first line;
+/// further sends then fill the bounded channel until one no longer completes
+/// on its first poll (a send only pends on capacity, and nothing drains it
+/// again). Before the fix `serve_requests_while` awaited that send inline and
+/// never returned; the phase must resolve on its budget regardless.
+#[tokio::test]
+async fn phase_resolves_on_budget_while_a_response_send_is_pending_on_writer_capacity() {
+    let (conn, mut requests, _peer_in, mut peer_out) = in_memory_connection(1);
+
+    let mut queued = 0usize;
+    loop {
+        assert!(queued < 10_000, "writer never saturated");
+        let fill = conn.notify("x/fill", json!({}));
+        tokio::pin!(fill);
+        match poll_once(fill.as_mut()).await {
+            Poll::Ready(res) => res.expect("writer open"),
+            // Pending is not yet proof: the writer task may still be moving a
+            // line out of the channel. Let it finish; the send that stays
+            // pending after that is blocked by a full channel behind a full
+            // pipe, which nothing drains.
+            Poll::Pending => {
+                tokio::task::yield_now().await;
+                if poll_once(fill.as_mut()).await.is_pending() {
+                    break;
+                }
+            }
+        }
+        queued += 1;
+    }
+    assert!(
+        queued > 1,
+        "expected the channel to hold lines before saturating"
+    );
+
+    let seq = conn.client_request_seq();
+    let flood = format!(
+        "{}\n{}\n",
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "session/request_permission",
+                "params": { "sessionId": "s1", "options": [] } }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "x/unknown", "params": {} }),
+    );
+    peer_out
+        .write_all(flood.as_bytes())
+        .await
+        .expect("peer write");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while conn.client_request_seq() < seq + 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reader forwards both requests");
+
+    let budget = Duration::from_millis(300);
+    let margin = Duration::from_secs(2);
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        serve_requests_while(
+            &conn,
+            &mut requests,
+            tokio::time::timeout(budget, std::future::pending::<()>()),
+        ),
+    )
+    .await
+    .expect("a response send pending on writer capacity must not stall the phase");
+    let elapsed = started.elapsed();
+    assert!(
+        outcome.is_err(),
+        "the phase clock, not the send, ends the phase"
+    );
+    assert!(elapsed >= budget, "finished before the budget: {elapsed:?}");
+    assert!(
+        elapsed < budget + margin,
+        "phase resolved {elapsed:?} after start; budget {budget:?} + margin {margin:?}"
+    );
+
+    // The first request was dequeued and its send left in flight (the loop
+    // pulls no further request while one is pending), so the second is still
+    // queued: the send really was blocked on capacity, not merely slow.
+    let still_queued = requests.try_recv().expect("second request still queued");
+    assert_eq!(still_queued.method, "x/unknown");
+    assert!(requests.try_recv().is_err());
 }
 
 #[tokio::test]
