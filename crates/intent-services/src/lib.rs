@@ -30593,6 +30593,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.principal_me_op().await })
     }
 
+    fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.principal_list_op().await })
+    }
+
     // `workspace.members.*` (multiplayer w3) — see `capability`.
 
     fn workspace_members_list(

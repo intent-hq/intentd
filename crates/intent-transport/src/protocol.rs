@@ -576,9 +576,14 @@
 //! and the `fromPrincipalId` stamp is unchanged. Intentional exception: a
 //! collaborator's `agent.editQueuedMessage` of an agent-authored (A2A /
 //! automatic) entry is not preambled — its sender stays the originating
-//! agent's header; the edit is recorded by the stamp only. The catalog
-//! contains
-//! 326 router methods, 56 fast-path methods, and two aliases: 384
+//! agent's header; the edit is recorded by the stamp only. Also within
+//! 10.3, direct member add (additive): `principal.list` (owner-only, no
+//! params) → `{ principals: [{ principalId, login?, displayName?,
+//! avatarUrl?, githubUserId? }] }`, every non-primary principal holding at
+//! least one active (non-revoked) credential, by creation time; a guest
+//! that revoked itself is omitted. A per-principal (collaborator) caller
+//! is `-32003`. The catalog contains
+//! 327 router methods, 56 fast-path methods, and two aliases: 385
 //! client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and

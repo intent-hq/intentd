@@ -167,12 +167,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Gist identity proof replaces the host-side device flow: −1 fast-path
 /// method (`invite.redeem`); the guest joins through `invite.challenge` /
 /// `invite.prove` (or `invite.accept` with a credential) instead.
-const EXPECTED_TOTAL_METHODS: usize = 385;
+///
+/// Direct member add: +1 router method (`principal.list`, the owner-only
+/// roster of credentialed guests).
+const EXPECTED_TOTAL_METHODS: usize = 386;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 327;
+const EXPECTED_ROUTER_METHODS: usize = 328;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -726,6 +729,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "primitive.addCli",
     "primitive.addPatch",
     "primitive.addReference",
+    "principal.list",
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
@@ -1240,6 +1244,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "pairing.getInfo",
     "prMonitor.cancel",
     "prMonitor.flush",
+    "principal.list",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1856,6 +1861,7 @@ mod unbound_owner_only_methods {
                 "prMonitor.flush",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),
             ),
+            ("principal.list", json!({})),
             ("repo.list", json!({})),
             ("repo.remove", json!({ "path": dir })),
             (

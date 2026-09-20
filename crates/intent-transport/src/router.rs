@@ -3056,6 +3056,13 @@ async fn dispatch(
             let r = api.principal_me().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // `principal.list` (direct member add): the host's credentialed
+        // guests for the owner's share dialog; no params. Owner-only in the
+        // service layer (`-32003` for a collaborator).
+        "principal.list" => {
+            let r = api.principal_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         // `principal.revokeSelf` (multiplayer w4): the bound collaborator
         // revokes its own credentials and leaves its workspaces; the
         // transport then closes its connections. The administrator is
