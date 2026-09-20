@@ -751,6 +751,8 @@ mod tests {
                 .run(role, async { Services::require_administrator("git.clone") })
                 .await;
             assert_eq!(cell(&guard), expected, "require_administrator as {role:?}");
+            let roster = f.run(role, f.services.principal_list()).await;
+            assert_eq!(cell(&roster), expected, "principal.list as {role:?}");
             // `host.exec` through the trait: a collaborator never reaches the
             // runner; an agent (steered by anyone) and the daemon do — the
             // empty args fail on params, past the guard.
@@ -874,6 +876,10 @@ mod tests {
                     .workspace_members_remove(f.ws.clone(), f.outsider.clone())
                     .await
                     .map(drop),
+            ),
+            (
+                "principal.list",
+                f.services.principal_list().await.map(drop),
             ),
             (
                 "host.exec",

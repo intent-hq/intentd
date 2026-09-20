@@ -3384,6 +3384,114 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     srv.ws.stop().await;
 }
 
+/// Direct member add: `principal.list` over the wire answers the owner
+/// (legacy token → administrator) with every non-primary principal holding
+/// an active credential — `{ principals: [{ principalId, login, displayName,
+/// avatarUrl, githubUserId }] }`, oldest first — and omits the primary
+/// principal and a guest whose credentials were all revoked. A guest
+/// connection (per-principal credential) is refused at the transport
+/// allowlist with `-32003 Forbidden`.
+#[intent_test_macros::daemon_test]
+async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
+    use intent_core::{Principal, PrincipalId};
+
+    let srv = start(WsOptions::default()).await;
+    let primary = srv
+        .store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+    srv.store
+        .insert_principal_credential(&primary.id, &sha256_hex(b"primary-extra"))
+        .await
+        .expect("primary credential");
+
+    let guest = |login: &str, github_user_id: i64, created_at: &str| Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(github_user_id),
+        login: Some(login.to_string()),
+        display_name: Some(format!("{login} name")),
+        avatar_url: Some(format!("https://example.test/{login}.png")),
+        is_primary: false,
+        created_at: created_at.to_string(),
+        updated_at: created_at.to_string(),
+    };
+    let older = guest("older", 11, "2026-01-01T00:00:00Z");
+    let newer = guest("newer", 12, "2026-01-02T00:00:00Z");
+    let revoked = guest("revoked", 13, "2026-01-03T00:00:00Z");
+    for p in [&older, &newer, &revoked] {
+        srv.store.upsert_principal(p).await.expect("guest");
+    }
+    let older_token = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a";
+    srv.store
+        .insert_principal_credential(&older.id, &sha256_hex(older_token.as_bytes()))
+        .await
+        .expect("older credential");
+    srv.store
+        .insert_principal_credential(&newer.id, &sha256_hex(b"newer"))
+        .await
+        .expect("newer credential");
+    srv.store
+        .insert_principal_credential(&revoked.id, &sha256_hex(b"revoked"))
+        .await
+        .expect("revoked credential");
+    srv.store
+        .revoke_all_principal_credentials(&revoked.id)
+        .await
+        .expect("revoke");
+
+    let frame = r#"{"jsonrpc":"2.0","id":1,"method":"principal.list","params":{}}"#;
+    let owner_view = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(owner_view["jsonrpc"], "2.0");
+    assert_eq!(owner_view["id"], 1);
+    assert!(
+        owner_view.get("error").is_none(),
+        "principal.list over legacy token: {owner_view}"
+    );
+    assert_eq!(
+        owner_view["result"],
+        serde_json::json!({ "principals": [
+            {
+                "principalId": older.id.0,
+                "login": "older",
+                "displayName": "older name",
+                "avatarUrl": "https://example.test/older.png",
+                "githubUserId": 11,
+            },
+            {
+                "principalId": newer.id.0,
+                "login": "newer",
+                "displayName": "newer name",
+                "avatarUrl": "https://example.test/newer.png",
+                "githubUserId": 12,
+            },
+        ] }),
+        "{owner_view}"
+    );
+
+    // A guest connection is refused by the transport allowlist.
+    let url = format!("wss://localhost:{}/ws?token={older_token}", srv.port);
+    let mut ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let guest_view = loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str::<Value>(&text).expect("json")
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert_eq!(guest_view["id"], 1);
+    assert_eq!(
+        guest_view["error"]["code"], -32003,
+        "principal.list over guest: {guest_view}"
+    );
+    assert_eq!(guest_view["error"]["message"], "Forbidden");
+
+    srv.ws.stop().await;
+}
+
 /// Multiplayer w3: the capability matrix is enforced in the service layer,
 /// keyed on the caller the connection was bound to. On a workspace the
 /// primary user created, a **non-member** guest is answered `NotFound`

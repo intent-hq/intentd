@@ -4412,6 +4412,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `principal.list` (direct member add): the host's credentialed guests
+    /// → `{ principals: [{ principalId, login?, displayName?, avatarUrl?,
+    /// githubUserId? }] }` — every non-primary principal holding at least
+    /// one active (non-revoked) credential, by `createdAt`; a guest that
+    /// revoked itself is omitted (it cannot connect). No params.
+    /// Owner-only: a per-principal (collaborator) wire caller is
+    /// `Forbidden`; the administrator, agents and the daemon pass.
+    fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::principal_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `workspace.members.list` (multiplayer w3): the members of a workspace
     /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
     /// addedAt }], guestCount, guestLimit }`, owners first. `guestCount` is
