@@ -286,7 +286,13 @@ async fn serve_requests_while<F: std::future::Future>(
     let mut responder = Responder::new(conn);
     loop {
         tokio::select! {
-            out = &mut fut => return out,
+            out = &mut fut => {
+                // The phase won the race against a just-dequeued request:
+                // answer it if the writer has room (the inline await used to
+                // guarantee that); a wedged send stays abandoned.
+                responder.finish_if_ready();
+                return out;
+            }
             () = responder.flush(), if responder.in_flight() => {}
             req = requests.recv(), if requests_open && !responder.in_flight() => match req {
                 Some(req) => responder.start(req),
@@ -310,7 +316,10 @@ async fn serve_requests_while<F: std::future::Future>(
 /// times out; the budgets stay the hard ceiling. While a send is in flight
 /// the loop stops pulling further requests (their queue is unbounded and the
 /// transport reader keeps draining, so nothing deadlocks), preserving the
-/// in-order answer the auto-deny posture always gave.
+/// in-order answer the auto-deny posture always gave. At a phase boundary
+/// [`Responder::finish_if_ready`] gives a not-yet-polled send its one chance
+/// so a well-behaved adapter's request is never silently dropped between
+/// setup and the prompt.
 struct Responder<'c> {
     conn: &'c Connection,
     in_flight: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'c>>>,
@@ -340,6 +349,18 @@ impl<'c> Responder<'c> {
         if let Some(fut) = self.in_flight.as_mut() {
             fut.await;
             self.in_flight = None;
+        }
+    }
+
+    /// Poll the in-flight send exactly once without waiting. A response send
+    /// is a single bounded-channel `send`, so this completes it whenever the
+    /// writer has room and leaves a send wedged on a full writer in place.
+    fn finish_if_ready(&mut self) {
+        if let Some(fut) = self.in_flight.as_mut() {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                self.in_flight = None;
+            }
         }
     }
 }

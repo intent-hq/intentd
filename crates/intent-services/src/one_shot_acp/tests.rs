@@ -161,13 +161,15 @@ const onPrompt = () => {{}};
 }
 
 /// Regression (monorepo#5465): a flooding adapter that stops READING its
-/// stdin while issuing thousands of client-served requests fills the
-/// transport's bounded writer channel (256 lines) plus the OS pipe. Before the
-/// fix the prompt-phase `select!` awaited each `auto_respond` inline, so the
-/// stalled response send starved the `session/prompt` timeout and the
-/// one-shot hung until the child exited. The phase budget must stay the hard
-/// ceiling: the caller sees `PromptTimeout` near its budget and the child is
-/// reaped.
+/// stdin while issuing thousands of client-served requests
+/// (`session/request_permission` and an unknown method, alternating) fills
+/// the transport's bounded writer channel (256 lines) plus the OS pipe.
+/// Before the fix the prompt-phase `select!` awaited each `auto_respond`
+/// inline, so the stalled response send starved the `session/prompt` timeout
+/// and the one-shot hung until the child exited (on main this test only ends
+/// when the 15 s harness guard fires). The phase budget must stay the hard
+/// ceiling: the caller sees `PromptTimeout` within budget + a bounded margin
+/// and the child is reaped.
 #[cfg(unix)]
 #[tokio::test]
 async fn flooding_non_reading_adapter_cannot_stall_prompt_past_its_budget() {
@@ -179,11 +181,18 @@ fs.writeFileSync({pidfile:?}, String(process.pid));
 {ADAPTER_PRELUDE}
 const onPrompt = () => {{
   // Stop consuming stdin (keep it open) and flood client-served requests
-  // whose responses nobody will ever read; never resolve the prompt.
+  // whose responses nobody will ever read; never resolve the prompt. stdout
+  // is a pipe, so Node writes these synchronously: the whole flood is on the
+  // wire before the prompt budget can elapse, and the runner's 256-line
+  // writer channel + the stdin pipe wedge well inside it.
   rl.pause();
   process.stdin.pause();
   for (let i = 0; i < 6000; i++) {{
-    send({{ jsonrpc: '2.0', id: 10000 + i, method: 'fs/read_text_file', params: {{ path: '/x' }} }});
+    if (i % 2 === 0) {{
+      send({{ jsonrpc: '2.0', id: 10000 + i, method: 'session/request_permission', params: {{ sessionId: 's1', options: [] }} }});
+    }} else {{
+      send({{ jsonrpc: '2.0', id: 10000 + i, method: 'x/unknown', params: {{}} }});
+    }}
   }}
   setInterval(() => {{}}, 1000);
 }};
@@ -191,6 +200,10 @@ const onPrompt = () => {{
         pidfile = pidfile.to_string_lossy(),
     ));
     let budget = Duration::from_millis(500);
+    // Upper bound = budget + spawn/setup + exit-observe/reap grace, with slack
+    // for a loaded host. Observed ~1.8 s on a quiet host; the hang this guards
+    // against never ends on its own.
+    let margin = Duration::from_secs(4);
     let slots = AdapterSlots::new(1);
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
@@ -207,6 +220,10 @@ const onPrompt = () => {{
         "expected PromptTimeout, got {err}"
     );
     assert!(elapsed >= budget, "finished before the budget: {elapsed:?}");
+    assert!(
+        elapsed < budget + margin,
+        "PromptTimeout arrived {elapsed:?} after start; budget {budget:?} + margin {margin:?}"
+    );
 
     let pid: i32 = std::fs::read_to_string(&pidfile)
         .expect("adapter wrote its pid")
