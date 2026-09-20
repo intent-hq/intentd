@@ -520,9 +520,11 @@ impl Store {
     /// is inside its own write transaction — cannot both take the last
     /// seat, and a `revoke_all_principal_credentials` that committed
     /// before the transaction began is always observed (no seat for a
-    /// principal that can no longer authenticate). An already-seated
-    /// principal takes no new seat and is reported without a write or a
-    /// credential check.
+    /// principal that can no longer authenticate). The credential predicate
+    /// is evaluated first, so a seated principal whose credentials are all
+    /// revoked is `NoActiveCredential`, not `AlreadyMember`; an already
+    /// seated credentialed principal takes no new seat and is reported
+    /// without a write.
     ///
     /// # Errors
     ///
@@ -545,17 +547,6 @@ impl Store {
             .map_err(|e| Error::Internal(format!("capped member add begin failed: {e}")))?;
 
         let body_result: Result<CollaboratorAddOutcome> = async {
-            let already_member: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
-            )
-            .bind(&workspace_id.0)
-            .bind(&principal_id.0)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("capped member add member check failed: {e}")))?;
-            if already_member.is_some() {
-                return Ok(CollaboratorAddOutcome::AlreadyMember);
-            }
             let active_credential: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM principal_credential \
                     WHERE principal_id = ? AND revoked_at IS NULL LIMIT 1",
@@ -568,6 +559,17 @@ impl Store {
             })?;
             if active_credential.is_none() {
                 return Ok(CollaboratorAddOutcome::NoActiveCredential);
+            }
+            let already_member: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
+            )
+            .bind(&workspace_id.0)
+            .bind(&principal_id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("capped member add member check failed: {e}")))?;
+            if already_member.is_some() {
+                return Ok(CollaboratorAddOutcome::AlreadyMember);
             }
             let sql = format!(
                 "SELECT \

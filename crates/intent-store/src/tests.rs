@@ -9444,13 +9444,23 @@ async fn add_workspace_collaborator_within_cap_is_atomic() {
             .expect("add"),
         crate::CollaboratorAddOutcome::WorkspaceFull
     );
-    // The owner is a member too: `AlreadyMember`, never a second row.
+    // The owner is a member too, but holds no per-principal credential: the
+    // credential predicate is evaluated first, so it is `NoActiveCredential`
+    // (the service refuses the primary principal before reaching the store);
+    // never a second row either way.
     assert_eq!(
         store
             .add_workspace_collaborator_within_cap(&ws, &primary, 5)
             .await
             .expect("add"),
-        crate::CollaboratorAddOutcome::AlreadyMember
+        crate::CollaboratorAddOutcome::NoActiveCredential
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &primary)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Owner)
     );
     // An open invite reserves a seat against a direct add (cap 2 with one
     // collaborator and one open invite is full); revoking it frees the seat.
@@ -9576,7 +9586,9 @@ async fn add_workspace_collaborator_within_cap_is_atomic() {
 /// transaction as the insert (the `principal.revokeSelf` race, intentd#2025):
 /// a principal without a credential, or whose credentials were all revoked
 /// before the transaction began, is `NoActiveCredential` with no row
-/// written; a seated principal is still `AlreadyMember` without the check.
+/// written; the predicate runs before the membership short-circuit, so a
+/// seated principal whose credentials were revoked is `NoActiveCredential`
+/// too (never `AlreadyMember`), with its row left untouched.
 #[tokio::test]
 async fn add_workspace_collaborator_within_cap_requires_an_active_credential() {
     let tmp = TempDb::new();
@@ -9649,9 +9661,10 @@ async fn add_workspace_collaborator_within_cap_requires_an_active_credential() {
         }
     );
 
-    // A seated principal whose credentials are revoked afterwards is still
-    // answered `AlreadyMember`: nothing is written either way, and revokeSelf
-    // tears the seat down itself.
+    // A seated principal whose credentials are revoked afterwards is
+    // `NoActiveCredential`, not `AlreadyMember`: the contract has no
+    // already-member exception. Nothing is written — the seat is left for
+    // the revocation path to tear down.
     store
         .revoke_all_principal_credentials(&seated.id)
         .await
@@ -9661,7 +9674,15 @@ async fn add_workspace_collaborator_within_cap_requires_an_active_credential() {
             .add_workspace_collaborator_within_cap(&ws, &seated.id, 10)
             .await
             .expect("add"),
-        crate::CollaboratorAddOutcome::AlreadyMember
+        crate::CollaboratorAddOutcome::NoActiveCredential
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &seated.id)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator),
+        "the refusal writes nothing"
     );
 }
 
