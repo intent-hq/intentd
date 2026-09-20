@@ -10,7 +10,15 @@
 #                 `pr_labels`)
 #   - mark stale: 14 idle days   -> `stale` label + comment
 #   - close:      +7 idle days   -> closed, branch is NOT deleted
-#   - any comment, push, or label change removes `stale` and resets the clock.
+#   - a comment or push removes `stale` and resets the clock. Applying an
+#     exemption label to an already-stale PR does NOT clear `stale` (the
+#     action checks exemptions before it processes updates), so comment or
+#     push as well.
+#
+# Permissions: `actions: write` is needed because actions/stale persists its
+# pagination cursor in the Actions cache and must be able to delete/reset that
+# cache entry; without it a run that hits `operations-per-run` can leave a
+# stale cursor and later runs will not reliably cover every PR.
 #
 # Dry-run gate: every scheduled run is `debug-only` — it logs the decisions it
 # WOULD take and touches nothing. Only a manual `workflow_dispatch` with
@@ -29,6 +37,7 @@ on:
         default: true
 
 permissions:
+  actions: write
   contents: read
   issues: write
   pull-requests: write
@@ -60,12 +69,15 @@ jobs:
           stale-pr-message: >-
             This pull request has had no activity for 14 days and has been
             marked `stale`. It will be closed in 7 days unless there is
-            further activity. To keep it open: leave a comment, push a
-            commit, or apply an exempting label (`dependencies`,
-            `github_actions`, `release`). Converting it to a draft also
-            exempts it. The `stale` label is removed automatically on
-            activity.
+            further activity. To keep it open, leave a comment or push a
+            commit — either removes the `stale` label and resets the clock.
+            Applying an exempting label (`dependencies`, `github_actions`,
+            `release`) or converting to a draft prevents future stale
+            marking but does not by itself clear `stale`, so comment or
+            push as well.
           close-pr-message: >-
             Closing this pull request because it has been `stale` for 7 days
-            with no further activity. The branch has not been deleted — to
-            resume, reopen the PR (or open a new one from the same branch).
+            with no further activity. The branch has not been deleted. A
+            push or comment on a closed PR does not reopen it — to resume,
+            reopen the PR first, then push or comment (or open a new PR from
+            the same branch).
