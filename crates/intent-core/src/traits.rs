@@ -4371,6 +4371,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// `{ ok, userCode, verificationUri, expiresIn, interval }`, or with
     /// `method: "pat"` validate + persist the in-band `token` →
     /// `{ ok: true, method: "pat" }`. 🔒 `token` is never logged or echoed.
+    /// A provider holds one credential for one bound host, so a connect that
+    /// binds `host` — device or PAT — supersedes a device flow still pending
+    /// for any host (its late completion is discarded: no write, no event).
     fn source_control_connect(
         &self,
         provider: String,
