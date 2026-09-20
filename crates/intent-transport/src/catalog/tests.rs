@@ -168,14 +168,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// method (`invite.redeem`); the guest joins through `invite.challenge` /
 /// `invite.prove` (or `invite.accept` with a credential) instead.
 ///
-/// Direct member add: +1 router method (`principal.list`, the owner-only
-/// roster of credentialed guests).
-const EXPECTED_TOTAL_METHODS: usize = 386;
+/// Direct member add: +2 router methods (`principal.list`, the owner-only
+/// roster of credentialed guests; `workspace.members.add`, the owner-only
+/// direct attach of one of them).
+const EXPECTED_TOTAL_METHODS: usize = 387;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 328;
+const EXPECTED_ROUTER_METHODS: usize = 329;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -851,6 +852,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.list",
     "workspace.localChanges",
     "workspace.markSeen",
+    "workspace.members.add",
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
@@ -1326,6 +1328,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "workspace.invite.create",
     "workspace.invite.list",
     "workspace.invite.revoke",
+    "workspace.members.add",
     "workspace.members.remove",
     "workspace.restore",
     "workspace.saveSetupScript",
@@ -1979,6 +1982,10 @@ mod unbound_owner_only_methods {
             (
                 "workspace.invite.revoke",
                 json!({ "workspaceId": ws, "inviteId": "inv" }),
+            ),
+            (
+                "workspace.members.add",
+                json!({ "workspaceId": ws, "principalId": "p" }),
             ),
             (
                 "workspace.members.remove",

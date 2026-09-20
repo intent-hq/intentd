@@ -877,7 +877,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (WORKSPACE_SETUP_COMPLETED, "Workspace: setup finished; id and outcome."),
     (WORKSPACE_SETUP_STARTED, "Workspace: setup started; id only."),
     (WORKSPACE_TOKEN_USAGE_CHANGED, "Workspace: token usage counters changed (workspace.getTokenUsage is Collaborator+)."),
-    (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta); `changes.members` + `removedPrincipalId` on a membership removal."),
+    (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta); `changes.members` + `removedPrincipalId` on a membership removal, `addedPrincipalId` on an add (invite join or `workspace.members.add`)."),
     (WORKSPACE_WAITING_CHANGED, "Workspace: the waiting marker changed (workspace channel delta)."),
 ];
 

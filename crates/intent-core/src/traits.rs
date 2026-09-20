@@ -4445,6 +4445,27 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.members.add` (direct member add): attach an existing
+    /// credentialed guest as a collaborator → `{ added: bool, memberCount }`;
+    /// `added: false` when the principal is already a member (idempotent,
+    /// nothing published). Owner-only. `InvalidParams` for an unknown
+    /// principal, the primary principal, or a principal without an active
+    /// credential; `guest-limit` when the workspace's guest cap is spent.
+    /// On an add the same `workspace:updated { members: true,
+    /// addedPrincipalId, memberCount }` an invite join publishes.
+    fn workspace_members_add(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_members_add not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `workspace.members.remove` (multiplayer w3): drop a collaborator from
     /// a workspace → `{ removed: bool }`. Owner-only; the owner membership
     /// itself cannot be removed (`InvalidParams`). The removed member's

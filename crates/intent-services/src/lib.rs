@@ -30606,6 +30606,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.workspace_members_list_op(&workspace_id).await })
     }
 
+    fn workspace_members_add(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_members_add_op(&workspace_id, &principal_id)
+                .await
+        })
+    }
+
     fn workspace_members_remove(
         &self,
         workspace_id: WorkspaceId,

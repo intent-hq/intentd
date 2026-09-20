@@ -582,8 +582,17 @@
 //! avatarUrl?, githubUserId? }] }`, every non-primary principal holding at
 //! least one active (non-revoked) credential, by creation time; a guest
 //! that revoked itself is omitted. A per-principal (collaborator) caller
-//! is `-32003`. The catalog contains
-//! 327 router methods, 56 fast-path methods, and two aliases: 385
+//! is `-32003`. `workspace.members.add { workspaceId, principalId }`
+//! (owner-only) → `{ added, memberCount }`: attaches such a guest as a
+//! collaborator; `added: false` when already a member (idempotent, nothing
+//! published); `-32602` for an unknown principal, the primary principal, a
+//! principal without an active credential (`invalid-params`) or a spent
+//! guest cap (`guest-limit`). An add publishes the same `workspace:updated
+//! { changes: { members: true, addedPrincipalId, memberCount } }` an invite
+//! join does, so the guest's open `workspace` channel — whose forwarder
+//! re-reads under the guest's own caller — upserts the now-visible row as
+//! an `updated` delta without a reconnect. The catalog contains
+//! 328 router methods, 56 fast-path methods, and two aliases: 386
 //! client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
