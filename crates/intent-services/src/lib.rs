@@ -30442,11 +30442,11 @@ impl WorkspaceApi for Services {
                         !client_id.trim().is_empty(),
                     ))
                 }
-                source_control_auth_ops::Target::Gitlab { host, bound } => {
+                source_control_auth_ops::Target::Gitlab { host, .. } => {
                     let client_id = self.gitlab_client_id(&host);
                     let probe = source_control_auth_ops::probe_gitlab(
                         &host,
-                        bound,
+                        &|| self.gitlab_host_is_bound(&host),
                         client_id.as_deref(),
                         self.gitlab_secret_store.clone(),
                         &self.gitlab_credential_gate,
@@ -30584,34 +30584,30 @@ impl WorkspaceApi for Services {
                     // another host is a successful no-op that never deletes
                     // it and never emits `revoked` for it. With nothing
                     // stored (never connected / already revoked) there is no
-                    // connection to end either: ok, no delete, no event.
-                    let had_credential = if bound {
+                    // connection to end either: ok, no delete, no event. The
+                    // read, delete and event ride one hold of the gate so
+                    // subscribers observe events in store order.
+                    if bound {
                         let _gate = self.gitlab_credential_gate.lock().await;
                         let stored = intent_sourcecontrol::gitlab_auth::stored_credential(
                             self.gitlab_secret_store.clone(),
                         )
                         .await
                         .map_err(pr_ops::map_sc_err)?;
-                        let had = stored != intent_sourcecontrol::StoredCredential::None;
-                        if had {
+                        if stored != intent_sourcecontrol::StoredCredential::None {
                             intent_sourcecontrol::gitlab_auth::revoke_gitlab_token(
                                 self.gitlab_secret_store.clone(),
                             )
                             .await
                             .map_err(pr_ops::map_sc_err)?;
+                            source_control_auth_ops::publish_auth_changed(
+                                self.event_bus.as_ref(),
+                                source_control_auth_ops::Provider::Gitlab,
+                                host.host(),
+                                "revoked",
+                            )
+                            .await;
                         }
-                        had
-                    } else {
-                        false
-                    };
-                    if had_credential {
-                        source_control_auth_ops::publish_auth_changed(
-                            self.event_bus.as_ref(),
-                            source_control_auth_ops::Provider::Gitlab,
-                            host.host(),
-                            "revoked",
-                        )
-                        .await;
                     }
                     Ok(serde_json::json!({ "ok": true }))
                 }
@@ -30658,11 +30654,11 @@ impl WorkspaceApi for Services {
                         Err(e) => Err(pr_ops::map_sc_err(e)),
                     }
                 }
-                source_control_auth_ops::Target::Gitlab { host, bound } => {
+                source_control_auth_ops::Target::Gitlab { host, .. } => {
                     let client_id = self.gitlab_client_id(&host);
                     let probe = source_control_auth_ops::probe_gitlab(
                         &host,
-                        bound,
+                        &|| self.gitlab_host_is_bound(&host),
                         client_id.as_deref(),
                         self.gitlab_secret_store.clone(),
                         &self.gitlab_credential_gate,
