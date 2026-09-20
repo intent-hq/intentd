@@ -160,6 +160,68 @@ const onPrompt = () => {{}};
     panic!("adapter pid {pid} still alive after the one-shot timed out");
 }
 
+/// Regression (monorepo#5465): a flooding adapter that stops READING its
+/// stdin while issuing thousands of client-served requests fills the
+/// transport's bounded writer channel (256 lines) plus the OS pipe. Before the
+/// fix the prompt-phase `select!` awaited each `auto_respond` inline, so the
+/// stalled response send starved the `session/prompt` timeout and the
+/// one-shot hung until the child exited. The phase budget must stay the hard
+/// ceiling: the caller sees `PromptTimeout` near its budget and the child is
+/// reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn flooding_non_reading_adapter_cannot_stall_prompt_past_its_budget() {
+    let scratch = test_tempdir("intent-one-shot-flood-");
+    let pidfile = scratch.path().join("adapter.pid");
+    let (cmd, _dir) = mock_adapter(&format!(
+        "import fs from 'node:fs';
+fs.writeFileSync({pidfile:?}, String(process.pid));
+{ADAPTER_PRELUDE}
+const onPrompt = () => {{
+  // Stop consuming stdin (keep it open) and flood client-served requests
+  // whose responses nobody will ever read; never resolve the prompt.
+  rl.pause();
+  process.stdin.pause();
+  for (let i = 0; i < 6000; i++) {{
+    send({{ jsonrpc: '2.0', id: 10000 + i, method: 'fs/read_text_file', params: {{ path: '/x' }} }});
+  }}
+  setInterval(() => {{}}, 1000);
+}};
+",
+        pidfile = pidfile.to_string_lossy(),
+    ));
+    let budget = Duration::from_millis(500);
+    let slots = AdapterSlots::new(1);
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        run_one_shot_acp_in(&slots, cmd, "flood", None, None, budget),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let err = outcome
+        .expect("a flooding non-reading adapter must not stall the one-shot past its budget")
+        .unwrap_err();
+    assert!(
+        matches!(err, OneShotError::PromptTimeout),
+        "expected PromptTimeout, got {err}"
+    );
+    assert!(elapsed >= budget, "finished before the budget: {elapsed:?}");
+
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("adapter wrote its pid")
+        .trim()
+        .parse()
+        .expect("pid parses");
+    for _ in 0..100 {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("adapter pid {pid} still alive after the one-shot timed out");
+}
+
 #[tokio::test]
 async fn permission_request_is_auto_denied_and_turn_completes() {
     // The adapter asks for permission mid-turn and only finishes once it has

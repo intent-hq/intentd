@@ -221,16 +221,21 @@ async fn drive_one_shot(
         "sessionId": session_id,
         "prompt": [{ "type": "text", "text": prompt }],
     });
-    // `prompt_timeout` is passed as the transport request timeout, so it is
-    // the single bound on the prompt phase. Dropping the request future on
-    // timeout is cancel-safe — the transport's drop guard removes the
-    // pending entry.
-    let prompt_fut = conn.request_timeout("session/prompt", params, prompt_timeout);
+    // `prompt_timeout` is the single bound on the prompt phase. The transport
+    // request timeout only starts once the line is queued to the writer, so
+    // the outer timeout also covers the send itself (a writer channel wedged
+    // by a non-reading adapter). Dropping the request future on timeout is
+    // cancel-safe — the transport's drop guard removes the pending entry.
+    let prompt_fut = tokio::time::timeout(
+        prompt_timeout,
+        conn.request_timeout("session/prompt", params, prompt_timeout),
+    );
     tokio::pin!(prompt_fut);
 
     let mut text = String::new();
     let mut notifications_open = true;
     let mut requests_open = true;
+    let mut responder = Responder::new(conn);
     let outcome = loop {
         tokio::select! {
             resp = &mut prompt_fut => break resp,
@@ -242,14 +247,15 @@ async fn drive_one_shot(
                 // branch so the select! cannot busy-spin.
                 None => notifications_open = false,
             },
-            req = requests.recv(), if requests_open => match req {
-                Some(req) => auto_respond(conn, req).await,
+            () = responder.flush(), if responder.in_flight() => {}
+            req = requests.recv(), if requests_open && !responder.in_flight() => match req {
+                Some(req) => responder.start(req),
                 None => requests_open = false,
             },
         }
     };
 
-    match outcome {
+    match outcome.unwrap_or_else(|_| Err(intent_acp::AcpError::Timeout("session/prompt".into()))) {
         Ok(_) => {
             // Drain any chunk that raced the prompt response into the channel
             // before deciding the turn produced nothing.
@@ -277,15 +283,63 @@ async fn serve_requests_while<F: std::future::Future>(
 ) -> F::Output {
     tokio::pin!(fut);
     let mut requests_open = true;
+    let mut responder = Responder::new(conn);
     loop {
         tokio::select! {
             out = &mut fut => return out,
-            req = requests.recv(), if requests_open => match req {
-                Some(req) => auto_respond(conn, req).await,
+            () = responder.flush(), if responder.in_flight() => {}
+            req = requests.recv(), if requests_open && !responder.in_flight() => match req {
+                Some(req) => responder.start(req),
                 // Channel closed (connection dropped the sender): disable
                 // this branch so the select! cannot busy-spin.
                 None => requests_open = false,
             },
+        }
+    }
+}
+
+/// The at-most-one in-flight [`auto_respond`] send of a serving loop, polled
+/// as its own `select!` branch rather than awaited inside a handler.
+///
+/// Response sends go through the transport's bounded writer channel, so an
+/// adapter that floods client-served requests without reading its stdin
+/// eventually makes a send block. Awaiting that send inline would stop the
+/// loop polling the phase future — and with it the phase timeout — turning a
+/// hostile adapter into an unbounded hang (monorepo#5465). Kept as a sibling
+/// branch, a stalled send is simply abandoned when the phase resolves or
+/// times out; the budgets stay the hard ceiling. While a send is in flight
+/// the loop stops pulling further requests (their queue is unbounded and the
+/// transport reader keeps draining, so nothing deadlocks), preserving the
+/// in-order answer the auto-deny posture always gave.
+struct Responder<'c> {
+    conn: &'c Connection,
+    in_flight: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'c>>>,
+}
+
+impl<'c> Responder<'c> {
+    fn new(conn: &'c Connection) -> Self {
+        Self {
+            conn,
+            in_flight: None,
+        }
+    }
+
+    fn in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    fn start(&mut self, req: IncomingRequest) {
+        debug_assert!(self.in_flight.is_none());
+        self.in_flight = Some(Box::pin(auto_respond(self.conn, req)));
+    }
+
+    /// Drive the in-flight send to completion and clear it. Only polled
+    /// under an `in_flight()` precondition; the pending future is left in
+    /// place when this is dropped mid-poll, so it resumes on the next call.
+    async fn flush(&mut self) {
+        if let Some(fut) = self.in_flight.as_mut() {
+            fut.await;
+            self.in_flight = None;
         }
     }
 }
@@ -304,12 +358,21 @@ async fn apply_config_option_model(
     timeout: Duration,
 ) {
     let params = json!({ "sessionId": session_id, "configId": "model", "value": model });
+    // The outer timeout also bounds the send itself (see the prompt phase).
     let outcome = serve_requests_while(
         conn,
         requests,
-        conn.request_timeout("session/set_config_option", params, timeout),
+        tokio::time::timeout(
+            timeout,
+            conn.request_timeout("session/set_config_option", params, timeout),
+        ),
     )
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        Err(intent_acp::AcpError::Timeout(
+            "session/set_config_option".into(),
+        ))
+    });
     if let Err(err) = outcome {
         tracing::debug!(
             "one-shot session/set_config_option(model={model}) failed; \
