@@ -1068,10 +1068,11 @@ async fn credit_replenishment_resumes_exactly_the_granted_bytes() {
 const STARVATION_IDLE: Duration = Duration::from_millis(600);
 
 /// A relay under test for credit starvation: its loopback peer writes
-/// `reply_bytes`, then drains everything the client uploads; the relay
-/// starts with a `window` of credit and `STARVATION_IDLE` as its idle
-/// timeout. A feeder task keeps uploading small client frames every quarter
-/// of that timeout so the plain idle timer can never fire.
+/// `reply_bytes` (then half-closes its write side if `peer_half_closes`),
+/// then drains everything the client uploads; the relay starts with a
+/// `window` of credit and `STARVATION_IDLE` as its idle timeout. A feeder
+/// task keeps uploading small client frames every quarter of that timeout so
+/// the plain idle timer can never fire.
 struct StarvedRelay {
     relay: tokio::task::JoinHandle<()>,
     out_rx: mpsc::Receiver<OutboundFrame>,
@@ -1081,11 +1082,22 @@ struct StarvedRelay {
 }
 
 async fn starved_relay(reply_bytes: usize, window: u32) -> StarvedRelay {
+    starved_relay_with(reply_bytes, window, false).await
+}
+
+async fn starved_relay_with(
+    reply_bytes: usize,
+    window: u32,
+    peer_half_closes: bool,
+) -> StarvedRelay {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let peer = tokio::spawn(async move {
         let (mut tcp, _) = listener.accept().await.unwrap();
         tcp.write_all(&vec![0xCD; reply_bytes]).await.unwrap();
+        if peer_half_closes {
+            tcp.shutdown().await.unwrap();
+        }
         let mut sink = [0u8; 1024];
         while !matches!(tcp.read(&mut sink).await, Ok(0) | Err(_)) {}
     });
@@ -1146,6 +1158,44 @@ async fn zero_credit_stream_with_nothing_waiting_survives_past_idle_timeout() {
     assert!(
         next.is_none(),
         "zero-credit stream with nothing waiting was torn down: {next:?}"
+    );
+    assert!(!t.relay.is_finished());
+    t.relay.abort();
+}
+
+/// A peer half-close is not waiting output either: a peer that sends exactly
+/// the window and then shuts its write side while still draining the upload
+/// leaves no payload pending, so the zero-credit stream survives past
+/// `idle_timeout` with its upload flowing; the first grant then forwards the
+/// deferred `EOF` and the stream stays open for the inbound direction.
+#[tokio::test]
+async fn half_closed_zero_credit_stream_survives_and_forwards_eof_on_grant() {
+    let window = 4 * READ_CHUNK_BYTES;
+    let mut t = starved_relay_with(window, u32::try_from(window).unwrap(), true).await;
+    recv_data_bytes(&mut t.out_rx, window).await;
+    assert_eq!(t.credit.available(), 0, "the window is spent");
+    let next = tokio::time::timeout(STARVATION_IDLE * 5, t.out_rx.recv())
+        .await
+        .ok()
+        .map(|frame| frame.map(|f| f.frame));
+    assert!(
+        next.is_none(),
+        "half-closed zero-credit stream was torn down: {next:?}"
+    );
+    assert!(!t.relay.is_finished());
+    t.credit.grant(1);
+    let eof = tokio::time::timeout(Duration::from_secs(5), t.out_rx.recv())
+        .await
+        .expect("deferred EOF forwarded once credit returns")
+        .expect("relay alive");
+    assert_eq!(eof.frame, Frame::Eof { stream_id: 1 });
+    let next = tokio::time::timeout(STARVATION_IDLE * 2, t.out_rx.recv())
+        .await
+        .ok()
+        .map(|frame| frame.map(|f| f.frame));
+    assert!(
+        next.is_none(),
+        "stream torn down after forwarding EOF while its upload is active: {next:?}"
     );
     assert!(!t.relay.is_finished());
     t.relay.abort();

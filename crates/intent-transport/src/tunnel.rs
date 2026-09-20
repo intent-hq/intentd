@@ -43,10 +43,10 @@
 //! altogether can still block `sink.send` before its window is spent (a
 //! bounded connection write is a separate follow-up). Clients that never send
 //! `CREDIT` keep working for the first window per stream and then stall only
-//! that stream. A stream starved of credit while loopback output is waiting
+//! that stream. A stream starved of credit while loopback payload is waiting
 //! is closed after [`TunnelLimits::idle_timeout`]; a zero-credit stream with
-//! nothing waiting is not. `CREDIT` for an unknown stream is ignored like any
-//! other teardown race.
+//! nothing waiting — including one whose peer has only half-closed — is not.
+//! `CREDIT` for an unknown stream is ignored like any other teardown race.
 //!
 //! Stream queues are bounded and admission never waits on a TCP consumer:
 //! a full queue closes only that stream, leaving sibling frames and pings
@@ -322,10 +322,10 @@ enum StreamMsg {
 }
 
 /// Outcome of the relay's loopback poll: a credit-bounded read, or — with an
-/// empty window — the observation that output is waiting behind it.
+/// empty window — a non-consuming peek at what is waiting behind it.
 enum Loopback {
     Read(std::io::Result<usize>),
-    Waiting,
+    Peeked(std::io::Result<usize>),
 }
 
 /// Daemon→client flow-control window of one stream, shared between the
@@ -738,12 +738,14 @@ where
 /// never queues output the client has not granted room for. An exhausted
 /// window pauses only this read, as a `select!` condition; the pause ends
 /// when the connection loop grants a client `CREDIT`. While the window is
-/// empty AND the loopback has output waiting (observed with a non-consuming
+/// empty AND the loopback has payload waiting (observed with a non-consuming
 /// `peek`), a starvation deadline of `idle_timeout` runs independently of the
 /// plain idle timer, so an upload that keeps the stream busy cannot keep a
 /// starved reply parked forever; a grant clears it. A zero-credit stream with
-/// nothing waiting (e.g. an inbound-only upload from a pre-credit client) is
-/// never closed by it. The isolation this buys is scoped to a credit-aware
+/// nothing waiting (e.g. an inbound-only upload from a pre-credit client, or
+/// one whose peer has half-closed after sending exactly the window — the EOF
+/// is forwarded by the first credited read) is never closed by it. The
+/// isolation this buys is scoped to a credit-aware
 /// client that keeps reading the WebSocket: a peer that stops reading the
 /// socket altogether can still park the connection's `sink.send` before its
 /// window is spent — the fixed initial window is not negotiated, and a
@@ -821,18 +823,24 @@ async fn run_stream(
     let mut inbound: Option<(Vec<u8>, usize, OwnedSemaphorePermit)> = None;
     let idle = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(idle);
-    // When loopback output was first seen waiting behind an empty credit
-    // window; `None` while credit is available or nothing is waiting. That
-    // starvation lasting `idle_timeout` closes the stream even if its inbound
-    // direction keeps resetting `idle`.
+    // When loopback output (payload bytes) was first seen waiting behind an
+    // empty credit window; `None` while credit is available or nothing is
+    // waiting. That starvation lasting `idle_timeout` closes the stream even
+    // if its inbound direction keeps resetting `idle`.
     let mut credit_exhausted_since: Option<Instant> = None;
     let credit_stall = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(credit_stall);
     let mut peek = [0u8; 1];
+    // A peer EOF / read error seen while the window was empty. It is not
+    // payload, so it never arms the starvation deadline; it is forwarded
+    // only once a grant lets the read observe it, and is not probed again
+    // until then.
+    let mut peer_eof_deferred = false;
     loop {
         let credit_available = credit.available();
         if credit_available > 0 {
             credit_exhausted_since = None;
+            peer_eof_deferred = false;
         }
         // Bounded by the window so `consume` observes the same figure.
         let read_limit = usize::try_from(credit_available)
@@ -840,13 +848,13 @@ async fn run_stream(
             .min(READ_CHUNK_BYTES);
         // With credit, read the next chunk (never while a frame is held, so
         // the loopback producer keeps its backpressure). Without credit, only
-        // peek — one non-consuming probe that arms the starvation deadline —
-        // until a grant re-evaluates the window.
+        // peek — one non-consuming probe that arms the starvation deadline
+        // when payload is waiting — until a grant re-evaluates the window.
         let poll_loopback = !read_done
             && if credit_available > 0 {
                 pending.is_none()
             } else {
-                credit_exhausted_since.is_none()
+                credit_exhausted_since.is_none() && !peer_eof_deferred
             };
         // Fixed priority: admit the held frame first, then progress the
         // in-flight loopback write, then drain client→daemon messages, then
@@ -907,10 +915,7 @@ async fn run_stream(
                 if credit_available > 0 {
                     Loopback::Read(rd.read(&mut buf[..read_limit]).await)
                 } else {
-                    // A peer EOF or error counts as waiting too: it is only
-                    // forwarded once the stream holds credit again.
-                    let _ = rd.peek(&mut peek).await;
-                    Loopback::Waiting
+                    Loopback::Peeked(rd.peek(&mut peek).await)
                 }
             }, if poll_loopback => match event {
                 // Read errors (e.g. RST) surface as EOF toward the client;
@@ -927,10 +932,17 @@ async fn run_stream(
                         payload: buf[..n].to_vec(),
                     });
                 }
-                Loopback::Waiting => {
+                // Payload waiting behind the empty window: start the
+                // starvation deadline.
+                Loopback::Peeked(Ok(1..)) => {
                     credit_exhausted_since = Some(Instant::now());
                     credit_stall.as_mut().reset(Instant::now() + limits.idle_timeout);
                 }
+                // Peer EOF / error with nothing waiting: not starvation. The
+                // stream lives by the plain idle timer (its inbound direction
+                // may still be active) and the EOF is forwarded, in order,
+                // by the first credited read.
+                Loopback::Peeked(Ok(_) | Err(_)) => peer_eof_deferred = true,
             },
             // Paused on an empty window: wake on the next client `CREDIT`
             // (a grant that lands before this arm is polled is kept as a
