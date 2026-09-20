@@ -221,7 +221,7 @@ pub fn watch_rotations(
             .map_err(|e| MicrovmError::AuthStage(format!("watch {}: {e}", dir.display())))?;
     }
 
-    let task = tokio::spawn(async move {
+    let pump = async move {
         loop {
             let Some(first) = rx.recv().await else { break };
             // Debounce: coalesce the burst, remembering every touched path.
@@ -251,7 +251,8 @@ pub fn watch_rotations(
                 }
             }
         }
-    });
+    };
+    let task = tokio::spawn(pump); // caller-binding: allow — file-copy pump; never reaches the service layer
 
     Ok(RotationWatcher {
         _watcher: watcher,

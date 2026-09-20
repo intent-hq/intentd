@@ -537,14 +537,15 @@ impl HelperStderr {
         let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
         let drain = stderr.map(|stderr| {
             let tail = Arc::clone(&tail);
-            tokio::spawn(async move {
+            let pump = async move {
                 use tokio::io::AsyncBufReadExt;
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::debug!(target: "microvm_helper", "{line}");
                     push_tail_line(&mut tail.lock().unwrap(), &line);
                 }
-            })
+            };
+            tokio::spawn(pump) // caller-binding: allow — helper stderr drain; never reaches the service layer
         });
         Self { tail, drain }
     }
@@ -669,7 +670,7 @@ async fn wait_for_exec_agent(
 /// a duplex pipe. Ends when the writer side is dropped (VM teardown).
 fn tail_file(path: PathBuf) -> Box<dyn AsyncRead + Unpin + Send> {
     let (reader, mut writer) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(async move {
+    let pump = async move {
         let mut offset: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -684,7 +685,8 @@ fn tail_file(path: PathBuf) -> Box<dyn AsyncRead + Unpin + Send> {
                 offset = data.len() as u64;
             }
         }
-    });
+    };
+    tokio::spawn(pump); // caller-binding: allow — guest log → duplex I/O pump; never reaches the service layer
     Box::new(reader)
 }
 

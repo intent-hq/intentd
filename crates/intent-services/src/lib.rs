@@ -3340,7 +3340,7 @@ impl Services {
             return;
         }
         let probe = Arc::clone(&self.microvm_host_probe);
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             if let Err(reason) = probe.result().await {
                 tracing::info!(%reason, "microVM unavailable on this host");
             }
@@ -5837,7 +5837,7 @@ impl Services {
                     // other agent's completion wake sat undelivered (and the
                     // subscriber queue could lag out entirely).
                     let services = services.clone();
-                    tokio::spawn(async move {
+                    intent_core::spawn_daemon(async move {
                         services.handle_completion_event(&event).await;
                     });
                 }
@@ -30720,9 +30720,11 @@ impl WorkspaceApi for Services {
             // immediately and run the merge on a DETACHED task; the outcome
             // is observable via the sandbox row (`agent.status`
             // `sandboxStatus`, `sandbox.cow.get`) and the settlement events
-            // (`sandbox:cow:merged` / `sandbox:cow:conflict`).
+            // (`sandbox:cow:merged` / `sandbox:cow:conflict`). The caller's
+            // membership was gated above; the detached body runs as the
+            // daemon, like the completion-path and retry-sweep merges.
             let pre_claim_status = sandbox.status;
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 services
                     .run_claimed_sandbox_merge(&workspace_id, &sandbox_id, pre_claim_status)
                     .await;
