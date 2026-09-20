@@ -443,6 +443,10 @@ jobs:
       # non-instrumented run (times out at uds_concurrent_dispatch.rs:63), so
       # it stays skipped everywhere until STAB-42 is fixed.
       - name: Coverage-skipped tests (STAB-40/43)
+        # Armed bound-caller seam, as on the coverage jobs' run steps (see
+        # coverage-e2e) — the only non-instrumented step running crate tests.
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
         run: |
           cargo test -p intent-core --lib capture_login_shell_path_with_fake_shell
           cargo test -p intentd --test wss_integration wss_note_save_asset_round_trip
