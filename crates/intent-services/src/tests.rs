@@ -30848,6 +30848,13 @@ mod worktree_provisioning {
             .await
             .expect_err("out-of-range memMib rejected");
         assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "microvm": { "memMib": 1_000_000 } },
+            }))
+            .await
+            .expect_err("over-cap memMib rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
 
         // Sizing on a non-microvm type → InvalidParams.
         let err = svc

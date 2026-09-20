@@ -312,7 +312,11 @@ impl MicrovmVm {
         if let Err(e) = ready {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            let _ = tokio::fs::remove_file(&exec_sock).await;
+            // Same scrub as Drop: the vm dir holds the rootfs clone with the
+            // 0600 credential copies staged above, which must not outlive a
+            // failed boot (only a re-boot of the same agent id would
+            // otherwise remove it).
+            schedule_scrub(spec.vm_dir.clone(), exec_sock.clone());
             return Err(e);
         }
         let boot_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -444,7 +448,9 @@ impl MicrovmVm {
             // socket clean even before the shell's redirect engages.
             merge_stderr: false,
         };
-        let exec = exec::start(&self.exec_sock, &req).await?;
+        // Bounded like the setup commands: a guest agent that accepts but
+        // never writes the status line must fail the spawn, not hang it.
+        let exec = exec::start_within(&self.exec_sock, &req, SETUP_TIMEOUT).await?;
         let (read_half, write_half) = exec.stream.into_split();
         let stderr_tail = tail_file(self.rootfs.join(GUEST_INTENT_DIR).join("acp.err"));
         Ok((write_half, read_half, stderr_tail))
@@ -464,9 +470,11 @@ impl MicrovmVm {
 /// (Drop cannot be async, and the tree can be large). The thread is
 /// registered in [`PENDING_SCRUBS`] so a re-boot of the same agent id joins
 /// it instead of racing it. Every handle-teardown path drops the VM after
-/// killing the helper's process group, so the scrub is universal; a daemon
-/// crash instead scrubs lazily at the next boot for the same agent
-/// (`MicrovmVm::boot` removes a stale vm dir and exec socket first).
+/// killing the helper's process group, and `boot`'s own post-staging failure
+/// path (exec-agent readiness) schedules the same scrub directly, so the
+/// scrub is universal; a daemon crash instead scrubs lazily at the next boot
+/// for the same agent (`MicrovmVm::boot` removes a stale vm dir and exec
+/// socket first).
 impl Drop for MicrovmVm {
     fn drop(&mut self) {
         schedule_scrub(self.vm_dir.clone(), self.exec_sock.clone());
@@ -780,6 +788,86 @@ mod tests {
         schedule_scrub(vm_dir.clone(), sock.clone());
         await_pending_scrub(&vm_dir).await;
         assert!(!vm_dir.exists());
+    }
+
+    /// Regression (#873 review): a boot that fails at exec-agent readiness
+    /// must scrub `vm_dir` — the rootfs clone holding the 0600 credential
+    /// copies staged before the helper spawned — instead of leaving it until
+    /// the same agent id boots again. Drives the real `boot` with a helper
+    /// stand-in that exits immediately.
+    #[tokio::test]
+    async fn readiness_failure_scrubs_vm_dir_with_staged_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Cached image: a tiny rootfs archive next to its manifest.
+        let entry = tmp.path().join("img");
+        std::fs::create_dir_all(&entry).unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("root")).unwrap();
+        std::fs::write(src.join("root/.keep"), b"").unwrap();
+        let archive = entry.join("rootfs.tar.xz");
+        let status = std::process::Command::new("tar")
+            .arg("-cJf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .status()
+            .expect("tar available");
+        assert!(status.success());
+        let manifest: crate::sandbox_image::ImageManifest =
+            serde_json::from_value(serde_json::json!({
+                "schema": 1,
+                "id": "intent-guest-base",
+                "version": "0.0.0-test",
+                "arch": "aarch64",
+                "rootfs": { "url": "http://127.0.0.1:1/rootfs.tar.xz", "format": "tar.xz",
+                            "sha256": "0".repeat(64) },
+                "vsockExec": { "init": "/usr/local/bin/intent-init", "port": 4088,
+                               "protocol": "intent-exec/1" },
+            }))
+            .unwrap();
+        // Host home with one credential file the boot stages into the guest.
+        let host_home = tmp.path().join("home");
+        std::fs::create_dir_all(host_home.join(".augment")).unwrap();
+        std::fs::write(host_home.join(".augment/session.json"), b"{\"secret\":1}").unwrap();
+        // Helper stand-in: dies at once, so readiness fails fast.
+        let helper = tmp.path().join("helper.sh");
+        std::fs::write(&helper, "#!/bin/sh\nexit 69\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let workspace_dir = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let vm_dir = tmp.path().join("microvm").join("agent-readiness-fail");
+        let spec = MicrovmSpawnSpec {
+            vm_dir: vm_dir.clone(),
+            helper_exe: helper,
+            image: crate::sandbox_image::CachedImage {
+                manifest,
+                rootfs_path: archive,
+                manifest_path: entry.join("manifest.json"),
+            },
+            workspace_dir,
+            host_home,
+            stage_claude_onboarding: true,
+            vcpus: 1,
+            mem_mib: 128,
+        };
+        let Err(err) = MicrovmVm::boot(&spec).await else {
+            panic!("helper died; boot must fail");
+        };
+        if matches!(err, MicrovmError::RootfsClone(_)) {
+            eprintln!("skipping: CoW clone unsupported on this filesystem ({err})");
+            return;
+        }
+        assert!(matches!(err, MicrovmError::Boot(_)), "{err}");
+
+        await_pending_scrub(&vm_dir).await;
+        assert!(
+            !vm_dir.exists(),
+            "vm dir (rootfs clone + staged credentials) must be scrubbed after a readiness failure"
+        );
     }
 
     fn exit_status(code: i32) -> ExitStatus {

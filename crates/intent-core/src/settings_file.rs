@@ -285,8 +285,8 @@ pub struct SandboxMicrovmSettings {
     /// overrides beat this; absent both, agents get this value.
     pub vcpus: u8,
     /// `sandbox.microvm.memMib` — default guest memory in MiB for spawned
-    /// agent VMs (>= 128, mirroring the helper's `MIN_MEM_MIB`). Per-agent
-    /// `vmResources` overrides beat this.
+    /// agent VMs (128–65536, mirroring the helper's `MIN_MEM_MIB` /
+    /// `MAX_MEM_MIB`). Per-agent `vmResources` overrides beat this.
     pub mem_mib: u32,
 }
 
@@ -311,6 +311,13 @@ pub const MAX_MICROVM_VCPUS: u8 = 16;
 /// Lower bound on `sandbox.microvm.memMib` / per-agent `vmResources.memMib`
 /// (mirrors `MIN_MEM_MIB` in intentd-microvm-helper).
 pub const MIN_MICROVM_MEM_MIB: u32 = 128;
+/// Upper bound on `sandbox.microvm.memMib` / per-agent `vmResources.memMib`
+/// (mirrors `MAX_MEM_MIB` in intentd-microvm-helper): 64 GiB. A fixed cap
+/// rather than a host-memory probe keeps settings parsing deterministic and
+/// still rejects the absurd (`vmResources` is agent-settable via
+/// `agent.delegate` / `agent.create`); overcommit within the cap remains the
+/// helper's boot failure.
+pub const MAX_MICROVM_MEM_MIB: u32 = 65_536;
 
 /// `sandbox.microvm.image` value — a pinned guest-image manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1583,10 +1590,12 @@ impl SettingsFile {
             ));
         }
         let mem = self.sandbox.microvm.mem_mib;
-        if mem < MIN_MICROVM_MEM_MIB {
+        if !(MIN_MICROVM_MEM_MIB..=MAX_MICROVM_MEM_MIB).contains(&mem) {
             return Err(bad(
                 "sandbox.microvm.memMib",
-                &format!("must be >= {MIN_MICROVM_MEM_MIB}, got {mem}"),
+                &format!(
+                    "must be between {MIN_MICROVM_MEM_MIB} and {MAX_MICROVM_MEM_MIB}, got {mem}"
+                ),
             ));
         }
         let terms = self.voice.workspace_vocabulary.max_terms;
@@ -2592,6 +2601,10 @@ mod tests {
             ("[sandbox.microvm]\nvcpus = 0\n", "sandbox.microvm.vcpus"),
             ("[sandbox.microvm]\nvcpus = 17\n", "sandbox.microvm.vcpus"),
             ("[sandbox.microvm]\nmemMib = 64\n", "sandbox.microvm.memMib"),
+            (
+                "[sandbox.microvm]\nmemMib = 65537\n",
+                "sandbox.microvm.memMib",
+            ),
         ] {
             let err = SettingsFile::parse_str(body).unwrap_err();
             assert!(

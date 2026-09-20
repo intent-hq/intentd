@@ -1199,8 +1199,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "microVM memory (MiB)",
             "Default guest memory in MiB for spawned agent VMs (per-agent vmResources overrides beat this)",
             "sandbox",
-            Some(128.0), // MIN_MEM_MIB in intentd-microvm-helper
-            None,
+            Some(128.0),   // MIN_MEM_MIB in intentd-microvm-helper
+            Some(65536.0), // MAX_MEM_MIB in intentd-microvm-helper
             2048.0,
         ),
         // --- Group A: MCP ----------------------------------------------------

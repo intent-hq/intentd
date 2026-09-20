@@ -8929,6 +8929,85 @@ async fn wss_sandbox_image_check() {
     srv.ws.stop().await;
 }
 
+/// The four `sandbox.*` methods are administrator-only (PROTOCOL §5.5b):
+/// a collaborator principal — even one holding a workspace membership — is
+/// refused with `-32003 Forbidden` before dispatch, and the refusal is a
+/// pure error envelope (no `result`). The daemon-global settings surface
+/// they front (execution-environment defaults, guest-image resolution) is
+/// exactly what a non-admin must not steer.
+#[tokio::test]
+async fn wss_sandbox_methods_refuse_collaborator() {
+    use intent_core::WorkspaceRole;
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let repo_dir = seed_git_repo("intentd-wss-collab-sandbox-");
+    let repo = repo_dir.path().to_path_buf();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"Collab Sandbox","worktreePath":"{}","path":"{}"}}}}"#,
+            repo.display(),
+            repo.display(),
+        ),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+
+    let mut guest = Guest::connect(
+        &srv,
+        "d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7",
+    )
+    .await;
+    srv.store
+        .add_workspace_member(
+            &WorkspaceId::from(ws_id.as_str()),
+            &guest.principal.id,
+            WorkspaceRole::Collaborator,
+        )
+        .await
+        .expect("add collaborator");
+
+    for (method, params) in [
+        ("sandbox.profiles.list", json!({})),
+        (
+            "sandbox.profiles.update",
+            json!({ "profiles": { "cow": { "enabled": true } } }),
+        ),
+        ("sandbox.options", json!({})),
+        (
+            "sandbox.image.check",
+            json!({ "manifestUrl": "http://127.0.0.1:1/manifest.json" }),
+        ),
+    ] {
+        let refused = guest.call(method, params).await;
+        assert_eq!(refused["error"]["code"], -32003, "{method}: {refused}");
+        assert_eq!(
+            refused["error"]["message"], "Forbidden",
+            "{method}: {refused}"
+        );
+        assert!(refused.get("result").is_none(), "{method}: {refused}");
+    }
+
+    // Control: the refused update did not apply — the administrator still
+    // sees the defaults.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"sandbox.profiles.list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["profiles"][2]["type"], "cow", "{resp}");
+    assert_eq!(resp["result"]["profiles"][2]["enabled"], false, "{resp}");
+
+    drop(guest);
+    srv.ws.stop().await;
+}
+
 /// `debug.sampleStacks` (PROTOCOL §5.43, monorepo#1755): point-in-time
 /// sample of the daemon's own thread stacks — no workspaceId, both params
 /// optional and clamped server-side. Asserts the documented result shape

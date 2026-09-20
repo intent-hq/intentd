@@ -2072,6 +2072,24 @@ fn merge_ok(mut v: Value) -> Value {
 mod tests {
     use super::*;
 
+    /// Agent-facing `vmResources` is bounds-checked at the binding (#873
+    /// review): an over-cap `memMib` errors at call time, naming the field.
+    #[test]
+    fn vm_resources_arg_rejects_over_cap_memory() {
+        assert_eq!(parse_vm_resources(&json!({})).unwrap(), None);
+        let ok = parse_vm_resources(&json!({ "vmResources": { "memMib": 4096 } }))
+            .unwrap()
+            .expect("in-range override");
+        assert_eq!(ok.mem_mib, Some(4096));
+        let err =
+            parse_vm_resources(&json!({ "vmResources": { "memMib": 1_000_000 } })).unwrap_err();
+        assert!(err.contains("vmResources.memMib"), "{err}");
+        assert!(
+            err.contains(&intent_core::settings_file::MAX_MICROVM_MEM_MIB.to_string()),
+            "{err}"
+        );
+    }
+
     #[test]
     fn agent_list_filter_omits_terminal_rows_by_default() {
         let f = parse_agent_list_filter(&json!({})).expect("empty args parse");

@@ -106,6 +106,28 @@ pub async fn start(socket: &Path, req: &ExecRequest) -> Result<GuestExec, Microv
     })
 }
 
+/// [`start`] bounded by `timeout` over connect + header write + status-line
+/// read. Streaming callers (the provider launch) use this so a guest agent
+/// that accepts the connection but never answers cannot hang the spawn.
+///
+/// # Errors
+///
+/// Returns `MicrovmError::Exec` on any [`start`] failure, or when the guest
+/// has not answered the status line within `timeout`.
+pub async fn start_within(
+    socket: &Path,
+    req: &ExecRequest,
+    timeout: Duration,
+) -> Result<GuestExec, MicrovmError> {
+    tokio::time::timeout(timeout, start(socket, req))
+        .await
+        .map_err(|_| {
+            MicrovmError::Exec(format!(
+                "guest exec agent did not acknowledge the start within {timeout:?}"
+            ))
+        })?
+}
+
 /// Connect + start `req`, then wait for the child to exit (EOF), returning
 /// everything the child wrote to the socket. Used for setup commands that
 /// must complete before the provider launches.
@@ -257,6 +279,39 @@ mod tests {
         }
     }
 
+    /// Regression (#873 review): a guest agent that accepts the connection
+    /// but never writes the status line must not hang the streaming start;
+    /// `start_within` fails with a structured timeout error.
+    #[tokio::test]
+    async fn start_within_times_out_when_guest_never_answers() {
+        let sock = sock_path("wedged");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind wedged agent");
+        let wedged = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            // Hold the connection open without answering until the test ends.
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let req = ExecRequest {
+            argv: vec!["/bin/true".into()],
+            env: BTreeMap::new(),
+            cwd: "/".into(),
+            merge_stderr: false,
+        };
+        let Err(err) = start_within(&sock, &req, Duration::from_millis(200)).await else {
+            panic!("must time out");
+        };
+        assert!(matches!(err, MicrovmError::Exec(_)), "{err}");
+        assert!(
+            err.to_string()
+                .contains("did not acknowledge the start within 200ms"),
+            "{err}"
+        );
+        wedged.abort();
+        std::fs::remove_file(&sock).ok();
+    }
+
     /// Path of the guest exec agent script shipped in the image
     /// (`guest-image/intent-vsock-exec`, copied verbatim by the Dockerfile).
     fn guest_agent_script() -> std::path::PathBuf {
@@ -303,6 +358,8 @@ for _ in range(int(sys.argv[3])):
             .arg(guest_agent_script())
             .arg(socket)
             .arg(connections.to_string())
+            // Keep the checkout clean: no __pycache__ beside the script.
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()

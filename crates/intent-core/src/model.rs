@@ -4596,7 +4596,7 @@ pub struct BatchTaskOptions {
 /// `agent.create`): both fields optional — a missing field falls back to the
 /// corresponding `sandbox.microvm.*` setting, then the built-in default
 /// (2 vCPUs / 2048 MiB). Bounds mirror the microVM helper: vcpus 1–16,
-/// memMib >= 128; validated at delegate/create time so bad input errors
+/// memMib 128–65536; validated at delegate/create time so bad input errors
 /// before the VM boots.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -4609,7 +4609,7 @@ pub struct VmResources {
 
 impl VmResources {
     /// Validate the override against the microVM helper's bounds
-    /// (`vcpus` 1–16, `memMib` >= 128). Called at delegate/create time so
+    /// (`vcpus` 1–16, `memMib` 128–65536). Called at delegate/create time so
     /// invalid sizing errors immediately instead of at VM boot.
     ///
     /// # Errors
@@ -4625,10 +4625,13 @@ impl VmResources {
             }
         }
         if let Some(m) = self.mem_mib {
-            if m < crate::settings_file::MIN_MICROVM_MEM_MIB {
+            let (min, max) = (
+                crate::settings_file::MIN_MICROVM_MEM_MIB,
+                crate::settings_file::MAX_MICROVM_MEM_MIB,
+            );
+            if !(min..=max).contains(&m) {
                 return Err(crate::Error::InvalidParams(format!(
-                    "vmResources.memMib: must be >= {}, got {m}",
-                    crate::settings_file::MIN_MICROVM_MEM_MIB
+                    "vmResources.memMib: must be between {min} and {max}, got {m}"
                 )));
             }
         }
@@ -8093,10 +8096,34 @@ mod tests {
                 },
                 "vmResources.memMib",
             ),
+            (
+                VmResources {
+                    vcpus: None,
+                    mem_mib: Some(crate::settings_file::MAX_MICROVM_MEM_MIB + 1),
+                },
+                "vmResources.memMib",
+            ),
+            (
+                VmResources {
+                    vcpus: None,
+                    mem_mib: Some(1_000_000),
+                },
+                "vmResources.memMib",
+            ),
         ] {
             let err = vm.validate().unwrap_err();
+            assert!(
+                matches!(err, crate::Error::InvalidParams(_)),
+                "{vm:?}: {err}"
+            );
             assert!(err.to_string().contains(field), "{vm:?}: {err}");
         }
+        VmResources {
+            vcpus: None,
+            mem_mib: Some(crate::settings_file::MAX_MICROVM_MEM_MIB),
+        }
+        .validate()
+        .expect("the cap itself is accepted");
     }
 
     #[test]

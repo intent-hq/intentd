@@ -29,6 +29,10 @@ pub const MAX_VCPUS: u8 = 16;
 /// Minimum guest RAM in MiB.
 pub const MIN_MEM_MIB: u32 = 128;
 
+/// Maximum guest RAM in MiB (64 GiB; mirrored by the daemon's
+/// `MAX_MICROVM_MEM_MIB`).
+pub const MAX_MEM_MIB: u32 = 65_536;
+
 /// Unix socket paths must fit `sockaddr_un.sun_path`: 104 bytes on macOS
 /// (SUN_LEN), 108 on Linux. Reject over-long vsock socket paths during
 /// validation (exit 64) instead of failing deep in a libkrun API call.
@@ -194,9 +198,9 @@ impl Cli {
                 self.vcpus
             ));
         }
-        if self.mem_mib < MIN_MEM_MIB {
+        if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&self.mem_mib) {
             return Err(format!(
-                "--mem-mib must be >= {MIN_MEM_MIB}, got {}",
+                "--mem-mib must be {MIN_MEM_MIB}..={MAX_MEM_MIB}, got {}",
                 self.mem_mib
             ));
         }
@@ -485,6 +489,9 @@ mod tests {
             .unwrap_err()
             .contains("--vcpus"));
         assert!(plan_with(root.path(), &["--mem-mib", "64"])
+            .unwrap_err()
+            .contains("--mem-mib"));
+        assert!(plan_with(root.path(), &["--mem-mib", "65537"])
             .unwrap_err()
             .contains("--mem-mib"));
     }

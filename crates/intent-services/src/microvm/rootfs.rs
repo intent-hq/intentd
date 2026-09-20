@@ -43,6 +43,10 @@ pub async fn ensure_extracted_tree(rootfs_path: &Path) -> Result<PathBuf, Microv
     {
         return Ok(tree);
     }
+    // Containment is checked explicitly rather than trusted to tar's
+    // defaults: the archive is sha-verified only against a manifest from the
+    // same (repo/admin supplied) source.
+    reject_escaping_members(rootfs_path).await?;
     // Stale partial tree from an interrupted extraction: remove and redo.
     if tokio::fs::try_exists(&tree).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(&tree)
@@ -93,6 +97,47 @@ pub async fn ensure_extracted_tree(rootfs_path: &Path) -> Result<PathBuf, Microv
         .await
         .map_err(|e| MicrovmError::Extract(format!("write marker: {e}")))?;
     Ok(tree)
+}
+
+/// Why an archive member name must not be extracted: an absolute path or a
+/// `..` component would land outside the tree.
+fn escaping_member_reason(name: &str) -> Option<&'static str> {
+    if name.starts_with('/') {
+        return Some("absolute path");
+    }
+    if name.split('/').any(|component| component == "..") {
+        return Some("`..` component");
+    }
+    None
+}
+
+/// List the archive (`-P` so GNU tar reports member names as stored instead
+/// of silently stripping the very prefixes being checked) and refuse it on
+/// the first member that would escape the extraction tree.
+async fn reject_escaping_members(archive: &Path) -> Result<(), MicrovmError> {
+    let output = tokio::process::Command::new("tar")
+        .arg("-tPf")
+        .arg(archive)
+        .output()
+        .await
+        .map_err(|e| MicrovmError::Extract(format!("spawn tar -t: {e}")))?;
+    if !output.status.success() {
+        return Err(MicrovmError::Extract(format!(
+            "tar -tf {} failed ({}): {}",
+            archive.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    for name in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(reason) = escaping_member_reason(name) {
+            return Err(MicrovmError::Extract(format!(
+                "refusing to extract {}: member `{name}` has an {reason}",
+                archive.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// CoW-clone the extracted tree into the per-VM rootfs directory. `dst` must
@@ -190,5 +235,85 @@ mod tests {
         // mountpoint.
         assert!(tree.join("dev").is_dir());
         assert_eq!(std::fs::read_dir(tree.join("dev")).unwrap().count(), 0);
+    }
+
+    /// Hand-built ustar archive with one regular-file member named `name`
+    /// (tar's own create modes sanitize names, so the escaping ones are
+    /// written byte-for-byte here).
+    fn crafted_tar(name: &str) -> Vec<u8> {
+        let data = b"escaped";
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[148..156].copy_from_slice(b"        ");
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let mut out = header.to_vec();
+        out.extend_from_slice(data);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+        out.extend_from_slice(&[0u8; 1024]);
+        out
+    }
+
+    /// #873 review nit: archive members that would land outside the tree —
+    /// absolute paths and `..` components — are refused explicitly, before
+    /// anything is extracted, instead of relying on tar's default stripping.
+    #[tokio::test]
+    async fn escaping_archive_members_are_refused_before_extraction() {
+        for (name, reason) in [
+            ("../escape", "`..` component"),
+            ("etc/../../escape", "`..` component"),
+            ("/abs/escape", "absolute path"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let entry = dir.path().join("digest");
+            std::fs::create_dir_all(&entry).unwrap();
+            let archive = entry.join("rootfs.tar");
+            std::fs::write(&archive, crafted_tar(name)).unwrap();
+
+            let err = ensure_extracted_tree(&archive)
+                .await
+                .expect_err("escaping member must be refused");
+            let msg = err.to_string();
+            assert!(matches!(err, MicrovmError::Extract(_)), "{name}: {msg}");
+            assert!(msg.contains(reason), "{name}: {msg}");
+            assert!(msg.contains(name), "{name}: {msg}");
+            assert!(
+                !entry.join(TREE_DIR).exists() && !entry.join(TREE_OK_MARKER).exists(),
+                "{name}: nothing extracted"
+            );
+            assert!(
+                !dir.path().join("escape").exists(),
+                "{name}: escaped the tree"
+            );
+        }
+
+        // Control: the same crafted archive with a contained name extracts.
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("digest");
+        std::fs::create_dir_all(&entry).unwrap();
+        let archive = entry.join("rootfs.tar");
+        std::fs::write(&archive, crafted_tar("./etc/contained")).unwrap();
+        let tree = ensure_extracted_tree(&archive).await.expect("contained");
+        assert_eq!(
+            std::fs::read(tree.join("etc/contained")).unwrap(),
+            b"escaped"
+        );
+    }
+
+    #[test]
+    fn escaping_member_reason_flags_only_real_escapes() {
+        assert_eq!(escaping_member_reason("./usr/bin/sh"), None);
+        assert_eq!(escaping_member_reason("etc/..hidden"), None);
+        assert_eq!(escaping_member_reason("a/../b"), Some("`..` component"));
+        assert_eq!(escaping_member_reason(".."), Some("`..` component"));
+        assert_eq!(escaping_member_reason("/etc/passwd"), Some("absolute path"));
     }
 }

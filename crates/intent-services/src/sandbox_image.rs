@@ -388,6 +388,10 @@ pub struct CachedImage {
 /// Total timeout for fetching a manifest document.
 const MANIFEST_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Upper bound on a manifest document. The URL is repo/admin supplied, so
+/// the fetch must not buffer an arbitrary body; real manifests are a few KiB.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
 /// Total timeout for downloading a rootfs archive.
 const ROOTFS_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
@@ -406,18 +410,112 @@ fn download_lock(rootfs_path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     std::sync::Arc::clone(locks.entry(rootfs_path.to_path_buf()).or_default())
 }
 
+fn rootfs_file_name(rootfs_path: &Path) -> String {
+    rootfs_path.file_name().map_or_else(
+        || "rootfs".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
 /// Unique per-download temp path next to `rootfs_path`, so concurrent
 /// downloaders (other processes included) never share a partial file.
 fn partial_path(rootfs_path: &Path) -> PathBuf {
-    let name = rootfs_path.file_name().map_or_else(
-        || "rootfs".to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    );
     rootfs_path.with_file_name(format!(
-        "{name}.partial.{}-{}",
+        "{}.partial.{}-{}",
+        rootfs_file_name(rootfs_path),
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ))
+}
+
+/// Marker next to a cached rootfs holding the sha256 this daemon verified
+/// after landing it. Written only after a successful hash check, so a
+/// rootfs without a matching marker is re-hashed on cache hit (and removed +
+/// re-downloaded when its bytes do not match): a torn or tampered archive
+/// left by a crash or an older daemon is never served.
+fn verified_marker_path(rootfs_path: &Path) -> PathBuf {
+    rootfs_path.with_file_name(format!("{}.verified", rootfs_file_name(rootfs_path)))
+}
+
+async fn verified_marker_matches(rootfs_path: &Path, expected_sha: &str) -> bool {
+    match tokio::fs::read_to_string(verified_marker_path(rootfs_path)).await {
+        Ok(recorded) => recorded.trim() == expected_sha,
+        Err(_) => false,
+    }
+}
+
+/// Persist the verified marker atomically (private temp file + rename).
+async fn write_verified_marker(rootfs_path: &Path, sha: &str) -> std::io::Result<()> {
+    let marker = verified_marker_path(rootfs_path);
+    let tmp = partial_path(&marker);
+    tokio::fs::write(&tmp, sha.as_bytes()).await?;
+    if let Err(e) = tokio::fs::rename(&tmp, &marker).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Streamed sha256 of a file on disk (blocking pool; archives are large).
+async fn hash_file(path: &Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hex_digest(&hasher.finalize()))
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("hash task panicked: {e}")))?
+}
+
+/// Whether the cached rootfs at `rootfs_path` can be served for
+/// `expected_sha`: `Ok(true)` when its verified marker matches, or when the
+/// file re-hashes to the digest (the marker is then written). A file whose
+/// bytes do not match is removed together with any stale marker and
+/// `Ok(false)` is returned, as it is when no file exists.
+async fn cached_rootfs_is_verified(
+    rootfs_path: &Path,
+    expected_sha: &str,
+) -> std::io::Result<bool> {
+    let marker = verified_marker_path(rootfs_path);
+    let exists = tokio::fs::try_exists(rootfs_path).await.unwrap_or(false);
+    if !exists {
+        let _ = tokio::fs::remove_file(&marker).await;
+        return Ok(false);
+    }
+    if verified_marker_matches(rootfs_path, expected_sha).await {
+        return Ok(true);
+    }
+    let actual = match hash_file(rootfs_path).await {
+        Ok(actual) => actual,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if actual == expected_sha {
+        write_verified_marker(rootfs_path, expected_sha).await?;
+        return Ok(true);
+    }
+    tracing::warn!(
+        path = %rootfs_path.display(),
+        expected = expected_sha,
+        actual,
+        "cached guest rootfs failed verification; discarding and re-downloading"
+    );
+    let _ = tokio::fs::remove_file(&marker).await;
+    match tokio::fs::remove_file(rootfs_path).await {
+        Ok(()) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Ensure the image referenced by `image_ref` is present and verified in the
@@ -531,15 +629,23 @@ async fn ensure_image_inner(
     tokio::fs::create_dir_all(&entry_dir)
         .await
         .map_err(|e| cache_io(&entry_dir, e))?;
-    if tokio::fs::try_exists(&rootfs_path).await.unwrap_or(false) {
+    // Fast path: a rootfs this daemon already verified (marker matches).
+    if verified_marker_matches(&rootfs_path, &rootfs_sha).await
+        && tokio::fs::try_exists(&rootfs_path).await.unwrap_or(false)
+    {
         return cache_hit(manifest, &manifest_bytes, rootfs_path, manifest_path).await;
     }
 
     // Serialize concurrent in-process downloads of this entry; whoever wins
-    // the lock downloads, the rest find the landed file on re-check.
+    // the lock downloads, the rest find the landed file on re-check. The
+    // re-check re-hashes an unmarked file (and evicts a torn one) so nothing
+    // short of a verified archive is ever served from the cache.
     let lock = download_lock(&rootfs_path);
     let _guard = lock.lock().await;
-    if tokio::fs::try_exists(&rootfs_path).await.unwrap_or(false) {
+    if cached_rootfs_is_verified(&rootfs_path, &rootfs_sha)
+        .await
+        .map_err(|e| cache_io(&rootfs_path, e))?
+    {
         return cache_hit(manifest, &manifest_bytes, rootfs_path, manifest_path).await;
     }
 
@@ -584,13 +690,22 @@ async fn ensure_image_inner(
             actual,
         });
     }
-    if tokio::fs::try_exists(&rootfs_path).await.unwrap_or(false) {
-        // A competing process landed the (content-addressed, so identical)
-        // file first; discard ours and use theirs.
+    // A competing process may have landed the (content-addressed, so
+    // identical) file first: keep theirs only once it verifies, else ours
+    // replaces the evicted copy.
+    let competitor_verified = cached_rootfs_is_verified(&rootfs_path, &rootfs_sha)
+        .await
+        .map_err(|e| cache_io(&rootfs_path, e))?;
+    if competitor_verified {
         let _ = tokio::fs::remove_file(&tmp_path).await;
-    } else if let Err(e) = tokio::fs::rename(&tmp_path, &rootfs_path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(cache_io(&rootfs_path, e));
+    } else {
+        if let Err(e) = tokio::fs::rename(&tmp_path, &rootfs_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(cache_io(&rootfs_path, e));
+        }
+        write_verified_marker(&rootfs_path, &rootfs_sha)
+            .await
+            .map_err(|e| cache_io(&rootfs_path, e))?;
     }
     tokio::fs::write(&manifest_path, &manifest_bytes)
         .await
@@ -638,13 +753,15 @@ async fn cache_hit(
     })
 }
 
-/// GET `url` fully into memory (manifests are small).
+/// GET `url` fully into memory, bounded by [`MAX_MANIFEST_BYTES`]: rejected
+/// up front on `Content-Length`, and while streaming when the header is
+/// absent or lies.
 async fn fetch_bytes(
     client: &reqwest::Client,
     url: &str,
     timeout: std::time::Duration,
 ) -> std::result::Result<Vec<u8>, String> {
-    let resp = client
+    let mut resp = client
         .get(url)
         .timeout(timeout)
         .send()
@@ -654,10 +771,23 @@ async fn fetch_bytes(
     if !status.is_success() {
         return Err(format!("HTTP {status}"));
     }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| e.to_string())
+    if let Some(len) = resp.content_length() {
+        if len > MAX_MANIFEST_BYTES {
+            return Err(format!(
+                "manifest is {len} bytes, larger than the {MAX_MANIFEST_BYTES}-byte limit"
+            ));
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if (body.len() + chunk.len()) as u64 > MAX_MANIFEST_BYTES {
+            return Err(format!(
+                "manifest body exceeds the {MAX_MANIFEST_BYTES}-byte limit"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Stream `url` to `dest`, hashing as it downloads; returns the hex sha256.
@@ -908,6 +1038,99 @@ mod tests {
         assert!(cached.rootfs_path.exists());
     }
 
+    /// Regression (#873 review, cache-hit trust): a cached rootfs whose bytes
+    /// do not match the manifest digest — a torn landing from a crash or an
+    /// older daemon, hence no verified marker — must be evicted and
+    /// re-downloaded, not served forever.
+    #[tokio::test]
+    async fn torn_cached_rootfs_is_evicted_and_redownloaded() {
+        let rootfs: Vec<u8> = b"the-whole-archive".to_vec();
+        let (base, hits) = serve_image(rootfs.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let r = image_ref(&base);
+
+        let first = ensure_image(tmp.path(), &r, &ImageSource::BuiltinPin, None, None)
+            .await
+            .expect("first fetch");
+        let marker = verified_marker_path(&first.rootfs_path);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            hex_sha256(&rootfs),
+            "marker records the verified digest"
+        );
+
+        // Simulate a torn archive left without a marker.
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::write(&first.rootfs_path, &rootfs[..5]).unwrap();
+
+        let second = ensure_image(tmp.path(), &r, &ImageSource::BuiltinPin, None, None)
+            .await
+            .expect("second fetch");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "torn rootfs re-downloaded");
+        assert_eq!(std::fs::read(&second.rootfs_path).unwrap(), rootfs);
+        assert!(marker.exists(), "marker rewritten after the fresh verify");
+    }
+
+    /// An intact but unmarked rootfs (cache written before markers existed)
+    /// is re-hashed on hit and marked, without a network round-trip.
+    #[tokio::test]
+    async fn unmarked_intact_rootfs_is_rehashed_not_redownloaded() {
+        let rootfs: Vec<u8> = b"intact".to_vec();
+        let (base, hits) = serve_image(rootfs.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let r = image_ref(&base);
+
+        let first = ensure_image(tmp.path(), &r, &ImageSource::BuiltinPin, None, None)
+            .await
+            .expect("first fetch");
+        let marker = verified_marker_path(&first.rootfs_path);
+        std::fs::remove_file(&marker).unwrap();
+
+        ensure_image(tmp.path(), &r, &ImageSource::BuiltinPin, None, None)
+            .await
+            .expect("second fetch");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "intact rootfs not re-downloaded"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            hex_sha256(&rootfs)
+        );
+    }
+
+    /// Manifest documents are bounded (#873 review nit): a body over
+    /// `MAX_MANIFEST_BYTES` is a structured fetch error, not a buffered read.
+    #[tokio::test]
+    async fn oversized_manifest_is_rejected() {
+        let (base, _hits) = serve_fixtures(|_| {
+            let mut routes = HashMap::new();
+            let len = usize::try_from(MAX_MANIFEST_BYTES).unwrap() + 1;
+            routes.insert("/manifest.json".to_string(), vec![b' '; len]);
+            routes
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let err = ensure_image(
+            tmp.path(),
+            &image_ref(&base),
+            &ImageSource::BuiltinPin,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        match &err {
+            ImageError::ManifestFetch { detail, .. } => {
+                assert!(
+                    detail.contains("larger than the 1048576-byte limit"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected ManifestFetch, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn rootfs_sha_mismatch_is_structured_and_leaves_no_cache_entry() {
         let rootfs: Vec<u8> = b"actual-bytes".to_vec();
@@ -993,11 +1216,16 @@ mod tests {
             partial_files(&entry).is_empty(),
             "no per-download temp files left behind"
         );
-        let landed: Vec<String> = std::fs::read_dir(&entry)
+        let mut landed: Vec<String> = std::fs::read_dir(&entry)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(landed.len(), 2, "exactly rootfs + manifest: {landed:?}");
+        landed.sort();
+        assert_eq!(
+            landed,
+            ["manifest.json", "rootfs.tar.xz", "rootfs.tar.xz.verified"],
+            "exactly rootfs + marker + manifest"
+        );
     }
 
     #[test]
