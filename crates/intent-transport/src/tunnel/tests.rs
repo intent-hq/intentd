@@ -867,10 +867,12 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
         }
     }
     let mut received = 0;
-    let mut saw_echo = false;
-    let mut saw_ping = false;
+    // Response bytes received when the sibling echo / heartbeat ping arrived:
+    // both must land while the large reply is still draining.
+    let mut echo_at: Option<usize> = None;
+    let mut ping_at: Option<usize> = None;
     let mut sent = 0;
-    while received < RESPONSE_BYTES || !saw_echo || !saw_ping {
+    while received < RESPONSE_BYTES || echo_at.is_none() || ping_at.is_none() {
         if sent < REQUESTS {
             client_send(
                 &mut client_sink,
@@ -904,7 +906,7 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
                     payload,
                 } => {
                     assert_eq!(payload, vec![7]);
-                    saw_echo = true;
+                    echo_at = Some(received);
                 }
                 Frame::Data { stream_id, payload } => panic!(
                     "unexpected {} DATA bytes on stream {stream_id} after {received} response bytes",
@@ -912,11 +914,21 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
                 ),
                 other => panic!("unexpected frame {other:?} after {received} response bytes"),
             },
-            Message::Ping(_) => saw_ping = true,
+            Message::Ping(_) => ping_at = Some(received),
             other => panic!("unexpected message {other:?}"),
         }
     }
     assert_eq!(received, RESPONSE_BYTES);
+    let echo_at = echo_at.unwrap();
+    let ping_at = ping_at.unwrap();
+    assert!(
+        echo_at < RESPONSE_BYTES,
+        "sibling echo arrived only after the {RESPONSE_BYTES}-byte reply fully drained"
+    );
+    assert!(
+        ping_at < RESPONSE_BYTES,
+        "heartbeat ping arrived only after the {RESPONSE_BYTES}-byte reply fully drained"
+    );
     let requests = tokio::time::timeout(Duration::from_secs(5), requests_rx)
         .await
         .expect("consumer reads the queued requests")
