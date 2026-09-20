@@ -65,6 +65,18 @@ impl WorkspaceGuestCount {
     }
 }
 
+/// Result of [`Store::add_workspace_collaborator_within_cap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollaboratorAddOutcome {
+    /// A `collaborator` row was inserted.
+    Added,
+    /// The principal was already a member (any role); nothing was written.
+    AlreadyMember,
+    /// The workspace's committed seats (collaborators plus open invites)
+    /// already reach the cap; nothing was written.
+    WorkspaceFull,
+}
+
 /// Result of [`Store::join_workspace_by_invite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InviteJoinOutcome {
@@ -493,6 +505,85 @@ impl Store {
             Ok(res.rows_affected() > 0)
         })
         .await
+    }
+
+    /// Seat a `collaborator` only while the workspace's committed guest
+    /// seats (collaborators plus open invites, the count
+    /// [`Store::count_workspace_guests`] reports and an invite mint spends)
+    /// stay under `max_guests`: the membership check, the count and the
+    /// insert run in one `BEGIN IMMEDIATE` transaction, so two concurrent
+    /// adds — or an add racing an invite join, whose cap check is inside
+    /// its own write transaction — cannot both take the last seat. An
+    /// already-seated principal takes no new seat and is reported without
+    /// a write.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails (including
+    /// an unknown workspace or principal, rejected by the FKs).
+    pub async fn add_workspace_collaborator_within_cap(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        max_guests: u32,
+    ) -> Result<CollaboratorAddOutcome> {
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("capped member add acquire failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("capped member add begin failed: {e}")))?;
+
+        let body_result: Result<CollaboratorAddOutcome> = async {
+            let already_member: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
+            )
+            .bind(&workspace_id.0)
+            .bind(&principal_id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("capped member add member check failed: {e}")))?;
+            if already_member.is_some() {
+                return Ok(CollaboratorAddOutcome::AlreadyMember);
+            }
+            let sql = format!(
+                "SELECT \
+                    (SELECT COUNT(*) FROM workspace_member m \
+                        WHERE m.workspace_id = ? AND m.role = 'collaborator') + \
+                    (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = ? \
+                        AND {INVITE_OPEN})"
+            );
+            let committed: i64 = sqlx::query_scalar(&sql)
+                .bind(&workspace_id.0)
+                .bind(&workspace_id.0)
+                .bind(now_iso())
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("capped member add guest count failed: {e}"))
+                })?;
+            if u64::try_from(committed).unwrap_or(u64::MAX) >= u64::from(max_guests) {
+                return Ok(CollaboratorAddOutcome::WorkspaceFull);
+            }
+            let insert =
+                format!("INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?)");
+            sqlx::query(&insert)
+                .bind(&workspace_id.0)
+                .bind(&principal_id.0)
+                .bind(WorkspaceRole::Collaborator.as_str())
+                .bind(now_iso())
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_owner_violation(&e, workspace_id, "capped member add"))?;
+            Ok(CollaboratorAddOutcome::Added)
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(conn, body_result, "capped member add commit failed")
+            .await
     }
 
     /// Change an existing member's role. `workspace.owner_principal_id` is
