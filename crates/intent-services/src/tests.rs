@@ -44672,7 +44672,7 @@ mod derived_workspace_unread {
     /// call's error, the stored `unread` flag survives, and no `{ none }`
     /// event is emitted — the caller never sees "seen" while a session
     /// stays unread.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_mark_seen_propagates_marker_failures() {
         let h = harness().await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
