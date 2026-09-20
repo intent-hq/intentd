@@ -7050,6 +7050,126 @@ async fn write_txn_retry_retries_busy_then_succeeds() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
+/// A write-pool acquire timeout as surfaced by the repositories
+/// (intent-hq/intent#5511: "append agent message begin failed: pool timed
+/// out while waiting for an open connection").
+fn pool_timeout_error() -> Error {
+    Error::Internal(format!(
+        "append agent message begin failed: {}",
+        crate::POOL_TIMED_OUT_MESSAGE
+    ))
+}
+
+/// `with_write_txn_retry` treats a write-pool acquire timeout like
+/// `SQLITE_BUSY`: it is transient saturation of the single write connection,
+/// so the closure is retried until it succeeds (intent-hq/intent#5511).
+#[tokio::test]
+async fn write_txn_retry_retries_pool_timeout_then_succeeds() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result = crate::with_write_txn_retry(|| async {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        if n < 2 {
+            Err(pool_timeout_error())
+        } else {
+            Ok("done")
+        }
+    })
+    .await;
+    assert_eq!(
+        result.expect("pool acquire timeouts should be retried"),
+        "done"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+/// A closed pool is NOT transient: `PoolClosed` means the store is shutting
+/// down, so the closure runs once and the error surfaces immediately.
+#[tokio::test]
+async fn write_txn_retry_does_not_retry_pool_closed() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result: crate::Result<u32> = crate::with_write_txn_retry(|| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Internal(
+            "append agent message begin failed: attempted to acquire a connection on a closed pool"
+                .to_string(),
+        ))
+    })
+    .await;
+    assert!(result.is_err(), "pool-closed error must surface");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// End-to-end regression for intent-hq/intent#5511: a task holding the
+/// single write connection past the pool's acquire timeout used to fail
+/// `append_agent_message` terminally ("append agent message begin failed:
+/// pool timed out while waiting for an open connection"), which in turn
+/// failed the agent turn. The acquire timeout is a transient saturation
+/// signal, so the append must wait it out and succeed once the connection is
+/// released. The store is opened with a shrunk acquire timeout so the test
+/// exercises the real sqlx `PoolTimedOut` path without the production 10s
+/// window.
+#[tokio::test]
+async fn append_agent_message_survives_write_pool_acquire_timeout() {
+    // Short enough to keep the test fast, long enough that opening the pool's
+    // one fresh connection under parallel test load never trips it itself.
+    const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+    let tmp = TempDb::new();
+    // Migrate with the ordinary store, then reopen with a short acquire
+    // timeout on the write pool.
+    drop(Store::open(&tmp.path).await.expect("open store"));
+    let store = Store {
+        write_pool: crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT)
+            .await
+            .expect("open short-timeout write pool"),
+        read_pool: crate::connect_read(&tmp.path)
+            .await
+            .expect("open read pool"),
+        browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+    };
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // Occupy the only write connection for more than two acquire windows so
+    // the append's `begin()` observes at least two `PoolTimedOut`s before the
+    // connection is released.
+    let held = store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write connection");
+    let holder = tokio::spawn(async move {
+        tokio::time::sleep(ACQUIRE_TIMEOUT * 5 / 2).await;
+        drop(held);
+    });
+
+    let result = store
+        .append_agent_message(
+            &agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "hi" }]),
+            "t0",
+        )
+        .await;
+    holder.await.expect("holder task");
+    let msg = result.expect("append must retry through the write-pool acquire timeout");
+    assert_eq!(msg.seq, 0);
+    let rows = store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(rows.len(), 1, "exactly one row must be persisted");
+}
+
 /// Guard against duplicate migration version numbers: two files sharing a
 /// version (e.g. two `0062_*.sql`) embed fine but make every `Store::open`
 /// fail at runtime with a UNIQUE constraint violation on
