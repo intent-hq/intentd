@@ -109,6 +109,17 @@ pub struct SystemStatus {
     /// enough that the baseline alone missed them almost entirely — measured,
     /// a 16-chain burst peaking at 6.97 GB reported 0.01 GB.
     pub child_memory_peak_bytes: Option<u64>,
+    /// The share of [`Self::child_memory_bytes`] attributable to spawned
+    /// agents: the sum of the per-agent subtree buckets from the same sweep
+    /// (each descendant's RSS credited to its nearest registered agent root).
+    /// Descendants under no registered root (one-shot adapter chains,
+    /// `host.exec` children) count only in the aggregate. `None` alongside
+    /// `child_processes`.
+    pub agent_memory_bytes: Option<u64>,
+    /// Spawned agents with a live root pid in the same sweep — the number of
+    /// buckets behind [`Self::agent_memory_bytes`]. `None` alongside
+    /// `child_processes`.
+    pub agent_process_count: Option<usize>,
     /// The installed aggregate agent memory budget in bytes
     /// (`agents.memoryBudgetMb`, monorepo#2063). `None` when the budget is
     /// off. The three budget fields are presence-detected on the wire —
@@ -385,6 +396,8 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "childProcesses": status.child_processes,
         "childMemoryBytes": status.child_memory_bytes,
         "childMemoryPeakBytes": status.child_memory_peak_bytes,
+        "agentMemoryBytes": status.agent_memory_bytes,
+        "agentProcessCount": status.agent_process_count,
         "fingerprint": status.fingerprint,
         "localIps": status.local_ips,
         "hostname": status.hostname,

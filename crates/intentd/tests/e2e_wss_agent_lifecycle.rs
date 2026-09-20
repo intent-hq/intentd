@@ -3475,6 +3475,13 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
 /// service-level fake). Also asserts the field stays off the hot `agent.get` /
 /// `agent.list` payloads (diagnostics-only by design).
 ///
+/// Once the sweep has attribution data, the same parked subtree proves the
+/// populated `agent.memoryUsage` (§5.5) wire shape: one row for the spawned
+/// agent carrying the session's name / workspace / provider, a `rootPid`
+/// from the bucket, `processes` rows that sum to the row's `memoryBytes`
+/// sorted descending, `totalBytes` covering the row, an RFC-3339 `sampledAt`
+/// — and no row for the never-spawned agent.
+///
 /// Timing: the sampler publishes a full attribution sweep at boot and then on
 /// its ~5s baseline cadence, so the parked agent's bucket lands within one
 /// baseline period of the spawn — the poll loop below bounds that wait.
@@ -3608,6 +3615,79 @@ async fn agent_diagnostics_reports_subtree_memory_over_wss() {
         panic!("sampler never attributed the parked subtree: {last_diag}");
     });
     assert!(busy_bytes > 0, "a live node subtree has resident bytes");
+
+    // §5.5 `agent.memoryUsage`, populated: the parked subtree is still live,
+    // so every sweep from here on buckets it. Daemon-wide — no `workspaceId`.
+    let u = &wss_rpc(&mut rpc, 80, "agent.memoryUsage", json!({})).await;
+    assert!(
+        u["sampledAt"].as_str().is_some_and(|s| s.contains('T')),
+        "sampledAt is an RFC-3339 stamp once sampled: {u}"
+    );
+    let rows = u["agents"].as_array().expect("agents array");
+    assert!(
+        !rows.iter().any(|r| r["agentId"] == json!(idle_id)),
+        "never-spawned agent has no bucket and no row: {u}"
+    );
+    let busy_row = rows
+        .iter()
+        .find(|r| r["agentId"] == json!(busy_id))
+        .unwrap_or_else(|| panic!("spawned agent row in agent.memoryUsage: {u}"));
+    assert_eq!(busy_row["agentName"], json!("Spawned"), "{busy_row}");
+    assert_eq!(busy_row["workspaceId"], json!(ws_id), "{busy_row}");
+    assert_eq!(busy_row["provider"], json!("mock"), "{busy_row}");
+    let row_bytes = busy_row["memoryBytes"]
+        .as_u64()
+        .expect("row memoryBytes u64");
+    assert!(
+        row_bytes > 0,
+        "a live node subtree has resident bytes: {busy_row}"
+    );
+    let procs = busy_row["processes"].as_array().expect("processes array");
+    assert!(!procs.is_empty(), "at least the worker root: {busy_row}");
+    assert_eq!(
+        busy_row["processCount"],
+        json!(procs.len()),
+        "processCount counts the rows: {busy_row}"
+    );
+    let mut sum = 0u64;
+    let mut prev = u64::MAX;
+    for p in procs {
+        for key in ["pid", "parentPid", "memoryBytes"] {
+            assert!(p[key].is_u64(), "{key} is u64: {p}");
+        }
+        for key in ["name", "cmdline"] {
+            assert!(p[key].is_string(), "{key} is a string: {p}");
+        }
+        let bytes = p["memoryBytes"].as_u64().expect("u64");
+        assert!(
+            bytes <= prev,
+            "processes sort by memoryBytes desc: {busy_row}"
+        );
+        prev = bytes;
+        sum += bytes;
+    }
+    assert_eq!(sum, row_bytes, "rows sum to the row total: {busy_row}");
+    let root_pid = busy_row["rootPid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("spawned handle knows its root pid: {busy_row}"));
+    assert!(
+        procs.iter().any(|p| p["pid"] == json!(root_pid)),
+        "rootPid is one of the bucket's rows: {busy_row}"
+    );
+    let total = u["totalBytes"]
+        .as_u64()
+        .expect("totalBytes u64 once sampled");
+    assert!(
+        total >= row_bytes,
+        "totalBytes {total} covers the row's {row_bytes}: {u}"
+    );
+    assert_eq!(
+        total,
+        rows.iter()
+            .map(|r| r["memoryBytes"].as_u64().expect("u64"))
+            .sum::<u64>(),
+        "totalBytes is the cross-agent sum: {u}"
+    );
 
     // Diagnostics-only by design: the hot list payloads never carry the field.
     let got = wss_rpc(&mut rpc, 90, "agent.get", json!({ "agentId": busy_id })).await;

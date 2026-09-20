@@ -153,15 +153,17 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Also within 10.3: +1 router method (`github.users.search`, the
 /// collaborator picker's login-prefix user search).
 ///
+/// Agent memory attribution (§5.5): +1 router method (`agent.memoryUsage`).
+///
 /// Provider-generic auth (protocol 10.5, §5.27): +5 router methods
 /// (`sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
 /// `getUser`); the `github.*` auth quintet stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 384;
+const EXPECTED_TOTAL_METHODS: usize = 385;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 329;
+const EXPECTED_ROUTER_METHODS: usize = 330;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 53;
@@ -502,6 +504,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.listInterrupted",
     "agent.listUserMessages",
     "agent.markSeen",
+    "agent.memoryUsage",
     "agent.pendingPermissions",
     "agent.removeQueuedMessage",
     "agent.rename",
@@ -1117,6 +1120,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.delete",
     "agent.diagnostics",
     "agent.enhancePrompt",
+    "agent.memoryUsage",
     "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveProposal",
@@ -1597,6 +1601,9 @@ mod unbound_owner_only_methods {
     /// growing it needs a reason on the row. The failure message prints the
     /// recomputed list.
     const UNGATED_AT_SERVICE_LAYER: &[(&str, &str)] = &[
+        // No gate: daemon-wide per-agent memory read; no-manager early
+        // return `{ sampledAt: null, totalBytes: null, agents: [] }`.
+        ("agent.memoryUsage", "ok"),
         // No gate: daemon-wide reverse-client listing.
         ("client.list", "ok"),
         // No gate: process-wide stack sampler.
@@ -1696,6 +1703,7 @@ mod unbound_owner_only_methods {
                 "agent.enhancePrompt",
                 json!({ "prompt": "p", "timeoutMs": 1 }),
             ),
+            ("agent.memoryUsage", json!({})),
             (
                 "agent.replaceMessages",
                 json!({ "agentId": "a1", "messages": [] }),

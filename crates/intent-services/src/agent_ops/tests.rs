@@ -17661,6 +17661,184 @@ async fn diagnostics_reports_subtree_memory_bytes() {
     );
 }
 
+/// §5.5: `agent.memoryUsage` renders the tree probe's per-process buckets as
+/// one row per attributed agent — `memoryBytes` is the bucket's sum,
+/// `rootPid` falls back to the row no other row in the bucket parents when
+/// the manager holds no spawned handle (this test never spawns), the
+/// provider / model / name / workspace come from the session row, rows sort
+/// by `memoryBytes` descending, and `totalBytes` is the cross-agent sum. An
+/// agent the probe did not bucket has no row, and a bucket whose session row
+/// is gone (`NotFound`) is omitted (from the list and the total) — but any
+/// other store failure propagates instead of shrinking the total. Without a
+/// manager, or before the first sample lands, the empty shape carries
+/// `sampledAt: null`, `totalBytes: null`. The stamp and the rows are taken
+/// from the probe as one snapshot — exactly one probe read per request, so a
+/// sweep landing mid-request cannot pair one sweep's stamp with the next
+/// sweep's rows (the same-sweep contract §5.5 documents).
+#[tokio::test]
+async fn agent_memory_usage_reports_per_agent_process_rows() {
+    use crate::agent_manager::{AgentMemorySnapshot, ProcessSample, TreeMemoryProbe, TreeSample};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // The manager's probe slot is set-once, so "no sample yet" is a flag
+    // the test flips rather than a second probe. `reads` counts every probe
+    // method call so the test can prove the service takes one snapshot.
+    struct ProcessProbe {
+        sampled: AtomicBool,
+        rows: HashMap<AgentId, Vec<ProcessSample>>,
+        reads: AtomicUsize,
+    }
+    impl TreeMemoryProbe for ProcessProbe {
+        fn sample(&self) -> Option<TreeSample> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.sampled.load(Ordering::SeqCst).then(|| TreeSample {
+                memory_bytes: self.agent_samples().values().sum(),
+                seq: 1,
+                available_memory: None,
+            })
+        }
+        fn agent_samples(&self) -> HashMap<AgentId, u64> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.rows
+                .iter()
+                .map(|(id, rows)| (id.clone(), rows.iter().map(|r| r.memory_bytes).sum()))
+                .collect()
+        }
+        fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.sampled
+                .load(Ordering::SeqCst)
+                .then(|| AgentMemorySnapshot {
+                    sampled_at: Some("2026-09-20T07:00:00Z".to_string()),
+                    processes: self.rows.clone(),
+                })
+        }
+    }
+    let proc = |pid: u32, parent_pid: u32, name: &str, memory_bytes: u64| ProcessSample {
+        pid,
+        parent_pid,
+        name: name.to_string(),
+        cmdline: format!("/bin/{name} --pid {pid}"),
+        memory_bytes,
+    };
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let big = create_agent(&svc, &ws, "Big").await;
+    let small = create_agent(&svc, &ws, "Small").await;
+    let _unsampled = create_agent(&svc, &ws, "Unsampled").await;
+
+    let empty = json!({ "sampledAt": null, "totalBytes": null, "agents": [] });
+    assert_eq!(
+        svc.agent_memory_usage().await.expect("no manager"),
+        empty,
+        "no manager attached: empty shape"
+    );
+
+    let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus));
+    let manager = Arc::new(crate::agent_manager::AgentManager::new(
+        svc.clone(),
+        sink,
+        4,
+    ));
+    svc.attach_agent_manager(&manager);
+    let rows = HashMap::from([
+        (
+            big.clone(),
+            vec![
+                proc(100, 1, "node", 1_000),
+                proc(101, 100, "rg", 5_000),
+                proc(102, 100, "bash", 2_000),
+            ],
+        ),
+        (small.clone(), vec![proc(200, 1, "node", 3_000)]),
+        (
+            AgentId("agent-gone".to_string()),
+            vec![proc(300, 1, "node", 9_000)],
+        ),
+    ]);
+    let probe = Arc::new(ProcessProbe {
+        sampled: AtomicBool::new(false),
+        rows,
+        reads: AtomicUsize::new(0),
+    });
+    manager.set_tree_probe(probe.clone());
+    assert_eq!(
+        svc.agent_memory_usage().await.expect("unsampled"),
+        empty,
+        "probe wired but no sample yet: empty shape"
+    );
+    assert_eq!(
+        probe.reads.swap(0, Ordering::SeqCst),
+        1,
+        "the unsampled check is the one snapshot read, not a separate probe call"
+    );
+
+    probe.sampled.store(true, Ordering::SeqCst);
+    let result = svc.agent_memory_usage().await.expect("memory usage");
+    assert_eq!(
+        probe.reads.swap(0, Ordering::SeqCst),
+        1,
+        "stamp and rows come from one probe read: {result}"
+    );
+    assert_eq!(result["sampledAt"], json!("2026-09-20T07:00:00Z"));
+    assert_eq!(result["totalBytes"], json!(11_000));
+    let agents = result["agents"].as_array().expect("agents");
+    assert_eq!(
+        agents.len(),
+        2,
+        "one row per bucketed agent with a session row: {result}"
+    );
+
+    let first = &agents[0];
+    assert_eq!(first["agentId"], json!(big.0));
+    assert_eq!(first["agentName"], json!("Big"));
+    assert_eq!(first["workspaceId"], json!(ws.0));
+    assert_eq!(first["provider"], json!("auggie"));
+    assert_eq!(first["model"], json!("sonnet4.5"));
+    assert_eq!(first["rootPid"], json!(100), "subtree root: {first}");
+    assert_eq!(first["processCount"], json!(3));
+    assert_eq!(first["memoryBytes"], json!(8_000));
+    let procs = first["processes"].as_array().expect("processes");
+    assert_eq!(
+        procs
+            .iter()
+            .map(|p| p["pid"].as_u64().expect("pid"))
+            .collect::<Vec<_>>(),
+        vec![101, 102, 100],
+        "processes sort by memoryBytes descending: {first}"
+    );
+    assert_eq!(
+        procs[0],
+        json!({
+            "pid": 101,
+            "parentPid": 100,
+            "name": "rg",
+            "cmdline": "/bin/rg --pid 101",
+            "memoryBytes": 5_000,
+        })
+    );
+
+    let second = &agents[1];
+    assert_eq!(second["agentId"], json!(small.0));
+    assert_eq!(second["rootPid"], json!(200));
+    assert_eq!(second["processCount"], json!(1));
+    assert_eq!(second["memoryBytes"], json!(3_000));
+
+    // A store failure that is not `NotFound` must surface, never read as
+    // "these sessions were deleted" and shrink the total. Closing the pools
+    // turns the session lookup into `Error::Internal`.
+    svc.store().close().await;
+    let err = svc
+        .agent_memory_usage()
+        .await
+        .expect_err("store failure propagates");
+    assert!(
+        matches!(err, Error::Internal(_)),
+        "store failures propagate as Internal, got: {err:?}"
+    );
+}
+
 /// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry
 /// `lastTurnSilentTailMs` (the last ended turn's stream-silence tail,
 /// recorded in-memory at turn end; omitted when no turn ended this daemon
