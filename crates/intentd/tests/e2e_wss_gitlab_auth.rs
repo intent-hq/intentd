@@ -1417,3 +1417,159 @@ async fn gitlab_probe_rereads_the_binding_after_waiting_over_wss() {
         "no expired may precede the deliberate revoke"
     );
 }
+
+/// A revoke that waited on the credential gate re-reads the host binding
+/// before it deletes: while the device completion for `gitlab.com` sits in a
+/// held authorize exchange, `sourceControl.gitlab.host` moves to another
+/// instance and `revoke(other)` is issued. At the previous head the revoke
+/// snapshotted "other is bound" at resolve time, queued behind the gate, and
+/// then deleted the pair the completion had just committed (and re-bound to
+/// `gitlab.com`). Now the binding is read under the gate: the revoke is a
+/// no-op for the unbound host — nothing deleted, no `revoked` — and the
+/// device connection to `gitlab.com` survives.
+#[tokio::test]
+async fn gitlab_revoke_rereads_the_binding_after_waiting_over_wss() {
+    let mock = spawn_mock_gitlab().await;
+    let h = boot(&mock).await;
+    let mut sub = subscriber(&h).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let gitlab = json!({ "provider": "gitlab" });
+    let other_host = "gitlab.other.internal";
+
+    let v = wss_rpc(&mut rpc, 10, "sourceControl.connect", gitlab.clone()).await;
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE), "{v}");
+
+    // Authorize, but park the response: the completion holds the gate.
+    mock.flags.hold_authorize.store(true, Ordering::SeqCst);
+    mock.flags.authorize.store(true, Ordering::SeqCst);
+    await_latch(&mock.flags.authorize_held, "hold the authorize response").await;
+
+    // The binding moves, then a revoke for the newly bound instance queues
+    // behind the held completion.
+    let v = wss_rpc(
+        &mut rpc,
+        11,
+        "settings.update",
+        json!({ "changes": [{ "path": "sourceControl.gitlab.host", "value": other_host }] }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "rebind: {v}");
+    let mut conn = connect_ws(h.port, h.cfg.clone()).await;
+    let params = json!({ "provider": "gitlab", "host": other_host });
+    let revoke =
+        tokio::spawn(async move { wss_rpc(&mut conn, 20, "sourceControl.revoke", params).await });
+    mock.flags.release_authorize.notify_one();
+
+    // The completion commits its pair and binds `gitlab.com` back; the
+    // queued revoke then finds `other` unbound and deletes nothing.
+    let ev = await_auth_changed(&mut sub, "authorized", 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "authorized" })
+    );
+    let v = revoke.await.expect("revoke task");
+    assert_eq!(v["result"], json!({ "ok": true }), "{v}");
+    let secrets = read_secrets(&h.secrets_file);
+    assert_eq!(
+        secrets["sourceControl.gitlab.token"],
+        json!(ACCESS_TOKEN),
+        "the revoke of an unbound host deleted nothing: {secrets}"
+    );
+    let v = wss_rpc(&mut rpc, 12, "sourceControl.authStatus", gitlab.clone()).await;
+    let r = &v["result"];
+    assert_eq!(
+        r["host"],
+        json!(HOST),
+        "the completion re-bound its host: {r}"
+    );
+    assert_eq!(r["isConfigured"], json!(true), "{r}");
+    assert_eq!(r["method"], json!("device"));
+    assert_eq!(r["user"]["login"], json!("glab-octocat"));
+
+    // No `revoked` was emitted for the no-op: the next auth-changed is this
+    // deliberate revoke's, for `gitlab.com`.
+    let v = wss_rpc(&mut rpc, 13, "sourceControl.revoke", gitlab).await;
+    assert_eq!(v["result"], json!({ "ok": true }));
+    let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "revoked" }),
+        "only the deliberate revoke may follow the authorize"
+    );
+}
+
+/// A device flow cancelled while its authorize exchange is in flight must not
+/// touch a credential connected before it: a PAT is connected, a device grant
+/// is started for the same host, the instance's authorize response is parked,
+/// `cancelAuth` clears the slot, and the response is released. At the
+/// previous head the late completion persisted its pair over the PAT and,
+/// finding its slot gone, deleted the credential — leaving nothing stored. Now
+/// the grant is committed only by a still-resident flow: the cancelled
+/// completion drops it, the PAT stays exactly as it was, and no `authorized`
+/// is emitted for the discarded grant.
+#[tokio::test]
+async fn gitlab_cancel_during_device_authorize_keeps_the_pat_over_wss() {
+    let mock = spawn_mock_gitlab().await;
+    let h = boot(&mock).await;
+    let mut sub = subscriber(&h).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let gitlab = json!({ "provider": "gitlab" });
+
+    let v = wss_rpc(
+        &mut rpc,
+        10,
+        "sourceControl.connect",
+        json!({ "provider": "gitlab", "method": "pat", "token": PAT_TOKEN }),
+    )
+    .await;
+    assert_eq!(v["result"], json!({ "ok": true, "method": "pat" }), "{v}");
+    let ev = await_auth_changed(&mut sub, "authorized", 15).await;
+    assert_eq!(ev["status"], json!("authorized"));
+    let pat_user_requests = mock.flags.user_requests.load(Ordering::SeqCst);
+
+    // A device grant for the same host, authorized with the response parked.
+    let v = wss_rpc(&mut rpc, 11, "sourceControl.connect", gitlab.clone()).await;
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE), "{v}");
+    mock.flags.hold_authorize.store(true, Ordering::SeqCst);
+    mock.flags.authorize.store(true, Ordering::SeqCst);
+    await_latch(&mock.flags.authorize_held, "hold the authorize response").await;
+
+    // Cancel while the completion is in flight (cancel does not wait on the
+    // gate), then let the instance answer.
+    let v = wss_rpc(&mut rpc, 12, "sourceControl.cancelAuth", gitlab.clone()).await;
+    assert_eq!(v["result"], json!({ "ok": true, "cancelled": true }), "{v}");
+    mock.flags.release_authorize.notify_one();
+
+    // authStatus queues behind the completion's gate hold, so once it
+    // answers the completion has finished — and the PAT is what remains.
+    let v = wss_rpc(&mut rpc, 13, "sourceControl.authStatus", gitlab.clone()).await;
+    let r = &v["result"];
+    assert_eq!(r["isConfigured"], json!(true), "{r}");
+    assert_eq!(r["method"], json!("pat"));
+    assert_eq!(r["user"]["login"], json!("glab-octocat"));
+    assert_eq!(r["deviceFlow"], Value::Null, "the cancel cleared the slot");
+    assert_eq!(
+        mock.flags.user_requests.load(Ordering::SeqCst),
+        pat_user_requests + 1,
+        "the probe validated the PAT once"
+    );
+    let secrets = read_secrets(&h.secrets_file);
+    assert_eq!(
+        secrets["sourceControl.gitlab.token"],
+        json!(PAT_TOKEN),
+        "the PAT survives the cancelled device completion: {secrets}"
+    );
+    assert!(secrets.get("sourceControl.gitlab.refreshToken").is_none());
+    assert!(secrets.get("sourceControl.gitlab.tokenExpiresAt").is_none());
+
+    // The discarded grant announced nothing: the next auth-changed is the
+    // `revoked` this deliberate revoke triggers.
+    let v = wss_rpc(&mut rpc, 14, "sourceControl.revoke", gitlab).await;
+    assert_eq!(v["result"], json!({ "ok": true }));
+    let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "revoked" }),
+        "nothing but the revoke may follow the PAT connect"
+    );
+}

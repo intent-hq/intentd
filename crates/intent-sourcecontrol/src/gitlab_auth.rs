@@ -440,6 +440,60 @@ pub enum GitlabPollStatus {
     Denied,
 }
 
+/// One token-endpoint exchange's outcome, with the authorized grant still
+/// **uncommitted** — see [`GitlabDeviceFlow::exchange_once`].
+#[derive(Debug)]
+pub enum GitlabExchange {
+    /// The user authorized; nothing has been written yet. Call
+    /// [`GitlabGrant::commit`] to persist the pair, or drop it to discard the
+    /// grant without touching whatever the store holds.
+    Authorized(GitlabGrant),
+    /// As [`GitlabPollStatus::Pending`].
+    Pending,
+    /// As [`GitlabPollStatus::Expired`].
+    Expired,
+    /// As [`GitlabPollStatus::Denied`].
+    Denied,
+}
+
+/// An authorized device grant the instance has issued but that is not yet in
+/// the secret store: the caller decides, after its own checks, whether to
+/// [`commit`](Self::commit) it. The tokens never leave this value; `Debug` is
+/// redacted and dropping it discards them.
+pub struct GitlabGrant {
+    store: FileSecretStore,
+    access_token: SecretString,
+    refresh_token: Option<SecretString>,
+    expires_at: Option<u64>,
+}
+
+impl std::fmt::Debug for GitlabGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitlabGrant")
+            .field("has_refresh_token", &self.refresh_token.is_some())
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GitlabGrant {
+    /// Persist the pair into the flow's secret store (replacing whatever it
+    /// held, clearing a stale refresh token / expiry when the grant has none).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store write fails or times out.
+    pub async fn commit(self) -> Result<()> {
+        persist_tokens(
+            self.store,
+            self.access_token,
+            self.refresh_token,
+            self.expires_at,
+        )
+        .await
+    }
+}
+
 /// Opaque in-flight device-grant handle returned by [`start_device_grant`].
 /// Holds the secret `device_code` privately; `Debug` is redacted.
 pub struct GitlabDeviceFlow {
@@ -589,6 +643,7 @@ impl GitlabDeviceFlow {
     /// Poll the token endpoint once. On [`GitlabPollStatus::Authorized`] the
     /// access token (and the refresh token, when granted) has already been
     /// persisted to the secret store — it is never returned to the caller.
+    /// [`Self::exchange_once`] + [`GitlabGrant::commit`] in one step.
     ///
     /// # Errors
     ///
@@ -597,6 +652,29 @@ impl GitlabDeviceFlow {
     /// are not errors — they are reported as [`GitlabPollStatus::Expired`]
     /// and [`GitlabPollStatus::Denied`].
     pub async fn poll_once(&mut self) -> Result<GitlabPollStatus> {
+        match self.exchange_once().await? {
+            GitlabExchange::Authorized(grant) => {
+                grant.commit().await?;
+                Ok(GitlabPollStatus::Authorized)
+            }
+            GitlabExchange::Pending => Ok(GitlabPollStatus::Pending),
+            GitlabExchange::Expired => Ok(GitlabPollStatus::Expired),
+            GitlabExchange::Denied => Ok(GitlabPollStatus::Denied),
+        }
+    }
+
+    /// Poll the token endpoint once **without** persisting: an authorized
+    /// grant comes back as an opaque [`GitlabGrant`] the caller commits (or
+    /// drops) after its own checks — the seam for a caller that must decide
+    /// under a lock whether this completion still owns the store (the
+    /// instance issues the grant once; a dropped grant is simply lost, and
+    /// the store is left exactly as it was).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token request fails or the response cannot
+    /// be classified.
+    pub async fn exchange_once(&mut self) -> Result<GitlabExchange> {
         // Doorkeeper reports pending/slow_down/expired/denied as an `error`
         // code on an HTTP 400 body, so classify the body regardless of status.
         let response = self
@@ -621,23 +699,19 @@ impl GitlabDeviceFlow {
                 access_token,
                 refresh_token,
                 expires_in,
-            } => {
-                persist_tokens(
-                    self.store.clone(),
-                    access_token,
-                    refresh_token,
-                    expires_in.map(|secs| unix_now().saturating_add(secs)),
-                )
-                .await?;
-                Ok(GitlabPollStatus::Authorized)
-            }
-            PollResponse::Pending => Ok(GitlabPollStatus::Pending),
+            } => Ok(GitlabExchange::Authorized(GitlabGrant {
+                store: self.store.clone(),
+                access_token,
+                refresh_token,
+                expires_at: expires_in.map(|secs| unix_now().saturating_add(secs)),
+            })),
+            PollResponse::Pending => Ok(GitlabExchange::Pending),
             PollResponse::SlowDown { interval } => {
                 self.interval = next_interval(self.interval, interval);
-                Ok(GitlabPollStatus::Pending)
+                Ok(GitlabExchange::Pending)
             }
-            PollResponse::Expired => Ok(GitlabPollStatus::Expired),
-            PollResponse::Denied => Ok(GitlabPollStatus::Denied),
+            PollResponse::Expired => Ok(GitlabExchange::Expired),
+            PollResponse::Denied => Ok(GitlabExchange::Denied),
         }
     }
 }

@@ -8,8 +8,10 @@
 //!
 //! 🔒 Tokens, device codes and refresh tokens never cross this module's
 //! boundary: the engine (`intent_sourcecontrol::gitlab_auth`) persists them
-//! straight into the file-backed secret store, and every DTO here carries
-//! only user-facing codes, derived identity and connection state.
+//! straight into the file-backed secret store (an authorized device grant
+//! travels only as the opaque `GitlabGrant` this module commits or drops),
+//! and every DTO here carries only user-facing codes, derived identity and
+//! connection state.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,7 +23,7 @@ use intent_sourcecontrol::gitlab_auth::{
 };
 use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT as GITLAB_SECRET_ACCOUNT;
 use intent_sourcecontrol::{
-    GitlabDeviceFlow, GitlabHost, GitlabPollStatus, GitlabUser, StoredCredential, UserIdentity,
+    GitlabDeviceFlow, GitlabExchange, GitlabHost, GitlabUser, StoredCredential, UserIdentity,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -81,11 +83,12 @@ impl Provider {
 #[derive(Debug, Clone)]
 pub(crate) enum Target {
     Github,
+    /// Whether `host` is the bound instance (`sourceControl.gitlab.host`) —
+    /// the only host whose stored token applies — is deliberately NOT
+    /// snapshotted here: handlers re-read it (`Services::gitlab_host_is_bound`)
+    /// at the moment they act, under the [`GitlabCredentialGate`].
     Gitlab {
         host: GitlabHost,
-        /// True iff `host` is the bound instance (`sourceControl.gitlab.host`)
-        /// — the only host whose stored token applies.
-        bound: bool,
     },
 }
 
@@ -138,18 +141,14 @@ pub(crate) fn resolve_target(
                 Some(h) => parse_gitlab_host(h)?,
                 None => bound_host.clone(),
             };
-            let bound = resolved.host() == bound_host.host();
-            if bound {
+            if resolved.host() == bound_host.host() {
                 if let Some(origin) = api_origin.map(str::trim).filter(|o| !o.is_empty()) {
                     resolved = resolved.with_api_origin(origin).map_err(|e| {
                         Error::Internal(format!("gitlab api origin override rejected: {e}"))
                     })?;
                 }
             }
-            Ok(Target::Gitlab {
-                host: resolved,
-                bound,
-            })
+            Ok(Target::Gitlab { host: resolved })
         }
     }
 }
@@ -234,23 +233,23 @@ async fn is_resident(state: &GitlabAuthStateHandle, flow_id: u64) -> bool {
 /// The daemon-owned GitLab poll loop `sourceControl.connect` spawns — the
 /// gitlab twin of [`github_auth_ops::run_poll_loop`] (same cooperative
 /// cancellation: the task exits at its next tick once cancel / revoke / a
-/// newer connect replaced the slot, and reconciles a raced authorize by
-/// deleting the just-persisted credential). On `Authorized` the engine has
-/// already persisted the token pair; the slot is cleared, the host is bound
-/// (`sourceControl.gitlab.host`) and `sourceControl:auth-changed` is emitted.
+/// newer connect replaced the slot). On an authorized exchange the grant is
+/// committed to the store only if this flow is **still** the resident slot;
+/// then the slot is cleared, the host is bound (`sourceControl.gitlab.host`)
+/// and `sourceControl:auth-changed` is emitted. A completion whose slot was
+/// cancelled or replaced while its exchange was in flight drops the grant
+/// uncommitted — the store (a PAT connected before the flow, a newer
+/// connection) is left exactly as it was.
 ///
 /// Every exchange runs under the [`GitlabCredentialGate`]: the residency
-/// check, the exchange (whose `Authorized` persist lives in the engine), the
-/// residency re-check and the slot clear + bind / orphan delete are one
-/// atomic step against a PAT connect, revoke or refresh on the same store —
-/// a completion that lost the slot while it was in flight can only delete
-/// the pair it just wrote, never a newer connection.
+/// check, the exchange, the residency re-check and the commit + slot clear +
+/// bind are one atomic step against a PAT connect, revoke or refresh on the
+/// same store.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_gitlab_poll_loop(
     state: GitlabAuthStateHandle,
     bus: Option<EventBus>,
     registry: Option<Arc<crate::SettingsRegistry>>,
-    store: FileSecretStore,
     gate: GitlabCredentialGate,
     flow_id: u64,
     host: String,
@@ -271,34 +270,34 @@ pub(crate) async fn run_gitlab_poll_loop(
         if Instant::now() >= deadline {
             break FlowPhase::Expired;
         }
-        match flow.poll_once().await {
-            Ok(GitlabPollStatus::Pending) => consecutive_errors = 0,
-            Ok(GitlabPollStatus::Authorized) => {
-                let resident = {
-                    let mut guard = state.lock().await;
-                    let resident =
-                        matches!(guard.flow.as_ref(), Some(f) if f.slot.flow_id == flow_id);
-                    if resident {
-                        guard.flow = None;
-                    }
-                    resident
-                };
-                if !resident {
-                    if let Err(e) = revoke_gitlab_token(store).await {
-                        tracing::warn!(
-                            error = %e,
-                            "could not delete gitlab token after orphaned authorize"
-                        );
-                    }
+        match flow.exchange_once().await {
+            Ok(GitlabExchange::Pending) => consecutive_errors = 0,
+            Ok(GitlabExchange::Authorized(grant)) => {
+                let mut guard = state.lock().await;
+                if !matches!(guard.flow.as_ref(), Some(f) if f.slot.flow_id == flow_id) {
+                    drop(grant);
+                    tracing::info!(
+                        host,
+                        "gitlab device grant superseded before commit; discarded"
+                    );
                     return;
                 }
+                if let Err(e) = grant.commit().await {
+                    // The instance issued the grant once; there is nothing
+                    // left to poll for.
+                    tracing::warn!(error = %e, host, "could not persist gitlab device grant");
+                    drop(guard);
+                    break FlowPhase::Error;
+                }
+                guard.flow = None;
+                drop(guard);
                 bind_gitlab_host(registry.as_deref(), &host);
                 tracing::info!(status = "authorized", host, "gitlab device grant finished");
                 publish_auth_changed(bus.as_ref(), Provider::Gitlab, &host, "authorized").await;
                 return;
             }
-            Ok(GitlabPollStatus::Expired) => break FlowPhase::Expired,
-            Ok(GitlabPollStatus::Denied) => break FlowPhase::Denied,
+            Ok(GitlabExchange::Expired) => break FlowPhase::Expired,
+            Ok(GitlabExchange::Denied) => break FlowPhase::Denied,
             Err(e) => {
                 consecutive_errors += 1;
                 tracing::warn!(
@@ -808,7 +807,6 @@ impl crate::Services {
             self.gitlab_auth.clone(),
             self.event_bus.clone(),
             self.settings_registry.clone(),
-            self.gitlab_secret_store.clone(),
             self.gitlab_credential_gate.clone(),
             flow_id,
             host.host().to_string(),
@@ -892,8 +890,7 @@ mod tests {
 
         let origin = Some("http://127.0.0.1:4321");
         match resolve_target(Provider::Gitlab, None, "gitlab.com", origin).unwrap() {
-            Target::Gitlab { host, bound } => {
-                assert!(bound);
+            Target::Gitlab { host } => {
                 assert_eq!(host.host(), "gitlab.com");
                 assert_eq!(host.base_url(), "http://127.0.0.1:4321");
             }
@@ -907,8 +904,8 @@ mod tests {
         )
         .unwrap()
         {
-            Target::Gitlab { host, bound } => {
-                assert!(!bound, "another instance is not the bound one");
+            Target::Gitlab { host } => {
+                // Another instance is not the bound one: no origin override.
                 assert_eq!(host.base_url(), "https://gitlab.acme.internal");
             }
             Target::Github => panic!("expected a gitlab target"),

@@ -30571,24 +30571,28 @@ impl WorkspaceApi for Services {
             let target = self.resolve_source_control_target(&provider, host.as_deref())?;
             match target {
                 source_control_auth_ops::Target::Github => self.github_revoke().await,
-                source_control_auth_ops::Target::Gitlab { host, bound } => {
-                    // Abort a flow for exactly this host (its poll task exits
-                    // cooperatively and reconciles a raced authorize).
+                source_control_auth_ops::Target::Gitlab { host, .. } => {
+                    // Slot clear, binding read, credential read, delete and
+                    // event ride one hold of the gate: a device completion
+                    // in flight for another host cannot bind it and commit
+                    // between this call's checks, and subscribers observe
+                    // events in store order. The slot clear aborts a flow
+                    // for exactly this host (its poll task exits
+                    // cooperatively at its next tick).
+                    let _gate = self.gitlab_credential_gate.lock().await;
                     {
                         let mut guard = self.gitlab_auth.lock().await;
                         if guard.flow.as_ref().is_some_and(|f| f.host == host.host()) {
                             guard.flow = None;
                         }
                     }
-                    // Only the bound instance owns the stored token: revoking
+                    // Only the bound instance owns the stored token — read
+                    // NOW, under the gate, not at resolve time: revoking
                     // another host is a successful no-op that never deletes
                     // it and never emits `revoked` for it. With nothing
                     // stored (never connected / already revoked) there is no
-                    // connection to end either: ok, no delete, no event. The
-                    // read, delete and event ride one hold of the gate so
-                    // subscribers observe events in store order.
-                    if bound {
-                        let _gate = self.gitlab_credential_gate.lock().await;
+                    // connection to end either: ok, no delete, no event.
+                    if self.gitlab_host_is_bound(&host) {
                         let stored = intent_sourcecontrol::gitlab_auth::stored_credential(
                             self.gitlab_secret_store.clone(),
                         )

@@ -26,8 +26,8 @@ pub use device_flow::{DeviceFlow, IdentityFlow, IdentityPollStatus, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use gitlab_auth::{
-    GitlabDeviceAuthorization, GitlabDeviceFlow, GitlabHost, GitlabPollStatus, GitlabUser,
-    StoredCredential,
+    GitlabDeviceAuthorization, GitlabDeviceFlow, GitlabExchange, GitlabGrant, GitlabHost,
+    GitlabPollStatus, GitlabUser, StoredCredential,
 };
 pub use gitlab_token::GitlabTokenSource;
 pub use model::{
