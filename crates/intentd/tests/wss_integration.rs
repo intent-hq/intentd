@@ -4971,6 +4971,8 @@ impl SystemControl for BusyDaemonControl {
             child_processes: Some(9),
             child_memory_bytes: Some(2_684_354_560),
             child_memory_peak_bytes: Some(5_368_709_120),
+            agent_memory_bytes: Some(2_147_483_648),
+            agent_process_count: Some(3),
             agent_memory_budget_bytes: Some(21_474_836_480),
             agent_memory_charged_bytes: Some(3_221_225_472),
             queued_spawns: Some(1),
