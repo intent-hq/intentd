@@ -587,9 +587,12 @@
 //! collaborator; `added: false` when already a member (idempotent, nothing
 //! published); `-32602` for an unknown principal, the primary principal, a
 //! principal without an active credential (`invalid-params`) or a spent
-//! guest cap (`guest-limit`; collaborators plus open invites, checked and
-//! seated in one store transaction so concurrent adds cannot overshoot the
-//! last seat). The seated count is protected at redemption, not at mint:
+//! guest cap (`guest-limit`; collaborators plus open invites). The
+//! credential predicate, the cap check and the seat are one store
+//! transaction, so concurrent adds cannot overshoot the last seat and a
+//! `principal.revokeSelf` racing the add (which revokes credentials before
+//! it drops memberships) never leaves a seated member without an active
+//! credential. The seated count is protected at redemption, not at mint:
 //! an invite minted concurrently with a direct add may be refused
 //! `workspace-full` at join. An add publishes the same `workspace:updated
 //! { changes: { members: true, addedPrincipalId, memberCount } }` an invite

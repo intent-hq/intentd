@@ -454,9 +454,13 @@ impl Services {
     /// predicate `principal.list` rows satisfy — else `InvalidParams`. An
     /// existing member (either role) is answered `added: false` with nothing
     /// published; otherwise the guest cap is spent like an invite mint
-    /// (collaborators plus open invites, `guest-limit` at the cap) — checked
-    /// and inserted in one store transaction, so concurrent adds cannot
-    /// overshoot the last seat — and the `addedPrincipalId`
+    /// (collaborators plus open invites, `guest-limit` at the cap). The
+    /// credential predicate, the cap check and the insert run in one store
+    /// transaction, so concurrent adds cannot overshoot the last seat and a
+    /// `principal.revokeSelf` that commits first can never leave a seated
+    /// member without an active credential (it revokes credentials before
+    /// it snapshots memberships, so an add that committed first is torn
+    /// down by the revocation instead). On insert the `addedPrincipalId`
     /// `workspace:updated` is published, so the guest's open workspace
     /// channel (which re-reads under its own caller) upserts the now-visible
     /// workspace without a reconnect.
@@ -482,17 +486,6 @@ impl Services {
                 "principal {principal_id} is the primary principal and cannot be added as a guest"
             )));
         }
-        if !self
-            .store
-            .list_principal_credentials(principal_id)
-            .await?
-            .iter()
-            .any(intent_core::PrincipalCredential::is_active)
-        {
-            return Err(Error::InvalidParams(format!(
-                "principal {principal_id} has no active credential on this host"
-            )));
-        }
         let added = self.attach_collaborator(workspace_id, principal_id).await?;
         let member_count = self.member_count(workspace_id).await?;
         Ok(json!({ "added": added, "memberCount": member_count }))
@@ -505,7 +498,8 @@ impl Services {
     /// `workspace:updated` an invite join publishes (`commit_invite_join`
     /// keeps its own copy: its insert is part of the invite-redemption
     /// transaction). Returns whether a row was inserted; a full workspace is
-    /// `guest-limit`.
+    /// `guest-limit`, a principal without an active credential (checked
+    /// inside the same transaction) is `InvalidParams`.
     pub(crate) async fn attach_collaborator(
         &self,
         workspace_id: &WorkspaceId,
@@ -522,6 +516,11 @@ impl Services {
         {
             CollaboratorAddOutcome::Added => true,
             CollaboratorAddOutcome::AlreadyMember => false,
+            CollaboratorAddOutcome::NoActiveCredential => {
+                return Err(Error::InvalidParams(format!(
+                    "principal {principal_id} has no active credential on this host"
+                )));
+            }
             CollaboratorAddOutcome::WorkspaceFull => {
                 return Err(Error::Invite(intent_core::InviteErrorKind::GuestLimit));
             }

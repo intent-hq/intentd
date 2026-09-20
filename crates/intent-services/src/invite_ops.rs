@@ -553,6 +553,13 @@ impl Services {
 
     /// `principal.revokeSelf`: see
     /// [`intent_core::WorkspaceApi::principal_revoke_self`].
+    ///
+    /// The credentials are revoked BEFORE the memberships are snapshotted
+    /// and torn down: a concurrent `workspace.members.add` checks the
+    /// active-credential predicate inside its insert transaction, so an
+    /// add that begins after the revocation committed is refused, and an
+    /// add that committed first is in the snapshot and detached here —
+    /// no interleaving leaves a seated member without an active credential.
     pub(crate) async fn principal_revoke_self_op(&self) -> Result<Value> {
         let (principal_id, is_administrator) = self.self_principal().await?;
         if is_administrator {
@@ -562,6 +569,10 @@ impl Services {
                     .to_string(),
             ));
         }
+        let credentials = self
+            .store
+            .revoke_all_principal_credentials(&principal_id)
+            .await?;
         let mut workspaces = 0u64;
         for m in self.store.list_principal_memberships(&principal_id).await? {
             if m.role == WorkspaceRole::Collaborator
@@ -572,10 +583,6 @@ impl Services {
                 workspaces += 1;
             }
         }
-        let credentials = self
-            .store
-            .revoke_all_principal_credentials(&principal_id)
-            .await?;
         let _ = self.principal_revocations.send(principal_id);
         Ok(json!({ "revoked": true, "credentials": credentials, "workspaces": workspaces }))
     }
