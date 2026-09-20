@@ -131,12 +131,14 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -396,6 +398,229 @@ async fn retired_agents_are_inert_until_restored() {
         .await
         .expect("no-op restore");
     assert_eq!(r2["restored"], json!(false));
+}
+
+/// Create a session with the given parent / background flag through the real
+/// create path, so the row's `parent_agent_id` / `is_background` columns are
+/// what `agent.create` persists.
+async fn create_scoped_agent(
+    svc: &Services,
+    ws: &WorkspaceId,
+    name: &str,
+    parent: Option<&AgentId>,
+    background: bool,
+) -> AgentId {
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("auggie".into()),
+        is_background: Some(background),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some(name.to_string()),
+            Some("sonnet4.5".into()),
+            None,
+            parent.cloned(),
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create scoped agent");
+    AgentId::from(created["agent"]["id"].as_str().unwrap())
+}
+
+/// `agent.list { scope }` (§5.5) on the fixture the task note names — top-level,
+/// delegated (foreground AND background children), an orphaned background
+/// agent and a retired session in every bin: each scope returns exactly its
+/// bin, the three bins partition the default (non-retired) read — union
+/// equal, pairwise disjoint — `scopeCounts` matches the bins, retired rows
+/// are in no bin, and `parentAgentId` narrows `delegated` to one parent's
+/// direct sub-agents while `scopeCounts.delegated` stays workspace-wide.
+#[tokio::test]
+async fn agent_list_scopes_partition_the_non_retired_rows() {
+    use intent_core::{AgentListRowScope, AgentScopeCounts};
+    use std::collections::BTreeSet;
+
+    let (_t, svc, ws) = setup().await;
+    let top_a = create_scoped_agent(&svc, &ws, "top-a", None, false).await;
+    let top_b = create_scoped_agent(&svc, &ws, "top-b", None, false).await;
+    let alpha_child = create_scoped_agent(&svc, &ws, "child-a1", Some(&top_a), false).await;
+    let alpha_bg_child = create_scoped_agent(&svc, &ws, "child-a2-bg", Some(&top_a), true).await;
+    let beta_child = create_scoped_agent(&svc, &ws, "child-b1", Some(&top_b), false).await;
+    let orphan_bg = create_scoped_agent(&svc, &ws, "orphan-bg", None, true).await;
+    // One retired session per bin: none of them may surface in any scope.
+    for (name, parent, bg) in [
+        ("retired-top", None, false),
+        ("retired-child", Some(&top_b), false),
+        ("retired-bg", None, true),
+    ] {
+        let id = create_scoped_agent(&svc, &ws, name, parent, bg).await;
+        svc.agent_retire_op(id, Some(ws.clone()), None)
+            .await
+            .expect("retire");
+    }
+
+    let ids = |rows: &[intent_core::AgentLite]| -> BTreeSet<String> {
+        rows.iter().map(|a| a.id.0.clone()).collect()
+    };
+    let expect = |xs: &[&AgentId]| -> BTreeSet<String> { xs.iter().map(|a| a.0.clone()).collect() };
+
+    let all = svc.agent_list_op(ws.clone()).await.expect("default list");
+    let top = svc
+        .agent_list_scoped_op(ws.clone(), AgentListRowScope::TopLevel)
+        .await
+        .expect("topLevel");
+    let delegated = svc
+        .agent_list_scoped_op(
+            ws.clone(),
+            AgentListRowScope::Delegated {
+                parent_agent_id: None,
+            },
+        )
+        .await
+        .expect("delegated");
+    let background = svc
+        .agent_list_scoped_op(ws.clone(), AgentListRowScope::Background)
+        .await
+        .expect("background");
+
+    assert_eq!(ids(&top), expect(&[&top_a, &top_b]));
+    assert_eq!(
+        ids(&delegated),
+        expect(&[&alpha_child, &alpha_bg_child, &beta_child]),
+        "a background CHILD is delegated, not background"
+    );
+    assert_eq!(ids(&background), expect(&[&orphan_bg]));
+
+    // Partition: union == default read, pairwise disjoint.
+    let union: BTreeSet<String> = ids(&top)
+        .union(&ids(&delegated))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .union(&ids(&background))
+        .cloned()
+        .collect();
+    assert_eq!(union, ids(&all), "topLevel ∪ delegated ∪ background == all");
+    assert_eq!(top.len() + delegated.len() + background.len(), all.len());
+    assert!(ids(&top).is_disjoint(&ids(&delegated)));
+    assert!(ids(&top).is_disjoint(&ids(&background)));
+    assert!(ids(&delegated).is_disjoint(&ids(&background)));
+
+    // Scoped rows are the same list projection as the default read.
+    for row in top.iter().chain(&delegated).chain(&background) {
+        let default_row = all
+            .iter()
+            .find(|a| a.id == row.id)
+            .expect("row in default read");
+        assert_eq!(
+            serde_json::to_value(row).unwrap(),
+            serde_json::to_value(default_row).unwrap(),
+            "scoped row differs from the default read's row"
+        );
+    }
+
+    // scopeCounts: one grouped aggregate over the non-retired rows.
+    assert_eq!(
+        svc.agent_scope_counts_op(ws.clone())
+            .await
+            .expect("scope counts"),
+        AgentScopeCounts {
+            top_level: 2,
+            delegated: 3,
+            background: 1,
+        }
+    );
+    assert_eq!(
+        svc.agent_retired_count_op(ws.clone())
+            .await
+            .expect("retired count"),
+        3
+    );
+
+    // parentAgentId narrows delegated to that parent's direct sub-agents.
+    let under_a = svc
+        .agent_list_scoped_op(
+            ws.clone(),
+            AgentListRowScope::Delegated {
+                parent_agent_id: Some(top_a.clone()),
+            },
+        )
+        .await
+        .expect("delegated under top-a");
+    assert_eq!(ids(&under_a), expect(&[&alpha_child, &alpha_bg_child]));
+    let under_b = svc
+        .agent_list_scoped_op(
+            ws.clone(),
+            AgentListRowScope::Delegated {
+                parent_agent_id: Some(top_b.clone()),
+            },
+        )
+        .await
+        .expect("delegated under top-b");
+    assert_eq!(
+        ids(&under_b),
+        expect(&[&beta_child]),
+        "the retired child under top-b is excluded"
+    );
+    let under_orphan = svc
+        .agent_list_scoped_op(
+            ws.clone(),
+            AgentListRowScope::Delegated {
+                parent_agent_id: Some(orphan_bg.clone()),
+            },
+        )
+        .await
+        .expect("delegated under a childless parent");
+    assert!(under_orphan.is_empty());
+
+    // Retiring the (childless) orphan background agent moves it out of its
+    // bin and count only.
+    svc.agent_retire_op(orphan_bg.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire orphan-bg");
+    let background = svc
+        .agent_list_scoped_op(ws.clone(), AgentListRowScope::Background)
+        .await
+        .expect("background after retire");
+    assert!(background.is_empty());
+    assert_eq!(
+        svc.agent_scope_counts_op(ws.clone())
+            .await
+            .expect("scope counts after retire"),
+        AgentScopeCounts {
+            top_level: 2,
+            delegated: 3,
+            background: 0,
+        }
+    );
+}
+
+/// An empty workspace answers zero counts and empty bins (no rows, no error).
+#[tokio::test]
+async fn agent_list_scopes_on_empty_workspace() {
+    use intent_core::{AgentListRowScope, AgentScopeCounts};
+    let (_t, svc, ws) = setup().await;
+    assert_eq!(
+        svc.agent_scope_counts_op(ws.clone())
+            .await
+            .expect("scope counts"),
+        AgentScopeCounts::default()
+    );
+    for scope in [
+        AgentListRowScope::TopLevel,
+        AgentListRowScope::Delegated {
+            parent_agent_id: None,
+        },
+        AgentListRowScope::Background,
+    ] {
+        assert!(svc
+            .agent_list_scoped_op(ws.clone(), scope)
+            .await
+            .expect("scoped list")
+            .is_empty());
+    }
 }
 
 /// Projection-cost contract (PR review): the default `agent.list` projection
@@ -7382,6 +7607,100 @@ async fn get_conversation_slim_pages_are_byte_budgeted() {
     assert_eq!(walked, all, "token walk has no gaps or duplicates");
 }
 
+/// Multiplayer w2 × slim page budget: the serve-time `author` projection is
+/// attached BEFORE the page is budgeted, so the profile strings count toward
+/// [`SLIM_PAGE_BUDGET_BYTES`] instead of landing on top of an at-budget page.
+/// The author profile is deliberately oversized (8 KiB display name) so the
+/// arithmetic is unambiguous: 100 KiB rows alone admit five per page
+/// (500 KiB), rows + author admit four (4 × 108 KiB) — a page sized without
+/// the authors would serve ~540 KiB, over the budget it just enforced.
+#[tokio::test]
+async fn get_conversation_slim_budget_counts_attached_author_bytes() {
+    use intent_core::{ConversationProjection, Principal, PrincipalId, SLIM_PAGE_BUDGET_BYTES};
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AuthorBudget").await;
+    let guest = PrincipalId::new();
+    let long_name = "N".repeat(8 * 1024);
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("guest".into()),
+            display_name: Some(long_name.clone()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    let chunk = "y".repeat(100 * 1024);
+    let stamp = json!({ "fromPrincipalId": guest.0 });
+    for i in 0..12 {
+        let c = json!([{ "type": "text", "text": format!("{i}:{chunk}") }]);
+        svc.store()
+            .append_agent_message_with_metadata(&id, "user", &c, Some(&stamp), &now_iso())
+            .await
+            .expect("append");
+    }
+
+    let mut walked: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut first_page_len = None;
+    loop {
+        let page = svc
+            .agent_get_conversation_op(
+                id.clone(),
+                None,
+                None,
+                token.clone(),
+                None,
+                None,
+                Some(ConversationProjection::Slim),
+                false,
+            )
+            .await
+            .expect("slim page");
+        let msgs = page["messages"].as_array().unwrap();
+        assert!(!msgs.is_empty(), "budgeted pages are never empty");
+        for m in msgs {
+            assert_eq!(
+                m["author"]["displayName"].as_str().map(str::len),
+                Some(long_name.len()),
+                "every served user row carries the resolved author: {}",
+                m["id"]
+            );
+        }
+        // No single row exceeds the budget, so the SERVED page — authors
+        // included — must fit inside it.
+        let page_bytes = serde_json::to_string(&page["messages"]).unwrap().len();
+        assert!(
+            page_bytes <= SLIM_PAGE_BUDGET_BYTES,
+            "served page (with authors) exceeds the budget: {page_bytes}"
+        );
+        first_page_len.get_or_insert(msgs.len());
+        let ids: Vec<String> = msgs
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        walked.splice(0..0, ids);
+        match page["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(
+        first_page_len,
+        Some(4),
+        "author bytes are budgeted: four 108 KiB rows fit, five do not"
+    );
+    assert_eq!(walked.len(), 12, "token walk has no gaps or duplicates");
+    let mut dedup = walked.clone();
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(dedup.len(), 12, "token walk has no duplicates");
+}
+
 /// Slim page budget edge: a single message over the whole page budget still
 /// serves alone (never an empty page, no infinite token loop), and the walk
 /// continues past it into older history.
@@ -7740,6 +8059,7 @@ fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
         content,
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: now_iso(),
     };
     let stamped = stamp_synthetic_block_ids(msg(json!([
@@ -7864,6 +8184,7 @@ fn agent_last_message_payload_shapes() {
         content,
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: now_iso(),
     };
 
@@ -7934,6 +8255,7 @@ fn stamp_after_strip_uses_post_strip_indices() {
         ]),
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: now_iso(),
     };
     let served = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
@@ -9303,6 +9625,423 @@ async fn list_caps_previews_get_serves_full_values() {
     assert!(long_line.starts_with(row.last_agent_response.as_deref().unwrap()));
     assert!(long_user.starts_with(row.last_user_message.as_deref().unwrap()));
     assert!(long_report.starts_with(row.metadata.completion_report.as_deref().unwrap()));
+}
+
+/// Detail-only `agent.list` row keys (intent-hq/intent#5383): populated on
+/// the worst-case fixture's SESSION so the list/detail asymmetry test below
+/// can prove they are stripped from list rows and kept on `agent.get`.
+const DETAIL_ONLY_ROW_KEYS: &[&str] = &[
+    "harnessFeatures",
+    "effortLevels",
+    "contextReferences",
+    "fileBlocks",
+    "stats",
+];
+const DETAIL_ONLY_METADATA_KEYS: &[&str] = &["pendingProposals", "proposalResolutions"];
+
+/// Build the worst-case-realistic `agent.list` row for the budget /
+/// allowlist goldens: one session with every optional field populated (ids,
+/// model/effort, sandbox + attention + completion-report metadata, every
+/// raw-metadata marker, stop reason, context references / file blocks,
+/// cached session stats), every preview string AND the attention reason
+/// over the preview cap, `name` / `model` over their 128-byte cap,
+/// `sandboxPath` / `sandboxBranch` over their 256-byte cap, an over-cap
+/// `lastToolUse` input, two active hooks, two
+/// active PR monitors, a live context-usage report, an outgoing completion
+/// watch and a pending delete — then read back through the real list path
+/// (`agent_list_op` → `agent_list_impl` → `strip_detail_only_fields` +
+/// `cap_list_previews`). The only fields not seedable without a live ACP
+/// turn (`isResponding` / `isWaitingOnTool` / `turnInFlight` /
+/// `lastStreamActivityAt`, all overlaid from the live-turn slot) and
+/// `sessionCorrupted` (derived from the in-memory poison set) are set on
+/// the projected row afterwards; `retiredAt` is set the same way because a
+/// retired row leaves the default scope (and retire cancels its hooks and
+/// monitors). `cap_list_previews` is idempotent, so re-running it after the
+/// overlay keeps the row on the exact list-path shape.
+async fn worst_case_agent_list_row(
+    svc: &Services,
+    ws: &WorkspaceId,
+) -> (AgentId, intent_core::AgentLite) {
+    use intent_core::{
+        AGENT_LIST_NAME_CAP_BYTES as NAME_CAP, AGENT_LIST_PATH_CAP_BYTES as PATH_CAP,
+        AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET,
+    };
+    let parent = create_agent(svc, ws, "Parent").await;
+    let child = create_agent(svc, ws, "Child").await;
+    let id = create_agent(svc, ws, "Worst-case row").await;
+
+    let user = json!([{ "type": "text", "text": format!("ask {}", "u".repeat(BUDGET * 3)) }]);
+    svc.store()
+        .append_agent_message(&id, "user", &user, &now_iso())
+        .await
+        .expect("append user");
+    let assistant = json!([
+        {
+            "type": "tool_use", "id": "m:0", "name": "str-replace-editor",
+            "input": {
+                "path": "packages/intentd/crates/intent-services/src/agent_ops.rs",
+                "command": "str_replace",
+                "old_str_1": "x".repeat(BUDGET * 3),
+                "new_str_1": "y".repeat(BUDGET * 3),
+            },
+            "toolCallId": "toolu_01",
+        },
+        {
+            "type": "text",
+            "text": format!(
+                "answer {}\n<agent_digest>digest {}</agent_digest>",
+                "a".repeat(BUDGET * 3),
+                "d".repeat(BUDGET * 3)
+            ),
+        },
+    ]);
+    svc.store()
+        .append_agent_message(&id, "assistant", &assistant, &now_iso())
+        .await
+        .expect("append assistant");
+
+    let ts = now_iso();
+    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    s.parent_agent_id = Some(parent.clone());
+    s.backend_session_id = Some(AgentId::from("agent-11111111-2222-3333-4444-555555555555"));
+    s.acp_session_id = Some("acp-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
+    s.name = format!("Worst-case row {}", "n".repeat(NAME_CAP));
+    s.name_explicitly_set = true;
+    s.model = Some(format!(
+        "claude-sonnet-4-5-20250929-{}",
+        "m".repeat(NAME_CAP)
+    ));
+    s.reasoning_effort = Some("medium".into());
+    s.specialist = Some("implementor".into());
+    s.task_note_id = Some(intent_core::NoteId::from(
+        "1d8c1e09-41fb-4b83-834a-781d012e2707",
+    ));
+    s.completion_report = Some(format!("report {}", "r".repeat(BUDGET * 3)));
+    s.completion_report_timestamp = Some(ts.clone());
+    s.delegation_depth = Some(2);
+    s.context_references = Some(json!([{ "type": "file", "path": "src/lib.rs" }]));
+    s.file_blocks = Some(json!([{ "type": "file", "path": "docs/a.md", "size": 1200 }]));
+    s.sandbox_id = Some("sbx-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
+    s.sandbox_path = Some(format!(
+        "/home/user/intent/workspaces/agent-list/.sandboxes/sbx-01HZY8Q6/{}",
+        "p".repeat(PATH_CAP)
+    ));
+    s.sandbox_branch = Some(format!(
+        "sandbox/agent-list/sbx-01HZY8Q6W1V2K3M4N5P6R7S8T9/{}",
+        "b".repeat(PATH_CAP)
+    ));
+    s.stop_reason = Some("end_turn".into());
+    s.stop_reason_timestamp = Some(ts.clone());
+    s.metadata = Some(json!({
+        intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-01HZY8Q6W1V2K3M4N5P6R7S8T9",
+        intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY: "msg-01HZY8Q6W1V2K3M4N5P6R7S8U0",
+        intent_core::LAST_SEEN_MESSAGE_ID_KEY: "msg-01HZY8Q6W1V2K3M4N5P6R7S8U1",
+        intent_core::PENDING_PROPOSALS_KEY: [
+            { "proposalId": "prop-01", "messageId": "msg-01HZY8Q6W1V2K3M4N5P6R7S8U2" },
+            { "proposalId": "prop-02", "messageId": "msg-01HZY8Q6W1V2K3M4N5P6R7S8U3" },
+        ],
+        intent_core::PROPOSAL_RESOLUTIONS_KEY: {
+            "prop-00": intent_core::PROPOSAL_OUTCOME_APPLIED,
+            "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
+        },
+        "isInitialAgent": true,
+        "sponsorAgentId": parent.0,
+    }));
+    svc.store()
+        .update_agent_session(ws, &s)
+        .await
+        .expect("populate session");
+    svc.store()
+        .set_attention_request(
+            ws,
+            &id,
+            "discussion",
+            &format!(
+                "Need a decision on the row budget before tightening the golden. {}",
+                "q".repeat(BUDGET * 3)
+            ),
+            &ts,
+        )
+        .await
+        .expect("attention request");
+    svc.store()
+        .set_agent_effort_levels(
+            ws,
+            &id,
+            Some(&["low".to_string(), "medium".to_string(), "high".to_string()]),
+            &ts,
+        )
+        .await
+        .expect("effort levels");
+    svc.store()
+        .set_agent_notifications_muted(ws, &id, true, &ts)
+        .await
+        .expect("mute");
+
+    seed_active_hook(svc, ws, &id, "Wait for CI on intentd PR").await;
+    seed_active_hook(svc, ws, &id, "Wait for shipped alpha").await;
+    seed_active_pr_monitor(svc, ws, &id, 1993).await;
+    seed_active_pr_monitor(svc, ws, &id, 5383).await;
+    svc.record_context_usage(&id, 123_456, 200_000);
+    svc.register_completion_watch(ws, ws, id.clone(), "Worst-case row".into(), child, None)
+        .expect("outgoing watch");
+    svc.agent_schedule_delete_op(id.clone(), Some(ws.clone()), 60_000)
+        .await
+        .expect("pending delete");
+
+    let rows = svc.agent_list_op(ws.clone()).await.expect("list");
+    let mut row = rows
+        .into_iter()
+        .find(|a| a.id == id)
+        .expect("worst-case row listed");
+    row.is_responding = true;
+    row.is_waiting_on_tool = true;
+    row.turn_in_flight = true;
+    row.last_stream_activity_at = Some(ts.clone());
+    row.session_corrupted = true;
+    row.retired_at = Some(ts);
+    row.cap_list_previews();
+    (id, row)
+}
+
+/// List/detail asymmetry (intent-hq/intent#5383): the detail-only fields
+/// the worst-case fixture populates on the session are ABSENT (not `null`)
+/// on the `agent.list` row in every scope, and present unchanged on
+/// `agent.get` / `agent.getSession`. `stats` is never persisted (it is a
+/// derived §5.24 snapshot), so it is only asserted absent on list rows.
+#[tokio::test]
+async fn agent_list_strips_detail_only_fields_get_keeps_them() {
+    let (_t, svc, ws) = setup().await;
+    let (id, row) = worst_case_agent_list_row(&svc, &ws).await;
+    let wire = serde_json::to_value(&row).unwrap();
+    let obj = wire.as_object().expect("row object");
+    for key in DETAIL_ONLY_ROW_KEYS {
+        assert!(
+            !obj.contains_key(*key),
+            "agent.list row must not carry detail-only `{key}`: {wire}"
+        );
+    }
+    let meta = wire["metadata"].as_object().expect("metadata object");
+    for key in DETAIL_ONLY_METADATA_KEYS {
+        assert!(
+            !meta.contains_key(*key),
+            "agent.list metadata must not carry detail-only `{key}`: {wire}"
+        );
+    }
+
+    // Retired scopes go through the same list projection.
+    svc.agent_retire_op(id.clone(), None, None)
+        .await
+        .expect("retire");
+    for (label, rows) in [
+        (
+            "includeRetired",
+            svc.agent_list_including_retired_op(ws.clone())
+                .await
+                .expect("list including retired"),
+        ),
+        (
+            "retiredOnly",
+            svc.agent_list_retired_only_op(ws.clone())
+                .await
+                .expect("list retired only"),
+        ),
+    ] {
+        let listed = rows.into_iter().find(|a| a.id == id).expect("row listed");
+        let v = serde_json::to_value(&listed).unwrap();
+        for key in DETAIL_ONLY_ROW_KEYS {
+            assert!(
+                v.get(*key).is_none(),
+                "{label}: list row carries `{key}`: {v}"
+            );
+        }
+        for key in DETAIL_ONLY_METADATA_KEYS {
+            assert!(
+                v["metadata"].get(*key).is_none(),
+                "{label}: list metadata carries `{key}`: {v}"
+            );
+        }
+    }
+
+    // The detail reads keep every one of them.
+    let got = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    assert!(
+        got["harnessFeatures"].is_object(),
+        "agent.get keeps harnessFeatures: {got}"
+    );
+    assert_eq!(got["effortLevels"], json!(["low", "medium", "high"]));
+    assert_eq!(
+        got["contextReferences"],
+        json!([{ "type": "file", "path": "src/lib.rs" }])
+    );
+    assert_eq!(
+        got["fileBlocks"],
+        json!([{ "type": "file", "path": "docs/a.md", "size": 1200 }])
+    );
+    assert_eq!(
+        got["metadata"]["pendingProposals"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        got["metadata"]["proposalResolutions"],
+        json!({
+            "prop-00": intent_core::PROPOSAL_OUTCOME_APPLIED,
+            "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
+        })
+    );
+    // And agent.get never applies the list caps either.
+    assert!(
+        got["metadata"]["attentionRequestReason"]
+            .as_str()
+            .map_or(0, str::len)
+            > intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        "agent.get serves the full attention reason: {got}"
+    );
+    let session = svc.agent_get_session_op(id).await.expect("get session");
+    assert!(session.harness_features.is_some());
+    assert_eq!(
+        session.effort_levels.as_deref().map(<[String]>::len),
+        Some(3)
+    );
+    assert!(session.context_references.is_some());
+    assert!(session.file_blocks.is_some());
+    assert_eq!(session.pending_proposals().len(), 2);
+    assert_eq!(session.proposal_resolutions().len(), 2);
+}
+
+/// Row-budget golden (intent-hq/intent#5383): the worst-case-realistic
+/// `agent.list` row serializes at or under
+/// [`intent_core::AGENT_LIST_ROW_BUDGET_BYTES`] — the failure message is the
+/// per-field byte table, so the field that blew the budget is named. Also
+/// pins the fixture as genuinely worst-case: every preview slot and the
+/// attention reason sit at the preview cap, `name` / `model` at the
+/// 128-byte cap, `sandboxPath` / `sandboxBranch` at the 256-byte cap, and
+/// both idle-visibility lists carry two entries.
+#[tokio::test]
+async fn agent_list_row_stays_within_row_budget() {
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, AGENT_LIST_NAME_CAP_BYTES,
+        AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
+    };
+    let (_t, svc, ws) = setup().await;
+    let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
+
+    assert_eq!(
+        row.last_agent_response.as_deref().map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(
+        row.last_user_message.as_deref().map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(
+        row.digest.as_deref().map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(
+        row.metadata.completion_report.as_deref().map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(
+        row.metadata
+            .attention_request_reason
+            .as_deref()
+            .map(str::len),
+        Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+    );
+    assert_eq!(row.name.len(), AGENT_LIST_NAME_CAP_BYTES);
+    assert_eq!(
+        row.model.as_deref().map(str::len),
+        Some(AGENT_LIST_NAME_CAP_BYTES)
+    );
+    assert_eq!(
+        row.metadata.sandbox_path.as_deref().map(str::len),
+        Some(AGENT_LIST_PATH_CAP_BYTES)
+    );
+    assert_eq!(
+        row.metadata.sandbox_branch.as_deref().map(str::len),
+        Some(AGENT_LIST_PATH_CAP_BYTES)
+    );
+    assert_eq!(
+        row.last_tool_use.as_ref().unwrap()["inputTruncated"],
+        json!(true)
+    );
+    assert_eq!(row.waiting_on_hooks.len(), 2);
+    assert_eq!(row.waiting_on_pr_monitors.len(), 2);
+    assert_eq!(row.waiting_for_agent_ids.len(), 1);
+    assert!(row.context_usage.is_some());
+    assert!(row.pending_delete_at.is_some());
+    assert!(row.metadata.attention_request_kind.is_some());
+    assert!(row.metadata.sandbox_id.is_some());
+
+    let wire = serde_json::to_value(&row).unwrap();
+    let (total, per_key) = serialized_key_bytes(&wire);
+    let (meta_total, meta_per_key) = serialized_key_bytes(&wire["metadata"]);
+    let table = format!(
+        "{}metadata breakdown:\n{}",
+        format_key_bytes_table(total, &per_key),
+        format_key_bytes_table(meta_total, &meta_per_key)
+    );
+    assert!(
+        total <= AGENT_LIST_ROW_BUDGET_BYTES,
+        "worst-case agent.list row is {total} B, over AGENT_LIST_ROW_BUDGET_BYTES \
+         ({AGENT_LIST_ROW_BUDGET_BYTES} B). Shrink or drop the largest fields below \
+         (detail-only data belongs on agent.get / agent.getSession), or justify a \
+         budget change in the const's doc comment.\n{table}"
+    );
+}
+
+/// Key-allowlist golden (intent-hq/intent#5383): every top-level key and
+/// every `metadata` key of the worst-case `agent.list` row is listed in
+/// [`intent_core::AGENT_LIST_ROW_KEYS`] / [`intent_core::AGENT_LIST_ROW_METADATA_KEYS`],
+/// and — the other direction — the fixture populates every allowlisted key,
+/// so the budget test above really measures the worst case.
+#[tokio::test]
+async fn agent_list_row_keys_match_allowlist_golden() {
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, AGENT_LIST_ROW_KEYS,
+        AGENT_LIST_ROW_METADATA_KEYS,
+    };
+    let (_t, svc, ws) = setup().await;
+    let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
+    let wire = serde_json::to_value(&row).unwrap();
+
+    let check = |label: &str, object: &serde_json::Value, allow: &[&str]| {
+        let (total, per_key) = serialized_key_bytes(object);
+        let table = format_key_bytes_table(total, &per_key);
+        let keys: Vec<&str> = object
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let unlisted: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| !allow.contains(k))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "agent.list {label} carries keys outside the allowlist golden: {unlisted:?}. \
+             Either add each to intent_core::AGENT_LIST_ROW_KEYS / \
+             AGENT_LIST_ROW_METADATA_KEYS (only if list-context UI renders it AND it \
+             is small — then document it in docs/protocol/methods/agents.md) or serve \
+             it on agent.get / agent.getSession only.\n{table}"
+        );
+        let missing: Vec<&str> = allow
+            .iter()
+            .copied()
+            .filter(|k| !keys.contains(k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the worst-case {label} fixture does not populate allowlisted keys \
+             {missing:?}; extend worst_case_agent_list_row so the budget golden \
+             measures every field.\n{table}"
+        );
+    };
+    check("row", &wire, AGENT_LIST_ROW_KEYS);
+    check("metadata", &wire["metadata"], AGENT_LIST_ROW_METADATA_KEYS);
 }
 
 /// The top-level `isBackground` param wins over the `metadata` fallback, and
@@ -12643,6 +13382,178 @@ async fn queue_message_emits_queue_updated_with_snapshot() {
     assert_eq!(queue[0]["position"], 0);
 }
 
+/// Multiplayer w2 — the queue read path carries the resolved `author`
+/// projection: a `agent.queueMessage` by a wire principal shows up in
+/// `agent.getQueue` AND in the `agent:queue:updated` payload with the same
+/// `{ principalId, login, displayName, avatarUrl }` shape as
+/// `agent.getConversation` user rows, while an agent-sent entry keeps only
+/// its `fromAgentId` attribution.
+#[tokio::test]
+async fn queue_reads_and_queue_updated_carry_resolved_author() {
+    use intent_core::{with_caller, Caller, Principal, PrincipalId};
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+    let guest = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("guest".into()),
+            display_name: Some("Guest User".into()),
+            avatar_url: Some("https://example.test/guest.png".into()),
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    let expected_author = json!({
+        "principalId": guest.0,
+        "login": "guest",
+        "displayName": "Guest User",
+        "avatarUrl": "https://example.test/guest.png",
+    });
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let queued = with_caller(
+        Caller::Wire {
+            principal_id: guest.clone(),
+            is_administrator: false,
+        },
+        async {
+            svc.agent_queue_message(id.clone(), "from guest".into(), None, None, None)
+                .await
+        },
+    )
+    .await
+    .expect("queueMessage");
+    let human_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let agent_sent = svc
+        .agent_queue_message_op(
+            id.clone(),
+            "from agent".into(),
+            None,
+            None,
+            Some(json!({ "fromAgentId": "agent-peer", "fromAgentName": "Peer" })),
+        )
+        .await
+        .expect("queue agent-sent");
+    let agent_sent_id = agent_sent["queuedMessage"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let q = svc
+        .agent_get_queue_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("getQueue");
+    let entries = q["queue"].as_array().expect("queue array");
+    let human = entries
+        .iter()
+        .find(|e| e["id"] == human_id.as_str())
+        .expect("human entry");
+    assert_eq!(human["author"], expected_author, "getQueue: {human}");
+    let peer = entries
+        .iter()
+        .find(|e| e["id"] == agent_sent_id.as_str())
+        .expect("agent-sent entry");
+    assert_eq!(
+        peer.get("author"),
+        Some(&serde_json::Value::Null),
+        "agent-sent entry carries an explicit null author (key never absent): {peer}"
+    );
+    assert_eq!(peer["messageMetadata"]["fromAgentId"], "agent-peer");
+
+    // The last `agent:queue:updated` (post agent-sent enqueue) lists both
+    // entries with the same projection.
+    let mut last_queue = None;
+    while let Ok(Some(batch)) = timeout(Duration::from_secs(2), sub.recv()).await {
+        for evt in batch
+            .iter()
+            .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        {
+            last_queue = Some(evt.data["queue"].clone());
+        }
+        if last_queue
+            .as_ref()
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|q| q.len() == 2)
+        {
+            break;
+        }
+    }
+    let event_queue = last_queue.expect("queue:updated emitted");
+    let event_queue = event_queue.as_array().expect("queue array");
+    assert_eq!(event_queue.len(), 2, "{event_queue:?}");
+    let human = event_queue
+        .iter()
+        .find(|e| e["id"] == human_id.as_str())
+        .expect("human entry in event");
+    assert_eq!(human["author"], expected_author, "queue:updated: {human}");
+    let peer = event_queue
+        .iter()
+        .find(|e| e["id"] == agent_sent_id.as_str())
+        .expect("agent-sent entry in event");
+    assert_eq!(peer.get("author"), Some(&serde_json::Value::Null), "{peer}");
+}
+
+/// `agent.getQueue` never omits `author`: an unscoped read whose session
+/// lookup fails (no session row for the agent — the branch that skips the
+/// resolver) still returns every queued entry with an explicit `author: null`,
+/// including a human-stamped entry the resolver would otherwise have
+/// projected. A scoped read surfaces the lookup failure instead.
+#[tokio::test]
+async fn get_queue_without_session_carries_null_author_on_every_row() {
+    let (_t, svc, ws) = setup().await;
+    let ghost = AgentId::from("agent-without-session");
+    let stamped = json!({ "fromPrincipalId": intent_core::PrincipalId::new().0, "kind": "reply" });
+    svc.enqueue_message(
+        &ghost,
+        "stamped".into(),
+        None,
+        None,
+        Some(stamped),
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    svc.enqueue_message(
+        &ghost,
+        "plain".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+
+    let q = svc
+        .agent_get_queue_op(ghost.clone(), None)
+        .await
+        .expect("unscoped getQueue tolerates a missing session");
+    let entries = q["queue"].as_array().expect("queue array");
+    assert_eq!(entries.len(), 2, "{q}");
+    for entry in entries {
+        assert_eq!(
+            entry.get("author"),
+            Some(&serde_json::Value::Null),
+            "author key must be present (null) when no session resolves it: {entry}"
+        );
+    }
+
+    let err = svc
+        .agent_get_queue_op(ghost, Some(ws))
+        .await
+        .expect_err("a scoped read surfaces the missing session");
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
 #[tokio::test]
 async fn remove_queued_message_emits_queue_updated_only_when_present() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
@@ -12888,6 +13799,686 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
         Some(&metadata),
         "store-only sendToTask fallback must persist messageMetadata verbatim"
     );
+}
+
+/// Multiplayer w2 — the user-origin entry-point matrix (Product Brief "Chat
+/// attribution"; the wire-side catalog golden lives in
+/// `intent_transport::catalog::tests`). Every entry point that writes a
+/// human-authored chat entry stamps the bound wire caller's EXACT principal
+/// and overwrites the client-supplied `fromPrincipalId`; Agent / Daemon
+/// callers strip it instead. Driven through the `WorkspaceApi` trait (where
+/// the stamp lives), read back from the persisted row or the queue entry.
+#[tokio::test]
+async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_point() {
+    use intent_core::{with_caller, AgentWakeOrCreateInput, Caller, Principal, PrincipalId};
+
+    let (tmp, svc, ws) = setup().await;
+    // A hermetic workspaces root for the `workspace.create` arm below.
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
+    let alice = PrincipalId::new();
+    let bob = PrincipalId::new();
+    for (id, login) in [(&alice, "alice"), (&bob, "bob")] {
+        svc.store()
+            .upsert_principal(&Principal {
+                id: id.clone(),
+                github_user_id: None,
+                login: Some(login.into()),
+                display_name: None,
+                avatar_url: None,
+                is_primary: false,
+                created_at: now_iso(),
+                updated_at: now_iso(),
+            })
+            .await
+            .expect("principal");
+    }
+    let wire = |p: &PrincipalId| Caller::Wire {
+        principal_id: p.clone(),
+        is_administrator: false,
+    };
+    let spoof = || json!({ "fromPrincipalId": "spoof", "kind": "reply" });
+    let stamp_of = |md: Option<&serde_json::Value>| {
+        md.and_then(|m| m.get("fromPrincipalId"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let row = |svc: &Services, agent: &AgentId, id: &str| {
+        let svc = svc.clone();
+        let agent = agent.clone();
+        let id = id.to_string();
+        async move {
+            svc.store()
+                .get_agent_session(&agent)
+                .await
+                .expect("session")
+                .messages
+                .into_iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("row {id}"))
+        }
+    };
+    let latest_row_containing = |svc: &Services, agent: &AgentId, text: &str| {
+        let svc = svc.clone();
+        let agent = agent.clone();
+        let text = text.to_string();
+        async move {
+            svc.store()
+                .get_agent_session(&agent)
+                .await
+                .expect("session")
+                .messages
+                .into_iter()
+                .rev()
+                .find(|m| m.role == "user" && m.content.to_string().contains(&text))
+                .unwrap_or_else(|| panic!("user row containing {text:?}"))
+        }
+    };
+    let queue_entry = |svc: &Services, agent: &AgentId, id: &str| {
+        svc.queue_snapshot(agent)
+            .into_iter()
+            .find(|q| q["id"] == id)
+            .unwrap_or_else(|| panic!("queue entry {id}"))
+    };
+
+    let agent = create_agent(&svc, &ws, "Stamped").await;
+    let note_id = seed_task(&svc, &ws, "stamp matrix").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), agent.0.clone(), None)
+        .await
+        .expect("assign");
+
+    // agent.sendMessage (user origin): direct persist.
+    let sent = with_caller(wire(&alice), async {
+        svc.agent_send_message(
+            ws.clone(),
+            agent.clone(),
+            "send".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(spoof()),
+            MessageOrigin::User,
+        )
+        .await
+    })
+    .await
+    .expect("sendMessage");
+    let sent_id = sent["messageId"].as_str().expect("messageId").to_string();
+    let sent_row = row(&svc, &agent, &sent_id).await;
+    assert_eq!(
+        stamp_of(sent_row.metadata.as_ref()).as_deref(),
+        Some(alice.0.as_str()),
+        "sendMessage: {sent_row:?}"
+    );
+    assert_eq!(sent_row.metadata.as_ref().unwrap()["kind"], "reply");
+    assert_eq!(sent_row.role, "user");
+
+    // agent.appendMessage (role user).
+    let appended = with_caller(wire(&bob), async {
+        svc.agent_append_message(
+            agent.clone(),
+            Some(ws.clone()),
+            "user".into(),
+            json!([{ "type": "text", "text": "append" }]),
+            Some(spoof()),
+        )
+        .await
+    })
+    .await
+    .expect("appendMessage");
+    assert_eq!(
+        appended["message"]["metadata"]["fromPrincipalId"], bob.0,
+        "appendMessage(user): {appended}"
+    );
+
+    // agent.sendToTask (store-only delivery persists the row).
+    let to_task = with_caller(wire(&alice), async {
+        svc.agent_send_to_task(
+            ws.clone(),
+            note_id.clone(),
+            "to task".into(),
+            None,
+            Some(spoof()),
+        )
+        .await
+    })
+    .await
+    .expect("sendToTask");
+    assert_eq!(to_task["ok"], true, "{to_task}");
+    let task_row = row(
+        &svc,
+        &agent,
+        to_task["result"]["messageId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("sendToTask messageId: {to_task}")),
+    )
+    .await;
+    assert_eq!(
+        stamp_of(task_row.metadata.as_ref()).as_deref(),
+        Some(alice.0.as_str()),
+        "sendToTask: {task_row:?}"
+    );
+
+    // agent.wakeOrCreate (wake branch, store-only delivery).
+    let woke = with_caller(wire(&bob), async {
+        svc.agent_wake_or_create(
+            ws.clone(),
+            note_id.clone(),
+            "wake".into(),
+            AgentWakeOrCreateInput {
+                message_metadata: Some(spoof()),
+                ..Default::default()
+            },
+        )
+        .await
+    })
+    .await
+    .expect("wakeOrCreate");
+    assert_eq!(woke["ok"], true, "{woke}");
+    let wake_row = latest_row_containing(&svc, &agent, "wake").await;
+    assert_eq!(
+        stamp_of(wake_row.metadata.as_ref()).as_deref(),
+        Some(bob.0.as_str()),
+        "wakeOrCreate: {wake_row:?}"
+    );
+
+    // agent.editAndRegenerate: the edited message is a fresh row by the editor.
+    let regenerated = with_caller(wire(&bob), async {
+        svc.agent_edit_and_regenerate(
+            ws.clone(),
+            agent.clone(),
+            sent_id.clone(),
+            "send (edited)".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("editAndRegenerate");
+    let regenerated_row = row(&svc, &agent, regenerated["messageId"].as_str().expect("id")).await;
+    assert_eq!(
+        stamp_of(regenerated_row.metadata.as_ref()).as_deref(),
+        Some(bob.0.as_str()),
+        "editAndRegenerate: {regenerated_row:?}"
+    );
+
+    // agent.queueMessage: the queue entry captures the stamp …
+    let queued = with_caller(wire(&alice), async {
+        svc.agent_queue_message(agent.clone(), "queued".into(), None, None, Some(spoof()))
+            .await
+    })
+    .await
+    .expect("queueMessage");
+    let queued_id = queued["queuedMessage"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("queued id: {queued}"))
+        .to_string();
+    assert_eq!(
+        queue_entry(&svc, &agent, &queued_id)["messageMetadata"]["fromPrincipalId"],
+        alice.0,
+        "queueMessage"
+    );
+    // … agent.editQueuedMessage by another person re-attributes it …
+    with_caller(wire(&bob), async {
+        svc.agent_edit_queued_message(
+            agent.clone(),
+            queued_id.clone(),
+            "queued (edited)".into(),
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("editQueuedMessage");
+    let edited = queue_entry(&svc, &agent, &queued_id);
+    assert_eq!(
+        edited["messageMetadata"]["fromPrincipalId"], bob.0,
+        "editQueuedMessage re-stamps the editor: {edited}"
+    );
+    assert_eq!(edited["messageMetadata"]["kind"], "reply");
+    // … an agent edit leaves the human stamp alone …
+    with_caller(
+        Caller::Agent {
+            agent_id: AgentId::from("agent-editor"),
+        },
+        async {
+            svc.agent_edit_queued_message(
+                agent.clone(),
+                queued_id.clone(),
+                "queued (agent)".into(),
+                None,
+            )
+            .await
+        },
+    )
+    .await
+    .expect("agent edit");
+    assert_eq!(
+        queue_entry(&svc, &agent, &queued_id)["messageMetadata"]["fromPrincipalId"],
+        bob.0,
+        "an agent edit never changes the author"
+    );
+    // … and agent.sendQueuedMessageNow re-delivers the entry with the stamp
+    // captured at enqueue (the drainer is not the author). agent.retry needs
+    // a manager-driven failure/redrive and is covered end to end by
+    // `guest_wake_stamp_survives_terminal_failure_requeue_over_wss`
+    // (crates/intentd/tests/e2e_wss_wake_or_create.rs).
+    let drained = with_caller(wire(&alice), async {
+        svc.agent_send_queued_message_now(ws.clone(), agent.clone(), queued_id.clone())
+            .await
+    })
+    .await
+    .expect("sendQueuedMessageNow");
+    let drained_row = row(&svc, &agent, drained["messageId"].as_str().expect("id")).await;
+    assert_eq!(
+        stamp_of(drained_row.metadata.as_ref()).as_deref(),
+        Some(bob.0.as_str()),
+        "sendQueuedMessageNow keeps the enqueue-time author: {drained_row:?}"
+    );
+
+    // A human wake parked as `Automatic` (deliver_wake_message's busy /
+    // archived / retired / append-failure enqueues) is still human-authored:
+    // its stamp — not the lifecycle origin — decides that an edit by another
+    // person re-attributes it.
+    let (parked, _) = svc.enqueue_message(
+        &agent,
+        "parked wake".into(),
+        None,
+        None,
+        Some(json!({ "type": "deliver_wake_message", "fromPrincipalId": alice.0 })),
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    with_caller(wire(&bob), async {
+        svc.agent_edit_queued_message(
+            agent.clone(),
+            parked.id.clone(),
+            "parked (edited)".into(),
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("edit parked wake");
+    let parked_now = queue_entry(&svc, &agent, &parked.id);
+    assert_eq!(
+        parked_now["messageMetadata"]["fromPrincipalId"], bob.0,
+        "an Automatic-origin human wake is re-attributed to its editor: {parked_now}"
+    );
+    assert_eq!(
+        parked_now["messageMetadata"]["type"],
+        "deliver_wake_message"
+    );
+    // Negative control: an agent-to-agent entry (no stamp) edited by a person
+    // gains no principal — it is not human-authored.
+    let (a2a, _) = svc.enqueue_message(
+        &agent,
+        "from agent".into(),
+        None,
+        None,
+        Some(json!({ "type": "agent_message", "fromAgentId": "agent-peer" })),
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    with_caller(wire(&bob), async {
+        svc.agent_edit_queued_message(
+            agent.clone(),
+            a2a.id.clone(),
+            "from agent (edited)".into(),
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("edit a2a");
+    let a2a_now = queue_entry(&svc, &agent, &a2a.id);
+    assert!(
+        a2a_now["messageMetadata"].get("fromPrincipalId").is_none(),
+        "an agent-authored entry never gains a human stamp: {a2a_now}"
+    );
+    assert_eq!(a2a_now["messageMetadata"]["fromAgentId"], "agent-peer");
+
+    // agent.create: the wire stores `initialMessage` on the session and
+    // appends NO transcript row — the kickoff arrives through
+    // `agent.sendMessage` (stamped above), so no unstamped row can exist.
+    let created = with_caller(wire(&alice), async {
+        svc.agent_create(
+            ws.clone(),
+            Some("Kickoff".into()),
+            None,
+            None,
+            None,
+            None,
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                metadata: Some(json!({ "initialMessage": "first" })),
+                ..Default::default()
+            },
+        )
+        .await
+    })
+    .await
+    .expect("agent.create");
+    let kickoff = svc
+        .store()
+        .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().expect("id")))
+        .await
+        .expect("kickoff session");
+    assert_eq!(kickoff.initial_message.as_deref(), Some("first"));
+    assert!(
+        kickoff.messages.is_empty(),
+        "agent.create appends no transcript row: {:?}",
+        kickoff.messages
+    );
+
+    // workspace.create: the `initialAgent.prompt` kickoff IS a persisted user
+    // row (delivered daemon-side, no `agent.sendMessage` follows), stamped
+    // with the creating caller — a collaborator's first message must never
+    // fall back to the workspace owner.
+    let created_ws = with_caller(wire(&bob), async {
+        WorkspaceApi::create_workspace(
+            &svc,
+            intent_core::WorkspaceCreate {
+                title: Some("Bob's workspace".into()),
+                skip_isolation: Some(true),
+                initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                    prompt: Some("initial kickoff".into()),
+                    provider: Some("auggie".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("workspace.create");
+    let initial_agent = AgentId::from(
+        created_ws
+            .initial_agent
+            .as_ref()
+            .and_then(|a| a["id"].as_str())
+            .expect("initial agent id"),
+    );
+    let initial_row = latest_row_containing(&svc, &initial_agent, "initial kickoff").await;
+    assert_eq!(
+        stamp_of(initial_row.metadata.as_ref()).as_deref(),
+        Some(bob.0.as_str()),
+        "workspace.create: the initialAgent kickoff row carries the creator: {initial_row:?}"
+    );
+
+    // Negative controls: Agent / Daemon callers strip the spoof and stamp
+    // nothing on the direct-persist and queue entry points.
+    for (label, caller) in [
+        (
+            "agent",
+            Caller::Agent {
+                agent_id: AgentId::from("agent-caller"),
+            },
+        ),
+        ("daemon", Caller::Daemon),
+    ] {
+        let sent = with_caller(caller.clone(), async {
+            svc.agent_send_message(
+                ws.clone(),
+                agent.clone(),
+                format!("send by {label}"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(spoof()),
+                MessageOrigin::User,
+            )
+            .await
+        })
+        .await
+        .expect("sendMessage");
+        let sent_row = row(&svc, &agent, sent["messageId"].as_str().expect("id")).await;
+        assert_eq!(
+            stamp_of(sent_row.metadata.as_ref()),
+            None,
+            "{label}: sendMessage strips the spoof: {sent_row:?}"
+        );
+        assert_eq!(sent_row.metadata.as_ref().unwrap()["kind"], "reply");
+        let queued = with_caller(caller, async {
+            svc.agent_queue_message(
+                agent.clone(),
+                format!("queued by {label}"),
+                None,
+                None,
+                Some(spoof()),
+            )
+            .await
+        })
+        .await
+        .expect("queueMessage");
+        let entry = queue_entry(
+            &svc,
+            &agent,
+            queued["queuedMessage"]["id"].as_str().expect("id"),
+        );
+        assert!(
+            entry["messageMetadata"].get("fromPrincipalId").is_none(),
+            "{label}: queueMessage strips the spoof: {entry}"
+        );
+    }
+}
+
+/// Multiplayer w2: a non-object `messageMetadata` cannot carry the principal
+/// stamp, so every user-origin entry point rejects it as `InvalidParams`
+/// instead of persisting an unattributed human message (which would be
+/// served as the workspace's legacy author / owner, not its sender).
+#[tokio::test]
+async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_point() {
+    use intent_core::{with_caller, AgentWakeOrCreateInput, Caller, PrincipalId};
+
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Strict").await;
+    let note_id = seed_task(&svc, &ws, "strict metadata").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), agent.0.clone(), None)
+        .await
+        .expect("assign");
+    let caller = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        is_administrator: false,
+    };
+    let is_invalid = |label: &str, r: Result<serde_json::Value, Error>| {
+        assert!(
+            matches!(r, Err(Error::InvalidParams(ref m)) if m.contains("messageMetadata must be an object")),
+            "{label}: {r:?}"
+        );
+    };
+    for bad in [json!([]), json!("x"), json!(1)] {
+        let r = with_caller(caller.clone(), async {
+            svc.agent_send_message(
+                ws.clone(),
+                agent.clone(),
+                "send".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(bad.clone()),
+                MessageOrigin::User,
+            )
+            .await
+        })
+        .await;
+        is_invalid("sendMessage", r);
+        let r = with_caller(caller.clone(), async {
+            svc.agent_append_message(
+                agent.clone(),
+                Some(ws.clone()),
+                "user".into(),
+                json!([{ "type": "text", "text": "append" }]),
+                Some(bad.clone()),
+            )
+            .await
+        })
+        .await;
+        is_invalid("appendMessage(user)", r);
+        let r = with_caller(caller.clone(), async {
+            svc.agent_send_to_task(
+                ws.clone(),
+                note_id.clone(),
+                "task".into(),
+                None,
+                Some(bad.clone()),
+            )
+            .await
+        })
+        .await;
+        is_invalid("sendToTask", r);
+        let r = with_caller(caller.clone(), async {
+            svc.agent_wake_or_create(
+                ws.clone(),
+                note_id.clone(),
+                "wake".into(),
+                AgentWakeOrCreateInput {
+                    message_metadata: Some(bad.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+        })
+        .await;
+        is_invalid("wakeOrCreate", r);
+        let r = with_caller(caller.clone(), async {
+            svc.agent_queue_message(
+                agent.clone(),
+                "queued".into(),
+                None,
+                None,
+                Some(bad.clone()),
+            )
+            .await
+        })
+        .await;
+        is_invalid("queueMessage", r);
+    }
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert!(
+        session.messages.is_empty(),
+        "nothing was persisted: {:?}",
+        session.messages
+    );
+    assert!(
+        svc.queue_snapshot(&agent).is_empty(),
+        "nothing was enqueued"
+    );
+}
+
+/// Multiplayer w2: a durable pre-attribution user-origin queue entry may
+/// carry scalar `messageMetadata`, which the editor restamp rejects. The
+/// rejection must leave the entry EXACTLY as it was — content, metadata and
+/// editing flag — rather than a half-applied mutation that never published
+/// and that a later queue write would persist.
+#[tokio::test]
+async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
+    use intent_core::{with_caller, Caller, PrincipalId};
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent = create_agent(&svc, &ws, "Legacy").await;
+    let (legacy, _) = svc.enqueue_message(
+        &agent,
+        "original".into(),
+        None,
+        None,
+        Some(json!("legacy")),
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    let before = svc
+        .queue_snapshot(&agent)
+        .into_iter()
+        .find(|q| q["id"] == legacy.id.as_str())
+        .expect("seeded entry");
+    assert_eq!(before["content"], "original");
+    assert_eq!(before["messageMetadata"], json!("legacy"));
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+    let err = with_caller(
+        Caller::Wire {
+            principal_id: PrincipalId::new(),
+            is_administrator: false,
+        },
+        async {
+            svc.agent_edit_queued_message(
+                agent.clone(),
+                legacy.id.clone(),
+                "edited by wire".into(),
+                Some(true),
+            )
+            .await
+        },
+    )
+    .await
+    .expect_err("scalar metadata cannot be restamped");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("messageMetadata must be an object")),
+        "{err:?}"
+    );
+
+    let after = svc
+        .queue_snapshot(&agent)
+        .into_iter()
+        .find(|q| q["id"] == legacy.id.as_str())
+        .expect("entry still queued");
+    assert_eq!(after, before, "rejected edit mutated the entry: {after}");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv())
+            .await
+            .is_err(),
+        "a rejected edit publishes no queue update"
+    );
+
+    // An agent-origin edit (no restamp) still succeeds on the same entry.
+    with_caller(
+        Caller::Agent {
+            agent_id: agent.clone(),
+        },
+        async {
+            svc.agent_edit_queued_message(
+                agent.clone(),
+                legacy.id.clone(),
+                "agent edit".into(),
+                None,
+            )
+            .await
+        },
+    )
+    .await
+    .expect("agent edit leaves the stamp alone");
+    let edited = svc
+        .queue_snapshot(&agent)
+        .into_iter()
+        .find(|q| q["id"] == legacy.id.as_str())
+        .expect("entry still queued");
+    assert_eq!(edited["content"], "agent edit");
+    assert_eq!(edited["messageMetadata"], json!("legacy"));
 }
 
 /// monorepo#564 regression: `agent.sendMessage` to a nonexistent agent id
@@ -32482,7 +34073,10 @@ async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
 /// summary + last-rows projection) is byte-identical to the full-transcript
 /// projection of the same seeded session — every `AgentLite` field, including
 /// `messageCount`, `lastAgentResponse`, digest, `lastUserMessage`, and the
-/// derived `sessionCorrupted` flag.
+/// derived `sessionCorrupted` flag. The `agent.list` row differs from it only
+/// by the list-payload cost contract (detail-only fields stripped, previews
+/// capped — intent-hq/intent#5383), so it is compared against the full
+/// projection with that same contract applied.
 #[tokio::test]
 async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
     let (_t, svc, ws) = setup().await;
@@ -32512,7 +34106,18 @@ async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
 
     // Old (full-transcript) projection, still used by the event-emit paths.
     let full = svc.store().get_agent_session(&id).await.expect("session");
-    let old = serde_json::to_value(svc.project_lite_with_flags(full)).unwrap();
+    let old_lite = svc.project_lite_with_flags(full);
+    let old = serde_json::to_value(&old_lite).unwrap();
+    assert!(
+        old.get("harnessFeatures").is_some(),
+        "fixture must carry a detail-only field so the list comparison is meaningful: {old}"
+    );
+    let old_as_list_row = {
+        let mut lite = old_lite;
+        lite.strip_detail_only_fields();
+        lite.cap_list_previews();
+        serde_json::to_value(lite).unwrap()
+    };
 
     // New bounded paths — `agent.get` (with the workspace scope check in
     // play) and the `agent.list` entry.
@@ -32537,7 +34142,7 @@ async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
 
     let agents = svc.agent_list_op(ws).await.expect("list");
     let listed = agents.into_iter().find(|a| a.id == id).expect("listed");
-    assert_eq!(serde_json::to_value(listed).unwrap(), old);
+    assert_eq!(serde_json::to_value(listed).unwrap(), old_as_list_row);
 }
 
 /// `lastMessageRole` derivation across both projection paths: omitted on an
@@ -41326,6 +42931,7 @@ mod resume_tail_recap {
             content,
             metadata,
             app_message_id: None,
+            author: None,
             created_at: "2026-08-15T12:00:00Z".to_string(),
         }
     }

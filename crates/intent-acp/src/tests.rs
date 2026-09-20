@@ -3947,6 +3947,47 @@ mod error_tests {
             .starts_with(crate::PROMPT_IDLE_TIMEOUT_PREFIX));
     }
 
+    /// intent-hq/intent#5395: the terminal provider-stall error renders
+    /// prefix-anchored on `PROVIDER_STALL_PREFIX` in both shapes (tool-free
+    /// and open-tool, the latter naming the hung tool call), is distinct
+    /// from the warn-and-continue idle timeout, and is never classified as a
+    /// transient disconnect / fetch failure (it must fail the turn, not
+    /// route into a redrive or in-place retry).
+    #[test]
+    fn acp_error_provider_stall_display_is_prefix_anchored_and_terminal() {
+        let tool_free = AcpError::ProviderStall {
+            silent: Duration::from_secs(1200),
+            open_tool_call: None,
+        };
+        let rendered = tool_free.to_string();
+        assert!(
+            rendered.starts_with(crate::PROVIDER_STALL_PREFIX),
+            "{rendered}"
+        );
+        assert!(rendered.contains("1200s"), "{rendered}");
+        assert!(rendered.contains("no tool call in flight"), "{rendered}");
+        assert!(!rendered.starts_with(crate::PROMPT_IDLE_TIMEOUT_PREFIX));
+        assert!(!crate::is_transient_upstream_disconnect(&tool_free));
+        assert!(!crate::is_transient_provider_fetch_failure(&tool_free));
+
+        let open_tool = AcpError::ProviderStall {
+            silent: Duration::from_secs(1500),
+            open_tool_call: Some("t1 (Bash: Run tests)".to_string()),
+        };
+        let rendered = open_tool.to_string();
+        assert!(
+            rendered.starts_with(crate::PROVIDER_STALL_PREFIX),
+            "{rendered}"
+        );
+        assert!(rendered.contains("1500s"), "{rendered}");
+        assert!(
+            rendered.contains("tool call t1 (Bash: Run tests) still open"),
+            "{rendered}"
+        );
+        assert!(!crate::is_transient_upstream_disconnect(&open_tool));
+        assert!(!crate::is_transient_provider_fetch_failure(&open_tool));
+    }
+
     #[test]
     fn from_serde_error_into_acp_serde_variant() {
         let serde_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
@@ -6385,6 +6426,9 @@ mod workspace_api_tool_tests {
 
     struct WorkspaceInfoMockApi {
         ws: Mutex<Workspace>,
+        /// `(called, caller)`: whether `get_workspace` ran and the task-local
+        /// [`intent_core::Caller`] it observed (multiplayer w1 caller binding).
+        seen_caller: Mutex<(bool, Option<intent_core::Caller>)>,
     }
 
     impl WorkspaceInfoMockApi {
@@ -6429,19 +6473,25 @@ mod workspace_api_tool_tests {
                 token_usage: None,
                 cow_supported: None,
                 browser_client_id: None,
+                pull_requests_total: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
                 execution_environment: None,
                 disk_usage: None,
                 pending_delete_at: None,
+                membership: None,
             };
-            Arc::new(Self { ws: Mutex::new(ws) })
+            Arc::new(Self {
+                ws: Mutex::new(ws),
+                seen_caller: Mutex::new((false, None)),
+            })
         }
     }
 
     impl WorkspaceApi for WorkspaceInfoMockApi {
         fn get_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            *self.seen_caller.lock().unwrap() = (true, intent_core::current_caller());
             let snapshot = self.ws.lock().unwrap().clone();
             Box::pin(async move { Ok(snapshot) })
         }
@@ -6750,6 +6800,33 @@ mod workspace_api_tool_tests {
         let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
         assert_eq!(body["id"], json!("amber-forest"));
         assert_eq!(body["path"], json!("/tmp/amber-forest"));
+    }
+
+    #[tokio::test]
+    async fn workspace_api_dispatch_binds_calling_agent_as_caller() {
+        // Multiplayer w1: every `ws.*` call a script makes runs with the
+        // bridge's calling agent bound as the task-local `Caller::Agent`;
+        // a bridge with no caller agent leaves no caller bound (fail-closed).
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_caller_agent_id(Some(intent_core::AgentId::from_string("agent-77")));
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(
+            api.seen_caller.lock().unwrap().clone(),
+            (
+                true,
+                Some(intent_core::Caller::Agent {
+                    agent_id: intent_core::AgentId::from_string("agent-77"),
+                })
+            )
+        );
+
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"));
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(api.seen_caller.lock().unwrap().clone(), (true, None));
     }
 
     #[tokio::test]
@@ -9607,6 +9684,10 @@ mod wsapi4_bindings_tests {
     #[derive(Default)]
     struct FakeApi {
         agent_list_calls: Mutex<u32>,
+        /// `agent_list_scoped` calls, recorded as `(scope wire name,
+        /// parentAgentId)` — the `ws.agent.list` subagents / parent
+        /// filters must go through the SQL-side scope, not `agent_list`.
+        agent_list_scoped_calls: Mutex<Vec<(String, Option<String>)>>,
         agent_get_calls: Mutex<Vec<String>>,
         agent_send_calls: Mutex<Vec<SendCall>>,
         agent_send_to_task_calls: Mutex<Vec<SendToTaskCall>>,
@@ -9800,6 +9881,47 @@ mod wsapi4_bindings_tests {
                     row.notifications_muted = muted.contains(&row.id.as_str().to_string());
                 }
                 Ok(rows)
+            })
+        }
+
+        /// The seeded rows narrowed by the scope's SQL predicate (the store
+        /// does this in SQL; the fake mirrors it in memory).
+        fn agent_list_scoped(
+            &self,
+            ws: WorkspaceId,
+            scope: intent_core::AgentListRowScope,
+        ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+            use intent_core::AgentListRowScope;
+            self.agent_list_scoped_calls.lock().unwrap().push((
+                scope.wire_name().to_string(),
+                match &scope {
+                    AgentListRowScope::Delegated {
+                        parent_agent_id: Some(p),
+                    } => Some(p.as_str().to_string()),
+                    _ => None,
+                },
+            ));
+            let rows = self.agent_list_rows.lock().unwrap().clone();
+            Box::pin(async move {
+                let rows =
+                    rows.unwrap_or_else(|| vec![stub_agent("a-1", &ws), stub_agent("a-2", &ws)]);
+                Ok(rows
+                    .into_iter()
+                    .filter(|r| match &scope {
+                        AgentListRowScope::TopLevel => {
+                            r.parent_agent_id.is_none() && !r.metadata.is_background
+                        }
+                        AgentListRowScope::Delegated { parent_agent_id } => {
+                            r.parent_agent_id.is_some()
+                                && parent_agent_id
+                                    .as_ref()
+                                    .is_none_or(|p| r.parent_agent_id.as_ref() == Some(p))
+                        }
+                        AgentListRowScope::Background => {
+                            r.parent_agent_id.is_none() && r.metadata.is_background
+                        }
+                    })
+                    .collect())
             })
         }
 
@@ -10335,6 +10457,11 @@ mod wsapi4_bindings_tests {
         );
     }
 
+    /// `scope: 'subagents'` and a bare `parentAgentId` are served by the wire's
+    /// SQL-side `delegated` scope (`agent_list_scoped`, never the full
+    /// `agent_list` read); `'top-level'` stays a client-side filter over the
+    /// default read because its "no parent" semantics are wider than the
+    /// wire's `topLevel` bin (it keeps unparented background agents).
     #[tokio::test]
     async fn agent_list_scope_and_parent_filters() {
         let (srv, api) = server();
@@ -10343,6 +10470,9 @@ mod wsapi4_bindings_tests {
             agent_list_ids(&srv, "return await ws.agent.list({ scope: 'top-level' });").await,
             ["a-top"]
         );
+        assert_eq!(*api.agent_list_calls.lock().unwrap(), 1);
+        assert!(api.agent_list_scoped_calls.lock().unwrap().is_empty());
+
         assert_eq!(
             agent_list_ids(&srv, "return await ws.agent.list({ scope: 'subagents' });").await,
             ["a-child"]
@@ -10358,10 +10488,51 @@ mod wsapi4_bindings_tests {
         assert_eq!(
             agent_list_ids(
                 &srv,
+                "return await ws.agent.list({ scope: 'subagents', parentAgentId: 'a-top' });"
+            )
+            .await,
+            ["a-child"]
+        );
+        assert_eq!(
+            agent_list_ids(
+                &srv,
                 "return await ws.agent.list({ parentAgentId: 'a-other' });"
             )
             .await,
             Vec::<String>::new()
+        );
+        assert_eq!(
+            *api.agent_list_calls.lock().unwrap(),
+            1,
+            "subagents / parentAgentId reads must not load the full list"
+        );
+        assert_eq!(
+            *api.agent_list_scoped_calls.lock().unwrap(),
+            vec![
+                ("delegated".to_string(), None),
+                ("delegated".to_string(), Some("a-top".to_string())),
+                ("delegated".to_string(), Some("a-top".to_string())),
+                ("delegated".to_string(), Some("a-other".to_string())),
+            ]
+        );
+    }
+
+    /// An unparented BACKGROUND agent is `'top-level'` for the binding (no
+    /// parent) even though the wire's `topLevel` bin excludes it — the
+    /// binding's public semantics are unchanged.
+    #[tokio::test]
+    async fn agent_list_top_level_keeps_unparented_background_agents() {
+        let (srv, api) = server();
+        let ws = WorkspaceId::from_string("amber-forest");
+        let top = stub_agent("a-top", &ws);
+        let mut bg = stub_agent("a-bg", &ws);
+        bg.metadata.is_background = true;
+        let mut child = stub_agent("a-child", &ws);
+        child.parent_agent_id = Some(AgentId::from("a-top"));
+        *api.agent_list_rows.lock().unwrap() = Some(vec![top, bg, child]);
+        assert_eq!(
+            agent_list_ids(&srv, "return await ws.agent.list({ scope: 'top-level' });").await,
+            ["a-top", "a-bg"]
         );
     }
 
@@ -12673,12 +12844,14 @@ mod workspace_api_output_limit_tests {
                     token_usage: None,
                     cow_supported: None,
                     browser_client_id: None,
+                    pull_requests_total: None,
                     display_status: None,
                     waiting: false,
                     checkout_mode: None,
                     execution_environment: None,
                     disk_usage: None,
                     pending_delete_at: None,
+                    membership: None,
                 })
             })
         }
@@ -12989,6 +13162,7 @@ mod workspace_apply_proposal_tests {
             pr_status: None,
             active_pull_request: None,
             pull_requests: None,
+            pull_requests_total: None,
             context_links: None,
             archived: false,
             archived_at: None,
@@ -13004,6 +13178,7 @@ mod workspace_apply_proposal_tests {
             disk_usage: None,
             pending_delete_at: None,
             execution_environment: None,
+            membership: None,
         }
     }
 

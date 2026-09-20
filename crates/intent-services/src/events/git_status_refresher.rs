@@ -43,7 +43,7 @@ use crate::{accept_changes, changes_git_status_event, git_ops};
 /// (not reset by later ones), so a sustained churn — e.g. a branch switch
 /// touching many files — still refreshes within `DEBOUNCE` of its first event
 /// while everything inside the window collapses into one recompute.
-const DEBOUNCE: Duration = Duration::from_secs(1);
+pub(super) const DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// Bridges `file:*` events to debounced `changes:git-status` refreshes.
 /// Dropping the handle tears both tasks down (clean-shutdown contract shared

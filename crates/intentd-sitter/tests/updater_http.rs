@@ -322,6 +322,30 @@ fn reinstalls_when_state_points_at_a_missing_binary() {
 }
 
 #[test]
+fn channel_recovers_missing_newer_binary_from_older_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.3.0", Channel::Stable);
+    fs::remove_file(paths.daemon_binary("1.3.0")).unwrap();
+    let base = serve_release("1.2.0", b"recovered daemon", false);
+    let updater = Updater::with_base_url(paths.clone(), base).unwrap();
+
+    assert_eq!(
+        updater.check_and_install(Channel::Stable).unwrap(),
+        UpdateOutcome::Installed {
+            version: "1.2.0".into(),
+            previous: Some("1.3.0".into()),
+        }
+    );
+    let current = state::load(&paths.state_path).current_version.unwrap();
+    assert_eq!(current, "1.2.0");
+    assert_eq!(
+        fs::read(paths.daemon_binary(&current)).unwrap(),
+        b"recovered daemon"
+    );
+}
+
+#[test]
 fn unknown_manifest_schema_is_a_soft_failure() {
     let dir = tempfile::tempdir().unwrap();
     let paths = paths_in(dir.path());
@@ -512,6 +536,9 @@ fn serve_release_with_archive_hook(
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let manifest = manifest_json(version, &base_url, &asset, &sha);
     let archive_path = format!("/{asset}");
+    let exact_archive_path = format!("/v{version}/{asset}");
+    let exact_checksum_path = format!("{exact_archive_path}.sha256");
+    let checksum = format!("{sha}  {asset}\n").into_bytes();
 
     let hook = std::sync::Mutex::new(Some(on_archive_request));
     thread::spawn(move || {
@@ -532,7 +559,9 @@ fn serve_release_with_archive_hook(
             let path = request_line.split_whitespace().nth(1).unwrap_or("/");
             let (status, body) = if path == "/channel-stable/stable.json" {
                 ("200 OK", manifest.clone())
-            } else if path == archive_path {
+            } else if path == exact_checksum_path {
+                ("200 OK", checksum.clone())
+            } else if path == archive_path || path == exact_archive_path {
                 if let Some(hook) = hook.lock().unwrap().take() {
                     hook();
                 }
@@ -628,4 +657,196 @@ fn with_base_url_means_exactly_one_base_and_never_falls_back() {
         other => panic!("expected HttpStatus, got {other:?}"),
     }
     assert!(installed_versions(&paths).is_empty());
+}
+
+fn serve_exact_release(target: &str, tamper: bool) -> String {
+    let archive = make_tar_xz(b"fixed release daemon");
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let hash = if tamper {
+        "0".repeat(64)
+    } else {
+        sha256_hex(&archive)
+    };
+    serve(HashMap::from([
+        (format!("/v{target}/{asset}"), archive),
+        (
+            format!("/v{target}/{asset}.sha256"),
+            format!("{hash}  {asset}\n").into_bytes(),
+        ),
+    ]))
+}
+
+#[test]
+fn exact_install_uses_fixed_release_and_preserves_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.0.0", Channel::Beta);
+    let base = serve_exact_release("1.2.0", false);
+    let updater = Updater::with_base_url(paths.clone(), base).unwrap();
+    assert_eq!(
+        updater.install_exact("1.2.0", "1.0.0").unwrap(),
+        UpdateOutcome::Installed {
+            version: "1.2.0".into(),
+            previous: Some("1.0.0".into())
+        }
+    );
+    assert_eq!(state::load(&paths.state_path).channel, Channel::Beta);
+    assert_eq!(
+        fs::read(paths.daemon_binary("1.2.0")).unwrap(),
+        b"fixed release daemon"
+    );
+    assert!(updater.install_exact("1.1.0", "1.0.0").is_err());
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("1.2.0")
+    );
+}
+
+#[test]
+fn exact_hash_failure_and_invalid_targets_leave_install_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.0.0", Channel::Alpha);
+    let before = fs::read(&paths.state_path).unwrap();
+    let updater =
+        Updater::with_base_url(paths.clone(), serve_exact_release("1.2.0", true)).unwrap();
+    assert!(matches!(
+        updater.install_exact("1.2.0", "1.0.0"),
+        Err(UpdateError::Sha256Mismatch { .. })
+    ));
+    for target in [
+        "../1.2.0",
+        "v1.2.0",
+        "1.2.0+build",
+        "1.2.0;id",
+        "01.2.0",
+        "1.2.0-01",
+        "0.9.0",
+    ] {
+        assert!(updater.install_exact(target, "1.0.0").is_err(), "{target}");
+    }
+    assert_eq!(fs::read(&paths.state_path).unwrap(), before);
+    assert!(!paths.daemon_binary("1.2.0").exists());
+}
+
+#[test]
+fn exact_install_accepts_comparison_versions_with_build_metadata() {
+    for installed in ["1.0.0+channel.build", "1.2.0+channel.build"] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        preinstall(&paths, installed, Channel::Beta);
+        let updater =
+            Updater::with_base_url(paths.clone(), serve_exact_release("1.2.0", false)).unwrap();
+
+        assert!(matches!(
+            updater
+                .install_exact("1.2.0", "1.0.0+running.build")
+                .unwrap(),
+            UpdateOutcome::Installed { .. }
+        ));
+        assert_eq!(
+            state::load(&paths.state_path).current_version.as_deref(),
+            Some("1.2.0")
+        );
+        assert!(paths.daemon_binary("1.2.0").exists());
+        assert!(updater
+            .install_exact("1.3.0+target.build", "1.2.0")
+            .is_err());
+        assert!(updater
+            .install_exact("1.1.0", "1.2.0+running.build")
+            .is_err());
+        assert!(updater
+            .install_exact("1.1.0", "1.0.0+running.build")
+            .is_err());
+    }
+}
+
+#[test]
+fn exact_install_preserves_a_concurrent_channel_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.0.0", Channel::Stable);
+    let concurrent = paths.clone();
+    let base = serve_release_with_archive_hook("1.2.0", b"exact daemon", move || {
+        let _lock = state::lock(&concurrent.state_path).unwrap();
+        preinstall(&concurrent, "1.1.0", Channel::Beta);
+    });
+    let updater = Updater::with_base_url(paths.clone(), base).unwrap();
+
+    assert!(matches!(
+        updater.install_exact("1.2.0", "1.0.0").unwrap(),
+        UpdateOutcome::Installed { .. }
+    ));
+    let state = state::load(&paths.state_path);
+    assert_eq!(state.channel, Channel::Beta);
+    assert_eq!(state.current_version.as_deref(), Some("1.2.0"));
+    assert_eq!(
+        fs::read(paths.daemon_binary("1.2.0")).unwrap(),
+        b"exact daemon"
+    );
+}
+
+#[test]
+fn exact_install_rejects_missing_newer_recorded_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.3.0", Channel::Stable);
+    fs::remove_file(paths.daemon_binary("1.3.0")).unwrap();
+    let before = fs::read(&paths.state_path).unwrap();
+    let updater =
+        Updater::with_base_url(paths.clone(), serve_exact_release("1.2.0", false)).unwrap();
+
+    assert!(matches!(
+        updater.install_exact("1.2.0", "1.0.0"),
+        Err(UpdateError::ExactVersion(_))
+    ));
+    assert_eq!(fs::read(&paths.state_path).unwrap(), before);
+    assert!(!paths.daemon_binary("1.2.0").exists());
+}
+
+#[test]
+fn exact_install_rejects_concurrent_newer_state_even_with_missing_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.0.0", Channel::Stable);
+    let winner = paths.clone();
+    let base = serve_release_with_archive_hook("1.2.0", b"losing exact version", move || {
+        let _lock = state::lock(&winner.state_path).unwrap();
+        preinstall(&winner, "1.3.0", Channel::Stable);
+        fs::remove_file(winner.daemon_binary("1.3.0")).unwrap();
+    });
+    let updater = Updater::with_base_url(paths.clone(), base).unwrap();
+
+    assert!(matches!(
+        updater.install_exact("1.2.0", "1.0.0"),
+        Err(UpdateError::ExactVersion(_))
+    ));
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("1.3.0")
+    );
+    assert!(!paths.daemon_binary("1.2.0").exists());
+}
+
+#[test]
+fn exact_install_reports_a_concurrent_newer_winner_without_downgrading() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "1.0.0", Channel::Stable);
+    let winner = paths.clone();
+    let base = serve_release_with_archive_hook("1.2.0", b"losing exact version", move || {
+        let _lock = state::lock(&winner.state_path).unwrap();
+        preinstall(&winner, "1.3.0", Channel::Stable);
+    });
+    let updater = Updater::with_base_url(paths.clone(), base).unwrap();
+    assert!(matches!(
+        updater.install_exact("1.2.0", "1.0.0"),
+        Err(UpdateError::ExactVersion(_))
+    ));
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("1.3.0")
+    );
+    assert!(paths.daemon_binary("1.3.0").exists());
+    assert!(!paths.daemon_binary("1.2.0").exists());
 }

@@ -11822,12 +11822,13 @@ async fn prepare_flush_turn(
 /// `messageMetadata` (parity with `deliver_wake_message`'s in-block tag) AND on
 /// the row-level `metadata` column (parity with the direct `agent.sendMessage`
 /// persist) — so transcript consumers find the tag regardless of which field
-/// they read. The client-identity `userAppMessageId` key is excluded from the
-/// in-block copy (it stays row-level only): the block embed exists for
-/// attribution tags that history replay should surface, and a queued send's
-/// content block should not diverge from its direct-send counterpart just
-/// because a dedup id rode along. Best-effort; a store or publish error is
-/// logged and the turn still proceeds.
+/// they read. The client-identity `userAppMessageId` key and the daemon's
+/// `fromPrincipalId` stamp are excluded from the in-block copy (they stay
+/// row-level only): the block embed exists for attribution tags that history
+/// replay should surface, and a queued send's content block should not
+/// diverge from its direct-send counterpart just because a dedup id or the
+/// author stamp rode along. Best-effort; a store or publish error is logged
+/// and the turn still proceeds.
 ///
 /// Returns `true` when the user row was durably appended to the transcript,
 /// `false` when the store append failed for every bounded retry attempt
@@ -11858,6 +11859,7 @@ async fn persist_user(
         Value::Object(m) => {
             let mut m = m.clone();
             m.remove(intent_core::USER_APP_MESSAGE_ID_KEY);
+            m.remove(intent_core::FROM_PRINCIPAL_ID_KEY);
             (!m.is_empty()).then_some(Value::Object(m))
         }
         other => Some(other.clone()),
@@ -12965,6 +12967,13 @@ pub(crate) const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
 /// spec's only sanctioned cancel-error shape is code `-32800` (the message is
 /// free text there too). The "cancelled" substring heuristic remains for
 /// non-RPC renderings, which carry no data suffix.
+///
+/// A provider stall (intent-hq/intent#5395) is rejected up front: its
+/// rendering is prefix-anchored on [`intent_acp::PROVIDER_STALL_PREFIX`] and
+/// the open-tool shape embeds the provider-controlled id/title of the hung
+/// tool call, so a call titled "Inspect cancelled jobs" must not turn the
+/// terminal stall into a benign cancel (skipping Error persistence and the
+/// worker's teardown/requeue).
 pub(crate) fn prompt_cancellation_error(err: &Error) -> bool {
     let Error::Internal(msg) = err else {
         return false;
@@ -12972,7 +12981,11 @@ pub(crate) fn prompt_cancellation_error(err: &Error) -> bool {
     let Some(inner) = msg.strip_prefix(PROMPT_FAILED_PREFIX) else {
         return false;
     };
-    if let Some(rest) = inner.trim_start().strip_prefix("JSON-RPC error ") {
+    let inner_trimmed = inner.trim_start();
+    if inner_trimmed.starts_with(intent_acp::PROVIDER_STALL_PREFIX) {
+        return false;
+    }
+    if let Some(rest) = inner_trimmed.strip_prefix("JSON-RPC error ") {
         let code = rest.split(':').next().unwrap_or("").trim();
         return code == "-32800";
     }
@@ -13355,12 +13368,14 @@ mod role_reminder_tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -15851,6 +15866,8 @@ mod uniform_isolation_tests {
             checkout_mode: Some(checkout_mode),
             execution_environment: Some(env),
             disk_usage: None,
+            membership: None,
+            pull_requests_total: None,
         }
     }
 
@@ -16969,6 +16986,41 @@ mod turn_failure_tests {
     }
 
     #[test]
+    fn provider_stall_with_cancelled_in_tool_label_is_terminal() {
+        // intent-hq/intent#5395: the open-tool provider stall embeds the
+        // provider-controlled tool id/title. A hung call titled "Inspect
+        // cancelled jobs" must stay terminal (Error persisted, child torn
+        // down, retry requeued) — the stall prefix wins over the "cancelled"
+        // substring heuristic, for both stall shapes.
+        let stall = intent_acp::AcpError::ProviderStall {
+            silent: std::time::Duration::from_secs(1500),
+            open_tool_call: Some("cancelled-sweep (bash: Inspect cancelled jobs)".to_string()),
+        };
+        let err = Error::Internal(format!("{PROMPT_FAILED_PREFIX} {stall}"));
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("cancelled"),
+            "precondition: the label reaches the flattened wrapper: {err}"
+        );
+        assert!(!prompt_cancellation_error(&err), "{err}");
+        assert!(!is_benign_turn_error(&err), "{err}");
+
+        let stall = intent_acp::AcpError::ProviderStall {
+            silent: std::time::Duration::from_secs(1200),
+            open_tool_call: None,
+        };
+        let err = Error::Internal(format!("{PROMPT_FAILED_PREFIX} {stall}"));
+        assert!(!is_benign_turn_error(&err), "{err}");
+
+        // The prefix is anchored: a stall mention elsewhere in an otherwise
+        // benign cancel does not flip it terminal.
+        let err = Error::Internal(
+            "session/prompt failed: JSON-RPC error -32800: cancelled after provider stall"
+                .to_string(),
+        );
+        assert!(is_benign_turn_error(&err));
+    }
+
+    #[test]
     fn cancellation_code_without_message_is_benign() {
         // Some providers omit a human-readable message; the -32800 code alone
         // is the cancellation signal.
@@ -17362,12 +17414,14 @@ mod agent_retry_tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
             task_stats: None,
         }
     }

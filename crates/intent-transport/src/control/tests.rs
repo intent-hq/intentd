@@ -16,11 +16,13 @@ struct FakeControl {
     credential_pid: std::sync::Mutex<Option<Option<u64>>>,
     update_error: Option<String>,
     update_called: AtomicBool,
+    exact_target: std::sync::Mutex<Option<String>>,
 }
 
 impl FakeControl {
     fn new() -> Self {
         Self {
+            exact_target: std::sync::Mutex::new(None),
             status: SystemStatus {
                 listen_mode: "both".to_string(),
                 uds: true,
@@ -94,6 +96,13 @@ impl FakeControl {
 }
 
 impl SystemControl for FakeControl {
+    fn exact_update_supported(&self) -> bool {
+        self.update_error.is_none()
+    }
+    fn request_exact_update(&self, target: &str) -> Result<(), String> {
+        *self.exact_target.lock().unwrap() = Some(target.into());
+        Ok(())
+    }
     fn status(&self) -> SystemStatus {
         self.status.clone()
     }
@@ -649,4 +658,48 @@ async fn git_credential_remote_rejects_with_uds_only_error() {
     );
     // The resolver must never run for a remote caller.
     assert_eq!(*control.credential_pid.lock().unwrap(), None);
+}
+
+#[tokio::test]
+async fn exact_update_validates_and_never_falls_back_to_channel() {
+    let control = FakeControl::new();
+    for target in [
+        json!(null),
+        json!(42),
+        json!(""),
+        json!("v1.2.3"),
+        json!("../1.2.3"),
+        json!("https://host/1.2.3"),
+        json!("1.2.3+build"),
+        json!("01.2.3"),
+        json!("1.2.3;id"),
+        json!("1.2.3-01"),
+        json!(format!("1.2.3-{}", "a".repeat(129))),
+    ] {
+        let req = classify(&json!({"jsonrpc":"2.0","id":71,"method":"system.requestUpdate","params":{"targetVersion":target}})).unwrap();
+        let response: Value =
+            serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+    }
+    assert!(!control.update_called.load(Ordering::SeqCst));
+    assert_eq!(*control.exact_target.lock().unwrap(), None);
+    let req = classify(&json!({"jsonrpc":"2.0","id":72,"method":"system.requestUpdate","params":{"targetVersion":"1.2.3-beta.1"}})).unwrap();
+    let response: Value =
+        serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+    assert_eq!(
+        response,
+        json!({"jsonrpc":"2.0","id":72,"result":{"ok":true,"targetVersion":"1.2.3-beta.1"}})
+    );
+    assert_eq!(
+        *control.exact_target.lock().unwrap(),
+        Some("1.2.3-beta.1".into())
+    );
+    assert!(!control.update_called.load(Ordering::SeqCst));
+
+    let unsupported = FakeControl::with_update_error("old sitter");
+    let req = classify(&json!({"jsonrpc":"2.0","id":73,"method":"system.requestUpdate","params":{"targetVersion":"1.2.3"}})).unwrap();
+    let response: Value =
+        serde_json::from_str(&handle(req, &unsupported, false, false).await.unwrap()).unwrap();
+    assert_eq!(response["error"]["code"], -32603);
+    assert!(!unsupported.update_called.load(Ordering::SeqCst));
 }

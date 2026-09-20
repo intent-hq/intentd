@@ -171,12 +171,14 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -213,6 +215,135 @@ pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, Note
         .expect("note");
     let services = Services::new(store);
     (tmp, services, ws, id)
+}
+
+/// The transport bearer seam resolves an active credential to its principal
+/// and records the use, and rejects a revoked one — through the single
+/// atomic store statement, so no lookup-then-touch window exists in which a
+/// concurrent revoke is still admitted (intent-hq/intentd#1868).
+#[tokio::test]
+async fn resolve_principal_credential_admits_active_and_rejects_revoked() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "e".repeat(64);
+    store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+    let services = Services::new(store.clone());
+
+    assert_eq!(
+        services
+            .resolve_principal_credential("f".repeat(64))
+            .await
+            .expect("resolve unknown"),
+        None
+    );
+    assert_eq!(
+        services
+            .resolve_principal_credential(hash.clone())
+            .await
+            .expect("resolve active"),
+        Some(primary.id.clone())
+    );
+    assert!(
+        store
+            .lookup_principal_credential(&hash)
+            .await
+            .expect("lookup")
+            .expect("present")
+            .last_used_at
+            .is_some(),
+        "an admitted credential records last_used_at"
+    );
+
+    assert!(store
+        .revoke_principal_credential(&hash)
+        .await
+        .expect("revoke"));
+    assert_eq!(
+        services
+            .resolve_principal_credential(hash)
+            .await
+            .expect("resolve revoked"),
+        None,
+        "a revoked credential is never admitted"
+    );
+}
+
+/// Regression (intent-hq/intentd#1868 review): a credential revoked while a
+/// resolution is already in flight is NOT admitted. The pre-fix seam read the
+/// row on the read pool, saw it active, then parked on the write pool to
+/// `touch`; a revoke landing in that window flipped the touch to `false`,
+/// which was ignored, and the stale principal was returned. Holding the sole
+/// write-pool connection reproduces that interleaving deterministically: the
+/// resolve is driven until it parks on the write pool, the revoke lands via
+/// the held connection, and only then is the resolve released.
+///
+/// Negative control: with only the service body restored to e8083cbd
+/// (lookup → `is_active` → touch ignoring `false`) this test fails at the
+/// `None` assertion with `Some(<primary id>)`; with the atomic body from
+/// 80585837 it passes.
+#[tokio::test]
+async fn resolve_principal_credential_rejects_revoke_landing_mid_resolution() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "a".repeat(64);
+    store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+    let services = Services::new(store.clone());
+
+    // The sole write-pool connection: any resolve parks on its touch/UPDATE.
+    let mut held = store.write_pool().acquire().await.expect("hold write conn");
+
+    // Drive the resolve past its (read-pool) lookup up to the write gate. Each
+    // poll is separated by a real read-pool round trip, so the pre-fix body has
+    // observed the active row and is waiting to touch by the time we revoke.
+    let mut fut = services.resolve_principal_credential(hash.clone());
+    let parked = poll_until(&mut fut, 20, || async {
+        assert!(store
+            .lookup_principal_credential(&hash)
+            .await
+            .expect("lookup")
+            .expect("present")
+            .is_active());
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    // Revoke through the held connection while the resolve is still gated.
+    let revoked = sqlx::query(
+        "UPDATE principal_credential SET revoked_at = ? \
+         WHERE token_hash = ? AND revoked_at IS NULL",
+    )
+    .bind(now_iso())
+    .bind(&hash)
+    .execute(&mut *held)
+    .await
+    .expect("revoke via held conn");
+    assert_eq!(revoked.rows_affected(), 1);
+    drop(held);
+
+    assert_eq!(
+        fut.await.expect("resolve"),
+        None,
+        "a credential revoked mid-resolution must not be admitted"
+    );
+    let after = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("row kept after revoke");
+    assert!(!after.is_active());
+    assert!(
+        after.last_used_at.is_none(),
+        "a rejected resolve does not record a use"
+    );
 }
 
 #[tokio::test]
@@ -434,20 +565,61 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(v.get("diskUsage").is_none());
 }
 
-/// List-frame slimming (monorepo#3041): `workspace.list` rows never carry
-/// `tokenUsage` (detail-only — clients read it via `workspace.getTokenUsage`
-/// and the tokenUsage-changed event), and ARCHIVED rows additionally omit
-/// `agentSummary` (no HUD/coverflow agent card renders for an archived
-/// workspace). Active rows keep the full `agentSummary`, and `workspace.get`
-/// keeps serving both fields for detail reads.
+/// List-frame slimming (monorepo#3041, `Workspace::slim_for_list`):
+/// `workspace.list` rows never carry `tokenUsage` (detail-only — clients read
+/// it via `workspace.getTokenUsage` and the tokenUsage-changed event),
+/// `setupScript` (`workspace.getSetupScript`), `contextLinks` (read once on
+/// open via `workspace.get`), nor the per-PR `headSha` / `author` on
+/// `activePullRequest` / `pullRequests[]` (`mergeable` / `mergeableState`
+/// stay: the FE derives the PR lifecycle display status from them);
+/// ARCHIVED rows additionally omit `agentSummary` (no HUD/coverflow agent
+/// card renders for an archived workspace). Active rows keep the full
+/// `agentSummary`, and `workspace.get` keeps serving every field.
 #[tokio::test]
 async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     use std::collections::BTreeMap;
 
-    use intent_core::{AgentId, AgentSession, AgentStatus, TokenUsage, TokenUsageTotals};
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, ContextLink, ContextLinkKind, PullRequestInfo,
+        PullRequestStatus, SetupScript, TokenUsage, TokenUsageTotals,
+    };
 
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
+
+    let detail_pr = PullRequestInfo {
+        id: "pr-1".to_string(),
+        number: 1,
+        url: "https://github.com/intent-hq/intentd/pull/1".to_string(),
+        title: "feat: slim list rows".to_string(),
+        status: PullRequestStatus::Open,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        base_ref: Some("main".to_string()),
+        head_ref: Some("feat/slim".to_string()),
+        head_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()),
+        author: Some("dev".to_string()),
+        mergeable: Some(true),
+        mergeable_state: Some("clean".to_string()),
+        is_draft: Some(false),
+    };
+    let with_detail_fields = |ws: &mut Workspace| {
+        ws.setup_script = Some(SetupScript {
+            script: "#!/bin/bash\nnpm ci\n".to_string(),
+            project_type: None,
+            updated_at: 1,
+            generated_by: None,
+        });
+        ws.context_links = Some(vec![ContextLink {
+            kind: ContextLinkKind::Issue,
+            url: "https://github.com/intent-hq/intent/issues/3041".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intent".to_string(),
+            number: 3041,
+        }]);
+        ws.active_pull_request = Some(detail_pr.clone());
+        ws.pull_requests = Some(vec![detail_pr.clone()]);
+    };
 
     let usage = TokenUsage {
         by_agent_id: BTreeMap::from([(
@@ -476,6 +648,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     let ws_active = WorkspaceId::new();
     let mut active = workspace(&ws_active);
     active.token_usage = Some(usage.clone());
+    with_detail_fields(&mut active);
     store.insert_workspace(&active).await.expect("active ws");
 
     let ws_archived = WorkspaceId::new();
@@ -483,6 +656,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     archived.archived = true;
     archived.archived_at = Some(now_iso());
     archived.token_usage = Some(usage);
+    with_detail_fields(&mut archived);
     store
         .insert_workspace(&archived)
         .await
@@ -574,20 +748,616 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert!(v.get("tokenUsage").is_none());
     assert!(v.get("agentSummary").is_none());
 
-    // Lite list (workspace.subscribe seq-0): tokenUsage stripped the same way.
+    // The other detail-only fields are stripped on every list row, active
+    // and archived alike; the PR entries keep their list-context keys.
+    let assert_detail_stripped = |row: &Workspace, path: &str| {
+        assert!(row.setup_script.is_none(), "{path}: setupScript omitted");
+        assert!(row.context_links.is_none(), "{path}: contextLinks omitted");
+        let active_pr = row
+            .active_pull_request
+            .as_ref()
+            .expect("activePullRequest kept");
+        let pool_pr = &row.pull_requests.as_ref().expect("pullRequests kept")[0];
+        for pr in [active_pr, pool_pr] {
+            assert_eq!(pr.number, 1);
+            assert_eq!(pr.status, PullRequestStatus::Open);
+            assert_eq!(pr.is_draft, Some(false));
+            assert_eq!(pr.head_ref.as_deref(), Some("feat/slim"));
+            assert!(pr.head_sha.is_none(), "{path}: PR headSha omitted");
+            assert!(pr.author.is_none(), "{path}: PR author omitted");
+            assert_eq!(pr.mergeable, Some(true), "{path}: PR mergeable kept");
+            assert_eq!(
+                pr.mergeable_state.as_deref(),
+                Some("clean"),
+                "{path}: PR mergeableState kept"
+            );
+        }
+    };
+    assert_detail_stripped(row_active, "list/active");
+    assert_detail_stripped(row_archived, "list/archived");
+    assert!(v.get("setupScript").is_none());
+    assert!(v.get("contextLinks").is_none());
+    assert!(v["activePullRequest"].get("headSha").is_none());
+    assert_eq!(v["activePullRequest"]["mergeableState"], "clean");
+
+    // Lite list (workspace.subscribe seq-0): slimmed the same way.
     let lite = svc.list_workspaces_lite(true).await.expect("lite list");
     assert!(lite.iter().all(|w| w.token_usage.is_none()));
+    for row in &lite {
+        assert_detail_stripped(row, "lite");
+    }
 
-    // workspace.get keeps both fields for detail reads — archived included.
+    // workspace.get keeps every field for detail reads — archived included.
     let got_active = svc.get_workspace(ws_active).await.expect("get active");
     assert!(got_active.token_usage.is_some(), "get keeps tokenUsage");
     assert!(got_active.agent_summary.is_some());
+    assert!(got_active.setup_script.is_some(), "get keeps setupScript");
+    assert!(got_active.context_links.is_some(), "get keeps contextLinks");
+    assert_eq!(
+        got_active
+            .active_pull_request
+            .as_ref()
+            .and_then(|pr| pr.mergeable_state.as_deref()),
+        Some("clean"),
+        "get keeps the per-PR detail fields"
+    );
+    assert_eq!(
+        got_active.pull_requests.as_ref().unwrap()[0].head_sha,
+        detail_pr.head_sha
+    );
     let got_archived = svc.get_workspace(ws_archived).await.expect("get archived");
     assert!(got_archived.token_usage.is_some());
     assert!(
         got_archived.agent_summary.is_some(),
         "get keeps agentSummary on archived workspaces"
     );
+}
+
+/// Build the worst-case-realistic ACTIVE `workspace.list` row the row-budget
+/// golden measures: every small optional scalar present, a long title /
+/// status message, eight PRs in the pool (so the
+/// `WORKSPACE_LIST_PR_CAP` truncation is exercised and `pullRequestsTotal`
+/// is present) plus a linked `activePullRequest` (all detail fields
+/// populated so the slimming has something to strip), a saved setup script,
+/// context links, a fat `tokenUsage`, and ten live agent sessions
+/// (coordinator + nine sub-agents) so the enrichment builds a ten-agent
+/// `agentSummary`. Returns the row as served by `list_workspaces`.
+async fn worst_case_workspace_list_row() -> Workspace {
+    use std::collections::BTreeMap;
+
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, CheckoutMode, ClientId, ContextLink, ContextLinkKind,
+        PullRequestInfo, PullRequestStatus, SetupScript, TokenUsage, TokenUsageTotals,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let totals = |n: u64| TokenUsageTotals {
+        input_tokens: 1_000_000 + n,
+        output_tokens: 500_000 + n,
+        cache_read_tokens: 2_000_000 + n,
+        cache_creation_tokens: 300_000 + n,
+        thought_tokens: 0,
+        cost: None,
+    };
+    let pr = |n: u64, status: PullRequestStatus| PullRequestInfo {
+        id: format!("PR_kwDOLxyz{n:08}"),
+        number: 1_000 + n,
+        url: format!("https://github.com/intent-hq/intentd/pull/{}", 1_000 + n),
+        title: format!("feat(workspace): slim list rows and add the row-budget golden ({n})"),
+        status,
+        created_at: now_iso(),
+        // Entry `n` was updated `n` minutes into the hour: a higher `n` is
+        // more recent, so the list cap keeps the highest-numbered entries.
+        updated_at: format!("2026-01-01T00:{n:02}:00Z"),
+        base_ref: Some("main".to_string()),
+        head_ref: Some(format!("feat/slim-list-rows-{n}")),
+        head_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()),
+        author: Some("octocat-developer".to_string()),
+        mergeable: Some(true),
+        mergeable_state: Some("blocked".to_string()),
+        is_draft: Some(false),
+    };
+
+    let ws = WorkspaceId::new();
+    let mut row = workspace(&ws);
+    row.title = "Fix the workspace panel focus regression after the modal closes".to_string();
+    row.branch = "feat/fix-workspace-panel-focus-regression-after-modal-close".to_string();
+    row.base_ref = Some("origin/main".to_string());
+    row.base_commit_sha = Some("f759124bdeadbeefdeadbeefdeadbeefdeadbeef".to_string());
+    row.status_message = Some(
+        "PR #1234 for the panel focus fix is open and waiting for review after \
+         addressing every reviewer thread."
+            .to_string(),
+    );
+    row.status_image_asset_id = Some(format!("asset-{}", uuid::Uuid::new_v4()));
+    row.last_activity = Some(now_iso());
+    row.tags = vec!["frontend".to_string(), "regression".to_string()];
+    row.path = Some(format!(
+        "/home/user/intent/workspaces/{}/monorepo",
+        ws.as_str()
+    ));
+    row.repository_path = Some("/home/user/src/intent/monorepo".to_string());
+    row.repository_owner = Some("intent-hq".to_string());
+    row.repository_name = Some("intent".to_string());
+    row.worktree_path = row.path.clone();
+    row.scope = Some("intent-hq/intent".to_string());
+    row.default_model = Some("anthropic:claude-opus-4-1-20250805".to_string());
+    row.pr_number = Some(1_000);
+    row.pr_url = Some("https://github.com/intent-hq/intentd/pull/1000".to_string());
+    row.pr_status = Some(PullRequestStatus::Open);
+    row.active_pull_request = Some(pr(0, PullRequestStatus::Open));
+    row.pull_requests = Some(vec![
+        pr(0, PullRequestStatus::Open),
+        pr(1, PullRequestStatus::Merged),
+        pr(2, PullRequestStatus::Closed),
+        pr(3, PullRequestStatus::Draft),
+        pr(4, PullRequestStatus::Merged),
+        pr(5, PullRequestStatus::Closed),
+        pr(6, PullRequestStatus::Open),
+        pr(7, PullRequestStatus::Merged),
+    ]);
+    row.setup_script = Some(SetupScript {
+        script: "#!/usr/bin/env bash\nset -euo pipefail\n".repeat(40),
+        project_type: None,
+        updated_at: 1_700_000_000_000,
+        generated_by: None,
+    });
+    row.context_links = Some(
+        (0..3)
+            .map(|n| ContextLink {
+                kind: ContextLinkKind::Issue,
+                url: format!("https://github.com/intent-hq/intent/issues/{}", 3_000 + n),
+                owner: "intent-hq".to_string(),
+                repo: "intent".to_string(),
+                number: 3_000 + n,
+            })
+            .collect(),
+    );
+    row.token_usage = Some(TokenUsage {
+        by_agent_id: (0..10)
+            .map(|n| (format!("agent-{}", uuid::Uuid::new_v4()), totals(n)))
+            .collect(),
+        totals: totals(9),
+        by_model: BTreeMap::from([("claude-opus-4-1".to_string(), totals(1))]),
+        last_scan_at: Some(now_iso()),
+    });
+    row.cow_supported = Some(true);
+    row.browser_client_id = Some(ClientId::from(
+        format!("client-{}", uuid::Uuid::new_v4()).as_str(),
+    ));
+    row.checkout_mode = Some(CheckoutMode::Worktree);
+    row.execution_environment = Some(intent_core::SandboxType::Worktree);
+    store.insert_workspace(&row).await.expect("ws");
+
+    let coordinator = AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str());
+    for n in 0..10u64 {
+        let id = if n == 0 {
+            coordinator.clone()
+        } else {
+            AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str())
+        };
+        store
+            .insert_agent_session(&AgentSession {
+                harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+                harness_features: None,
+                id,
+                workspace_id: ws.clone(),
+                parent_agent_id: (n > 0).then(|| coordinator.clone()),
+                backend_session_id: None,
+                acp_session_id: None,
+                name: format!("Implement the sidebar dropdown ({n})"),
+                name_explicitly_set: true,
+                model: None,
+                reasoning_effort: None,
+                effort_levels: None,
+                provider: None,
+                system_prompt: None,
+                specialist: Some("implementor".to_string()),
+                status: AgentStatus::Idle,
+                is_active: false,
+                messages: vec![],
+                stats: None,
+                task_note_id: None,
+                skip_auto_commit: false,
+                completion_report: None,
+                completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                file_blocks: None,
+                is_background: n > 0,
+                metadata: None,
+                created_at: now_iso(),
+                updated_at: now_iso(),
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+                stop_reason: None,
+                stop_reason_timestamp: None,
+                session_corrupted: false,
+                pending_delete_at: None,
+                retired_at: None,
+                notifications_muted: false,
+            })
+            .await
+            .expect("session");
+    }
+
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    // Bind the primary principal as the wire caller so the row carries the
+    // full flattened membership shape (`myRole` is omitted without one).
+    let primary = store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let caller = intent_core::Caller::Wire {
+        principal_id: primary.id,
+        is_administrator: true,
+    };
+    let list = intent_core::with_caller(caller, svc.list_workspaces(true))
+        .await
+        .expect("list");
+    let mut served = list
+        .into_iter()
+        .find(|w| w.id == ws)
+        .expect("worst-case row listed");
+    // The list path never populates `diffSummary` today, but it is part of
+    // the wire shape; charge its totals so the budget covers it if a future
+    // rung-1/2 rollup lands (`files` stays empty on list rows by contract).
+    served.diff_summary = Some(intent_core::WorkspaceDiffSummary {
+        schema_version: 1,
+        updated_at: now_iso(),
+        total_files: 12,
+        total_additions: 1_234,
+        total_deletions: 567,
+        files: vec![],
+    });
+    served
+}
+
+/// Row-budget golden: the worst-case-realistic ACTIVE `workspace.list` row
+/// serializes at or under [`intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES`] —
+/// the failure message is the per-field byte table so the offending field
+/// is named, not guessed.
+#[tokio::test]
+async fn workspace_list_row_stays_within_row_budget() {
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, WORKSPACE_LIST_ROW_BUDGET_BYTES,
+    };
+
+    let row = worst_case_workspace_list_row().await;
+    let summary = row
+        .agent_summary
+        .as_ref()
+        .expect("active row keeps agentSummary");
+    assert_eq!(summary.count, 10, "worst case carries ten agents");
+    // The eight-entry pool is capped to the five most recently updated with
+    // the linked PR (the oldest, `pr(0)`) retained and moved to the front.
+    assert_eq!(
+        row.pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>(),
+        vec![1_000, 1_007, 1_006, 1_005, 1_004]
+    );
+    assert_eq!(row.pull_requests_total, Some(8));
+    assert!(row.active_pull_request.is_some());
+    assert!(row.task_stats.is_some(), "list rows carry taskStats");
+    assert!(
+        row.display_status.is_some(),
+        "list rows carry displayStatus"
+    );
+
+    let measured = serde_json::to_value(&row).unwrap();
+    let (total, per_key) = serialized_key_bytes(&measured);
+    let (summary_total, summary_per_key) = serialized_key_bytes(&measured["agentSummary"]);
+    let table = format!(
+        "{}\nagentSummary breakdown:\n{}",
+        format_key_bytes_table(total, &per_key),
+        format_key_bytes_table(summary_total, &summary_per_key)
+    );
+    assert!(
+        total <= WORKSPACE_LIST_ROW_BUDGET_BYTES,
+        "worst-case workspace.list row is {total} B, over WORKSPACE_LIST_ROW_BUDGET_BYTES \
+         ({WORKSPACE_LIST_ROW_BUDGET_BYTES} B). Shrink or drop the largest fields below \
+         (detail-only data belongs on workspace.get / a dedicated RPC), or justify a new \
+         budget in intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES's arithmetic.\n{table}"
+    );
+}
+
+/// Key-allowlist golden: every top-level key of the worst-case
+/// `workspace.list` row is in [`intent_core::WORKSPACE_LIST_ROW_KEYS`], every
+/// key of its `activePullRequest` / `pullRequests[]` entries is in
+/// [`intent_core::WORKSPACE_LIST_PR_KEYS`], and — since the worst case
+/// populates every allowlisted field — each allowlisted key is present, so
+/// a stale allowlist entry fails too. The only allowlisted keys an active,
+/// idle row legitimately lacks are the state-conditional ones:
+/// `archivedAt` (archived rows), `pendingDeleteAt` (a running delete grace
+/// window) and `waiting` (omitted when `false`).
+#[tokio::test]
+async fn workspace_list_row_keys_match_allowlist_golden() {
+    use std::collections::BTreeSet;
+
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, WORKSPACE_LIST_PR_KEYS,
+        WORKSPACE_LIST_ROW_KEYS,
+    };
+
+    const STATE_CONDITIONAL_KEYS: &[&str] = &["archivedAt", "pendingDeleteAt", "waiting"];
+
+    let row = worst_case_workspace_list_row().await;
+    let measured = serde_json::to_value(&row).unwrap();
+
+    let check = |object: &serde_json::Value, allowlist: &[&str], what: &str| {
+        let keys: BTreeSet<&str> = object
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let allowed: BTreeSet<&str> = allowlist.iter().copied().collect();
+        let (total, per_key) = serialized_key_bytes(object);
+        let table = format_key_bytes_table(total, &per_key);
+        let unlisted: Vec<&str> = keys.difference(&allowed).copied().collect();
+        assert!(
+            unlisted.is_empty(),
+            "{what} carries keys outside the list-row allowlist: {unlisted:?}. Either add \
+             each to intent_core::WORKSPACE_LIST_ROW_KEYS / WORKSPACE_LIST_PR_KEYS (only if \
+             list-context UI renders it AND it is small; update \
+             docs/protocol/methods/workspace.md in the same commit) or strip it in \
+             Workspace::slim_for_list so it is served on workspace.get only.\n{table}"
+        );
+        let missing: Vec<&str> = allowed
+            .difference(&keys)
+            .copied()
+            .filter(|key| !STATE_CONDITIONAL_KEYS.contains(key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{what} allowlist names keys the worst-case row does not carry: {missing:?}. \
+             Populate them in worst_case_workspace_list_row or drop them from the \
+             allowlist.\n{table}"
+        );
+    };
+
+    check(&measured, WORKSPACE_LIST_ROW_KEYS, "workspace.list row");
+    check(
+        &measured["activePullRequest"],
+        WORKSPACE_LIST_PR_KEYS,
+        "workspace.list row activePullRequest",
+    );
+    for (i, entry) in measured["pullRequests"]
+        .as_array()
+        .expect("pullRequests array")
+        .iter()
+        .enumerate()
+    {
+        check(
+            entry,
+            WORKSPACE_LIST_PR_KEYS,
+            &format!("workspace.list row pullRequests[{i}]"),
+        );
+    }
+}
+
+/// `pullRequests` cap (`intent_core::WORKSPACE_LIST_PR_CAP`): both list
+/// surfaces (`workspace.list`, lite `workspace.subscribe` seq-0) serve the
+/// five most recently updated entries of an eight-entry pool plus
+/// `pullRequestsTotal: 8`, while `workspace.get` keeps the full pool in
+/// stored order with `pullRequestsTotal` absent — the cap is applied only by
+/// the final list-row slimming pass, never on the detail read. The same
+/// holds whatever the pool's source: a pool held entirely on a registered
+/// git root, or entirely on PR monitors, is merged onto `workspace.get`
+/// exactly as onto the list rows (batch-1b verification defect: the
+/// documented `workspace.get` recovery read served `0` entries for an
+/// eight-PR git root the list capped to five).
+#[tokio::test]
+async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
+    use intent_core::{
+        PrMonitor, PrMonitorId, PrMonitorState, PullRequestInfo, PullRequestStatus,
+        WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource, WORKSPACE_LIST_PR_CAP,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let pr = |n: u64| PullRequestInfo {
+        id: format!("PR_{n}"),
+        number: 500 + n,
+        url: format!("https://github.com/intent-hq/intentd/pull/{}", 500 + n),
+        title: format!("PR {n}"),
+        status: PullRequestStatus::Open,
+        created_at: now_iso(),
+        updated_at: format!("2026-01-01T00:{n:02}:00Z"),
+        base_ref: None,
+        head_ref: None,
+        head_sha: None,
+        author: None,
+        mergeable: None,
+        mergeable_state: None,
+        is_draft: None,
+    };
+    let numbers = |ws: &Workspace| -> Vec<u64> {
+        ws.pull_requests
+            .as_ref()
+            .expect("pullRequests")
+            .iter()
+            .map(|pr| pr.number)
+            .collect()
+    };
+
+    // own_ws: the eight-entry pool is the workspace's own.
+    let own_ws = WorkspaceId::new();
+    let mut row = workspace(&own_ws);
+    row.pull_requests = Some((0..8).map(pr).collect());
+    store.insert_workspace(&row).await.expect("own ws");
+
+    // root_ws: no own PRs; the eight-entry pool lives on one git root.
+    let root_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&root_ws))
+        .await
+        .expect("root ws");
+    let ts = now_iso();
+    store
+        .upsert_workspace_git_root(&WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: root_ws.clone(),
+            path: "/tmp/root-pool".into(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("intent-hq".into()),
+            repo_name: Some("intentd".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some((0..8).map(pr).collect()),
+            created_at: ts.clone(),
+            updated_at: ts,
+        })
+        .await
+        .expect("git root");
+
+    // monitor_ws: no own PRs; eight completed, snapshotless monitors (one
+    // per PR number — the synthesized URL is the merge identity).
+    let monitor_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&monitor_ws))
+        .await
+        .expect("monitor ws");
+    // Monitor rows FK onto agent_session; one session covers every monitor.
+    let owner = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from("agent-pool-mon"),
+        workspace_id: monitor_ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Monitor Owner".into(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+        retired_at: None,
+        notifications_muted: false,
+    };
+    store.insert_agent_session(&owner).await.expect("owner");
+    for n in 0..8_i64 {
+        store
+            .insert_pr_monitor(&PrMonitor {
+                monitor_id: PrMonitorId::new(),
+                workspace_id: monitor_ws.clone(),
+                agent_id: owner.id.clone(),
+                repo_owner: "intent-hq".into(),
+                repo_name: "intentd".into(),
+                pr_number: 500 + n,
+                state: PrMonitorState::Completed,
+                last_snapshot: None,
+                baseline_snapshot: None,
+                pending_changes: vec![],
+                pending_since: None,
+                last_change_at: None,
+                last_polled_at: None,
+                last_error: None,
+                created_at: format!("2026-01-02T00:{n:02}:00Z"),
+                updated_at: format!("2026-01-02T00:{n:02}:01Z"),
+            })
+            .await
+            .expect("monitor");
+    }
+
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+
+    let list = svc.list_workspaces(true).await.expect("list");
+    let lite = svc.list_workspaces_lite(true).await.expect("lite list");
+    // Entry `n` was updated `n` minutes into the hour on every source (a
+    // snapshotless monitor's entry carries the monitor row's `updated_at`),
+    // so the cap keeps the five newest on each; `get` serves the source's
+    // own order (stored / git-root / monitor creation order).
+    for (label, ws) in [
+        ("own", &own_ws),
+        ("git-root", &root_ws),
+        ("monitor", &monitor_ws),
+    ] {
+        let listed = list.iter().find(|w| &w.id == ws).expect("listed");
+        assert_eq!(
+            numbers(listed),
+            vec![507, 506, 505, 504, 503],
+            "{label}: workspace.list caps the pool"
+        );
+        assert_eq!(
+            listed.pull_requests.as_ref().unwrap().len(),
+            WORKSPACE_LIST_PR_CAP
+        );
+        assert_eq!(listed.pull_requests_total, Some(8), "{label}: list total");
+        let lite_row = lite.iter().find(|w| &w.id == ws).expect("lite row");
+        assert_eq!(
+            numbers(lite_row),
+            vec![507, 506, 505, 504, 503],
+            "{label}: lite list caps the pool"
+        );
+        assert_eq!(lite_row.pull_requests_total, Some(8), "{label}: lite total");
+
+        let got = svc.get_workspace(ws.clone()).await.expect("get");
+        assert_eq!(
+            numbers(&got),
+            (500..508).collect::<Vec<_>>(),
+            "{label}: workspace.get serves the full merged pool"
+        );
+        assert_eq!(got.pull_requests_total, None, "{label}");
+        let detail = serde_json::to_value(&got).unwrap();
+        assert!(detail.get("pullRequestsTotal").is_none(), "{label}");
+        // Every capped list entry is recoverable from the detail read.
+        let served: Vec<u64> = numbers(&got);
+        for n in numbers(listed) {
+            assert!(
+                served.contains(&n),
+                "{label}: list entry {n} missing on get"
+            );
+        }
+    }
 }
 
 /// Frame-size regression guard for monorepo#3041: ~130 realistic rows —
@@ -1200,12 +1970,14 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
         row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
-        svc.enrich_workspace_aggregates_with_unread(row, Some(unread.contains(row.id.as_str())))
-            .await;
-        row.token_usage = None;
-        if row.archived {
-            row.agent_summary = None;
-        }
+        svc.enrich_workspace_aggregates_with_unread(
+            row,
+            Some(unread.contains(row.id.as_str())),
+            None,
+        )
+        .await;
+        row.slim_for_list();
+        svc.attach_workspace_membership(row).await;
     }
 
     let actual = svc.list_workspaces(true).await.unwrap();
@@ -1217,12 +1989,15 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
 }
 
 /// Both list emit paths (`workspace.list` and the lite path behind
-/// `workspace.subscribe` seq-0) merge externally known PRs into each row's
-/// `pullRequests`: git-root PRs (`workspace_git_root.pull_requests`) and
-/// monitor-derived PRs (active + completed; cancelled excluded), deduped by
-/// URL with workspace > git-root > monitor priority. Purely an emit-path
-/// merge — nothing is persisted, and a row with no external sources keeps
-/// its stored value untouched.
+/// `workspace.subscribe` seq-0) AND the `workspace.get` detail read merge
+/// externally known PRs into the row's `pullRequests`: git-root PRs
+/// (`workspace_git_root.pull_requests`) and monitor-derived PRs (active +
+/// completed; cancelled excluded), deduped by URL with workspace > git-root
+/// > monitor priority — the same pool on every surface, so a capped list
+/// row's `pullRequestsTotal` is always recoverable from `get` (which alone
+/// keeps the per-PR detail fields the list slimming strips). Purely an
+/// emit-path merge — nothing is persisted, and a row with no external
+/// sources keeps its stored value untouched.
 #[tokio::test]
 async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     use intent_core::{
@@ -1448,6 +2223,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
     let assert_merged = |list: &[Workspace], path: &str| {
+        let detail = path == "workspace.get";
         let r1 = list.iter().find(|w| w.id == ws1).expect("ws1 row");
         let prs = r1.pull_requests.as_ref().expect("ws1 pullRequests");
         let urls: Vec<_> = prs.iter().map(|p| p.url.as_str()).collect();
@@ -1470,7 +2246,15 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
             intent_core::PullRequestStatus::Open,
             "{path}"
         );
-        assert_eq!(prs[1].head_sha.as_deref(), Some("abc123"), "{path}");
+        // The merged entry carried the snapshot's headSha: the final
+        // list-row slimming (`Workspace::slim_for_list`) strips the per-PR
+        // detail fields from externally merged entries too, while the
+        // detail read keeps them.
+        assert_eq!(
+            prs[1].head_sha.as_deref(),
+            if detail { Some("abc123") } else { None },
+            "{path}: headSha slimmed off list rows only"
+        );
         assert_eq!(prs[1].is_draft, Some(false), "{path}");
         // Snapshotless completed monitor: URL/title synthesized from the
         // repo identity; terminal without a verdict reads closed, not merged.
@@ -1513,13 +2297,26 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     assert_merged(&full, "workspace.list");
     let lite = svc.list_workspaces_lite(false).await.expect("lite list");
     assert_merged(&lite, "lite list");
+    // The detail read merges the same pool per workspace (scoped reads).
+    let mut gets = Vec::new();
+    for ws in [&ws1, &ws2, &ws3, &ws4] {
+        gets.push(svc.get_workspace(ws.clone()).await.expect("get"));
+    }
+    assert_merged(&gets, "workspace.get");
 
-    // Archived-inclusive list: the archived row's git-root PR merges in.
+    // Archived-inclusive list: the archived row's git-root PR merges in —
+    // and `get`, which serves archived workspaces regardless, merges it too.
     let all = svc.list_workspaces_lite(true).await.expect("archived list");
     let r5 = all.iter().find(|w| w.id == ws5).expect("ws5 row");
     let prs5 = r5.pull_requests.as_ref().expect("ws5 pullRequests");
     assert_eq!(prs5.len(), 1);
     assert_eq!(prs5[0].title, "Archived root PR");
+    let got5 = svc.get_workspace(ws5.clone()).await.expect("get ws5");
+    assert_eq!(
+        got5.pull_requests.as_ref().map(|p| p[0].title.as_str()),
+        Some("Archived root PR"),
+        "workspace.get merges the archived workspace's git-root PR"
+    );
 
     // Archived-excluding bulk reads filter archived-workspace rows in SQL.
     let roots = store
@@ -1769,6 +2566,10 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             p.mergeable_state.clone(),
         )
     };
+    // `Workspace::slim_for_list` runs AFTER the derivation on the list
+    // surfaces and keeps the whole lifecycle tuple (`mergeable` /
+    // `mergeableState` included — the FE derives the PR display status from
+    // them off list rows), so every surface serves the canonical copy.
 
     // Repro A, both root orders: linked + pooled stale `open` copy of the
     // URL; one root still `open` (newer than the workspace copy), one root
@@ -1962,12 +2763,8 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
                 "{ctx}"
             );
             assert!(ws.active_pull_request.is_none(), "{ctx}");
-            // Root-only URLs are appended by the list paths' external merge
-            // only; `workspace.get` has no workspace-owned copy to serve.
-            if surface == "workspace.get" {
-                assert!(ws.pull_requests.is_none(), "{ctx}");
-                continue;
-            }
+            // Root-only URLs are appended by the external merge on every
+            // surface — the list paths and `workspace.get` alike.
             let prs = ws.pull_requests.as_ref().expect("pullRequests");
             assert_eq!(prs.len(), 1, "{ctx}: root copies dedupe into one entry");
             assert_eq!(lifecycle(&prs[0]), tied_canonical, "{ctx}: pullRequests");
@@ -26690,12 +27487,14 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -26839,12 +27638,14 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -26979,12 +27780,14 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -27114,12 +27917,14 @@ mod rules {
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -27248,12 +28053,14 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -27387,12 +28194,14 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -27534,6 +28343,8 @@ mod rules {
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            membership: None,
+            pull_requests_total: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -27696,6 +28507,8 @@ mod rules {
             checkout_mode: Some(intent_core::CheckoutMode::Cow),
             execution_environment: None,
             disk_usage: None,
+            membership: None,
+            pull_requests_total: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -27963,6 +28776,8 @@ mod rules {
             checkout_mode: None,
             execution_environment: Some(intent_core::SandboxType::Microvm),
             disk_usage: None,
+            membership: None,
+            pull_requests_total: None,
         };
 
         // microVM agents also carry sandbox fields (host-side CoW clone the VM
@@ -28845,12 +29660,14 @@ mod known_repo {
             diff_summary: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
@@ -35931,6 +36748,58 @@ mod clone_orchestration {
         assert!(
             frames.is_empty(),
             "idempotent replay emits no git:clone frames: {frames:?}"
+        );
+    }
+
+    /// Two concurrent first-use `workspace.create` calls carrying the same
+    /// `idempotencyKey` are exactly-once: `with_idempotency` serializes
+    /// same-key callers, so one provisions and the other replays the stored
+    /// result — identical ids, one workspace row, one `workspace:created`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_creates_yield_one_workspace() {
+        let repo = seed_repo("intentd-idem-race-src");
+        let root = unique_dir("intentd-idem-race-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let input = WorkspaceCreate {
+            repository_path: Some(repo.0.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let key = Some("idem-key-race-1".to_string());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let (first, second) = tokio::join!(
+            svc.create_workspace(input.clone(), key.clone()),
+            svc.create_workspace(input, key)
+        );
+        let first = first.expect("first create");
+        let second = second.expect("second create");
+        assert_eq!(
+            first.workspace.id, second.workspace.id,
+            "both callers observe the same workspace"
+        );
+
+        let rows = store.list_workspaces(true).await.expect("list workspaces");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one workspace row: {:?}",
+            rows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>()
+        );
+        let created = drain_event_types(&mut sub)
+            .await
+            .into_iter()
+            .filter(|t| t == intent_core::events::WORKSPACE_CREATED)
+            .count();
+        assert_eq!(created, 1, "exactly one workspace:created");
+        assert!(
+            svc.idempotency_inflight.is_empty(),
+            "in-flight key entry is dropped after both callers finish"
         );
     }
 
@@ -45942,5 +46811,321 @@ mod local_changes {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+}
+
+/// `with_idempotency` under concurrency: same-key first-use callers are
+/// serialized per `(workspace_id, key)` so `op` runs exactly once and every
+/// caller observes the stored result; errors stay uncached; unrelated keys
+/// never wait on each other.
+mod idempotency_serialization {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use intent_core::{Error, Result};
+    use intent_store::Store;
+
+    use super::TempDb;
+    use crate::{with_idempotency, IdempotencyInflight};
+
+    /// A racing caller's observable checkpoints: `entered` fires
+    /// synchronously right before `with_idempotency` is called, `started`
+    /// fires from inside `op`, and `op` then parks until `release` opens.
+    struct Race {
+        store: Store,
+        inflight: Arc<IdempotencyInflight>,
+        calls: Arc<AtomicUsize>,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    struct Checkpoints {
+        entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+        started: tokio::sync::mpsc::UnboundedReceiver<()>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    fn race(store: Store) -> (Arc<Race>, Checkpoints) {
+        let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        (
+            Arc::new(Race {
+                store,
+                inflight: Arc::new(IdempotencyInflight::default()),
+                calls: Arc::new(AtomicUsize::new(0)),
+                entered: entered_tx,
+                started: started_tx,
+                release: release_rx,
+            }),
+            Checkpoints {
+                entered: entered_rx,
+                started: started_rx,
+                release: release_tx,
+            },
+        )
+    }
+
+    async fn wait_open(mut release: tokio::sync::watch::Receiver<bool>) {
+        while !*release.borrow_and_update() {
+            release.changed().await.expect("release gate dropped");
+        }
+    }
+
+    impl Race {
+        /// Spawn a caller on `key` whose `op` (call number `n`, 1-based)
+        /// yields `outcome(n)` once the gate opens.
+        fn spawn(
+            self: &Arc<Self>,
+            key: &str,
+            outcome: fn(usize) -> Result<serde_json::Value>,
+        ) -> tokio::task::JoinHandle<Result<serde_json::Value>> {
+            let race = self.clone();
+            let key = key.to_string();
+            tokio::spawn(async move {
+                let op_race = race.clone();
+                race.entered.send(()).expect("entered checkpoint");
+                with_idempotency(
+                    &race.inflight,
+                    &race.store,
+                    "",
+                    Some(key),
+                    "test.op",
+                    move || async move {
+                        let n = op_race.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        op_race.started.send(()).expect("started checkpoint");
+                        wait_open(op_race.release.clone()).await;
+                        outcome(n)
+                    },
+                )
+                .await
+            })
+        }
+
+        /// Yield until `n` callers hold or await `key`'s lock — i.e. a
+        /// second caller is provably parked behind the first.
+        async fn wait_holders(&self, key: &str, n: usize) {
+            while self.holders(key) < n {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        fn holders(&self, key: &str) -> usize {
+            self.inflight.holders(&(String::new(), key.to_string()))
+        }
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the `outcome` fn-pointer shape"
+    )]
+    fn winner(n: usize) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({ "call": n }))
+    }
+
+    /// Two callers racing one fresh key while the first `op` is provably in
+    /// flight: the second must wait on the key and then observe the stored
+    /// result, never run `op` a second time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_first_use_runs_op_once() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store.clone());
+
+        let first = race.spawn("race-key", winner);
+        cp.entered.recv().await.expect("first entered");
+        cp.started.recv().await.expect("first op in flight");
+        let second = race.spawn("race-key", winner);
+        cp.entered
+            .recv()
+            .await
+            .expect("second caller entered while the first op is parked");
+        race.wait_holders("race-key", 2).await;
+        cp.release.send(true).expect("open gate");
+
+        let first = first.await.expect("join").expect("first result");
+        let second = second.await.expect("join").expect("second result");
+        assert_eq!(
+            race.calls.load(Ordering::SeqCst),
+            1,
+            "op ran more than once for one key"
+        );
+        assert_eq!(first, second, "both callers observe the stored result");
+        assert_eq!(first["call"], 1);
+        assert_eq!(
+            store.get_idempotent("", "race-key").await.expect("lookup"),
+            Some(serde_json::to_string(&first).unwrap()),
+            "the single result is what was persisted"
+        );
+        assert!(
+            race.inflight.is_empty(),
+            "in-flight entry is dropped once every caller is done"
+        );
+    }
+
+    /// Errors are not cached: when the first caller's `op` fails, a same-key
+    /// caller that was waiting runs `op` itself and its success is stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_first_op_does_not_poison_waiting_caller() {
+        fn fail_first(n: usize) -> Result<serde_json::Value> {
+            if n == 1 {
+                Err(Error::Internal("first attempt failed".to_string()))
+            } else {
+                Ok(serde_json::json!({ "call": n }))
+            }
+        }
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store.clone());
+
+        let first = race.spawn("fail-key", fail_first);
+        cp.entered.recv().await.expect("first entered");
+        cp.started.recv().await.expect("first op in flight");
+        let second = race.spawn("fail-key", fail_first);
+        cp.entered.recv().await.expect("second entered");
+        race.wait_holders("fail-key", 2).await;
+        cp.release.send(true).expect("open gate");
+
+        let first = first.await.expect("join");
+        let second = second.await.expect("join");
+        assert!(
+            matches!(first, Err(Error::Internal(_))),
+            "first caller surfaces its op error: {first:?}"
+        );
+        let second = second.expect("waiting caller runs op itself");
+        assert_eq!(second["call"], 2);
+        assert_eq!(race.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store.get_idempotent("", "fail-key").await.expect("lookup"),
+            Some(serde_json::to_string(&second).unwrap()),
+            "only the success is persisted"
+        );
+        assert!(race.inflight.is_empty());
+    }
+
+    /// The lock is per key: a caller on an unrelated key completes while
+    /// another key's first `op` is still parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unrelated_keys_do_not_serialize() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store.clone());
+
+        let held = race.spawn("held-key", winner);
+        cp.entered.recv().await.expect("held entered");
+        cp.started.recv().await.expect("held op in flight");
+
+        let other = tokio::time::timeout(
+            Duration::from_secs(30),
+            with_idempotency(
+                &race.inflight,
+                &store,
+                "",
+                Some("other-key".to_string()),
+                "test.op",
+                || async { Ok::<_, Error>(serde_json::json!({ "other": true })) },
+            ),
+        )
+        .await
+        .expect("unrelated key must not wait on the held key")
+        .expect("other result");
+        assert_eq!(other["other"], true);
+
+        assert_eq!(
+            race.holders("held-key"),
+            1,
+            "the unrelated call never touched the held key"
+        );
+
+        cp.release.send(true).expect("open gate");
+        let held = held.await.expect("join").expect("held result");
+        assert_eq!(held["call"], 1);
+        assert!(race.inflight.is_empty());
+    }
+
+    /// A waiter cancelled while parked on the key's lock releases its hold
+    /// at once (the holder's count drops back to 1), and the entry is pruned
+    /// when the holder itself finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_waiter_releases_hold_and_entry_is_pruned() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store);
+
+        let holder = race.spawn("k", winner);
+        cp.entered.recv().await.expect("holder entered");
+        cp.started.recv().await.expect("holder op in flight");
+
+        let waiter = race.spawn("k", winner);
+        cp.entered.recv().await.expect("waiter entered");
+        race.wait_holders("k", 2).await;
+
+        waiter.abort();
+        assert!(
+            waiter.await.expect_err("aborted").is_cancelled(),
+            "waiter was cancelled while parked"
+        );
+        assert_eq!(
+            race.holders("k"),
+            1,
+            "the cancelled waiter no longer holds the key"
+        );
+
+        cp.release.send(true).expect("open gate");
+        let held = holder.await.expect("join").expect("holder result");
+        assert_eq!(held["call"], 1);
+        assert_eq!(race.calls.load(Ordering::SeqCst), 1, "op ran once");
+        assert!(
+            race.inflight.is_empty(),
+            "entry pruned once the last holder released"
+        );
+    }
+
+    /// Same-key slots dropped at the same instant must leave the registry
+    /// empty. Pruning has to release the dropping slot's ref under the
+    /// registry mutex: checking the count first and letting the ref drop
+    /// after `Drop::drop` returned lets two concurrent drops each see the
+    /// other's ref, both skip removal, and leak the entry for good.
+    #[test]
+    fn concurrent_slot_drops_prune_the_entry() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 2_000;
+
+        let inflight = IdempotencyInflight::default();
+        let key = (String::new(), "k".to_string());
+        // Three phases per round: all entered → all dropped → checked.
+        let barrier = std::sync::Barrier::new(THREADS + 1);
+
+        // Recorded rather than asserted inside the scope so a failure does
+        // not leave the workers parked on the barrier.
+        let mut leaked_round = None;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        let slot = inflight.enter(key.clone());
+                        barrier.wait();
+                        drop(slot);
+                        barrier.wait();
+                        barrier.wait();
+                    }
+                });
+            }
+            for round in 0..ROUNDS {
+                barrier.wait();
+                barrier.wait();
+                if leaked_round.is_none() && !inflight.is_empty() {
+                    leaked_round = Some((round, inflight.holders(&key)));
+                }
+                barrier.wait();
+            }
+        });
+        assert_eq!(
+            leaked_round, None,
+            "(round, holders): entry leaked after every slot dropped"
+        );
     }
 }

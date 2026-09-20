@@ -1122,23 +1122,48 @@ jobs:
       # Same value and rationale as coverage-e2e (co-tenancy on tinybox,
       # matches the 16-core burst runner).
       NEXTEST_TEST_THREADS: 16
-      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
-      # Depth 2 keeps both parents of the PR merge commit (base and head), so
-      # the selection's merge base resolves to the PR base; the explicit
-      # fetch below pins the base commit even when the merge ref is the
-      # branch head itself (no merge commit).
+      # Depth 2 keeps both parents of the PR merge commit — HEAD^1 is the
+      # base-branch tip GitHub merged against, HEAD^2 the PR head — so the
+      # selection's base is HEAD^1 itself. The base is resolved from that
+      # merge commit, never from pull_request.base.sha: the payload's base.sha
+      # is not guaranteed to be the first parent of the merge commit the job
+      # checks out (github.sha), and when the two differ the depth-1 fetch of
+      # base.sha is a disconnected object `git merge-base` cannot connect to
+      # HEAD (intent-hq/intent#5414). Should the checkout ever be the branch head
+      # itself (no merge commit), the base branch and the PR head are fetched
+      # unshallowed so origin/<base> connects to HEAD. Both changed-tests.sh
+      # runs below read the same resolved BASE_SHA.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 2
-      - name: Fetch PR base commit
-        run: git fetch --no-tags --depth=1 origin "$BASE_SHA"
+      - name: Resolve PR base from the merge commit
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            base=$(git rev-parse 'HEAD^1')
+            echo "base: HEAD^1 (merge-commit parent) = $base"
+          else
+            git fetch --no-tags --unshallow origin \
+              "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
+              "+refs/pull/$PR_NUMBER/head:refs/remotes/pull/$PR_NUMBER/head"
+            base=$(git rev-parse "refs/remotes/origin/$BASE_REF")
+            echo "base: origin/$BASE_REF (HEAD is not a merge commit) = $base"
+          fi
+          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
       - name: Select changed tests (dry run)
         id: select
         run: |
           set -euo pipefail
           plan="$RUNNER_TEMP/coverage-changed-plan.txt"
-          ./scripts/changed-tests.sh --instrumented --dry-run --base "$BASE_SHA" | tee "$plan"
+          status=0
+          ./scripts/changed-tests.sh --instrumented --dry-run --base "$BASE_SHA" | tee "$plan" || status=$?
+          if [ "$status" -eq 4 ]; then
+            echo "::error title=coverage-changed: base unresolvable::changed-tests.sh could not connect BASE $BASE_SHA to HEAD $(git rev-parse HEAD) — a checkout/fetch problem in this job, not a test failure (intent-hq/intent#5414)"
+          fi
+          [ "$status" -eq 0 ] || exit "$status"
           if grep -q 'cargo llvm-cov' "$plan"; then
             echo "has_selection=true" >> "$GITHUB_OUTPUT"
           else

@@ -322,12 +322,14 @@ async fn seed_workspace(data_dir: &Path) -> String {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
         execution_environment: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     id.0
@@ -423,6 +425,8 @@ fn apply_entity(messages: &mut Vec<Value>, entity: &Value) {
         ("role", "role"),
         ("messageSeq", "seq"),
         ("timestamp", "timestamp"),
+        ("metadata", "metadata"),
+        ("author", "author"),
     ] {
         if let Some(v) = entity.get(from) {
             msg[to] = v.clone();

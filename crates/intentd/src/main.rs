@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 mod client;
+mod exact_update;
 mod git_credential;
 mod import;
 mod legacy_import;
@@ -256,6 +257,7 @@ fn main() -> ExitCode {
         std::sync::atomic::Ordering::Relaxed,
     );
     std::env::remove_var(SITTER_IDLE_RESTART_ENV);
+    exact_update::capture_sitter_handshake();
     // Parse the CLI here too — before the tokio runtime — so `serve
     // --specialists-dir` can fold into INTENTD_SPECIALISTS_DIR while
     // `env::set_var` is still sound (the flag wins over an inherited env
@@ -269,10 +271,29 @@ fn main() -> ExitCode {
     {
         std::env::set_var("INTENTD_SPECIALISTS_DIR", dir);
     }
-    async_main(cli)
+    build_runtime().block_on(async_main(cli))
 }
 
-#[tokio::main]
+/// Stack size for the runtime's worker (and blocking) threads. Tokio's
+/// default is the std thread default, 2 MiB. A debug build's nested `poll`
+/// frames along the agent-turn / completion-delivery paths already sit
+/// within a few hundred KB of that (`run_message_worker` alone is ~660 KB),
+/// so the daemon reserves its worker stacks explicitly instead of aborting
+/// with "has overflowed its stack" on the next few frames of growth. Thread
+/// stacks are reserved virtual memory; only the pages a thread actually
+/// touches are committed, so the larger reservation costs nothing at rest.
+const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// The daemon's tokio runtime: multi-threaded, all drivers enabled, worker
+/// stacks sized by [`WORKER_THREAD_STACK_BYTES`].
+fn build_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_THREAD_STACK_BYTES)
+        .build()
+        .expect("build tokio runtime")
+}
+
 async fn async_main(cli: Cli) -> ExitCode {
     let command = match cli.command {
         Command::Provider { command } if command.is_internal_helper() => {
@@ -2345,6 +2366,7 @@ async fn cmd_serve(
         legacy_import_bus: bus.clone(),
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
+        exact_update: exact_update::ExactUpdate::default(),
         tunnel: tunnel_supervisor.clone(),
         #[cfg(unix)]
         idle_update_state: idle_update_state.clone(),
@@ -2770,6 +2792,7 @@ struct DaemonControl {
     /// `<data_dir>/sitter/sitter.pid` — the supervising sitter's pidfile,
     /// read by `system.requestUpdate` to find the process to SIGUSR1.
     sitter_pid_path: PathBuf,
+    exact_update: exact_update::ExactUpdate,
     /// Tailcat tunnel sidecar supervisor (`server.tunnel.*`). Always present
     /// so the runtime toggle works whether or not the tunnel was boot-started.
     tunnel: Arc<tunnel::TunnelSupervisor>,
@@ -3911,7 +3934,22 @@ impl SystemControl for DaemonControl {
     }
 
     fn request_update(&self) -> Result<(), String> {
+        if self.exact_update.active() {
+            return Err("an exact-version update is already in progress".into());
+        }
         signal_sitter_update(&self.sitter_pid_path)
+    }
+
+    fn exact_update_supported(&self) -> bool {
+        exact_update::supported(&self.sitter_pid_path)
+    }
+
+    fn target_update_status(&self) -> Option<Value> {
+        self.exact_update.status()
+    }
+
+    fn request_exact_update(&self, target: &str) -> Result<(), String> {
+        self.exact_update.start(&self.sitter_pid_path, target)
     }
 
     fn import_legacy(
@@ -7138,6 +7176,31 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for [`WORKER_THREAD_STACK_BYTES`]: a task whose
+    /// frame needs more than the 2 MiB std default must still complete on a
+    /// runtime worker. On a default-sized runtime this aborts the test
+    /// process with "has overflowed its stack" instead of failing an
+    /// assertion, which is the same symptom the daemon showed.
+    #[test]
+    fn runtime_workers_carry_more_than_the_default_thread_stack() {
+        const FRAME_BYTES: usize = 3 * 1024 * 1024;
+        // The oversized frame is the point: it has to live on the worker's
+        // stack, not the heap, to exercise the configured stack size.
+        #[expect(clippy::large_stack_arrays)]
+        #[inline(never)]
+        fn burn_stack() -> usize {
+            let mut buf = [0u8; FRAME_BYTES];
+            std::hint::black_box(&mut buf);
+            usize::from(buf[0]) + usize::from(buf[FRAME_BYTES - 1])
+        }
+        let sum = build_runtime().block_on(async {
+            tokio::spawn(async { burn_stack() })
+                .await
+                .expect("stack-heavy task joins")
+        });
+        assert_eq!(sum, 0);
+    }
 
     #[test]
     fn banner_build_commit_passes_through_embedded_commit() {

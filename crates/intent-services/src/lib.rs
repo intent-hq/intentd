@@ -112,6 +112,7 @@ pub mod pi_cli;
 mod pr_monitor;
 mod pr_ops;
 mod primitive_ops;
+mod principal_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_models;
@@ -488,9 +489,20 @@ pub struct Services {
     one_shot_npx: Option<Option<PathBuf>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
-    /// idle auto-commit path uses its ~30s default; tests compress it so the
+    /// idle auto-commit path uses its 60s default; tests compress it so the
     /// timeout-fallback path completes in milliseconds.
     auto_commit_timeout_ms: Option<u64>,
+    /// Test-only override (milliseconds) for the per-workspace auto-commit
+    /// generation cool-down (intent-hq/intent#5454). Production composition
+    /// leaves this `None` and the idle auto-commit path resolves the window
+    /// from `INTENTD_AUTO_COMMIT_COOLDOWN_MS` or its 10-minute default.
+    auto_commit_cooldown_ms: Option<u64>,
+    /// Per-workspace auto-commit generation cool-down: the instant the last
+    /// generation for that workspace timed out (intent-hq/intent#5454). While
+    /// an entry is younger than the cool-down window the idle path skips
+    /// generation up front and commits the fallback subject. In-memory only,
+    /// shared across clones like the other registries.
+    auto_commit_cooldowns: Arc<Mutex<HashMap<WorkspaceId, std::time::Instant>>>,
     /// Daemon-global parent→child completion-watch registry (AS-2). One table
     /// for all workspaces: each watch/group carries its own workspace anchors
     /// (parent home + child workspace), so the same code path serves
@@ -958,6 +970,10 @@ pub struct Services {
     /// Unit tests inject an invalid/mock URI so `github.connect` never
     /// reaches github.com.
     github_login_base_uri: Option<String>,
+    /// When the primary principal's GitHub profile was last refreshed from
+    /// `GET /user` on a `principal.me` read (multiplayer w1); shared across
+    /// clones so the rate limit spans every RPC handle.
+    principal_identity_refreshed_at: principal_ops::IdentityRefreshState,
     /// Shared cache + offload gates for git-derived aggregates that are still
     /// computed on demand (`diffSummary` for explicit callers, `CoW` support
     /// probes on list/get). Diff rollups are **not** attached to the high-
@@ -1170,6 +1186,10 @@ pub struct Services {
     /// instead of racing it to the store (whose primary key is the last line
     /// of defence). Entries are dropped once no caller holds them.
     attachment_idempotency_inflight: Arc<Mutex<attachment_upload::IdempotencyInflight>>,
+    /// Per-`(workspace, idempotencyKey)` in-flight guard behind
+    /// [`with_idempotency`]: same-key first-use callers serialize on the
+    /// key so one runs the operation and the rest replay its stored result.
+    idempotency_inflight: Arc<IdempotencyInflight>,
     /// In-flight source-side exports (`workspace.export.*`, keyed by
     /// `exportId`): build state + sealed archive + WIP bookkeeping between
     /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
@@ -1250,6 +1270,8 @@ impl Services {
             branches_ls_remote_base: None,
             one_shot_npx: None,
             auto_commit_timeout_ms: None,
+            auto_commit_cooldown_ms: None,
+            auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
@@ -1321,6 +1343,7 @@ impl Services {
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
+            principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
             microvm_host_probe: Arc::new(microvm::host_probe::HostProbeCache::new()),
             disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
@@ -1357,6 +1380,7 @@ impl Services {
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
             attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
+            idempotency_inflight: Arc::new(IdempotencyInflight::default()),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
@@ -2350,7 +2374,7 @@ impl Services {
     /// Called on `workspace.*` mutation paths (update/archive/unarchive) that
     /// return a `Workspace` on the wire so clients never have to recompute it;
     /// the `workspace.list`/`workspace.get` read paths derive the same value
-    /// inline as part of [`Services::enrich_workspace_aggregates`] to keep the
+    /// inline as part of [`Services::enrich_workspace_aggregates_with_unread`] to keep the
     /// aggregate scan single-pass. Keep the two in sync when the derivation
     /// rules change. Store failures fall back to the workspace's own
     /// timestamps rather than failing the caller.
@@ -2608,20 +2632,30 @@ impl Services {
     /// re-read path; desktop FE already treats the field as deprecated and
     /// fetches diffs on demand via `git.diffs`, and embedding the rollup on
     /// every workspace re-read pinned the blocking pool.
+    ///
+    /// Production callers go through
+    /// [`Self::enrich_workspace_aggregates_with_unread`] (the list path
+    /// threads its batch unread set, `workspace.get` its pre-read external
+    /// PR inputs); this no-argument form remains for tests.
+    #[cfg(test)]
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
-        self.enrich_workspace_aggregates_with_unread(ws, None).await;
+        self.enrich_workspace_aggregates_with_unread(ws, None, None)
+            .await;
     }
 
-    /// [`Self::enrich_workspace_aggregates`] with the caller's batch-derived
+    /// The workspace aggregate enrichment with the caller's batch-derived
     /// unread value threaded to the displayStatus derivation: the list path
     /// computes the whole list's unread set in ONE statement
     /// (`workspaces_with_unread_top_level_sessions`) and hands each row its
     /// membership here, so enrichment issues no per-row unread probe.
     /// `None` (single-row callers) keeps the bounded per-workspace probe.
+    /// `external_prs` likewise threads pre-read git-root PRs and monitor rows
+    /// (`workspace.get`) so the derivation issues no duplicate scoped read.
     pub(crate) async fn enrich_workspace_aggregates_with_unread(
         &self,
         ws: &mut Workspace,
         unread: Option<bool>,
+        external_prs: Option<workspace_status::WorkspaceExternalPrs<'_>>,
     ) {
         let cow_supported = self.compute_cow_supported().await;
         let mut activity_max = latest_activity_candidate(&[
@@ -2673,7 +2707,7 @@ impl Services {
         // Derived "current cycle" display status over the active/latest PR
         // and the taskStats computed above; never persisted. See
         // [`Services::enrich_display_status`] (workspace_status module).
-        self.enrich_display_status(ws, sessions.as_deref(), unread)
+        self.enrich_display_status(ws, sessions.as_deref(), unread, external_prs)
             .await;
     }
 
@@ -3020,33 +3054,32 @@ impl Services {
         for ws in list.iter_mut() {
             let roots = git_root_prs.remove(&ws.id).unwrap_or_default();
             let monitored = monitor_prs.remove(&ws.id).unwrap_or_default();
-            if roots.is_empty() && monitored.is_empty() {
-                continue;
-            }
-            let merged = ws.pull_requests.get_or_insert_with(Vec::new);
-            for mut info in roots {
-                // The derivation's same-URL step: the linked and pooled
-                // copies of this URL move to the canonical snapshot; a URL
-                // the pool does not carry is appended, itself canonicalized
-                // (it may duplicate the linked `activePullRequest`, and a
-                // URL's copies always agree).
-                let copies = workspace_status::canonicalize_pr_url_copies(
-                    ws.active_pull_request.as_mut(),
-                    merged,
-                    &info,
-                );
-                if !copies.pooled {
-                    workspace_status::canonicalize_pr_lifecycle(&mut info, &copies.canonical);
-                    merged.push(info);
-                }
-            }
-            for info in monitored {
-                match merged.iter_mut().find(|p| p.url == info.url) {
-                    None => merged.push(info),
-                    Some(present) => workspace_status::upgrade_pr_lifecycle(present, &info),
-                }
-            }
+            merge_workspace_pull_requests(ws, roots, monitored);
         }
+    }
+
+    /// The single-row counterpart of [`Self::merge_external_pull_requests`]
+    /// for `workspace.get`: fold the workspace's git-root PRs and
+    /// monitor-derived PRs into its `pullRequests` with the same source
+    /// priority, dedup and lifecycle rules, so the detail read serves the
+    /// full merged pool the list rows were capped from
+    /// (`WORKSPACE_LIST_PR_CAP` + `pullRequestsTotal`) — uncapped and
+    /// unslimmed. Consumes the reads the displayStatus derivation already
+    /// used ([`Services::workspace_external_pr_reads`], issued once per
+    /// call): no store reads of its own, no forge calls, nothing persisted.
+    /// Runs after enrichment for the same reason the list merge does: the
+    /// derivation must not see the merged entries a second time.
+    pub(crate) fn merge_workspace_external_pull_requests(
+        ws: &mut Workspace,
+        reads: workspace_status::WorkspaceExternalPrReads,
+    ) {
+        let monitored = reads
+            .monitors
+            .list_entries
+            .iter()
+            .map(pr_monitor::pr_monitor_pr_info)
+            .collect();
+        merge_workspace_pull_requests(ws, reads.git_root_prs, monitored);
     }
 
     /// Start the one-time repository owner/name backfill after daemon listeners
@@ -4216,12 +4249,23 @@ impl Services {
     }
 
     /// Override the auto-commit message generation timeout (defaults to the
-    /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
+    /// 60s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
     /// the timeout-fallback path completes in milliseconds. Its only callers
     /// spawn a fake CLI via a shell script, so they (and it) are unix-only.
     #[cfg(all(test, unix))]
     pub(crate) fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
         self.auto_commit_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Override the per-workspace auto-commit generation cool-down window
+    /// (defaults to `GENERATION_COOLDOWN_MS` in `auto_commit`, or the
+    /// `INTENTD_AUTO_COMMIT_COOLDOWN_MS` env seam). Tests compress it so the
+    /// cool-down expiry path completes in milliseconds; unix-only for the same
+    /// reason as [`Self::with_auto_commit_timeout_ms`].
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_auto_commit_cooldown_ms(mut self, ms: u64) -> Self {
+        self.auto_commit_cooldown_ms = Some(ms);
         self
     }
 
@@ -10576,7 +10620,7 @@ fn iso_to_epoch_ms(iso: &str) -> i64 {
 /// Return the latest RFC-3339 timestamp among the supplied candidates, ignoring
 /// unparsable or absent entries. Powers the `lastActivity` derivation on every
 /// `workspace.*` path that returns a `Workspace` on the wire (§9.1) — the
-/// list/get read path via [`Services::enrich_workspace_aggregates`] and the
+/// list/get read path via [`Services::enrich_workspace_aggregates_with_unread`] and the
 /// update/archive/unarchive mutation paths via [`Services::derive_last_activity`].
 /// FE `getLatestActivityCandidate` parity.
 fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
@@ -10591,6 +10635,46 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
         }
     }
     best.map(|(_, s)| s)
+}
+
+/// Fold one workspace's externally known PRs into its `pullRequests` — the
+/// per-row body shared by the list emit merge
+/// ([`Services::merge_external_pull_requests`]) and the `workspace.get`
+/// merge ([`Services::merge_workspace_external_pull_requests`]), so both
+/// surfaces apply the same source priority (workspace > git-root >
+/// monitor), URL dedup and lifecycle rules. A row with nothing to merge is
+/// left untouched (a `None` stays omitted on the wire; empty inputs never
+/// materialize `[]`).
+fn merge_workspace_pull_requests(
+    ws: &mut Workspace,
+    roots: Vec<PullRequestInfo>,
+    monitored: Vec<PullRequestInfo>,
+) {
+    if roots.is_empty() && monitored.is_empty() {
+        return;
+    }
+    let merged = ws.pull_requests.get_or_insert_with(Vec::new);
+    for mut info in roots {
+        // The derivation's same-URL step: the linked and pooled copies of
+        // this URL move to the canonical snapshot; a URL the pool does not
+        // carry is appended, itself canonicalized (it may duplicate the
+        // linked `activePullRequest`, and a URL's copies always agree).
+        let copies = workspace_status::canonicalize_pr_url_copies(
+            ws.active_pull_request.as_mut(),
+            merged,
+            &info,
+        );
+        if !copies.pooled {
+            workspace_status::canonicalize_pr_lifecycle(&mut info, &copies.canonical);
+            merged.push(info);
+        }
+    }
+    for info in monitored {
+        match merged.iter_mut().find(|p| p.url == info.url) {
+            None => merged.push(info),
+            Some(present) => workspace_status::upgrade_pr_lifecycle(present, &info),
+        }
+    }
 }
 
 /// Trailing-edge debounce window for `workspace:updated { lastActivity }` event
@@ -14945,6 +15029,114 @@ async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Opti
     })
 }
 
+/// Per-key in-flight async locks: callers on one key serialize on that key's
+/// lock while unrelated keys never wait on each other, and an entry is dropped
+/// once no caller holds it (no unbounded growth). The generic form of the
+/// attachment placement guard (`attachment_upload::IdempotencyInflight`);
+/// [`IdempotencyInflight`] is its `(workspace_id, key)` instance behind
+/// [`with_idempotency`].
+pub(crate) struct KeyedInflight<K> {
+    locks: Mutex<HashMap<K, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl<K> Default for KeyedInflight<K> {
+    fn default() -> Self {
+        Self {
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
+    /// Take (or join) `key`'s lock. The returned slot drops the map entry on
+    /// drop once no other caller holds it.
+    fn enter(&self, key: K) -> KeyedInflightSlot<'_, K> {
+        let lock = self
+            .locks
+            .lock()
+            .expect("keyed inflight registry poisoned")
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        KeyedInflightSlot {
+            registry: self,
+            key,
+            lock: Some(lock),
+        }
+    }
+
+    /// Callers currently holding or waiting on `key`.
+    #[cfg(test)]
+    pub(crate) fn holders(&self, key: &K) -> usize {
+        self.locks
+            .lock()
+            .expect("keyed inflight registry poisoned")
+            .get(key)
+            .map_or(0, |lock| Arc::strong_count(lock) - 1)
+    }
+
+    /// `true` when no key is held or awaited.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.locks
+            .lock()
+            .expect("keyed inflight registry poisoned")
+            .is_empty()
+    }
+}
+
+/// One caller's hold on a [`KeyedInflight`] entry (see `enter`).
+struct KeyedInflightSlot<'a, K: std::hash::Hash + Eq> {
+    registry: &'a KeyedInflight<K>,
+    key: K,
+    /// `Some` until `Drop`, which releases it under the registry mutex.
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl<K: std::hash::Hash + Eq> KeyedInflightSlot<'_, K> {
+    /// Acquire the key's lock; the guard must be dropped before the slot.
+    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lock
+            .as_ref()
+            .expect("keyed inflight slot lock is taken only on drop")
+            .lock()
+            .await
+    }
+}
+
+impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
+    fn drop(&mut self) {
+        let mut locks = self
+            .registry
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Release our ref while the registry is locked so the prune check
+        // below and another slot's concurrent drop cannot both see each
+        // other's ref and both skip the removal (the field would otherwise
+        // drop only after this fn returns, outside the mutex).
+        drop(self.lock.take());
+        // Only the map's ref left = nobody holds or awaits the key.
+        if locks
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.key);
+        }
+    }
+}
+
+/// `(workspace_id, idempotency_key)` — the dedupe identity of one
+/// [`with_idempotency`] call (`workspace_id` is `""` for global methods).
+pub(crate) type IdempotencyIdent = (String, String);
+
+/// The [`with_idempotency`] in-flight registry: a same-key caller racing the
+/// first use waits on the key's lock, so its lookup runs after the winner's
+/// result is stored and replays it instead of running `op` a second time (the
+/// store's primary key stays the last line of defence). Shared across
+/// [`Services`] clones.
+pub(crate) type IdempotencyInflight = KeyedInflight<IdempotencyIdent>;
+
 /// Idempotency wrapper for create/commit/PR-merge methods (design note TB-0 §5).
 ///
 /// When `key` is present and already recorded for `(workspace_id, key)`, returns
@@ -14953,9 +15145,16 @@ async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Opti
 /// and returns it (errors are not cached). When `key` is absent this is a
 /// SOFT-LAUNCH (R5): log a warn and execute normally — never reject.
 ///
+/// The lookup → `op` → store sequence runs under the key's [`IdempotencyInflight`]
+/// lock, so concurrent first-use callers on one key are serialized: the second
+/// caller's lookup sees the first's stored result and replays it rather than
+/// running `op` again. A failed `op` releases the key without storing, so the
+/// next same-key caller runs `op` itself.
+///
 /// `workspace_id` is the `""` sentinel for global methods that carry no
 /// workspaceId (e.g. `workspace.create`).
 pub(crate) async fn with_idempotency<T, F, Fut>(
+    inflight: &IdempotencyInflight,
     store: &Store,
     workspace_id: &str,
     key: Option<String>,
@@ -14974,6 +15173,8 @@ where
         );
         return op().await;
     };
+    let slot = inflight.enter((workspace_id.to_string(), key.clone()));
+    let _held = slot.acquire().await;
     if let Some(stored) = store.get_idempotent(workspace_id, &key).await? {
         let value: T = serde_json::from_str(&stored)
             .map_err(|e| Error::Internal(format!("decode idempotent result failed: {e}")))?;
@@ -18960,27 +19161,6 @@ impl WorkspaceApi for Services {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, true)
                     .await;
             }
-            // List-frame slimming (monorepo#3041), following the v4.2
-            // `diskUsage` precedent — optional fields simply never present on
-            // list rows, no wire-shape change. Applied after the join-merge so
-            // the guarantee also covers base rows served on the panic
-            // degradation path above (a base row still carries its persisted
-            // `tokenUsage`):
-            // - `tokenUsage` is detail-only (clients read it via
-            //   `workspace.getTokenUsage` + the tokenUsage-changed event,
-            //   never off list rows) and dominated large frames (~26% of a
-            //   real 180-workspace payload).
-            // - `agentSummary` on ARCHIVED rows: archived workspaces render
-            //   no HUD/coverflow agent cards, yet their accumulated sessions
-            //   made archived rows the bulk of the aggregate (~65% of
-            //   agentSummary bytes measured). Active rows keep the full
-            //   summary; `workspace.get` keeps both fields for detail reads.
-            for ws in &mut list {
-                ws.token_usage = None;
-                if ws.archived {
-                    ws.agent_summary = None;
-                }
-            }
             tracing::debug!(
                 workspaces = count,
                 total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -18997,6 +19177,17 @@ impl WorkspaceApi for Services {
             // derivation and the wire merge.
             this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
+            // List-frame slimming (monorepo#3041): the final pass, after
+            // enrichment and the PR merge, so base rows served on the panic
+            // degradation path above (still carrying persisted `tokenUsage` /
+            // `setupScript`) and externally merged PR entries are slimmed
+            // alike. `workspace.get` keeps every field for detail reads.
+            for ws in &mut list {
+                ws.slim_for_list();
+            }
+            // Membership summary (multiplayer w1): one SQL query for the
+            // whole list, relative to the request's bound caller.
+            this.attach_workspace_memberships(&mut list).await;
             Ok(list)
         })
     }
@@ -19025,9 +19216,6 @@ impl WorkspaceApi for Services {
             for ws in &mut list {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, false)
                     .await;
-                // Detail-only on the wire (monorepo#3041): list rows never
-                // carry `tokenUsage` — same rationale as the full list path.
-                ws.token_usage = None;
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
@@ -19036,6 +19224,11 @@ impl WorkspaceApi for Services {
             // now moves out of the snapshot into the merge).
             this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
+            // Same final slimming pass as the full list path (monorepo#3041).
+            for ws in &mut list {
+                ws.slim_for_list();
+            }
+            this.attach_workspace_memberships(&mut list).await;
             Ok(list)
         })
     }
@@ -19052,6 +19245,7 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 let mut ws = chief_workspace();
                 ws.activity = this.workspace_activity(&id);
+                this.attach_workspace_membership(&mut ws).await;
                 return Ok(ws);
             }
             let mut ws = store.get_workspace(&id).await?;
@@ -19061,7 +19255,25 @@ impl WorkspaceApi for Services {
             // Delete grace window (§5.1): surface the in-memory
             // pending-deletion deadline; O(1) map read, never persisted.
             ws.pending_delete_at = this.pending_workspace_deletes.deadline(id.as_str());
-            this.enrich_workspace_aggregates(&mut ws).await;
+            // The git-root PRs and monitor rows are read ONCE and shared by
+            // the displayStatus derivation and the PR merge below, so the
+            // detail read's statement count does not grow with the merge
+            // (`workspace_get_enrichment_stays_within_statement_budget`).
+            let external = this.workspace_external_pr_reads(&id).await;
+            this.enrich_workspace_aggregates_with_unread(
+                &mut ws,
+                None,
+                Some(external.status_inputs()),
+            )
+            .await;
+            // Same external PR merge as the list paths, after enrichment
+            // for the same reason, so the detail read serves the full
+            // merged pool a capped list row (`pullRequestsTotal`) points
+            // at — uncapped and unslimmed: `workspace.get` keeps every
+            // field for detail reads.
+            Self::merge_workspace_external_pull_requests(&mut ws, external);
+            // Membership summary (multiplayer w1), relative to the caller.
+            this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
         })
     }
@@ -19201,7 +19413,9 @@ impl WorkspaceApi for Services {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let wrapper_bus = bus.clone();
+            let inflight = services.idempotency_inflight.clone();
             let result = with_idempotency(
+                &inflight,
                 &store,
                 "",
                 idempotency_key,
@@ -20159,6 +20373,7 @@ impl WorkspaceApi for Services {
                         token_usage: None,
                         cow_supported: None,
                         browser_client_id: None,
+                        pull_requests_total: None,
                         display_status: None,
                         waiting: false,
                         checkout_mode: None,
@@ -20168,6 +20383,7 @@ impl WorkspaceApi for Services {
                         execution_environment: requested_env,
                         disk_usage: None,
                         pending_delete_at: None,
+                        membership: None,
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
                     // parity): a local workspace created off a local git repo
@@ -21102,10 +21318,20 @@ impl WorkspaceApi for Services {
                             || created_file_blocks.is_some();
                         if has_content {
                             let prompt_text = prompt.unwrap_or_default();
+                            // Principal stamp (multiplayer w2): the initial
+                            // prompt is the creating human's first message,
+                            // stamped with the bound wire caller exactly like
+                            // `agent.sendMessage` (an agent / daemon caller
+                            // stamps nothing). Stamping an absent payload
+                            // cannot fail, so this never strands the row
+                            // persisted above.
+                            let message_metadata =
+                                crate::principal_ops::stamp_principal_attribution(None)?;
                             let options = crate::agent_manager::TurnOptions {
                                 image_blocks: created_image_blocks.clone(),
                                 file_blocks: created_file_blocks.clone(),
                                 context_references: created_context_refs,
+                                message_metadata: message_metadata.clone(),
                                 ..crate::agent_manager::TurnOptions::default()
                             };
                             let send = match services.agent_manager() {
@@ -21122,7 +21348,7 @@ impl WorkspaceApi for Services {
                                             None,
                                             created_image_blocks,
                                             created_file_blocks,
-                                            None,
+                                            message_metadata,
                                         )
                                         .await
                                 }
@@ -22574,12 +22800,14 @@ impl WorkspaceApi for Services {
                 token_usage: None,
                 cow_supported: None,
                 browser_client_id: None,
+                pull_requests_total: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
                 execution_environment: None,
                 disk_usage: None,
                 pending_delete_at: None,
+                membership: None,
             };
             // Provision the checkout for the duplicate (TS
             // `duplicateWorkspace` parity, mirroring the `workspace.create`
@@ -23856,7 +24084,9 @@ impl WorkspaceApi for Services {
             }
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
+            let inflight = services.idempotency_inflight.clone();
             with_idempotency(
+                &inflight,
                 &store,
                 &ws_scope,
                 idempotency_key,
@@ -25802,7 +26032,9 @@ impl WorkspaceApi for Services {
             // Emission lives inside the idempotency scope so a replayed add
             // (same idempotencyKey) returns the cached result without a second
             // `comment:added` (design note TB-0 §5).
+            let inflight = services.idempotency_inflight.clone();
             let result = with_idempotency(
+                &inflight,
                 &store,
                 &ws_scope,
                 idempotency_key,
@@ -27817,7 +28049,9 @@ impl WorkspaceApi for Services {
             let event_bus = bus.clone();
             let event_message = message.clone();
             let status_cache = this.git_status_invalidator();
+            let inflight = this.idempotency_inflight.clone();
             with_idempotency(
+                &inflight,
                 &store,
                 &ws_scope,
                 idempotency_key,
@@ -28671,6 +28905,21 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_retired_count_op(workspace_id).await })
     }
 
+    fn agent_list_scoped(
+        &self,
+        workspace_id: WorkspaceId,
+        scope: intent_core::AgentListRowScope,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        Box::pin(async move { self.agent_list_scoped_op(workspace_id, scope).await })
+    }
+
+    fn agent_scope_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::AgentScopeCounts>> {
+        Box::pin(async move { self.agent_scope_counts_op(workspace_id).await })
+    }
+
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_list_active_op().await })
     }
@@ -28760,6 +29009,14 @@ impl WorkspaceApi for Services {
         metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Principal stamp (multiplayer w2): a `user` row appended by a
+            // wire caller is human-authored; any other role only has a
+            // client-supplied stamp stripped.
+            let metadata = if role == "user" {
+                crate::principal_ops::stamp_principal_attribution(metadata)?
+            } else {
+                crate::principal_ops::strip_principal_attribution(metadata)
+            };
             self.agent_append_message_op(agent_id, role, content, metadata)
                 .await
         })
@@ -28865,6 +29122,7 @@ impl WorkspaceApi for Services {
             // nothing commits unless the user explicitly asks.
             let skip_auto_commit = !self.effective_auto_commit(&workspace_id).await;
             with_idempotency(
+                &self.idempotency_inflight,
                 &self.store,
                 &ws_scope,
                 idempotency_key,
@@ -28896,6 +29154,8 @@ impl WorkspaceApi for Services {
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            let message_metadata =
+                crate::principal_ops::stamp_principal_attribution(message_metadata)?;
             self.agent_send_to_task_op(
                 workspace_id,
                 task_note_id,
@@ -28923,6 +29183,16 @@ impl WorkspaceApi for Services {
         origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Principal stamp (multiplayer w2), applied once here so the
+            // runtime path (direct persist, busy enqueue, quarantine park,
+            // auto-queue) and the store-only fallback persist the same
+            // metadata. Only a user-origin send is human-authored; an
+            // automatic/agent-origin send has a client stamp stripped.
+            let message_metadata = if origin.is_user() {
+                crate::principal_ops::stamp_principal_attribution(message_metadata)?
+            } else {
+                crate::principal_ops::strip_principal_attribution(message_metadata)
+            };
             // Attachment-reference validation (PROTOCOL §5.5) up front: the
             // runtime-manager path below never reaches
             // `agent_send_message_op`'s check.
@@ -29071,9 +29341,12 @@ impl WorkspaceApi for Services {
             )?;
             self.validate_image_block_refs("agent.editAndRegenerate", image_blocks.as_ref())
                 .await?;
+            // Principal stamp (multiplayer w2): the edited message is a
+            // fresh human-authored user row.
             let options = crate::agent_manager::TurnOptions {
                 image_blocks,
                 file_blocks,
+                message_metadata: crate::principal_ops::stamp_principal_attribution(None)?,
                 ..Default::default()
             };
             if let Some(manager) = self.agent_manager() {
@@ -29107,7 +29380,7 @@ impl WorkspaceApi for Services {
                         None,
                         options.image_blocks,
                         options.file_blocks,
-                        None,
+                        options.message_metadata,
                     )
                     .await?;
                 let mut result = result;
@@ -29131,6 +29404,11 @@ impl WorkspaceApi for Services {
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Principal stamp (multiplayer w2): captured on the queue entry
+            // so the drain-time persist and every `agent:queue:*` payload
+            // carry it.
+            let message_metadata =
+                crate::principal_ops::stamp_principal_attribution(message_metadata)?;
             self.agent_queue_message_op(
                 agent_id,
                 content,
@@ -29434,7 +29712,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         context_message: String,
-        input: intent_core::AgentWakeOrCreateInput,
+        mut input: intent_core::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             if let Some(model) = input.model.as_deref() {
@@ -29443,6 +29721,10 @@ impl WorkspaceApi for Services {
             if let Some(model) = input.create.as_ref().and_then(|c| c.model.as_deref()) {
                 reject_compound_model("create.model", model)?;
             }
+            // Principal stamp (multiplayer w2) on the delivered context
+            // message, whichever branch (wake / queue / create) carries it.
+            input.message_metadata =
+                crate::principal_ops::stamp_principal_attribution(input.message_metadata)?;
             self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, input)
                 .await
         })
@@ -30981,6 +31263,29 @@ impl WorkspaceApi for Services {
             let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
         })
+    }
+
+    // ========================================================================
+    // principal.* (multiplayer w1) — see `principal_ops`.
+    // ========================================================================
+
+    fn principal_me(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.principal_me_op().await })
+    }
+
+    fn primary_principal_id(&self) -> BoxFuture<'_, Result<intent_core::PrincipalId>> {
+        let store = self.store.clone();
+        Box::pin(async move { Ok(store.get_primary_principal().await?.id) })
+    }
+
+    fn resolve_principal_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, Result<Option<intent_core::PrincipalId>>> {
+        let store = self.store.clone();
+        // One atomic resolve+touch: a credential revoked between a separate
+        // lookup and touch must not be admitted (intent-hq/intentd#1868).
+        Box::pin(async move { store.resolve_active_principal_credential(&token_hash).await })
     }
 
     // ========================================================================

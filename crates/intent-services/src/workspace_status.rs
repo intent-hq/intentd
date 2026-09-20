@@ -179,13 +179,19 @@ impl Services {
     /// hot RPC's statement count stays independent of the workspace count —
     /// AGENTS.md RPC cost contract). `None` (single-row paths: get, mutation
     /// responses, event emits) runs the bounded per-workspace EXISTS probe.
+    ///
+    /// `external_prs` — the workspace's git-root PRs and displayStatus
+    /// monitor rows when the caller already read them (`workspace.get` reads
+    /// them ONCE and reuses them for its PR merge, so the detail read issues
+    /// no duplicate scoped statement). `None` runs the two scoped reads.
     pub(crate) async fn enrich_display_status(
         &self,
         ws: &mut Workspace,
         sessions: Option<&[intent_core::AgentSession]>,
         unread: Option<bool>,
+        external_prs: Option<WorkspaceExternalPrs<'_>>,
     ) {
-        self.enrich_display_status_with_snapshot(ws, sessions, unread, None)
+        self.enrich_display_status_inner(ws, sessions, unread, external_prs, None)
             .await;
     }
 
@@ -197,6 +203,24 @@ impl Services {
         ws: &mut Workspace,
         sessions: Option<&[intent_core::AgentSession]>,
         unread: Option<bool>,
+        snapshot: Option<WorkspaceStatusSnapshot<'_>>,
+    ) {
+        self.enrich_display_status_inner(
+            ws,
+            sessions,
+            unread,
+            snapshot.map(|snapshot| snapshot.external_prs()),
+            snapshot,
+        )
+        .await;
+    }
+
+    async fn enrich_display_status_inner(
+        &self,
+        ws: &mut Workspace,
+        sessions: Option<&[intent_core::AgentSession]>,
+        unread: Option<bool>,
+        external_prs: Option<WorkspaceExternalPrs<'_>>,
         snapshot: Option<WorkspaceStatusSnapshot<'_>>,
     ) {
         // Served `attention` is DERIVED on this same emit path (§5.1):
@@ -261,12 +285,12 @@ impl Services {
         // the awaits below must not have this seed resurrect the baseline.
         let generation = self.last_display_statuses.generation();
         // Git-root PRs feed the PR rungs alongside the workspace's own
-        // linkage: the list snapshot carries them from its one bulk read;
-        // single-row callers do one scoped read (same class as the monitor
-        // probe below).
+        // linkage: the list snapshot carries them from its one bulk read and
+        // `workspace.get` from its one pre-read; other single-row callers do
+        // one scoped read (same class as the monitor probe below).
         let fetched_git_root_prs;
-        let git_root_prs: &[PullRequestInfo] = if let Some(snapshot) = snapshot {
-            snapshot.git_root_prs
+        let git_root_prs: &[PullRequestInfo] = if let Some(external) = external_prs {
+            external.git_root_prs
         } else {
             fetched_git_root_prs = self.workspace_git_root_prs(&ws.id).await;
             &fetched_git_root_prs
@@ -301,9 +325,9 @@ impl Services {
             ws.pull_requests.as_deref().unwrap_or_default(),
             git_root_prs,
         );
-        let monitor_prs = match snapshot {
-            Some(snapshot) => {
-                crate::pr_monitor::fold_monitor_pr_signals(snapshot.monitor_rows, &terminal_prs)
+        let monitor_prs = match external_prs {
+            Some(external) => {
+                crate::pr_monitor::fold_monitor_pr_signals(external.monitor_rows, &terminal_prs)
             }
             None => {
                 self.workspace_monitor_pr_signals(&ws.id, &terminal_prs)
@@ -357,6 +381,40 @@ impl Services {
                 );
                 Vec::new()
             }
+        }
+    }
+
+    /// The `workspace.get` external-PR reads: the git-root PRs
+    /// ([`Self::workspace_git_root_prs`]) plus the one-statement monitor
+    /// read serving both the displayStatus rows and the PR-merge projection
+    /// (`Store::load_workspace_pr_monitor_reads`) — two scoped statements,
+    /// the same count the derivation alone paid before the merge existed.
+    /// Best-effort like its parts: a monitor read failure is logged and
+    /// reads as no monitors (no signals, nothing merged) so the detail read
+    /// is never wedged.
+    pub(crate) async fn workspace_external_pr_reads(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> WorkspaceExternalPrReads {
+        let git_root_prs = self.workspace_git_root_prs(workspace_id).await;
+        let monitors = match self
+            .store
+            .load_workspace_pr_monitor_reads(workspace_id)
+            .await
+        {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "workspace.get: pr monitor read failed; reads as no monitors"
+                );
+                intent_store::WorkspacePrMonitorReads::default()
+            }
+        };
+        WorkspaceExternalPrReads {
+            git_root_prs,
+            monitors,
         }
     }
 
@@ -668,6 +726,51 @@ pub(crate) struct WorkspaceStatusSnapshot<'a> {
     /// call's one bulk read (`list_workspace_git_roots_with_prs`).
     pub(crate) git_root_prs: &'a [PullRequestInfo],
     pub(crate) legacy_question_holds: &'a HashSet<AgentId>,
+}
+
+impl<'a> WorkspaceStatusSnapshot<'a> {
+    fn external_prs(&self) -> WorkspaceExternalPrs<'a> {
+        WorkspaceExternalPrs {
+            monitor_rows: self.monitor_rows,
+            git_root_prs: self.git_root_prs,
+        }
+    }
+}
+
+/// The externally known PR inputs to the displayStatus derivation a caller
+/// already read: the subset of [`WorkspaceStatusSnapshot`] every path can
+/// supply without the list-only `waiting` / legacy-hold batches.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkspaceExternalPrs<'a> {
+    /// See [`WorkspaceStatusSnapshot::monitor_rows`].
+    pub(crate) monitor_rows: &'a [intent_core::PrMonitor],
+    /// See [`WorkspaceStatusSnapshot::git_root_prs`].
+    pub(crate) git_root_prs: &'a [PullRequestInfo],
+}
+
+/// The `workspace.get` external-PR reads, issued ONCE per call
+/// ([`Services::workspace_external_pr_reads`]) and consumed twice: the
+/// displayStatus derivation ([`WorkspaceExternalPrReads::status_inputs`])
+/// and, after enrichment, the PR merge
+/// (`Services::merge_workspace_external_pull_requests`) — so the detail read
+/// serves the merged pool with no extra statement over the enrichment it
+/// already paid for (`workspace_get_enrichment_stays_within_statement_budget`).
+pub(crate) struct WorkspaceExternalPrReads {
+    /// PRs persisted on the workspace's secondary git roots
+    /// ([`Services::workspace_git_root_prs`]).
+    pub(crate) git_root_prs: Vec<PullRequestInfo>,
+    /// The one-statement monitor read: displayStatus rows plus the PR-merge
+    /// projection of every non-cancelled row.
+    pub(crate) monitors: intent_store::WorkspacePrMonitorReads,
+}
+
+impl WorkspaceExternalPrReads {
+    pub(crate) fn status_inputs(&self) -> WorkspaceExternalPrs<'_> {
+        WorkspaceExternalPrs {
+            monitor_rows: &self.monitors.display_rows,
+            git_root_prs: &self.git_root_prs,
+        }
+    }
 }
 
 /// The workspace-owned PR copies (linked `activePullRequest`, pooled
@@ -5271,7 +5374,9 @@ mod display_status_events {
         assert_silent(&mut sub).await;
         let mut ws = h.store.get_workspace(&h.ws).await.expect("reload");
         ws.task_stats = Some(h.services.cheap_task_stats(&h.ws).await.expect("stats"));
-        h.services.enrich_display_status(&mut ws, None, None).await;
+        h.services
+            .enrich_display_status(&mut ws, None, None, None)
+            .await;
         assert_eq!(ws.display_status, Some(WorkspaceDisplayStatus::Complete));
 
         h.services.mark_seen(h.ws.clone()).await.expect("mark seen");

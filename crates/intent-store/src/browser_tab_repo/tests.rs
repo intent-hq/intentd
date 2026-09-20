@@ -77,7 +77,9 @@ fn test_workspace(ws_id: &WorkspaceId, ts: &str) -> Workspace {
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
         browser_client_id: None,
+        pull_requests_total: None,
     }
 }
 

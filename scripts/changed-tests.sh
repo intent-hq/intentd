@@ -49,11 +49,14 @@
 # (`make test`, the merge queue) stays the complete gate.
 #
 # Exit codes: 0 = nothing to test, or every invocation passed; 2 = usage error
-# or BASE cannot be resolved; 3 = a build-wide file changed (Cargo.toml,
+# or a git command failed; 3 = a build-wide file changed (Cargo.toml,
 # Cargo.lock, crates/*/Cargo.toml, crates/*/build.rs, .config/nextest.toml,
 # rust-toolchain.toml, .cargo/**) or a non-inert path outside crates/ changed
-# -- run the full `make test` instead; any other code is the first failing
-# cargo invocation's (or the runner's) exit code. Under --instrumented a
+# -- run the full `make test` instead; 4 = `git merge-base HEAD BASE` failed
+# (BASE unknown, or not connected to HEAD in a shallow checkout -- an
+# environment problem, not a test result; intent-hq/intent#5414); any other
+# code is the first failing cargo invocation's (or the runner's) exit code.
+# Under --instrumented a
 # build-wide change never exits 3: the full instrumented suite already runs in
 # the merge queue, so the script prints a notice naming the files and still
 # runs the mapped crates/ selection (a build-wide file under crates/<c>/
@@ -118,7 +121,7 @@ die() {
 cd "$repo_root"
 git rev-parse --git-dir >/dev/null 2>&1 || die 2 "$repo_root is not a git checkout"
 merge_base=$(git merge-base HEAD "$base" 2>/dev/null) ||
-  die 2 "cannot resolve BASE '$base'; run 'git fetch origin main' or set BASE=<ref>"
+  die 4 "cannot resolve BASE '$base'; run 'git fetch origin main' or set BASE=<ref>"
 
 # Paths outside crates/ that no test can observe.
 is_inert() {

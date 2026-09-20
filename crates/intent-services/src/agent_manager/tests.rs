@@ -1937,12 +1937,14 @@ async fn process_cap_events_queued_resumed_evicted() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.unwrap();
     let (a, b) = (AgentId::from("a"), AgentId::from("b"));
@@ -4413,12 +4415,14 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -5229,12 +5233,14 @@ async fn seed_agent_with_task_graph(
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     let session = AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -10470,6 +10476,7 @@ fn turn_progress_check_excludes_only_empty_marker_row() {
             content,
             metadata: None,
             app_message_id: None,
+            author: None,
             created_at: now_iso(),
         }
     }
@@ -11488,12 +11495,14 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store
         .insert_workspace(&workspace)
@@ -16026,12 +16035,14 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("existing workspace path resolves");
@@ -16142,12 +16153,14 @@ async fn resolve_spawn_falls_back_to_repository_path() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: Some(intent_core::CheckoutMode::Direct),
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("repository_path fallback resolves");
@@ -16562,11 +16575,13 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -16931,12 +16946,14 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
 
     assert_eq!(

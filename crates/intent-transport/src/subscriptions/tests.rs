@@ -2448,6 +2448,347 @@ mod workspace_delta_chief {
     }
 }
 
+// --- workspace_delta rows carry the list projection (slim_for_list) --------
+
+mod workspace_delta_list_projection {
+    use super::*;
+    use intent_core::{
+        chief_workspace, BoxFuture, PullRequestInfo, PullRequestStatus, Result, SetupScript,
+        TokenUsage, Workspace, WorkspaceApi, WorkspaceId, WORKSPACE_LIST_PR_CAP,
+        WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_KEYS,
+    };
+
+    /// `get_workspace` serves the FULL detail row (`workspace.get` shape):
+    /// detail-only `tokenUsage` / `setupScript` / `contextLinks`, and a PR
+    /// pool over [`WORKSPACE_LIST_PR_CAP`] whose entries carry the detail-only
+    /// `headSha` / `author`.
+    struct DetailWorkspaceApi;
+
+    /// Pool length served by the detail read: over the list cap so the
+    /// truncation (and `pullRequestsTotal`) is exercised on the delta path.
+    const POOL_LEN: usize = WORKSPACE_LIST_PR_CAP + 3;
+
+    fn pr(number: usize) -> PullRequestInfo {
+        PullRequestInfo {
+            id: format!("pr-{number}"),
+            number: u64::try_from(number).expect("small"),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            title: format!("PR {number}"),
+            status: PullRequestStatus::Open,
+            created_at: "t0".to_string(),
+            updated_at: format!("t{number}"),
+            base_ref: Some("main".to_string()),
+            head_ref: Some(format!("feat/{number}")),
+            head_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            author: Some("octocat".to_string()),
+            mergeable: Some(true),
+            mergeable_state: Some("clean".to_string()),
+            is_draft: Some(false),
+        }
+    }
+
+    impl WorkspaceApi for DetailWorkspaceApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            Box::pin(async move {
+                Ok(Workspace {
+                    id,
+                    token_usage: Some(TokenUsage::default()),
+                    setup_script: Some(SetupScript {
+                        script: "npm install".to_string(),
+                        project_type: None,
+                        updated_at: 1,
+                        generated_by: None,
+                    }),
+                    context_links: Some(vec![]),
+                    active_pull_request: Some(pr(1)),
+                    pull_requests: Some((1..=POOL_LEN).map(pr).collect()),
+                    ..chief_workspace()
+                })
+            })
+        }
+    }
+
+    fn workspace_event(event_type: &str) -> Event {
+        Event {
+            id: "evt-1".into(),
+            event_type: event_type.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from("w"),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({ "workspaceId": "w" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_rows_are_slimmed_like_the_seq_0_snapshot() {
+        // The `workspace` channel re-reads via `workspace.get` (full detail
+        // row); the pushed `added` / `updated` row must nonetheless be the
+        // `slim_for_list` shape the lite seq-0 snapshot serves, so a delta
+        // never re-hydrates `tokenUsage` / `setupScript` / `contextLinks`
+        // or an uncapped PR pool into subscribed clients' lists.
+        for (event_type, key) in [
+            (WORKSPACE_CREATED, "added"),
+            (WORKSPACE_UPDATED, "updated"),
+            (PR_UPDATED, "updated"),
+        ] {
+            let d = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type))
+                .await
+                .expect("delta");
+            let row = &d[key][0];
+            let obj = row.as_object().expect("row object");
+            for detail in ["tokenUsage", "setupScript", "contextLinks", "diskUsage"] {
+                assert!(
+                    !obj.contains_key(detail),
+                    "{event_type}: delta row carries detail-only `{detail}`: {row}"
+                );
+            }
+            let unlisted: Vec<&str> = obj
+                .keys()
+                .map(String::as_str)
+                .filter(|k| !WORKSPACE_LIST_ROW_KEYS.contains(k))
+                .collect();
+            assert!(
+                unlisted.is_empty(),
+                "{event_type}: delta row carries keys outside WORKSPACE_LIST_ROW_KEYS: \
+                 {unlisted:?}: {row}"
+            );
+            let prs = row["pullRequests"].as_array().expect("pullRequests");
+            assert_eq!(prs.len(), WORKSPACE_LIST_PR_CAP, "{event_type}: {row}");
+            assert_eq!(
+                row["pullRequestsTotal"].as_u64().map(usize::try_from),
+                Some(Ok(POOL_LEN)),
+                "{event_type}: {row}"
+            );
+            for entry in prs.iter().chain(std::iter::once(&row["activePullRequest"])) {
+                let unlisted: Vec<&str> = entry
+                    .as_object()
+                    .expect("pr object")
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|k| !WORKSPACE_LIST_PR_KEYS.contains(k))
+                    .collect();
+                assert!(
+                    unlisted.is_empty(),
+                    "{event_type}: PR entry carries keys outside WORKSPACE_LIST_PR_KEYS: \
+                     {unlisted:?}: {entry}"
+                );
+            }
+        }
+    }
+}
+
+// --- agent_delta rows carry the list projection (intent-hq/intent#5383) ----
+
+mod agent_delta_list_projection {
+    use super::*;
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, AgentId, AgentLite, BoxFuture, Result,
+        WorkspaceApi, WorkspaceId, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
+        AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS,
+    };
+
+    const DETAIL_ONLY_ROW_KEYS: &[&str] = &[
+        "harnessFeatures",
+        "effortLevels",
+        "contextReferences",
+        "fileBlocks",
+        "stats",
+    ];
+    const DETAIL_ONLY_METADATA_KEYS: &[&str] = &["pendingProposals", "proposalResolutions"];
+
+    /// `agent_get` serves the FULL `agent.get` detail row: every detail-only
+    /// field populated and every render-preview string far over
+    /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] — what the seq-0 `agent.list`
+    /// snapshot would have stripped and capped.
+    struct DetailAgentApi;
+
+    fn detail_row() -> AgentLite {
+        let big = "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 3);
+        let metadata = json!({
+            "isBackground": true,
+            "specialist": "implementor",
+            "createdByAgentId": "agent-parent",
+            "taskNoteId": "n-1",
+            "completionReport": big,
+            "completionReportTimestamp": "t1",
+            "attentionRequestKind": "discussion",
+            "attentionRequestReason": big,
+            "attentionRequestTimestamp": "t1",
+            "delegationDepth": 2,
+            "sandboxId": "sbx-1",
+            "sandboxPath": "/home/u/.sandboxes/sbx-1",
+            "sandboxBranch": "sandbox/sbx-1",
+            "dismissedQuestionsMessageId": "msg-q",
+            "pendingQuestionsMessageId": "msg-p",
+            "pendingProposals": [{ "proposalId": "prop-1", "messageId": "msg-1" }],
+            "proposalResolutions": { "prop-0": "applied" },
+            "lastSeenMessageId": "msg-seen",
+            "isInitialAgent": true,
+            "sponsorAgentId": "agent-sponsor",
+        });
+        serde_json::from_value(json!({
+            "id": "agent-1",
+            "workspaceId": "w",
+            "parentAgentId": "agent-parent",
+            "backendSessionId": "agent-backend",
+            "acpSessionId": "acp-1",
+            "name": "Worker",
+            "nameExplicitlySet": true,
+            "model": "claude-sonnet-4-5",
+            "reasoningEffort": "medium",
+            "effortLevels": ["low", "medium", "high"],
+            "provider": "auggie",
+            "status": "active",
+            "isActive": true,
+            "waitingForAgentIds": ["agent-child"],
+            "waitingOnHooks": [{ "hookId": "h-1", "name": "Wait for CI" }],
+            "waitingOnPrMonitors": [{ "monitorId": "m-1", "prNumber": 1 }],
+            "lastStreamActivityAt": "t1",
+            "contextUsage": { "used": 1, "size": 2, "updatedAt": "t1" },
+            "stats": { "creditsUsed": 1.5, "messageCount": 3, "toolCount": 2 },
+            "createdAt": "t0",
+            "updatedAt": "t1",
+            "lastActivity": "t1",
+            "messageCount": 3,
+            "lastAgentResponse": big,
+            "lastUserMessage": big,
+            "lastMessageRole": "assistant",
+            "lastMessageId": "msg-1",
+            "lastToolUse": { "name": "str-replace-editor", "input": { "old_str_1": big } },
+            "digest": big,
+            "contextReferences": [{ "type": "file", "path": "src/lib.rs" }],
+            "fileBlocks": [{ "type": "file", "path": "docs/a.md", "size": 1200 }],
+            "stopReason": "end_turn",
+            "stopReasonTimestamp": "t1",
+            "pendingDeleteAt": "t9",
+            "retiredAt": "t9",
+            "notificationsMuted": true,
+            "harnessVersion": "1",
+            "harnessFeatures": { "hooks": true },
+            "metadata": metadata,
+        }))
+        .expect("agent.get detail row deserializes")
+    }
+
+    impl WorkspaceApi for DetailAgentApi {
+        fn agent_get(
+            &self,
+            _agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<AgentLite>> {
+            Box::pin(async { Ok(detail_row()) })
+        }
+    }
+
+    fn agent_event(event_type: &str) -> Event {
+        Event {
+            id: "evt-1".into(),
+            event_type: event_type.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from("w"),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({ "agentId": "agent-1" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_rows_satisfy_the_agent_list_allowlist_and_row_budget() {
+        // The `agent` channel re-reads via `agent.get` (full detail row); the
+        // pushed `added` / `updated` row must nonetheless be the `agent.list`
+        // projection (`strip_detail_only_fields` + `cap_list_previews`): the
+        // same key allowlist goldens and row budget the seq-0 snapshot rows
+        // satisfy, so a delta never re-hydrates what the snapshot stripped.
+        let sanity = serde_json::to_value(detail_row()).unwrap();
+        assert!(
+            serialized_key_bytes(&sanity).0 > AGENT_LIST_ROW_BUDGET_BYTES,
+            "fixture must be over budget before projection"
+        );
+        for (event_type, key) in [
+            (AGENT_CREATED, "added"),
+            (AGENT_RESTORED, "added"),
+            (AGENT_STATUS_CHANGED, "updated"),
+            (AGENT_UPDATED, "updated"),
+            (AGENT_COMPLETED, "updated"),
+        ] {
+            let d = agent_delta(&DetailAgentApi, &agent_event(event_type))
+                .await
+                .expect("delta");
+            let row = &d[key][0];
+            let obj = row.as_object().expect("row object");
+            let meta = row["metadata"].as_object().expect("metadata object");
+            for detail in DETAIL_ONLY_ROW_KEYS {
+                assert!(
+                    !obj.contains_key(*detail),
+                    "{event_type}: delta row carries detail-only `{detail}`: {row}"
+                );
+            }
+            for detail in DETAIL_ONLY_METADATA_KEYS {
+                assert!(
+                    !meta.contains_key(*detail),
+                    "{event_type}: delta metadata carries detail-only `{detail}`: {row}"
+                );
+            }
+            for (label, object, allow) in [
+                ("row", obj, AGENT_LIST_ROW_KEYS),
+                ("metadata", meta, AGENT_LIST_ROW_METADATA_KEYS),
+            ] {
+                let unlisted: Vec<&str> = object
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|k| !allow.contains(k))
+                    .collect();
+                assert!(
+                    unlisted.is_empty(),
+                    "{event_type}: agent delta {label} carries keys outside the agent.list \
+                     allowlist golden: {unlisted:?}: {row}"
+                );
+            }
+            for (label, s) in [
+                ("lastAgentResponse", &row["lastAgentResponse"]),
+                ("lastUserMessage", &row["lastUserMessage"]),
+                ("digest", &row["digest"]),
+                (
+                    "metadata.completionReport",
+                    &row["metadata"]["completionReport"],
+                ),
+                (
+                    "metadata.attentionRequestReason",
+                    &row["metadata"]["attentionRequestReason"],
+                ),
+            ] {
+                assert_eq!(
+                    s.as_str().map(str::len),
+                    Some(AGENT_LIST_PREVIEW_BUDGET_BYTES),
+                    "{event_type}: `{label}` must be capped like an agent.list row"
+                );
+            }
+            assert_eq!(row["lastToolUse"]["inputTruncated"], json!(true));
+            let (total, per_key) = serialized_key_bytes(row);
+            assert!(
+                total <= AGENT_LIST_ROW_BUDGET_BYTES,
+                "{event_type}: agent delta row is {total} B, over AGENT_LIST_ROW_BUDGET_BYTES \
+                 ({AGENT_LIST_ROW_BUDGET_BYTES} B) — the delta must apply the same list \
+                 projection as agent.list.\n{}",
+                format_key_bytes_table(total, &per_key)
+            );
+        }
+    }
+}
+
 // --- chat_snapshot bounded seq-0 read (monorepo#958 regression) ------------
 
 mod chat_snapshot_bounded {

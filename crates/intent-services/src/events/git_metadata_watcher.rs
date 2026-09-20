@@ -424,6 +424,7 @@ mod tests {
 
     use super::super::bus::{EventBus, Subscription};
     use super::super::filter::SubscriptionFilter;
+    use super::super::git_status_refresher::DEBOUNCE;
     use super::*;
 
     /// Self-cleaning temp directory (workspace worktrees).
@@ -1117,8 +1118,32 @@ mod tests {
             &root.path.clone(),
         )
         .expect("git repo must gain a metadata watch");
-        watcher.wait_established(crate::events::LIVENESS).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Establishment and the settle drain below share one liveness budget
+        // so a refresh loop fails here with a diagnostic instead of holding
+        // `WATCHER_TEST_SERIAL` until the harness timeout.
+        let budget = crate::events::TestBudget::liveness();
+        watcher.wait_established(budget.remaining()).await;
+        // macOS FSEvents replays mutations that landed just before the stream
+        // was created — here `init_repo`'s ref writes under `.git/refs/`,
+        // which are genuine metadata paths and legitimately schedule a
+        // debounced refresh (intent-hq/intent#3476). Drain until the
+        // refresher has been quiet for longer than its debounce so the
+        // negative assertion below only sees what `COMMIT_EDITMSG` causes.
+        // The quiet interval is a settling heuristic, not proof that no
+        // refresh is pending; the outer budget bounds a continuous stream.
+        let quiet = DEBOUNCE + Duration::from_millis(500);
+        let mut drained = 0usize;
+        let settled = tokio::time::timeout(budget.remaining(), async {
+            while next_event(&mut status_sub, &ws.id, quiet).await.is_some() {
+                drained += 1;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "status refreshes never went quiet for {quiet:?} within the \
+             liveness budget ({drained} drained after establishment)"
+        );
 
         // `COMMIT_EDITMSG` lives in `.git` but is not watched metadata.
         std::fs::write(root.path.join(".git/COMMIT_EDITMSG"), "msg\n").unwrap();

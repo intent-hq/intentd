@@ -61,12 +61,14 @@ fn seed_workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -183,7 +185,26 @@ async fn uds_slice_end_to_end() {
     let wss = resp["result"]["workspaces"]
         .as_array()
         .expect("workspaces array");
-    assert!(wss.iter().any(|w| w["id"] == json!("ws-seed")));
+    let seeded = wss
+        .iter()
+        .find(|w| w["id"] == json!("ws-seed"))
+        .expect("seeded workspace listed");
+    // Multiplayer w1: a UDS connection IS the primary user, so the row's
+    // membership summary is relative to the owner.
+    assert_eq!(seeded["myRole"], json!("owner"));
+    assert_eq!(seeded["memberCount"], json!(1));
+    assert_eq!(seeded["openInviteCount"], json!(0));
+    assert!(seeded["ownerPrincipalId"].is_string());
+
+    // (a') principal.me over UDS: the primary principal, administrator.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":1,"method":"principal.me"}"#,
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "principal.me: {resp}");
+    assert_eq!(resp["result"]["id"], seeded["ownerPrincipalId"]);
+    assert_eq!(resp["result"]["isAdministrator"], json!(true));
 
     // (b) note.list with the seeded workspaceId
     let resp = send(

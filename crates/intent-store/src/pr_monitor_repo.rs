@@ -286,6 +286,80 @@ pub struct PrMonitorListEntry {
     pub snapshot_mergeable: Option<bool>,
 }
 
+/// One workspace's PR-monitor inputs for `workspace.get`, read by
+/// [`Store::load_workspace_pr_monitor_reads`] in a single statement.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspacePrMonitorReads {
+    /// The displayStatus derivation rows — ACTIVE rows plus the latest
+    /// COMPLETED row, oldest first — carrying only what the fold reads
+    /// (`state`, `last_snapshot`, `updated_at`, identity):
+    /// `baseline_snapshot` / `pending_changes` are never selected and read
+    /// as absent.
+    pub display_rows: Vec<PrMonitor>,
+    /// Every non-cancelled row as the PR-merge projection, oldest first.
+    pub list_entries: Vec<PrMonitorListEntry>,
+}
+
+/// The [`PrMonitorListEntry`] projection query over the non-cancelled rows,
+/// with `extra_filter` appended to the inner `WHERE` (the archived-workspace
+/// exclusion). The blob columns are never
+/// selected: the few `last_snapshot` scalars the merge consumes are
+/// `json_extract`ed in SQL, guarded by `json_valid` so a malformed blob
+/// degrades to NULL scalars instead of failing the query.
+fn non_cancelled_list_entry_sql(extra_filter: &str) -> String {
+    format!(
+        "SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
+         updated_at, \
+         json_extract(snapshot, '$.url') AS snapshot_url, \
+         json_extract(snapshot, '$.title') AS snapshot_title, \
+         json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
+         json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
+         json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
+         json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable \
+         FROM (SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
+         updated_at, \
+         CASE WHEN json_valid(last_snapshot) THEN last_snapshot END AS snapshot \
+         FROM pr_monitor WHERE state != 'cancelled'{extra_filter}) \
+         ORDER BY created_at"
+    )
+}
+
+/// The single statement behind [`Store::load_workspace_pr_monitor_reads`]
+/// (one `?` bind: the workspace id), exposed so the plan-shape regression
+/// test EXPLAINs the exact production SQL.
+///
+/// Shape matters here, not just the projection: the per-state
+/// `ROW_NUMBER()` that picks the latest COMPLETED row runs in a window
+/// sorter, and every column of the ranked subquery's rows is copied into
+/// that sorter's records. Ranking the narrow identity (`monitor_id`, keyed
+/// by `state` / `updated_at`) alone and joining back to `pr_monitor` on its
+/// primary key afterwards keeps `last_snapshot` out of the sorter, so the
+/// blob is read only after `state_rank` is known and only reaches the
+/// result row for the displayStatus set — ranking the full row instead
+/// carried every completed monitor's snapshot into the window sort
+/// (intentd#2001 review).
+fn workspace_pr_monitor_reads_sql() -> &'static str {
+    "SELECT monitor_id, agent_id, workspace_id, repo_owner, repo_name, pr_number, \
+     state, created_at, updated_at, \
+     json_extract(snapshot, '$.url') AS snapshot_url, \
+     json_extract(snapshot, '$.title') AS snapshot_title, \
+     json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
+     json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
+     json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
+     json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable, \
+     display_row, \
+     CASE WHEN display_row THEN last_snapshot END AS display_snapshot \
+     FROM (SELECT m.monitor_id, m.agent_id, m.workspace_id, m.repo_owner, m.repo_name, \
+     m.pr_number, m.state, m.created_at, m.updated_at, m.last_snapshot, \
+     CASE WHEN json_valid(m.last_snapshot) THEN m.last_snapshot END AS snapshot, \
+     (m.state = 'active' OR r.state_rank = 1) AS display_row \
+     FROM (SELECT monitor_id, \
+     ROW_NUMBER() OVER (PARTITION BY state ORDER BY updated_at DESC) AS state_rank \
+     FROM pr_monitor WHERE workspace_id = ? AND state != 'cancelled') AS r \
+     JOIN pr_monitor AS m ON m.monitor_id = r.monitor_id) \
+     ORDER BY created_at"
+}
+
 fn list_entry_from_row(r: &SqliteRow) -> Result<PrMonitorListEntry> {
     let err =
         |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor list row: {e}"));
@@ -689,28 +763,82 @@ impl Store {
         } else {
             " AND workspace_id IN (SELECT id FROM workspace WHERE archived = 0)"
         };
-        let sql = format!(
-            "SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
-             updated_at, \
-             json_extract(snapshot, '$.url') AS snapshot_url, \
-             json_extract(snapshot, '$.title') AS snapshot_title, \
-             json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
-             json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
-             json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
-             json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable \
-             FROM (SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
-             updated_at, \
-             CASE WHEN json_valid(last_snapshot) THEN last_snapshot END AS snapshot \
-             FROM pr_monitor WHERE state != 'cancelled'{archived_filter}) \
-             ORDER BY created_at"
-        );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(&non_cancelled_list_entry_sql(archived_filter))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| {
                 intent_core::Error::Internal(format!("load pr monitor list entries failed: {e}"))
             })?;
         rows.iter().map(list_entry_from_row).collect()
+    }
+
+    /// One workspace's PR-monitor inputs for `workspace.get` in ONE
+    /// statement: every non-cancelled row as the narrow
+    /// [`PrMonitorListEntry`] projection (the PR merge, same shape as
+    /// [`Store::load_non_cancelled_pr_monitor_list_entries`]) plus the
+    /// displayStatus rows — the ACTIVE rows and the single most recently
+    /// updated COMPLETED row, exactly the set
+    /// [`Store::list_display_status_pr_monitors_by_workspace`] returns. The
+    /// `last_snapshot` blob reaches the result only for those displayStatus
+    /// rows (`display_snapshot`, NULL elsewhere) and is read only after the
+    /// per-state ranking — the ranking runs over the narrow monitor identity
+    /// and joins back on the primary key ([`workspace_pr_monitor_reads_sql`]),
+    /// so the window sorter never carries snapshot bytes for the completed
+    /// history. Each non-cancelled row still costs one `last_snapshot` read
+    /// for its `json_extract`ed scalars (the projection covers the whole
+    /// non-cancelled history), so the statement is O(non-cancelled monitors)
+    /// in blob reads but O(displayStatus rows) in blob bytes materialized
+    /// into the result; `baseline_snapshot` / `pending_changes` are never
+    /// selected (`idx_pr_monitor_workspace` SEARCH, then a primary-key
+    /// SEARCH per ranked row). No archived filter: `workspace.get` serves
+    /// archived workspaces too.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn load_workspace_pr_monitor_reads(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspacePrMonitorReads> {
+        let rows = sqlx::query(workspace_pr_monitor_reads_sql())
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!(
+                    "load pr monitor reads for workspace failed: {e}"
+                ))
+            })?;
+        let err =
+            |e: sqlx::Error| intent_core::Error::Internal(format!("read pr monitor list row: {e}"));
+        let mut reads = WorkspacePrMonitorReads::default();
+        for r in &rows {
+            let entry = list_entry_from_row(r)?;
+            if r.try_get::<bool, _>("display_row").map_err(err)? {
+                reads.display_rows.push(PrMonitor {
+                    monitor_id: PrMonitorId(r.try_get::<String, _>("monitor_id").map_err(err)?),
+                    workspace_id: entry.workspace_id.clone(),
+                    agent_id: AgentId(r.try_get::<String, _>("agent_id").map_err(err)?),
+                    repo_owner: entry.repo_owner.clone(),
+                    repo_name: entry.repo_name.clone(),
+                    pr_number: entry.pr_number,
+                    state: entry.state,
+                    last_snapshot: r
+                        .try_get::<Option<String>, _>("display_snapshot")
+                        .map_err(err)?,
+                    baseline_snapshot: None,
+                    pending_changes: Vec::new(),
+                    pending_since: None,
+                    last_change_at: None,
+                    last_polled_at: None,
+                    last_error: None,
+                    created_at: entry.created_at.clone(),
+                    updated_at: entry.updated_at.clone(),
+                });
+            }
+            reads.list_entries.push(entry);
+        }
+        Ok(reads)
     }
 
     /// Set a monitor's lifecycle state. Every legal transition starts from
@@ -1012,12 +1140,14 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -1188,7 +1318,9 @@ mod tests {
     /// them, so the shape is enforced at compile time. A missing or malformed
     /// `last_snapshot` degrades to NULL scalars instead of failing the query,
     /// cancelled rows are excluded, and archived-workspace rows are filtered
-    /// unless `include_archived`.
+    /// unless `include_archived`. The per-workspace `workspace.get` read
+    /// serves the same projection scoped to one workspace, archived or not,
+    /// alongside the displayStatus rows in the same statement.
     #[tokio::test]
     async fn list_entries_project_snapshot_scalars_without_blobs() {
         let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
@@ -1299,6 +1431,294 @@ mod tests {
             vec![1, 2, 3, 5],
             "include_archived adds the archived workspace's row; cancelled stays excluded"
         );
+
+        // Per-workspace `workspace.get` read: the same projection over this
+        // workspace's non-cancelled rows (archived served regardless), plus
+        // the displayStatus rows — active rows and only the LATEST completed
+        // row — carrying the snapshot blob.
+        let mut older_completed = mk(
+            6,
+            PrMonitorState::Completed,
+            Some(r#"{"v":6}"#.to_string()),
+            "2025-12-31T00:00:00Z",
+        );
+        older_completed.updated_at = "2025-12-31T00:00:00Z".to_string();
+        assert!(store
+            .insert_pr_monitor(&older_completed)
+            .await
+            .expect("insert older completed"));
+        let reads = store
+            .load_workspace_pr_monitor_reads(&ws_id)
+            .await
+            .expect("workspace reads");
+        assert_eq!(
+            reads
+                .list_entries
+                .iter()
+                .map(|e| e.pr_number)
+                .collect::<Vec<_>>(),
+            vec![6, 1, 2, 3],
+            "list entries: every non-cancelled row, oldest first"
+        );
+        assert_eq!(
+            reads.list_entries[1].snapshot_url.as_deref(),
+            Some("https://github.com/o/r/pull/1")
+        );
+        assert_eq!(
+            reads.list_entries[1].snapshot_state.as_deref(),
+            Some("merged")
+        );
+        assert_eq!(
+            reads
+                .display_rows
+                .iter()
+                .map(|m| (m.pr_number, m.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, PrMonitorState::Active),
+                (2, PrMonitorState::Completed),
+                (3, PrMonitorState::Active),
+            ],
+            "display rows: active rows plus only the latest completed row"
+        );
+        let display_1 = &reads.display_rows[0];
+        assert_eq!(display_1.workspace_id, ws_id);
+        assert_eq!(display_1.agent_id, agent_id);
+        assert!(
+            display_1
+                .last_snapshot
+                .as_deref()
+                .is_some_and(|s| s.contains("\"headSha\":\"abc123\"")),
+            "display rows carry the snapshot blob"
+        );
+        assert_eq!(
+            display_1.baseline_snapshot, None,
+            "baseline blob is never selected"
+        );
+        assert!(display_1.pending_changes.is_empty());
+        assert_eq!(
+            reads.display_rows[2].last_snapshot.as_deref(),
+            Some("{not json"),
+            "the display row carries the raw blob; the fold tolerates it"
+        );
+        let archived_reads = store
+            .load_workspace_pr_monitor_reads(&archived_ws)
+            .await
+            .expect("archived workspace reads");
+        assert_eq!(
+            archived_reads
+                .list_entries
+                .iter()
+                .map(|e| e.pr_number)
+                .collect::<Vec<_>>(),
+            vec![5],
+            "workspace read has no archived filter"
+        );
+        assert_eq!(archived_reads.display_rows.len(), 1);
+    }
+
+    /// Plan-shape guard for [`workspace_pr_monitor_reads_sql`] (intentd#2001
+    /// review): the per-state `ROW_NUMBER()` must rank the narrow monitor
+    /// identity and join back on the primary key, so no `last_snapshot`
+    /// column read from the `pr_monitor` table cursor happens before the
+    /// window sorter has sorted (`SorterSort`) — a read before it means the
+    /// blob is being copied into the sorter record for every non-cancelled
+    /// row, which is what the outer `display_snapshot` CASE cannot undo.
+    /// `baseline_snapshot` / `pending_changes` must not be read at all. The
+    /// old rank-the-full-row shape is kept as a positive control: it MUST
+    /// trip the same check, so an opcode rename in a bundled-SQLite bump
+    /// fails loudly instead of leaving the guard vacuous. Output equivalence
+    /// of the two shapes is covered by the round-trip test above; this test
+    /// also runs the statement against a history of large completed
+    /// snapshots to pin the one-display-blob result.
+    #[tokio::test]
+    async fn workspace_pr_monitor_reads_rank_narrow_identity_before_blob_read() {
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let table_root: i64 =
+            sqlx::query("SELECT rootpage FROM sqlite_master WHERE name = 'pr_monitor'")
+                .fetch_one(store.read_pool())
+                .await
+                .expect("pr_monitor rootpage")
+                .get("rootpage");
+        let mut ordinals = std::collections::HashMap::new();
+        for row in sqlx::query("PRAGMA table_info(pr_monitor)")
+            .fetch_all(store.read_pool())
+            .await
+            .expect("pr_monitor columns")
+        {
+            ordinals.insert(row.get::<String, _>("name"), row.get::<i64, _>("cid"));
+        }
+        let blob_ordinals: Vec<(&'static str, i64)> =
+            ["last_snapshot", "baseline_snapshot", "pending_changes"]
+                .into_iter()
+                .map(|c| (c, ordinals[c]))
+                .collect();
+
+        // For a statement: (blob columns read from a `pr_monitor` table cursor
+        // before the first `SorterSort`, blob columns read anywhere).
+        let blob_reads = |ops: &[(String, i64, i64)]| -> (Vec<&'static str>, Vec<&'static str>) {
+            let table_cursors: Vec<i64> = ops
+                .iter()
+                .filter(|(op, _, p2)| op == "OpenRead" && *p2 == table_root)
+                .map(|(_, p1, _)| *p1)
+                .collect();
+            let first_sort = ops
+                .iter()
+                .position(|(op, _, _)| op == "SorterSort")
+                .unwrap_or(ops.len());
+            let all: Vec<(usize, &'static str)> = ops
+                .iter()
+                .enumerate()
+                .filter(|(_, (op, p1, _))| op == "Column" && table_cursors.contains(p1))
+                .filter_map(|(i, (_, _, p2))| {
+                    blob_ordinals
+                        .iter()
+                        .find(|(_, cid)| cid == p2)
+                        .map(|(name, _)| (i, *name))
+                })
+                .collect();
+            (
+                all.iter()
+                    .filter(|(i, _)| *i < first_sort)
+                    .map(|(_, n)| *n)
+                    .collect(),
+                all.iter().map(|(_, n)| *n).collect(),
+            )
+        };
+        let ws = ws_id.0.as_str();
+        let pool = store.read_pool();
+        let explain = |sql: String| async move {
+            sqlx::query(&sql)
+                .bind(ws)
+                .fetch_all(pool)
+                .await
+                .expect("explain")
+        };
+
+        let sql = workspace_pr_monitor_reads_sql();
+        let details: Vec<String> = explain(format!("EXPLAIN QUERY PLAN {sql}"))
+            .await
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("USING INDEX idx_pr_monitor_workspace")),
+            "ranking must SEARCH the workspace index, plan: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("SEARCH m USING INDEX sqlite_autoindex_pr_monitor_1")),
+            "the projection must join back on the monitor_id primary key, plan: {details:?}"
+        );
+        let ops: Vec<(String, i64, i64)> = explain(format!("EXPLAIN {sql}"))
+            .await
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("opcode"),
+                    row.get::<i64, _>("p1"),
+                    row.get::<i64, _>("p2"),
+                )
+            })
+            .collect();
+        assert!(
+            ops.iter().any(|(op, _, _)| op == "SorterSort"),
+            "window ranking is expected to run through a sorter, opcodes: {ops:?}"
+        );
+        let (before_sort, anywhere) = blob_reads(&ops);
+        assert!(
+            before_sort.is_empty(),
+            "blob column(s) {before_sort:?} are read from the pr_monitor table cursor \
+             before the window sort — the ranked subquery must carry only the narrow \
+             identity, opcodes: {ops:?}"
+        );
+        assert!(
+            anywhere.iter().all(|n| *n == "last_snapshot"),
+            "baseline_snapshot / pending_changes must never be read: {anywhere:?}"
+        );
+
+        // Positive control: the pre-review shape (rank the full row, CASE
+        // the blob afterwards) reads `last_snapshot` into the sorter record.
+        let control = "SELECT monitor_id, agent_id, workspace_id, repo_owner, repo_name, \
+             pr_number, state, created_at, updated_at, \
+             json_extract(snapshot, '$.url') AS snapshot_url, \
+             (state = 'active' OR state_rank = 1) AS display_row, \
+             CASE WHEN state = 'active' OR state_rank = 1 THEN last_snapshot END \
+             AS display_snapshot \
+             FROM (SELECT monitor_id, agent_id, workspace_id, repo_owner, repo_name, \
+             pr_number, state, created_at, updated_at, last_snapshot, \
+             CASE WHEN json_valid(last_snapshot) THEN last_snapshot END AS snapshot, \
+             ROW_NUMBER() OVER (PARTITION BY state ORDER BY updated_at DESC) AS state_rank \
+             FROM pr_monitor WHERE workspace_id = ? AND state != 'cancelled') \
+             ORDER BY created_at";
+        let control_ops: Vec<(String, i64, i64)> = explain(format!("EXPLAIN {control}"))
+            .await
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("opcode"),
+                    row.get::<i64, _>("p1"),
+                    row.get::<i64, _>("p2"),
+                )
+            })
+            .collect();
+        let (control_before_sort, _) = blob_reads(&control_ops);
+        assert!(
+            control_before_sort.contains(&"last_snapshot"),
+            "positive control lost: the rank-the-full-row shape no longer shows a \
+             `last_snapshot` Column read before `SorterSort`, so the guard above is \
+             vacuous — re-verify the opcode names for this SQLite version, \
+             opcodes: {control_ops:?}"
+        );
+
+        // Large completed history: one active row plus many completed rows
+        // with ~64 KiB snapshots; only the active row and the LATEST
+        // completed row carry a display snapshot, every row projects scalars.
+        let pad = "x".repeat(64 * 1024);
+        let ts = now_iso();
+        for i in 1..=40_i64 {
+            let mut m = test_monitor(&ws_id, &agent_id, &ts);
+            m.pr_number = i;
+            m.state = if i == 40 {
+                PrMonitorState::Active
+            } else {
+                PrMonitorState::Completed
+            };
+            m.created_at = format!("2026-01-01T00:{i:02}:00Z");
+            m.updated_at = format!("2026-01-02T00:{i:02}:00Z");
+            m.last_snapshot = Some(format!(
+                r#"{{"url":"https://github.com/o/r/pull/{i}","title":"t{i}","pad":"{pad}"}}"#
+            ));
+            assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+        }
+        let reads = store
+            .load_workspace_pr_monitor_reads(&ws_id)
+            .await
+            .expect("workspace reads");
+        assert_eq!(reads.list_entries.len(), 40);
+        assert_eq!(
+            reads.list_entries[0].snapshot_url.as_deref(),
+            Some("https://github.com/o/r/pull/1")
+        );
+        assert_eq!(
+            reads
+                .display_rows
+                .iter()
+                .map(|m| (m.pr_number, m.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (39, PrMonitorState::Completed),
+                (40, PrMonitorState::Active)
+            ],
+            "display rows: latest completed (by updated_at) plus the active row"
+        );
+        assert!(reads
+            .display_rows
+            .iter()
+            .all(|m| m.last_snapshot.as_deref().is_some_and(|s| s.contains(&pad))));
     }
 
     /// `baseline_snapshot` round-trips through insert/get, and

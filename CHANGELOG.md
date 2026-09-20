@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.85] - 2026-09-20
+
+### 🐛 Bug Fixes
+
+- *(services)* Bound auto-commit generation and cool down after timeouts ([#2009](https://github.com/intent-hq/intentd/pull/2009))
+- *(agent)* Surface and end mid-turn provider stalls (intent#5395) ([#2007](https://github.com/intent-hq/intentd/pull/2007))
+- Raise tokio worker stack size to 8 MiB for the daemon runtime ([#2011](https://github.com/intent-hq/intentd/pull/2011))
+
+
+## [0.9.84] - 2026-09-19
+
+### 🧪 Testing
+
+- *(events)* Drain FSEvents replay before the negative git-metadata assertion on macOS ([#2008](https://github.com/intent-hq/intentd/pull/2008))
+
+
+## [0.9.83] - 2026-09-19
+
+### 🚀 Features
+
+- *(rpc)* Slim agent.list / workspace.list rows, scope filter, push-side projection ([#2001](https://github.com/intent-hq/intentd/pull/2001))
+
+### 🐛 Bug Fixes
+
+- *(agent_session)* Raise blocker attention on post-output transient fetch failure ([#2004](https://github.com/intent-hq/intentd/pull/2004))
+
+
+## [0.9.82] - 2026-09-19
+
+### 🐛 Bug Fixes
+
+- *(services)* Serialize same-key first-use in with_idempotency ([#2000](https://github.com/intent-hq/intentd/pull/2000))
+
+
+## [0.9.81] - 2026-09-19
+
+### 🚀 Features
+
+- Support exact-version remote daemon updates ([#1941](https://github.com/intent-hq/intentd/pull/1941))
+
+
+## [0.9.80] - 2026-09-19
+
+### 🚀 Features
+
+- *(acp)* Add ws.workspace.applyProposal binding for agent-applied sibling proposals ([#1995](https://github.com/intent-hq/intentd/pull/1995))
+
+### 🐛 Bug Fixes
+
+- *(acp)* Make queued ws.agent.send durable past the eval budget ([#1994](https://github.com/intent-hq/intentd/pull/1994))
+- *(rpc_profile)* Budget agent.sendQueuedMessageNow / agent.resolveProposal on the compound tier ([#1993](https://github.com/intent-hq/intentd/pull/1993))
+
+### 🧪 Testing
+
+- *(acp)* Egress registry + contract test for AGENT_HIDDEN_FIELDS ([#1996](https://github.com/intent-hq/intentd/pull/1996))
+
+
 ## [0.9.79] - 2026-09-18
 
 ### 🚀 Features

@@ -39,8 +39,11 @@ use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::accept_backoff::{sleep_unless_shutdown, AcceptBackoff, AcceptFailure};
-use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore};
+use crate::auth::{
+    extract_token, is_allowed_origin, validate_token, AsyncTokenStore, ResolvedCredential,
+};
 use crate::conn::{self, ConnSubs};
+use crate::context::Caller;
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::reverse::{PrimaryReverseRegistry, ReverseChannel, ReverseTransport};
@@ -541,22 +544,31 @@ impl WsInner {
         if !is_allowed_origin(origin.as_deref()) {
             return reject(&mut stream, 403, "Forbidden").await;
         }
-        if self.auth_enabled {
+        // The credential resolved at the gate binds the connection's caller
+        // for its whole lifetime (multiplayer w1): the legacy file token is
+        // the primary user, a hashed per-principal credential its principal.
+        // Identity is never taken from `client.hello`. The insecure dev seat
+        // (auth off) is the local user, exactly like UDS.
+        let credential = if self.auth_enabled {
             // Keychain-backed token reads can stall on a locked/prompting OS
             // keychain; [`AsyncTokenStore`] offloads to the blocking pool with
             // a bounded per-call timeout + single-flight cache so a hung
             // upgrade never wedges the accept loop or delays other connections.
-            let ok = match (
+            let resolved = match (
                 self.token_store.as_ref(),
                 extract_token(authorization.as_deref(), target),
             ) {
-                (Some(store), Some(t)) => validate_token(store, &t).await,
-                _ => false,
+                (Some(store), Some(t)) => validate_token(store, self.api.as_ref(), &t).await,
+                _ => None,
             };
-            if !ok {
+            let Some(resolved) = resolved else {
                 return reject(&mut stream, 401, "Unauthorized").await;
-            }
-        }
+            };
+            resolved
+        } else {
+            ResolvedCredential::Legacy
+        };
+        let caller = credential.into_caller(self.api.as_ref()).await;
         let Some(key) = ws_key else {
             return reject(&mut stream, 400, "Bad Request").await;
         };
@@ -607,7 +619,7 @@ impl WsInner {
         if path == "/tunnel" {
             self.spawn_tunnel_connection(ws);
         } else {
-            self.spawn_connection(ws);
+            self.spawn_connection(ws, caller);
         }
         Ok(())
     }
@@ -629,18 +641,21 @@ impl WsInner {
         Ok(())
     }
 
-    /// Register a new client and spawn its connection loop.
-    fn spawn_connection<S>(self: &Arc<Self>, ws: WebSocketStream<S>)
+    /// Register a new client and spawn its connection loop. `caller` is the
+    /// principal binding resolved at the upgrade gate, fixed for the life of
+    /// the connection.
+    fn spawn_connection<S>(self: &Arc<Self>, ws: WebSocketStream<S>, caller: Option<Caller>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
         let last_pong = Arc::new(AtomicI64::new(mono_ms()));
-        let handle = tokio::spawn(
-            self.clone()
-                .connection_loop(id, ws, cmd_rx, last_pong.clone()),
-        );
+        let handle =
+            tokio::spawn(
+                self.clone()
+                    .connection_loop(id, ws, cmd_rx, last_pong.clone(), caller),
+            );
         let abort = handle.abort_handle();
         self.clients.lock().expect("ws clients poisoned").insert(
             id,
@@ -700,6 +715,7 @@ impl WsInner {
         ws: WebSocketStream<S>,
         mut cmd_rx: mpsc::Receiver<ConnCmd>,
         last_pong: Arc<AtomicI64>,
+        caller: Option<Caller>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -749,8 +765,9 @@ impl WsInner {
                         // `host.status` IS answered here, with the resolved WSS
                         // locality (remote unless overridden, §5.14).
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
-                        // RPCs gate on real origin, not the locality flag (§5.2).
-                        let frame_ok = crate::context::with_connection_context(true, async {
+                        // RPCs gate on real origin, not the locality flag (§5.2), and
+                        // bind the caller resolved at upgrade (multiplayer w1).
+                        let frame_ok = crate::context::with_request_context(true, caller.clone(), async {
                             conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, &reverse_guard, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local, &self.rpc_limiter).await
                         }).await;
                         if !frame_ok {

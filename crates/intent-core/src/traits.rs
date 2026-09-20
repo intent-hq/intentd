@@ -7,13 +7,15 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
+use crate::ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, PrincipalId, WorkspaceGitRootId, WorkspaceId,
+};
 use crate::model::{
-    AgentDelegateInput, AgentLite, AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo,
-    CommentAddResult, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
-    CommentResolveThreadResult, CommentRespondResult, ContextItem, Draft, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus,
-    GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
+    AgentDelegateInput, AgentListRowScope, AgentLite, AgentScopeCounts, AgentSession, BrowserTab,
+    BrowserTabInput, ClientHostInfo, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
+    CommentListResult, CommentResolveThreadResult, CommentRespondResult, ContextItem, Draft,
+    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, GitAgentCommitResult,
+    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
     LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
     NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
@@ -1494,6 +1496,36 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_retired_count not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.list { scope }` (PROTOCOL §5.5): ONLY the non-retired sessions
+    /// in one [`AgentListRowScope`] bin (`topLevel` / `delegated` /
+    /// `background`), filtered SQL-side so cost stays O(rows returned).
+    fn agent_list_scoped(
+        &self,
+        workspace_id: WorkspaceId,
+        scope: AgentListRowScope,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        let _ = (workspace_id, scope);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_scoped not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Per-bin non-retired session counts — the `scopeCounts` field attached
+    /// to every `agent.list` response variant (PROTOCOL §5.5).
+    fn agent_scope_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<AgentScopeCounts>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_scope_counts not implemented".to_string(),
             ))
         })
     }
@@ -4394,6 +4426,47 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::github_get_user not implemented".to_string(),
             ))
         })
+    }
+
+    // ========================================================================
+    // principal.* (multiplayer w1)
+    // ========================================================================
+
+    /// `principal.me`: the principal the current request is bound to →
+    /// `{ id, login?, displayName?, avatarUrl?, isAdministrator }`. Profile
+    /// fields are the cached GitHub identity (served offline); a wire caller
+    /// resolves to its bound principal, agent and daemon callers to the
+    /// primary principal. Fails when no caller is bound (fail-closed).
+    fn principal_me(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::principal_me not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Transport seam: the daemon's primary principal, bound to UDS
+    /// connections and to the legacy file bearer token at WSS upgrade.
+    /// Errors when the composition root has no principal store (test stubs);
+    /// the transport then admits the connection with no caller bound.
+    fn primary_principal_id(&self) -> BoxFuture<'_, Result<PrincipalId>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::primary_principal_id not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Transport seam: resolve a presented bearer credential — already hashed
+    /// (hex SHA-256) by the caller, the store never sees plaintext — to its
+    /// principal. `None` for an unknown or revoked hash. Default: no
+    /// per-principal credentials exist.
+    fn resolve_principal_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, Result<Option<PrincipalId>>> {
+        let _ = token_hash;
+        Box::pin(async { Ok(None) })
     }
 
     /// `linear.authStatus`: validate the resolved Linear API key via the GraphQL

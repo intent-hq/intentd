@@ -149,6 +149,8 @@ pub const UPDATE_RESTART_ENV: &str = "INTENTD_UPDATE_RESTART";
 /// [`RESTART_FOR_UPDATE_EXIT_CODE`] when idle. Cleared on one-shot spawns
 /// and off unix.
 pub const IDLE_RESTART_ENV: &str = "INTENTD_SITTER_IDLE_RESTART";
+/// Signals that installer mutations are serialized with the daemon's exact updater.
+pub const EXACT_UPDATE_ENV: &str = "INTENTD_SITTER_EXACT_UPDATE";
 
 /// Exit code by which a supervised daemon asks to be respawned on the
 /// `state.json` version (its answer to SIGUSR2 once idle). Outside 0/1/2
@@ -544,8 +546,10 @@ impl Supervisor {
             // elsewhere so a one-shot never inherits a stale marker.
             if cfg!(unix) && supervised {
                 command.env(IDLE_RESTART_ENV, "1");
+                command.env(EXACT_UPDATE_ENV, "1");
             } else {
                 command.env_remove(IDLE_RESTART_ENV);
+                command.env_remove(EXACT_UPDATE_ENV);
             }
             let mut child = match command.spawn() {
                 Ok(child) => child,
@@ -927,6 +931,10 @@ impl Supervisor {
     fn schedule_next_check(&self) -> Instant {
         let delay = next_check_delay(self.config.check_min, self.config.check_max, random_u64());
         let now = OffsetDateTime::now_utc();
+        let Ok(_lock) = state::lock(&self.paths.state_path) else {
+            eprintln!("intentd-sitter: failed to lock update state; not persisting schedule");
+            return Instant::now() + delay;
+        };
         let mut state = state::load(&self.paths.state_path);
         state.last_check_at = Some(now);
         state.next_check_at = Some(now + delay);

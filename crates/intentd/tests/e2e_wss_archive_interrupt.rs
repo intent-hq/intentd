@@ -315,12 +315,14 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         execution_environment: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 

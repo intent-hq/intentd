@@ -1316,6 +1316,209 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
     );
 }
 
+/// Terminal provider stall under a hung tool call over the real WSS wire
+/// (intent-hq/intent#5395 — the opencode/grok signature): the mock's
+/// `parkMidToolCall` mode streams ONE `tool_call` (`in_progress`) and then
+/// goes completely silent — no terminal `tool_call_update`, no prompt
+/// resolution, pipes held open — so the daemon's open-tool ceilings are the
+/// only thing that can end the turn. With the thresholds lowered to seconds
+/// (stall 1s, open-tool advisory 1.5s, tool-free terminal 2s, open-tool
+/// terminal 4s), an `events.subscribe` subscriber MUST observe, in order:
+/// the routed `agent:tool:call`, the `agent:stream:status` `phase: "stalled"`
+/// advisory (open-tool ceiling — the FE leaves "Thinking"), the blocker
+/// `agent:attention-requested`, and `agent:failed` whose `error` is the
+/// `PROVIDER_STALL_PREFIX`-anchored text naming the hung call
+/// (`tc_park_mid_tool`). `agent.getSession` then reports the persisted
+/// `status: "error"` plus the blocker attention. Exactly one terminal
+/// `agent:stream:end` rides the wire (§7: error and complete both map to it),
+/// after the stalled advisory and before `agent:failed` (the deferred
+/// mid-turn raise is flushed just ahead of `agent:failed`). Margins: the
+/// terminal fires ~4s into the park (checker cadence ~166ms), well inside
+/// the 30s collection window on saturated CI runners.
+#[tokio::test]
+async fn open_tool_call_provider_stall_fails_turn_over_wss() {
+    let Some(script) = gate("WSS open-tool provider stall terminal E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // parkMidToolCall: emit tool_call (in_progress) then hold the prompt
+    // open forever (only session/cancel would release it).
+    let behavior = json!({ "parkMidToolCall": true, "response": "never streamed" }).to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_STREAM_STALL_MS", "1000"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "1500"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "2000"),
+        ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "4000"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — events.subscribe BEFORE the turn so we miss nothing.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Hung", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hang on a tool call" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect this agent's frames until agent:failed rides the wire.
+    let events = timeout(Duration::from_secs(30), async {
+        let mut events: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+                continue;
+            }
+            let done = ev["type"] == json!("agent:failed");
+            events.push(ev.clone());
+            if done {
+                return events;
+            }
+        }
+    })
+    .await
+    .expect("hung open tool call fails the turn within the lowered terminal threshold");
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["type"].as_str().unwrap_or_default())
+        .collect();
+
+    let tool_call_idx = types
+        .iter()
+        .position(|t| *t == "agent:tool:call")
+        .unwrap_or_else(|| panic!("tool call routed over the wire: {types:?}"));
+    let stalled_idx = events
+        .iter()
+        .position(|e| {
+            e["type"] == json!("agent:stream:status") && e["data"]["phase"] == json!("stalled")
+        })
+        .unwrap_or_else(|| panic!("stalled advisory precedes the terminal stall: {types:?}"));
+    let attention_idx = types
+        .iter()
+        .position(|t| *t == "agent:attention-requested")
+        .unwrap_or_else(|| panic!("blocker attention raised over the wire: {types:?}"));
+    let failed_idx = types.len() - 1;
+    assert!(
+        tool_call_idx < stalled_idx && stalled_idx < attention_idx && attention_idx < failed_idx,
+        "tool call → stalled → attention-requested → failed: {types:?}"
+    );
+    let ends: Vec<usize> = types
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == "agent:stream:end")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(ends.len(), 1, "one terminal stream:end: {types:?}");
+    assert!(
+        stalled_idx < ends[0] && ends[0] < failed_idx,
+        "stream:end lands after the stalled advisory and before agent:failed: {types:?}"
+    );
+
+    // Payload contract. The stalled advisory fired at the open-tool ceiling
+    // (1.5s), not the tool-free threshold (1s).
+    let stalled = &events[stalled_idx]["data"];
+    assert_eq!(
+        stalled["level"],
+        json!("warn"),
+        "stalled is warn: {stalled}"
+    );
+    assert!(
+        stalled["silentMs"].as_u64().expect("silentMs") >= 1500,
+        "stalled fires at the open-tool ceiling: {stalled}"
+    );
+    let attention = &events[attention_idx]["data"];
+    assert_eq!(
+        attention["kind"],
+        json!("blocker"),
+        "attention kind: {attention}"
+    );
+    let reason = attention["reason"].as_str().expect("attention reason");
+    assert!(
+        reason.contains("provider stall") && reason.contains("tc_park_mid_tool"),
+        "attention reason names the stall and the hung call: {reason}"
+    );
+    let failed = &events[failed_idx]["data"];
+    let error = failed["error"]
+        .as_str()
+        .expect("agent:failed carries error");
+    assert!(
+        error.starts_with(intent_acp::PROVIDER_STALL_PREFIX),
+        "agent:failed error is ProviderStall-prefixed: {error}"
+    );
+    assert!(
+        error.contains("tc_park_mid_tool") && error.contains("still open"),
+        "agent:failed error names the hung tool call: {error}"
+    );
+
+    // Persisted state: the agent is in Error with the blocker attention.
+    let got = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["status"], "error",
+        "provider stall persists Error status: {session}"
+    );
+    assert_eq!(
+        session["attentionRequestKind"], "blocker",
+        "blocker attention persisted: {session}"
+    );
+    assert!(
+        session["attentionRequestReason"]
+            .as_str()
+            .is_some_and(|r| r.contains("tc_park_mid_tool")),
+        "persisted attention reason names the hung call: {session}"
+    );
+}
+
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
 /// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
 /// turn as
@@ -5999,12 +6202,14 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -7624,9 +7829,13 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     .await;
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second send should queue: {send2}");
-    // (a) The queued entry wire shape carries messageMetadata verbatim.
+    // (a) The queued entry wire shape carries messageMetadata verbatim, plus
+    // the daemon's `fromPrincipalId` stamp for the wire caller.
+    let me = wss_rpc(&mut rpc, 15, "principal.me", json!({})).await;
+    let mut stamped = metadata.clone();
+    stamped["fromPrincipalId"] = me["id"].clone();
     assert_eq!(
-        send2["queuedMessage"]["messageMetadata"], metadata,
+        send2["queuedMessage"]["messageMetadata"], stamped,
         "queued entry must carry messageMetadata: {send2}"
     );
 
@@ -7640,7 +7849,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     .await;
     let queue = q["queue"].as_array().expect("queue array");
     assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0]["messageMetadata"], metadata);
+    assert_eq!(queue[0]["messageMetadata"], stamped);
 
     // Wait for both turns to finish (first send + drained queued send).
     let mut stream_end_count = 0;
@@ -7675,7 +7884,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
                     .is_some_and(|t| t.starts_with("tagged queued message"))
         })
         .expect("drained user message row present");
-    for (key, want) in metadata.as_object().unwrap() {
+    for (key, want) in stamped.as_object().unwrap() {
         assert_eq!(
             &tagged["metadata"][key], want,
             "drained user row must persist messageMetadata field {key}: {tagged}"
@@ -7694,9 +7903,12 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     );
     // Both direct-delivery placements are covered: the row-level `metadata`
     // column (direct `agent.sendMessage` parity) and the in-block fold
-    // (`deliver_wake_message` parity) — the fold carries queueInfo too.
+    // (`deliver_wake_message` parity) — the fold carries queueInfo too, but
+    // the `fromPrincipalId` stamp stays row-level only.
+    let mut folded = tagged["metadata"].clone();
+    folded.as_object_mut().unwrap().remove("fromPrincipalId");
     assert_eq!(
-        tagged["contentBlocks"][0]["messageMetadata"], tagged["metadata"],
+        tagged["contentBlocks"][0]["messageMetadata"], folded,
         "drained user block must fold the same messageMetadata: {tagged}"
     );
 }
@@ -8847,6 +9059,186 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
         .filter(|m| m["role"] == "user")
         .count();
     assert_eq!(user_count, 1, "replay delivered no second prompt: {conv}");
+}
+
+/// Multiplayer w2 — `workspace.create`'s `initialAgent.prompt` is the
+/// creator's first user row, delivered daemon-side through the runtime
+/// `AgentManager` (no `agent.sendMessage` follows). A collaborator creating a
+/// workspace over WSS must be stamped as that row's author — never the
+/// workspace owner via the legacy fallback — on `agent.getSession` and
+/// `agent.getConversation` alike.
+#[tokio::test]
+async fn workspace_create_initial_agent_prompt_carries_creator_stamp_over_wss() {
+    use intent_core::{now_iso, Principal, PrincipalId};
+    use intent_store::Store;
+
+    let Some(script) = gate("WSS workspace.create creator attribution E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let behavior = json!({ "response": "initial agent ran" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // A collaborator with its own credential, seeded into the daemon's store.
+    let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    {
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open daemon store");
+        store
+            .upsert_principal(&guest)
+            .await
+            .expect("guest principal");
+        let token_hash =
+            Sha256::digest(guest_token.as_bytes())
+                .iter()
+                .fold(String::new(), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+        store
+            .insert_principal_credential(&guest.id, &token_hash)
+            .await
+            .expect("guest credential");
+    }
+
+    // SUBSCRIBER conn (owner) — the workspace id is minted by the create, so
+    // subscribe unfiltered BEFORE creating.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // The GUEST creates the workspace with an initialAgent prompt.
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
+    let created = wss_rpc(
+        &mut guest_rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Guest WS",
+            "branch": "feat/guest-initial-agent-e2e",
+            "initialAgent": {
+                "prompt": "guest kickoff",
+                "model": "default", "provider": "mock",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let agent_id = created["initialAgent"]["id"]
+        .as_str()
+        .expect("result carries the created agent")
+        .to_string();
+
+    // Wait for the initial turn to finish so the transcript is settled.
+    let mut ends = 0u32;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id.as_str() {
+            ends += 1;
+            break;
+        }
+    }
+    assert_eq!(ends, 1, "initial agent turn reached stream:end");
+
+    // The persisted kickoff row: stamped with the GUEST, served with the
+    // resolved author by both hydration routes.
+    let expected_author = json!({
+        "principalId": guest.id.0,
+        "login": "guest",
+        "displayName": "Guest User",
+        "avatarUrl": null,
+    });
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let session = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let user_rows: Vec<&Value> = session["session"]["messages"]
+        .as_array()
+        .expect("session messages")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "exactly one delivered prompt: {session}"
+    );
+    let session_row = user_rows[0];
+    assert_eq!(
+        session_row["metadata"]["fromPrincipalId"],
+        json!(guest.id.0),
+        "the initialAgent kickoff row carries the creator's principal: {session_row}"
+    );
+    assert_eq!(
+        session_row["author"], expected_author,
+        "agent.getSession serves the creator as author: {session_row}"
+    );
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let conv_row = conv["messages"]
+        .as_array()
+        .expect("conversation messages")
+        .iter()
+        .find(|m| m["id"] == session_row["id"])
+        .unwrap_or_else(|| panic!("the same row in agent.getConversation: {conv}"));
+    assert_eq!(
+        conv_row["author"], expected_author,
+        "agent.getConversation and agent.getSession agree on the creator"
+    );
 }
 
 #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
@@ -12992,23 +13384,24 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     })
     .await
     .expect("human row reached the chat channel");
-    match lean.get("metadata") {
-        None => {} // direct delivery: the lean metadata-free entity shape
-        Some(md) => {
-            // Queued delivery race: only the drain-time queueInfo stamp is
-            // allowed — human sends never gain A2A attribution metadata.
-            let keys: Vec<&String> = md
-                .as_object()
-                .unwrap_or_else(|| panic!("metadata is an object: {lean}"))
-                .keys()
-                .collect();
-            assert_eq!(
-                keys,
-                vec!["queueInfo"],
-                "a human row carries at most the queueInfo stamp: {lean}"
-            );
-        }
-    }
+    // A human row carries the daemon's `fromPrincipalId` stamp for the wire
+    // caller and, on the queued-delivery race, the drain-time queueInfo stamp
+    // — never A2A attribution metadata.
+    let md = lean["metadata"]
+        .as_object()
+        .unwrap_or_else(|| panic!("metadata is an object: {lean}"));
+    assert!(
+        md["fromPrincipalId"].is_string(),
+        "a human row carries the principal stamp: {lean}"
+    );
+    let extra: Vec<&String> = md
+        .keys()
+        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo")
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "a human row carries at most the principal + queueInfo stamps: {lean}"
+    );
 
     // Contrast: a parentless BYSTANDER sending to the CHILD — a created
     // worker target (parent linkage), not an independent top-level peer —
