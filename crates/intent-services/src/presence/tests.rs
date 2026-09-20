@@ -8,6 +8,32 @@ fn cursor(head: u64) -> Value {
     json!({ "rev": 1, "anchor": head, "head": head })
 }
 
+/// Deadline scale factor for slow environments (coverage runs export
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`); never below 1.0, and non-finite
+/// values are ignored so `Duration::mul_f64` cannot panic.
+fn timeout_multiplier() -> f64 {
+    std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|m| m.is_finite())
+        .unwrap_or(1.0)
+        .max(1.0)
+}
+
+/// Poll `cond` until it holds, failing with `what` if it has not within
+/// `10 × CURSOR_MIN_INTERVAL` (scaled by the timeout multiplier).
+async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let budget = (CURSOR_MIN_INTERVAL * 10).mul_f64(timeout_multiplier());
+    let deadline = Instant::now() + budget;
+    while !cond() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {budget:?} waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Drive a burst of `offers` carets `step` apart through the throttle,
 /// honouring every `Defer` as the async driver would (a flush at the
 /// deferred instant, folded into the timeline). Returns the published
@@ -213,8 +239,15 @@ async fn stale_trailing_flush_never_touches_a_rejoined_viewer() {
 /// every call: a removed collaborator's next update is `NotFound` and a
 /// caret already deferred when the membership ended is dropped, not
 /// published after the gate closed.
+///
+/// The deferral is armed through the pure throttle (time injected) and its
+/// trailing flush is spawned only once the removal has landed, so the
+/// outcome never depends on a store write beating a 100 ms timer; the
+/// flush itself is then awaited on the observable `pending` state rather
+/// than a fixed sleep (intent-hq/intent#5515).
 #[tokio::test]
 async fn caret_updates_are_member_gated_including_the_deferred_flush() {
+    use super::spawn_trailing_flush;
     use crate::events::SubscriptionFilter;
     use intent_core::{with_caller, Error, NoteId};
     let tmp = crate::tests::TempDb::new();
@@ -253,10 +286,6 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
             .note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(1))
             .await
             .expect("leading caret");
-        services
-            .note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(2))
-            .await
-            .expect("deferred caret");
     })
     .await;
     assert_eq!(
@@ -267,8 +296,26 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
         next_kinds(sub.recv().await),
         vec![("updated".to_string(), cursor(1))]
     );
+
+    let key = (ws.clone(), note.clone());
+    let (generation, delay) = {
+        let mut state = services.presence.lock();
+        let viewer = state
+            .viewers
+            .get_mut(&key)
+            .and_then(|v| v.get_mut(&principal))
+            .expect("the member is viewing the note");
+        let published = viewer
+            .throttle
+            .last_publish
+            .expect("the leading caret was published");
+        let Offer::Defer(delay) = viewer.throttle.offer(cursor(2), published) else {
+            panic!("a caret inside the floor defers");
+        };
+        (viewer.generation, delay)
+    };
     assert_eq!(
-        services.presence.lock().viewers[&(ws.clone(), note.clone())][&principal]
+        services.presence.lock().viewers[&key][&principal]
             .throttle
             .pending,
         Some(cursor(2)),
@@ -289,15 +336,29 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
         matches!(refused, Err(Error::NotFound(_))),
         "a removed collaborator's caret is refused even with a live lease: {refused:?}"
     );
-
-    tokio::time::sleep(CURSOR_MIN_INTERVAL + Duration::from_millis(50)).await;
     assert_eq!(
-        services.presence.lock().viewers[&(ws.clone(), note.clone())][&principal]
+        services.presence.lock().viewers[&key][&principal]
             .throttle
             .pending,
-        None,
-        "the flush fired and dropped the pending caret"
+        Some(cursor(2)),
+        "the deferred caret is still pending when the membership ends"
     );
+
+    spawn_trailing_flush(
+        services.clone(),
+        Some(caller.clone()),
+        key.clone(),
+        principal.clone(),
+        generation,
+        delay,
+    );
+    wait_until("the trailing flush to drop the pending caret", || {
+        services.presence.lock().viewers[&key][&principal]
+            .throttle
+            .pending
+            .is_none()
+    })
+    .await;
     let leaked = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await;
     assert!(
         leaked.is_err(),
