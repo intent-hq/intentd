@@ -1437,7 +1437,7 @@ jobs:
     if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       contents: read
-    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@copies-validate
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@main
     with:
       component: intentd
       head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
