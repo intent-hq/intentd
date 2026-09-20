@@ -876,7 +876,7 @@ async fn redirty_change(repo: &GitRepo, svc: &Services, ws: &WorkspaceId, agent:
 /// cool-down — the next idle within the window skips generation up front (no
 /// CLI spawn, no second wait on the budget) and commits the fallback subject.
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generation_timeout_starts_cooldown_that_skips_next_generation() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -915,7 +915,7 @@ async fn generation_timeout_starts_cooldown_that_skips_next_generation() {
 /// intent-hq/intent#5454: the cool-down expires — once the window has passed
 /// the next idle attempts generation again (and, here, succeeds).
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generation_cooldown_expires_and_generation_resumes() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -957,7 +957,7 @@ async fn generation_cooldown_expires_and_generation_resumes() {
 /// intent-hq/intent#5454: a non-timeout generation failure (here: a
 /// non-zero exit) does NOT start the cool-down — only timeouts do.
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn non_timeout_generation_failure_does_not_start_cooldown() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -1019,7 +1019,7 @@ printf '{"subject": "feat: generated after cool-down"}'
 /// it must sit inside the budgeted region so the timeout still fires, the
 /// fallback subject lands and the cool-down engages.
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn large_prompt_to_non_reading_cli_still_times_out_and_cools_down() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
