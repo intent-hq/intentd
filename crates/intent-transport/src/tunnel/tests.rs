@@ -715,16 +715,20 @@ async fn wait_until(ready: impl Fn() -> bool) -> bool {
 /// window (wall-clock, scaled) and return where it stalled. Reading a stall
 /// early only yields a smaller figure, which every caller's
 /// `stalled_at < reply` bound tolerates; the counter is monotone and capped,
-/// so the wait always ends.
+/// so the wait ends well inside the enclosing `deadline()`.
 async fn producer_stall(written: &AtomicUsize) -> usize {
     let quiet = deadline() / 50;
-    loop {
-        let before = written.load(Ordering::Relaxed);
-        tokio::time::sleep(quiet).await;
-        if written.load(Ordering::Relaxed) == before {
-            return before;
+    tokio::time::timeout(deadline(), async {
+        loop {
+            let before = written.load(Ordering::Relaxed);
+            tokio::time::sleep(quiet).await;
+            if written.load(Ordering::Relaxed) == before {
+                return before;
+            }
         }
-    }
+    })
+    .await
+    .expect("producer stalls within the deadline")
 }
 
 /// Regression for intent-hq/intent#5461, at the relay level. A loopback
@@ -794,7 +798,7 @@ async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
         )
         .await
     );
-    let opened = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+    let opened = tokio::time::timeout(deadline(), out_rx.recv())
         .await
         .expect("OPEN_OK within the deadline")
         .expect("relay alive");
@@ -933,7 +937,7 @@ async fn blocked_loopback_write_does_not_hold_back_admitted_output() {
         out_tx.clone(),
         TunnelLimits::default(),
     ));
-    let opened = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+    let opened = tokio::time::timeout(deadline(), out_rx.recv())
         .await
         .expect("OPEN_OK within the deadline")
         .expect("relay alive");
@@ -953,13 +957,13 @@ async fn blocked_loopback_write_does_not_hold_back_admitted_output() {
     );
     // Client resumes: the queue drains, and the held chunk must follow.
     for _ in 0..OUTBOUND_QUEUE_FRAMES {
-        let outbound = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        let outbound = tokio::time::timeout(deadline(), out_rx.recv())
             .await
             .expect("queued response chunks")
             .expect("relay alive");
         assert!(matches!(outbound.frame, Frame::Data { stream_id: 1, .. }));
     }
-    let held = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+    let held = tokio::time::timeout(deadline(), out_rx.recv())
         .await
         .expect("held chunk is admitted once a slot frees, despite the blocked loopback write")
         .expect("relay alive");
