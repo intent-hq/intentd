@@ -513,8 +513,8 @@
 //! the `workspace.create` `executionEnvironment` param with the persisted
 //! `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
-//! error payloads (§9). The catalog contains 320 router methods, 49
-//! fast-path methods, and two aliases: 371 client-callable names. The five
+//! error payloads (§9). The catalog contains 327 router methods, 53
+//! fast-path methods, and two aliases: 382 client-callable names. The five
 //! reverse methods are counted separately.
 
 use std::sync::Mutex;
