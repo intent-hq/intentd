@@ -797,13 +797,17 @@ async fn client_next(stream: &mut futures_util::stream::SplitStream<ClientWs>) -
 /// until the client takes it), while pipelining a request per reply chunk
 /// behind a response twice the shared outbound queue. The stream survives,
 /// the consumer gets every request in order, and a sibling stream plus a
-/// heartbeat ping issued mid-response reach the client.
+/// heartbeat ping issued mid-response reach the client. This guards the
+/// connection-loop contract rather than reproducing the bug: with a client
+/// that keeps reading, the pre-fix relay drains between chunks too, so this
+/// test also passes on the pre-fix code — the RED reproduction is the
+/// relay-level test above.
 ///
 /// Scope waiver (intent-hq/intent#5461): a client that stops reading
 /// altogether parks the connection loop in `sink.send`, which stalls the whole
 /// socket — every stream and heartbeat — until the WebSocket write completes.
 /// That is pre-existing, independent of the relay fix, and needs a wire credit
-/// window; it is out of scope here and tracked separately.
+/// window; it is out of scope here and tracked as intent-hq/intent#5482.
 #[tokio::test]
 async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
     const RESPONSE_BYTES: usize = 2 * OUTBOUND_QUEUE_FRAMES * READ_CHUNK_BYTES;
