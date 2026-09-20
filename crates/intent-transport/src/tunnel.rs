@@ -15,6 +15,7 @@
 //! | 0x04   | `DATA`     | raw bytes          | both |
 //! | 0x05   | `EOF`      | (empty)            | both |
 //! | 0x06   | `CLOSE`    | (empty)            | both |
+//! | 0x07   | `CREDIT`   | credit `u32` BE    | client → daemon |
 //!
 //! Per `OPEN` the daemon connects `TcpStream` to `127.0.0.1:<port>` — connect
 //! targets are hard-limited to the daemon's IPv4 loopback (a service bound
@@ -27,6 +28,20 @@
 //! teardown can race a client `CLOSE`, so frames for unknown stream ids are
 //! ignored (a duplicate `CLOSE` is harmless).
 //!
+//! Daemon→client `DATA` is flow-controlled per stream (intent-hq/intent#5482):
+//! every stream starts with [`TUNNEL_INITIAL_CREDIT_BYTES`] of credit at
+//! `OPEN_OK`, each `DATA` payload the daemon sends consumes its length, and
+//! the client replenishes with `CREDIT` (exactly 4 payload bytes, a non-zero
+//! `credit`, saturating at `u32::MAX`) once it has flushed bytes to its local
+//! socket. A stream with no credit pauses only its own loopback read (so the
+//! peer's `EOF` is also seen only once credit is available again) — its
+//! inbound direction, its siblings, and the heartbeat keep flowing — so a
+//! client that stops consuming one stream can no longer park the connection
+//! loop in a WebSocket write for everyone. Clients that never send `CREDIT`
+//! keep working for the first window per stream and then stall only that
+//! stream. `CREDIT` for an unknown stream is ignored like any other
+//! teardown race.
+//!
 //! Stream queues are bounded and admission never waits on a TCP consumer:
 //! a full queue closes only that stream, leaving sibling frames and pings
 //! readable. Client `CLOSE` is handled out-of-band (never queued behind
@@ -37,7 +52,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +60,7 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
@@ -67,9 +82,19 @@ pub(crate) const OP_DATA: u8 = 0x04;
 pub(crate) const OP_EOF: u8 = 0x05;
 /// `CLOSE` — full stream teardown (no payload).
 pub(crate) const OP_CLOSE: u8 = 0x06;
+/// `CREDIT` — the client grants `credit` more bytes of daemon→client `DATA`
+/// payload on a stream (payload: `u32` big-endian, must be non-zero).
+pub const OP_CREDIT: u8 = 0x07;
 
 /// Frame header length: opcode (1 byte) + streamId (4 bytes, big-endian).
 pub(crate) const HEADER_LEN: usize = 5;
+/// `CREDIT` payload length: the granted byte count as a `u32`.
+const CREDIT_PAYLOAD_LEN: usize = 4;
+
+/// Daemon→client `DATA` credit every stream holds at `OPEN_OK` without any
+/// client action. Equals [`MAX_DATA_PAYLOAD_BYTES`], so a client that never
+/// sends `CREDIT` still receives one maximal reply per stream unchanged.
+pub const TUNNEL_INITIAL_CREDIT_BYTES: u32 = 1024 * 1024;
 
 /// Maximum concurrent streams per `/tunnel` connection; further `OPEN`s are
 /// answered with `OPEN_ERR` until a stream closes.
@@ -139,6 +164,8 @@ pub enum Frame {
     Eof { stream_id: u32 },
     /// Full teardown of the stream (both directions).
     Close { stream_id: u32 },
+    /// The client grants `credit` more bytes of daemon→client `DATA` payload.
+    Credit { stream_id: u32, credit: u32 },
 }
 
 /// Why a byte buffer failed to decode as a [`Frame`].
@@ -146,7 +173,7 @@ pub enum Frame {
 pub enum FrameError {
     /// Shorter than the 5-byte `[opcode][streamId]` header.
     TooShort,
-    /// The opcode byte is not one of the six defined opcodes.
+    /// The opcode byte is not one of the seven defined opcodes.
     UnknownOpcode(u8),
     /// `OPEN` payload must be exactly 2 bytes (port, big-endian).
     BadOpenPayload,
@@ -154,6 +181,10 @@ pub enum FrameError {
     UnexpectedPayload(u8),
     /// `OPEN_ERR` message must be valid UTF-8.
     BadErrMessage,
+    /// `CREDIT` payload must be exactly 4 bytes (credit, big-endian).
+    BadCreditPayload,
+    /// `CREDIT` must grant at least one byte.
+    ZeroCredit,
 }
 
 impl std::fmt::Display for FrameError {
@@ -166,6 +197,13 @@ impl std::fmt::Display for FrameError {
                 write!(f, "opcode 0x{op:02x} must not carry a payload")
             }
             Self::BadErrMessage => write!(f, "OPEN_ERR message is not valid UTF-8"),
+            Self::BadCreditPayload => {
+                write!(
+                    f,
+                    "CREDIT payload must be exactly {CREDIT_PAYLOAD_LEN} bytes (credit)"
+                )
+            }
+            Self::ZeroCredit => write!(f, "CREDIT must grant at least one byte"),
         }
     }
 }
@@ -182,7 +220,8 @@ impl Frame {
             | Self::OpenErr { stream_id, .. }
             | Self::Data { stream_id, .. }
             | Self::Eof { stream_id }
-            | Self::Close { stream_id } => *stream_id,
+            | Self::Close { stream_id }
+            | Self::Credit { stream_id, .. } => *stream_id,
         }
     }
 
@@ -205,16 +244,19 @@ impl Frame {
             Self::Data { stream_id, payload } => build(OP_DATA, *stream_id, payload),
             Self::Eof { stream_id } => build(OP_EOF, *stream_id, &[]),
             Self::Close { stream_id } => build(OP_CLOSE, *stream_id, &[]),
+            Self::Credit { stream_id, credit } => {
+                build(OP_CREDIT, *stream_id, &credit.to_be_bytes())
+            }
         }
     }
 
     /// Decode one wire frame. Rejects short buffers, unknown opcodes, wrong
-    /// `OPEN` payload sizes, payloads on payload-less opcodes, and non-UTF-8
-    /// `OPEN_ERR` messages.
+    /// `OPEN` / `CREDIT` payload sizes, payloads on payload-less opcodes,
+    /// non-UTF-8 `OPEN_ERR` messages, and a zero `CREDIT` grant.
     ///
     /// # Errors
     ///
-    /// Returns a [`FrameError`] for short buffers, unknown opcodes, wrong `OPEN` payload sizes, payloads on payload-less opcodes, or non-UTF-8 `OPEN_ERR` messages.
+    /// Returns a [`FrameError`] for short buffers, unknown opcodes, wrong `OPEN` / `CREDIT` payload sizes, payloads on payload-less opcodes, non-UTF-8 `OPEN_ERR` messages, or a zero `CREDIT` grant.
     ///
     /// # Panics
     ///
@@ -249,6 +291,14 @@ impl Frame {
             }),
             OP_EOF => Ok(Self::Eof { stream_id }),
             OP_CLOSE => Ok(Self::Close { stream_id }),
+            OP_CREDIT if payload.len() != CREDIT_PAYLOAD_LEN => Err(FrameError::BadCreditPayload),
+            OP_CREDIT => {
+                let credit = u32::from_be_bytes(payload.try_into().expect("4 bytes"));
+                if credit == 0 {
+                    return Err(FrameError::ZeroCredit);
+                }
+                Ok(Self::Credit { stream_id, credit })
+            }
             other => Err(FrameError::UnknownOpcode(other)),
         }
     }
@@ -265,6 +315,47 @@ enum StreamMsg {
     Eof,
 }
 
+/// Daemon→client flow-control window of one stream, shared between the
+/// connection loop (which grants on `CREDIT`) and the relay (which gates its
+/// loopback read on it and consumes per `DATA` payload byte). Grants bypass
+/// the stream's bounded message queue so a blocked loopback write or a full
+/// queue can never delay a replenishment.
+struct CreditWindow {
+    bytes: AtomicU32,
+    replenished: Notify,
+}
+
+impl CreditWindow {
+    fn new(initial: u32) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: AtomicU32::new(initial),
+            replenished: Notify::new(),
+        })
+    }
+
+    fn available(&self) -> u32 {
+        self.bytes.load(Ordering::Acquire)
+    }
+
+    /// Add `credit`, saturating at `u32::MAX`, and wake a relay paused on an
+    /// empty window (the permit is stored if it is not waiting right now).
+    fn grant(&self, credit: u32) {
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(credit))
+            });
+        self.replenished.notify_one();
+    }
+
+    /// Consume `n` bytes just read for a `DATA` payload; the relay never
+    /// reads more than the window it observed, so this cannot underflow.
+    fn consume(&self, n: usize) {
+        let n = u32::try_from(n).expect("read bounded by the u32 window");
+        self.bytes.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
 /// Connection-loop handle to one live stream's relay task.
 struct StreamHandle {
     port: u16,
@@ -273,6 +364,8 @@ struct StreamHandle {
     /// Payload bytes admitted to `msg_tx` and not yet received by the relay;
     /// named in the full-queue close warning.
     queued_bytes: Arc<AtomicUsize>,
+    /// Daemon→client credit the client has granted this stream.
+    credit: Arc<CreditWindow>,
     abort: tokio::task::AbortHandle,
 }
 
@@ -430,12 +523,14 @@ where
             let generation = Arc::new(());
             let (msg_tx, msg_rx) = mpsc::channel::<StreamMsg>(STREAM_QUEUE_FRAMES);
             let queued_bytes = Arc::new(AtomicUsize::new(0));
+            let credit = CreditWindow::new(TUNNEL_INITIAL_CREDIT_BYTES);
             let task = tokio::spawn(run_stream(
                 stream_id,
                 generation.clone(),
                 port,
                 msg_rx,
                 queued_bytes.clone(),
+                credit.clone(),
                 out_tx.clone(),
                 limits,
             ));
@@ -446,9 +541,19 @@ where
                     generation,
                     msg_tx,
                     queued_bytes,
+                    credit,
                     abort: task.abort_handle(),
                 },
             );
+            true
+        }
+        Frame::Credit { stream_id, credit } => {
+            // Bypasses the stream queue on purpose: a replenishment must
+            // reach a relay whose inbound queue is full or whose loopback
+            // write is blocked, or the pause it lifts could never end.
+            if let Some(handle) = streams.get(&stream_id) {
+                handle.credit.grant(credit);
+            }
             true
         }
         Frame::Data { stream_id, payload } => {
@@ -542,9 +647,10 @@ where
     true
 }
 
-/// Admit a message without parking the shared WebSocket reader. The wire
-/// protocol has no per-stream credit window: once the bounded queue is full,
-/// close that stream rather than blocking unrelated requests and heartbeats.
+/// Admit a message without parking the shared WebSocket reader. The
+/// client→daemon direction has no credit window: once the bounded queue is
+/// full, close that stream rather than blocking unrelated requests and
+/// heartbeats.
 /// The relay keeps draining this queue while its own output waits on a
 /// lagging client, so a full queue means the loopback consumer has stopped
 /// reading (or the client is flooding one stream), not that a large reply is
@@ -612,12 +718,22 @@ where
 /// (the loopback peer is itself busy producing that reply and not reading)
 /// must not stop the held output from being admitted when a slot frees, or
 /// the two sides deadlock until the idle timeout.
+///
+/// The loopback read is additionally gated on the stream's daemon→client
+/// credit window (intent-hq/intent#5482): it reads at most `min(16 KiB,
+/// credit)` bytes and each `DATA` payload consumes its length, so the daemon
+/// never queues output the client has not granted room for. An exhausted
+/// window pauses only this read, as a `select!` condition; the pause ends
+/// when the connection loop grants a client `CREDIT`, or the stream is closed
+/// with a warning after `idle_timeout` of continuous exhaustion.
+#[expect(clippy::too_many_arguments)]
 async fn run_stream(
     stream_id: u32,
     generation: Arc<()>,
     port: u16,
     mut msg_rx: mpsc::Receiver<StreamMsg>,
     queued_bytes: Arc<AtomicUsize>,
+    credit: Arc<CreditWindow>,
     out_tx: mpsc::Sender<OutboundFrame>,
     limits: TunnelLimits,
 ) {
@@ -683,7 +799,21 @@ async fn run_stream(
     let mut inbound: Option<(Vec<u8>, usize, OwnedSemaphorePermit)> = None;
     let idle = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(idle);
+    // When the credit window last hit zero; `None` while credit is available.
+    // Continuous exhaustion for `idle_timeout` closes the stream even if its
+    // inbound direction keeps resetting `idle`.
+    let mut credit_exhausted_since: Option<Instant> = None;
+    let credit_stall = tokio::time::sleep(limits.idle_timeout);
+    tokio::pin!(credit_stall);
     loop {
+        let credit_available = credit.available();
+        if credit_available > 0 {
+            credit_exhausted_since = None;
+        }
+        // Bounded by the window so `consume` observes the same figure.
+        let read_limit = usize::try_from(credit_available)
+            .unwrap_or(READ_CHUNK_BYTES)
+            .min(READ_CHUNK_BYTES);
         // Fixed priority: admit the held frame first, then progress the
         // in-flight loopback write, then drain client→daemon messages, then
         // read more loopback output. A burst of reads may not starve `msg_rx`
@@ -739,7 +869,7 @@ async fn run_stream(
                 }
                 None => break,
             },
-            n = rd.read(&mut buf), if !read_done && pending.is_none() => match n {
+            n = rd.read(&mut buf[..read_limit]), if !read_done && pending.is_none() && credit_available > 0 => match n {
                 // Read errors (e.g. RST) surface as EOF toward the client;
                 // the write side keeps draining until the client is done too.
                 Ok(0) | Err(_) => {
@@ -748,12 +878,31 @@ async fn run_stream(
                 }
                 Ok(n) => {
                     idle.as_mut().reset(Instant::now() + limits.idle_timeout);
+                    credit.consume(n);
+                    if credit.available() == 0 {
+                        credit_exhausted_since = Some(Instant::now());
+                        credit_stall.as_mut().reset(Instant::now() + limits.idle_timeout);
+                    }
                     pending = Some(Frame::Data {
                         stream_id,
                         payload: buf[..n].to_vec(),
                     });
                 }
             },
+            // Paused on an empty window: wake on the next client `CREDIT`
+            // (a grant that lands before this arm is polled is kept as a
+            // stored permit) and re-evaluate the window.
+            () = credit.replenished.notified(), if !read_done && pending.is_none() && credit_available == 0 => {}
+            () = &mut credit_stall, if !read_done && credit_exhausted_since.is_some() => {
+                let credit_exhausted_for_ms = credit_exhausted_since
+                    .map_or(0, |since| since.elapsed().as_millis());
+                tracing::warn!(
+                    stream_id,
+                    credit_exhausted_for_ms,
+                    "closing tunnel stream: daemon→client credit window exhausted for the idle timeout without a client CREDIT"
+                );
+                break;
+            }
             () = &mut idle => break,
         }
     }
