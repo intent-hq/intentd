@@ -8,26 +8,28 @@ fn cursor(head: u64) -> Value {
     json!({ "rev": 1, "anchor": head, "head": head })
 }
 
-/// Deadline scale factor for slow environments (coverage runs export
-/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`); never below 1.0, and non-finite
-/// values are ignored so `Duration::mul_f64` cannot panic.
-fn timeout_multiplier() -> f64 {
-    std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
+/// `base` scaled for slow environments (coverage runs export
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`): the multiplier is never below 1.0,
+/// non-finite values are ignored, and an unrepresentable product saturates
+/// to `Duration::MAX`, so no value of the variable can panic here.
+fn scaled_timeout(base: Duration) -> Duration {
+    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|m| m.is_finite())
-        .unwrap_or(1.0)
-        .max(1.0)
+        .unwrap_or(1.0);
+    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier.max(1.0)).unwrap_or(Duration::MAX)
 }
 
 /// Poll `cond` until it holds, failing with `what` if it has not within
-/// `10 × CURSOR_MIN_INTERVAL` (scaled by the timeout multiplier).
+/// `10 × CURSOR_MIN_INTERVAL` (scaled by the timeout multiplier; a budget
+/// the clock cannot represent means no deadline).
 async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let budget = (CURSOR_MIN_INTERVAL * 10).mul_f64(timeout_multiplier());
-    let deadline = Instant::now() + budget;
+    let budget = scaled_timeout(CURSOR_MIN_INTERVAL * 10);
+    let deadline = Instant::now().checked_add(budget);
     while !cond() {
         assert!(
-            Instant::now() < deadline,
+            deadline.is_none_or(|deadline| Instant::now() < deadline),
             "timed out after {budget:?} waiting for {what}"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -240,11 +242,14 @@ async fn stale_trailing_flush_never_touches_a_rejoined_viewer() {
 /// caret already deferred when the membership ended is dropped, not
 /// published after the gate closed.
 ///
-/// The deferral is armed through the pure throttle (time injected) and its
-/// trailing flush is spawned only once the removal has landed, so the
-/// outcome never depends on a store write beating a 100 ms timer; the
-/// flush itself is then awaited on the observable `pending` state rather
-/// than a fixed sleep (intent-hq/intent#5515).
+/// While the principal is still a member, a deferred caret goes through the
+/// production driver end to end (`note_presence_update_op` arms the flush
+/// with the bound caller, and the flush publishes). The gated deferral is
+/// then armed through the pure throttle (time injected) and its trailing
+/// flush is spawned only once the removal has landed, so the outcome never
+/// depends on a store write beating a 100 ms timer; each flush is awaited
+/// on the observable `pending` state rather than a fixed sleep
+/// (intent-hq/intent#5515).
 #[tokio::test]
 async fn caret_updates_are_member_gated_including_the_deferred_flush() {
     use super::spawn_trailing_flush;
@@ -298,6 +303,28 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
     );
 
     let key = (ws.clone(), note.clone());
+    with_caller(
+        caller.clone(),
+        services.note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(2)),
+    )
+    .await
+    .expect("a member's caret inside the floor is accepted");
+    wait_until(
+        "the production trailing flush to publish the deferred caret",
+        || {
+            services.presence.lock().viewers[&key][&principal]
+                .throttle
+                .pending
+                .is_none()
+        },
+    )
+    .await;
+    assert_eq!(
+        next_kinds(sub.recv().await),
+        vec![("updated".to_string(), cursor(2))],
+        "the deferred caret reaches the bus while the membership holds"
+    );
+
     let (generation, delay) = {
         let mut state = services.presence.lock();
         let viewer = state
@@ -305,11 +332,8 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
             .get_mut(&key)
             .and_then(|v| v.get_mut(&principal))
             .expect("the member is viewing the note");
-        let published = viewer
-            .throttle
-            .last_publish
-            .expect("the leading caret was published");
-        let Offer::Defer(delay) = viewer.throttle.offer(cursor(2), published) else {
+        let published = viewer.throttle.last_publish.expect("a caret was published");
+        let Offer::Defer(delay) = viewer.throttle.offer(cursor(3), published) else {
             panic!("a caret inside the floor defers");
         };
         (viewer.generation, delay)
@@ -318,8 +342,8 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
         services.presence.lock().viewers[&key][&principal]
             .throttle
             .pending,
-        Some(cursor(2)),
-        "the second caret waits for the trailing flush"
+        Some(cursor(3)),
+        "the third caret waits for the trailing flush"
     );
 
     store
@@ -329,7 +353,7 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
 
     let refused = with_caller(
         caller.clone(),
-        services.note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(3)),
+        services.note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(4)),
     )
     .await;
     assert!(
@@ -340,7 +364,7 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
         services.presence.lock().viewers[&key][&principal]
             .throttle
             .pending,
-        Some(cursor(2)),
+        Some(cursor(3)),
         "the deferred caret is still pending when the membership ends"
     );
 
