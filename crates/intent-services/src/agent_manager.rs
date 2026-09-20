@@ -1053,6 +1053,22 @@ pub struct TreeSample {
     pub available_memory: Option<u64>,
 }
 
+/// One process in a registered agent's subtree, as the descendant-tree
+/// sampler saw it in the sweep that produced the agent's bucket. The rows of a
+/// bucket sum to the bucket's [`TreeMemoryProbe::agent_samples`] total by
+/// construction — both come from the same walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessSample {
+    pub pid: u32,
+    pub parent_pid: u32,
+    /// Short process name (Linux: the 15-char `comm`).
+    pub name: String,
+    /// Full command line joined with single spaces; empty when unreadable.
+    pub cmdline: String,
+    /// Resident bytes.
+    pub memory_bytes: u64,
+}
+
 /// Source of the daemon's aggregate descendant-tree memory, implemented by the
 /// composition root's `system.status` sampler (intentd#1139) and by fakes in
 /// tests.
@@ -1067,6 +1083,13 @@ pub trait TreeMemoryProbe: Send + Sync {
     /// (monorepo#2063 Phase A). Empty before the first sample lands and for
     /// probes that don't attribute (the default keeps test fakes minimal).
     fn agent_samples(&self) -> HashMap<AgentId, u64> {
+        HashMap::new()
+    }
+
+    /// Per-process detail behind [`Self::agent_samples`]: every process in
+    /// each registered agent's subtree, from the same sweep. Empty before the
+    /// first sample lands and for probes that don't attribute.
+    fn agent_process_samples(&self) -> HashMap<AgentId, Vec<ProcessSample>> {
         HashMap::new()
     }
 }
@@ -2804,6 +2827,16 @@ impl AgentManager {
         self.tree_probe
             .get()
             .map(|p| p.agent_samples())
+            .unwrap_or_default()
+    }
+
+    /// Per-agent subtree process rows from the installed probe — the
+    /// per-process detail behind [`Self::agent_memory_samples`], from the same
+    /// sweep. Empty when no probe is wired or no sample has landed yet.
+    pub fn agent_process_memory_samples(&self) -> HashMap<AgentId, Vec<ProcessSample>> {
+        self.tree_probe
+            .get()
+            .map(|p| p.agent_process_samples())
             .unwrap_or_default()
     }
 
