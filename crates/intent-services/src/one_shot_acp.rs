@@ -173,7 +173,7 @@ pub(crate) async fn run_one_shot_acp_in(
 /// `initialize` → `session/new` (both under the launch's staged setup cap) →
 /// best-effort model application → one `session/prompt` bounded by
 /// `prompt_timeout`, accumulating `agent_message_chunk` text while answering
-/// agent→client requests inline through every phase.
+/// agent→client requests concurrently through every phase.
 #[expect(clippy::too_many_arguments)]
 async fn drive_one_shot(
     conn: &Connection,
@@ -277,7 +277,7 @@ async fn drive_one_shot(
     }
 }
 
-/// Drive `fut` to completion while answering agent→client requests inline
+/// Drive `fut` to completion while answering agent→client requests concurrently
 /// (the same auto-deny/refuse posture as the prompt phase), so no phase of
 /// the one-shot lifecycle can hang on an unanswered client-served request.
 /// A send still in flight when `fut` resolves stays in `responder` for the
