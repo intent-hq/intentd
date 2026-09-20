@@ -49,6 +49,7 @@ use intent_core::{
     current_caller, lift_from_principal_id, AgentId, Caller, Error, PrincipalId, Result, Workspace,
     WorkspaceId, WorkspaceRole,
 };
+use intent_store::CollaboratorAddOutcome;
 use serde_json::{json, Value};
 
 use crate::Services;
@@ -452,11 +453,13 @@ impl Services {
     /// principal and holds at least one active credential, the same
     /// predicate `principal.list` rows satisfy — else `InvalidParams`. An
     /// existing member (either role) is answered `added: false` with nothing
-    /// published; otherwise the guest cap is checked like an invite mint
-    /// (`guest-limit`), the `collaborator` row inserted and the
-    /// `addedPrincipalId` `workspace:updated` published, so the guest's open
-    /// workspace channel (which re-reads under its own caller) upserts the
-    /// now-visible workspace without a reconnect.
+    /// published; otherwise the guest cap is spent like an invite mint
+    /// (collaborators plus open invites, `guest-limit` at the cap) — checked
+    /// and inserted in one store transaction, so concurrent adds cannot
+    /// overshoot the last seat — and the `addedPrincipalId`
+    /// `workspace:updated` is published, so the guest's open workspace
+    /// channel (which re-reads under its own caller) upserts the now-visible
+    /// workspace without a reconnect.
     pub(crate) async fn workspace_members_add_op(
         &self,
         workspace_id: &WorkspaceId,
@@ -490,43 +493,39 @@ impl Services {
                 "principal {principal_id} has no active credential on this host"
             )));
         }
-        if self
-            .store
-            .get_workspace_member_role(workspace_id, principal_id)
-            .await?
-            .is_some()
-        {
-            let member_count = self.member_count(workspace_id).await?;
-            return Ok(json!({ "added": false, "memberCount": member_count }));
-        }
-        if self
-            .store
-            .count_workspace_guests(workspace_id)
-            .await?
-            .committed()
-            >= u64::from(self.max_guests_per_workspace())
-        {
-            return Err(Error::Invite(intent_core::InviteErrorKind::GuestLimit));
-        }
         let added = self.attach_collaborator(workspace_id, principal_id).await?;
         let member_count = self.member_count(workspace_id).await?;
         Ok(json!({ "added": added, "memberCount": member_count }))
     }
 
-    /// Mirror of [`Self::detach_collaborator`] for a direct add: insert the
-    /// `collaborator` row and, when one was inserted, publish the
-    /// `addedPrincipalId` `workspace:updated` an invite join publishes
-    /// (`commit_invite_join` keeps its own copy: its insert is part of the
-    /// invite-redemption transaction). Returns whether a row was inserted.
+    /// Mirror of [`Self::detach_collaborator`] for a direct add: seat the
+    /// `collaborator` under the guest cap in one store transaction
+    /// ([`intent_store::Store::add_workspace_collaborator_within_cap`]) and,
+    /// when a row was inserted, publish the `addedPrincipalId`
+    /// `workspace:updated` an invite join publishes (`commit_invite_join`
+    /// keeps its own copy: its insert is part of the invite-redemption
+    /// transaction). Returns whether a row was inserted; a full workspace is
+    /// `guest-limit`.
     pub(crate) async fn attach_collaborator(
         &self,
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) -> Result<bool> {
-        let added = self
+        let added = match self
             .store
-            .add_workspace_member(workspace_id, principal_id, WorkspaceRole::Collaborator)
-            .await?;
+            .add_workspace_collaborator_within_cap(
+                workspace_id,
+                principal_id,
+                self.max_guests_per_workspace(),
+            )
+            .await?
+        {
+            CollaboratorAddOutcome::Added => true,
+            CollaboratorAddOutcome::AlreadyMember => false,
+            CollaboratorAddOutcome::WorkspaceFull => {
+                return Err(Error::Invite(intent_core::InviteErrorKind::GuestLimit));
+            }
+        };
         if added {
             let member_count = self.member_count(workspace_id).await?;
             crate::publish_event(
