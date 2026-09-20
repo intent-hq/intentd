@@ -602,11 +602,16 @@ where
 /// Client `CLOSE` does not arrive here — the connection loop aborts this task
 /// directly and emits the final `CLOSE` itself.
 ///
-/// Output waits for a slot in the shared daemon→client queue as a `select!`
-/// branch, never by parking the whole task: a reply larger than that queue
-/// (a 1 MiB JSON-RPC frame is 64 chunks) sent to a lagging client must not
-/// stop `msg_rx` draining, or the client's ordinary requests behind it fill
-/// this stream's inbound queue and close it (intent-hq/intent#5461).
+/// Neither direction's I/O is awaited outside the `select!`. Output waits for
+/// a slot in the shared daemon→client queue as a branch, never by parking the
+/// whole task: a reply larger than that queue (a 1 MiB JSON-RPC frame is 64
+/// chunks) sent to a lagging client must not stop `msg_rx` draining, or the
+/// client's ordinary requests behind it fill this stream's inbound queue and
+/// close it (intent-hq/intent#5461). The loopback write is a branch for the
+/// same reason in the other direction: a client frame whose write blocks
+/// (the loopback peer is itself busy producing that reply and not reading)
+/// must not stop the held output from being admitted when a slot frees, or
+/// the two sides deadlock until the idle timeout.
 async fn run_stream(
     stream_id: u32,
     generation: Arc<()>,
@@ -671,12 +676,18 @@ async fn run_stream(
     // No TCP read happens while one is pending, so the loopback producer sees
     // the same backpressure as before; only `msg_rx` keeps flowing.
     let mut pending: Option<Frame> = None;
+    // The client→daemon frame being written: bytes, write offset, and its
+    // share of the shared inbound byte budget (released once fully written).
+    // No further `msg_rx` message is taken while one is in flight, so the
+    // per-stream queue keeps its bound and bytes stay ordered.
+    let mut inbound: Option<(Vec<u8>, usize, OwnedSemaphorePermit)> = None;
     let idle = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(idle);
     loop {
-        // Fixed priority: admit the held frame first, then drain client→daemon
-        // messages, then read more loopback output. A burst of reads may not
-        // starve `msg_rx` — that is the coupling behind #5461.
+        // Fixed priority: admit the held frame first, then progress the
+        // in-flight loopback write, then drain client→daemon messages, then
+        // read more loopback output. A burst of reads may not starve `msg_rx`
+        // — that is the coupling behind #5461.
         tokio::select! {
             biased;
             permit = out_tx.reserve(), if pending.is_some() => {
@@ -690,22 +701,32 @@ async fn run_stream(
                     break;
                 }
             }
-            msg = msg_rx.recv() => match msg {
-                Some(StreamMsg::Data(bytes, _permit)) => {
+            // The expression is evaluated even when the branch is disabled,
+            // so it must not unwrap `inbound`.
+            written = wr.write(inbound.as_ref().map_or(&[][..], |(bytes, off, _)| &bytes[*off..])),
+                if inbound.is_some() =>
+            {
+                match written {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        idle.as_mut().reset(Instant::now() + limits.idle_timeout);
+                        let (bytes, off, _) = inbound.as_mut().expect("guarded by inbound.is_some()");
+                        *off += n;
+                        if *off >= bytes.len() {
+                            inbound = None;
+                        }
+                    }
+                }
+            }
+            msg = msg_rx.recv(), if inbound.is_none() => match msg {
+                Some(StreamMsg::Data(bytes, permit)) => {
                     queued_bytes.fetch_sub(bytes.len(), Ordering::Relaxed);
                     // Data after the client's own EOF is a client error; drop it.
-                    if write_done {
+                    if write_done || bytes.is_empty() {
                         continue;
                     }
                     idle.as_mut().reset(Instant::now() + limits.idle_timeout);
-                    // Bound the write with the idle deadline: the idle timer
-                    // in the select is not polled while parked here, so an
-                    // unbounded `write_all` against a non-reading consumer
-                    // would leak this task + socket indefinitely.
-                    match tokio::time::timeout(limits.idle_timeout, wr.write_all(&bytes)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) | Err(_) => break,
-                    }
+                    inbound = Some((bytes, 0, permit));
                 }
                 Some(StreamMsg::Eof) => {
                     write_done = true;
