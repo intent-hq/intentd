@@ -43,6 +43,8 @@ const TOKEN: &str = "cececececececececececececececececececececececececececececec
 const USER_CODE: &str = "GLAB-0001";
 const ACCESS_TOKEN: &str = "glo_e2e_device_grant_token";
 const REFRESH_TOKEN: &str = "glr_e2e_device_grant_refresh";
+const ROTATED_ACCESS_TOKEN: &str = "glo_e2e_rotated_access_token";
+const ROTATED_REFRESH_TOKEN: &str = "glr_e2e_rotated_refresh";
 const PAT_TOKEN: &str = "glpat-e2e-valid-personal-token";
 const BAD_PAT: &str = "glpat-e2e-rejected-token";
 
@@ -247,16 +249,27 @@ fn read_secrets(path: &Path) -> Value {
 // ---------------------------------------------------------------------------
 // Mock GitLab instance: plain-HTTP `/oauth/authorize_device`, `/oauth/token`
 // and `/api/v4/user`. The token endpoint answers `authorization_pending` until
-// `authorize` is flipped, then mints the access + refresh token pair; the
-// user endpoint accepts exactly the minted token or `PAT_TOKEN` as bearer and
-// answers 401 for anything else. With `unsupported` set, the device endpoint
-// answers 404 (a GitLab < 17.1 instance).
+// `authorize` is flipped, then mints the access + refresh token pair (a
+// 60 s access token with `short_lived`, inside the daemon's refresh leeway);
+// a `grant_type=refresh_token` exchange rotates the pair exactly once (only
+// `REFRESH_TOKEN` is accepted; a rotated one is `invalid_grant`). The user
+// endpoint accepts the minted / rotated token or `PAT_TOKEN` as bearer and
+// answers 401 for anything else (`reject_rotated` revokes the rotated token
+// server-side). With `unsupported` set, the device endpoint answers 404 (a
+// GitLab < 17.1 instance).
 // ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct MockFlags {
+    authorize: AtomicBool,
+    unsupported: AtomicBool,
+    short_lived: AtomicBool,
+    reject_rotated: AtomicBool,
+}
 
 struct MockGitlab {
     base_uri: String,
-    authorize: Arc<AtomicBool>,
-    unsupported: Arc<AtomicBool>,
+    flags: Arc<MockFlags>,
 }
 
 async fn spawn_mock_gitlab() -> MockGitlab {
@@ -264,34 +277,28 @@ async fn spawn_mock_gitlab() -> MockGitlab {
         .await
         .expect("bind mock gitlab");
     let port = listener.local_addr().expect("mock addr").port();
-    let authorize = Arc::new(AtomicBool::new(false));
-    let unsupported = Arc::new(AtomicBool::new(false));
-    let (auth_flag, unsupported_flag) = (authorize.clone(), unsupported.clone());
+    let flags = Arc::new(MockFlags::default());
+    let shared = flags.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let (auth_flag, unsupported_flag) = (auth_flag.clone(), unsupported_flag.clone());
+            let flags = shared.clone();
             tokio::spawn(async move {
-                let _ = serve_conn(stream, auth_flag, unsupported_flag).await;
+                let _ = serve_conn(stream, flags).await;
             });
         }
     });
     MockGitlab {
         base_uri: format!("http://127.0.0.1:{port}"),
-        authorize,
-        unsupported,
+        flags,
     }
 }
 
 /// Minimal HTTP/1.1 handler for the mock endpoints. Reads one request
 /// (headers + content-length body), answers, and closes.
-async fn serve_conn(
-    mut stream: TcpStream,
-    authorize: Arc<AtomicBool>,
-    unsupported: Arc<AtomicBool>,
-) -> std::io::Result<()> {
+async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     let (head_end, body_start) = loop {
@@ -330,8 +337,18 @@ async fn serve_conn(
     let bearer = header("authorization")
         .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string))
         .unwrap_or_default();
+    let form = String::from_utf8_lossy(&buf[body_start..]).to_string();
+    let form_field = |name: &str| -> Option<String> {
+        form.split('&')
+            .find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == name))
+            .map(|(_, v)| v.to_string())
+    };
+    let is_refresh = form_field("grant_type").as_deref() == Some("refresh_token");
+    let bearer_ok = bearer == ACCESS_TOKEN
+        || bearer == PAT_TOKEN
+        || (bearer == ROTATED_ACCESS_TOKEN && !flags.reject_rotated.load(Ordering::SeqCst));
     let (status, body) = match (method, path.split('?').next().unwrap_or_default()) {
-        ("POST", "/oauth/authorize_device") if unsupported.load(Ordering::SeqCst) => {
+        ("POST", "/oauth/authorize_device") if flags.unsupported.load(Ordering::SeqCst) => {
             (404, json!({ "error": "Not Found" }))
         }
         ("POST", "/oauth/authorize_device") => (
@@ -345,18 +362,36 @@ async fn serve_conn(
                 "interval": 1,
             }),
         ),
-        ("POST", "/oauth/token") if authorize.load(Ordering::SeqCst) => (
+        ("POST", "/oauth/token")
+            if is_refresh && form_field("refresh_token").as_deref() == Some(REFRESH_TOKEN) =>
+        {
+            (
+                200,
+                json!({
+                    "access_token": ROTATED_ACCESS_TOKEN,
+                    "token_type": "Bearer",
+                    "refresh_token": ROTATED_REFRESH_TOKEN,
+                    "expires_in": 7200,
+                    "scope": "api",
+                }),
+            )
+        }
+        ("POST", "/oauth/token") if is_refresh => (
+            400,
+            json!({ "error": "invalid_grant", "error_description": "revoked" }),
+        ),
+        ("POST", "/oauth/token") if flags.authorize.load(Ordering::SeqCst) => (
             200,
             json!({
                 "access_token": ACCESS_TOKEN,
                 "token_type": "Bearer",
                 "refresh_token": REFRESH_TOKEN,
-                "expires_in": 7200,
+                "expires_in": if flags.short_lived.load(Ordering::SeqCst) { 60 } else { 7200 },
                 "scope": "api",
             }),
         ),
         ("POST", "/oauth/token") => (400, json!({ "error": "authorization_pending" })),
-        ("GET", "/api/v4/user") if bearer == ACCESS_TOKEN || bearer == PAT_TOKEN => (
+        ("GET", "/api/v4/user") if bearer_ok => (
             200,
             json!({
                 "id": 4242,
@@ -512,7 +547,7 @@ async fn gitlab_device_grant_full_lifecycle_over_wss() {
 
     // 5. The user authorizes on (mock) gitlab.com; the daemon's background
     //    poll picks it up and pushes the provider-tagged event.
-    mock.authorize.store(true, Ordering::SeqCst);
+    mock.flags.authorize.store(true, Ordering::SeqCst);
     let ev = await_auth_changed(&mut sub, "authorized", 30).await;
     assert_eq!(
         ev,
@@ -733,14 +768,14 @@ async fn gitlab_device_grant_unsupported_and_cancel_over_wss() {
     assert_eq!(v["result"]["deviceGrantSupported"], json!(true));
 
     // The instance stops offering the grant.
-    mock.unsupported.store(true, Ordering::SeqCst);
+    mock.flags.unsupported.store(true, Ordering::SeqCst);
     let v = wss_rpc(&mut rpc, 14, "sourceControl.connect", gitlab.clone()).await;
     expect_typed_error(&v, "device-grant-unsupported");
     let v = wss_rpc(&mut rpc, 15, "sourceControl.authStatus", gitlab.clone()).await;
     assert_eq!(v["result"]["deviceGrantSupported"], json!(false), "{v}");
     assert_eq!(v["result"]["isConfigured"], json!(false));
     // Remembered: the grant is not retried even once the mock recovers.
-    mock.unsupported.store(false, Ordering::SeqCst);
+    mock.flags.unsupported.store(false, Ordering::SeqCst);
     let v = wss_rpc(&mut rpc, 16, "sourceControl.connect", gitlab.clone()).await;
     expect_typed_error(&v, "device-grant-unsupported");
 
@@ -767,4 +802,97 @@ async fn gitlab_device_grant_unsupported_and_cancel_over_wss() {
     )
     .await;
     assert_eq!(v["result"], json!({ "ok": true, "method": "pat" }), "{v}");
+}
+
+/// Token refresh over WSS: the grant mints a 60 s access token (inside the
+/// daemon's refresh leeway), so the next authStatus proactively exchanges the
+/// refresh token, persists the rotated pair and still reports the identity.
+/// When the instance later rejects the rotated access token AND refuses the
+/// rotated refresh token (`invalid_grant`), the daemon clears the connection
+/// and emits `sourceControl:auth-changed { status: "expired" }`.
+#[tokio::test]
+async fn gitlab_token_refresh_and_expiry_over_wss() {
+    let mock = spawn_mock_gitlab().await;
+    mock.flags.short_lived.store(true, Ordering::SeqCst);
+    let h = boot(&mock).await;
+    let mut sub = subscriber(&h).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let gitlab = json!({ "provider": "gitlab" });
+
+    let v = wss_rpc(&mut rpc, 10, "sourceControl.connect", gitlab.clone()).await;
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE), "{v}");
+    mock.flags.authorize.store(true, Ordering::SeqCst);
+    let ev = await_auth_changed(&mut sub, "authorized", 30).await;
+    assert_eq!(ev["status"], json!("authorized"));
+    let secrets = read_secrets(&h.secrets_file);
+    assert_eq!(secrets["sourceControl.gitlab.token"], json!(ACCESS_TOKEN));
+    assert_eq!(
+        secrets["sourceControl.gitlab.refreshToken"],
+        json!(REFRESH_TOKEN)
+    );
+
+    // Proactive refresh: the probe sees the near-expiry and rotates first.
+    let v = wss_rpc(&mut rpc, 11, "sourceControl.authStatus", gitlab.clone()).await;
+    let r = &v["result"];
+    assert_eq!(r["isConfigured"], json!(true), "{r}");
+    assert_eq!(r["method"], json!("device"));
+    assert_eq!(r["user"]["login"], json!("glab-octocat"));
+    let secrets = read_secrets(&h.secrets_file);
+    assert_eq!(
+        secrets["sourceControl.gitlab.token"],
+        json!(ROTATED_ACCESS_TOKEN),
+        "rotated access token persisted: {secrets}"
+    );
+    assert_eq!(
+        secrets["sourceControl.gitlab.refreshToken"],
+        json!(ROTATED_REFRESH_TOKEN)
+    );
+    let expires_at: u64 = secrets["sourceControl.gitlab.tokenExpiresAt"]
+        .as_str()
+        .expect("tokenExpiresAt stored")
+        .parse()
+        .expect("unix seconds");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    assert!(
+        expires_at > now + 3600,
+        "expiry moved out: {expires_at} vs {now}"
+    );
+
+    // A second probe needs no refresh and keeps the rotated pair.
+    let v = wss_rpc(&mut rpc, 12, "sourceControl.getUser", gitlab.clone()).await;
+    assert_eq!(v["result"]["user"]["login"], json!("glab-octocat"));
+    assert_eq!(
+        read_secrets(&h.secrets_file)["sourceControl.gitlab.refreshToken"],
+        json!(ROTATED_REFRESH_TOKEN)
+    );
+
+    // The instance revokes the rotated access token; the one retry-refresh
+    // is refused (the rotated refresh token is not accepted) → disconnect.
+    mock.flags.reject_rotated.store(true, Ordering::SeqCst);
+    let v = wss_rpc(&mut rpc, 13, "sourceControl.authStatus", gitlab.clone()).await;
+    let r = &v["result"];
+    assert_eq!(r["isConfigured"], json!(false), "{r}");
+    assert_eq!(r["method"], Value::Null);
+    assert!(r.get("user").is_none(), "{r}");
+    let ev = await_auth_changed(&mut sub, "expired", 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "expired" })
+    );
+    let secrets = read_secrets(&h.secrets_file);
+    for account in [
+        "sourceControl.gitlab.token",
+        "sourceControl.gitlab.refreshToken",
+        "sourceControl.gitlab.tokenExpiresAt",
+    ] {
+        assert!(
+            secrets.get(account).is_none(),
+            "{account} cleared: {secrets}"
+        );
+    }
+    let v = wss_rpc(&mut rpc, 14, "sourceControl.getUser", gitlab).await;
+    assert_eq!(v["result"], json!({ "user": null }));
 }
