@@ -79,9 +79,10 @@ jobs:
   route:
     # Skipped on push to main: its Linux consumers (check / coverage-e2e /
     # coverage-all / coverage-changed) are push-skipped as redundant (see the
-    # `on: push` comment), and the build job falls back to the pinned
-    # self-hosted Windows labels when this job did not run (see its matrix),
-    # so the probe would spend API calls on a decision nothing consumes.
+    # `on: push` comment), and the build job keeps the historical
+    # self-hosted Windows pin on push when this job did not run (see its
+    # matrix), so the probe would spend API calls on a decision nothing
+    # consumes.
     # Also skipped on fork PRs (see the `pull_request` trigger comment):
     # route's skip cascades over the needs chain, skipping check /
     # coverage-e2e / coverage-all / coverage-changed, so fork PRs can never
@@ -249,9 +250,8 @@ jobs:
             // depth to weigh. Offline, invisible, or unreadable → burst.
             let windowsUseBurst = true;
             let windowsReason = "fail-open default";
-            if (runnerListError) {
-              windowsReason = `probe failed (${runnerListError.message})`;
-            } else {
+            try {
+              if (runnerListError) throw runnerListError;
               const online = onlineWith(windowsSelfHosted);
               if (online.length === 0) {
                 windowsReason = `no online self-hosted Windows runner (${runnerSource} list)`;
@@ -259,6 +259,9 @@ jobs:
                 windowsUseBurst = false;
                 windowsReason = `online=${online.length} (${runnerSource} list)`;
               }
+            } catch (e) {
+              windowsUseBurst = true;
+              windowsReason = `probe failed (${e.message})`;
             }
             core.info(`windows routing: burst=${windowsUseBurst} (${windowsReason})`);
             core.setOutput("windows_labels", JSON.stringify(windowsUseBurst ? windowsBurst : windowsSelfHosted));
@@ -694,15 +697,17 @@ jobs:
           # gh-windows-16x runner otherwise (fail-open to burst, like the
           # Linux jobs — an offline 5090pc used to leave this required check
           # QUEUED forever and block every merge: intent-hq/intent#1382,
-          # #1583). The `||` fallback keeps the historical self-hosted pin
-          # when route produced no output: push to main (route is
-          # push-skipped; the release build stays on 5090pc) or a route
-          # failure (`!cancelled()` still runs this job) — `fromJSON('')`
-          # would otherwise fail the matrix expansion and drop the required
-          # contexts. The name below pins the required-check context — do
-          # not rename it.
+          # #1583). When route produced no output (`fromJSON('')` would
+          # fail the matrix expansion and drop the required contexts) the
+          # fallback is event-dependent: on push route is skipped by design
+          # and the release build keeps the historical self-hosted pin; on
+          # every other event (pull_request / merge_group) an empty output
+          # means route itself failed or timed out (`!cancelled()` still
+          # runs this job), and that is a probe failure — burst, never pin
+          # to a runner nothing confirmed online. The name below pins the
+          # required-check context — do not rename it.
           - target: x86_64-pc-windows-msvc
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["self-hosted","Windows","X64"]') }}
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || (github.event_name == 'push' && '["self-hosted","Windows","X64"]' || '["gh-windows-16x"]')) }}
             name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
     # Explicit per-entry names (instead of the default matrix-value join) so
     # the required-check contexts in the main ruleset stay stable even when a
