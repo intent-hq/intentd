@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.85] - 2026-09-20
+
+### 🐛 Bug Fixes
+
+- *(services)* Bound auto-commit generation and cool down after timeouts ([#2009](https://github.com/intent-hq/intentd/pull/2009))
+- *(agent)* Surface and end mid-turn provider stalls (intent#5395) ([#2007](https://github.com/intent-hq/intentd/pull/2007))
+- Raise tokio worker stack size to 8 MiB for the daemon runtime ([#2011](https://github.com/intent-hq/intentd/pull/2011))
+
+
 ## [0.9.84] - 2026-09-19
 
 ### 🧪 Testing
