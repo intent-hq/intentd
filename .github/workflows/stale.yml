@@ -20,10 +20,11 @@
 # cache entry; without it a run that hits `operations-per-run` can leave a
 # stale cursor and later runs will not reliably cover every PR.
 #
-# Dry-run gate: every scheduled run is `debug-only` — it logs the decisions it
-# WOULD take and touches nothing. Only a manual `workflow_dispatch` with
-# `dry_run=false` acts for real. Enablement (after the dry-run review) changes
-# only the `schedule` side of the `debug-only` expression below.
+# Live/dry-run gate: scheduled runs are LIVE — the cron labels, comments on
+# and closes PRs per the policy above. A manual `workflow_dispatch` defaults
+# to `debug-only` (logs the decisions it WOULD take and touches nothing);
+# pass `dry_run=false` for a live manual pass. To pause closure, set
+# `debug-only: true` (or revert this file).
 name: Stale PRs
 
 on:
@@ -51,7 +52,7 @@ jobs:
       # can be moved to malicious code — a full commit SHA cannot.
       - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
         with:
-          debug-only: ${{ github.event_name == 'schedule' || inputs.dry_run }}
+          debug-only: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
           operations-per-run: 200
 
           # Issues are disabled on this repo.

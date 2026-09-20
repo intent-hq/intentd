@@ -487,7 +487,7 @@ pub const WORKSPACE_LIST_PR_CAP: usize = 5;
 /// (`ownerPrincipalId`, `myRole`, `memberCount`, `openInviteCount`) are
 /// list-relevant (role badge / member count in the sidebar), small, and
 /// rung 1: one bulk membership query per list, persisted counts.
-/// `executionEnvironment` (protocol 10.4) is a persisted enum scalar on
+/// `executionEnvironment` (protocol 10.5) is a persisted enum scalar on
 /// rung 1 that the FE reads off list rows like `checkoutMode`. Adding a
 /// key here is a
 /// wire-contract change — update `docs/protocol/methods/workspace.md` in
