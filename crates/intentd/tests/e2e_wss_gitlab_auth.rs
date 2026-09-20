@@ -294,6 +294,9 @@ struct MockFlags {
     hold_refresh: AtomicBool,
     refresh_held: Notify,
     release_refresh: Notify,
+    hold_poll: AtomicBool,
+    poll_held: Notify,
+    release_poll: Notify,
 }
 
 struct MockGitlab {
@@ -450,6 +453,14 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
             flags.authorize_held.notify_one();
             flags.release_authorize.notified().await;
         }
+    } else if method == "POST"
+        && route == "/oauth/token"
+        && !is_refresh
+        && status == 400
+        && flags.hold_poll.swap(false, Ordering::SeqCst)
+    {
+        flags.poll_held.notify_one();
+        flags.release_poll.notified().await;
     }
     let payload = body.to_string();
     let response = format!(
@@ -468,6 +479,8 @@ struct Harness {
     _data_dir: tempfile::TempDir,
     _daemon: Daemon,
     secrets_file: std::path::PathBuf,
+    /// The daemon's stderr (tracing at `info`).
+    log_file: std::path::PathBuf,
     port: u16,
     cfg: Arc<ClientConfig>,
 }
@@ -501,6 +514,7 @@ async fn boot_with_env(mock: &MockGitlab, extra_env: &[(&str, &str)]) -> Harness
         .expect("fingerprint")
         .to_string();
     Harness {
+        log_file: data_dir.join("daemon.log"),
         _data_dir: data_dir_guard,
         _daemon: daemon,
         secrets_file,
@@ -1571,5 +1585,551 @@ async fn gitlab_cancel_during_device_authorize_keeps_the_pat_over_wss() {
         ev,
         json!({ "provider": "gitlab", "host": HOST, "status": "revoked" }),
         "nothing but the revoke may follow the PAT connect"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pairwise interleavings of the gated credential mutations.
+
+/// Another GitLab instance; never reaches the mock unless it is bound (only
+/// the bound host gets the API-origin override), so the cells that connect
+/// it rebind first.
+const OTHER: &str = "gitlab.other.internal";
+
+/// The gated exchange parked (its response held by the mock) while the
+/// interleaved actions land — the "first mutation" of a pair, waiting.
+#[derive(Clone, Copy, Debug)]
+enum Holder {
+    /// The device completion for `HOST` is inside its authorize exchange;
+    /// nothing is stored yet.
+    Authorize,
+    /// A probe of the bound `HOST` is inside the refresh exchange rotating
+    /// its near-expiry device pair (`ACCESS_TOKEN` stored, its `authorized`
+    /// already consumed).
+    Refresh,
+    /// The device flow for `HOST` is inside a pending poll; nothing is
+    /// stored. Once the actions landed the instance authorizes the grant, so
+    /// the cell shows whether the flow still acts on it.
+    PendingPoll,
+}
+
+/// The "second mutation": issued while the holder is parked, in order.
+#[derive(Clone, Copy, Debug)]
+enum Action {
+    /// `sourceControl.connect { method: "pat" }` for the host (gated).
+    PatConnect(&'static str),
+    /// `sourceControl.revoke` for the host (gated).
+    Revoke(&'static str),
+    /// `sourceControl.cancelAuth` for the host (slot only; never waits),
+    /// expected to answer `cancelled`.
+    Cancel(&'static str, bool),
+    /// `sourceControl.authStatus` for the host (gated), expected to answer
+    /// `isConfigured`.
+    Probe(&'static str, bool),
+    /// `settings.update sourceControl.gitlab.host` (not gated: applies now).
+    Rebind(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stored {
+    Nothing,
+    Device(&'static str),
+    Pat,
+}
+
+struct Case {
+    name: &'static str,
+    holder: Holder,
+    actions: &'static [Action],
+    /// The credential left in the secrets file.
+    stored: Stored,
+    /// `sourceControl.gitlab.host` afterwards.
+    bound: &'static str,
+    /// Every `sourceControl:auth-changed` `(host, status)` emitted after the
+    /// holder was parked, in order — and nothing else.
+    events: &'static [(&'static str, &'static str)],
+    /// The device flow for `HOST` was superseded: its poll task exits (or
+    /// drops an authorized grant) without committing, which the daemon logs.
+    flow_superseded: bool,
+    /// Refresh exchanges the mock served in total.
+    refreshes: usize,
+}
+
+const AUTHORIZED_HOST: (&str, &str) = (HOST, "authorized");
+const AUTHORIZED_OTHER: (&str, &str) = (OTHER, "authorized");
+
+static INTERLEAVINGS: &[Case] = &[
+    // --- a device completion holds the gate ---------------------------------
+    Case {
+        name: "authorize ∥ pat connect (same host): both commit, PAT last",
+        holder: Holder::Authorize,
+        actions: &[Action::PatConnect(HOST)],
+        stored: Stored::Pat,
+        bound: HOST,
+        events: &[AUTHORIZED_HOST, AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ rebind + pat connect (other): PAT wins, binds other",
+        holder: Holder::Authorize,
+        actions: &[Action::Rebind(OTHER), Action::PatConnect(OTHER)],
+        stored: Stored::Pat,
+        bound: OTHER,
+        events: &[AUTHORIZED_HOST, AUTHORIZED_OTHER],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ revoke (same host): the committed pair is revoked",
+        holder: Holder::Authorize,
+        actions: &[Action::Revoke(HOST)],
+        stored: Stored::Nothing,
+        bound: HOST,
+        events: &[AUTHORIZED_HOST, (HOST, "revoked")],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ rebind + revoke (other): completion re-binds, revoke is a no-op",
+        holder: Holder::Authorize,
+        actions: &[Action::Rebind(OTHER), Action::Revoke(OTHER)],
+        stored: Stored::Device(ACCESS_TOKEN),
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ cancel (same host): the grant is dropped uncommitted",
+        holder: Holder::Authorize,
+        actions: &[Action::Cancel(HOST, true)],
+        stored: Stored::Nothing,
+        bound: HOST,
+        events: &[],
+        flow_superseded: true,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ cancel (other): nothing to cancel, completion commits",
+        holder: Holder::Authorize,
+        actions: &[Action::Cancel(OTHER, false)],
+        stored: Stored::Device(ACCESS_TOKEN),
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ probe (same host): the probe sees the committed pair",
+        holder: Holder::Authorize,
+        actions: &[Action::Probe(HOST, true)],
+        stored: Stored::Device(ACCESS_TOKEN),
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ rebind + probe (other): completion re-binds, other is unbound",
+        holder: Holder::Authorize,
+        actions: &[Action::Rebind(OTHER), Action::Probe(OTHER, false)],
+        stored: Stored::Device(ACCESS_TOKEN),
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    // --- a refresh rotation holds the gate ----------------------------------
+    Case {
+        name: "refresh ∥ pat connect (same host): rotation commits, PAT replaces it",
+        holder: Holder::Refresh,
+        actions: &[Action::PatConnect(HOST)],
+        stored: Stored::Pat,
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 1,
+    },
+    Case {
+        name: "refresh ∥ revoke (same host): the rotated pair is revoked",
+        holder: Holder::Refresh,
+        actions: &[Action::Revoke(HOST)],
+        stored: Stored::Nothing,
+        bound: HOST,
+        events: &[(HOST, "revoked")],
+        flow_superseded: false,
+        refreshes: 1,
+    },
+    Case {
+        name: "refresh ∥ cancel (same host): no flow, rotation stands",
+        holder: Holder::Refresh,
+        actions: &[Action::Cancel(HOST, false)],
+        stored: Stored::Device(ROTATED_ACCESS_TOKEN),
+        bound: HOST,
+        events: &[],
+        flow_superseded: false,
+        refreshes: 1,
+    },
+    Case {
+        name: "refresh ∥ probe (same host): the second probe reuses the rotation",
+        holder: Holder::Refresh,
+        actions: &[Action::Probe(HOST, true)],
+        stored: Stored::Device(ROTATED_ACCESS_TOKEN),
+        bound: HOST,
+        events: &[],
+        flow_superseded: false,
+        refreshes: 1,
+    },
+    Case {
+        name: "refresh ∥ rebind + probe (same host): rotation commits, host now unbound",
+        holder: Holder::Refresh,
+        actions: &[Action::Rebind(OTHER), Action::Probe(HOST, false)],
+        stored: Stored::Device(ROTATED_ACCESS_TOKEN),
+        bound: OTHER,
+        events: &[],
+        flow_superseded: false,
+        refreshes: 1,
+    },
+    // --- a pending poll holds the gate; the grant is authorized afterwards --
+    Case {
+        name: "pending ∥ pat connect (same host): flow superseded, grant never committed",
+        holder: Holder::PendingPoll,
+        actions: &[Action::PatConnect(HOST)],
+        stored: Stored::Pat,
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: true,
+        refreshes: 0,
+    },
+    Case {
+        name: "pending ∥ rebind + pat connect (other): flow superseded, PAT for other stays",
+        holder: Holder::PendingPoll,
+        actions: &[Action::Rebind(OTHER), Action::PatConnect(OTHER)],
+        stored: Stored::Pat,
+        bound: OTHER,
+        events: &[AUTHORIZED_OTHER],
+        flow_superseded: true,
+        refreshes: 0,
+    },
+    Case {
+        name: "pending ∥ revoke (same host): flow aborted, nothing to revoke",
+        holder: Holder::PendingPoll,
+        actions: &[Action::Revoke(HOST)],
+        stored: Stored::Nothing,
+        bound: HOST,
+        events: &[],
+        flow_superseded: true,
+        refreshes: 0,
+    },
+    Case {
+        name: "pending ∥ rebind + revoke (other): flow survives and completes",
+        holder: Holder::PendingPoll,
+        actions: &[Action::Rebind(OTHER), Action::Revoke(OTHER)],
+        stored: Stored::Device(ACCESS_TOKEN),
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "pending ∥ cancel (same host): flow aborted",
+        holder: Holder::PendingPoll,
+        actions: &[Action::Cancel(HOST, true)],
+        stored: Stored::Nothing,
+        bound: HOST,
+        events: &[],
+        flow_superseded: true,
+        refreshes: 0,
+    },
+    Case {
+        name: "pending ∥ cancel (other): flow survives and completes",
+        holder: Holder::PendingPoll,
+        actions: &[Action::Cancel(OTHER, false)],
+        stored: Stored::Device(ACCESS_TOKEN),
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+];
+
+/// Poll the daemon's stderr log until it contains `marker`.
+async fn await_log_marker(log: &Path, marker: &str, what: &str) {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if std::fs::read_to_string(log).is_ok_and(|s| s.contains(marker)) {
+                return;
+            }
+            // timing-guard: poll interval
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: daemon log never reported {marker:?}"));
+}
+
+fn stored_in(secrets: &Value) -> Stored {
+    let token = secrets["sourceControl.gitlab.token"].as_str();
+    let refresh = secrets.get("sourceControl.gitlab.refreshToken").is_some();
+    let expiry = secrets.get("sourceControl.gitlab.tokenExpiresAt").is_some();
+    match token {
+        None => {
+            assert!(!refresh && !expiry, "orphaned device keys: {secrets}");
+            Stored::Nothing
+        }
+        Some(PAT_TOKEN) => {
+            assert!(!refresh && !expiry, "device keys next to a PAT: {secrets}");
+            Stored::Pat
+        }
+        Some(ACCESS_TOKEN) => {
+            assert!(refresh && expiry, "device pair incomplete: {secrets}");
+            Stored::Device(ACCESS_TOKEN)
+        }
+        Some(ROTATED_ACCESS_TOKEN) => {
+            assert!(refresh && expiry, "device pair incomplete: {secrets}");
+            Stored::Device(ROTATED_ACCESS_TOKEN)
+        }
+        Some(other) => panic!("unexpected stored token {other:?}: {secrets}"),
+    }
+}
+
+async fn run_interleaving(case: &'static Case) {
+    let name = case.name;
+    let mock = spawn_mock_gitlab().await;
+    if matches!(case.holder, Holder::Refresh) {
+        mock.flags.short_lived.store(true, Ordering::SeqCst);
+    }
+    let h = boot(&mock).await;
+    let mut sub = subscriber(&h).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let gitlab = json!({ "provider": "gitlab" });
+
+    let v = wss_rpc(&mut rpc, 10, "sourceControl.connect", gitlab.clone()).await;
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE), "{name}: {v}");
+
+    // Park the holder inside its gated exchange.
+    let mut held_probe = None;
+    match case.holder {
+        Holder::Authorize => {
+            mock.flags.hold_authorize.store(true, Ordering::SeqCst);
+            mock.flags.authorize.store(true, Ordering::SeqCst);
+            await_latch(&mock.flags.authorize_held, name).await;
+        }
+        Holder::Refresh => {
+            mock.flags.authorize.store(true, Ordering::SeqCst);
+            let ev = await_auth_changed(&mut sub, "authorized", 30).await;
+            assert_eq!(ev["host"], json!(HOST), "{name}: {ev}");
+            mock.flags.hold_refresh.store(true, Ordering::SeqCst);
+            let mut conn = connect_ws(h.port, h.cfg.clone()).await;
+            let params = gitlab.clone();
+            held_probe = Some(tokio::spawn(async move {
+                wss_rpc(&mut conn, 30, "sourceControl.authStatus", params).await
+            }));
+            await_latch(&mock.flags.refresh_held, name).await;
+        }
+        Holder::PendingPoll => {
+            mock.flags.hold_poll.store(true, Ordering::SeqCst);
+            await_latch(&mock.flags.poll_held, name).await;
+        }
+    }
+
+    // Land the actions: gated ones queue behind the holder, so they run on
+    // their own connections and are awaited after the release.
+    let mut queued = Vec::new();
+    for (i, action) in case.actions.iter().enumerate() {
+        let id = 40 + i64::try_from(i).expect("small index");
+        match *action {
+            Action::Rebind(host) => {
+                let v = wss_rpc(
+                    &mut rpc,
+                    id,
+                    "settings.update",
+                    json!({ "changes": [{ "path": "sourceControl.gitlab.host", "value": host }] }),
+                )
+                .await;
+                assert!(v.get("error").is_none(), "{name}: rebind: {v}");
+            }
+            Action::Cancel(host, cancelled) => {
+                let v = wss_rpc(
+                    &mut rpc,
+                    id,
+                    "sourceControl.cancelAuth",
+                    json!({ "provider": "gitlab", "host": host }),
+                )
+                .await;
+                assert_eq!(
+                    v["result"],
+                    json!({ "ok": true, "cancelled": cancelled }),
+                    "{name}: cancel: {v}"
+                );
+            }
+            Action::PatConnect(host) | Action::Revoke(host) | Action::Probe(host, _) => {
+                let (method, params) = match *action {
+                    Action::PatConnect(_) => (
+                        "sourceControl.connect",
+                        json!({ "provider": "gitlab", "host": host, "method": "pat", "token": PAT_TOKEN }),
+                    ),
+                    Action::Revoke(_) => (
+                        "sourceControl.revoke",
+                        json!({ "provider": "gitlab", "host": host }),
+                    ),
+                    _ => (
+                        "sourceControl.authStatus",
+                        json!({ "provider": "gitlab", "host": host }),
+                    ),
+                };
+                let mut conn = connect_ws(h.port, h.cfg.clone()).await;
+                queued.push((
+                    *action,
+                    tokio::spawn(async move { wss_rpc(&mut conn, id, method, params).await }),
+                ));
+            }
+        }
+    }
+
+    // Let the holder finish, then collect what the queued actions answered.
+    match case.holder {
+        Holder::Authorize => mock.flags.release_authorize.notify_one(),
+        Holder::Refresh => mock.flags.release_refresh.notify_one(),
+        Holder::PendingPoll => mock.flags.release_poll.notify_one(),
+    }
+    for (action, handle) in queued {
+        let v = handle.await.expect("queued action task");
+        match action {
+            Action::PatConnect(_) => {
+                assert_eq!(
+                    v["result"],
+                    json!({ "ok": true, "method": "pat" }),
+                    "{name}: {action:?}: {v}"
+                );
+            }
+            Action::Revoke(_) => {
+                assert_eq!(
+                    v["result"],
+                    json!({ "ok": true }),
+                    "{name}: {action:?}: {v}"
+                );
+            }
+            Action::Probe(_, configured) => {
+                assert_eq!(
+                    v["result"]["isConfigured"],
+                    json!(configured),
+                    "{name}: {action:?}: {v}"
+                );
+            }
+            Action::Cancel(..) | Action::Rebind(_) => unreachable!(),
+        }
+    }
+    if let Some(handle) = held_probe {
+        // The parked probe checked the binding before its exchange and
+        // answers for the pair it rotated.
+        let v = handle.await.expect("held probe task");
+        assert_eq!(v["result"]["isConfigured"], json!(true), "{name}: {v}");
+        assert_eq!(v["result"]["method"], json!("device"), "{name}: {v}");
+    }
+    if matches!(case.holder, Holder::PendingPoll) {
+        // The instance authorizes the grant now: a flow still resident
+        // commits it at its next tick (its `authorized` is in the expected
+        // events); a superseded one exits without an exchange.
+        mock.flags.authorize.store(true, Ordering::SeqCst);
+    }
+    if case.flow_superseded {
+        await_log_marker(&h.log_file, "gitlab device grant superseded", name).await;
+    }
+
+    // The expected events, in order. Every emitter has either answered its
+    // RPC or (a completion) is awaited here, so what follows is settled.
+    for (host, status) in case.events {
+        let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+        assert_eq!(
+            ev,
+            json!({ "provider": "gitlab", "host": host, "status": status }),
+            "{name}: events {:?}",
+            case.events
+        );
+    }
+
+    // A probe of the bound host queues behind whatever is still in flight
+    // (the completion after a cancel, which did not wait) and reports the
+    // binding; the secrets file is read once it answered.
+    let v = wss_rpc(&mut rpc, 60, "sourceControl.authStatus", gitlab.clone()).await;
+    let r = &v["result"];
+    assert_eq!(r["host"], json!(case.bound), "{name}: bound host: {r}");
+    let secrets = read_secrets(&h.secrets_file);
+    assert_eq!(
+        stored_in(&secrets),
+        case.stored,
+        "{name}: stored: {secrets}"
+    );
+    let expected_method = match case.stored {
+        Stored::Nothing => Value::Null,
+        Stored::Device(_) => json!("device"),
+        Stored::Pat => json!("pat"),
+    };
+    assert_eq!(r["method"], expected_method, "{name}: method: {r}");
+    assert_eq!(
+        mock.flags.refresh_exchanges.load(Ordering::SeqCst),
+        case.refreshes,
+        "{name}: refresh exchanges"
+    );
+
+    // Nothing beyond the expected events: a sentinel PAT connect on the
+    // bound host must be the next auth-changed observed.
+    let v = wss_rpc(
+        &mut rpc,
+        61,
+        "sourceControl.connect",
+        json!({ "provider": "gitlab", "method": "pat", "token": PAT_TOKEN }),
+    )
+    .await;
+    assert_eq!(
+        v["result"],
+        json!({ "ok": true, "method": "pat" }),
+        "{name}: sentinel: {v}"
+    );
+    let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": case.bound, "status": "authorized" }),
+        "{name}: an event beyond {:?} was emitted",
+        case.events
+    );
+}
+
+/// Every credential mutation (PAT connect, device completion, cancelAuth,
+/// revoke, refresh rotation) takes the credential gate, re-reads the host
+/// binding and the generation it was started for (slot residency, the stored
+/// token) inside the hold, acts only while that still holds, and commits the
+/// store write, the slot / binding update and the event in the same hold.
+/// This table pairs each gated exchange that can be parked mid-flight
+/// ([`Holder`]) with every other mutation for the same or another host
+/// ([`Action`]) and pins the stored credential, the bound host and the exact
+/// event stream each interleaving leaves behind. Cells run a few at a time,
+/// each against its own daemon and mock.
+#[tokio::test]
+async fn gitlab_gated_mutation_interleavings_over_wss() {
+    let permits = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut handles = Vec::new();
+    for case in INTERLEAVINGS {
+        let permits = permits.clone();
+        handles.push((
+            case.name,
+            tokio::spawn(async move {
+                let _permit = permits.acquire_owned().await.expect("semaphore");
+                run_interleaving(case).await;
+            }),
+        ));
+    }
+    let mut failed = Vec::new();
+    for (name, handle) in handles {
+        if let Err(e) = handle.await {
+            failed.push(format!("{name}: {e}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "failed interleavings:\n{}",
+        failed.join("\n")
     );
 }

@@ -177,16 +177,40 @@ pub(crate) fn new_gitlab_state() -> GitlabAuthStateHandle {
 }
 
 /// Serialises every mutation of the stored GitLab credential pair — token
-/// refresh (rotation), PAT persist, the device poll's persist + slot
-/// reconcile, revoke / expiry deletion — and every credential read a probe
-/// makes, so that two concurrent probes never race a rotation (the instance
-/// accepts a refresh token once; a second exchange with the consumed one is
-/// `invalid_grant` and would disconnect a live connection) and a stale
-/// device completion never overwrites or deletes a newer connection. Held
-/// across the device poll's token exchange (its persist lives inside the
-/// engine) but never across the `GET /api/v4/user` probe itself. Lock
-/// order: this gate first, the [`GitlabAuthStateHandle`] slot lock only
-/// ever nested inside it.
+/// refresh (rotation), PAT persist, the device completion's commit, revoke /
+/// expiry deletion — and every credential read a probe makes, so that two
+/// concurrent probes never race a rotation (the instance accepts a refresh
+/// token once; a second exchange with the consumed one is `invalid_grant`
+/// and would disconnect a live connection) and a stale device completion
+/// never overwrites or deletes a newer connection.
+///
+/// The contract every credential mutation follows (the daemon holds ONE
+/// credential, for ONE bound host, so any path that acted on state read
+/// before it waited here has already caused a lost or leaked credential):
+///
+/// 1. take this gate;
+/// 2. inside the hold, re-read what the action is conditioned on — the host
+///    binding (`Services::gitlab_host_is_bound`, never a resolve-time
+///    snapshot) and the generation it was started for: the device
+///    completion's slot residency (`flow_id`), a refresh / disconnect's
+///    stored access token (still the one it read / the instance rejected);
+/// 3. act only while that still holds — otherwise a no-op with no store
+///    write, no binding change and no event;
+/// 4. store write, slot / binding update and `sourceControl:auth-changed`
+///    ride the same hold, so subscribers observe events in store order.
+///
+/// | path | gate | re-read under the hold | acts only if |
+/// |---|---|---|---|
+/// | PAT connect (`gitlab_connect_pat`) | yes | — (a user action: it *sets* the binding) | always; supersedes any pending flow |
+/// | device completion (`run_gitlab_poll_loop`) | yes, across the exchange | slot residency | still resident after the exchange |
+/// | `cancelAuth` | no — slot only, never the store, no event | slot host + phase | a pending flow for that host |
+/// | `revoke` | yes | binding, stored credential | host bound now and something stored |
+/// | proactive / 401 refresh (`probe_gitlab`) | yes, across the exchange | binding, stored pair | bound and the stored token is the one it read |
+/// | disconnect on failed refresh | yes | binding, stored token | bound and the stored token is the rejected one |
+///
+/// Held across the device poll's token exchange and the refresh exchange but
+/// never across the `GET /api/v4/user` probe itself. Lock order: this gate
+/// first, the [`GitlabAuthStateHandle`] slot lock only ever nested inside it.
 pub(crate) type GitlabCredentialGate = Arc<tokio::sync::Mutex<()>>;
 
 pub(crate) fn new_gitlab_credential_gate() -> GitlabCredentialGate {
@@ -265,6 +289,7 @@ pub(crate) async fn run_gitlab_poll_loop(
         tokio::time::sleep(github_auth_ops::poll_sleep(flow.interval_secs()).min(remaining)).await;
         let _gate = gate.lock().await;
         if !is_resident(&state, flow_id).await {
+            tracing::info!(host, "gitlab device grant superseded; poll loop stopped");
             return;
         }
         if Instant::now() >= deadline {
@@ -699,15 +724,19 @@ impl crate::Services {
     }
 
     /// `sourceControl.connect { provider: "gitlab", method: "pat" }`: validate
-    /// the token against `host`, persist it, bind the host, abort any flow
-    /// pending for the host and emit `authorized`. A rejected token stores
-    /// nothing and surfaces as `source-control-unauthorized`.
+    /// the token against `host`, persist it, bind the host, abort any pending
+    /// device flow and emit `authorized`. A rejected token stores nothing and
+    /// surfaces as `source-control-unauthorized`.
     ///
     /// Persist, slot clear, bind and event ride one hold of the
     /// [`GitlabCredentialGate`], so a device completion cannot land between
     /// them (it either finished before, and the PAT replaces its pair, or it
     /// finds its slot gone and exchanges nothing) and the event order matches
-    /// the store order.
+    /// the store order. The slot is cleared whatever host the flow targets:
+    /// the daemon holds one credential for one bound host, so a flow started
+    /// before this connection — for this instance or another — would, on
+    /// completion, overwrite the PAT and re-bind; it is superseded the same
+    /// way a newer device connect supersedes it.
     pub(crate) async fn gitlab_connect_pat(
         &self,
         host: GitlabHost,
@@ -730,12 +759,7 @@ impl crate::Services {
         )
         .await
         .map_err(crate::pr_ops::map_sc_err)?;
-        {
-            let mut guard = self.gitlab_auth.lock().await;
-            if guard.flow.as_ref().is_some_and(|f| f.host == host.host()) {
-                guard.flow = None;
-            }
-        }
+        self.gitlab_auth.lock().await.flow = None;
         bind_gitlab_host(self.settings_registry.as_deref(), host.host());
         tracing::info!(host = host.host(), "gitlab personal access token connected");
         publish_auth_changed(
