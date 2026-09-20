@@ -391,6 +391,35 @@ const MANIFEST_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Total timeout for downloading a rootfs archive.
 const ROOTFS_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// Per-cache-entry download locks: concurrent in-process resolves of the same
+/// uncached rootfs serialize here so the second caller reuses the first
+/// caller's result instead of downloading again. Keyed by the final rootfs
+/// path (data dir + digest).
+static DOWNLOAD_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn download_lock(rootfs_path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut locks = DOWNLOAD_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::sync::Arc::clone(locks.entry(rootfs_path.to_path_buf()).or_default())
+}
+
+/// Unique per-download temp path next to `rootfs_path`, so concurrent
+/// downloaders (other processes included) never share a partial file.
+fn partial_path(rootfs_path: &Path) -> PathBuf {
+    let name = rootfs_path.file_name().map_or_else(
+        || "rootfs".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    rootfs_path.with_file_name(format!(
+        "{name}.partial.{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
 /// Ensure the image referenced by `image_ref` is present and verified in the
 /// cache under `data_dir`, downloading on first use. Emits
 /// `sandbox:image:pulling` / `sandbox:image:downloaded` /
@@ -503,16 +532,15 @@ async fn ensure_image_inner(
         .await
         .map_err(|e| cache_io(&entry_dir, e))?;
     if tokio::fs::try_exists(&rootfs_path).await.unwrap_or(false) {
-        // Refresh the cached manifest copy (the rootfs was verified when it
-        // landed; the manifest may carry updated metadata).
-        tokio::fs::write(&manifest_path, &manifest_bytes)
-            .await
-            .map_err(|e| cache_io(&manifest_path, e))?;
-        return Ok(CachedImage {
-            manifest,
-            rootfs_path,
-            manifest_path,
-        });
+        return cache_hit(manifest, &manifest_bytes, rootfs_path, manifest_path).await;
+    }
+
+    // Serialize concurrent in-process downloads of this entry; whoever wins
+    // the lock downloads, the rest find the landed file on re-check.
+    let lock = download_lock(&rootfs_path);
+    let _guard = lock.lock().await;
+    if tokio::fs::try_exists(&rootfs_path).await.unwrap_or(false) {
+        return cache_hit(manifest, &manifest_bytes, rootfs_path, manifest_path).await;
     }
 
     // 5. Cache miss — download.
@@ -528,16 +556,23 @@ async fn ensure_image_inner(
     )
     .await;
 
-    let tmp_path = entry_dir.join(format!("rootfs.{}.partial", manifest.rootfs.format));
+    // Private temp file: another process downloading the same digest cannot
+    // rename or delete it mid-write, and the hash covers exactly our bytes.
+    let tmp_path = partial_path(&rootfs_path);
     let client = reqwest::Client::new();
-    let actual = download_hashed(&client, &manifest.rootfs.url, &tmp_path)
-        .await
-        .map_err(|detail| ImageError::RootfsDownload {
-            url: url.clone(),
-            rootfs_url: manifest.rootfs.url.clone(),
-            config_source: source.clone(),
-            detail,
-        })?;
+    let downloaded = download_hashed(&client, &manifest.rootfs.url, &tmp_path).await;
+    let actual = match downloaded {
+        Ok(actual) => actual,
+        Err(detail) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(ImageError::RootfsDownload {
+                url: url.clone(),
+                rootfs_url: manifest.rootfs.url.clone(),
+                config_source: source.clone(),
+                detail,
+            });
+        }
+    };
 
     // 6. Verify + atomically land in the cache.
     if actual != rootfs_sha {
@@ -549,9 +584,14 @@ async fn ensure_image_inner(
             actual,
         });
     }
-    tokio::fs::rename(&tmp_path, &rootfs_path)
-        .await
-        .map_err(|e| cache_io(&rootfs_path, e))?;
+    if tokio::fs::try_exists(&rootfs_path).await.unwrap_or(false) {
+        // A competing process landed the (content-addressed, so identical)
+        // file first; discard ours and use theirs.
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    } else if let Err(e) = tokio::fs::rename(&tmp_path, &rootfs_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(cache_io(&rootfs_path, e));
+    }
     tokio::fs::write(&manifest_path, &manifest_bytes)
         .await
         .map_err(|e| cache_io(&manifest_path, e))?;
@@ -570,6 +610,27 @@ async fn ensure_image_inner(
     )
     .await;
 
+    Ok(CachedImage {
+        manifest,
+        rootfs_path,
+        manifest_path,
+    })
+}
+
+/// Cache hit: refresh the cached manifest copy (the rootfs was verified when
+/// it landed; the manifest may carry updated metadata) and return the entry.
+async fn cache_hit(
+    manifest: ImageManifest,
+    manifest_bytes: &[u8],
+    rootfs_path: PathBuf,
+    manifest_path: PathBuf,
+) -> std::result::Result<CachedImage, ImageError> {
+    tokio::fs::write(&manifest_path, manifest_bytes)
+        .await
+        .map_err(|e| ImageError::CacheIo {
+            path: manifest_path.display().to_string(),
+            detail: e.to_string(),
+        })?;
     Ok(CachedImage {
         manifest,
         rootfs_path,
@@ -700,6 +761,16 @@ mod tests {
     fn serve_fixtures(
         build_routes: impl FnOnce(&str) -> HashMap<String, Vec<u8>>,
     ) -> (String, Arc<AtomicUsize>) {
+        serve_fixtures_with_rootfs_hook(build_routes, || {})
+    }
+
+    /// [`serve_fixtures`] plus `on_rootfs`, run on the server thread before
+    /// each rootfs response body is written (simulates a competitor acting
+    /// while a download is in flight).
+    fn serve_fixtures_with_rootfs_hook(
+        build_routes: impl FnOnce(&str) -> HashMap<String, Vec<u8>>,
+        on_rootfs: impl Fn() + Send + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let routes = build_routes(&base);
@@ -719,6 +790,7 @@ mod tests {
                     .to_string();
                 if path.contains("rootfs") {
                     hits.fetch_add(1, Ordering::SeqCst);
+                    on_rootfs();
                 }
                 match routes.get(&path) {
                     Some(body) => {
@@ -868,7 +940,132 @@ mod tests {
         assert!(err.to_string().contains(".intent/config.json"));
         let entry = guest_image_cache_dir(tmp.path()).join(&wrong_sha);
         assert!(!entry.join("rootfs.tar.xz").exists());
-        assert!(!entry.join("rootfs.tar.xz.partial").exists());
+        assert!(
+            partial_files(&entry).is_empty(),
+            "no leftover .partial file"
+        );
+    }
+
+    /// Names of `*.partial*` entries left in a cache entry dir.
+    fn partial_files(entry: &Path) -> Vec<String> {
+        std::fs::read_dir(entry)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.contains(".partial"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolves_of_uncached_image_download_once_and_land_one_file() {
+        let rootfs: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let sha = hex_sha256(&rootfs);
+        let (base, hits) = serve_image(rootfs.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let r = image_ref(&base);
+
+        // A stale shared-name partial from an older daemon must not disturb
+        // the download either.
+        let entry = guest_image_cache_dir(tmp.path()).join(&sha);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("rootfs.tar.xz.partial"), b"stale garbage").unwrap();
+
+        let resolve = || {
+            let data_dir = tmp.path().to_path_buf();
+            let r = r.clone();
+            async move { ensure_image(&data_dir, &r, &ImageSource::BuiltinPin, None, None).await }
+        };
+        let results = tokio::join!(resolve(), resolve(), resolve(), resolve());
+        for res in [&results.0, &results.1, &results.2, &results.3] {
+            let cached = res.as_ref().expect("every concurrent resolve succeeds");
+            assert_eq!(cached.rootfs_path, entry.join("rootfs.tar.xz"));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "rootfs downloaded once");
+        assert_eq!(
+            hex_sha256(&std::fs::read(entry.join("rootfs.tar.xz")).unwrap()),
+            sha,
+            "landed file hashes to the manifest digest"
+        );
+        std::fs::remove_file(entry.join("rootfs.tar.xz.partial")).unwrap();
+        assert!(
+            partial_files(&entry).is_empty(),
+            "no per-download temp files left behind"
+        );
+        let landed: Vec<String> = std::fs::read_dir(&entry)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(landed.len(), 2, "exactly rootfs + manifest: {landed:?}");
+    }
+
+    #[test]
+    fn partial_paths_are_private_siblings_of_the_final_file() {
+        let final_path = Path::new("/cache/abc/rootfs.tar.xz");
+        let a = partial_path(final_path);
+        let b = partial_path(final_path);
+        assert_eq!(a.parent(), final_path.parent());
+        assert_ne!(a, b, "each download gets its own temp file");
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&format!("rootfs.tar.xz.partial.{}-", std::process::id())),
+            "{name}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_download_yields_to_file_landed_by_competitor() {
+        // Another process (outside our in-process lock) lands the entry while
+        // our download is in flight: the final file exists when we go to
+        // land, so ours is discarded, theirs is kept, and no temp file remains.
+        let rootfs: Vec<u8> = b"landed-by-competitor".to_vec();
+        let sha = hex_sha256(&rootfs);
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = guest_image_cache_dir(tmp.path()).join(&sha);
+        let final_path = entry.join("rootfs.tar.xz");
+        let competitor_bytes = rootfs.clone();
+        let competitor_target = final_path.clone();
+        let (base, hits) = serve_fixtures_with_rootfs_hook(
+            {
+                let rootfs = rootfs.clone();
+                let sha = sha.clone();
+                move |base| {
+                    HashMap::from([
+                        (
+                            "/manifest.json".to_string(),
+                            serde_json::to_vec(&manifest_json(
+                                &format!("{base}/rootfs.tar.xz"),
+                                &sha,
+                            ))
+                            .unwrap(),
+                        ),
+                        ("/rootfs.tar.xz".to_string(), rootfs),
+                    ])
+                }
+            },
+            move || {
+                std::fs::create_dir_all(competitor_target.parent().unwrap()).unwrap();
+                std::fs::write(&competitor_target, &competitor_bytes).unwrap();
+            },
+        );
+        let cached = ensure_image(
+            tmp.path(),
+            &image_ref(&base),
+            &ImageSource::BuiltinPin,
+            None,
+            None,
+        )
+        .await
+        .expect("resolve");
+        assert_eq!(cached.rootfs_path, final_path);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(hex_sha256(&std::fs::read(&final_path).unwrap()), sha);
+        assert!(
+            partial_files(&entry).is_empty(),
+            "our temp file was removed"
+        );
+        assert!(cached.manifest_path.exists());
     }
 
     #[tokio::test]

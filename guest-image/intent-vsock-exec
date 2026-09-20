@@ -7,12 +7,15 @@ one command execution:
   1. Client sends ONE newline-terminated JSON header:
        { "argv": ["cmd", ...],        # required, non-empty
          "env":  {"K": "V", ...},     # optional, merged over agent env
-         "cwd":  "/workspace",        # optional
+         "cwd":  "/workspace",        # optional; must be an existing dir
          "stderr": "merge"|"discard" }# optional (default "merge")
   2. Agent replies with ONE newline-terminated JSON status line:
        { "ok": true,  "protocol": "intent-exec/1", "pid": 123 }
      or
        { "ok": false, "protocol": "intent-exec/1", "error": "..." }
+     The header is fully validated (argv, stderr mode, cwd exists and is a
+     directory) BEFORE `ok` is sent, so a lost /workspace mount fails the
+     exec instead of silently running the child elsewhere.
   3. On ok, the agent relays the socket to the child's REAL PIPE stdio:
      socket -> stdin pipe, stdout pipe -> socket (stderr merged into the
      stdout pipe or discarded per header). The child never sees the vsock
@@ -79,6 +82,12 @@ def handle(conn):
         env = dict(os.environ)
         env.update(header.get("env") or {})
         cwd = header.get("cwd") or "/workspace"
+        if not isinstance(cwd, str):
+            raise ValueError("header.cwd must be a string")
+        # Validate BEFORE reporting ok: a lost /workspace mount or a bad
+        # guest path must fail the exec, never silently run elsewhere.
+        if not os.path.isdir(cwd):
+            raise ValueError(f"cwd is not an existing directory: {cwd!r}")
         stderr_mode = header.get("stderr", "merge")
         if stderr_mode not in ("merge", "discard"):
             raise ValueError(f"unsupported stderr mode: {stderr_mode!r}")
@@ -107,8 +116,11 @@ def handle(conn):
         os.close(stdout_w)
         try:
             os.chdir(cwd)
-        except OSError:
-            os.chdir("/")
+        except OSError as e:
+            # Validated above; a race (mount vanished) still must not fall
+            # back to another directory.
+            os.write(2, f"[intent-vsock-exec] chdir {cwd!r} failed: {e}\n".encode())
+            os._exit(127)
         try:
             os.execvpe(argv[0], argv, env)
         except OSError as e:

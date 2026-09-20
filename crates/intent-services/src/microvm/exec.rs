@@ -256,4 +256,110 @@ mod tests {
             std::fs::remove_file(&sock).ok();
         }
     }
+
+    /// Path of the guest exec agent script shipped in the image
+    /// (`guest-image/intent-vsock-exec`, copied verbatim by the Dockerfile).
+    fn guest_agent_script() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../guest-image/intent-vsock-exec")
+            .canonicalize()
+            .expect("guest-image/intent-vsock-exec exists")
+    }
+
+    /// Run the REAL guest agent's `handle()` behind a unix socket (its
+    /// `main()` is vsock-only) so the host client is exercised against the
+    /// script that ships in the image. Returns `None` when no `python3` is
+    /// on PATH.
+    fn real_agent(socket: &std::path::Path, connections: usize) -> Option<std::process::Child> {
+        let have_python = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !have_python {
+            eprintln!("skipping: python3 not available");
+            return None;
+        }
+        let driver = r#"
+import importlib.machinery, importlib.util, socket, sys
+loader = importlib.machinery.SourceFileLoader("vexec", sys.argv[1])
+spec = importlib.util.spec_from_loader("vexec", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sys.argv[2])
+srv.listen(4)
+sys.stdout.write("READY\n")
+sys.stdout.flush()
+for _ in range(int(sys.argv[3])):
+    conn, _ = srv.accept()
+    try:
+        mod.handle(conn)
+    finally:
+        conn.close()
+"#;
+        let mut child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(driver)
+            .arg(guest_agent_script())
+            .arg(socket)
+            .arg(connections.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn python3 driver");
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut ready,
+        )
+        .expect("read READY");
+        assert_eq!(ready.trim(), "READY");
+        Some(child)
+    }
+
+    #[tokio::test]
+    async fn real_agent_refuses_missing_cwd_before_ok_and_runs_in_valid_cwd() {
+        let sock = sock_path("realagent");
+        let _ = std::fs::remove_file(&sock);
+        let Some(mut agent) = real_agent(&sock, 2) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("vanished-mount");
+
+        // 1. Missing cwd: the agent must answer `ok: false` (never start the
+        //    child in `/`), which the host maps to a structured exec error.
+        let req = ExecRequest {
+            argv: vec!["/bin/sh".into(), "-c".into(), "pwd -P".into()],
+            env: BTreeMap::new(),
+            cwd: missing.display().to_string(),
+            merge_stderr: true,
+        };
+        let err = run_to_completion(&sock, &req, Duration::from_secs(10))
+            .await
+            .expect_err("missing cwd must refuse the exec");
+        assert!(matches!(err, MicrovmError::Exec(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("guest exec refused"), "{msg}");
+        assert!(msg.contains("cwd is not an existing directory"), "{msg}");
+        assert!(msg.contains("vanished-mount"), "{msg}");
+
+        // 2. Valid cwd: the child really runs there.
+        let req = ExecRequest {
+            cwd: dir.path().display().to_string(),
+            ..req
+        };
+        let out = run_to_completion(&sock, &req, Duration::from_secs(10))
+            .await
+            .expect("valid cwd runs");
+        let want = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out).trim(),
+            want.display().to_string()
+        );
+
+        let status = agent.wait().expect("driver exits");
+        assert!(status.success(), "driver exit: {status}");
+        std::fs::remove_file(&sock).ok();
+    }
 }
