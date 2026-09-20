@@ -591,7 +591,7 @@
 //! seated in one store transaction so concurrent adds cannot overshoot the
 //! last seat). The seated count is protected at redemption, not at mint:
 //! an invite minted concurrently with a direct add may be refused
-//! `guest-limit` at join. An add publishes the same `workspace:updated
+//! `workspace-full` at join. An add publishes the same `workspace:updated
 //! { changes: { members: true, addedPrincipalId, memberCount } }` an invite
 //! join does, so the guest's open `workspace` channel — whose forwarder
 //! re-reads under the guest's own caller — upserts the now-visible row as
