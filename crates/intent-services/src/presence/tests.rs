@@ -244,12 +244,15 @@ async fn stale_trailing_flush_never_touches_a_rejoined_viewer() {
 ///
 /// While the principal is still a member, a deferred caret goes through the
 /// production driver end to end (`note_presence_update_op` arms the flush
-/// with the bound caller, and the flush publishes). The gated deferral is
-/// then armed through the pure throttle (time injected) and its trailing
-/// flush is spawned only once the removal has landed, so the outcome never
-/// depends on a store write beating a 100 ms timer; each flush is awaited
-/// on the observable `pending` state rather than a fixed sleep
-/// (intent-hq/intent#5515).
+/// with the bound caller, and the flush publishes). Its deferral is made
+/// certain by pinning the throttle's last publish ahead of the clock —
+/// `offer` saturates the elapsed time to zero — so the op's `Instant::now()`
+/// lands inside the floor however long the membership check took. The
+/// gated deferral is then armed through the pure throttle (time injected)
+/// and its trailing flush is spawned only once the removal has landed, so
+/// the outcome never depends on a store write beating a 100 ms timer; each
+/// flush is awaited on the observable `pending` state rather than a fixed
+/// sleep (intent-hq/intent#5515).
 #[tokio::test]
 async fn caret_updates_are_member_gated_including_the_deferred_flush() {
     use super::spawn_trailing_flush;
@@ -303,12 +306,28 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
     );
 
     let key = (ws.clone(), note.clone());
+    services
+        .presence
+        .lock()
+        .viewers
+        .get_mut(&key)
+        .and_then(|v| v.get_mut(&principal))
+        .expect("the member is viewing the note")
+        .throttle
+        .last_publish = Some(Instant::now() + Duration::from_secs(60));
     with_caller(
         caller.clone(),
         services.note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(2)),
     )
     .await
     .expect("a member's caret inside the floor is accepted");
+    assert_eq!(
+        services.presence.lock().viewers[&key][&principal]
+            .throttle
+            .pending,
+        Some(cursor(2)),
+        "the production op deferred the second caret"
+    );
     wait_until(
         "the production trailing flush to publish the deferred caret",
         || {
