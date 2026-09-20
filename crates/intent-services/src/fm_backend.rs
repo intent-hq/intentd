@@ -12,9 +12,13 @@
 //! stale-while-revalidate, mirroring [`crate::model_catalog`]: a fresh entry
 //! is returned as-is; a stale entry is returned immediately while one
 //! background refresh runs (single-flighted — a second stale read neither
-//! starts another probe nor waits); only a cold cache blocks the caller on the
-//! probe, and concurrent cold callers share that one probe. Hot read RPCs
-//! must use [`FmBackend::cached`], which never spawns.
+//! starts another probe nor waits). [`FmBackend::probe`] blocks a cold caller
+//! on the probe (concurrent cold callers share it);
+//! [`FmBackend::cached_or_refresh`] never blocks — a cold cache answers
+//! `None` while the same single-flight probe warms it off-path — and is what
+//! latency-bound callers such as `agent.completeOnce` use, so a slow or stuck
+//! probe can never eat into a caller's timeout. Hot read RPCs must use
+//! [`FmBackend::cached`], which never spawns.
 //!
 //! Non-macOS hosts short-circuit to unavailable without spawning anything.
 //! The binary path is overridable with the [`FM_BIN_ENV`] environment
@@ -26,6 +30,12 @@
 //! caller's timeout. Its failures are classified ([`FmRespondFailure`]) the
 //! same way as probe reasons — child stderr is inspected, never echoed — so
 //! `agent.completeOnce` can log them and fall through to its provider route.
+//!
+//! Every spawn runs in its own process group, and a [`ProcessGroupGuard`]
+//! kills that whole group unless the child completed normally — on timeout,
+//! on a wait error, and when the future is cancelled or dropped — so helper
+//! processes an `fm` (or an [`FM_BIN_ENV`] wrapper) starts never outlive the
+//! call.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -120,6 +130,12 @@ struct CachedVerdict {
 }
 
 type InflightCell = Arc<OnceCell<FmAvailability>>;
+
+enum CacheState {
+    Fresh(FmAvailability),
+    Stale(FmAvailability),
+    Cold,
+}
 
 /// TTL-cached `fm` usability probe. Construct once per daemon
 /// ([`FmBackend::from_env`]) and share behind an `Arc`.
@@ -217,25 +233,64 @@ impl FmBackend {
         let Some(bin) = self.bin.clone() else {
             return Self::host_unsupported();
         };
-        let stale = {
-            let cache = self.cache.lock().expect("fm cache poisoned");
-            match cache.as_ref() {
-                Some(c) if c.probed_at.elapsed() < self.ttl => return c.verdict.clone(),
-                Some(c) => Some(c.verdict.clone()),
-                None => None,
+        match self.cache_state() {
+            CacheState::Fresh(verdict) => verdict,
+            CacheState::Stale(verdict) => {
+                self.spawn_refresh(bin);
+                verdict
             }
-        };
-        if let Some(stale) = stale {
-            if let Some(cell) = self.try_claim_inflight() {
-                let this = Arc::clone(self);
-                tokio::spawn(async move {
-                    this.run_and_record(&bin, &cell).await;
-                });
+            CacheState::Cold => {
+                let cell = self.join_inflight();
+                self.run_and_record(&bin, &cell).await
             }
-            return stale;
         }
-        let cell = self.join_inflight();
-        self.run_and_record(&bin, &cell).await
+    }
+
+    /// The non-blocking counterpart of [`FmBackend::probe`] for callers on a
+    /// deadline: the cached verdict (fresh or stale) or `None` on a cold
+    /// cache, never awaiting a spawn. A cold or stale cache starts one
+    /// background probe (single-flight, skipped when one is already running)
+    /// so a later call finds the cache warm. Non-macOS hosts answer
+    /// unavailable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache or in-flight mutex is poisoned (a prior panic
+    /// while holding it).
+    pub fn cached_or_refresh(self: &Arc<Self>) -> Option<FmAvailability> {
+        let Some(bin) = self.bin.clone() else {
+            return Some(Self::host_unsupported());
+        };
+        match self.cache_state() {
+            CacheState::Fresh(verdict) => Some(verdict),
+            CacheState::Stale(verdict) => {
+                self.spawn_refresh(bin);
+                Some(verdict)
+            }
+            CacheState::Cold => {
+                self.spawn_refresh(bin);
+                None
+            }
+        }
+    }
+
+    fn cache_state(&self) -> CacheState {
+        let cache = self.cache.lock().expect("fm cache poisoned");
+        match cache.as_ref() {
+            Some(c) if c.probed_at.elapsed() < self.ttl => CacheState::Fresh(c.verdict.clone()),
+            Some(c) => CacheState::Stale(c.verdict.clone()),
+            None => CacheState::Cold,
+        }
+    }
+
+    /// Start one off-path probe unless one is already in flight.
+    fn spawn_refresh(self: &Arc<Self>, bin: PathBuf) {
+        if let Some(cell) = self.try_claim_inflight() {
+            let this = Arc::clone(self);
+            tokio::spawn(async move {
+                this.run_and_record(&bin, &cell).await;
+            });
+        }
     }
 
     /// One greedy, non-streaming completion: `fm respond --no-stream --greedy
@@ -355,12 +410,47 @@ enum FmRun {
     TimedOut,
 }
 
+/// Kills a spawned child's whole process group (`SIGKILL`) on drop unless
+/// [`ProcessGroupGuard::disarm`]ed after the child completed normally. The
+/// child is spawned as its own group leader (`process_group(0)`), so the
+/// group id is its pid. Owning the kill in a guard makes it run on every
+/// abnormal path — timeout, wait error, and the enclosing future being
+/// cancelled or dropped — where `kill_on_drop` alone would only reach the
+/// direct child and leave helper processes alive. A no-op on non-unix.
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    /// The child exited and was reaped: nothing to kill.
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            use nix::sys::signal::{killpg, Signal};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
+        }
+    }
+}
+
 /// Spawn `bin args…` — `stdin` piped in when given, else closed — bounded by
-/// `timeout`; on expiry the whole process group is killed (`kill_on_drop`
-/// covers the direct child on non-unix). The stdin write runs inside the
-/// timed section, concurrently with the output drain: a child that never
-/// reads a prompt larger than the pipe capacity (16 KiB on macOS) would
-/// otherwise block the write forever and the timeout would never fire.
+/// `timeout`. On expiry, on a wait error, and when this future is dropped
+/// before the child completes, the [`ProcessGroupGuard`] kills the whole
+/// process group (`kill_on_drop` additionally covers the direct child on
+/// non-unix). The stdin write runs inside the timed section, concurrently
+/// with the output drain: a child that never reads a prompt larger than the
+/// pipe capacity (16 KiB on macOS) would otherwise block the write forever
+/// and the timeout would never fire.
 async fn run_fm(bin: &Path, args: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> FmRun {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
@@ -379,7 +469,7 @@ async fn run_fm(bin: &Path, args: &[&str], stdin: Option<&[u8]>, timeout: Durati
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FmRun::NotFound,
         Err(e) => return FmRun::Spawn(e),
     };
-    let pid = child.id();
+    let mut group = ProcessGroupGuard::new(child.id());
     let pipe = child.stdin.take();
     let run = async {
         let feed = async {
@@ -394,19 +484,12 @@ async fn run_fm(bin: &Path, args: &[&str], stdin: Option<&[u8]>, timeout: Durati
         output
     };
     match tokio::time::timeout(timeout, run).await {
-        Ok(Ok(output)) => FmRun::Exited(output),
-        Ok(Err(e)) => FmRun::Spawn(e),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                use nix::sys::signal::{killpg, Signal};
-                use nix::unistd::Pid;
-                let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            let _ = pid;
-            FmRun::TimedOut
+        Ok(Ok(output)) => {
+            group.disarm();
+            FmRun::Exited(output)
         }
+        Ok(Err(e)) => FmRun::Spawn(e),
+        Err(_) => FmRun::TimedOut,
     }
 }
 
@@ -649,6 +732,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_or_refresh_never_blocks_and_warms_the_cache_off_path() {
+        // Cold: answers None at once and starts the single-flight probe,
+        // even though the probe itself would take longer than any caller
+        // could wait (`available` stalls until the probe timeout).
+        let (dir, bin, log) = fake_fm(
+            "cached-or-refresh",
+            "echo \"$*\" >> \"$LOG\"\n[ -e \"$(dirname \"$LOG\")/ready\" ] || sleep 30\nexit 0",
+        );
+        let backend = Arc::new(FmBackend::new(
+            Some(bin),
+            Duration::ZERO,
+            Duration::from_millis(300),
+        ));
+        let started = Instant::now();
+        assert_eq!(
+            backend.cached_or_refresh(),
+            None,
+            "cold cache is not awaited"
+        );
+        assert_eq!(
+            backend.cached_or_refresh(),
+            None,
+            "a second cold read joins the in-flight probe, no new spawn"
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backend.cached().is_none() {
+            assert!(Instant::now() < deadline, "background probe never landed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let first = backend.cached().unwrap();
+        assert!(!first.available, "stalled `available` timed out: {first:?}");
+        assert_eq!(calls(&log), vec!["available"], "exactly one probe ran");
+
+        // Stale (TTL zero): the last verdict is served now and one refresh
+        // runs in the background, picking up the changed host state.
+        std::fs::write(dir.path().join("ready"), "").unwrap();
+        assert_eq!(backend.cached_or_refresh(), Some(first.clone()));
+        wait_until_cached_available(&backend).await;
+        assert_eq!(
+            calls(&log),
+            vec!["available", "available", "license --status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_or_refresh_serves_a_fresh_verdict_without_spawning() {
+        let (_dir, bin, log) = fake_fm("cached-fresh", LOGGING_OK);
+        let backend = backend(bin, LONG_TTL);
+        let v = backend.probe().await;
+        assert_eq!(v, FmAvailability::available());
+        assert_eq!(backend.cached_or_refresh(), Some(v));
+        assert_eq!(calls(&log).len(), 2, "fresh cache hit must not re-spawn");
+        assert!(backend.inflight.lock().unwrap().is_none());
+
+        let unsupported = Arc::new(FmBackend::new(None, LONG_TTL, TIMEOUT));
+        assert_eq!(
+            unsupported.cached_or_refresh(),
+            Some(FmBackend::host_unsupported())
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_cold_callers_share_one_probe() {
         let (_dir, bin, log) = fake_fm("shared", LOGGING_OK);
         let backend = backend(bin, LONG_TTL);
@@ -824,6 +971,59 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "child was reaped"
         );
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        // `kill(pid, 0)` probes existence without signalling; ESRCH means
+        // the process is gone (reaped), any other answer means it is still
+        // there (alive or zombie).
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+            .map_or_else(|e| e != nix::errno::Errno::ESRCH, |()| true)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_respond_kills_helper_processes_in_the_group() {
+        // Regression: the group kill used to live only in the timeout arm,
+        // so aborting the future killed the direct child (`kill_on_drop`)
+        // but left a helper it had started running. The fake starts a
+        // background helper in its process group, publishes the helper's
+        // pid, then waits on it.
+        let (dir, bin, _log) = fake_fm(
+            "respond-cancel",
+            "cat > /dev/null\nsleep 30 > /dev/null 2>&1 &\necho $! > \"$(dirname \"$LOG\")/helper.pid\"\nwait",
+        );
+        let pid_file = dir.path().join("helper.pid");
+        let backend = backend(bin, LONG_TTL);
+        let task = tokio::spawn({
+            let backend = Arc::clone(&backend);
+            async move { backend.respond(None, "p", Duration::from_secs(30)).await }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let helper: i32 = loop {
+            if let Ok(s) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = s.trim().parse() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "helper never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(process_exists(helper), "helper is running before the abort");
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_exists(helper) {
+            assert!(
+                Instant::now() < deadline,
+                "helper {helper} survived the cancelled respond future"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]

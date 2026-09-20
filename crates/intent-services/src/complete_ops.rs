@@ -20,7 +20,10 @@
 //! macOS 27 `fm` model ([`crate::fm_backend`]): `quickActions.localModel` is
 //! `auto`, the call's `type` is `fast` or unset (commit / pr / review stay on
 //! the providers), prompt + system prompt fit [`FM_PROMPT_BYTE_BUDGET`], and
-//! the cached probe reports `fm` usable. Any `fm` failure — non-zero exit
+//! the *cached* probe reports `fm` usable. The probe is never awaited on the
+//! call path: a cold cache takes the provider route while the probe warms
+//! off-path, so the caller's `timeoutMs` bounds `fm respond` alone and a slow
+//! or stuck probe can never delay the call. Any `fm` failure — non-zero exit
 //! (context overflow, licence gate), timeout, empty reply, guardrail marker —
 //! is logged at debug and falls through to the provider route unchanged, so
 //! the caller never sees an `fm`-specific error and the §5.32 result shape is
@@ -514,10 +517,14 @@ impl Services {
 
     /// The on-device `fm` attempt: `Some(text)` when the call is eligible
     /// (setting `auto`, [`fm_eligible_type`], within
-    /// [`FM_PROMPT_BYTE_BUDGET`]), the probe reports `fm` usable, and
+    /// [`FM_PROMPT_BYTE_BUDGET`]), the cached probe reports `fm` usable, and
     /// `fm respond` returned a usable reply; `None` otherwise, with the reason
     /// logged at debug so the caller falls through to its provider route. The
     /// cheap gates run before the probe so an ineligible call never spawns.
+    /// The probe is read, never awaited
+    /// ([`crate::fm_backend::FmBackend::cached_or_refresh`]): a cold cache
+    /// misses this call while the probe warms in the background, so
+    /// `timeout_ms` bounds `fm respond` alone.
     async fn try_fm_completion(
         &self,
         settings: &SettingsFile,
@@ -542,14 +549,23 @@ impl Services {
             );
             return None;
         }
-        let verdict = self.fm_backend.probe().await;
-        if !verdict.available {
-            tracing::debug!(
-                target: "fm_backend",
-                reason = verdict.reason.as_deref().unwrap_or(""),
-                "fm unavailable for completeOnce; using provider route"
-            );
-            return None;
+        match self.fm_backend.cached_or_refresh() {
+            Some(verdict) if verdict.available => {}
+            Some(verdict) => {
+                tracing::debug!(
+                    target: "fm_backend",
+                    reason = verdict.reason.as_deref().unwrap_or(""),
+                    "fm unavailable for completeOnce; using provider route"
+                );
+                return None;
+            }
+            None => {
+                tracing::debug!(
+                    target: "fm_backend",
+                    "fm probe cold for completeOnce; warming off-path, using provider route"
+                );
+                return None;
+            }
         }
         match self
             .fm_backend
@@ -1839,15 +1855,94 @@ rl.on('line', (line) => {
         (tmp, services)
     }
 
+    /// Warm the fm probe cache the way a daemon that has already served one
+    /// eligible call would be: the op itself never awaits the probe.
+    #[cfg(unix)]
+    async fn warm_fm(services: &Services) -> crate::fm_backend::FmAvailability {
+        services.fm_backend.probe().await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_cold_probe_takes_provider_route_and_warms_off_path() {
+        // The first eligible call on a cold cache is served by the provider
+        // at once while the probe runs in the background; once it lands,
+        // the next call is served by fm.
+        let (_auggie_dir, auggie) = fake_auggie("fm-cold", "printf '🤖\\nfrom-auggie\\n'");
+        let (_fm_dir, fm, log) = fake_fm_available("cold", "printf 'fm says: '\ncat");
+        let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(v["text"], "from-auggie", "cold cache ⇒ provider route");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !services.fm_backend.cached().is_some_and(|v| v.available) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "off-path probe never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            fm_calls(&log),
+            vec!["available", "license --status"],
+            "the cold call kicked exactly one probe and no respond"
+        );
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(v["text"], "fm says: hi", "warm cache ⇒ fm route");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_slow_probe_never_delays_the_call() {
+        // Regression: a cold probe used to be awaited on the call path, so
+        // two 10 s probe steps could run before `fm respond` even started
+        // and a 100 ms call took seconds. A stalled `available` and a
+        // stalled `license --status` must each leave the call on the
+        // provider route within its own timeout.
+        let (_auggie_dir, auggie) = fake_auggie("fm-slow-probe", "printf '🤖\\nfrom-auggie\\n'");
+        for (tag, body) in [
+            (
+                "slow-available",
+                "[ \"$1\" = available ] && sleep 30\nexit 0",
+            ),
+            ("slow-license", "[ \"$1\" = license ] && sleep 30\nexit 0"),
+        ] {
+            let (_fm_dir, fm, log) = fake_fm(tag, body);
+            let (_tmp, services) = services_with_fm(auggie.clone(), fm, "auto").await;
+            let started = std::time::Instant::now();
+            let v = services
+                .agent_complete_once_op("hi".into(), None, None, None, None, Some(100))
+                .await
+                .unwrap();
+            assert_eq!(v["text"], "from-auggie", "{tag}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{tag}: the call waited on the probe ({:?})",
+                started.elapsed()
+            );
+            assert!(
+                !fm_calls(&log).iter().any(|c| c.starts_with("respond")),
+                "{tag}: fm respond never ran on a cold cache"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn complete_once_eligible_call_uses_fm() {
-        // Setting auto + probe ok + no type + small prompt ⇒ the reply comes
-        // from `fm respond` (prompt over stdin, system prompt via -i) and
-        // the auggie fake never runs.
+        // Setting auto + warm probe ok + no type + small prompt ⇒ the reply
+        // comes from `fm respond` (prompt over stdin, system prompt via -i)
+        // and the auggie fake never runs.
         let (_auggie_dir, auggie) = fake_auggie("fm-unused", "printf '🤖\\nfrom-auggie\\n'");
         let (_fm_dir, fm, log) = fake_fm_available("eligible", "printf 'fm says: '\ncat");
         let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        assert!(warm_fm(&services).await.available);
         let v = services
             .agent_complete_once_op(
                 "make a slug".into(),
@@ -1922,6 +2017,7 @@ rl.on('line', (line) => {
         ] {
             let (_fm_dir, fm, log) = fake_fm_available(tag, body);
             let (_tmp, services) = services_with_fm(auggie.clone(), fm, "auto").await;
+            assert!(warm_fm(&services).await.available, "{tag}");
             let v = services
                 .agent_complete_once_op("hi".into(), None, None, None, None, None)
                 .await
@@ -1934,9 +2030,10 @@ rl.on('line', (line) => {
             );
         }
 
-        // An unusable probe never reaches `respond`.
+        // An unusable (warm) probe never reaches `respond`.
         let (_fm_dir, fm, log) = fake_fm("probe-fail", "exit 1");
         let (_tmp, services) = services_with_fm(auggie.clone(), fm, "auto").await;
+        assert!(!warm_fm(&services).await.available);
         let v = services
             .agent_complete_once_op("hi".into(), None, None, None, None, None)
             .await
@@ -1949,13 +2046,19 @@ rl.on('line', (line) => {
     #[tokio::test]
     async fn complete_once_fm_timeout_falls_back_to_provider() {
         let (_auggie_dir, auggie) = fake_auggie("fm-timeout", "printf '🤖\\nfrom-auggie\\n'");
-        let (_fm_dir, fm, _log) = fake_fm_available("timeout", "cat > /dev/null\nsleep 30");
+        let (_fm_dir, fm, log) = fake_fm_available("timeout", "cat > /dev/null\nsleep 30");
         let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        assert!(warm_fm(&services).await.available);
         let v = services
             .agent_complete_once_op("hi".into(), None, None, None, None, Some(200))
             .await
             .unwrap();
         assert_eq!(v["text"], "from-auggie");
+        assert_eq!(
+            fm_calls(&log).last().map(String::as_str),
+            Some("respond --no-stream --greedy"),
+            "fm was attempted first"
+        );
     }
 
     #[cfg(unix)]
@@ -1968,6 +2071,7 @@ rl.on('line', (line) => {
         let (_auggie_dir, auggie) = fake_auggie("fm-no-drain", "printf '🤖\\nfrom-auggie\\n'");
         let (_fm_dir, fm, log) = fake_fm_available("no-drain", "sleep 30");
         let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        assert!(warm_fm(&services).await.available);
         let prompt = "x".repeat(FM_PROMPT_BYTE_BUDGET - 1);
         let started = std::time::Instant::now();
         let v = services
@@ -2024,6 +2128,7 @@ rl.on('line', (line) => {
         let (_auggie_dir, auggie) = fake_auggie("fm-no-provider", "printf '🤖\\nfrom-auggie\\n'");
         let (_fm_dir, fm, log) = fake_fm_available("no-provider", "printf 'fm says: '\ncat");
         let (_tmp, services) = services_with_fm_and_provider(auggie, fm, "auto", None).await;
+        assert!(warm_fm(&services).await.available);
         let v = services
             .agent_complete_once_op("make a slug".into(), None, None, None, None, None)
             .await
@@ -2044,6 +2149,7 @@ rl.on('line', (line) => {
             fake_auggie("fm-no-provider-miss", "printf '🤖\\nfrom-auggie\\n'");
         let (_fm_dir, fm, log) = fake_fm_available("no-provider-miss", "cat > /dev/null\nexit 1");
         let (_tmp, services) = services_with_fm_and_provider(auggie, fm, "auto", None).await;
+        assert!(warm_fm(&services).await.available);
         let unavailable = serde_json::json!({
             "available": false,
             "reason": "completeOnce requires a decidable effective default provider"

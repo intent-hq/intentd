@@ -1,8 +1,9 @@
 //! WSS end-to-end for the on-device `fm` route of `agent.completeOnce`
 //! (§5.32): with `quickActions.localModel = "auto"` and a usable `fm`
-//! (`INTENTD_FM_BIN` → fake script, which also lifts the macOS-only gate), an
-//! eligible call returns `{ text }` produced by `fm respond` over the real
-//! pinned-TLS WebSocket transport, the auggie fixture never runs, and a
+//! (`INTENTD_FM_BIN` → fake script, which also lifts the macOS-only gate), the
+//! first eligible call on a fresh daemon is served by auggie while the `fm`
+//! probe warms off-path, then an eligible call returns `{ text }` produced by
+//! `fm respond` over the real pinned-TLS WebSocket transport, and a
 //! provider-bound `type` still routes to auggie. A second daemon proves the
 //! `fm` failure path: a fake whose `respond` exits non-zero degrades to the
 //! auggie reply with the §5.32 result shape unchanged.
@@ -223,6 +224,45 @@ async fn wss_call(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     }
 }
 
+/// The first eligible call on a fresh daemon: the fm probe cache is cold, so
+/// the reply comes from auggie at once while the probe warms off-path. Then
+/// repeat the call until the warm cache routes it to `fm respond` (`done`
+/// inspects the fm call log) and return that response. Each iteration is a
+/// full round trip through the fake auggie, so the loop is self-paced.
+async fn first_call_cold_then_warm(
+    ws: &mut Ws,
+    log: &Path,
+    params: Value,
+    done: impl Fn(&[String]) -> bool,
+) -> Value {
+    let resp = wss_call(ws, 40, "agent.completeOnce", params.clone()).await;
+    assert_eq!(resp["id"], 40);
+    assert_eq!(
+        resp["result"],
+        json!({ "text": "from-auggie" }),
+        "cold probe cache ⇒ provider route without waiting, got {resp}"
+    );
+    assert!(
+        !fm_calls(log).iter().any(|c| c.starts_with("respond")),
+        "the cold call never ran fm respond: {:?}",
+        fm_calls(log)
+    );
+    let mut id = 41;
+    timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let resp = wss_call(ws, id, "agent.completeOnce", params.clone()).await;
+            assert_eq!(resp["id"], id);
+            assert_eq!(resp["jsonrpc"], "2.0");
+            if done(&fm_calls(log)) {
+                return resp;
+            }
+            id += 1;
+        }
+    })
+    .await
+    .expect("the off-path probe warmed the cache and fm was attempted")
+}
+
 #[tokio::test]
 async fn wss_complete_once_eligible_call_returns_fm_reply() {
     let root = scratch_dir("ok");
@@ -232,15 +272,13 @@ async fn wss_complete_once_eligible_call_returns_fm_reply() {
     let mut ws = connect_ws(port, cfg).await;
 
     // Eligible: no `type`, small prompt, system prompt rides `-i`.
-    let resp = wss_call(
+    let resp = first_call_cold_then_warm(
         &mut ws,
-        41,
-        "agent.completeOnce",
+        &log,
         json!({ "prompt": "slug for login fix", "systemPrompt": "be terse" }),
+        |calls| calls.iter().any(|c| c.starts_with("respond")),
     )
     .await;
-    assert_eq!(resp["id"], 41);
-    assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(
         resp["result"],
         json!({ "text": "fm says: slug for login fix" }),
@@ -253,18 +291,18 @@ async fn wss_complete_once_eligible_call_returns_fm_reply() {
             "license --status",
             "respond --no-stream --greedy -i be terse",
         ],
-        "probe once (cached), then respond with the prompt on stdin"
+        "probe once (off-path, cached), then respond with the prompt on stdin"
     );
 
     // A provider-bound type never touches fm: auggie answers.
     let resp = wss_call(
         &mut ws,
-        42,
+        60,
         "agent.completeOnce",
         json!({ "prompt": "msg", "type": "commit" }),
     )
     .await;
-    assert_eq!(resp["id"], 42);
+    assert_eq!(resp["id"], 60);
     assert_eq!(resp["result"], json!({ "text": "from-auggie" }), "{resp}");
     assert_eq!(fm_calls(&log).len(), 3, "type: commit spawned no fm");
 }
@@ -280,15 +318,13 @@ async fn wss_complete_once_fm_failure_falls_back_to_provider() {
     let (_daemon, port, cfg) = boot(root.path(), &auggie, &fm).await;
     let mut ws = connect_ws(port, cfg).await;
 
-    let resp = wss_call(
+    let resp = first_call_cold_then_warm(
         &mut ws,
-        43,
-        "agent.completeOnce",
+        &log,
         json!({ "prompt": "slug for login fix" }),
+        |calls| calls.iter().any(|c| c.starts_with("respond")),
     )
     .await;
-    assert_eq!(resp["id"], 43);
-    assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(
         resp["result"],
         json!({ "text": "from-auggie" }),
