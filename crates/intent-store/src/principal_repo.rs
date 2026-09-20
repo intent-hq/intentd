@@ -72,6 +72,9 @@ pub enum CollaboratorAddOutcome {
     Added,
     /// The principal was already a member (any role); nothing was written.
     AlreadyMember,
+    /// The principal has no active (unrevoked) credential; nothing was
+    /// written.
+    NoActiveCredential,
     /// The workspace's committed seats (collaborators plus open invites)
     /// already reach the cap; nothing was written.
     WorkspaceFull,
@@ -510,12 +513,16 @@ impl Store {
     /// Seat a `collaborator` only while the workspace's committed guest
     /// seats (collaborators plus open invites, the count
     /// [`Store::count_workspace_guests`] reports and an invite mint spends)
-    /// stay under `max_guests`: the membership check, the count and the
-    /// insert run in one `BEGIN IMMEDIATE` transaction, so two concurrent
-    /// adds — or an add racing an invite join, whose cap check is inside
-    /// its own write transaction — cannot both take the last seat. An
-    /// already-seated principal takes no new seat and is reported without
-    /// a write.
+    /// stay under `max_guests` and the principal holds an active
+    /// credential: the membership check, the credential check, the count
+    /// and the insert run in one `BEGIN IMMEDIATE` transaction, so two
+    /// concurrent adds — or an add racing an invite join, whose cap check
+    /// is inside its own write transaction — cannot both take the last
+    /// seat, and a `revoke_all_principal_credentials` that committed
+    /// before the transaction began is always observed (no seat for a
+    /// principal that can no longer authenticate). An already-seated
+    /// principal takes no new seat and is reported without a write or a
+    /// credential check.
     ///
     /// # Errors
     ///
@@ -548,6 +555,19 @@ impl Store {
             .map_err(|e| Error::Internal(format!("capped member add member check failed: {e}")))?;
             if already_member.is_some() {
                 return Ok(CollaboratorAddOutcome::AlreadyMember);
+            }
+            let active_credential: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM principal_credential \
+                    WHERE principal_id = ? AND revoked_at IS NULL LIMIT 1",
+            )
+            .bind(&principal_id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("capped member add credential check failed: {e}"))
+            })?;
+            if active_credential.is_none() {
+                return Ok(CollaboratorAddOutcome::NoActiveCredential);
             }
             let sql = format!(
                 "SELECT \

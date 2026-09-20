@@ -2662,6 +2662,91 @@ async fn concurrent_member_adds_cannot_overshoot_the_guest_cap() {
     assert_eq!(guest_summary(&f).await, (5, 4));
 }
 
+/// `workspace.members.add` racing the guest's own `principal.revokeSelf`
+/// (intentd#2025 review): the credential predicate is evaluated inside the
+/// add's insert transaction and `revokeSelf` revokes credentials before it
+/// snapshots memberships, so whichever commits first, the guest ends up
+/// with no active credential AND no membership — either the add was
+/// refused `InvalidParams`, or it seated the guest and the revocation tore
+/// the seat down (`workspaces: 1`). A seated member without a credential
+/// (the TOCTOU the pre-transaction check allowed) is never observable.
+#[tokio::test]
+async fn members_add_racing_revoke_self_never_leaves_a_credential_less_member() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    for n in 0..24i64 {
+        let guest = principal(&format!("racer-{n}"), Some(7000 + n));
+        f.store.upsert_principal(&guest).await.expect("guest");
+        f.store
+            .insert_principal_credential(&guest.id, &hash_secret(&format!("racer-token-{n}")))
+            .await
+            .expect("guest credential");
+
+        let add = {
+            let services = f.services.clone();
+            let (ws, owner, guest) = (f.ws.clone(), f.owner.clone(), guest.id.clone());
+            tokio::spawn(async move {
+                with_caller(wire(&owner), async move {
+                    services.workspace_members_add_op(&ws, &guest).await
+                })
+                .await
+            })
+        };
+        let revoke = {
+            let services = f.services.clone();
+            let guest = guest.id.clone();
+            tokio::spawn(async move {
+                with_caller(wire(&guest), async move {
+                    services.principal_revoke_self_op().await
+                })
+                .await
+            })
+        };
+        let add = add.await.expect("add task");
+        let revoked = revoke
+            .await
+            .expect("revoke task")
+            .expect("revokeSelf succeeds");
+        assert_eq!(revoked["credentials"], json!(1), "round {n}: {revoked}");
+        match add {
+            Ok(v) => {
+                assert_eq!(v["added"], json!(true), "round {n}: {v}");
+                assert_eq!(
+                    revoked["workspaces"],
+                    json!(1),
+                    "round {n}: the add committed first, so revokeSelf tore the seat down"
+                );
+            }
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("no active credential"), "round {n}: {msg}");
+                assert_eq!(
+                    revoked["workspaces"],
+                    json!(0),
+                    "round {n}: the revocation committed first, so the add was refused"
+                );
+            }
+            Err(e) => panic!("round {n}: unexpected add error {e:?}"),
+        }
+        assert_eq!(
+            f.store
+                .get_workspace_member_role(&f.ws, &guest.id)
+                .await
+                .expect("role"),
+            None,
+            "round {n}: a revoked principal is never left seated"
+        );
+        assert!(
+            f.store
+                .list_principal_credentials(&guest.id)
+                .await
+                .expect("credentials")
+                .iter()
+                .all(|c| !c.is_active()),
+            "round {n}: every credential is revoked"
+        );
+    }
+}
+
 // --- leave / revokeSelf ----------------------------------------------------
 
 /// `members.leave`: a collaborator leaves (membership gone), the owner
