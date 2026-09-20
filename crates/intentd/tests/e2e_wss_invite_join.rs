@@ -623,8 +623,14 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         "no bearer token in the link: {url}"
     );
     assert!(!url.contains(TOKEN), "no bearer token in the link: {url}");
+    assert_eq!(
+        r["invite"]["url"],
+        json!(url),
+        "the invite row echoes the minted link"
+    );
 
-    // 2. invite.list shows it open, never with the secret.
+    // 2. invite.list shows it open with the same link rebuilt from the
+    //    stored secret — never with the secret itself as a field.
     let v = wss_rpc(
         &mut owner,
         11,
@@ -633,8 +639,17 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     )
     .await;
     assert_eq!(v["result"]["invites"].as_array().map(Vec::len), Some(1));
-    assert_eq!(v["result"]["invites"][0]["id"], json!(invite_id));
-    assert!(v["result"]["invites"][0].get("secret").is_none());
+    let listed = &v["result"]["invites"][0];
+    assert_eq!(listed["id"], json!(invite_id));
+    assert!(listed.get("secret").is_none());
+    assert!(listed.get("secretHash").is_none());
+    assert_eq!(listed["url"], json!(url), "list rebuilds the minted link");
+    let mut listed_sans_url = listed.clone();
+    listed_sans_url.as_object_mut().unwrap().remove("url");
+    assert!(
+        !listed_sans_url.to_string().contains(&secret),
+        "the secret rides only inside url: {listed}"
+    );
 
     // 3. The unauthenticated /invite endpoint: nothing but invite.redeem is
     //    reachable, a wrong secret is `invite-not-found`, and a good link

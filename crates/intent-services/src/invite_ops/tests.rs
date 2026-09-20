@@ -422,6 +422,7 @@ async fn identity_switch_rechecks_the_lock_after_a_concurrent_mint() {
         id: uuid::Uuid::new_v4().to_string(),
         workspace_id: ws.clone(),
         secret_hash: hash_secret("s"),
+        secret: None,
         created_by_principal_id: primary.id.clone(),
         pin_github_user_id: None,
         pin_login: None,
@@ -669,6 +670,175 @@ async fn revoke_leaves_an_expired_invite_expired() {
         closed_kind(&stored, &now_iso()),
         Some(InviteErrorKind::Expired)
     );
+}
+
+/// Stand-in for the transport's link builder: `Some` formats
+/// `stub://<inviteId>/<secret>`, `None` models a listener nobody can dial.
+struct StubLinks {
+    envelope: bool,
+    resolves: std::sync::atomic::AtomicUsize,
+}
+
+struct StubEnvelope;
+
+impl intent_core::InviteLinkEnvelope for StubEnvelope {
+    fn invite_url(&self, invite_id: &str, secret: &str) -> String {
+        format!("stub://{invite_id}/{secret}")
+    }
+}
+
+impl intent_core::InviteLinkBuilder for StubLinks {
+    fn invite_link_envelope(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = intent_core::ResolvedInviteLinkEnvelope> + Send + '_>,
+    > {
+        self.resolves
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let envelope = self.envelope;
+        Box::pin(async move {
+            envelope.then(|| Box::new(StubEnvelope) as Box<dyn intent_core::InviteLinkEnvelope>)
+        })
+    }
+}
+
+/// Every wire form of an invite: no `secret` / `secretHash` key, and the raw
+/// secret nowhere but inside `url` (when present).
+fn assert_secret_hidden(wire: &Value, secret: &str) {
+    assert!(wire.get("secret").is_none(), "{wire}");
+    assert!(wire.get("secretHash").is_none(), "{wire}");
+    let mut without_url = wire.clone();
+    without_url.as_object_mut().expect("object").remove("url");
+    let text = serde_json::to_string(&without_url).expect("json");
+    assert!(!text.contains(secret), "raw secret leaked: {text}");
+    assert!(!text.contains(&hash_secret(secret)), "hash leaked: {text}");
+}
+
+/// The mint stores the secret and, with a link builder attached, every
+/// `list` row carries `url` rebuilt from it — the envelope resolved once per
+/// list, not per row, and never by `create` (the transport resolves the
+/// create envelope itself and stamps both `url`s from it); a row minted
+/// before the secret was stored gets no `url`; the secret itself never
+/// serialises.
+#[tokio::test]
+async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let links = Arc::new(StubLinks {
+        envelope: true,
+        resolves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    f.services.attach_invite_link_builder(links.clone());
+
+    let created = f.create_invite(Some(3600)).await;
+    let id = id_of(&created);
+    let secret = created["secret"].as_str().expect("secret").to_string();
+    let expected_url = format!("stub://{id}/{secret}");
+    assert_eq!(
+        links.resolves.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "create never resolves the envelope through the builder"
+    );
+    assert!(
+        created["invite"].get("url").is_none(),
+        "create leaves url to the transport: {created}"
+    );
+    assert_secret_hidden(&created["invite"], &secret);
+    let stored = f
+        .store
+        .get_workspace_invite(&id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(stored.secret.as_deref(), Some(secret.as_str()));
+    assert_eq!(stored.secret_hash, hash_secret(&secret));
+
+    // A second open invite plus a pre-0128 row (no stored secret).
+    let created_2 = f.create_invite(Some(3600)).await;
+    let id_2 = id_of(&created_2);
+    let secret_2 = created_2["secret"].as_str().expect("secret").to_string();
+    let legacy_secret = "f".repeat(64);
+    let legacy = WorkspaceInvite {
+        id: "inv-legacy".to_string(),
+        workspace_id: f.ws.clone(),
+        secret_hash: hash_secret(&legacy_secret),
+        secret: None,
+        created_by_principal_id: f.owner.clone(),
+        pin_github_user_id: None,
+        pin_login: None,
+        created_at: now_iso(),
+        expires_at: iso_after(60),
+        redeemed_at: None,
+        redeemed_by_principal_id: None,
+        revoked_at: None,
+    };
+    f.store
+        .insert_workspace_invite(&legacy)
+        .await
+        .expect("insert legacy");
+
+    let before = links.resolves.load(std::sync::atomic::Ordering::SeqCst);
+    let listed = with_caller(wire(&f.owner), f.services.workspace_invite_list_op(&f.ws))
+        .await
+        .expect("list");
+    assert_eq!(
+        links.resolves.load(std::sync::atomic::Ordering::SeqCst),
+        before + 1,
+        "one envelope resolve per list call"
+    );
+    let rows = listed["invites"].as_array().expect("invites");
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let row_id = row["id"].as_str().expect("id");
+        match row_id {
+            _ if row_id == id => {
+                assert_eq!(row["url"], json!(expected_url));
+                assert_secret_hidden(row, &secret);
+            }
+            _ if row_id == id_2 => {
+                assert_eq!(row["url"], json!(format!("stub://{id_2}/{secret_2}")));
+                assert_secret_hidden(row, &secret_2);
+            }
+            "inv-legacy" => {
+                assert!(row.get("url").is_none(), "no secret, no url: {row}");
+                assert_secret_hidden(row, &legacy_secret);
+            }
+            other => panic!("unexpected invite {other}"),
+        }
+    }
+    let text = serde_json::to_string(&listed).expect("json");
+    assert!(!text.contains("\"secret\""), "{text}");
+}
+
+/// Without a builder, or with one that cannot build a link right now
+/// (listener down, no dialable route), `create` and `list` still answer —
+/// their rows simply carry no `url`.
+#[tokio::test]
+async fn invite_list_omits_the_url_when_no_link_can_be_built() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(Some(3600)).await;
+    assert!(created["invite"].get("url").is_none(), "{created}");
+    let listed = with_caller(wire(&f.owner), f.services.workspace_invite_list_op(&f.ws))
+        .await
+        .expect("list without builder");
+    assert_eq!(listed["invites"].as_array().map(Vec::len), Some(1));
+    assert!(listed["invites"][0].get("url").is_none(), "{listed}");
+
+    f.services.attach_invite_link_builder(Arc::new(StubLinks {
+        envelope: false,
+        resolves: std::sync::atomic::AtomicUsize::new(0),
+    }));
+    let created = f.create_invite(Some(3600)).await;
+    assert!(created["invite"].get("url").is_none(), "{created}");
+    let secret = created["secret"].as_str().expect("secret");
+    assert_secret_hidden(&created["invite"], secret);
+    let listed = with_caller(wire(&f.owner), f.services.workspace_invite_list_op(&f.ws))
+        .await
+        .expect("list with an unresolvable envelope");
+    let rows = listed["invites"].as_array().expect("invites");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.get("url").is_none()), "{listed}");
 }
 
 /// A waiter whose budget runs out while the poll task is committing the
@@ -936,6 +1106,214 @@ async fn complete_join_enforces_the_pin_by_account_id() {
         .await
         .expect("pinned account joins");
     assert_eq!(joined["login"], json!("renamed-login"));
+}
+
+// --- guest caps ------------------------------------------------------------
+
+/// The fixture wired to a settings registry with
+/// `sharing.maxGuestsPerWorkspace = cap`; the registry is returned so a
+/// test can move the cap while the daemon runs (the ops read it live).
+async fn capped_fixture(
+    tmp: &TempDb,
+    cap: u32,
+) -> (Fixture, Arc<crate::SettingsRegistry>, tempfile::TempDir) {
+    let cfg_dir = crate::test_support::test_tempdir("intentd-guest-caps");
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(cfg_dir.path().join("config.toml")).expect("load registry"),
+    );
+    set_cap(&registry, cap);
+    let mut f = fixture(tmp).await;
+    f.services = Services::new(f.store.clone()).with_settings_registry(registry.clone());
+    (f, registry, cfg_dir)
+}
+
+fn set_cap(registry: &crate::SettingsRegistry, cap: u32) {
+    registry
+        .apply(&[("sharing.maxGuestsPerWorkspace".to_string(), json!(cap))])
+        .expect("apply cap");
+}
+
+async fn guest_summary(f: &Fixture) -> (u64, u64) {
+    let v = with_caller(wire(&f.owner), f.services.workspace_members_list_op(&f.ws))
+        .await
+        .expect("members.list");
+    (
+        v["guestCount"].as_u64().expect("guestCount"),
+        v["guestLimit"].as_u64().expect("guestLimit"),
+    )
+}
+
+/// `workspace.invite.create` spends the cap on collaborators PLUS open
+/// invites (the fixture seats two collaborators): at the cap it is
+/// `GuestLimit`, revoking an invite frees the seat, lowering the cap live
+/// applies to the next mint, cap `0` closes a fresh workspace to guests,
+/// and `members.list` reports the same count / limit.
+#[tokio::test]
+async fn invite_create_refuses_at_the_guest_limit() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 3).await;
+    assert_eq!(guest_summary(&f).await, (2, 3));
+
+    let created = f.create_invite(None).await;
+    assert_eq!(guest_summary(&f).await, (3, 3));
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_invite_create_op(&f.ws, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+    assert_eq!(
+        f.store
+            .list_open_workspace_invites(&f.ws)
+            .await
+            .expect("list")
+            .len(),
+        1,
+        "a refused mint leaves no row"
+    );
+
+    with_caller(
+        wire(&f.owner),
+        f.services
+            .workspace_invite_revoke_op(&f.ws, &id_of(&created)),
+    )
+    .await
+    .expect("revoke");
+    assert_eq!(guest_summary(&f).await, (2, 3));
+    f.create_invite(None).await;
+
+    // Live cap change: two collaborators already fill a cap of 2.
+    set_cap(&registry, 2);
+    assert_eq!(guest_summary(&f).await, (3, 2));
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_invite_create_op(&f.ws, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+
+    // Cap 0: even a workspace with no guest at all admits none. The owner
+    // (GitHub-linked) owns it alone; the primary seat is removed.
+    set_cap(&registry, 0);
+    let empty = WorkspaceId::new();
+    f.store
+        .insert_workspace(&workspace(&empty))
+        .await
+        .expect("empty ws");
+    let primary = f.store.get_primary_principal().await.expect("primary").id;
+    f.store
+        .remove_workspace_member(&empty, &primary)
+        .await
+        .expect("remove primary");
+    f.store
+        .add_workspace_member(&empty, &f.owner, WorkspaceRole::Owner)
+        .await
+        .expect("owner");
+    assert_eq!(
+        f.store
+            .count_workspace_guests(&empty)
+            .await
+            .expect("count")
+            .committed(),
+        0
+    );
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_invite_create_op(&empty, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+}
+
+/// The join re-checks the cap against collaborators inside the store
+/// transaction: an open invite minted under a higher cap is `WorkspaceFull`
+/// once the cap drops to the seated count — nothing is written and the
+/// invite stays open — an account that is already a member re-joins without
+/// a seat, and the same invite admits a newcomer once the cap is raised.
+#[tokio::test]
+async fn complete_join_refuses_a_full_workspace_and_keeps_the_invite_open() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 3).await;
+    let id = id_of(&f.create_invite(None).await);
+    let principals = f.store.count_principals().await.expect("count");
+
+    set_cap(&registry, 2);
+    let r = f
+        .services
+        .complete_invite_join(&id, &identity("newcomer", 7001))
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::WorkspaceFull);
+    assert_eq!(f.store.count_principals().await.expect("count"), principals);
+    let invite = f
+        .store
+        .get_workspace_invite(&id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(invite.redeemed_at.is_none(), "the invite stays open");
+
+    // A seated collaborator (github 2002) needs no new seat.
+    let rejoined = f
+        .services
+        .complete_invite_join(&id, &identity("collab", 2002))
+        .await
+        .expect("member re-joins under a full cap");
+    assert_eq!(rejoined["principalId"], json!(f.collaborator.0));
+
+    set_cap(&registry, 3);
+    let id = id_of(&f.create_invite(None).await);
+    let joined = f
+        .services
+        .complete_invite_join(&id, &identity("newcomer", 7001))
+        .await
+        .expect("join once the cap is raised");
+    assert_eq!(joined["login"], json!("newcomer"));
+    assert_eq!(guest_summary(&f).await, (3, 3));
+}
+
+/// Concurrent joins on distinct open invites for the last seat: exactly one
+/// commits, the rest are `WorkspaceFull` with their invites still open.
+#[tokio::test]
+async fn concurrent_joins_cannot_overshoot_the_guest_cap() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 5).await;
+    let mut invite_ids = Vec::new();
+    for _ in 0..3 {
+        invite_ids.push(id_of(&f.create_invite(None).await));
+    }
+    set_cap(&registry, 3);
+
+    let mut handles = Vec::new();
+    for (n, id) in (9000u64..).zip(invite_ids) {
+        let services = f.services.clone();
+        handles.push(tokio::spawn(async move {
+            services
+                .complete_invite_join(&id, &identity(&format!("racer-{n}"), n))
+                .await
+        }));
+    }
+    let mut joined = 0;
+    let mut full = 0;
+    for h in handles {
+        match h.await.expect("task") {
+            Ok(_) => joined += 1,
+            r => {
+                assert_eq!(invite_kind(&r), InviteErrorKind::WorkspaceFull);
+                full += 1;
+            }
+        }
+    }
+    assert_eq!((joined, full), (1, 2));
+    assert_eq!(
+        f.store
+            .list_open_workspace_invites(&f.ws)
+            .await
+            .expect("list")
+            .len(),
+        2,
+        "refused joins leave their invites open"
+    );
+    assert_eq!(guest_summary(&f).await, (5, 3));
 }
 
 // --- leave / revokeSelf ----------------------------------------------------

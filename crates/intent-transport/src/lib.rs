@@ -19,6 +19,7 @@ pub use control::{FileWatchStatus, IdleUpdateCheckStatus, SystemControl, SystemS
 pub use host_env::{
     detect_has_display, detect_host_environment, local_hostname, pretty_hostname, HostEnvironment,
 };
+pub use invite::InviteLinkResolver;
 #[cfg(windows)]
 pub use listener::pipe_name_for_socket_path;
 pub use listener::{serve_uds, serve_uds_with_reverse};
@@ -34,7 +35,9 @@ pub use server::{
     PairingSnapshot, ServerPairingInfo,
 };
 pub use tls::{ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
-pub use ws::{WsApiServer, WsOptions};
+pub use ws::{
+    GuestConnectionLimits, SharedGuestLimits, WsApiServer, WsOptions, GUEST_CAP_RETRY_AFTER_SECS,
+};
 
 /// Source commit embedded at build time, when the build environment can identify it.
 pub const BUILD_COMMIT: Option<&str> = option_env!("INTENTD_EMBEDDED_BUILD_COMMIT");
