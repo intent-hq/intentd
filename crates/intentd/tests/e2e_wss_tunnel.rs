@@ -16,7 +16,9 @@ use futures_util::{SinkExt, StreamExt};
 use intent_core::{Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
-use intent_transport::tunnel::{Frame, TunnelLimits, MAX_TUNNEL_MESSAGE_BYTES, OP_OPEN};
+use intent_transport::tunnel::{
+    Frame, TunnelLimits, MAX_TUNNEL_MESSAGE_BYTES, OP_CREDIT, OP_OPEN, TUNNEL_INITIAL_CREDIT_BYTES,
+};
 use intent_transport::{
     ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
 };
@@ -524,6 +526,137 @@ async fn tunnel_daemon_only_opcode_from_client_rejected() {
 
     send_frame(&mut ws, Frame::OpenOk { stream_id: 1 }).await;
     expect_protocol_close(&mut ws, "daemon-only opcode").await;
+    srv.ws.stop().await;
+}
+
+/// A `CREDIT` frame whose payload is not exactly 4 bytes, or that grants
+/// zero bytes, is malformed and closes the connection with `1002`
+/// (intent-hq/intent#5482).
+#[intent_test_macros::daemon_test]
+async fn tunnel_malformed_credit_closes_with_protocol_error() {
+    let srv = start().await;
+    let mut short = vec![OP_CREDIT];
+    short.extend_from_slice(&1u32.to_be_bytes());
+    short.extend_from_slice(&[0, 0, 1]);
+    let mut zero = vec![OP_CREDIT];
+    zero.extend_from_slice(&1u32.to_be_bytes());
+    zero.extend_from_slice(&0u32.to_be_bytes());
+    for (bytes, needle) in [
+        (short, "CREDIT payload must be exactly 4 bytes"),
+        (zero, "CREDIT must grant at least one byte"),
+    ] {
+        let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+        ws.send(Message::Binary(bytes.into())).await.expect("send");
+        expect_protocol_close(&mut ws, needle).await;
+    }
+    srv.ws.stop().await;
+}
+
+/// Daemon→client `DATA` is flow-controlled per stream (intent-hq/intent#5482):
+/// a loopback reply larger than the initial window pauses at exactly
+/// `TUNNEL_INITIAL_CREDIT_BYTES` while the connection stays responsive, and a
+/// client `CREDIT` releases exactly the remainder. The peer's `EOF` is seen by
+/// the same gated read, so it follows only once the stream holds credit again.
+#[intent_test_macros::daemon_test]
+async fn tunnel_credit_window_pauses_reply_until_client_grants() {
+    const EXTRA: usize = 64 * 1024;
+    let srv = start().await;
+    let window = usize::try_from(TUNNEL_INITIAL_CREDIT_BYTES).expect("window fits");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("local addr").port();
+    let served = intent_core::spawn_daemon(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        sock.write_all(&vec![0xCD; window + EXTRA])
+            .await
+            .expect("write reply");
+        sock.shutdown().await.expect("shutdown");
+    });
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    send_frame(&mut ws, Frame::Open { stream_id: 1, port }).await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: 1 });
+    let mut received = 0;
+    while received < window {
+        match recv_frame(&mut ws).await {
+            Frame::Data {
+                stream_id: 1,
+                payload,
+            } => received += payload.len(),
+            other => panic!("expected DATA, got {other:?} after {received} bytes"),
+        }
+    }
+    assert_eq!(received, window, "reply overshot the initial credit window");
+    // Paused, not stalled: the connection still answers while the peer's
+    // remaining bytes wait on credit — and no further DATA precedes the pong.
+    ws.send(Message::Ping(b"paused".to_vec().into()))
+        .await
+        .expect("ping");
+    loop {
+        match tokio::time::timeout(common::test_timeout(Duration::from_secs(10)), ws.next())
+            .await
+            .expect("timed out waiting for pong")
+            .expect("connected")
+            .expect("message")
+        {
+            Message::Pong(p) if p.as_ref() == b"paused" => break,
+            Message::Ping(p) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            other => panic!("expected pong while the reply is paused, got {other:?}"),
+        }
+    }
+    send_frame(
+        &mut ws,
+        Frame::Credit {
+            stream_id: 1,
+            credit: u32::try_from(EXTRA).expect("grant fits"),
+        },
+    )
+    .await;
+    let mut granted = 0;
+    while granted < EXTRA {
+        match recv_frame(&mut ws).await {
+            Frame::Data {
+                stream_id: 1,
+                payload,
+            } => granted += payload.len(),
+            other => panic!("expected DATA, got {other:?} after {granted} granted bytes"),
+        }
+    }
+    assert_eq!(granted, EXTRA, "grant released exactly the remaining bytes");
+    served.await.expect("listener task");
+    // The window is spent again, so the peer's close is not read yet; the
+    // next grant surfaces it as `EOF` with no further `DATA`.
+    ws.send(Message::Ping(b"spent".to_vec().into()))
+        .await
+        .expect("ping");
+    loop {
+        match tokio::time::timeout(common::test_timeout(Duration::from_secs(10)), ws.next())
+            .await
+            .expect("timed out waiting for pong")
+            .expect("connected")
+            .expect("message")
+        {
+            Message::Pong(p) if p.as_ref() == b"spent" => break,
+            Message::Ping(p) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            other => panic!("expected pong with the window spent, got {other:?}"),
+        }
+    }
+    send_frame(
+        &mut ws,
+        Frame::Credit {
+            stream_id: 1,
+            credit: 1,
+        },
+    )
+    .await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::Eof { stream_id: 1 });
+    send_frame(&mut ws, Frame::Eof { stream_id: 1 }).await;
+    assert_eq!(recv_frame(&mut ws).await, Frame::Close { stream_id: 1 });
+    ws.close(None).await.expect("close ws");
     srv.ws.stop().await;
 }
 
