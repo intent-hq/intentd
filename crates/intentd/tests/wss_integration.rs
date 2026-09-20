@@ -3496,13 +3496,16 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
 /// holding its own credential is connected and subscribed to the global
 /// `workspace` channel BEFORE it is a member — its seq-0 snapshot omits the
 /// owner's workspace. The owner's `workspace.members.add` answers
-/// `{ added: true, memberCount }`, and the guest's open channel delivers
-/// the workspace as an upsert delta (`updated[0].id == ws`, `myRole:
-/// collaborator`) without a reconnect; its next `workspace.get` succeeds. A
-/// second add is `{ added: false }` with no further delta. Refusals over
-/// the wire: the guest itself is `-32003` at the transport allowlist; an
-/// unknown principal, the primary principal and a guest whose credentials
-/// were all revoked are `-32602 invalid-params` for the owner.
+/// `{ added: true, memberCount }`, the owner's own `events.subscribe`
+/// (`workspace:updated`, opened before the add) delivers the §6 event with
+/// the `{ members, addedPrincipalId, memberCount }` changes delta, and the
+/// guest's open channel delivers the workspace as an upsert delta
+/// (`updated[0].id == ws`, `myRole: collaborator`) without a reconnect; its
+/// next `workspace.get` succeeds. A second add is `{ added: false }` with no
+/// further delta and no further event. Refusals over the wire: the guest
+/// itself is `-32003` at the transport allowlist; an unknown principal, the
+/// primary principal and a guest whose credentials were all revoked are
+/// `-32602 invalid-params` for the owner.
 #[intent_test_macros::daemon_test]
 async fn wss_members_add_delivers_workspace_to_connected_guest() {
     use intent_core::{Principal, PrincipalId};
@@ -3640,6 +3643,26 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
     assert_eq!(self_add["error"]["code"], -32003, "guest add: {self_add}");
     assert_eq!(self_add["error"]["message"], "Forbidden");
 
+    // The owner's own event feed: subscribed to `workspace:updated` before
+    // the add so the membership event is delivered to this client.
+    let mut owner_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "events.subscribe",
+                "params": { "eventTypes": ["workspace:updated"], "workspaceId": ws_id },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send");
+    let sub = reply(&mut owner_ws, 1).await;
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "events.subscribe: {sub}"
+    );
+
     // Owner refusals: unknown / primary / no active credential.
     let owner_add = |principal_id: String, rpc_id: u64| {
         let frame = json!({
@@ -3681,6 +3704,41 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
         "{delta}"
     );
 
+    // The owner's `events.event`: the §6.5 `workspace:updated` membership
+    // delta is self-sufficient (`members`, `addedPrincipalId`, `memberCount`).
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match owner_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:updated"
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = owner_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the owner's workspace:updated");
+    assert_eq!(evt["workspaceId"], ws_id.as_str(), "{evt}");
+    assert_eq!(evt["data"]["workspaceId"], ws_id.as_str(), "{evt}");
+    assert_eq!(
+        evt["data"]["changes"],
+        json!({
+            "members": true,
+            "addedPrincipalId": guest.id.0,
+            "memberCount": 2,
+        }),
+        "membership event delta: {evt}"
+    );
+
     // Same connection, now a member.
     let (id, frame) = call("workspace.get", json!({ "workspaceId": ws_id }));
     ws.send(Message::Text(frame.into())).await.expect("send");
@@ -3712,6 +3770,25 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
     })
     .await;
     assert!(quiet.is_err(), "idempotent add pushed: {quiet:?}");
+    let quiet_owner = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match owner_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event" {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        quiet_owner.is_err(),
+        "idempotent add published an event: {quiet_owner:?}"
+    );
 
     let roster = wss_call(
         srv.port,
@@ -3732,6 +3809,7 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
     assert_eq!(roster["result"]["guestCount"], 1, "{roster}");
 
     drop(ws);
+    drop(owner_ws);
     srv.ws.stop().await;
 }
 
