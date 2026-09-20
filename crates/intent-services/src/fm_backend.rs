@@ -434,12 +434,15 @@ impl ProcessGroupGuard {
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
+        let Some(pid) = self.pid else { return };
         #[cfg(unix)]
-        if let Some(pid) = self.pid {
+        {
             use nix::sys::signal::{killpg, Signal};
             use nix::unistd::Pid;
             let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
         }
+        #[cfg(not(unix))]
+        let _ = pid;
     }
 }
 

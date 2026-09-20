@@ -4132,8 +4132,10 @@ impl Services {
     }
 
     /// Replace the `fm` one-shot backend (`agent.completeOnce` §5.32) with
-    /// one over a fake binary so the on-device route is testable on any host.
-    #[cfg(test)]
+    /// one over a fake binary so the on-device route is testable on any unix
+    /// host. Its callers drive a fake `fm` shell script, so they (and it) are
+    /// unix-only.
+    #[cfg(all(test, unix))]
     pub(crate) fn with_fm_backend(mut self, backend: Arc<fm_backend::FmBackend>) -> Self {
         self.fm_backend = backend;
         self
