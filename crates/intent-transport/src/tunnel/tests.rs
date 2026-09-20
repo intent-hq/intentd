@@ -684,8 +684,8 @@ async fn inbound_byte_budget_is_shared_and_released() {
 
 /// Deadline for one step of progress by the code under test, scaled for slow
 /// environments (coverage runs export `INTENTD_TEST_TIMEOUT_MULTIPLIER`);
-/// the multiplier is never below 1.0 and non-finite values are ignored so
-/// `Duration::mul_f64` cannot panic.
+/// the multiplier is never below 1.0, non-finite values are ignored, and an
+/// out-of-range product saturates instead of panicking.
 fn deadline() -> Duration {
     let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
         .ok()
@@ -693,7 +693,7 @@ fn deadline() -> Duration {
         .filter(|m| m.is_finite())
         .unwrap_or(1.0)
         .max(1.0);
-    Duration::from_secs(5).mul_f64(multiplier)
+    Duration::try_from_secs_f64(5.0 * multiplier).unwrap_or(Duration::MAX)
 }
 
 /// Poll `ready` on a short interval until it holds or `deadline()` passes;
