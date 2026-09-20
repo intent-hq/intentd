@@ -7109,12 +7109,23 @@ async fn write_txn_retry_does_not_retry_pool_closed() {
 /// signal, so the append must wait it out and succeed once the connection is
 /// released. The store is opened with a shrunk acquire timeout so the test
 /// exercises the real sqlx `PoolTimedOut` path without the production 10s
-/// window.
+/// window, and the held connection is released only once the append has
+/// observed at least one real timeout (via the task-scoped
+/// `POOL_TIMEOUT_OBSERVER`), so a slow pre-`begin()` read cannot consume the
+/// hold window and turn the test into a false pass.
 #[tokio::test]
 async fn append_agent_message_survives_write_pool_acquire_timeout() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     // Short enough to keep the test fast, long enough that opening the pool's
     // one fresh connection under parallel test load never trips it itself.
-    const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+    const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+    // Upper bound on how long the holder keeps the connection if the append
+    // never reports a timeout; the test then fails on the observer assertion
+    // instead of hanging.
+    const WATCHDOG: Duration = Duration::from_secs(15);
     let tmp = TempDb::new();
     // Migrate with the ordinary store, then reopen with a short acquire
     // timeout on the write pool.
@@ -7139,28 +7150,42 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         .await
         .expect("insert session");
 
-    // Occupy the only write connection for more than two acquire windows so
-    // the append's `begin()` observes at least two `PoolTimedOut`s before the
-    // connection is released.
+    // Occupy the only write connection until the append's `begin()` has
+    // observed at least one `PoolTimedOut`, then release it.
     let held = store
         .write_pool()
         .acquire()
         .await
         .expect("hold write connection");
-    let holder = tokio::spawn(async move {
-        tokio::time::sleep(ACQUIRE_TIMEOUT * 5 / 2).await;
-        drop(held);
-    });
+    let observed = Arc::new(AtomicUsize::new(0));
+    let holder = {
+        let observed = Arc::clone(&observed);
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + WATCHDOG;
+            while observed.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(held);
+        })
+    };
 
-    let result = store
-        .append_agent_message(
-            &agent_id,
-            "user",
-            &json!([{ "type": "text", "text": "hi" }]),
-            "t0",
+    let result = crate::POOL_TIMEOUT_OBSERVER
+        .scope(
+            Arc::clone(&observed),
+            store.append_agent_message(
+                &agent_id,
+                "user",
+                &json!([{ "type": "text", "text": "hi" }]),
+                "t0",
+            ),
         )
         .await;
     holder.await.expect("holder task");
+    let timeouts = observed.load(Ordering::SeqCst);
+    assert!(
+        timeouts >= 1,
+        "the append must have hit at least one real PoolTimedOut before the connection was released"
+    );
     let msg = result.expect("append must retry through the write-pool acquire timeout");
     assert_eq!(msg.seq, 0);
     let rows = store

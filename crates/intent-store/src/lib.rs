@@ -122,6 +122,16 @@ fn is_transient_message(msg: &str) -> bool {
     is_busy_message(msg) || is_pool_timeout_message(msg)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only observer: counts the pool acquire timeouts [`with_busy_retry`]
+    /// sees on the current task, whether or not they are retried. Scoped per
+    /// task so a test can prove the exact operation it wraps really hit
+    /// `PoolTimedOut` (see `append_agent_message_survives_write_pool_acquire_timeout`)
+    /// without a global counter that other parallel tests could bump.
+    pub(crate) static POOL_TIMEOUT_OBSERVER: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
 /// Shared transient-error retry loop backing [`with_write_txn_retry`] and
 /// [`with_read_retry`]. Executes the given async closure, retrying only when
 /// the error is transient contention (`Error::Internal` whose message
@@ -146,6 +156,11 @@ where
         match f().await {
             Ok(result) => return Ok(result),
             Err(e) => {
+                #[cfg(test)]
+                if matches!(&e, Error::Internal(msg) if is_pool_timeout_message(msg)) {
+                    let _ = POOL_TIMEOUT_OBSERVER
+                        .try_with(|seen| seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+                }
                 // Only retry on transient contention: SQLITE_BUSY-family
                 // (database is locked) or a pool acquire timeout.
                 let transient = matches!(&e, Error::Internal(msg) if is_transient_message(msg));
