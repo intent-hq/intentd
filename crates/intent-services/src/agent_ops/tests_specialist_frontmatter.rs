@@ -241,7 +241,7 @@ async fn retired_model_tier_falls_through_to_settings() {
 
 /// The delegate path ignores the retired `modelTier` identically to direct
 /// create — it funnels through the same resolver in `agent_create_op`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn retired_model_tier_ignored_on_delegate_path() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_with_retired_tier(specialists_dir.path(), "tiered", "smart");
@@ -267,7 +267,7 @@ async fn retired_model_tier_ignored_on_delegate_path() {
 /// the id, BEFORE provider/effort resolution — not a confusing downstream
 /// provider-resolution failure — and no child agent is created
 /// (monorepo#3497). An alias still delegates fine.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn unknown_specialist_rejects_delegate() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
 
@@ -322,7 +322,7 @@ async fn unknown_specialist_rejects_delegate() {
 /// monorepo#1729 (issue repro): a delegated specialist with no frontmatter
 /// model resolves `model.providerDefaults`, NOT the quick-action default —
 /// the quick-action model settings never apply to a delegated session.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_ignores_quick_action_default_model() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_without_model(specialists_dir.path(), "implementor-test");
@@ -370,7 +370,7 @@ async fn delegate_ignores_quick_action_default_model() {
 /// Seeded through `model.providerDefaults` rather than `model.default`: a
 /// compound `model.default` makes `resolve_delegate_provider` derive that
 /// provider and assert it is installed, which no CI runner guarantees.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_ignores_quick_action_type_override() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_without_model(specialists_dir.path(), "implementor-test");

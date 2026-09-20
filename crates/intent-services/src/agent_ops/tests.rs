@@ -1623,7 +1623,7 @@ async fn busy_misclassified_terminal_idle_heals_on_worker_exit_redelivery() {
 /// monorepo#1297 heal path (group sealing): a coordinator whose terminal
 /// idle was busy-misclassified still gets its open `after_all` group sealed
 /// and settled by the worker-exit redelivery.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn busy_misclassified_terminal_idle_heal_seals_group() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -1827,7 +1827,7 @@ async fn idle_with_editing_only_queue_delivers_and_retires_watch() {
 
 /// A progress-report watch survives an interim idle, then delivers and retires
 /// at the real completion after the queue drains.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn progress_report_watch_survives_interim_idle_and_fires_at_completion() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -2562,7 +2562,7 @@ async fn chief_anchored_group_fires_aggregated_wake_to_chief_parent() {
 /// The aggregated `after_all` wake carries `event_notification` metadata whose
 /// `eventCount` equals the group size and whose `events` array preserves each
 /// child's raw completion event (id, type, data, timestamp, actor).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_fire_attaches_event_notification_metadata() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -3372,7 +3372,7 @@ async fn fired_completion_watch_does_not_rehydrate() {
 /// restarts, the boot reconciliation synthesizes the child's HISTORICAL completion — which
 /// must NOT wake the parent again (the re-armed watch stays armed for a
 /// FUTURE completion), across any number of restarts.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn restart_reconcile_skips_already_delivered_completion() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
@@ -3466,7 +3466,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
 /// Regression (intent-hq/monorepo#2842, re-arm semantics): re-arming a watch
 /// on an already-completed child must not fire on the historical completion
 /// the parent already received — only on a subsequent one.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -3578,7 +3578,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
 /// dedup identity must still be derived (raw key presence, not the #1945
 /// filter), or a re-arm on the settled child replays the historical
 /// completion the retirement branch already recorded.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn rearmed_watch_dedups_empty_report_completion() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -3796,7 +3796,7 @@ async fn stale_reported_idle_does_not_suppress_newer_completion() {
 
 /// Re-arming after a progress report adopts the existing watch. The same
 /// cycle's terminal completion still delivers once and retires it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_wake_then_rearm_still_delivers_terminal_completion() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -3852,7 +3852,7 @@ async fn report_wake_then_rearm_still_delivers_terminal_completion() {
 
 /// Sender auto-subscribe adopts the progress-report watch and preserves its
 /// terminal completion wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn sender_auto_subscribe_after_report_still_gets_terminal_wake() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -3977,7 +3977,7 @@ async fn report_without_watch_then_arm_receives_terminal_completion() {
 /// immediate wake and must record NO delivery marker — the aggregated
 /// `after_all` wake is the one report carrier there and keeps today's
 /// behavior.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn grouped_report_records_no_marker_and_aggregated_wake_carries_report() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -4029,7 +4029,7 @@ async fn grouped_report_records_no_marker_and_aggregated_wake_carries_report() {
 /// into an `after_all` group and the aggregate wake fires — the report event
 /// folds into the aggregate metadata instead of flushing at `holdUntil` as a
 /// standalone wake beside it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_adoption_mid_window_retracts_held_report_into_aggregate_wake() {
     let (_t, svc, ws) = setup().await;
     svc.settings_registry()
@@ -4151,7 +4151,7 @@ async fn unreported_completion_wake_delivers_with_summary() {
 /// If the daemon restarts after a progress report but before terminal idle,
 /// startup reconciliation delivers the distinct terminal wake once and
 /// retires the persisted watch. A second restart does not duplicate it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn restart_reconcile_delivers_terminal_after_progress_once() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
@@ -10986,7 +10986,7 @@ async fn watch_completion_dedupe() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_progress_keeps_watch_armed_until_terminal_wake() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -11036,7 +11036,7 @@ async fn report_to_parent_progress_keeps_watch_armed_until_terminal_wake() {
 /// monorepo#4026 case 1: the report-time wake was DELIVERED to the parent and
 /// the child settled with that SAME report — the terminal wake references the
 /// earlier delivery instead of repeating the full `Report:` clause verbatim.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn terminal_wake_suppresses_already_delivered_report() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -11091,7 +11091,7 @@ async fn terminal_wake_suppresses_already_delivered_report() {
 /// monorepo#4026 case 2: the child reported AGAIN after the delivered wake
 /// (stamped identity is stale) — the terminal wake fails open and renders the
 /// full report.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn terminal_wake_renders_full_report_when_identity_stale() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -11143,7 +11143,7 @@ async fn terminal_wake_renders_full_report_when_identity_stale() {
 /// With a non-zero `agents.reportToParentDebounceSeconds`, a progress report
 /// parks the wake as a held entry on the parent's queue instead of delivering
 /// it, and a repeat report from the same child upserts that entry in place.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_debounce_parks_wake_as_held_entry() {
     let (_t, svc, ws) = setup().await;
     svc.settings_registry()
@@ -11208,7 +11208,7 @@ async fn report_to_parent_debounce_parks_wake_as_held_entry() {
 /// the held entry is retracted and its `agent:reportToParent` event is folded
 /// into the single terminal wake's metadata — the parent gets exactly ONE
 /// wake carrying both facts.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_debounce_settlement_retracts_and_combines() {
     let (_t, svc, ws) = setup().await;
     svc.settings_registry()
@@ -11291,7 +11291,7 @@ async fn report_to_parent_debounce_settlement_retracts_and_combines() {
 
 /// A quiet child: the debounce window expires with no settlement, the hold
 /// timer flushes the parked wake, and it delivers as a normal progress wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_debounce_expiry_flushes_wake() {
     let (_t, svc, ws) = setup().await;
     svc.settings_registry()
@@ -11348,7 +11348,7 @@ async fn report_to_parent_debounce_expiry_flushes_wake() {
 /// path restores the retracted held entry, so the stable-id retry retracts
 /// and folds it again — the parent still gets exactly ONE wake carrying both
 /// the report event and the terminal event.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_debounce_send_failure_restores_held_entry_for_retry() {
     let (_t, svc, ws) = setup().await;
     svc.settings_registry()
@@ -11469,7 +11469,7 @@ async fn wait_for_report_hold_flush(svc: &Services, parent: &AgentId) -> String 
 /// terminal settlement: it is retracted and its `agent:reportToParent` event
 /// folds into the single terminal wake — the parent gets exactly ONE wake
 /// carrying the report once, not a stale progress wake beside it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_flushed_wake_retracted_at_settlement() {
     let (_t, svc, ws) = setup().await;
     svc.settings_registry()
@@ -11547,7 +11547,7 @@ async fn report_to_parent_flushed_wake_retracted_at_settlement() {
 /// the send-failure path restores the entry verbatim (same id, still
 /// ready-to-send), so the stable-id retry retracts and folds it again — the
 /// parent still gets exactly ONE wake carrying both events.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn flushed_report_send_failure_restores_entry_for_retry() {
     let (_t, svc, ws) = setup().await;
     svc.settings_registry()
@@ -11681,7 +11681,7 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
 /// wake for real (it appends), then re-parks a stamp-less queue entry
 /// carrying that wake's real metadata — the shape the busy-parent fallback
 /// enqueues under a manager.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn debounce_zero_report_wake_retracted_at_settlement() {
     let (_t, svc, ws) = setup().await;
     svc.settings_registry()
@@ -11800,7 +11800,7 @@ async fn debounce_zero_report_wake_retracted_at_settlement() {
 /// when the `after_all` group settles — the report folds into the aggregate
 /// metadata instead of sitting on the parent's queue as a stale standalone
 /// wake beside the aggregate.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_settlement_retracts_flushed_report_into_aggregate_wake() {
     let (_t, svc, ws) = setup().await;
     svc.settings_registry()
@@ -12050,7 +12050,7 @@ async fn failed_terminal_wake_retries_without_another_event() {
     wait_for_persisted_watches(&svc, 0).await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn failed_aggregated_wake_retries_without_another_event() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -12335,7 +12335,7 @@ async fn clean_interim_retry_pass_stops_polling() {
 
 /// A report is a progress wake: it says "reported", omits terminal retirement,
 /// and exposes that the completion watch is still armed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_wake_says_reported_and_discloses_watch_is_still_armed() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -12383,7 +12383,7 @@ async fn report_wake_says_reported_and_discloses_watch_is_still_armed() {
 
 /// Without a watch, report metadata omits `watchStillArmed`. Repeated progress
 /// reports on a watched child continue to disclose the armed watch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -12469,7 +12469,7 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
 /// watch as `report_delivered` and delivers an immediate wake), `agent:failed` and
 /// `agent:deleted` events STILL deliver their completion wake to the parent.
 /// Only `agent:idle` is suppressed by the `report_delivered` flag.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_then_failed_or_deleted_still_wakes_parent() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -12697,7 +12697,7 @@ async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
 /// are background agents (G-A1/P3-1.2c). The persisted `initialMessage` is
 /// served by `agent.getSession` only — it stays off the lite projection
 /// (extending monorepo#2932).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_persists_initial_message_and_delegation_depth() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -12871,7 +12871,7 @@ async fn delegate_reads_cow_isolation_setting() {
 }
 
 /// When workspace.cowIsolation is disabled (default), delegations use shared mode.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_defaults_to_shared_when_setting_disabled() {
     let (_t, svc, ws) = setup().await;
     // workspace.cowIsolation defaults to false, no need to set it
@@ -12930,7 +12930,7 @@ async fn delegate_explicit_isolation_overrides_setting() {
 
 /// The top-level (RPC / user) front door stays parentless and is never
 /// subject to the depth guard even when a foreground parent exists.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_without_parent_bypasses_depth_guard() {
     let (_t, svc, ws) = setup().await;
     // No caller_agent_id: this is the top-level create path.
@@ -19195,7 +19195,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
 
 /// MCP front door (caller set), default wait mode: exactly one ungrouped watch is
 /// registered linking the caller (parent) to the freshly created child.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_immediate_registers_one_ungrouped_watch_for_mcp_caller() {
     let (_t, svc, ws) = setup().await;
     let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
@@ -19218,7 +19218,7 @@ async fn delegate_immediate_registers_one_ungrouped_watch_for_mcp_caller() {
 }
 
 /// RPC front door (caller `None`): no watch is registered.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_rpc_path_registers_no_watch() {
     let (_t, svc, ws) = setup().await;
     let resp = svc
@@ -19232,7 +19232,7 @@ async fn delegate_rpc_path_registers_no_watch() {
 /// `wait_mode == "after_all"` (AS-4): the child is enrolled in the parent's
 /// delegation group and a grouped watch (`group_id` = Some) is registered
 /// instead of an immediate ungrouped watch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_after_all_enrolls_group_and_registers_group_watch() {
     let (_t, svc, ws) = setup().await;
     let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
@@ -19262,7 +19262,7 @@ async fn delegate_after_all_enrolls_group_and_registers_group_watch() {
 
 /// The deleted-parent guard skips registration when the caller's session is
 /// flagged `deleted` (TS `selectIsAgentDeleted`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_skips_watch_when_parent_deleted() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -20468,7 +20468,7 @@ async fn child_session_first_message_text(svc: &Services, child: &AgentId) -> St
 }
 
 /// Explicit `agentInstructions` become the child's first message.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_delivers_agent_instructions_as_child_first_message() {
     let (_t, svc, ws) = setup().await;
     let input = AgentDelegateInput {
@@ -20497,7 +20497,7 @@ async fn delegate_delivers_agent_instructions_as_child_first_message() {
 
 /// With no `agentInstructions`, the child's first message falls back to
 /// `taskText`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_falls_back_to_task_text_for_child_first_message() {
     let (_t, svc, ws) = setup().await;
     let input = AgentDelegateInput {
@@ -20521,7 +20521,7 @@ async fn delegate_falls_back_to_task_text_for_child_first_message() {
 }
 
 /// `agentInstructions` take priority over `taskText` when both are present.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_prefers_agent_instructions_over_task_text() {
     let (_t, svc, ws) = setup().await;
     let input = AgentDelegateInput {
@@ -20888,7 +20888,7 @@ async fn delegate_task_note_only_injects_preamble_below_note_body() {
 
 /// TASK-C: delegations without a task note deliver the message verbatim —
 /// no preamble is injected.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_without_task_note_omits_preamble() {
     let (_t, svc, ws) = setup().await;
     let input = AgentDelegateInput {
@@ -20918,7 +20918,7 @@ async fn delegate_without_task_note_omits_preamble() {
 
 /// A bare delegate (no instructions, no task text, no task note) creates the
 /// child but delivers no first message — there is nothing to send.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_without_message_source_delivers_nothing() {
     let (_t, svc, ws) = setup().await;
     let resp = svc
@@ -21016,7 +21016,7 @@ async fn delegate_names_child_from_task_text() {
 /// NAME-1: task-derived names longer than 100 chars are truncated to the
 /// first 97 chars + "..." (reference: `taskText.length > 100 ? taskText
 /// .substring(0, 97) + '...' : taskText`). Boundary: len == 100 is untouched.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_truncates_long_task_derived_names() {
     let (_t, svc, ws) = setup().await;
     // 150-char task text -> first 97 chars + "..." = 100 chars total.
@@ -21076,7 +21076,7 @@ async fn delegate_truncates_long_task_derived_names() {
 /// NAME-1: because delegate keeps `nameExplicitlySet = false`, a subsequent
 /// skip-guarded rename (the FE `ws.workspace.setAgentName` path uses
 /// `skipIfExplicitlySet: true`) still applies to the delegated child.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_leaves_child_renameable_by_skip_guarded_rename() {
     let (_t, svc, ws) = setup().await;
     let input = AgentDelegateInput {
@@ -22799,7 +22799,7 @@ async fn agent_failed_wakes_immediately_despite_active_hooks() {
 /// Idle-visibility deferral (d, continued): the immediate wake paths that
 /// bypass agent:idle settlement — `reportToParent`, the blocker/discussion
 /// attention fan-out, and `agent:deleted` — are never hook-deferred.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn immediate_wake_paths_ignore_active_hooks() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -24554,7 +24554,7 @@ async fn status_list_and_diagnostics_surface_waiting_on_pr_monitors() {
 
 /// Two `after_all` delegates from one parent share a single group whose expected
 /// set has both children, with two grouped watches and zero ungrouped watches.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn two_after_all_delegates_share_one_group() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -24577,7 +24577,7 @@ async fn two_after_all_delegates_share_one_group() {
 
 /// child idle (no fire) -> parent idle (seal, still incomplete, no fire) ->
 /// second child idle -> exactly one aggregated wake; group + watches removed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_fires_once_after_parent_then_remaining_child() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -24616,7 +24616,7 @@ async fn group_fires_once_after_parent_then_remaining_child() {
 
 /// Both children idle before the parent: no fire until the parent idles, then a
 /// single aggregated wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_fires_on_parent_idle_when_children_already_done() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -24648,7 +24648,7 @@ async fn group_fires_on_parent_idle_when_children_already_done() {
 
 /// A deleted child counts toward completion as `partial`: after the parent
 /// seals, one deleted + one idle child yields a single partial aggregated wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_partial_when_child_deleted() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -24688,7 +24688,7 @@ async fn group_partial_when_child_deleted() {
 
 /// The group fires exactly once: a duplicate child completion and a second parent
 /// idle after delivery do not deliver a second aggregated wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_no_double_fire() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -24737,7 +24737,7 @@ async fn group_no_double_fire() {
 /// delegation made in the redriven turn joins the same group, the real
 /// (queue-drained) completion seals it, and settlement covers BOTH children
 /// with a single aggregated wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -24828,7 +24828,7 @@ async fn interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
 /// seal the open `after_all` group. A delegation made in the redriven turn
 /// joins the same group, the redriven turn's terminal idle seals it, and
 /// settlement covers BOTH children with a single aggregated wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn busy_interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -24908,7 +24908,7 @@ async fn busy_interim_parent_idle_does_not_seal_group_and_late_delegate_joins() 
 /// monorepo#1281 guard (unchanged behavior): a coordinator's `agent:failed` /
 /// `agent:deleted` never seals its open group — only an idle real completion
 /// does.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn parent_failed_or_deleted_does_not_seal_group() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -24942,7 +24942,7 @@ async fn parent_failed_or_deleted_does_not_seal_group() {
 /// monorepo#1281 no-strand guard: when the redriven turn delegates nothing,
 /// the group still seals at the real (queue-drained) completion and settles
 /// normally — deferring the seal past the interim idle must not strand it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_seals_at_real_completion_when_redriven_turn_delegates_nothing() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -25002,7 +25002,7 @@ async fn group_seals_at_real_completion_when_redriven_turn_delegates_nothing() {
 /// coordinator's ready-to-send queue while it is idle synthesizes the REAL
 /// completion — the synthesized idle must seal the open group and settle it,
 /// even though the coordinator has no watchers of its own.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn queue_retraction_synthesized_idle_seals_group() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -25057,7 +25057,7 @@ async fn queue_retraction_synthesized_idle_seals_group() {
 /// hook-waiting classification defers only the agent's own settlement as a
 /// child, never the parent-side seal. Once every child settles, the
 /// aggregated wake is claimed and delivered and the group is removed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn hook_owning_parent_idle_seals_group_and_wake_delivers() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -25108,7 +25108,7 @@ async fn hook_owning_parent_idle_seals_group_and_wake_delivers() {
 /// while owning an active hook is still NOT recorded as settled — the seal
 /// gating change is scoped to the parent's own idle, and the sealed group
 /// keeps waiting for the hook-waiting child's genuine completion.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn hook_waiting_child_settlement_still_deferred_after_seal() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -25179,7 +25179,7 @@ async fn hook_waiting_child_settlement_still_deferred_after_seal() {
 /// queue-idle — the pr-monitor-waiting classification defers only the
 /// agent's own settlement as a child, never the parent-side seal. Mirrors
 /// `hook_owning_parent_idle_seals_group_and_wake_delivers`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_owning_parent_idle_seals_group_and_wake_delivers() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -25230,7 +25230,7 @@ async fn pr_monitor_owning_parent_idle_seals_group_and_wake_delivers() {
 /// gating change is scoped to the parent's own idle, and the sealed group
 /// keeps waiting for the pr-monitor-waiting child's genuine completion.
 /// Mirrors `hook_waiting_child_settlement_still_deferred_after_seal`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_waiting_child_settlement_still_deferred_after_seal() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -25307,7 +25307,7 @@ async fn pr_monitor_waiting_child_settlement_still_deferred_after_seal() {
 /// starve the parent's aggregated wake (the merge decision the withheld wake
 /// was supposed to inform). Settlement must NOT retire the monitor: it stays
 /// armed for late PR activity.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn completion_report_idle_settles_group_despite_active_pr_monitor() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -25367,7 +25367,7 @@ async fn completion_report_idle_settles_group_despite_active_pr_monitor() {
 /// monorepo#1945, hook variant: a grouped child whose terminal idle carries a
 /// completionReport settles its `after_all` group despite owning an active
 /// background hook, and settlement leaves the hook armed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn completion_report_idle_settles_group_despite_active_hook() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -25642,7 +25642,7 @@ async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() 
 
 /// Calling `agent.watch` after progress adopts the already-armed watch without
 /// duplicating it. The persisted watch stays terminal-ready.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn watch_after_progress_adopts_armed_watch_and_fires_terminal_idle() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -26436,7 +26436,7 @@ async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
 /// The SUB-1 sender auto-subscribe reuses the matching ungrouped watch after a
 /// progress report. The report leaves that watch armed, the reuse does not add
 /// a second durable row, and the child's terminal idle wakes the parent once.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -26597,7 +26597,7 @@ async fn registration_deferral_survives_non_last_hook_terminal_transition() {
 /// Watch-set changes emit `agent:subscriptions-changed` carrying the parent's
 /// refreshed waiting flags: `true` + the child id on registration (delegate),
 /// `false` + empty after the aggregated wake clears the group watches.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn watch_set_changes_emit_subscriptions_changed() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -26660,7 +26660,7 @@ async fn assert_display_status_silent(sub: &mut crate::Subscription) {
 /// `waiting` flag without moving the derived `displayStatus` — no
 /// `workspace:displayStatus-changed` fires for either the first or a second
 /// registration.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn watch_registration_sets_waiting_without_display_status_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -26681,7 +26681,7 @@ async fn watch_registration_sets_waiting_without_display_status_event() {
 /// waiting), goes idle while the child is still out (still waiting), and the
 /// child settling retires the group's watches, dropping the flag — with no
 /// `workspace:displayStatus-changed` at any point.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn watch_settlement_drops_waiting_without_display_status_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -26719,7 +26719,7 @@ async fn watch_settlement_drops_waiting_without_display_status_event() {
 /// The unscoped `agent.cancelSubscriptions` sweep drops the caller's last
 /// watch — and with it the anchor workspace's `waiting` flag — without any
 /// `workspace:displayStatus-changed`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cancel_subscriptions_drops_waiting_without_display_status_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -26741,7 +26741,7 @@ async fn cancel_subscriptions_drops_waiting_without_display_status_event() {
 /// suppressed: no immediate parent message, the report is still persisted, and
 /// it reaches the parent only inside the single aggregated wake (as that
 /// child's `Report:` line).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_suppressed_for_after_all_group_child() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -26800,7 +26800,7 @@ async fn report_to_parent_suppressed_for_after_all_group_child() {
 /// `completion_report`. The wake belongs to the child's next `agent:idle`;
 /// with the group + watches already gone there is no watch to fire, matching
 /// the reference where `reportToParent` never issues a standalone wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_immediate_after_group_delivery() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -27134,7 +27134,7 @@ async fn request_attention_validates_inputs() {
 
 /// A delegated (non-grouped) caller's parent receives the kind-flavored wake
 /// immediately, carrying the reason.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn request_attention_wakes_parent_for_delegated_agent() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -27173,7 +27173,7 @@ async fn request_attention_wakes_parent_for_delegated_agent() {
 /// IMMEDIATELY (mirroring the STAB-160 immediate grouped-failure wake); the
 /// later aggregated group wake still folds the attention request into that
 /// child's line as the record.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn request_attention_folds_into_after_all_group_wake() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -27227,7 +27227,7 @@ async fn request_attention_folds_into_after_all_group_wake() {
 /// The immediate grouped attention wake carries the kind-flavored text and
 /// reason, and delivers BEFORE any group settlement — a blocker raised by an
 /// `after_all` child must not wait for its siblings.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn request_attention_wakes_parent_immediately_in_after_all_group() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -27256,7 +27256,7 @@ async fn request_attention_wakes_parent_immediately_in_after_all_group() {
 /// `agent:attention-requested` from a delegated child carries the optional
 /// `parentAgentId` (the delegating parent) so subscribers can attribute the
 /// request without a follow-up `agent.get`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn attention_requested_event_carries_parent_agent_id_for_delegated_child() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -27534,7 +27534,7 @@ async fn request_attention_idle_agent_surfaces_immediately() {
 /// The deferred flush surfaces the payload captured at raise time, so a
 /// delegated child's flush carries `parentAgentId`, matching the immediate
 /// arm's payload contract.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn deferred_attention_flush_carries_parent_agent_id() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -27709,7 +27709,7 @@ async fn attention_signals_skip_deferred_pending_request_until_flush() {
 /// `agent:failed` for a delegated child is enriched centrally (in
 /// `publish_agent_event`) with the child's `parentAgentId`, covering every
 /// terminal-failure emit site.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_failed_event_carries_parent_agent_id_for_delegated_child() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -28273,7 +28273,7 @@ async fn diagnostics_task_filter_matches_session_side_only() {
 
 /// monorepo#1150: a nonexistent `taskNoteId` yields an empty snapshot, not
 /// an error.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn diagnostics_task_filter_unknown_note_yields_empty_snapshot() {
     let (_t, svc, ws) = setup().await;
     let _agent = create_agent(&svc, &ws, "Someone").await;
@@ -31119,7 +31119,7 @@ async fn queued_message_metadata_surfaces_in_queue_snapshot() {
 /// watch, unless a live ungrouped watch for the pair already exists,
 /// in which case the grouped watch is simply dropped. Either way the child's
 /// later settlement still wakes the parent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let _worker = svc.spawn_completion_delivery_loop();
@@ -31280,7 +31280,7 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
 /// wake through the same path as ungrouped watches while the group stays
 /// live and still fires its single aggregated wake at settlement; a
 /// reprocessed duplicate `agent:failed` adds no second immediate wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn grouped_child_failure_wakes_parent_immediately() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let _worker = svc.spawn_completion_delivery_loop();
@@ -39070,7 +39070,7 @@ async fn group_rehydration_settles_retired_child() {
 /// An attention request (blocker) from the watched agent wakes third-party
 /// `agent.watch` watchers, while the parent's own wake path is unchanged —
 /// the parent is excluded from the fan-out (no duplicate).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_watch_wakes_watcher_on_attention_request() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -39190,7 +39190,7 @@ async fn agent_watch_wakes_watcher_on_attention_request() {
 /// An explicit watch adopted into an `after_all` delegation group wakes at
 /// group settlement, not the target's individual completion — its attention
 /// wake must promise the settlement wake instead (monorepo#2051 review).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_watch_attention_wake_states_group_settlement_for_grouped_watch() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -39252,7 +39252,7 @@ async fn agent_watch_attention_wake_states_group_settlement_for_grouped_watch() 
 
 /// A parent that ALSO explicitly watches its child receives exactly ONE
 /// attention wake (the direct parent wake); the fan-out excludes the parent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_watch_attention_fanout_excludes_parent() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -39405,7 +39405,7 @@ async fn attention_fanout_reaches_auto_registered_grouped_watch() {
 /// auto-registered delegation watch (`wake_on_attention: false`) still gets
 /// exactly ONE attention wake — the direct step-5 parent wake; the widened
 /// fan-out keeps excluding the parent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn attention_fanout_excludes_parent_with_auto_registered_watch_only() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
@@ -39448,7 +39448,7 @@ async fn attention_fanout_excludes_parent_with_auto_registered_watch_only() {
 /// `reportToParent` idle suppression stays scoped to the parent's own
 /// watch: a third-party watcher still receives the `agent:idle`
 /// wake after the child reported.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_does_not_suppress_third_party_watch_idle_wake() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
