@@ -674,7 +674,11 @@ async fn run_stream(
     let idle = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(idle);
     loop {
+        // Fixed priority: admit the held frame first, then drain client→daemon
+        // messages, then read more loopback output. A burst of reads may not
+        // starve `msg_rx` — that is the coupling behind #5461.
         tokio::select! {
+            biased;
             permit = out_tx.reserve(), if pending.is_some() => {
                 let Ok(permit) = permit else { break };
                 let frame = pending.take().expect("guarded by pending.is_some()");
@@ -686,21 +690,6 @@ async fn run_stream(
                     break;
                 }
             }
-            n = rd.read(&mut buf), if !read_done && pending.is_none() => match n {
-                // Read errors (e.g. RST) surface as EOF toward the client;
-                // the write side keeps draining until the client is done too.
-                Ok(0) | Err(_) => {
-                    read_done = true;
-                    pending = Some(Frame::Eof { stream_id });
-                }
-                Ok(n) => {
-                    idle.as_mut().reset(Instant::now() + limits.idle_timeout);
-                    pending = Some(Frame::Data {
-                        stream_id,
-                        payload: buf[..n].to_vec(),
-                    });
-                }
-            },
             msg = msg_rx.recv() => match msg {
                 Some(StreamMsg::Data(bytes, _permit)) => {
                     queued_bytes.fetch_sub(bytes.len(), Ordering::Relaxed);
@@ -728,6 +717,21 @@ async fn run_stream(
                     }
                 }
                 None => break,
+            },
+            n = rd.read(&mut buf), if !read_done && pending.is_none() => match n {
+                // Read errors (e.g. RST) surface as EOF toward the client;
+                // the write side keeps draining until the client is done too.
+                Ok(0) | Err(_) => {
+                    read_done = true;
+                    pending = Some(Frame::Eof { stream_id });
+                }
+                Ok(n) => {
+                    idle.as_mut().reset(Instant::now() + limits.idle_timeout);
+                    pending = Some(Frame::Data {
+                        stream_id,
+                        payload: buf[..n].to_vec(),
+                    });
+                }
             },
             () = &mut idle => break,
         }

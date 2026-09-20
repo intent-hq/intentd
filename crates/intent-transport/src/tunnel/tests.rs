@@ -626,13 +626,17 @@ async fn yield_until(attempts: usize, ready: impl Fn() -> bool) -> bool {
     ready()
 }
 
-/// Regression for intent-hq/intent#5461. A loopback response larger than the
-/// shared daemon→client queue parks the relay on outbound admission while the
-/// WebSocket client lags (`out_rx` left undrained stands in for the connection
-/// loop blocked on a slow sink). Client→daemon frames for the SAME stream must
-/// keep draining into the loopback socket meanwhile: ordinary request traffic
-/// behind a large reply may not fill the stream's inbound queue and close it,
-/// while sibling streams and heartbeats stay unblocked.
+/// Regression for intent-hq/intent#5461, at the relay level. A loopback
+/// response larger than the shared daemon→client queue parks the relay on
+/// outbound admission while the WebSocket client lags (`out_rx` left undrained
+/// stands in for the connection loop blocked on a slow sink). Client→daemon
+/// frames for the SAME stream must keep draining into the loopback socket
+/// meanwhile: ordinary request traffic behind a large reply may not fill the
+/// stream's inbound queue and close it. The sibling/heartbeat checks here
+/// exercise `forward_to_stream` and the sink directly, so they only show the
+/// parked relay holds no lock those paths need; the connection loop is driven
+/// by `slow_client_keeps_stream_and_heartbeats_alive_behind_large_response`.
+/// Fails on the pre-fix relay at request `STREAM_QUEUE_FRAMES`.
 #[tokio::test]
 async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
     const RESPONSE_BYTES: usize = 2 * OUTBOUND_QUEUE_FRAMES * READ_CHUNK_BYTES;
@@ -766,4 +770,166 @@ async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
     );
     streams.remove(&1).unwrap().abort.abort();
     sibling.abort();
+}
+
+type ClientWs = WebSocketStream<tokio::io::DuplexStream>;
+
+/// Send one tunnel frame from the client side of an in-process WebSocket.
+async fn client_send(sink: &mut SplitSink<ClientWs, Message>, frame: Frame) {
+    assert!(sink
+        .send(Message::Binary(frame.encode().into()))
+        .await
+        .is_ok());
+}
+
+/// Next client-side message, failing loudly if the connection stops progressing.
+async fn client_next(stream: &mut futures_util::stream::SplitStream<ClientWs>) -> Message {
+    tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the connection keeps making progress")
+        .expect("connection alive")
+        .expect("clean WebSocket message")
+}
+
+/// Companion to the relay-level test above, through `run_tunnel_connection`
+/// on an in-process WebSocket. The client reads slowly but keeps progressing
+/// (a 4 KiB duplex buffer means every 16 KiB `DATA` frame blocks the sink
+/// until the client takes it), while pipelining a request per reply chunk
+/// behind a response twice the shared outbound queue. The stream survives,
+/// the consumer gets every request in order, and a sibling stream plus a
+/// heartbeat ping issued mid-response reach the client.
+///
+/// Scope waiver (intent-hq/intent#5461): a client that stops reading
+/// altogether parks the connection loop in `sink.send`, which stalls the whole
+/// socket — every stream and heartbeat — until the WebSocket write completes.
+/// That is pre-existing, independent of the relay fix, and needs a wire credit
+/// window; it is out of scope here and tracked separately.
+#[tokio::test]
+async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
+    const RESPONSE_BYTES: usize = 2 * OUTBOUND_QUEUE_FRAMES * READ_CHUNK_BYTES;
+    const REQUESTS: usize = STREAM_QUEUE_FRAMES + 1;
+    let (requests_tx, requests_rx) = tokio::sync::oneshot::channel();
+    let response_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let response_port = response_listener.local_addr().unwrap().port();
+    // Flushes the oversized reply first, then reads the requests queued behind
+    // it, then stays connected so no EOF/CLOSE races the assertions.
+    let response_consumer = tokio::spawn(async move {
+        let (mut tcp, _) = response_listener.accept().await.unwrap();
+        tcp.write_all(&vec![0xAB; RESPONSE_BYTES]).await.unwrap();
+        let mut requests = vec![0u8; REQUESTS];
+        tcp.read_exact(&mut requests).await.unwrap();
+        requests_tx.send(requests).unwrap();
+        std::future::pending::<()>().await;
+    });
+    let echo_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_consumer = tokio::spawn(async move {
+        let (mut tcp, _) = echo_listener.accept().await.unwrap();
+        let byte = tcp.read_u8().await.unwrap();
+        tcp.write_u8(byte).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let (server_io, client_io) = tokio::io::duplex(4 * 1024);
+    let server = WebSocketStream::from_raw_socket(
+        server_io,
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+    let client = WebSocketStream::from_raw_socket(
+        client_io,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    let (mut client_sink, mut client_stream) = client.split();
+    let (cmd_tx, cmd_rx) = mpsc::channel(4);
+    let connection = tokio::spawn(run_tunnel_connection(
+        server,
+        cmd_rx,
+        Arc::new(AtomicI64::new(0)),
+        TunnelLimits::default(),
+    ));
+    // The response stream opens last: its consumer starts flushing as soon as
+    // the relay connects, so nothing else may still be awaiting an OPEN_OK.
+    for (stream_id, port) in [(2, echo_port), (1, response_port)] {
+        client_send(&mut client_sink, Frame::Open { stream_id, port }).await;
+        match client_next(&mut client_stream).await {
+            Message::Binary(bytes) => assert!(
+                matches!(Frame::decode(&bytes).unwrap(), Frame::OpenOk { stream_id: id } if id == stream_id),
+                "stream {stream_id} did not open first"
+            ),
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+    let mut received = 0;
+    let mut saw_echo = false;
+    let mut saw_ping = false;
+    let mut sent = 0;
+    while received < RESPONSE_BYTES || !saw_echo || !saw_ping {
+        if sent < REQUESTS {
+            client_send(
+                &mut client_sink,
+                Frame::Data {
+                    stream_id: 1,
+                    payload: vec![u8::try_from(sent).unwrap()],
+                },
+            )
+            .await;
+            sent += 1;
+            if sent == REQUESTS / 2 {
+                client_send(
+                    &mut client_sink,
+                    Frame::Data {
+                        stream_id: 2,
+                        payload: vec![7],
+                    },
+                )
+                .await;
+                cmd_tx.send(ConnCmd::Ping).await.unwrap();
+            }
+        }
+        match client_next(&mut client_stream).await {
+            Message::Binary(bytes) => match Frame::decode(&bytes).unwrap() {
+                Frame::Data {
+                    stream_id: 1,
+                    payload,
+                } => received += payload.len(),
+                Frame::Data {
+                    stream_id: 2,
+                    payload,
+                } => {
+                    assert_eq!(payload, vec![7]);
+                    saw_echo = true;
+                }
+                Frame::Data { stream_id, payload } => panic!(
+                    "unexpected {} DATA bytes on stream {stream_id} after {received} response bytes",
+                    payload.len()
+                ),
+                other => panic!("unexpected frame {other:?} after {received} response bytes"),
+            },
+            Message::Ping(_) => saw_ping = true,
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+    assert_eq!(received, RESPONSE_BYTES);
+    let requests = tokio::time::timeout(Duration::from_secs(5), requests_rx)
+        .await
+        .expect("consumer reads the queued requests")
+        .unwrap();
+    assert_eq!(
+        requests,
+        (0..REQUESTS)
+            .map(|i| u8::try_from(i).unwrap())
+            .collect::<Vec<_>>()
+    );
+    drop(cmd_tx);
+    drop(client_sink);
+    drop(client_stream);
+    tokio::time::timeout(Duration::from_secs(5), connection)
+        .await
+        .expect("connection loop ends once its command channel closes")
+        .unwrap();
+    response_consumer.abort();
+    echo_consumer.abort();
 }
