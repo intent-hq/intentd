@@ -197,7 +197,7 @@ pub mod auggie_discovery {
 
 pub use agent_manager::{
     compute_process_cap, default_process_cap, recommended_memory_budget_bytes, AgentManager,
-    BusEventSink, ProcessRegistry, TreeMemoryProbe, TreeSample,
+    AgentMemorySnapshot, BusEventSink, ProcessRegistry, ProcessSample, TreeMemoryProbe, TreeSample,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via
@@ -17713,6 +17713,107 @@ impl WorkspaceApi for Services {
             };
             let stopped = manager.unsloth_manager().stop().await;
             Ok(serde_json::json!({ "stopped": stopped }))
+        })
+    }
+
+    fn agent_memory_usage(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let empty = serde_json::json!({
+                "sampledAt": serde_json::Value::Null,
+                "totalBytes": serde_json::Value::Null,
+                "agents": [],
+            });
+            let Some(manager) = self.agent_manager() else {
+                return Ok(empty);
+            };
+            // One probe read: the stamp and the rows come from the same sweep
+            // by construction, so a sampler store landing mid-request cannot
+            // pair one sweep's `sampledAt` with the next sweep's processes.
+            let Some(snapshot) = manager.agent_memory_snapshot() else {
+                return Ok(empty);
+            };
+            let crate::agent_manager::AgentMemorySnapshot {
+                sampled_at,
+                processes: samples,
+            } = snapshot;
+            let spawn_details = manager.agent_spawn_details();
+
+            let mut agents = Vec::with_capacity(samples.len());
+            let mut total_bytes: u64 = 0;
+            for (agent_id, processes) in samples {
+                // The bucket is keyed by the agent's registered root pid; a
+                // handle may already be gone (the exit watcher raced the
+                // sweep), so fall back to the row no other row in the bucket
+                // parents — the subtree root.
+                let details = spawn_details.get(&agent_id);
+                let pids: std::collections::HashSet<u32> =
+                    processes.iter().map(|p| p.pid).collect();
+                let root_pid = details.and_then(|d| d.root_pid).or_else(|| {
+                    processes
+                        .iter()
+                        .find(|p| !pids.contains(&p.parent_pid))
+                        .map(|p| p.pid)
+                });
+                // A bucket whose session row is gone (deleted mid-sweep) is
+                // omitted: the row's name / workspace are the session's. Any
+                // other store failure propagates — a partial total that
+                // silently dropped live agents would read as a smaller tree.
+                let session = match self.store.get_agent_session_summary(&agent_id).await {
+                    Ok(session) => session,
+                    Err(Error::NotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                };
+                // The session row carries the provider id clients know from
+                // `agent.get` ("mock", "auggie"); the handle's spawn-time
+                // value is the resolved command ("node"), so it is only the
+                // fallback for a row that never recorded one.
+                let provider = session
+                    .provider
+                    .clone()
+                    .or_else(|| details.map(|d| d.provider.clone()))
+                    .unwrap_or_default();
+                let model = details
+                    .and_then(|d| d.model.clone())
+                    .or_else(|| session.model.clone());
+                let memory_bytes: u64 = processes.iter().map(|p| p.memory_bytes).sum();
+                total_bytes += memory_bytes;
+                let mut processes: Vec<_> = processes;
+                processes.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes));
+                let mut row = serde_json::json!({
+                    "agentId": agent_id.0,
+                    "agentName": session.name,
+                    "workspaceId": session.workspace_id.0,
+                    "provider": provider,
+                    "rootPid": root_pid,
+                    "processCount": processes.len(),
+                    "memoryBytes": memory_bytes,
+                    "processes": processes
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "pid": p.pid,
+                            "parentPid": p.parent_pid,
+                            "name": p.name,
+                            "cmdline": p.cmdline,
+                            "memoryBytes": p.memory_bytes,
+                        }))
+                        .collect::<Vec<_>>(),
+                });
+                if let Some(model) = model {
+                    row["model"] = serde_json::Value::String(model);
+                }
+                agents.push(row);
+            }
+            agents.sort_by(|a, b| {
+                b["memoryBytes"]
+                    .as_u64()
+                    .cmp(&a["memoryBytes"].as_u64())
+                    .then_with(|| a["agentId"].as_str().cmp(&b["agentId"].as_str()))
+            });
+            Ok(serde_json::json!({
+                "sampledAt": sampled_at,
+                "totalBytes": total_bytes,
+                "agents": agents,
+            }))
         })
     }
 

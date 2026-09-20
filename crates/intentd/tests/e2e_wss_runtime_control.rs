@@ -1210,7 +1210,16 @@ async fn runtime_toggled_wss_serves_system_status() {
     // which would let a bundle read a count without a byte total. Asserting
     // the pair rather than a concrete value keeps this deterministic: the
     // first tick fires at startup but a fast test can still beat it.
-    for field in ["childProcesses", "childMemoryBytes", "childMemoryPeakBytes"] {
+    // The agent-attributed share (§5.5 `agentMemoryBytes` /
+    // `agentProcessCount`) rides the same sample and follows the same
+    // all-null-or-all-present contract.
+    for field in [
+        "childProcesses",
+        "childMemoryBytes",
+        "childMemoryPeakBytes",
+        "agentMemoryBytes",
+        "agentProcessCount",
+    ] {
         assert!(
             r.get(field).is_some(),
             "{field} must ride the WSS status result: {r}"
@@ -1220,10 +1229,12 @@ async fn runtime_toggled_wss_serves_system_status() {
         &r["childProcesses"],
         &r["childMemoryBytes"],
         &r["childMemoryPeakBytes"],
+        &r["agentMemoryBytes"],
+        &r["agentProcessCount"],
     ];
     let nulls = sampled.iter().filter(|v| v.is_null()).count();
     assert!(
-        nulls == 0 || nulls == 3,
+        nulls == 0 || nulls == 5,
         "descendant-tree fields must be all-null or all-present, got {nulls} nulls: {r}"
     );
     if nulls == 0 {
@@ -1239,6 +1250,48 @@ async fn runtime_toggled_wss_serves_system_status() {
             peak >= bytes,
             "peak {peak} must be >= instantaneous {bytes}"
         );
+        // No agent was spawned: the attributed share is zero, and it can
+        // never exceed the aggregate it is carved out of.
+        let agent_bytes = r["agentMemoryBytes"]
+            .as_u64()
+            .expect("agentMemoryBytes when sampled");
+        assert!(
+            agent_bytes <= bytes,
+            "agentMemoryBytes {agent_bytes} must be <= childMemoryBytes {bytes}"
+        );
+        assert_eq!(r["agentProcessCount"], 0, "no spawned agents: {r}");
+        assert_eq!(agent_bytes, 0, "no spawned agents: {r}");
+    }
+
+    // `agent.memoryUsage` (§5.5) over the same connection: daemon-wide, no
+    // `workspaceId`. The result envelope always carries the three keys;
+    // before the sampler's first tick `sampledAt` / `totalBytes` are null,
+    // afterwards `sampledAt` is an RFC-3339 stamp and `totalBytes` a u64 —
+    // and with no spawned agent the list is empty either way.
+    let resp = wss_rpc(&mut ws, 5, "agent.memoryUsage", json!({})).await;
+    assert_eq!(resp["id"], 5);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    let r = &resp["result"];
+    assert!(
+        resp.get("error").is_none(),
+        "agent.memoryUsage must succeed: {resp}"
+    );
+    let obj = r.as_object().expect("agent.memoryUsage result object");
+    for key in ["sampledAt", "totalBytes", "agents"] {
+        assert!(obj.contains_key(key), "{key} must be present: {r}");
+    }
+    assert_eq!(r["agents"], json!([]), "no spawned agents: {r}");
+    if r["sampledAt"].is_null() {
+        assert!(
+            r["totalBytes"].is_null(),
+            "unsampled ⇒ totalBytes null: {r}"
+        );
+    } else {
+        assert!(
+            r["sampledAt"].as_str().is_some_and(|s| s.contains('T')),
+            "sampledAt is an RFC-3339 stamp: {r}"
+        );
+        assert_eq!(r["totalBytes"], 0, "no spawned agents: {r}");
     }
 }
 

@@ -153,16 +153,17 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Also within 10.3: +1 router method (`github.users.search`, the
 /// collaborator picker's login-prefix user search).
 ///
+/// Agent memory attribution (§5.5): +1 router method (`agent.memoryUsage`).
+///
 /// Execution environments (protocol 10.5): +4 router methods
 /// (`sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
-/// `sandbox.image.check`) on top of the 10.3 / 10.4 catalog (379; 10.4 was
-/// a tunnel-only bump).
-const EXPECTED_TOTAL_METHODS: usize = 383;
+/// `sandbox.image.check`) on top of the 10.4 catalog (380).
+const EXPECTED_TOTAL_METHODS: usize = 384;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 328;
+const EXPECTED_ROUTER_METHODS: usize = 329;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 53;
@@ -503,6 +504,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.listInterrupted",
     "agent.listUserMessages",
     "agent.markSeen",
+    "agent.memoryUsage",
     "agent.pendingPermissions",
     "agent.removeQueuedMessage",
     "agent.rename",
@@ -1096,7 +1098,8 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// Owner-only families: `host.*` but the two display probes, `browser.*`,
 /// `forward.*`, `terminal.*`, `script.*`, `github.*`, `linear.*`, `sentry.*`,
 /// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
-/// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`),
+/// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`
+/// and `system.status`),
 /// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
 /// `git.agentCommit` (agent-only), agent deletion / proposals / one-shot
@@ -1116,6 +1119,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.delete",
     "agent.diagnostics",
     "agent.enhancePrompt",
+    "agent.memoryUsage",
     "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveProposal",
@@ -1266,7 +1270,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
-    "system.status",
     "terminal.create",
     "terminal.getBuffer",
     "terminal.kill",
@@ -1441,6 +1444,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "chat.subscribe",
         "workspace.subscribe",
         "system.capabilities",
+        "system.status",
         "host.status",
         "principal.me",
         "pr.status",
@@ -1471,6 +1475,8 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "mcp.servers.list",
         "prMonitor.cancel",
         "settings.get",
+        "system.shutdown",
+        "system.requestUpdate",
         "repo.list",
         "voice.transcribe",
         "workspace.create",
@@ -1593,6 +1599,9 @@ mod unbound_owner_only_methods {
     /// growing it needs a reason on the row. The failure message prints the
     /// recomputed list.
     const UNGATED_AT_SERVICE_LAYER: &[(&str, &str)] = &[
+        // No gate: daemon-wide per-agent memory read; no-manager early
+        // return `{ sampledAt: null, totalBytes: null, agents: [] }`.
+        ("agent.memoryUsage", "ok"),
         // No gate: daemon-wide reverse-client listing.
         ("client.list", "ok"),
         // No gate: process-wide stack sampler.
@@ -1692,6 +1701,7 @@ mod unbound_owner_only_methods {
                 "agent.enhancePrompt",
                 json!({ "prompt": "p", "timeoutMs": 1 }),
             ),
+            ("agent.memoryUsage", json!({})),
             (
                 "agent.replaceMessages",
                 json!({ "agentId": "a1", "messages": [] }),

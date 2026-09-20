@@ -427,10 +427,14 @@ pub(crate) async fn process_frame(
         if let Some(control) = control {
             if let Some(req) = control::classify(value) {
                 let is_uds = !crate::context::is_tcp_connection();
+                // A collaborator only ever reaches `system.status` here (the
+                // allowlist above refused the rest) and gets its guest-safe
+                // projection; the administrator keeps the full snapshot.
+                let is_administrator = !crate::context::is_non_administrator_caller();
                 let frame = panic_guard::guard_frame(
                     &method,
                     rpc_id.clone(),
-                    control::handle(req, control.as_ref(), is_local, is_uds),
+                    control::handle(req, control.as_ref(), is_local, is_uds, is_administrator),
                 )
                 .await;
                 return match frame {
