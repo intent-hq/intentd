@@ -214,6 +214,15 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
 /// Pump the subscriber connection until a `sourceControl:auth-changed` event
 /// with the wanted status arrives (bounded) and return its `data`.
 async fn await_auth_changed(ws: &mut Ws, status: &str, secs: u64) -> Value {
+    await_auth_changed_matching(ws, Some(status), secs).await
+}
+
+/// Like [`await_auth_changed`] but returns the NEXT `sourceControl:auth-changed`
+/// event of any status when `status` is `None` — the way to prove an event
+/// was never emitted: the first one observed is the one a later action
+/// deliberately triggered.
+async fn await_auth_changed_matching(ws: &mut Ws, status: Option<&str>, secs: u64) -> Value {
+    let status = status.unwrap_or("<any>");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
         let remaining = deadline
@@ -227,7 +236,8 @@ async fn await_auth_changed(ws: &mut Ws, status: &str, secs: u64) -> Value {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["method"] == json!("events.event")
                     && v["params"]["event"]["type"] == json!("sourceControl:auth-changed")
-                    && v["params"]["event"]["data"]["status"] == json!(status)
+                    && (status == "<any>"
+                        || v["params"]["event"]["data"]["status"] == json!(status))
                 {
                     return v["params"]["event"]["data"].clone();
                 }
@@ -895,4 +905,97 @@ async fn gitlab_token_refresh_and_expiry_over_wss() {
     }
     let v = wss_rpc(&mut rpc, 14, "sourceControl.getUser", gitlab).await;
     assert_eq!(v["result"], json!({ "user": null }));
+}
+
+/// Contract decision (PR Context, 2026-09-20): `sourceControl.revoke` is
+/// idempotent and host-scoped. With host A bound, `revoke(gitlab, host B)`
+/// is a successful no-op — A's token stays, no `auth-changed` is emitted for
+/// B — and it aborts only a device grant pending for exactly B. Only a
+/// malformed host is `-32602`; "not connected" never is.
+#[tokio::test]
+async fn gitlab_revoke_is_host_scoped_and_idempotent_over_wss() {
+    const OTHER_HOST: &str = "gitlab.acme.internal";
+    let mock = spawn_mock_gitlab().await;
+    let h = boot(&mock).await;
+    let mut sub = subscriber(&h).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let gitlab = json!({ "provider": "gitlab" });
+    let other = json!({ "provider": "gitlab", "host": OTHER_HOST });
+
+    // Bind host A (the configured instance) with a PAT.
+    let v = wss_rpc(
+        &mut rpc,
+        10,
+        "sourceControl.connect",
+        json!({ "provider": "gitlab", "method": "pat", "token": PAT_TOKEN }),
+    )
+    .await;
+    assert_eq!(v["result"], json!({ "ok": true, "method": "pat" }), "{v}");
+    let ev = await_auth_changed(&mut sub, "authorized", 15).await;
+    assert_eq!(ev["host"], json!(HOST));
+    assert_eq!(
+        read_secrets(&h.secrets_file)["sourceControl.gitlab.token"],
+        json!(PAT_TOKEN)
+    );
+
+    // revoke(gitlab, host B): ok, A's token untouched, A still configured.
+    let v = wss_rpc(&mut rpc, 11, "sourceControl.revoke", other.clone()).await;
+    assert_eq!(v["result"], json!({ "ok": true }), "{v}");
+    assert_eq!(
+        read_secrets(&h.secrets_file)["sourceControl.gitlab.token"],
+        json!(PAT_TOKEN),
+        "another host's revoke never deletes the bound instance's token"
+    );
+    let v = wss_rpc(&mut rpc, 12, "sourceControl.authStatus", gitlab.clone()).await;
+    assert_eq!(v["result"]["isConfigured"], json!(true), "{v}");
+    assert_eq!(v["result"]["host"], json!(HOST));
+
+    // Start a device grant on A; revoke(host B) leaves that grant pending.
+    let v = wss_rpc(&mut rpc, 13, "sourceControl.connect", gitlab.clone()).await;
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE), "{v}");
+    let v = wss_rpc(&mut rpc, 14, "sourceControl.revoke", other.clone()).await;
+    assert_eq!(v["result"], json!({ "ok": true }));
+    let v = wss_rpc(&mut rpc, 15, "sourceControl.authStatus", gitlab.clone()).await;
+    assert_eq!(
+        v["result"]["deviceFlow"]["status"],
+        json!("pending"),
+        "another host's revoke never aborts the bound instance's grant: {v}"
+    );
+    // cancelAuth on host B is the same host-scoped no-op.
+    let v = wss_rpc(&mut rpc, 16, "sourceControl.cancelAuth", other.clone()).await;
+    assert_eq!(v["result"], json!({ "ok": true, "cancelled": false }));
+
+    // Not-connected is never -32602; only a malformed host is.
+    let v = wss_rpc(
+        &mut rpc,
+        17,
+        "sourceControl.revoke",
+        json!({ "provider": "gitlab", "host": "https://gitlab.acme.internal/x" }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602), "{v}");
+
+    // revoke(host A) aborts the pending grant, deletes the token and emits
+    // `revoked` for A — and that is the FIRST auth-changed event since the
+    // PAT connect, so nothing was ever emitted for host B.
+    let v = wss_rpc(&mut rpc, 18, "sourceControl.revoke", gitlab.clone()).await;
+    assert_eq!(v["result"], json!({ "ok": true }));
+    let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "revoked" }),
+        "no auth-changed may be emitted for a host that was never connected"
+    );
+    let v = wss_rpc(&mut rpc, 19, "sourceControl.authStatus", gitlab.clone()).await;
+    assert_eq!(v["result"]["isConfigured"], json!(false), "{v}");
+    assert_eq!(v["result"]["deviceFlow"], Value::Null);
+    assert!(read_secrets(&h.secrets_file)
+        .get("sourceControl.gitlab.token")
+        .is_none());
+
+    // Idempotent: revoking again with nothing bound is still ok.
+    let v = wss_rpc(&mut rpc, 20, "sourceControl.revoke", other).await;
+    assert_eq!(v["result"], json!({ "ok": true }));
+    let v = wss_rpc(&mut rpc, 21, "sourceControl.cancelAuth", gitlab).await;
+    assert_eq!(v["result"], json!({ "ok": true, "cancelled": false }));
 }
