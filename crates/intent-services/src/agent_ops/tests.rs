@@ -17668,23 +17668,30 @@ async fn diagnostics_reports_subtree_memory_bytes() {
 /// provider / model / name / workspace come from the session row, rows sort
 /// by `memoryBytes` descending, and `totalBytes` is the cross-agent sum. An
 /// agent the probe did not bucket has no row, and a bucket whose session row
-/// is gone is omitted (from the list and the total). Without a manager, or
-/// before the first sample lands, the empty shape carries `sampledAt: null`,
-/// `totalBytes: null`.
+/// is gone (`NotFound`) is omitted (from the list and the total) — but any
+/// other store failure propagates instead of shrinking the total. Without a
+/// manager, or before the first sample lands, the empty shape carries
+/// `sampledAt: null`, `totalBytes: null`. The stamp and the rows are taken
+/// from the probe as one snapshot — exactly one probe read per request, so a
+/// sweep landing mid-request cannot pair one sweep's stamp with the next
+/// sweep's rows (the same-sweep contract §5.5 documents).
 #[tokio::test]
 async fn agent_memory_usage_reports_per_agent_process_rows() {
-    use crate::agent_manager::{ProcessSample, TreeMemoryProbe, TreeSample};
+    use crate::agent_manager::{AgentMemorySnapshot, ProcessSample, TreeMemoryProbe, TreeSample};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // The manager's probe slot is set-once, so "no sample yet" is a flag
-    // the test flips rather than a second probe.
+    // the test flips rather than a second probe. `reads` counts every probe
+    // method call so the test can prove the service takes one snapshot.
     struct ProcessProbe {
         sampled: AtomicBool,
         rows: HashMap<AgentId, Vec<ProcessSample>>,
+        reads: AtomicUsize,
     }
     impl TreeMemoryProbe for ProcessProbe {
         fn sample(&self) -> Option<TreeSample> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.sampled.load(Ordering::SeqCst).then(|| TreeSample {
                 memory_bytes: self.agent_samples().values().sum(),
                 seq: 1,
@@ -17692,18 +17699,20 @@ async fn agent_memory_usage_reports_per_agent_process_rows() {
             })
         }
         fn agent_samples(&self) -> HashMap<AgentId, u64> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.rows
                 .iter()
                 .map(|(id, rows)| (id.clone(), rows.iter().map(|r| r.memory_bytes).sum()))
                 .collect()
         }
-        fn agent_process_samples(&self) -> HashMap<AgentId, Vec<ProcessSample>> {
-            self.rows.clone()
-        }
-        fn sampled_at(&self) -> Option<String> {
+        fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.sampled
                 .load(Ordering::SeqCst)
-                .then(|| "2026-09-20T07:00:00Z".to_string())
+                .then(|| AgentMemorySnapshot {
+                    sampled_at: Some("2026-09-20T07:00:00Z".to_string()),
+                    processes: self.rows.clone(),
+                })
         }
     }
     let proc = |pid: u32, parent_pid: u32, name: &str, memory_bytes: u64| ProcessSample {
@@ -17751,6 +17760,7 @@ async fn agent_memory_usage_reports_per_agent_process_rows() {
     let probe = Arc::new(ProcessProbe {
         sampled: AtomicBool::new(false),
         rows,
+        reads: AtomicUsize::new(0),
     });
     manager.set_tree_probe(probe.clone());
     assert_eq!(
@@ -17758,9 +17768,19 @@ async fn agent_memory_usage_reports_per_agent_process_rows() {
         empty,
         "probe wired but no sample yet: empty shape"
     );
+    assert_eq!(
+        probe.reads.swap(0, Ordering::SeqCst),
+        1,
+        "the unsampled check is the one snapshot read, not a separate probe call"
+    );
 
     probe.sampled.store(true, Ordering::SeqCst);
     let result = svc.agent_memory_usage().await.expect("memory usage");
+    assert_eq!(
+        probe.reads.swap(0, Ordering::SeqCst),
+        1,
+        "stamp and rows come from one probe read: {result}"
+    );
     assert_eq!(result["sampledAt"], json!("2026-09-20T07:00:00Z"));
     assert_eq!(result["totalBytes"], json!(11_000));
     let agents = result["agents"].as_array().expect("agents");
@@ -17804,6 +17824,19 @@ async fn agent_memory_usage_reports_per_agent_process_rows() {
     assert_eq!(second["rootPid"], json!(200));
     assert_eq!(second["processCount"], json!(1));
     assert_eq!(second["memoryBytes"], json!(3_000));
+
+    // A store failure that is not `NotFound` must surface, never read as
+    // "these sessions were deleted" and shrink the total. Closing the pools
+    // turns the session lookup into `Error::Internal`.
+    svc.store().close().await;
+    let err = svc
+        .agent_memory_usage()
+        .await
+        .expect_err("store failure propagates");
+    assert!(
+        matches!(err, Error::Internal(_)),
+        "store failures propagate as Internal, got: {err:?}"
+    );
 }
 
 /// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry

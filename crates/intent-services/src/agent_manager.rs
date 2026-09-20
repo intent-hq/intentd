@@ -1086,18 +1086,28 @@ pub trait TreeMemoryProbe: Send + Sync {
         HashMap::new()
     }
 
-    /// Per-process detail behind [`Self::agent_samples`]: every process in
-    /// each registered agent's subtree, from the same sweep. Empty before the
-    /// first sample lands and for probes that don't attribute.
-    fn agent_process_samples(&self) -> HashMap<AgentId, Vec<ProcessSample>> {
-        HashMap::new()
+    /// The per-process detail behind [`Self::agent_samples`] together with
+    /// the timestamp of the sweep that produced it, as one value — the
+    /// `agent.memoryUsage` (§5.5) read. `None` before the first sample lands.
+    /// Published together for the same reason [`TreeSample`] is: a stamp and
+    /// rows read separately could straddle a sweep and describe two different
+    /// trees. The default serves an empty, unstamped snapshot once
+    /// [`Self::sample`] is `Some`, for probes that don't attribute.
+    fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+        self.sample().map(|_| AgentMemorySnapshot::default())
     }
+}
 
-    /// RFC-3339 UTC timestamp of the sweep behind [`Self::sample`], or `None`
-    /// before the first sample lands and for probes that don't record it.
-    fn sampled_at(&self) -> Option<String> {
-        None
-    }
+/// One sweep's per-agent process rows and the time it was taken, read
+/// together via [`TreeMemoryProbe::agent_memory_snapshot`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentMemorySnapshot {
+    /// RFC-3339 UTC timestamp of the sweep, or `None` for probes that don't
+    /// record it.
+    pub sampled_at: Option<String>,
+    /// Every process in each registered agent's subtree, bucketed by agent.
+    /// Empty for probes that don't attribute.
+    pub processes: HashMap<AgentId, Vec<ProcessSample>>,
 }
 
 /// What the manager knows about a live agent's spawned child, for
@@ -2846,27 +2856,14 @@ impl AgentManager {
             .unwrap_or_default()
     }
 
-    /// Per-agent subtree process rows from the installed probe — the
-    /// per-process detail behind [`Self::agent_memory_samples`], from the same
-    /// sweep. Empty when no probe is wired or no sample has landed yet.
-    pub fn agent_process_memory_samples(&self) -> HashMap<AgentId, Vec<ProcessSample>> {
+    /// The installed probe's latest per-agent process rows and their sweep
+    /// timestamp, read as one value — the per-process detail behind
+    /// [`Self::agent_memory_samples`]. `None` when no probe is wired or no
+    /// sample has landed yet.
+    pub fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
         self.tree_probe
             .get()
-            .map(|p| p.agent_process_samples())
-            .unwrap_or_default()
-    }
-
-    /// Whether the installed probe has published a sweep yet. `false` when
-    /// no probe is wired.
-    pub fn agent_memory_sampled(&self) -> bool {
-        self.tree_probe.get().is_some_and(|p| p.sample().is_some())
-    }
-
-    /// RFC-3339 timestamp of the sweep behind [`Self::agent_process_memory_samples`],
-    /// or `None` when no probe is wired, no sample has landed, or the probe
-    /// does not record it.
-    pub fn agent_memory_sampled_at(&self) -> Option<String> {
-        self.tree_probe.get().and_then(|p| p.sampled_at())
+            .and_then(|p| p.agent_memory_snapshot())
     }
 
     /// Spawn details of every tracked handle, for `agent.memoryUsage` rows.

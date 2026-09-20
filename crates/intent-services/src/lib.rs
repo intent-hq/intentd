@@ -195,7 +195,7 @@ pub mod auggie_discovery {
 
 pub use agent_manager::{
     compute_process_cap, default_process_cap, recommended_memory_budget_bytes, AgentManager,
-    BusEventSink, ProcessRegistry, ProcessSample, TreeMemoryProbe, TreeSample,
+    AgentMemorySnapshot, BusEventSink, ProcessRegistry, ProcessSample, TreeMemoryProbe, TreeSample,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via
@@ -16325,11 +16325,16 @@ impl WorkspaceApi for Services {
             let Some(manager) = self.agent_manager() else {
                 return Ok(empty);
             };
-            if !manager.agent_memory_sampled() {
+            // One probe read: the stamp and the rows come from the same sweep
+            // by construction, so a sampler store landing mid-request cannot
+            // pair one sweep's `sampledAt` with the next sweep's processes.
+            let Some(snapshot) = manager.agent_memory_snapshot() else {
                 return Ok(empty);
-            }
-            let sampled_at = manager.agent_memory_sampled_at();
-            let samples = manager.agent_process_memory_samples();
+            };
+            let crate::agent_manager::AgentMemorySnapshot {
+                sampled_at,
+                processes: samples,
+            } = snapshot;
             let spawn_details = manager.agent_spawn_details();
 
             let mut agents = Vec::with_capacity(samples.len());
@@ -16349,13 +16354,22 @@ impl WorkspaceApi for Services {
                         .map(|p| p.pid)
                 });
                 // A bucket whose session row is gone (deleted mid-sweep) is
-                // omitted: the row's name / workspace are the session's.
-                let Ok(session) = self.store.get_agent_session_summary(&agent_id).await else {
-                    continue;
+                // omitted: the row's name / workspace are the session's. Any
+                // other store failure propagates — a partial total that
+                // silently dropped live agents would read as a smaller tree.
+                let session = match self.store.get_agent_session_summary(&agent_id).await {
+                    Ok(session) => session,
+                    Err(Error::NotFound(_)) => continue,
+                    Err(e) => return Err(e),
                 };
-                let provider = details
-                    .map(|d| d.provider.clone())
-                    .or_else(|| session.provider.clone())
+                // The session row carries the provider id clients know from
+                // `agent.get` ("mock", "auggie"); the handle's spawn-time
+                // value is the resolved command ("node"), so it is only the
+                // fallback for a row that never recorded one.
+                let provider = session
+                    .provider
+                    .clone()
+                    .or_else(|| details.map(|d| d.provider.clone()))
                     .unwrap_or_default();
                 let model = details
                     .and_then(|d| d.model.clone())

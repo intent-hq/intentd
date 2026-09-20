@@ -16,8 +16,8 @@ use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
 use intent_services::{
     agent_memory_budget_bytes, default_process_cap, host_total_memory_bytes, init_adapter_slots,
     live_adapters, max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes,
-    AgentManager, BusEventSink, EventBus, GitStatusRefresher, PermissionPolicy, ProcessSample,
-    Services, TreeMemoryProbe, TreeSample, WatcherRegistry,
+    AgentManager, AgentMemorySnapshot, BusEventSink, EventBus, GitStatusRefresher,
+    PermissionPolicy, ProcessSample, Services, TreeMemoryProbe, TreeSample, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -3413,14 +3413,14 @@ impl TreeMemoryProbe for ChildTreeUsage {
             .unwrap_or_default()
     }
 
-    fn agent_process_samples(&self) -> HashMap<AgentId, Vec<ProcessSample>> {
-        self.load()
-            .map(|s| s.agent_processes.as_ref().clone())
-            .unwrap_or_default()
-    }
-
-    fn sampled_at(&self) -> Option<String> {
-        self.load().map(|s| s.sampled_at)
+    fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+        // One `load()` for the stamp and the rows: `agent.memoryUsage` reports
+        // a `sampledAt` that describes exactly the processes beside it, even
+        // when a `store()` lands while the request is being served.
+        self.load().map(|s| AgentMemorySnapshot {
+            sampled_at: Some(s.sampled_at),
+            processes: s.agent_processes.as_ref().clone(),
+        })
     }
 }
 
@@ -9325,7 +9325,6 @@ mod tests {
         let usage = ChildTreeUsage::default();
         let probe: &dyn TreeMemoryProbe = &usage;
         assert!(probe.agent_samples().is_empty());
-        assert!(probe.agent_process_samples().is_empty());
         let a = AgentId::from("agent-a");
         usage.store(
             TreeWalk {
@@ -9337,9 +9336,60 @@ mod tests {
             None,
         );
         assert_eq!(probe.agent_samples().get(&a), Some(&700));
+    }
+
+    /// The probe's `agent_memory_snapshot` (§5.5 `agent.memoryUsage`) serves
+    /// the sweep's timestamp and its per-agent process rows as one value from
+    /// one `load()` — `None` before the first sample — so a `store()` landing
+    /// between two reads can never pair one sweep's stamp with the next
+    /// sweep's rows. Each stored sweep replaces both together, and the stamp
+    /// is the one the stored sample carries.
+    #[test]
+    fn child_tree_usage_probe_serves_one_agent_snapshot_per_sweep() {
+        let usage = ChildTreeUsage::default();
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert_eq!(probe.agent_memory_snapshot(), None);
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        usage.store(
+            TreeWalk {
+                count: 2,
+                bytes: 900,
+                agent_bytes: HashMap::from([(a.clone(), 700)]),
+                agent_processes: HashMap::from([(a.clone(), vec![row(7, 1)])]),
+            },
+            None,
+        );
+        let first = probe.agent_memory_snapshot().expect("sampled");
+        let first_stored = usage.load().expect("sampled");
         assert_eq!(
-            probe.agent_process_samples().get(&a),
-            Some(&vec![row(7, 1)])
+            first.sampled_at.as_deref(),
+            Some(first_stored.sampled_at.as_str())
+        );
+        assert_eq!(
+            first.processes,
+            HashMap::from([(a.clone(), vec![row(7, 1)])])
+        );
+
+        usage.store(
+            TreeWalk {
+                count: 1,
+                bytes: 200,
+                agent_bytes: HashMap::from([(b.clone(), 200)]),
+                agent_processes: HashMap::from([(b.clone(), vec![row(2, 1)])]),
+            },
+            None,
+        );
+        let second = probe.agent_memory_snapshot().expect("sampled");
+        let second_stored = usage.load().expect("sampled");
+        assert_eq!(
+            second.sampled_at.as_deref(),
+            Some(second_stored.sampled_at.as_str())
+        );
+        assert_eq!(
+            second.processes,
+            HashMap::from([(b.clone(), vec![row(2, 1)])]),
+            "the next sweep replaces the rows wholesale alongside its stamp"
         );
     }
 
