@@ -1332,6 +1332,36 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "sourceControl",
             true,
         ),
+        string(
+            "sourceControl.gitlab.host",
+            "GitLab host",
+            "The bound GitLab instance as a bare host[:port] (no scheme); written by a \
+             successful sourceControl.connect for gitlab",
+            "sourceControl",
+            Some(intent_core::settings_file::DEFAULT_GITLAB_HOST),
+        ),
+        secret(
+            "sourceControl.gitlab.token",
+            "GitLab token",
+            "Access token used by the GitLab client (device grant or personal access token)",
+            "sourceControl",
+        ),
+        string(
+            "sourceControl.gitlab.oauthClientId",
+            "GitLab OAuth client ID",
+            "Public OAuth application id for the device authorization grant against the \
+             host; empty means the built-in gitlab.com id (gitlab.com only)",
+            "sourceControl",
+            None,
+        ),
+        string(
+            "sourceControl.gitlab.apiBaseUrl",
+            "GitLab API base URL",
+            "Optional origin override for API calls to the bound host (test seam); never \
+             changes the reported host",
+            "sourceControl",
+            None,
+        ),
         // --- Group A: Linear integration --------------------------------------
         secret(
             "linear.token",

@@ -117,6 +117,24 @@ pub enum Error {
         limit: u32,
     },
 
+    /// `sourceControl.connect { method: "device" }` against a forge host that
+    /// cannot run an OAuth device grant: no client id resolves for it, or the
+    /// instance rejected the grant (GitLab < 17.1 / application not enabled
+    /// for it). Surfaces as `-32603` with machine-readable
+    /// `error.data = { code: "device-grant-unsupported", provider, host }` —
+    /// the FE keys its PAT fallback on this code (PROTOCOL §5.27).
+    #[error("device grant unsupported on {provider} host {host}")]
+    DeviceGrantUnsupported { provider: String, host: String },
+
+    /// The forge rejected a source-control credential: a PAT offered to
+    /// `sourceControl.connect { method: "pat" }` that fails the host's user
+    /// probe (nothing is stored), or a stored/env credential the host rejects
+    /// on `sourceControl.getUser`. Surfaces as `-32603` with machine-readable
+    /// `error.data = { code: "source-control-unauthorized", provider, host }`.
+    /// A merely *absent* credential is not an error (PROTOCOL §5.27).
+    #[error("{provider} host {host} rejected the credential")]
+    SourceControlUnauthorized { provider: String, host: String },
+
     /// The source-control forge rate-limited a request (REST 403/429 with an
     /// exhausted quota). Distinct from `Internal` so background sweeps can
     /// detect the class and pause globally until the quota window resets, and
@@ -329,6 +347,8 @@ impl Error {
             | Error::ListenerDown
             | Error::WarmInFlight { .. }
             | Error::AdapterBusy { .. }
+            | Error::DeviceGrantUnsupported { .. }
+            | Error::SourceControlUnauthorized { .. }
             | Error::RateLimited(_)
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,

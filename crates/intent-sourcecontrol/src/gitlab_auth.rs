@@ -17,11 +17,18 @@
 //!
 //! PAT: [`validate_pat`] proves a pasted token against `GET /api/v4/user`.
 //!
+//! Refresh: a device-grant access token lives two hours; the grant also
+//! returns a refresh token, persisted under `sourceControl.gitlab.refreshToken`
+//! next to the access token's expiry (`sourceControl.gitlab.tokenExpiresAt`).
+//! [`refresh_access_token`] exchanges it (`POST /oauth/token`,
+//! `grant_type=refresh_token`) for a rotated pair and persists both. A PAT has
+//! neither — [`stored_credential`] tells the two apart for callers.
+//!
 //! Only a *public* OAuth application `client_id` is needed (no secret). 🔒
 //! Tokens and the `device_code` are secrets: never logged, never carried in
 //! any `Debug`/`Serialize` shape, never returned to callers.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use intent_core::FileSecretStore;
 use secrecy::{ExposeSecret, SecretString};
@@ -31,7 +38,7 @@ use tokio::time::timeout;
 
 use crate::error::{Error, Result};
 use crate::github::{CONNECT_TIMEOUT, READ_WRITE_TIMEOUT};
-use crate::gitlab_token::{REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT};
+use crate::gitlab_token::{EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT};
 
 /// Canonical host of the hosted (gitlab.com) instance.
 pub const GITLAB_COM_HOST: &str = "gitlab.com";
@@ -58,6 +65,10 @@ const SLOW_DOWN_BUMP_SECS: u64 = 5;
 /// Bounded wait for a blocking secret-store write/delete (mirrors
 /// `crate::device_flow`).
 const SECRET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Refresh a device-grant access token this long before its recorded expiry
+/// rather than racing the deadline on the next API call.
+pub const REFRESH_LEEWAY: Duration = Duration::from_secs(5 * 60);
 
 /// A validated GitLab instance: canonical lowercase host plus the `https://`
 /// base every `/oauth/*` and `/api/v4/*` request hangs off.
@@ -154,6 +165,210 @@ impl GitlabHost {
     #[must_use]
     pub fn is_gitlab_com(&self) -> bool {
         self.host == GITLAB_COM_HOST
+    }
+
+    /// The same canonical host, but with every `/oauth/*` and `/api/v4/*`
+    /// request sent to `origin` instead — the spawned-daemon test seam that
+    /// lets an e2e keep `gitlab.com` as the user-facing host while a loopback
+    /// mock answers. `origin` is parsed with the same rules as [`Self::parse`]
+    /// (https, or cleartext http on loopback only).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parse`] for `origin`.
+    pub fn with_api_origin(mut self, origin: &str) -> Result<Self> {
+        let parsed = Self::parse(origin)?;
+        self.base_url = parsed.base_url;
+        Ok(self)
+    }
+}
+
+/// What the secret store holds for GitLab: nothing, a PAT, or a device-grant
+/// pair whose access token expires at a known instant. Never carries the
+/// tokens themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredCredential {
+    /// No `sourceControl.gitlab.token` entry.
+    None,
+    /// An access token without a refresh token — a pasted PAT (no expiry).
+    Pat,
+    /// A device-grant access token with a refresh token; `expires_at` is the
+    /// recorded unix-seconds expiry when one was persisted.
+    Device { expires_at: Option<u64> },
+}
+
+impl StoredCredential {
+    /// True iff this is a device-grant credential whose recorded expiry is
+    /// within [`REFRESH_LEEWAY`] of `now` (or already past). A PAT, an absent
+    /// credential, or a device credential without a recorded expiry never
+    /// needs a proactive refresh.
+    #[must_use]
+    pub fn needs_refresh_at(self, now_unix: u64) -> bool {
+        match self {
+            Self::Device {
+                expires_at: Some(expires_at),
+            } => now_unix.saturating_add(REFRESH_LEEWAY.as_secs()) >= expires_at,
+            _ => false,
+        }
+    }
+
+    /// [`Self::needs_refresh_at`] against the wall clock.
+    #[must_use]
+    pub fn needs_refresh(self) -> bool {
+        self.needs_refresh_at(unix_now())
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Classify what `store` holds for GitLab (see [`StoredCredential`]). Runs the
+/// blocking reads on the pool bounded by [`SECRET_WRITE_TIMEOUT`].
+///
+/// # Errors
+///
+/// Returns [`Error::Api`] when the store cannot be read or the read times out.
+pub async fn stored_credential(store: FileSecretStore) -> Result<StoredCredential> {
+    let handle = tokio::task::spawn_blocking(move || -> intent_core::Result<StoredCredential> {
+        let has_token = store
+            .load(SECRET_ACCOUNT)?
+            .is_some_and(|t| !t.trim().is_empty());
+        if !has_token {
+            return Ok(StoredCredential::None);
+        }
+        let has_refresh = store
+            .load(REFRESH_SECRET_ACCOUNT)?
+            .is_some_and(|t| !t.trim().is_empty());
+        if !has_refresh {
+            return Ok(StoredCredential::Pat);
+        }
+        let expires_at = store
+            .load(EXPIRES_AT_SECRET_ACCOUNT)?
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        Ok(StoredCredential::Device { expires_at })
+    });
+    match timeout(SECRET_WRITE_TIMEOUT, handle).await {
+        Ok(Ok(Ok(c))) => Ok(c),
+        Ok(Ok(Err(e))) => Err(Error::Api(format!(
+            "could not read gitlab credential state: {e}"
+        ))),
+        Ok(Err(join_err)) => Err(Error::Api(format!(
+            "secret-store read task failed: {join_err}"
+        ))),
+        Err(_) => Err(Error::Api(format!(
+            "secret-store read timed out for {SECRET_ACCOUNT}"
+        ))),
+    }
+}
+
+/// Exchange the stored refresh token for a rotated access + refresh token
+/// pair (`POST /oauth/token`, `grant_type=refresh_token`) and persist both
+/// (plus the new expiry). GitLab rotates the refresh token on every use, so
+/// the persisted pair is always the latest one.
+///
+/// # Errors
+///
+/// Returns [`Error::Auth`] when no refresh token is stored (a PAT, or nothing
+/// connected) or the instance rejects the grant (`invalid_grant`: revoked,
+/// expired, or already-used refresh token) — the connection is unrecoverable
+/// and the caller should disconnect; [`Error::Config`] for an empty
+/// `client_id`; [`Error::Api`] / [`Error::Decode`] for transport and
+/// mis-shaped responses (retryable, the stored pair is left untouched).
+pub async fn refresh_access_token(
+    host: &GitlabHost,
+    client_id: &str,
+    store: FileSecretStore,
+) -> Result<()> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        return Err(Error::Config(
+            "gitlab token refresh requires a non-empty oauth client id \
+             (sourceControl.gitlab.oauthClientId)"
+                .to_string(),
+        ));
+    }
+    let refresh_token = {
+        let store = store.clone();
+        let handle = tokio::task::spawn_blocking(move || store.load(REFRESH_SECRET_ACCOUNT));
+        match timeout(SECRET_WRITE_TIMEOUT, handle).await {
+            Ok(Ok(Ok(Some(t)))) if !t.trim().is_empty() => SecretString::from(t),
+            Ok(Ok(Ok(_))) => {
+                return Err(Error::Auth(format!(
+                    "no gitlab refresh token stored for {}",
+                    host.host()
+                )))
+            }
+            Ok(Ok(Err(e))) => {
+                return Err(Error::Api(format!(
+                    "could not read gitlab refresh token: {e}"
+                )))
+            }
+            Ok(Err(join_err)) => {
+                return Err(Error::Api(format!(
+                    "secret-store read task failed: {join_err}"
+                )))
+            }
+            Err(_) => {
+                return Err(Error::Api(format!(
+                    "secret-store read timed out for {REFRESH_SECRET_ACCOUNT}"
+                )))
+            }
+        }
+    };
+    let client = http_client()?;
+    let response = client
+        .post(format!("{}/oauth/token", host.base_url()))
+        .form(&[
+            ("client_id", client_id),
+            ("refresh_token", refresh_token.expose_secret()),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .map_err(|e| transport(&e))?;
+    let status = response.status();
+    let body: Value = response.json().await.map_err(|e| {
+        Error::Decode(format!(
+            "gitlab token refresh response ({status}) is not json: {e}"
+        ))
+    })?;
+    if !status.is_success() {
+        let summary = oauth_error_summary(&body);
+        return Err(match body.get("error").and_then(Value::as_str) {
+            Some("invalid_grant" | "invalid_client" | "unauthorized_client") => {
+                Error::Auth(format!(
+                    "gitlab refused to refresh the token for {}: {summary}",
+                    host.host()
+                ))
+            }
+            _ => Error::Api(format!(
+                "gitlab token refresh on {} failed ({status}): {summary}",
+                host.host()
+            )),
+        });
+    }
+    match parse_poll_response(&body)? {
+        PollResponse::Authorized {
+            access_token,
+            refresh_token: rotated,
+            expires_in,
+        } => {
+            // Doorkeeper always rotates; keep the old one only if the body
+            // somehow omitted a replacement so the next refresh can still try.
+            persist_tokens(
+                store,
+                access_token,
+                Some(rotated.unwrap_or(refresh_token)),
+                expires_in.map(|secs| unix_now().saturating_add(secs)),
+            )
+            .await
+        }
+        other => Err(Error::Decode(format!(
+            "unexpected gitlab token refresh response: {other:?}"
+        ))),
     }
 }
 
@@ -405,8 +620,15 @@ impl GitlabDeviceFlow {
             PollResponse::Authorized {
                 access_token,
                 refresh_token,
+                expires_in,
             } => {
-                persist_tokens(self.store.clone(), access_token, refresh_token).await?;
+                persist_tokens(
+                    self.store.clone(),
+                    access_token,
+                    refresh_token,
+                    expires_in.map(|secs| unix_now().saturating_add(secs)),
+                )
+                .await?;
                 Ok(GitlabPollStatus::Authorized)
             }
             PollResponse::Pending => Ok(GitlabPollStatus::Pending),
@@ -426,6 +648,8 @@ enum PollResponse {
     Authorized {
         access_token: SecretString,
         refresh_token: Option<SecretString>,
+        /// Access-token lifetime in seconds (`expires_in`), when reported.
+        expires_in: Option<u64>,
     },
     Pending,
     SlowDown {
@@ -466,6 +690,7 @@ fn parse_poll_response(body: &Value) -> Result<PollResponse> {
                     .and_then(Value::as_str)
                     .filter(|t| !t.is_empty())
                     .map(|t| SecretString::from(t.to_string())),
+                expires_in: body.get("expires_in").and_then(Value::as_u64),
             });
         }
     }
@@ -610,22 +835,27 @@ fn check_api_scope(scopes: Option<&[String]>, host: &str) -> Result<()> {
 ///
 /// Returns [`Error::Api`] when the write fails or times out.
 pub async fn persist_gitlab_token(store: FileSecretStore, token: SecretString) -> Result<()> {
-    persist_tokens(store, token, None).await
+    persist_tokens(store, token, None, None).await
 }
 
-/// Persist the access token and, when granted, the refresh token; a `None`
-/// refresh token clears any stored one.
+/// Persist the access token and, when granted, the refresh token and expiry;
+/// a `None` refresh token / expiry clears any stored one.
 async fn persist_tokens(
     store: FileSecretStore,
     token: SecretString,
     refresh_token: Option<SecretString>,
+    expires_at: Option<u64>,
 ) -> Result<()> {
     run_blocking(
         move || {
             store.store(SECRET_ACCOUNT, token.expose_secret())?;
             match refresh_token {
-                Some(refresh) => store.store(REFRESH_SECRET_ACCOUNT, refresh.expose_secret()),
-                None => store.delete(REFRESH_SECRET_ACCOUNT),
+                Some(refresh) => store.store(REFRESH_SECRET_ACCOUNT, refresh.expose_secret())?,
+                None => store.delete(REFRESH_SECRET_ACCOUNT)?,
+            }
+            match expires_at {
+                Some(at) => store.store(EXPIRES_AT_SECRET_ACCOUNT, &at.to_string()),
+                None => store.delete(EXPIRES_AT_SECRET_ACCOUNT),
             }
         },
         "persist",
@@ -633,9 +863,10 @@ async fn persist_tokens(
     .await
 }
 
-/// Delete the stored `sourceControl.gitlab.token` (and refresh token) from
-/// `store` — revoke / disconnect. Absence is an idempotent success, mirroring
-/// [`FileSecretStore::delete`]. The `GITLAB_TOKEN` env fallback is untouched.
+/// Delete the stored `sourceControl.gitlab.token` (and refresh token +
+/// expiry) from `store` — revoke / disconnect. Absence is an idempotent
+/// success, mirroring [`FileSecretStore::delete`]. The `GITLAB_TOKEN` env
+/// fallback is untouched.
 ///
 /// # Errors
 ///
@@ -644,7 +875,8 @@ pub async fn revoke_gitlab_token(store: FileSecretStore) -> Result<()> {
     run_blocking(
         move || {
             store.delete(SECRET_ACCOUNT)?;
-            store.delete(REFRESH_SECRET_ACCOUNT)
+            store.delete(REFRESH_SECRET_ACCOUNT)?;
+            store.delete(EXPIRES_AT_SECRET_ACCOUNT)
         },
         "delete",
     )
@@ -777,9 +1009,11 @@ mod tests {
             PollResponse::Authorized {
                 access_token,
                 refresh_token,
+                expires_in,
             } => {
                 assert_eq!(access_token.expose_secret(), "glat-x");
                 assert_eq!(refresh_token.unwrap().expose_secret(), "glrt-y");
+                assert_eq!(expires_in, Some(7200));
             }
             other => panic!("expected Authorized, got {other:?}"),
         }
@@ -787,6 +1021,7 @@ mod tests {
             classify(&json!({ "access_token": "glat-x" })),
             PollResponse::Authorized {
                 refresh_token: None,
+                expires_in: None,
                 ..
             }
         ));
@@ -1058,6 +1293,22 @@ mod tests {
             store.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
             Some("glrt-granted")
         );
+        let expires_at: u64 = store
+            .load(EXPIRES_AT_SECRET_ACCOUNT)
+            .unwrap()
+            .expect("expiry persisted")
+            .parse()
+            .unwrap();
+        assert!(
+            (expires_at - unix_now()) <= 7200 && (expires_at - unix_now()) > 7000,
+            "expiry is now + expires_in (got {expires_at})"
+        );
+        assert_eq!(
+            stored_credential(store.clone()).await.unwrap(),
+            StoredCredential::Device {
+                expires_at: Some(expires_at)
+            }
+        );
 
         let requests = mock.requests();
         assert_eq!(requests[0].0, "POST /oauth/authorize_device");
@@ -1072,9 +1323,137 @@ mod tests {
         revoke_gitlab_token(store.clone()).await.expect("revoke");
         assert_eq!(store.load(SECRET_ACCOUNT).unwrap(), None);
         assert_eq!(store.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(store.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(
+            stored_credential(store.clone()).await.unwrap(),
+            StoredCredential::None
+        );
         revoke_gitlab_token(store)
             .await
             .expect("revoke twice is idempotent");
+    }
+
+    #[test]
+    fn stored_credential_refresh_policy() {
+        assert!(!StoredCredential::None.needs_refresh_at(1_000));
+        assert!(!StoredCredential::Pat.needs_refresh_at(1_000));
+        assert!(!StoredCredential::Device { expires_at: None }.needs_refresh_at(1_000));
+        let leeway = REFRESH_LEEWAY.as_secs();
+        let device = StoredCredential::Device {
+            expires_at: Some(10_000),
+        };
+        assert!(!device.needs_refresh_at(10_000 - leeway - 1));
+        assert!(device.needs_refresh_at(10_000 - leeway));
+        assert!(device.needs_refresh_at(10_000));
+        assert!(device.needs_refresh_at(20_000));
+    }
+
+    #[test]
+    fn with_api_origin_keeps_the_host_and_moves_the_base_url() {
+        let host = GitlabHost::parse("gitlab.com")
+            .unwrap()
+            .with_api_origin("http://127.0.0.1:4321")
+            .unwrap();
+        assert_eq!(host.host(), "gitlab.com");
+        assert!(host.is_gitlab_com());
+        assert_eq!(host.base_url(), "http://127.0.0.1:4321");
+        assert_eq!(host.api_base(), "http://127.0.0.1:4321/api/v4");
+        assert!(GitlabHost::parse("gitlab.com")
+            .unwrap()
+            .with_api_origin("http://mock.example")
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_access_token_rotates_and_persists_the_pair() {
+        let mock = spawn_mock(Arc::new(|method, path, body| match (method, path) {
+            ("POST", "/oauth/token") if body.contains("grant_type=refresh_token") => (
+                200,
+                json!({ "access_token": "glat-rotated", "refresh_token": "glrt-rotated",
+                        "token_type": "Bearer", "expires_in": 7200, "scope": "api" }),
+            ),
+            _ => (404, json!({ "error": "unexpected" })),
+        }))
+        .await;
+        let (_dir, store) = temp_store();
+        store.store(SECRET_ACCOUNT, "glat-old").unwrap();
+        store.store(REFRESH_SECRET_ACCOUNT, "glrt-old").unwrap();
+        store.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+        assert!(stored_credential(store.clone())
+            .await
+            .unwrap()
+            .needs_refresh());
+
+        refresh_access_token(&mock.host, "client-1", store.clone())
+            .await
+            .expect("refresh");
+        assert_eq!(
+            store.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glat-rotated")
+        );
+        assert_eq!(
+            store.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glrt-rotated")
+        );
+        assert!(!stored_credential(store.clone())
+            .await
+            .unwrap()
+            .needs_refresh());
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "POST /oauth/token");
+        assert!(requests[0].1.contains("client_id=client-1"));
+        assert!(requests[0].1.contains("refresh_token=glrt-old"));
+        assert!(requests[0].1.contains("grant_type=refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn refresh_access_token_invalid_grant_is_auth_and_leaves_the_store_untouched() {
+        let mock = spawn_mock(Arc::new(|_, _, _| {
+            (
+                400,
+                json!({ "error": "invalid_grant", "error_description": "revoked" }),
+            )
+        }))
+        .await;
+        let (_dir, store) = temp_store();
+        store.store(SECRET_ACCOUNT, "glat-old").unwrap();
+        store.store(REFRESH_SECRET_ACCOUNT, "glrt-old").unwrap();
+        let err = refresh_access_token(&mock.host, "client-1", store.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Auth(_)), "{err:?}");
+        assert!(!err.to_string().contains("glrt-old"));
+        assert_eq!(
+            store.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glat-old")
+        );
+
+        let mock_5xx = spawn_mock(Arc::new(|_, _, _| (503, json!({ "error": "down" })))).await;
+        let err = refresh_access_token(&mock_5xx.host, "client-1", store.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Api(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn refresh_access_token_without_a_stored_refresh_token_is_auth() {
+        let mock = spawn_mock(Arc::new(|_, _, _| (500, json!({})))).await;
+        let (_dir, store) = temp_store();
+        store.store(SECRET_ACCOUNT, "glpat-pasted").unwrap();
+        assert_eq!(
+            stored_credential(store.clone()).await.unwrap(),
+            StoredCredential::Pat
+        );
+        let err = refresh_access_token(&mock.host, "client-1", store)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Auth(_)), "{err:?}");
+        assert!(
+            mock.requests().is_empty(),
+            "no request without a refresh token"
+        );
     }
 
     #[tokio::test]
@@ -1271,6 +1650,7 @@ mod tests {
             Some("glpat-pasted")
         );
         assert_eq!(store.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(store.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
         assert_eq!(store.load(crate::token::SECRET_ACCOUNT).unwrap(), None);
     }
 }

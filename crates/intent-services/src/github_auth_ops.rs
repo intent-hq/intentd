@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use tokio::time::Instant;
 
 use crate::events::EventBus;
-use crate::{publish_event, system_actor};
+use crate::system_actor;
 
 /// Secret-store account the device flow persists the token under — the first
 /// slot of the existing resolution chain (`intent_sourcecontrol::token`).
@@ -210,7 +210,7 @@ pub(crate) async fn run_poll_loop(
                 // authorized, the engine persisted a token a concurrent
                 // cancel/revoke meant to prevent — reconcile by deleting it.
                 if outcome.is_none() {
-                    if let Err(e) = secrets.delete(SECRET_ACCOUNT).await {
+                    if let Err(e) = delete_stored_token(&secrets).await {
                         tracing::warn!(
                             error = %e,
                             "could not delete github token after orphaned authorize"
@@ -221,9 +221,28 @@ pub(crate) async fn run_poll_loop(
             }
         }
     }
+    if outcome.is_none() {
+        // Provenance marker for `sourceControl.authStatus.method` — fail-soft,
+        // the token itself is already persisted.
+        if let Err(e) = secrets
+            .store(
+                crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT,
+                "device",
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "could not record the github token provenance");
+        }
+    }
     let status = outcome.map_or("authorized", FlowPhase::as_wire);
     tracing::info!(status, "github device flow finished");
-    publish_event(bus.as_ref(), auth_changed_event(status)).await;
+    crate::source_control_auth_ops::publish_auth_changed(
+        bus.as_ref(),
+        crate::source_control_auth_ops::Provider::Github,
+        crate::source_control_auth_ops::GITHUB_HOST,
+        status,
+    )
+    .await;
     if outcome.is_none() && sync_gh {
         // Best-effort gh CLI sync: loads the token back from the secret store
         // (it never leaves the engine) and pipes it to `gh` via stdin only.
@@ -233,10 +252,14 @@ pub(crate) async fn run_poll_loop(
     }
 }
 
-/// Delete the stored `sourceControl.github.token` through the services
-/// secret-store seam (cache-coherent with `settings.*`, test-injectable).
+/// Delete the stored `sourceControl.github.token` (and its device-flow
+/// provenance marker) through the services secret-store seam
+/// (cache-coherent with `settings.*`, test-injectable).
 pub(crate) async fn delete_stored_token(secrets: &crate::settings::AsyncSecretStore) -> Result<()> {
-    secrets.delete(SECRET_ACCOUNT).await
+    secrets.delete(SECRET_ACCOUNT).await?;
+    secrets
+        .delete(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
+        .await
 }
 
 /// Resolve the login host. The builder override wins over the env override

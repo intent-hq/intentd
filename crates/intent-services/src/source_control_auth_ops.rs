@@ -1,0 +1,892 @@
+//! Provider-generic forge auth (`sourceControl.authStatus` / `connect` /
+//! `cancelAuth` / `revoke` / `getUser`, PROTOCOL §5.27 "Provider-generic auth
+//! — `sourceControl.*`", v10.4): param parsing, the GitLab device-grant slot +
+//! poll loop, the GitLab credential probe with proactive / 401-triggered
+//! refresh, and the wire DTOs. The `github.*` auth quintet is served as
+//! aliases of these with `provider: "github"` pinned (see `lib.rs`); the
+//! GitHub device flow itself stays in [`crate::github_auth_ops`].
+//!
+//! 🔒 Tokens, device codes and refresh tokens never cross this module's
+//! boundary: the engine (`intent_sourcecontrol::gitlab_auth`) persists them
+//! straight into the file-backed secret store, and every DTO here carries
+//! only user-facing codes, derived identity and connection state.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use intent_core::events::SOURCE_CONTROL_AUTH_CHANGED;
+use intent_core::{now_iso, Error, FileSecretStore, Result, WorkspaceId};
+use intent_sourcecontrol::gitlab_auth::{
+    refresh_access_token, revoke_gitlab_token, stored_credential, validate_pat,
+};
+use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT as GITLAB_SECRET_ACCOUNT;
+use intent_sourcecontrol::{
+    GitlabDeviceFlow, GitlabHost, GitlabPollStatus, GitlabUser, StoredCredential, UserIdentity,
+};
+use intent_store::NewEvent;
+use serde_json::{json, Value};
+use tokio::time::Instant;
+
+use crate::events::EventBus;
+use crate::github_auth_ops::{self, FlowPhase, FlowSlot, MAX_CONSECUTIVE_POLL_ERRORS};
+use crate::{publish_event, system_actor};
+
+/// Env override for the origin GitLab API / OAuth calls go to — the
+/// spawned-daemon test seam (consulted only when
+/// `sourceControl.gitlab.apiBaseUrl` is unset; same loopback-only cleartext
+/// rule as the GitHub login override, enforced by `GitlabHost::parse`).
+pub(crate) const GITLAB_API_BASE_URI_ENV: &str = "INTENTD_GITLAB_API_BASE_URI";
+
+/// Env var the GitLab resolution chain falls back to when nothing is stored.
+pub(crate) const GITLAB_TOKEN_ENV: &str = "GITLAB_TOKEN";
+
+/// Secret-store marker written next to `sourceControl.github.token` when the
+/// GitHub device flow authorized, so `sourceControl.authStatus` can report
+/// `method: "device"` for it; a token without the marker (settings.update
+/// PAT, pre-10.4) reports `"pat"`. Deleted with the token on revoke.
+pub(crate) const GITHUB_TOKEN_METHOD_ACCOUNT: &str = "sourceControl.github.tokenMethod";
+
+/// The `host` every GitHub auth result reports.
+pub(crate) const GITHUB_HOST: &str = "github.com";
+
+/// `provider` param of every `sourceControl.*` method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Provider {
+    Github,
+    Gitlab,
+}
+
+impl Provider {
+    /// Parse the wire `provider`; anything but `github` / `gitlab` → `-32602`.
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "github" => Ok(Self::Github),
+            "gitlab" => Ok(Self::Gitlab),
+            other => Err(Error::InvalidParams(format!(
+                "provider must be \"github\" or \"gitlab\" (got {other:?})"
+            ))),
+        }
+    }
+
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+            Self::Gitlab => "gitlab",
+        }
+    }
+}
+
+/// A validated `(provider, host)` target. `host` is gitlab-only; the GitHub
+/// side has no instance selection in v10.4.
+#[derive(Debug, Clone)]
+pub(crate) enum Target {
+    Github,
+    Gitlab {
+        host: GitlabHost,
+        /// True iff `host` is the bound instance (`sourceControl.gitlab.host`)
+        /// — the only host whose stored token applies.
+        bound: bool,
+    },
+}
+
+/// Validate the wire `host` for gitlab: a bare `host[:port]` — no scheme, no
+/// path, no credentials (`-32602` otherwise) — normalized by
+/// [`GitlabHost::parse`] (lowercase, `https://`).
+pub(crate) fn parse_gitlab_host(raw: &str) -> Result<GitlabHost> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidParams("host must not be empty".to_string()));
+    }
+    if trimmed.contains("://")
+        || trimmed.contains('/')
+        || trimmed.contains('@')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return Err(Error::InvalidParams(format!(
+            "host must be a bare host[:port] without scheme or path (got {trimmed:?})"
+        )));
+    }
+    GitlabHost::parse(trimmed).map_err(|e| Error::InvalidParams(format!("invalid host: {e}")))
+}
+
+/// Resolve the `(provider, host)` target of a `sourceControl.*` call.
+/// `configured_host` is `sourceControl.gitlab.host` (the default and the
+/// bound instance); `api_origin` is the optional origin override applied to
+/// the bound host only (`sourceControl.gitlab.apiBaseUrl`, else the env
+/// seam) — it never changes the reported host.
+pub(crate) fn resolve_target(
+    provider: Provider,
+    host: Option<&str>,
+    configured_host: &str,
+    api_origin: Option<&str>,
+) -> Result<Target> {
+    let host = host.map(str::trim).filter(|h| !h.is_empty());
+    match provider {
+        Provider::Github => match host {
+            Some(h) => Err(Error::InvalidParams(format!(
+                "host is only accepted for provider \"gitlab\" (got {h:?})"
+            ))),
+            None => Ok(Target::Github),
+        },
+        Provider::Gitlab => {
+            let bound_host = parse_gitlab_host(configured_host).map_err(|e| {
+                Error::Internal(format!("sourceControl.gitlab.host is invalid: {e}"))
+            })?;
+            let mut resolved = match host {
+                Some(h) => parse_gitlab_host(h)?,
+                None => bound_host.clone(),
+            };
+            let bound = resolved.host() == bound_host.host();
+            if bound {
+                if let Some(origin) = api_origin.map(str::trim).filter(|o| !o.is_empty()) {
+                    resolved = resolved.with_api_origin(origin).map_err(|e| {
+                        Error::Internal(format!("gitlab api origin override rejected: {e}"))
+                    })?;
+                }
+            }
+            Ok(Target::Gitlab {
+                host: resolved,
+                bound,
+            })
+        }
+    }
+}
+
+/// The GitLab device-grant slot: the single in-flight (or last-terminal)
+/// flow, tagged with the instance it targets so `cancelAuth` / `revoke` /
+/// `authStatus` act on exactly `(gitlab, host)`.
+pub(crate) struct GitlabFlowSlot {
+    pub(crate) host: String,
+    pub(crate) slot: FlowSlot,
+}
+
+/// Shared GitLab auth state: the flow slot plus the hosts that reported the
+/// device grant unsupported (404 / `unauthorized_client`), which flips
+/// `deviceGrantSupported` to `false` until the daemon restarts.
+#[derive(Default)]
+pub(crate) struct GitlabAuthState {
+    pub(crate) flow: Option<GitlabFlowSlot>,
+    pub(crate) unsupported_hosts: HashSet<String>,
+}
+
+pub(crate) type GitlabAuthStateHandle = Arc<tokio::sync::Mutex<GitlabAuthState>>;
+
+pub(crate) fn new_gitlab_state() -> GitlabAuthStateHandle {
+    Arc::new(tokio::sync::Mutex::new(GitlabAuthState::default()))
+}
+
+/// Build a `sourceControl:auth-changed { provider, host, status }` event —
+/// global like `settings:changed` (empty workspace id); never a token.
+pub(crate) fn auth_changed_event(provider: Provider, host: &str, status: &str) -> NewEvent {
+    NewEvent {
+        workspace_id: WorkspaceId::from_string(String::new()),
+        timestamp: now_iso(),
+        event_type: SOURCE_CONTROL_AUTH_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: json!({ "provider": provider.as_wire(), "host": host, "status": status }),
+    }
+}
+
+/// Publish the transition for `(provider, host)`: GitHub transitions emit
+/// the unchanged `github:auth-changed { status }` first, then every provider
+/// emits `sourceControl:auth-changed`.
+pub(crate) async fn publish_auth_changed(
+    bus: Option<&EventBus>,
+    provider: Provider,
+    host: &str,
+    status: &str,
+) {
+    if provider == Provider::Github {
+        publish_event(bus, github_auth_ops::auth_changed_event(status)).await;
+    }
+    publish_event(bus, auth_changed_event(provider, host, status)).await;
+}
+
+/// True iff this task's flow is still the resident slot for `host`.
+async fn is_resident(state: &GitlabAuthStateHandle, flow_id: u64) -> bool {
+    let guard = state.lock().await;
+    matches!(guard.flow.as_ref(), Some(f) if f.slot.flow_id == flow_id)
+}
+
+/// The daemon-owned GitLab poll loop `sourceControl.connect` spawns — the
+/// gitlab twin of [`github_auth_ops::run_poll_loop`] (same cooperative
+/// cancellation: the task exits at its next tick once cancel / revoke / a
+/// newer connect replaced the slot, and reconciles a raced authorize by
+/// deleting the just-persisted credential). On `Authorized` the engine has
+/// already persisted the token pair; the slot is cleared, the host is bound
+/// (`sourceControl.gitlab.host`) and `sourceControl:auth-changed` is emitted.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn run_gitlab_poll_loop(
+    state: GitlabAuthStateHandle,
+    bus: Option<EventBus>,
+    registry: Option<Arc<crate::SettingsRegistry>>,
+    store: FileSecretStore,
+    flow_id: u64,
+    host: String,
+    mut flow: GitlabDeviceFlow,
+    deadline: Instant,
+) {
+    let mut consecutive_errors: u32 = 0;
+    let outcome: Option<FlowPhase> = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Some(FlowPhase::Expired);
+        }
+        tokio::time::sleep(github_auth_ops::poll_sleep(flow.interval_secs()).min(remaining)).await;
+        if !is_resident(&state, flow_id).await {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break Some(FlowPhase::Expired);
+        }
+        match flow.poll_once().await {
+            Ok(GitlabPollStatus::Pending) => consecutive_errors = 0,
+            Ok(GitlabPollStatus::Authorized) => break None,
+            Ok(GitlabPollStatus::Expired) => break Some(FlowPhase::Expired),
+            Ok(GitlabPollStatus::Denied) => break Some(FlowPhase::Denied),
+            Err(e) => {
+                consecutive_errors += 1;
+                tracing::warn!(
+                    error = %e,
+                    consecutive_errors,
+                    host,
+                    "gitlab device-grant poll failed"
+                );
+                if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
+                    break Some(FlowPhase::Error);
+                }
+            }
+        }
+    };
+    {
+        let mut guard = state.lock().await;
+        match guard.flow.as_mut() {
+            Some(f) if f.slot.flow_id == flow_id => match outcome {
+                None => guard.flow = None,
+                Some(phase) => f.slot.phase = phase,
+            },
+            _ => {
+                if outcome.is_none() {
+                    if let Err(e) = revoke_gitlab_token(store).await {
+                        tracing::warn!(
+                            error = %e,
+                            "could not delete gitlab token after orphaned authorize"
+                        );
+                    }
+                }
+                return;
+            }
+        }
+    }
+    if outcome.is_none() {
+        bind_gitlab_host(registry.as_deref(), &host);
+    }
+    let status = outcome.map_or("authorized", FlowPhase::as_wire);
+    tracing::info!(status, host, "gitlab device grant finished");
+    publish_auth_changed(bus.as_ref(), Provider::Gitlab, &host, status).await;
+}
+
+/// Persist `host` as `sourceControl.gitlab.host` (the bound instance) after a
+/// successful connect. Fail-soft: a pinned key or a missing registry
+/// (read-only wiring) only logs — the credential is already stored.
+pub(crate) fn bind_gitlab_host(registry: Option<&crate::SettingsRegistry>, host: &str) {
+    let Some(registry) = registry else {
+        return;
+    };
+    if registry
+        .get("sourceControl.gitlab.host")
+        .and_then(|v| v.as_str().map(str::to_string))
+        == Some(host.to_string())
+    {
+        return;
+    }
+    if let Err(e) = registry.apply(&[("sourceControl.gitlab.host".to_string(), json!(host))]) {
+        tracing::warn!(error = %e, host, "could not persist sourceControl.gitlab.host");
+    }
+}
+
+/// Where the GitLab credential probe landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// No credential resolves for the host (or a device credential whose
+    /// refresh failed was just cleared).
+    NotConfigured,
+    /// The host accepted the credential; `method` is its provenance.
+    Configured {
+        user: GitlabUser,
+        method: &'static str,
+    },
+    /// The host rejected the credential in use.
+    Rejected,
+}
+
+/// Read the GitLab access token for the probe: the stored slot when `bound`
+/// (the stored token belongs to the bound instance only), then `GITLAB_TOKEN`.
+/// Returns the token with its provenance; `None` when nothing resolves.
+async fn load_gitlab_token(
+    store: &FileSecretStore,
+    bound: bool,
+    credential: StoredCredential,
+) -> Result<Option<(String, &'static str)>> {
+    if bound && credential != StoredCredential::None {
+        let store = store.clone();
+        let loaded = tokio::task::spawn_blocking(move || store.load(GITLAB_SECRET_ACCOUNT))
+            .await
+            .map_err(|e| Error::Internal(format!("secret-store read task failed: {e}")))?
+            .map_err(|e| Error::Internal(format!("could not read gitlab token: {e}")))?;
+        if let Some(token) = loaded.filter(|t| !t.trim().is_empty()) {
+            let method = match credential {
+                StoredCredential::Device { .. } => "device",
+                _ => "pat",
+            };
+            return Ok(Some((token, method)));
+        }
+    }
+    Ok(std::env::var(GITLAB_TOKEN_ENV)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .map(|t| (t, "env")))
+}
+
+/// Clear a device-grant connection whose access token can no longer be
+/// renewed, and tell subscribers (`status: "expired"`).
+async fn disconnect_gitlab(store: FileSecretStore, bus: Option<&EventBus>, host: &str) {
+    if let Err(e) = revoke_gitlab_token(store).await {
+        tracing::warn!(error = %e, host, "could not clear the gitlab credential");
+    }
+    publish_auth_changed(bus, Provider::Gitlab, host, "expired").await;
+}
+
+/// Probe the credential in use for `host` against `GET /api/v4/user`, running
+/// the device-grant refresh policy around it: a stored device credential is
+/// refreshed **proactively** when its recorded expiry is near / past, and
+/// **once more on a 401** before the credential is declared rejected. A
+/// refresh the instance refuses (`invalid_grant`) clears the connection
+/// (`sourceControl:auth-changed { status: "expired" }`) and reports
+/// [`ProbeOutcome::NotConfigured`]; a transport failure during refresh keeps
+/// the stored pair and falls through to the probe. PAT / env credentials are
+/// never refreshed.
+///
+/// # Errors
+///
+/// Rate limiting and non-auth forge failures propagate (mapped like the
+/// other `github.*` methods); a rejected credential is an outcome, not an
+/// error.
+pub(crate) async fn probe_gitlab(
+    host: &GitlabHost,
+    bound: bool,
+    client_id: Option<&str>,
+    store: FileSecretStore,
+    bus: Option<&EventBus>,
+) -> Result<ProbeOutcome> {
+    let mut credential = if bound {
+        stored_credential(store.clone())
+            .await
+            .map_err(crate::pr_ops::map_sc_err)?
+    } else {
+        StoredCredential::None
+    };
+    let mut refreshed = false;
+    if credential.needs_refresh() {
+        match try_refresh(host, client_id, store.clone()).await {
+            Ok(()) => {
+                refreshed = true;
+                credential = stored_credential(store.clone())
+                    .await
+                    .map_err(crate::pr_ops::map_sc_err)?;
+            }
+            Err(RefreshFailure::Unrecoverable) => {
+                disconnect_gitlab(store, bus, host.host()).await;
+                return Ok(ProbeOutcome::NotConfigured);
+            }
+            Err(RefreshFailure::Transient) => {}
+        }
+    }
+    let Some((token, method)) = load_gitlab_token(&store, bound, credential).await? else {
+        return Ok(ProbeOutcome::NotConfigured);
+    };
+    match validate_pat(host, &token).await {
+        Ok(user) => return Ok(ProbeOutcome::Configured { user, method }),
+        Err(intent_sourcecontrol::Error::Auth(_)) if method == "device" && !refreshed => {}
+        Err(intent_sourcecontrol::Error::Auth(_)) => return Ok(ProbeOutcome::Rejected),
+        Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
+    }
+    // 401 on a device credential: one refresh, one retry.
+    match try_refresh(host, client_id, store.clone()).await {
+        Ok(()) => {}
+        Err(RefreshFailure::Unrecoverable) => {
+            disconnect_gitlab(store, bus, host.host()).await;
+            return Ok(ProbeOutcome::NotConfigured);
+        }
+        Err(RefreshFailure::Transient) => return Ok(ProbeOutcome::Rejected),
+    }
+    let credential = stored_credential(store.clone())
+        .await
+        .map_err(crate::pr_ops::map_sc_err)?;
+    let Some((token, method)) = load_gitlab_token(&store, bound, credential).await? else {
+        return Ok(ProbeOutcome::NotConfigured);
+    };
+    match validate_pat(host, &token).await {
+        Ok(user) => Ok(ProbeOutcome::Configured { user, method }),
+        Err(intent_sourcecontrol::Error::Auth(_)) => {
+            disconnect_gitlab(store, bus, host.host()).await;
+            Ok(ProbeOutcome::NotConfigured)
+        }
+        Err(e) => Err(crate::pr_ops::map_sc_err(e)),
+    }
+}
+
+enum RefreshFailure {
+    /// The instance refused the refresh token (or none is stored / no client
+    /// id can run the exchange): the connection cannot be renewed.
+    Unrecoverable,
+    /// Transport / instance failure: the stored pair may still be good.
+    Transient,
+}
+
+async fn try_refresh(
+    host: &GitlabHost,
+    client_id: Option<&str>,
+    store: FileSecretStore,
+) -> std::result::Result<(), RefreshFailure> {
+    let Some(client_id) = client_id else {
+        tracing::warn!(
+            host = host.host(),
+            "gitlab token refresh needs an oauth client id"
+        );
+        return Err(RefreshFailure::Unrecoverable);
+    };
+    match refresh_access_token(host, client_id, store).await {
+        Ok(()) => {
+            tracing::info!(host = host.host(), "gitlab access token refreshed");
+            Ok(())
+        }
+        Err(
+            e @ (intent_sourcecontrol::Error::Auth(_) | intent_sourcecontrol::Error::Config(_)),
+        ) => {
+            tracing::warn!(error = %e, host = host.host(), "gitlab token refresh refused");
+            Err(RefreshFailure::Unrecoverable)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, host = host.host(), "gitlab token refresh failed");
+            Err(RefreshFailure::Transient)
+        }
+    }
+}
+
+/// `SourceControlUser` (§5.27): `{ id: string, login, displayName?, avatarUrl? }`
+/// — optional fields omitted, never null. Never carries a token.
+pub(crate) fn source_control_user(
+    id: &str,
+    login: &str,
+    display_name: Option<&str>,
+    avatar_url: Option<&str>,
+) -> Value {
+    let mut user = json!({ "id": id, "login": login });
+    if let Some(name) = display_name.filter(|n| !n.is_empty()) {
+        user["displayName"] = json!(name);
+    }
+    if let Some(url) = avatar_url.filter(|u| !u.is_empty()) {
+        user["avatarUrl"] = json!(url);
+    }
+    user
+}
+
+pub(crate) fn gitlab_user_to_wire(user: &GitlabUser) -> Value {
+    source_control_user(
+        &user.id.to_string(),
+        &user.username,
+        user.name.as_deref(),
+        user.avatar_url.as_deref(),
+    )
+}
+
+pub(crate) fn github_user_to_wire(user: &UserIdentity) -> Value {
+    source_control_user(
+        &user.id.map_or_else(String::new, |id| id.to_string()),
+        &user.login,
+        user.name.as_deref(),
+        user.avatar_url.as_deref(),
+    )
+}
+
+/// The `sourceControl.authStatus` result: the `github.authStatus` shape
+/// (`base`, from [`github_auth_ops::auth_status_to_wire`]) plus the additive
+/// `provider` / `host` / `method` / `user?` / `deviceGrantSupported` fields.
+/// `user` is present iff configured; `method` is `null` when not configured.
+pub(crate) fn auth_status_to_wire(
+    mut base: Value,
+    provider: Provider,
+    host: &str,
+    method: Option<&str>,
+    user: Option<Value>,
+    device_grant_supported: bool,
+) -> Value {
+    base["provider"] = json!(provider.as_wire());
+    base["host"] = json!(host);
+    base["method"] = method.map_or(Value::Null, |m| json!(m));
+    if let Some(user) = user {
+        base["user"] = user;
+    }
+    base["deviceGrantSupported"] = json!(device_grant_supported);
+    base
+}
+
+/// The `sourceControl.connect { method: "pat" }` success payload.
+pub(crate) fn pat_connect_response() -> Value {
+    json!({ "ok": true, "method": "pat" })
+}
+
+impl crate::Services {
+    /// Parse + resolve the `(provider, host)` of a `sourceControl.*` call
+    /// against the effective `sourceControl.gitlab.*` settings.
+    pub(crate) fn resolve_source_control_target(
+        &self,
+        provider: &str,
+        host: Option<&str>,
+    ) -> Result<Target> {
+        let provider = Provider::parse(provider)?;
+        let gitlab = self.effective_settings().source_control.gitlab;
+        let env_origin = std::env::var(GITLAB_API_BASE_URI_ENV).ok();
+        let api_origin = gitlab
+            .api_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .or(env_origin.as_deref());
+        resolve_target(provider, host, &gitlab.host, api_origin)
+    }
+
+    /// The OAuth client id the GitLab device grant uses for `host`
+    /// (`sourceControl.gitlab.oauthClientId`, else the compiled gitlab.com id).
+    pub(crate) fn gitlab_client_id(&self, host: &GitlabHost) -> Option<String> {
+        let configured = self
+            .effective_settings()
+            .source_control
+            .gitlab
+            .oauth_client_id;
+        intent_sourcecontrol::gitlab_auth::resolve_client_id(&configured, host)
+    }
+
+    /// Provenance of the GitHub credential in use: `"device"` when the
+    /// device-flow marker sits next to the stored token, `"pat"` for a stored
+    /// token without it, `"env"` when nothing is stored (env / `gh` fallback).
+    pub(crate) async fn github_credential_method(&self) -> &'static str {
+        let stored = self
+            .secrets
+            .load(github_auth_ops::SECRET_ACCOUNT)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|t| !t.trim().is_empty());
+        if !stored {
+            return "env";
+        }
+        let marker = self
+            .secrets
+            .load(GITHUB_TOKEN_METHOD_ACCOUNT)
+            .await
+            .ok()
+            .flatten();
+        match marker.as_deref() {
+            Some("device") => "device",
+            _ => "pat",
+        }
+    }
+
+    /// `sourceControl.connect { provider: "gitlab", method: "pat" }`: validate
+    /// the token against `host`, persist it, bind the host, abort any flow
+    /// pending for the host and emit `authorized`. A rejected token stores
+    /// nothing and surfaces as `source-control-unauthorized`.
+    pub(crate) async fn gitlab_connect_pat(
+        &self,
+        host: GitlabHost,
+        token: String,
+    ) -> Result<Value> {
+        match validate_pat(&host, &token).await {
+            Ok(_) => {}
+            Err(intent_sourcecontrol::Error::Auth(_)) => {
+                return Err(Error::SourceControlUnauthorized {
+                    provider: Provider::Gitlab.as_wire().to_string(),
+                    host: host.host().to_string(),
+                })
+            }
+            Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
+        }
+        intent_sourcecontrol::gitlab_auth::persist_gitlab_token(
+            self.gitlab_secret_store.clone(),
+            intent_sourcecontrol::SecretString::from(token),
+        )
+        .await
+        .map_err(crate::pr_ops::map_sc_err)?;
+        {
+            let mut guard = self.gitlab_auth.lock().await;
+            if guard.flow.as_ref().is_some_and(|f| f.host == host.host()) {
+                guard.flow = None;
+            }
+        }
+        bind_gitlab_host(self.settings_registry.as_deref(), host.host());
+        tracing::info!(host = host.host(), "gitlab personal access token connected");
+        publish_auth_changed(
+            self.event_bus.as_ref(),
+            Provider::Gitlab,
+            host.host(),
+            "authorized",
+        )
+        .await;
+        Ok(pat_connect_response())
+    }
+
+    /// `sourceControl.connect { provider: "gitlab" }` (device grant): the
+    /// gitlab twin of `github.connect` — idempotent while a flow for `host`
+    /// is live, replaces a terminal / other-host slot, and spawns the poll
+    /// loop. A host that cannot run the grant → `device-grant-unsupported`.
+    pub(crate) async fn gitlab_connect_device(&self, host: GitlabHost) -> Result<Value> {
+        let unsupported = || Error::DeviceGrantUnsupported {
+            provider: Provider::Gitlab.as_wire().to_string(),
+            host: host.host().to_string(),
+        };
+        {
+            let mut guard = self.gitlab_auth.lock().await;
+            if let Some(f) = guard.flow.as_ref() {
+                if f.host == host.host() && f.slot.is_live() {
+                    return Ok(github_auth_ops::connect_response(&f.slot));
+                }
+            }
+            guard.flow = None;
+            if guard.unsupported_hosts.contains(host.host()) {
+                return Err(unsupported());
+            }
+        }
+        let Some(client_id) = self.gitlab_client_id(&host) else {
+            return Err(unsupported());
+        };
+        let started = intent_sourcecontrol::gitlab_auth::start_device_grant_with_store(
+            &host,
+            &client_id,
+            self.gitlab_secret_store.clone(),
+        )
+        .await;
+        let (auth, flow) = match started {
+            Ok(pair) => pair,
+            Err(intent_sourcecontrol::Error::DeviceGrantUnsupported(reason)) => {
+                tracing::warn!(
+                    host = host.host(),
+                    reason,
+                    "gitlab device grant unsupported"
+                );
+                self.gitlab_auth
+                    .lock()
+                    .await
+                    .unsupported_hosts
+                    .insert(host.host().to_string());
+                return Err(unsupported());
+            }
+            Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
+        };
+        let mut guard = self.gitlab_auth.lock().await;
+        if let Some(f) = guard.flow.as_ref() {
+            if f.host == host.host() && f.slot.is_live() {
+                return Ok(github_auth_ops::connect_response(&f.slot));
+            }
+        }
+        let flow_id = github_auth_ops::next_flow_id();
+        let deadline = Instant::now() + std::time::Duration::from_secs(auth.expires_in);
+        intent_core::spawn_daemon(run_gitlab_poll_loop(
+            self.gitlab_auth.clone(),
+            self.event_bus.clone(),
+            self.settings_registry.clone(),
+            self.gitlab_secret_store.clone(),
+            flow_id,
+            host.host().to_string(),
+            flow,
+            deadline,
+        ));
+        let slot = FlowSlot {
+            flow_id,
+            user_code: auth.user_code,
+            verification_uri: auth
+                .verification_uri_complete
+                .unwrap_or(auth.verification_uri),
+            interval: auth.interval,
+            deadline,
+            phase: FlowPhase::Pending,
+        };
+        let resp = github_auth_ops::connect_response(&slot);
+        guard.flow = Some(GitlabFlowSlot {
+            host: host.host().to_string(),
+            slot,
+        });
+        tracing::info!(host = host.host(), "gitlab device grant started");
+        Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_parses_the_two_forges_only() {
+        assert_eq!(Provider::parse("github").unwrap(), Provider::Github);
+        assert_eq!(Provider::parse(" gitlab ").unwrap(), Provider::Gitlab);
+        for bad in ["", "GitHub", "bitbucket"] {
+            assert!(
+                matches!(Provider::parse(bad), Err(Error::InvalidParams(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gitlab_host_must_be_bare() {
+        assert_eq!(
+            parse_gitlab_host("GitLab.Acme.internal:8443")
+                .unwrap()
+                .host(),
+            "gitlab.acme.internal:8443"
+        );
+        for bad in [
+            "",
+            "https://gitlab.com",
+            "gitlab.com/",
+            "gitlab.com/gitlab",
+            "user@gitlab.com",
+            "gitlab.com?x=1",
+            "git lab.com",
+        ] {
+            assert!(
+                matches!(parse_gitlab_host(bad), Err(Error::InvalidParams(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_resolution_binds_and_overrides_the_configured_host_only() {
+        assert!(matches!(
+            resolve_target(Provider::Github, None, "gitlab.com", None).unwrap(),
+            Target::Github
+        ));
+        assert!(matches!(
+            resolve_target(Provider::Github, Some("github.com"), "gitlab.com", None),
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            resolve_target(Provider::Github, Some("  "), "gitlab.com", None).unwrap(),
+            Target::Github
+        ));
+
+        let origin = Some("http://127.0.0.1:4321");
+        match resolve_target(Provider::Gitlab, None, "gitlab.com", origin).unwrap() {
+            Target::Gitlab { host, bound } => {
+                assert!(bound);
+                assert_eq!(host.host(), "gitlab.com");
+                assert_eq!(host.base_url(), "http://127.0.0.1:4321");
+            }
+            Target::Github => panic!("expected a gitlab target"),
+        }
+        match resolve_target(
+            Provider::Gitlab,
+            Some("gitlab.acme.internal"),
+            "gitlab.com",
+            origin,
+        )
+        .unwrap()
+        {
+            Target::Gitlab { host, bound } => {
+                assert!(!bound, "another instance is not the bound one");
+                assert_eq!(host.base_url(), "https://gitlab.acme.internal");
+            }
+            Target::Github => panic!("expected a gitlab target"),
+        }
+        assert!(matches!(
+            resolve_target(
+                Provider::Gitlab,
+                None,
+                "gitlab.com",
+                Some("http://evil.example")
+            ),
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            resolve_target(Provider::Gitlab, Some("https://x"), "gitlab.com", None),
+            Err(Error::InvalidParams(_))
+        ));
+    }
+
+    #[test]
+    fn source_control_user_omits_absent_optionals() {
+        let user = gitlab_user_to_wire(&GitlabUser {
+            id: 42,
+            username: "octocat".into(),
+            name: None,
+            avatar_url: Some(String::new()),
+        });
+        assert_eq!(user, json!({ "id": "42", "login": "octocat" }));
+        let user = github_user_to_wire(&UserIdentity {
+            login: "octocat".into(),
+            id: Some(583_231),
+            name: Some("The Octocat".into()),
+            avatar_url: Some("https://avatars.example/u/1".into()),
+            html_url: Some("https://github.com/octocat".into()),
+        });
+        assert_eq!(
+            user,
+            json!({
+                "id": "583231", "login": "octocat", "displayName": "The Octocat",
+                "avatarUrl": "https://avatars.example/u/1"
+            })
+        );
+        assert!(user.get("htmlUrl").is_none());
+    }
+
+    #[test]
+    fn auth_status_additive_fields_extend_the_legacy_shape_only() {
+        let base = github_auth_ops::auth_status_to_wire(true, None);
+        let mut full = auth_status_to_wire(
+            base.clone(),
+            Provider::Gitlab,
+            "gitlab.com",
+            Some("device"),
+            Some(json!({ "id": "1", "login": "u" })),
+            true,
+        );
+        assert_eq!(full["provider"], "gitlab");
+        assert_eq!(full["host"], "gitlab.com");
+        assert_eq!(full["method"], "device");
+        assert_eq!(full["user"]["login"], "u");
+        assert_eq!(full["deviceGrantSupported"], true);
+        let obj = full.as_object_mut().unwrap();
+        for key in ["provider", "host", "method", "user", "deviceGrantSupported"] {
+            obj.remove(key);
+        }
+        assert_eq!(
+            full, base,
+            "the legacy github.authStatus shape is untouched"
+        );
+
+        let unconfigured =
+            auth_status_to_wire(base, Provider::Github, GITHUB_HOST, None, None, true);
+        assert_eq!(unconfigured["method"], Value::Null);
+        assert!(unconfigured.get("user").is_none());
+    }
+
+    #[test]
+    fn auth_changed_event_is_global_and_carries_only_the_transition() {
+        let ev = auth_changed_event(Provider::Gitlab, "gitlab.com", "authorized");
+        assert_eq!(ev.event_type, "sourceControl:auth-changed");
+        assert!(ev.workspace_id.as_str().is_empty());
+        assert_eq!(
+            ev.data,
+            json!({ "provider": "gitlab", "host": "gitlab.com", "status": "authorized" })
+        );
+    }
+}

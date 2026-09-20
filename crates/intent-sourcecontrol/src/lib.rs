@@ -27,6 +27,7 @@ pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use gitlab_auth::{
     GitlabDeviceAuthorization, GitlabDeviceFlow, GitlabHost, GitlabPollStatus, GitlabUser,
+    StoredCredential,
 };
 pub use gitlab_token::GitlabTokenSource;
 pub use model::{
@@ -38,6 +39,9 @@ pub use model::{
     ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
+/// Re-exported so callers can hand [`gitlab_auth::persist_gitlab_token`] a
+/// redacted token without depending on `secrecy` themselves.
+pub use secrecy::SecretString;
 pub use token::TokenSource;
 
 /// The provider-agnostic forge API (§7.2).

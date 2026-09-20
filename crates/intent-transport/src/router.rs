@@ -159,6 +159,33 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 "limit": limit,
             })),
         },
+        // Provider-generic auth typed errors (§5.27): -32603 with the stable
+        // `data = { code, provider, host }` so the FE keys its PAT fallback
+        // and "credential rejected" presentation on `data.code`, not prose.
+        ref e @ Error::DeviceGrantUnsupported {
+            ref provider,
+            ref host,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "device-grant-unsupported",
+                "provider": provider,
+                "host": host,
+            })),
+        },
+        ref e @ Error::SourceControlUnauthorized {
+            ref provider,
+            ref host,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "source-control-unauthorized",
+                "provider": provider,
+                "host": host,
+            })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
@@ -3003,6 +3030,55 @@ async fn dispatch(
         }
         "github.getUser" => {
             let r = api.github_get_user().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // Provider-generic auth (§5.27 "Provider-generic auth —
+        // `sourceControl.*`", v10.4): `provider` is required on every method
+        // (`github` | `gitlab`), `host` is optional and gitlab-only; both are
+        // validated by the service so the `-32602` messages stay in one place.
+        "sourceControl.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let r = api
+                .source_control_auth_status(provider, opt_str(params, "host"))
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let r = api
+                .source_control_connect(
+                    provider,
+                    opt_str(params, "host"),
+                    opt_str(params, "method"),
+                    opt_str(params, "token"),
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let r = api
+                .source_control_cancel_auth(provider, opt_str(params, "host"))
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let r = api
+                .source_control_revoke(provider, opt_str(params, "host"))
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let r = api
+                .source_control_get_user(provider, opt_str(params, "host"))
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         // `principal.me` (multiplayer w1): the principal this connection was

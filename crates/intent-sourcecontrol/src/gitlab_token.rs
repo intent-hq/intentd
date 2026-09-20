@@ -22,12 +22,19 @@ pub use crate::token::TokenResolution;
 /// Secrets-store account/key for the GitLab access token
 /// (`sourceControl.gitlab.token`). Shared with [`crate::gitlab_auth`], which
 /// writes/deletes this exact entry.
-pub(crate) const SECRET_ACCOUNT: &str = "sourceControl.gitlab.token";
+pub const SECRET_ACCOUNT: &str = "sourceControl.gitlab.token";
 /// Secrets-store account/key for the OAuth refresh token the device grant
 /// returns next to the access token (`sourceControl.gitlab.refreshToken`).
-/// Persisted by [`crate::gitlab_auth`] so a later refresh exchange can
-/// renew the (two-hour) access token; never read by the resolution chain.
-pub(crate) const REFRESH_SECRET_ACCOUNT: &str = "sourceControl.gitlab.refreshToken";
+/// Persisted by [`crate::gitlab_auth`] so a later refresh exchange
+/// ([`crate::gitlab_auth::refresh_access_token`]) can renew the (two-hour)
+/// access token; never read by the resolution chain. Its presence is also
+/// what marks the stored credential as device-grant issued (a PAT has none).
+pub const REFRESH_SECRET_ACCOUNT: &str = "sourceControl.gitlab.refreshToken";
+/// Secrets-store account/key for the access token's expiry
+/// (`sourceControl.gitlab.tokenExpiresAt`, unix seconds as a decimal string).
+/// Written next to the refresh token by the device grant / refresh exchange
+/// so a caller can refresh proactively; absent for a PAT (no expiry).
+pub const EXPIRES_AT_SECRET_ACCOUNT: &str = "sourceControl.gitlab.tokenExpiresAt";
 /// Bounded wait for a secrets-store read before treating the entry as absent
 /// (same budget as the GitHub chain).
 const SECRET_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
@@ -243,6 +250,10 @@ mod tests {
     fn secret_accounts_are_provider_scoped() {
         assert_eq!(SECRET_ACCOUNT, "sourceControl.gitlab.token");
         assert_eq!(REFRESH_SECRET_ACCOUNT, "sourceControl.gitlab.refreshToken");
+        assert_eq!(
+            EXPIRES_AT_SECRET_ACCOUNT,
+            "sourceControl.gitlab.tokenExpiresAt"
+        );
         assert_ne!(SECRET_ACCOUNT, crate::token::SECRET_ACCOUNT);
     }
 }

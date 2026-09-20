@@ -505,12 +505,22 @@
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release
 //! installs are asynchronous and never fall back to channel updates.
+//!
+//! Version 10.4 adds the provider-generic auth surface (§5.27):
+//! `sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
+//! `getUser` with `provider: "github" | "gitlab"` and an optional gitlab
+//! `host`, the `device-grant-unsupported` / `source-control-unauthorized`
+//! typed errors, the `sourceControl:auth-changed { provider, host, status }`
+//! event and the `sourceControl.gitlab.*` settings. The `github.*` auth
+//! quintet is served as byte-identical aliases. The catalog contains 328
+//! router methods, 53 fast-path methods, and two aliases: 383
+//! client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.3";
+pub const PROTOCOL_VERSION: &str = "10.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
