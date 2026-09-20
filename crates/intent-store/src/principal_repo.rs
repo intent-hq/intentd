@@ -192,6 +192,29 @@ impl Store {
         Ok(rows.iter().map(map_principal_row).collect())
     }
 
+    /// The credentialed guests (`principal.list`): every non-primary
+    /// principal holding at least one active (`revoked_at IS NULL`)
+    /// credential, by `created_at`. A guest whose credentials were all
+    /// revoked (`principal.revokeSelf`) is omitted — it cannot connect.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_credentialed_guest_principals(&self) -> Result<Vec<Principal>> {
+        let sql = format!(
+            "SELECT {PRINCIPAL_COLUMNS} FROM principal p \
+             WHERE p.is_primary = 0 AND EXISTS (\
+                 SELECT 1 FROM principal_credential c \
+                 WHERE c.principal_id = p.id AND c.revoked_at IS NULL) \
+             ORDER BY p.created_at, p.id"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list credentialed guests failed: {e}")))?;
+        Ok(rows.iter().map(map_principal_row).collect())
+    }
+
     /// Insert or update a principal by id. On conflict the GitHub identity
     /// and cached profile fields are overwritten and `updated_at` bumped;
     /// `is_primary` and `created_at` are never changed by an upsert (the
