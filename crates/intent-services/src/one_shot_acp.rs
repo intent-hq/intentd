@@ -185,12 +185,17 @@ async fn drive_one_shot(
     session_meta: Option<Value>,
     prompt_timeout: Duration,
 ) -> Result<String, OneShotError> {
+    // One responder for the whole lifecycle: a response send still pending
+    // when a phase resolves is carried into the next phase's loop instead of
+    // being dropped at the boundary (see `Responder`).
+    let mut responder = Responder::new(conn);
+
     // Setup is serviced too: an adapter that sends
     // `session/request_permission` during `initialize` or `session/new`
     // still gets the immediate auto-deny instead of stalling setup into a
     // misreported SetupTimeout.
     let session_id = serve_requests_while(
-        conn,
+        &mut responder,
         requests,
         tokio::time::timeout(
             cmd.setup_timeout(),
@@ -208,7 +213,7 @@ async fn drive_one_shot(
 
     if let Some(model) = config_option_model {
         apply_config_option_model(
-            conn,
+            &mut responder,
             requests,
             &session_id,
             model,
@@ -235,7 +240,6 @@ async fn drive_one_shot(
     let mut text = String::new();
     let mut notifications_open = true;
     let mut requests_open = true;
-    let mut responder = Responder::new(conn);
     let outcome = loop {
         tokio::select! {
             resp = &mut prompt_fut => break resp,
@@ -276,23 +280,18 @@ async fn drive_one_shot(
 /// Drive `fut` to completion while answering agent→client requests inline
 /// (the same auto-deny/refuse posture as the prompt phase), so no phase of
 /// the one-shot lifecycle can hang on an unanswered client-served request.
+/// A send still in flight when `fut` resolves stays in `responder` for the
+/// caller's next phase to finish.
 async fn serve_requests_while<F: std::future::Future>(
-    conn: &Connection,
+    responder: &mut Responder<'_>,
     requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
     fut: F,
 ) -> F::Output {
     tokio::pin!(fut);
     let mut requests_open = true;
-    let mut responder = Responder::new(conn);
     loop {
         tokio::select! {
-            out = &mut fut => {
-                // The phase won the race against a just-dequeued request:
-                // answer it if the writer has room (the inline await used to
-                // guarantee that); a wedged send stays abandoned.
-                responder.finish_if_ready();
-                return out;
-            }
+            out = &mut fut => return out,
             () = responder.flush(), if responder.in_flight() => {}
             req = requests.recv(), if requests_open && !responder.in_flight() => match req {
                 Some(req) => responder.start(req),
@@ -304,22 +303,29 @@ async fn serve_requests_while<F: std::future::Future>(
     }
 }
 
-/// The at-most-one in-flight [`auto_respond`] send of a serving loop, polled
-/// as its own `select!` branch rather than awaited inside a handler.
+/// The at-most-one in-flight [`auto_respond`] send of the one-shot's serving
+/// loops, polled as its own `select!` branch rather than awaited inside a
+/// handler.
 ///
 /// Response sends go through the transport's bounded writer channel, so an
 /// adapter that floods client-served requests without reading its stdin
 /// eventually makes a send block. Awaiting that send inline would stop the
 /// loop polling the phase future — and with it the phase timeout — turning a
 /// hostile adapter into an unbounded hang (monorepo#5465). Kept as a sibling
-/// branch, a stalled send is simply abandoned when the phase resolves or
-/// times out; the budgets stay the hard ceiling. While a send is in flight
-/// the loop stops pulling further requests (their queue is unbounded and the
-/// transport reader keeps draining, so nothing deadlocks), preserving the
-/// in-order answer the auto-deny posture always gave. At a phase boundary
-/// [`Responder::finish_if_ready`] gives a not-yet-polled send its one chance
-/// so a well-behaved adapter's request is never silently dropped between
-/// setup and the prompt.
+/// branch, a stalled send never delays the phase; the budgets stay the hard
+/// ceiling. While a send is in flight the loop stops pulling further requests
+/// (their queue is unbounded and the transport reader keeps draining, so
+/// nothing deadlocks), preserving the in-order answer the auto-deny posture
+/// always gave.
+///
+/// One responder lives for the whole lifecycle (setup → model → prompt): a
+/// send still pending when a phase resolves is carried into the next phase's
+/// loop rather than dropped at the boundary. `Pending` there says nothing
+/// about the writer — Tokio's cooperative budget makes a bounded `send`
+/// yield even on an empty channel, and a briefly full writer drains as soon
+/// as the adapter reads — so the send keeps being polled under the following
+/// budget. Only the send pending when the final phase resolves is abandoned,
+/// together with the adapter.
 struct Responder<'c> {
     conn: &'c Connection,
     in_flight: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'c>>>,
@@ -351,18 +357,6 @@ impl<'c> Responder<'c> {
             self.in_flight = None;
         }
     }
-
-    /// Poll the in-flight send exactly once without waiting. A response send
-    /// is a single bounded-channel `send`, so this completes it whenever the
-    /// writer has room and leaves a send wedged on a full writer in place.
-    fn finish_if_ready(&mut self) {
-        if let Some(fut) = self.in_flight.as_mut() {
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            if fut.as_mut().poll(&mut cx).is_ready() {
-                self.in_flight = None;
-            }
-        }
-    }
 }
 
 /// Best-effort `session/set_config_option { configId: "model" }`: the model
@@ -372,16 +366,17 @@ impl<'c> Responder<'c> {
 /// completion proceeds on the adapter's default model — a best-effort model
 /// is never an error.
 async fn apply_config_option_model(
-    conn: &Connection,
+    responder: &mut Responder<'_>,
     requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
     session_id: &str,
     model: &str,
     timeout: Duration,
 ) {
+    let conn = responder.conn;
     let params = json!({ "sessionId": session_id, "configId": "model", "value": model });
     // The outer timeout also bounds the send itself (see the prompt phase).
     let outcome = serve_requests_while(
-        conn,
+        responder,
         requests,
         tokio::time::timeout(
             timeout,
