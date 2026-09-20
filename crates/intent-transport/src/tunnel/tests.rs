@@ -1064,6 +1064,143 @@ async fn credit_replenishment_resumes_exactly_the_granted_bytes() {
     producer.abort();
 }
 
+/// Short idle/starvation deadline for the credit-exhaustion tests.
+const STARVATION_IDLE: Duration = Duration::from_millis(600);
+
+/// A relay under test for credit starvation: its loopback peer writes
+/// `reply_bytes`, then drains everything the client uploads; the relay
+/// starts with a `window` of credit and `STARVATION_IDLE` as its idle
+/// timeout. A feeder task keeps uploading small client frames every quarter
+/// of that timeout so the plain idle timer can never fire.
+struct StarvedRelay {
+    relay: tokio::task::JoinHandle<()>,
+    out_rx: mpsc::Receiver<OutboundFrame>,
+    credit: Arc<CreditWindow>,
+    _peer: tokio::task::JoinHandle<()>,
+    _feeder: tokio::task::JoinHandle<()>,
+}
+
+async fn starved_relay(reply_bytes: usize, window: u32) -> StarvedRelay {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        tcp.write_all(&vec![0xCD; reply_bytes]).await.unwrap();
+        let mut sink = [0u8; 1024];
+        while !matches!(tcp.read(&mut sink).await, Ok(0) | Err(_)) {}
+    });
+    let (msg_tx, msg_rx) = mpsc::channel(STREAM_QUEUE_FRAMES);
+    let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_QUEUE_FRAMES);
+    let credit = CreditWindow::new(window);
+    let relay = tokio::spawn(run_stream(
+        1,
+        Arc::new(()),
+        port,
+        msg_rx,
+        Arc::new(AtomicUsize::new(0)),
+        credit.clone(),
+        out_tx,
+        TunnelLimits {
+            idle_timeout: STARVATION_IDLE,
+            ..TunnelLimits::default()
+        },
+    ));
+    let feeder = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(STARVATION_IDLE / 4);
+        loop {
+            tick.tick().await;
+            if msg_tx.send(data(vec![0x01; 64])).await.is_err() {
+                break;
+            }
+        }
+    });
+    let opened = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        .await
+        .expect("OPEN_OK within the deadline")
+        .expect("relay alive");
+    assert_eq!(opened.frame, Frame::OpenOk { stream_id: 1 });
+    StarvedRelay {
+        relay,
+        out_rx,
+        credit,
+        _peer: peer,
+        _feeder: feeder,
+    }
+}
+
+/// Zero credit alone is not starvation: a pre-credit
+/// client that received exactly its window and then keeps uploading must
+/// keep its stream — nothing is waiting on the loopback, so the
+/// credit-exhaustion deadline never arms and the upload resets the idle
+/// timer as usual.
+#[tokio::test]
+async fn zero_credit_stream_with_nothing_waiting_survives_past_idle_timeout() {
+    let window = 4 * READ_CHUNK_BYTES;
+    let mut t = starved_relay(window, u32::try_from(window).unwrap()).await;
+    recv_data_bytes(&mut t.out_rx, window).await;
+    assert_eq!(t.credit.available(), 0, "the window is spent");
+    let next = tokio::time::timeout(STARVATION_IDLE * 5, t.out_rx.recv())
+        .await
+        .ok()
+        .map(|frame| frame.map(|f| f.frame));
+    assert!(
+        next.is_none(),
+        "zero-credit stream with nothing waiting was torn down: {next:?}"
+    );
+    assert!(!t.relay.is_finished());
+    t.relay.abort();
+}
+
+/// Genuine starvation closes: with the window spent AND loopback output
+/// waiting behind it, the stream is closed after `idle_timeout` even though
+/// the client's upload keeps resetting the plain idle timer.
+#[tokio::test]
+async fn starved_stream_with_waiting_output_closes_after_idle_timeout() {
+    let window = 4 * READ_CHUNK_BYTES;
+    let mut t = starved_relay(2 * window, u32::try_from(window).unwrap()).await;
+    recv_data_bytes(&mut t.out_rx, window).await;
+    let exhausted_at = Instant::now();
+    assert_eq!(t.credit.available(), 0, "the window is spent");
+    let closed = tokio::time::timeout(STARVATION_IDLE * 5, t.out_rx.recv())
+        .await
+        .expect("starved stream closed within the deadline")
+        .expect("relay alive");
+    assert_eq!(closed.frame, Frame::Close { stream_id: 1 });
+    assert!(
+        exhausted_at.elapsed() >= STARVATION_IDLE / 2,
+        "closed after {:?}, before the starvation deadline",
+        exhausted_at.elapsed()
+    );
+    tokio::time::timeout(Duration::from_secs(5), t.relay)
+        .await
+        .expect("relay task ends with its CLOSE")
+        .unwrap();
+}
+
+/// A client `CREDIT` cancels the pending starvation deadline: grants spaced
+/// well inside `idle_timeout` keep a stream with waiting output alive for
+/// several timeouts, each delivering exactly the granted byte, and only once
+/// the grants stop does the stream close.
+#[tokio::test]
+async fn credit_grant_clears_the_starvation_deadline() {
+    let window = 4 * READ_CHUNK_BYTES;
+    let mut t = starved_relay(2 * window, u32::try_from(window).unwrap()).await;
+    recv_data_bytes(&mut t.out_rx, window).await;
+    assert_eq!(t.credit.available(), 0, "the window is spent");
+    let mut tick = tokio::time::interval(STARVATION_IDLE / 4);
+    for _ in 0..12 {
+        tick.tick().await;
+        t.credit.grant(1);
+        recv_data_bytes(&mut t.out_rx, 1).await;
+        assert!(!t.relay.is_finished(), "grant did not clear the deadline");
+    }
+    let closed = tokio::time::timeout(STARVATION_IDLE * 5, t.out_rx.recv())
+        .await
+        .expect("stream closes once grants stop")
+        .expect("relay alive");
+    assert_eq!(closed.frame, Frame::Close { stream_id: 1 });
+}
+
 type ClientWs = WebSocketStream<tokio::io::DuplexStream>;
 
 /// Send one tunnel frame from the client side of an in-process WebSocket.

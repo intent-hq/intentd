@@ -36,11 +36,17 @@
 //! socket. A stream with no credit pauses only its own loopback read (so the
 //! peer's `EOF` is also seen only once credit is available again) — its
 //! inbound direction, its siblings, and the heartbeat keep flowing — so a
-//! client that stops consuming one stream can no longer park the connection
-//! loop in a WebSocket write for everyone. Clients that never send `CREDIT`
-//! keep working for the first window per stream and then stall only that
-//! stream. `CREDIT` for an unknown stream is ignored like any other
-//! teardown race.
+//! credit-aware client that keeps reading the WebSocket but stops flushing
+//! one local socket can no longer park the connection loop in a WebSocket
+//! write for everyone. That is the scope of the guarantee: the initial window
+//! is fixed, not negotiated, so a peer that stops reading the WebSocket
+//! altogether can still block `sink.send` before its window is spent (a
+//! bounded connection write is a separate follow-up). Clients that never send
+//! `CREDIT` keep working for the first window per stream and then stall only
+//! that stream. A stream starved of credit while loopback output is waiting
+//! is closed after [`TunnelLimits::idle_timeout`]; a zero-credit stream with
+//! nothing waiting is not. `CREDIT` for an unknown stream is ignored like any
+//! other teardown race.
 //!
 //! Stream queues are bounded and admission never waits on a TCP consumer:
 //! a full queue closes only that stream, leaving sibling frames and pings
@@ -313,6 +319,13 @@ enum StreamMsg {
     Data(Vec<u8>, OwnedSemaphorePermit),
     /// Client half-close: shut down the TCP write side.
     Eof,
+}
+
+/// Outcome of the relay's loopback poll: a credit-bounded read, or — with an
+/// empty window — the observation that output is waiting behind it.
+enum Loopback {
+    Read(std::io::Result<usize>),
+    Waiting,
 }
 
 /// Daemon→client flow-control window of one stream, shared between the
@@ -724,8 +737,17 @@ where
 /// credit)` bytes and each `DATA` payload consumes its length, so the daemon
 /// never queues output the client has not granted room for. An exhausted
 /// window pauses only this read, as a `select!` condition; the pause ends
-/// when the connection loop grants a client `CREDIT`, or the stream is closed
-/// with a warning after `idle_timeout` of continuous exhaustion.
+/// when the connection loop grants a client `CREDIT`. While the window is
+/// empty AND the loopback has output waiting (observed with a non-consuming
+/// `peek`), a starvation deadline of `idle_timeout` runs independently of the
+/// plain idle timer, so an upload that keeps the stream busy cannot keep a
+/// starved reply parked forever; a grant clears it. A zero-credit stream with
+/// nothing waiting (e.g. an inbound-only upload from a pre-credit client) is
+/// never closed by it. The isolation this buys is scoped to a credit-aware
+/// client that keeps reading the WebSocket: a peer that stops reading the
+/// socket altogether can still park the connection's `sink.send` before its
+/// window is spent — the fixed initial window is not negotiated, and a
+/// bounded connection write is outside this change.
 #[expect(clippy::too_many_arguments)]
 async fn run_stream(
     stream_id: u32,
@@ -799,12 +821,14 @@ async fn run_stream(
     let mut inbound: Option<(Vec<u8>, usize, OwnedSemaphorePermit)> = None;
     let idle = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(idle);
-    // When the credit window last hit zero; `None` while credit is available.
-    // Continuous exhaustion for `idle_timeout` closes the stream even if its
-    // inbound direction keeps resetting `idle`.
+    // When loopback output was first seen waiting behind an empty credit
+    // window; `None` while credit is available or nothing is waiting. That
+    // starvation lasting `idle_timeout` closes the stream even if its inbound
+    // direction keeps resetting `idle`.
     let mut credit_exhausted_since: Option<Instant> = None;
     let credit_stall = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(credit_stall);
+    let mut peek = [0u8; 1];
     loop {
         let credit_available = credit.available();
         if credit_available > 0 {
@@ -814,6 +838,16 @@ async fn run_stream(
         let read_limit = usize::try_from(credit_available)
             .unwrap_or(READ_CHUNK_BYTES)
             .min(READ_CHUNK_BYTES);
+        // With credit, read the next chunk (never while a frame is held, so
+        // the loopback producer keeps its backpressure). Without credit, only
+        // peek — one non-consuming probe that arms the starvation deadline —
+        // until a grant re-evaluates the window.
+        let poll_loopback = !read_done
+            && if credit_available > 0 {
+                pending.is_none()
+            } else {
+                credit_exhausted_since.is_none()
+            };
         // Fixed priority: admit the held frame first, then progress the
         // in-flight loopback write, then drain client→daemon messages, then
         // read more loopback output. A burst of reads may not starve `msg_rx`
@@ -869,31 +903,47 @@ async fn run_stream(
                 }
                 None => break,
             },
-            n = rd.read(&mut buf[..read_limit]), if !read_done && pending.is_none() && credit_available > 0 => match n {
+            event = async {
+                if credit_available > 0 {
+                    Loopback::Read(rd.read(&mut buf[..read_limit]).await)
+                } else {
+                    // A peer EOF or error counts as waiting too: it is only
+                    // forwarded once the stream holds credit again.
+                    let _ = rd.peek(&mut peek).await;
+                    Loopback::Waiting
+                }
+            }, if poll_loopback => match event {
                 // Read errors (e.g. RST) surface as EOF toward the client;
                 // the write side keeps draining until the client is done too.
-                Ok(0) | Err(_) => {
+                Loopback::Read(Ok(0) | Err(_)) => {
                     read_done = true;
                     pending = Some(Frame::Eof { stream_id });
                 }
-                Ok(n) => {
+                Loopback::Read(Ok(n)) => {
                     idle.as_mut().reset(Instant::now() + limits.idle_timeout);
                     credit.consume(n);
-                    if credit.available() == 0 {
-                        credit_exhausted_since = Some(Instant::now());
-                        credit_stall.as_mut().reset(Instant::now() + limits.idle_timeout);
-                    }
                     pending = Some(Frame::Data {
                         stream_id,
                         payload: buf[..n].to_vec(),
                     });
                 }
+                Loopback::Waiting => {
+                    credit_exhausted_since = Some(Instant::now());
+                    credit_stall.as_mut().reset(Instant::now() + limits.idle_timeout);
+                }
             },
             // Paused on an empty window: wake on the next client `CREDIT`
             // (a grant that lands before this arm is polled is kept as a
-            // stored permit) and re-evaluate the window.
-            () = credit.replenished.notified(), if !read_done && pending.is_none() && credit_available == 0 => {}
+            // stored permit) and re-evaluate the window — also while a frame
+            // is held, so the grant clears the starvation deadline.
+            () = credit.replenished.notified(), if !read_done && credit_available == 0 => {}
             () = &mut credit_stall, if !read_done && credit_exhausted_since.is_some() => {
+                // A grant that landed since the window was last observed
+                // has already ended the starvation.
+                if credit.available() > 0 {
+                    credit_exhausted_since = None;
+                    continue;
+                }
                 let credit_exhausted_for_ms = credit_exhausted_since
                     .map_or(0, |since| since.elapsed().as_millis());
                 tracing::warn!(
