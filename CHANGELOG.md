@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.88] - 2026-09-20
+
+### 🚀 Features
+
+- *(github)* Add github.users.search RPC ([#1912](https://github.com/intent-hq/intentd/pull/1912))
+- *(invite)* Persist the invite secret and return url from workspace.invite.list ([#1913](https://github.com/intent-hq/intentd/pull/1913))
+- *(sharing)* Enforce guest membership and guest connection caps ([#1917](https://github.com/intent-hq/intentd/pull/1917))
+- *(sharing)* Hot-reload guest connection caps ([#1918](https://github.com/intent-hq/intentd/pull/1918))
+- *(sharing)* Allowlist system.status for collaborator connections ([#1934](https://github.com/intent-hq/intentd/pull/1934))
+- Agent memory fields on system.status and a daemon-wide agent.memoryUsage RPC ([#2026](https://github.com/intent-hq/intentd/pull/2026))
+- *(invite)* Return host identity in the invite.redeem phase-1 result ([#1955](https://github.com/intent-hq/intentd/pull/1955))
+
+
 ## [0.9.87] - 2026-09-20
 
 ### 🚀 Features
