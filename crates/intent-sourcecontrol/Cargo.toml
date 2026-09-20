@@ -10,6 +10,7 @@ description = "SourceControl trait + GitHubSourceControl (PR/issue/review/check-
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.9.86" }
 octocrab = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

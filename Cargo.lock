@@ -2361,6 +2361,7 @@ dependencies = [
  "http",
  "intent-core",
  "octocrab",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",
