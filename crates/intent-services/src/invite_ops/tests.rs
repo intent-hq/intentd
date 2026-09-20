@@ -2423,6 +2423,62 @@ async fn invite_create_refuses_at_the_guest_limit() {
     assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
 }
 
+/// A direct `workspace.members.add` spends the same cap as an invite mint
+/// (collaborators plus open invites): at the cap it is `GuestLimit` and no
+/// row is written; an already-seated member is still the idempotent
+/// `added: false` past the cap; raising the cap live admits the guest, and
+/// `members.list` counts the new seat.
+#[tokio::test]
+async fn members_add_refuses_at_the_guest_limit() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 3).await;
+    let guest = principal("guest", Some(3003));
+    f.store.upsert_principal(&guest).await.expect("guest");
+    f.store
+        .insert_principal_credential(&guest.id, &hash_secret("guest-token"))
+        .await
+        .expect("guest credential");
+    f.store
+        .insert_principal_credential(&f.collaborator, &hash_secret("collab-token"))
+        .await
+        .expect("collaborator credential");
+    f.create_invite(None).await;
+    assert_eq!(guest_summary(&f).await, (3, 3));
+
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_members_add_op(&f.ws, &guest.id),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+    assert_eq!(r.unwrap_err().code(), -32602);
+    assert!(
+        f.store
+            .get_workspace_member_role(&f.ws, &guest.id)
+            .await
+            .expect("role")
+            .is_none(),
+        "a refused add leaves no row"
+    );
+    let seated = with_caller(
+        wire(&f.owner),
+        f.services.workspace_members_add_op(&f.ws, &f.collaborator),
+    )
+    .await
+    .expect("seated member");
+    assert_eq!(seated["added"], json!(false));
+
+    set_cap(&registry, 4);
+    let added = with_caller(
+        wire(&f.owner),
+        f.services.workspace_members_add_op(&f.ws, &guest.id),
+    )
+    .await
+    .expect("add under the raised cap");
+    assert_eq!(added["added"], json!(true));
+    assert_eq!(guest_summary(&f).await, (4, 4));
+}
+
 /// The join re-checks the cap against collaborators inside the store
 /// transaction: an open invite minted under a higher cap is `WorkspaceFull`
 /// once the cap drops to the seated count — nothing is written and the

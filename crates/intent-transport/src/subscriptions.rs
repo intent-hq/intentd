@@ -2123,7 +2123,12 @@ pub(crate) fn visible_workspace_ids(snapshot: &Value) -> HashSet<String> {
 /// tombstone is emitted only for a workspace previously shown to this
 /// subscriber, and every successful re-read records the id as shown; the
 /// subscriber's own unshare removes it. Without it (administrator) every
-/// tombstone is emitted as before.
+/// tombstone is emitted as before. The re-read runs under the subscriber's
+/// caller, so a membership add of that caller (`workspace.members.add`, an
+/// invite join — `changes.addedPrincipalId`) is the first re-read that
+/// succeeds for a previously invisible workspace: it upserts as an
+/// `updated` delta (the channel's documented upsert semantics), which is
+/// how a connected guest's list gains the workspace without a reconnect.
 pub(crate) async fn workspace_delta(
     api: &dyn WorkspaceApi,
     event: &Event,
