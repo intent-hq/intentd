@@ -375,10 +375,12 @@ impl Services {
     /// resolves to a `(provider, model)` pair, so a legacy compound value
     /// naming another registered provider routes the one-shot there.
     ///
-    /// Before the provider gate, an eligible call is first offered to the
-    /// on-device `fm` backend ([`Self::try_fm_completion`]), so a host with
-    /// no decidable default provider still gets `{ text }` from `fm`; any
-    /// `fm` miss falls through to the provider gate and route unchanged, and
+    /// Before the provider gate, an eligible call — one that names no
+    /// `model`, since an explicit client model always wins and only the
+    /// provider route can honour it — is first offered to the on-device `fm`
+    /// backend ([`Self::try_fm_completion`]), so a host with no decidable
+    /// default provider still gets `{ text }` from `fm`; any `fm` miss falls
+    /// through to the provider gate and route unchanged, and
     /// `{ available: false }` is returned only when both miss.
     pub(crate) async fn agent_complete_once_op(
         &self,
@@ -410,10 +412,13 @@ impl Services {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
+        // A blank client model counts as none.
+        let model = model.filter(|m| !m.trim().is_empty());
 
         if let Some(text) = self
             .try_fm_completion(
                 &settings,
+                model.as_deref(),
                 quick_action_type.as_deref(),
                 system_prompt,
                 &prompt,
@@ -432,7 +437,7 @@ impl Services {
         // (provider, model) pair — a compound rung names its own provider, so
         // the chain can still resolve when the default provider is unset;
         // the gate closes only when neither yields a provider.
-        let (run_provider, model) = match model.filter(|m| !m.trim().is_empty()) {
+        let (run_provider, model) = match model {
             Some(m) => match effective_provider {
                 Some(p) => (p, Some(m)),
                 None => {
@@ -516,24 +521,34 @@ impl Services {
     }
 
     /// The on-device `fm` attempt: `Some(text)` when the call is eligible
-    /// (setting `auto`, [`fm_eligible_type`], within
+    /// (setting `auto`, no explicit `model`, [`fm_eligible_type`], within
     /// [`FM_PROMPT_BYTE_BUDGET`]), the cached probe reports `fm` usable, and
     /// `fm respond` returned a usable reply; `None` otherwise, with the reason
-    /// logged at debug so the caller falls through to its provider route. The
-    /// cheap gates run before the probe so an ineligible call never spawns.
-    /// The probe is read, never awaited
+    /// logged at debug so the caller falls through to its provider route. An
+    /// explicit client model is §5.32's top precedence rung and `fm` cannot
+    /// run it, so such a call is never offered to `fm`. The cheap gates run
+    /// before the probe so an ineligible call never spawns. The probe is
+    /// read, never awaited
     /// ([`crate::fm_backend::FmBackend::cached_or_refresh`]): a cold cache
     /// misses this call while the probe warms in the background, so
     /// `timeout_ms` bounds `fm respond` alone.
     async fn try_fm_completion(
         &self,
         settings: &SettingsFile,
+        model: Option<&str>,
         quick_action_type: Option<&str>,
         system_prompt: Option<&str>,
         prompt: &str,
         timeout_ms: u64,
     ) -> Option<String> {
         if settings.quick_actions.local_model != QuickActionsLocalModel::Auto {
+            return None;
+        }
+        if model.is_some() {
+            tracing::debug!(
+                target: "fm_backend",
+                "completeOnce names an explicit model; using provider route"
+            );
             return None;
         }
         if !fm_eligible_type(quick_action_type) {
@@ -2117,6 +2132,57 @@ rl.on('line', (line) => {
         assert!(
             fm_calls(&log).is_empty(),
             "commit/pr/review never probe or spawn fm"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_explicit_model_bypasses_fm() {
+        // §5.32: an explicit client model always wins. An otherwise eligible
+        // call (auto, warm available probe, no type, small prompt) that
+        // names a model takes the provider route with that model and
+        // `fm respond` never runs; a blank model is no model and stays
+        // fm-eligible.
+        let (_auggie_dir, auggie) = fake_auggie_echoing_args("fm-explicit-model");
+        let (_fm_dir, fm, log) = fake_fm_available("explicit-model", "cat");
+        let (_tmp, services) = services_with_fm(auggie, fm, "auto").await;
+        assert!(warm_fm(&services).await.available);
+        let v = services
+            .agent_complete_once_op(
+                "make a slug".into(),
+                None,
+                Some("opus4.7".into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            v["text"].as_str().unwrap().contains("--model opus4.7"),
+            "the explicit model must reach the provider CLI, got {v:?}"
+        );
+        assert_eq!(
+            fm_calls(&log),
+            vec!["available", "license --status"],
+            "an explicit model never spawns fm respond"
+        );
+
+        let v = services
+            .agent_complete_once_op(
+                "make a slug".into(),
+                None,
+                Some("  ".into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["text"], "make a slug", "a blank model is fm-eligible");
+        assert_eq!(
+            fm_calls(&log).last().map(String::as_str),
+            Some("respond --no-stream --greedy")
         );
     }
 

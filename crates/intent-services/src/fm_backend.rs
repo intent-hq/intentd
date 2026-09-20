@@ -32,10 +32,9 @@
 //! `agent.completeOnce` can log them and fall through to its provider route.
 //!
 //! Every spawn runs in its own process group, and a [`ProcessGroupGuard`]
-//! kills that whole group unless the child completed normally — on timeout,
-//! on a wait error, and when the future is cancelled or dropped — so helper
-//! processes an `fm` (or an [`FM_BIN_ENV`] wrapper) starts never outlive the
-//! call.
+//! sweeps that whole group on every exit path — normal exit, timeout, wait
+//! error, and the future being cancelled or dropped — so helper processes
+//! an `fm` (or an [`FM_BIN_ENV`] wrapper) starts never outlive the call.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -410,13 +409,24 @@ enum FmRun {
     TimedOut,
 }
 
-/// Kills a spawned child's whole process group (`SIGKILL`) on drop unless
-/// [`ProcessGroupGuard::disarm`]ed after the child completed normally. The
-/// child is spawned as its own group leader (`process_group(0)`), so the
-/// group id is its pid. Owning the kill in a guard makes it run on every
-/// abnormal path — timeout, wait error, and the enclosing future being
-/// cancelled or dropped — where `kill_on_drop` alone would only reach the
-/// direct child and leave helper processes alive. A no-op on non-unix.
+/// Kills a spawned child's whole process group (`SIGKILL`) on drop — on
+/// every exit path, including a normal exit. The child is spawned as its own
+/// group leader (`process_group(0)`), so the group id is its pid. Owning the
+/// kill in a guard makes it run on timeout, on a wait error, and when the
+/// enclosing future is cancelled or dropped — where `kill_on_drop` alone
+/// would only reach the direct child — and sweeping after a normal exit too
+/// catches a helper the child left running in the background with its
+/// stdio redirected (which the output drain never notices). A no-op on
+/// non-unix.
+///
+/// The sweep is safe after the leader was reaped: a pgid stays reserved
+/// while any member lives, so the signal reaches the survivors, and once no
+/// member lives `killpg` fails with `ESRCH`, which is the harmless outcome
+/// and ignored. The one caveat is pid reuse: between the last member dying
+/// and this drop, the kernel could hand the freed pid to an unrelated new
+/// process that becomes its own group leader, which the sweep would then
+/// kill. The window is the few instructions between the child's reap in
+/// `run_fm` and the guard going out of scope, so it is accepted.
 struct ProcessGroupGuard {
     pid: Option<u32>,
 }
@@ -425,16 +435,11 @@ impl ProcessGroupGuard {
     fn new(pid: Option<u32>) -> Self {
         Self { pid }
     }
-
-    /// The child exited and was reaped: nothing to kill.
-    fn disarm(&mut self) {
-        self.pid = None;
-    }
 }
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        let Some(pid) = self.pid else { return };
+        let Some(pid) = self.pid.take() else { return };
         #[cfg(unix)]
         {
             use nix::sys::signal::{killpg, Signal};
@@ -447,10 +452,11 @@ impl Drop for ProcessGroupGuard {
 }
 
 /// Spawn `bin args…` — `stdin` piped in when given, else closed — bounded by
-/// `timeout`. On expiry, on a wait error, and when this future is dropped
-/// before the child completes, the [`ProcessGroupGuard`] kills the whole
-/// process group (`kill_on_drop` additionally covers the direct child on
-/// non-unix). The stdin write runs inside the timed section, concurrently
+/// `timeout`. On every exit — normal completion, expiry, a wait error, and
+/// this future being dropped before the child completes — the
+/// [`ProcessGroupGuard`] sweeps the whole process group (`kill_on_drop`
+/// additionally covers the direct child on non-unix). The stdin write runs
+/// inside the timed section, concurrently
 /// with the output drain: a child that never reads a prompt larger than the
 /// pipe capacity (16 KiB on macOS) would otherwise block the write forever
 /// and the timeout would never fire.
@@ -472,7 +478,7 @@ async fn run_fm(bin: &Path, args: &[&str], stdin: Option<&[u8]>, timeout: Durati
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FmRun::NotFound,
         Err(e) => return FmRun::Spawn(e),
     };
-    let mut group = ProcessGroupGuard::new(child.id());
+    let _group = ProcessGroupGuard::new(child.id());
     let pipe = child.stdin.take();
     let run = async {
         let feed = async {
@@ -487,10 +493,7 @@ async fn run_fm(bin: &Path, args: &[&str], stdin: Option<&[u8]>, timeout: Durati
         output
     };
     match tokio::time::timeout(timeout, run).await {
-        Ok(Ok(output)) => {
-            group.disarm();
-            FmRun::Exited(output)
-        }
+        Ok(Ok(output)) => FmRun::Exited(output),
         Ok(Err(e)) => FmRun::Spawn(e),
         Err(_) => FmRun::TimedOut,
     }
@@ -1024,6 +1027,36 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "helper {helper} survived the cancelled respond future"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_respond_sweeps_helper_processes_left_in_the_group() {
+        // Regression: the guard used to be disarmed once the direct child
+        // was reaped, so a child that backgrounded a helper (stdio
+        // redirected, so the output drain does not wait on it) and exited 0
+        // left that helper alive. The fake prints its own pid and the
+        // helper's as the reply, then exits.
+        let (_dir, bin, _log) = fake_fm(
+            "respond-helper",
+            "cat > /dev/null\nsleep 30 > /dev/null 2>&1 &\necho \"$$ $!\"",
+        );
+        let text = backend(bin, LONG_TTL)
+            .respond(None, "p", TIMEOUT)
+            .await
+            .expect("respond returns the child's reply");
+        let mut pids = text.split_whitespace().map(|p| p.parse::<i32>().unwrap());
+        let (leader, helper) = (pids.next().unwrap(), pids.next().unwrap());
+        assert!(leader > 0 && helper > 0 && leader != helper, "{text:?}");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_exists(helper) {
+            assert!(
+                Instant::now() < deadline,
+                "helper {helper} survived the successful respond"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
