@@ -1591,12 +1591,15 @@ jobs:
   # both carry `if: github.event_name == 'pull_request'` and are legitimately
   # skipped on push and merge_group runs (PR-metadata checks, already
   # validated on the PR) — requiring strict success there would fail the
-  # gate outside pull_request events. Net per event: pull_request requires
-  # check / build / coverage-changed / deb-packaging / release-scripts /
-  # install-ps1 / pr-title / conflict-markers; merge_group requires check /
-  # build / deb-packaging / release-scripts / install-ps1 / coverage-e2e /
-  # coverage-all against the queue's merged tree; push requires build /
-  # deb-packaging / release-scripts / install-ps1.
+  # gate outside pull_request events. monorepo-consumer-checks follows the
+  # check pattern: success on pull_request and merge_group, success or
+  # skipped on push (see its comment). Net per event: pull_request requires
+  # check / build / coverage-changed / monorepo-consumer-checks /
+  # deb-packaging / release-scripts / install-ps1 / pr-title /
+  # conflict-markers; merge_group requires check / build /
+  # monorepo-consumer-checks / deb-packaging / release-scripts / install-ps1 /
+  # coverage-e2e / coverage-all against the queue's merged tree; push
+  # requires build / deb-packaging / release-scripts / install-ps1.
   gate:
     name: CI Gate
     # Seconds-long job: pinned to ubuntu-latest (see pr-title).
