@@ -4,6 +4,7 @@
 
 use super::*;
 use futures_util::FutureExt;
+use tokio::net::TcpListener;
 
 fn data(bytes: Vec<u8>) -> StreamMsg {
     let permit = Arc::new(Semaphore::new(bytes.len()))
@@ -47,6 +48,7 @@ async fn full_stream_queue_closes_only_that_stream() {
                     port: 0,
                     generation: blocked_generation.clone(),
                     msg_tx: blocked_tx,
+                    queued_bytes: Arc::new(AtomicUsize::new(1)),
                     abort: blocked.abort_handle(),
                 },
             ),
@@ -56,6 +58,7 @@ async fn full_stream_queue_closes_only_that_stream() {
                     port: 0,
                     generation: healthy_generation,
                     msg_tx: healthy_tx,
+                    queued_bytes: Arc::new(AtomicUsize::new(0)),
                     abort: healthy.abort_handle(),
                 },
             ),
@@ -171,6 +174,7 @@ async fn client_close_drops_stale_output_after_stream_id_reuse() {
             port: 0,
             generation: stale_generation.clone(),
             msg_tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
             abort: old_relay.abort_handle(),
         },
     )]);
@@ -274,6 +278,7 @@ async fn natural_terminal_frames_release_only_the_matching_generation() {
             port: 0,
             generation: current_generation.clone(),
             msg_tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
             abort: relay.abort_handle(),
         },
     )]);
@@ -334,6 +339,7 @@ async fn natural_terminal_frames_release_only_the_matching_generation() {
             port: 0,
             generation: failed_generation.clone(),
             msg_tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
             abort: failed_relay.abort_handle(),
         },
     );
@@ -565,6 +571,7 @@ async fn inbound_byte_budget_is_shared_and_released() {
                 port: u16::try_from(id).unwrap(),
                 generation: Arc::new(()),
                 msg_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
                 abort: task.abort_handle(),
             },
         );
@@ -604,4 +611,159 @@ async fn inbound_byte_budget_is_shared_and_released() {
     drop(writing);
     assert_eq!(budget.available_permits(), 1);
     streams.remove(&1).unwrap().abort.abort();
+}
+
+/// Poll `ready` between scheduler yields until it holds or `attempts` runs
+/// out. Returns whether it held, so callers can wait for progress that the
+/// fixed code makes without hanging on code that never makes it.
+async fn yield_until(attempts: usize, ready: impl Fn() -> bool) -> bool {
+    for _ in 0..attempts {
+        if ready() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    ready()
+}
+
+/// Regression for intent-hq/intent#5461. A loopback response larger than the
+/// shared daemon→client queue parks the relay on outbound admission while the
+/// WebSocket client lags (`out_rx` left undrained stands in for the connection
+/// loop blocked on a slow sink). Client→daemon frames for the SAME stream must
+/// keep draining into the loopback socket meanwhile: ordinary request traffic
+/// behind a large reply may not fill the stream's inbound queue and close it,
+/// while sibling streams and heartbeats stay unblocked.
+#[tokio::test]
+async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
+    const RESPONSE_BYTES: usize = 2 * OUTBOUND_QUEUE_FRAMES * READ_CHUNK_BYTES;
+    const REQUESTS: usize = STREAM_QUEUE_FRAMES + 1;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Like a JSON-RPC server flushing one oversized reply, the consumer writes
+    // the whole response before it reads the requests queued behind it.
+    let consumer = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        tcp.write_all(&vec![0xAB; RESPONSE_BYTES]).await.unwrap();
+        let mut requests = vec![0u8; REQUESTS];
+        tcp.read_exact(&mut requests).await.unwrap();
+        requests
+    });
+    let (server_io, client_io) = tokio::io::duplex(1024);
+    let server = WebSocketStream::from_raw_socket(
+        server_io,
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+    let mut client = WebSocketStream::from_raw_socket(
+        client_io,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    let (mut sink, _) = server.split();
+    let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_QUEUE_FRAMES);
+    let budget = Arc::new(Semaphore::new(INBOUND_BYTES_PER_CONNECTION));
+    let mut streams = HashMap::new();
+    let (sibling_tx, mut sibling_rx) = mpsc::channel(STREAM_QUEUE_FRAMES);
+    let sibling = tokio::spawn(std::future::pending::<()>());
+    streams.insert(
+        2,
+        StreamHandle {
+            port: 0,
+            generation: Arc::new(()),
+            msg_tx: sibling_tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            abort: sibling.abort_handle(),
+        },
+    );
+    assert!(
+        handle_frame(
+            Frame::Open { stream_id: 1, port },
+            &mut sink,
+            &mut streams,
+            &out_tx,
+            TunnelLimits::default(),
+            &budget,
+        )
+        .await
+    );
+    let opened = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        .await
+        .expect("OPEN_OK within the deadline")
+        .expect("relay alive");
+    assert_eq!(opened.frame, Frame::OpenOk { stream_id: 1 });
+    // Client pauses: the relay fills the shared queue and is left holding a
+    // chunk it cannot admit.
+    assert!(
+        yield_until(100_000, || out_tx.capacity() == 0).await,
+        "response must saturate the outbound queue"
+    );
+    let relay_queue = streams[&1].msg_tx.clone();
+    for request in 0..REQUESTS {
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_frame(
+                Frame::Data {
+                    stream_id: 1,
+                    payload: vec![u8::try_from(request).unwrap()],
+                },
+                &mut sink,
+                &mut streams,
+                &out_tx,
+                TunnelLimits::default(),
+                &budget,
+            ),
+        )
+        .await
+        .expect("queue admission must not wait for the consumer"));
+        assert!(
+            streams.contains_key(&1),
+            "request {request} closed the stream behind the lagging response"
+        );
+        // A relay that keeps draining empties its queue between requests.
+        yield_until(64, || relay_queue.capacity() == relay_queue.max_capacity()).await;
+    }
+    assert!(client.next().now_or_never().is_none(), "no stream CLOSE");
+    // Siblings and heartbeats are unaffected by the parked relay.
+    assert!(forward_to_stream(&mut sink, &mut streams, 2, data(vec![9])).await);
+    assert!(
+        matches!(sibling_rx.recv().await, Some(StreamMsg::Data(bytes, _permit)) if bytes == vec![9])
+    );
+    assert!(sink.send(Message::Ping(Bytes::new())).await.is_ok());
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("ping reaches the client promptly"),
+        Some(Ok(Message::Ping(_)))
+    ));
+    // Client resumes: the whole response arrives, and the consumer then reads
+    // every request the relay wrote through while the client lagged.
+    let mut received = 0;
+    while received < RESPONSE_BYTES {
+        let outbound = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("response keeps flowing once the client resumes")
+            .expect("relay alive");
+        match outbound.frame {
+            Frame::Data {
+                stream_id: 1,
+                payload,
+            } => received += payload.len(),
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+    assert_eq!(received, RESPONSE_BYTES);
+    let requests = tokio::time::timeout(Duration::from_secs(5), consumer)
+        .await
+        .expect("consumer reads the queued requests")
+        .unwrap();
+    assert_eq!(
+        requests,
+        (0..REQUESTS)
+            .map(|i| u8::try_from(i).unwrap())
+            .collect::<Vec<_>>()
+    );
+    streams.remove(&1).unwrap().abort.abort();
+    sibling.abort();
 }

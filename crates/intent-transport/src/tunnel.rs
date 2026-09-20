@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -109,7 +109,7 @@ pub struct TunnelLimits {
     /// Daemon-side TCP connect deadline before `OPEN_ERR`.
     pub connect_timeout: Duration,
     /// Idle-stream (no data either way) teardown deadline; also bounds a
-    /// single blocked TCP write.
+    /// single blocked TCP write and a wait for daemon→client queue space.
     pub idle_timeout: Duration,
 }
 
@@ -270,6 +270,9 @@ struct StreamHandle {
     port: u16,
     generation: Arc<()>,
     msg_tx: mpsc::Sender<StreamMsg>,
+    /// Payload bytes admitted to `msg_tx` and not yet received by the relay;
+    /// named in the full-queue close warning.
+    queued_bytes: Arc<AtomicUsize>,
     abort: tokio::task::AbortHandle,
 }
 
@@ -426,11 +429,13 @@ where
             // old incarnation, so generations cannot wrap or alias.
             let generation = Arc::new(());
             let (msg_tx, msg_rx) = mpsc::channel::<StreamMsg>(STREAM_QUEUE_FRAMES);
+            let queued_bytes = Arc::new(AtomicUsize::new(0));
             let task = tokio::spawn(run_stream(
                 stream_id,
                 generation.clone(),
                 port,
                 msg_rx,
+                queued_bytes.clone(),
                 out_tx.clone(),
                 limits,
             ));
@@ -440,6 +445,7 @@ where
                     port,
                     generation,
                     msg_tx,
+                    queued_bytes,
                     abort: task.abort_handle(),
                 },
             );
@@ -539,7 +545,11 @@ where
 /// Admit a message without parking the shared WebSocket reader. The wire
 /// protocol has no per-stream credit window: once the bounded queue is full,
 /// close that stream rather than blocking unrelated requests and heartbeats.
-/// Unknown/finished streams are ordinary teardown races and are ignored.
+/// The relay keeps draining this queue while its own output waits on a
+/// lagging client, so a full queue means the loopback consumer has stopped
+/// reading (or the client is flooding one stream), not that a large reply is
+/// in flight. Unknown/finished streams are ordinary teardown races and are
+/// ignored.
 async fn forward_to_stream<S>(
     sink: &mut SplitSink<WebSocketStream<S>, Message>,
     streams: &mut HashMap<u32, StreamHandle>,
@@ -552,13 +562,31 @@ where
     let Some(handle) = streams.get(&stream_id) else {
         return true;
     };
+    let bytes = match &msg {
+        StreamMsg::Data(payload, _) => payload.len(),
+        StreamMsg::Eof => 0,
+    };
+    // Counted before admission so the relay's decrement can never underflow.
+    handle.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
     match handle.msg_tx.try_send(msg) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => true,
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            handle.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            true
+        }
         Err(mpsc::error::TrySendError::Full(_)) => {
+            let pending_bytes = handle.queued_bytes.fetch_sub(bytes, Ordering::Relaxed) - bytes;
+            let pending_frames = handle.msg_tx.max_capacity() - handle.msg_tx.capacity();
             if let Some(handle) = streams.remove(&stream_id) {
                 handle.abort.abort();
             }
-            tracing::warn!(stream_id, "closing tunnel stream with a full inbound queue");
+            tracing::warn!(
+                stream_id,
+                pending_frames,
+                pending_bytes,
+                rejected_bytes = bytes,
+                "closing tunnel stream with a full inbound queue"
+            );
             sink.send(Message::Binary(Frame::Close { stream_id }.encode().into()))
                 .await
                 .is_ok()
@@ -573,11 +601,18 @@ where
 /// connection loop releases the id only after sending that terminal frame.
 /// Client `CLOSE` does not arrive here — the connection loop aborts this task
 /// directly and emits the final `CLOSE` itself.
+///
+/// Output waits for a slot in the shared daemon→client queue as a `select!`
+/// branch, never by parking the whole task: a reply larger than that queue
+/// (a 1 MiB JSON-RPC frame is 64 chunks) sent to a lagging client must not
+/// stop `msg_rx` draining, or the client's ordinary requests behind it fill
+/// this stream's inbound queue and close it (intent-hq/intent#5461).
 async fn run_stream(
     stream_id: u32,
     generation: Arc<()>,
     port: u16,
     mut msg_rx: mpsc::Receiver<StreamMsg>,
+    queued_bytes: Arc<AtomicUsize>,
     out_tx: mpsc::Sender<OutboundFrame>,
     limits: TunnelLimits,
 ) {
@@ -632,46 +667,43 @@ async fn run_stream(
     let mut buf = vec![0u8; READ_CHUNK_BYTES];
     let mut read_done = false;
     let mut write_done = false;
+    // The next daemon→client frame, held until the shared queue has a slot.
+    // No TCP read happens while one is pending, so the loopback producer sees
+    // the same backpressure as before; only `msg_rx` keeps flowing.
+    let mut pending: Option<Frame> = None;
     let idle = tokio::time::sleep(limits.idle_timeout);
     tokio::pin!(idle);
     loop {
         tokio::select! {
-            n = rd.read(&mut buf), if !read_done => match n {
+            permit = out_tx.reserve(), if pending.is_some() => {
+                let Ok(permit) = permit else { break };
+                let frame = pending.take().expect("guarded by pending.is_some()");
+                permit.send(OutboundFrame {
+                    generation: generation.clone(),
+                    frame,
+                });
+                if read_done && write_done {
+                    break;
+                }
+            }
+            n = rd.read(&mut buf), if !read_done && pending.is_none() => match n {
                 // Read errors (e.g. RST) surface as EOF toward the client;
                 // the write side keeps draining until the client is done too.
                 Ok(0) | Err(_) => {
                     read_done = true;
-                    if out_tx
-                        .send(OutboundFrame {
-                            generation: generation.clone(),
-                            frame: Frame::Eof { stream_id },
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    if write_done {
-                        break;
-                    }
+                    pending = Some(Frame::Eof { stream_id });
                 }
                 Ok(n) => {
                     idle.as_mut().reset(Instant::now() + limits.idle_timeout);
-                    let payload = buf[..n].to_vec();
-                    if out_tx
-                        .send(OutboundFrame {
-                            generation: generation.clone(),
-                            frame: Frame::Data { stream_id, payload },
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                    pending = Some(Frame::Data {
+                        stream_id,
+                        payload: buf[..n].to_vec(),
+                    });
                 }
             },
             msg = msg_rx.recv() => match msg {
                 Some(StreamMsg::Data(bytes, _permit)) => {
+                    queued_bytes.fetch_sub(bytes.len(), Ordering::Relaxed);
                     // Data after the client's own EOF is a client error; drop it.
                     if write_done {
                         continue;
@@ -689,7 +721,9 @@ async fn run_stream(
                 Some(StreamMsg::Eof) => {
                     write_done = true;
                     let _ = wr.shutdown().await;
-                    if read_done {
+                    // With our own EOF still pending, the reserve arm breaks
+                    // once it has been admitted.
+                    if read_done && pending.is_none() {
                         break;
                     }
                 }
