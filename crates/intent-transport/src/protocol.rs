@@ -587,7 +587,9 @@
 //! collaborator; `added: false` when already a member (idempotent, nothing
 //! published); `-32602` for an unknown principal, the primary principal, a
 //! principal without an active credential (`invalid-params`) or a spent
-//! guest cap (`guest-limit`). An add publishes the same `workspace:updated
+//! guest cap (`guest-limit`; collaborators plus open invites, checked and
+//! seated in one store transaction so concurrent adds cannot overshoot the
+//! last seat). An add publishes the same `workspace:updated
 //! { changes: { members: true, addedPrincipalId, memberCount } }` an invite
 //! join does, so the guest's open `workspace` channel — whose forwarder
 //! re-reads under the guest's own caller — upserts the now-visible row as

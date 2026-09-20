@@ -2581,6 +2581,87 @@ async fn concurrent_joins_cannot_overshoot_the_guest_cap() {
     assert_eq!(guest_summary(&f).await, (6, 3));
 }
 
+/// Concurrent `workspace.members.add` calls for the last seat: exactly one
+/// commits, the rest are `GuestLimit` with no row written, and mixing in
+/// joins on an open invite (which reserves the seat against every add and
+/// admits exactly one joiner) still never overshoots the cap.
+#[tokio::test]
+async fn concurrent_member_adds_cannot_overshoot_the_guest_cap() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 3).await;
+    let mut guests = Vec::new();
+    for n in 0..8 {
+        let guest = principal(&format!("guest-{n}"), Some(4000 + n));
+        f.store.upsert_principal(&guest).await.expect("guest");
+        f.store
+            .insert_principal_credential(&guest.id, &hash_secret(&format!("guest-token-{n}")))
+            .await
+            .expect("guest credential");
+        guests.push(guest.id);
+    }
+
+    let mut handles = Vec::new();
+    for guest in guests.iter().take(4) {
+        let services = f.services.clone();
+        let (ws, owner, guest) = (f.ws.clone(), f.owner.clone(), guest.clone());
+        handles.push(tokio::spawn(async move {
+            with_caller(wire(&owner), async move {
+                services.workspace_members_add_op(&ws, &guest).await
+            })
+            .await
+        }));
+    }
+    let mut added = 0;
+    let mut full = 0;
+    for h in handles {
+        match h.await.expect("task") {
+            Ok(v) => {
+                assert_eq!(v["added"], json!(true));
+                added += 1;
+            }
+            r => {
+                assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+                full += 1;
+            }
+        }
+    }
+    assert_eq!((added, full), (1, 3));
+    assert_eq!(guest_summary(&f).await, (3, 3));
+
+    // Adds racing joins for one seat: the open invite (minted under a
+    // higher cap) reserves it against every add; one join wins it.
+    set_cap(&registry, 5);
+    let invite = id_of(&f.create_invite(None).await);
+    set_cap(&registry, 4);
+    let mut handles = Vec::new();
+    for n in 0..3u64 {
+        let services = f.services.clone();
+        let invite = invite.clone();
+        handles.push(tokio::spawn(async move {
+            let r = services
+                .complete_invite_join(&invite, &identity(&format!("joiner-{n}"), 9100 + n))
+                .await;
+            r.is_ok() || invite_kind(&r) == InviteErrorKind::WorkspaceFull
+        }));
+    }
+    for guest in guests.iter().skip(4) {
+        let services = f.services.clone();
+        let (ws, owner, guest) = (f.ws.clone(), f.owner.clone(), guest.clone());
+        handles.push(tokio::spawn(async move {
+            let r = with_caller(wire(&owner), async move {
+                services.workspace_members_add_op(&ws, &guest).await
+            })
+            .await;
+            invite_kind(&r) == InviteErrorKind::GuestLimit
+        }));
+    }
+    for h in handles {
+        assert!(h.await.expect("task"));
+    }
+    // Four collaborators plus the still-open reusable invite.
+    assert_eq!(guest_summary(&f).await, (5, 4));
+}
+
 // --- leave / revokeSelf ----------------------------------------------------
 
 /// `members.leave`: a collaborator leaves (membership gone), the owner

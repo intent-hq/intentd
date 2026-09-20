@@ -9374,6 +9374,197 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
     );
 }
 
+/// `add_workspace_collaborator_within_cap` spends the committed seats
+/// (collaborators plus open invites) inside its own `BEGIN IMMEDIATE`
+/// transaction: a full workspace is refused with nothing written, a seated
+/// principal is `AlreadyMember` past the cap, an open invite reserves a
+/// seat against a direct add, and a race of concurrent adds for the last
+/// seat — interleaved with joins for it — never overshoots the cap.
+#[tokio::test]
+async fn add_workspace_collaborator_within_cap_is_atomic() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Capped", false))
+        .await
+        .expect("insert ws");
+    let primary = store.get_primary_principal().await.expect("primary").id;
+    let guests: Vec<Principal> = (1..=12).map(guest_identity).collect();
+    for g in &guests {
+        store.upsert_principal(g).await.expect("guest");
+    }
+
+    // Cap 0: refused, no row.
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[0].id, 0)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::WorkspaceFull
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &guests[0].id)
+            .await
+            .expect("role"),
+        None
+    );
+    // Cap 1: seated; a second add of the same principal is idempotent even
+    // past the cap; a different guest is refused.
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[0].id, 1)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::Added
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &guests[0].id)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[0].id, 1)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::AlreadyMember
+    );
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[1].id, 1)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::WorkspaceFull
+    );
+    // The owner is a member too: `AlreadyMember`, never a second row.
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &primary, 5)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::AlreadyMember
+    );
+    // An open invite reserves a seat against a direct add (cap 2 with one
+    // collaborator and one open invite is full); revoking it frees the seat.
+    store
+        .insert_workspace_invite(&guest_invite("reserved", &ws, &primary))
+        .await
+        .expect("insert invite");
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[1].id, 2)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::WorkspaceFull
+    );
+    store
+        .revoke_workspace_invite("reserved")
+        .await
+        .expect("revoke");
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[1].id, 2)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::Added
+    );
+
+    // Race for the last seat: cap 3 with two seated collaborators, eight
+    // concurrent direct adds of distinct guests — exactly one more commits.
+    let mut handles = Vec::new();
+    for g in &guests[2..10] {
+        let store = store.clone();
+        let ws = ws.clone();
+        let id = g.id.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .add_workspace_collaborator_within_cap(&ws, &id, 3)
+                .await
+                .expect("add")
+        }));
+    }
+    let mut added = 0;
+    let mut full = 0;
+    for h in handles {
+        match h.await.expect("task") {
+            crate::CollaboratorAddOutcome::Added => added += 1,
+            crate::CollaboratorAddOutcome::WorkspaceFull => full += 1,
+            crate::CollaboratorAddOutcome::AlreadyMember => {
+                panic!("a first add was reported as already seated")
+            }
+        }
+    }
+    assert_eq!((added, full), (1, 7));
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.expect("count"),
+        crate::WorkspaceGuestCount {
+            collaborators: 3,
+            open_invites: 0,
+        }
+    );
+
+    // Adds racing joins for one seat (cap 4 with three seated): the open
+    // invite reserves the seat against every add, and the joins' own
+    // transaction admits exactly one of them.
+    store
+        .insert_workspace_invite(&guest_invite("race", &ws, &primary))
+        .await
+        .expect("insert invite");
+    let mut handles = Vec::new();
+    for n in 0..3i64 {
+        let store = store.clone();
+        let ws = ws.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .join_workspace_by_invite(
+                    "race",
+                    &ws,
+                    &guest_identity(500 + n),
+                    &format!("cred-race-{n}"),
+                    None,
+                    4,
+                )
+                .await
+                .expect("join")
+                == crate::InviteJoinOutcome::WorkspaceFull
+        }));
+    }
+    for g in &guests[10..] {
+        let store = store.clone();
+        let ws = ws.clone();
+        let id = g.id.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .add_workspace_collaborator_within_cap(&ws, &id, 4)
+                .await
+                .expect("add")
+                == crate::CollaboratorAddOutcome::WorkspaceFull
+        }));
+    }
+    let mut full = 0;
+    for h in handles {
+        if h.await.expect("task") {
+            full += 1;
+        }
+    }
+    assert_eq!(
+        full, 4,
+        "one of the three joins won the seat; every add saw it reserved"
+    );
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.expect("count"),
+        crate::WorkspaceGuestCount {
+            collaborators: 4,
+            open_invites: 1,
+        },
+        "the reusable invite stays open after its winner joined"
+    );
+}
+
 /// The owner's own GitHub account resolves to the primary principal: the
 /// join is refused `OwnerSelfJoin` inside the transaction, so the primary
 /// row gains no per-principal credential, no collaborator membership, and
