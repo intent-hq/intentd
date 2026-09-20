@@ -10,8 +10,10 @@
 //! the access token is persisted straight into the file-backed secret store
 //! under `sourceControl.gitlab.token` — the slot [`crate::gitlab_token`]
 //! reads first. GitLab added the grant in 17.1 (17.2 for self-managed
-//! behind a feature flag); an older instance answers 404, which maps to
-//! [`Error::DeviceGrantUnsupported`] so the caller can offer the PAT path.
+//! behind a feature flag); an older instance answers 404, and an instance
+//! whose application is not enabled for the grant answers
+//! `unauthorized_client` — both map to [`Error::DeviceGrantUnsupported`] so
+//! the caller can offer the PAT path.
 //!
 //! PAT: [`validate_pat`] proves a pasted token against `GET /api/v4/user`.
 //!
@@ -37,11 +39,13 @@ pub const GITLAB_COM_HOST: &str = "gitlab.com";
 /// Default OAuth application client id for the device grant on gitlab.com
 /// (public by design — device-grant apps have no secret). Used **only** when
 /// the canonical host is [`GITLAB_COM_HOST`]; self-managed instances must
-/// configure `sourceControl.gitlab.oauthClientId`. Empty means "no client
-/// id": the device grant is reported unsupported and the PAT path is the
-/// only connection method.
-// TODO(slice-a): fill from PR Context note once the intent-hq application is registered on gitlab.com.
-pub const GITLAB_COM_OAUTH_CLIENT_ID: &str = "";
+/// configure `sourceControl.gitlab.oauthClientId`. This is the Application
+/// ID of the intent-hq public (non-confidential) OAuth application on
+/// gitlab.com — an identifier, not a secret. Empty would mean "no client id":
+/// the device grant is reported unsupported and the PAT path is the only
+/// connection method.
+pub const GITLAB_COM_OAUTH_CLIENT_ID: &str =
+    "e65857695d3980e00e7e7b0fa99816b55381b932627c68fc8fd320179f88df89";
 
 /// Scopes requested by the device grant. `api` (rather than the narrower
 /// `read_api` + `write_repository`) because snippet create/delete — planned
@@ -267,8 +271,9 @@ fn default_interval() -> u64 {
 ///
 /// Returns [`Error::Config`] if `client_id` is empty;
 /// [`Error::DeviceGrantUnsupported`] when the instance answers 404 on
-/// `/oauth/authorize_device` (GitLab < 17.1); propagates other HTTP/decoding
-/// failures.
+/// `/oauth/authorize_device` (GitLab < 17.1) or rejects the request with the
+/// OAuth `unauthorized_client` error (application not enabled for the device
+/// grant); propagates other HTTP/decoding failures.
 pub async fn start_device_grant(
     host: &GitlabHost,
     client_id: &str,
@@ -314,6 +319,9 @@ pub async fn start_device_grant_with_store(
         ))
     })?;
     if !status.is_success() {
+        if body.get("error").and_then(Value::as_str) == Some("unauthorized_client") {
+            return Err(Error::DeviceGrantUnsupported(host.host().to_string()));
+        }
         return Err(Error::Api(format!(
             "gitlab device authorization failed ({status}): {}",
             oauth_error_summary(&body)
@@ -738,12 +746,14 @@ mod tests {
             Some("configured-id")
         );
         assert_eq!(resolve_client_id("", &acme), None);
-        // The compiled gitlab.com id is still empty (TODO(slice-a)), so even
-        // gitlab.com has no default until it is filled in.
+        assert!(!GITLAB_COM_OAUTH_CLIENT_ID.is_empty());
         assert_eq!(
-            resolve_client_id("", &com),
-            (!GITLAB_COM_OAUTH_CLIENT_ID.is_empty())
-                .then(|| GITLAB_COM_OAUTH_CLIENT_ID.to_string())
+            resolve_client_id("", &com).as_deref(),
+            Some(GITLAB_COM_OAUTH_CLIENT_ID)
+        );
+        assert_eq!(
+            resolve_client_id("  ", &com).as_deref(),
+            Some(GITLAB_COM_OAUTH_CLIENT_ID)
         );
     }
 
@@ -1106,6 +1116,26 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("personal access token"));
+    }
+
+    #[tokio::test]
+    async fn device_grant_unauthorized_client_maps_to_unsupported_on_this_instance() {
+        let mock = spawn_mock(Arc::new(|_m, _p, _b| {
+            (
+                400,
+                json!({ "error": "unauthorized_client",
+                        "error_description": "The client is not authorized to request a token using this method." }),
+            )
+        }))
+        .await;
+        let (_dir, store) = temp_store();
+        let err = start_device_grant_with_store(&mock.host, "client-1", store)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::DeviceGrantUnsupported(host) if host == mock.host.host()),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
