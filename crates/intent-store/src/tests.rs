@@ -8702,6 +8702,96 @@ async fn principal_credential_insert_lookup_touch_revoke() {
     );
 }
 
+/// `list_credentialed_guest_principals` (`principal.list`): a non-primary
+/// principal is listed while at least one of its credentials is active and
+/// exactly once regardless of how many it holds; the primary principal is
+/// never listed even when credentialed; a principal with no credential, or
+/// only revoked ones, is omitted — and reappears once a fresh credential is
+/// minted. Rows come back oldest first.
+#[tokio::test]
+async fn list_credentialed_guest_principals_filters_primary_and_revoked() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    store
+        .insert_principal_credential(&primary.id, &"0".repeat(64))
+        .await
+        .expect("primary credential");
+    assert!(
+        store
+            .list_credentialed_guest_principals()
+            .await
+            .expect("list")
+            .is_empty(),
+        "the primary principal is never a guest"
+    );
+
+    let guest = |login: &str, github_user_id: i64, created_at: &str| Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(github_user_id),
+        login: Some(login.to_string()),
+        display_name: Some(format!("{login} name")),
+        avatar_url: Some(format!("https://example.test/{login}.png")),
+        is_primary: false,
+        created_at: created_at.to_string(),
+        updated_at: created_at.to_string(),
+    };
+    let older = guest("older", 1, "2026-01-01T00:00:00Z");
+    let newer = guest("newer", 2, "2026-01-02T00:00:00Z");
+    let uncredentialed = guest("never", 3, "2026-01-03T00:00:00Z");
+    let revoked = guest("revoked", 4, "2026-01-04T00:00:00Z");
+    for p in [&older, &newer, &uncredentialed, &revoked] {
+        store.upsert_principal(p).await.expect("upsert");
+    }
+    // `older` holds two active credentials: still one row.
+    for hash in [&"1".repeat(64), &"2".repeat(64)] {
+        store
+            .insert_principal_credential(&older.id, hash)
+            .await
+            .expect("older credential");
+    }
+    store
+        .insert_principal_credential(&newer.id, &"3".repeat(64))
+        .await
+        .expect("newer credential");
+    store
+        .insert_principal_credential(&revoked.id, &"4".repeat(64))
+        .await
+        .expect("revoked credential");
+    assert_eq!(
+        store
+            .revoke_all_principal_credentials(&revoked.id)
+            .await
+            .expect("revoke"),
+        1
+    );
+
+    let listed = store
+        .list_credentialed_guest_principals()
+        .await
+        .expect("list");
+    assert_eq!(
+        listed.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+        vec![older.id.clone(), newer.id.clone()],
+        "{listed:?}"
+    );
+    assert_eq!(listed[0], older, "the full principal row is returned");
+
+    // A fresh credential brings a revoked guest back.
+    store
+        .insert_principal_credential(&revoked.id, &"5".repeat(64))
+        .await
+        .expect("re-mint");
+    let listed = store
+        .list_credentialed_guest_principals()
+        .await
+        .expect("list");
+    assert_eq!(
+        listed.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+        vec![older.id, newer.id, revoked.id]
+    );
+}
+
 /// `resolve_active_principal_credential` is the single-statement
 /// resolve+touch behind the WSS bearer seam: an active hash resolves to its
 /// principal and records the use; an unknown or revoked hash resolves to

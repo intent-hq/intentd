@@ -602,6 +602,30 @@ impl Services {
         Ok(principal_to_wire(&principal, is_administrator))
     }
 
+    /// `principal.list`: see [`intent_core::WorkspaceApi::principal_list`].
+    /// Owner-only via the administrator gate: the method is not scoped to a
+    /// workspace and the primary user owns every workspace (no transfer
+    /// RPC), so a per-principal wire caller is refused outright.
+    pub(crate) async fn principal_list_op(&self) -> Result<Value> {
+        Self::require_administrator("principal.list")?;
+        let principals: Vec<Value> = self
+            .store
+            .list_credentialed_guest_principals()
+            .await?
+            .iter()
+            .map(|p| {
+                json!({
+                    "principalId": p.id,
+                    "login": p.login,
+                    "displayName": p.display_name,
+                    "avatarUrl": p.avatar_url,
+                    "githubUserId": p.github_user_id,
+                })
+            })
+            .collect();
+        Ok(json!({ "principals": principals }))
+    }
+
     /// Spawn a rate-limited, bounded background refresh of the primary
     /// principal's GitHub identity from `GET /user`. Detached: the read that
     /// triggered it never waits, and any failure (not configured, offline,
@@ -844,6 +868,77 @@ mod tests {
             created_at: now_iso(),
             updated_at: now_iso(),
         }
+    }
+
+    /// `principal.list`: the daemon (and the administrator) get every
+    /// non-primary principal with an active credential — full profile
+    /// fields, `githubUserId` included, oldest first — while the primary
+    /// principal and a guest whose credentials were all revoked are omitted.
+    /// A per-principal wire caller is `Forbidden`, whatever its workspace
+    /// roles; an agent passes like the daemon.
+    #[intent_test_macros::daemon_test]
+    async fn principal_list_is_owner_only_and_lists_credentialed_guests() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let primary = store.get_primary_principal().await.expect("primary");
+        store
+            .insert_principal_credential(&primary.id, &"0".repeat(64))
+            .await
+            .expect("primary credential");
+        let mut active = principal("active");
+        active.github_user_id = Some(42);
+        let mut revoked = principal("revoked");
+        revoked.created_at = "2026-01-01T00:00:00Z".to_string();
+        let uncredentialed = principal("never");
+        for p in [&active, &revoked, &uncredentialed] {
+            store.upsert_principal(p).await.expect("upsert");
+        }
+        store
+            .insert_principal_credential(&active.id, &"1".repeat(64))
+            .await
+            .expect("active credential");
+        store
+            .insert_principal_credential(&revoked.id, &"2".repeat(64))
+            .await
+            .expect("revoked credential");
+        store
+            .revoke_all_principal_credentials(&revoked.id)
+            .await
+            .expect("revoke");
+        let services = Services::new(store);
+
+        let listed = services.principal_list_op().await.expect("daemon lists");
+        assert_eq!(
+            listed,
+            json!({ "principals": [{
+                "principalId": active.id.0,
+                "login": "active",
+                "displayName": "active name",
+                "avatarUrl": "https://example.test/active.png",
+                "githubUserId": 42,
+            }] })
+        );
+
+        let administrator = Caller::Wire {
+            principal_id: primary.id.clone(),
+            is_administrator: true,
+        };
+        let as_admin = with_caller(administrator, services.principal_list_op()).await;
+        assert_eq!(as_admin.expect("administrator lists"), listed);
+        let agent = Caller::Agent {
+            agent_id: AgentId::new(),
+        };
+        let as_agent = with_caller(agent, services.principal_list_op()).await;
+        assert_eq!(as_agent.expect("agent lists"), listed);
+
+        let refused = with_caller(wire(&active.id), services.principal_list_op())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, Error::Forbidden(ref m) if m.contains("principal.list")),
+            "{refused:?}"
+        );
+        assert_eq!(refused.code(), -32003);
     }
 
     /// A wire caller's principal overwrites a client-supplied stamp, is
