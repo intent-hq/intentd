@@ -187,10 +187,11 @@ fs.writeFileSync({pidfile:?}, String(process.pid));
 {ADAPTER_PRELUDE}
 const onPrompt = () => {{
   // Stop consuming stdin (keep it open) and flood client-served requests
-  // whose responses nobody will ever read; never resolve the prompt. stdout
-  // is a pipe, so Node writes these synchronously: the whole flood is on the
-  // wire before the prompt budget can elapse, and the runner's 256-line
-  // writer channel + the stdin pipe wedge well inside it.
+  // whose responses nobody will ever read; never resolve the prompt. Node
+  // queues whatever the stdout pipe cannot take immediately and keeps
+  // writing as the runner's reader drains it, so the flood reaches the
+  // runner early in the prompt budget, and the runner's 256-line writer
+  // channel + the unread stdin pipe wedge well inside it.
   rl.pause();
   process.stdin.pause();
   for (let i = 0; i < 6000; i++) {{
