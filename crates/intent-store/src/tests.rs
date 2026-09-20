@@ -7119,21 +7119,36 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    // Short enough to keep the test fast, long enough that opening the pool's
-    // one fresh connection under parallel test load never trips it itself.
+    // Short enough to keep the test fast; see the open loop below for why it
+    // is not relied on for opening the pool itself.
     const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
     // Upper bound on how long the holder keeps the connection if the append
     // never reports a timeout; the test then fails on the observer assertion
-    // instead of hanging.
+    // instead of hanging. Also bounds the pool-open retries below.
     const WATCHDOG: Duration = Duration::from_secs(15);
     let tmp = TempDb::new();
     // Migrate with the ordinary store, then reopen with a short acquire
-    // timeout on the write pool.
+    // timeout on the write pool. sqlx opens the pool's first connection
+    // eagerly under that same short timeout, and a fresh SQLite connection
+    // plus its pragmas can exceed 1s on a loaded host, so retry the open
+    // until the watchdog deadline; once it succeeds the connection stays idle
+    // in the pool and the hold below reuses it without a fresh open.
     drop(Store::open(&tmp.path).await.expect("open store"));
+    let open_deadline = tokio::time::Instant::now() + WATCHDOG;
+    let write_pool = loop {
+        match crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT).await {
+            Ok(pool) => break pool,
+            Err(Error::Internal(msg))
+                if msg.contains("acquire timeout exceeded")
+                    && tokio::time::Instant::now() < open_deadline =>
+            {
+                eprintln!("retrying short-timeout write pool open: {msg}");
+            }
+            Err(e) => panic!("open short-timeout write pool: {e}"),
+        }
+    };
     let store = Store {
-        write_pool: crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT)
-            .await
-            .expect("open short-timeout write pool"),
+        write_pool,
         read_pool: crate::connect_read(&tmp.path)
             .await
             .expect("open read pool"),
