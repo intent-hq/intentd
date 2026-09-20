@@ -1,0 +1,71 @@
+# Stale PR housekeeping: idle non-draft pull requests are labelled `stale`
+# after 14 days without activity and closed 7 days later if nobody responds.
+# Issues are disabled on this repository (they live in intent-hq/intent), so
+# the issue side is switched off entirely (`days-before-issue-*: -1`).
+#
+# Policy (intent-hq/intent workspace "Auto-close stale issues and PRs"):
+#   - in scope:   non-draft PRs (drafts are exempt)
+#   - exempt:     PRs labelled `dependencies`, `github_actions` (dependabot)
+#                 or `release` (release-plz Release PRs — see release-plz.toml
+#                 `pr_labels`)
+#   - mark stale: 14 idle days   -> `stale` label + comment
+#   - close:      +7 idle days   -> closed, branch is NOT deleted
+#   - any comment, push, or label change removes `stale` and resets the clock.
+#
+# Dry-run gate: every scheduled run is `debug-only` — it logs the decisions it
+# WOULD take and touches nothing. Only a manual `workflow_dispatch` with
+# `dry_run=false` acts for real. Enablement (after the dry-run review) changes
+# only the `schedule` side of the `debug-only` expression below.
+name: Stale PRs
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Log decisions only; do not label, comment on, or close anything"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # SHA-pinned (not tag-pinned): the action holds a write token, and a tag
+      # can be moved to malicious code — a full commit SHA cannot.
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          debug-only: ${{ github.event_name == 'schedule' || inputs.dry_run }}
+          operations-per-run: 200
+
+          # Issues are disabled on this repo.
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+
+          # Pull requests.
+          days-before-pr-stale: 14
+          days-before-pr-close: 7
+          stale-pr-label: stale
+          exempt-draft-pr: true
+          exempt-pr-labels: dependencies,github_actions,release
+          remove-stale-when-updated: true
+          delete-branch: false
+          stale-pr-message: >-
+            This pull request has had no activity for 14 days and has been
+            marked `stale`. It will be closed in 7 days unless there is
+            further activity. To keep it open: leave a comment, push a
+            commit, or apply an exempting label (`dependencies`,
+            `github_actions`, `release`). Converting it to a draft also
+            exempts it. The `stale` label is removed automatically on
+            activity.
+          close-pr-message: >-
+            Closing this pull request because it has been `stale` for 7 days
+            with no further activity. The branch has not been deleted — to
+            resume, reopen the PR (or open a new one from the same branch).
