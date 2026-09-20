@@ -150,7 +150,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
 /// counted with the other subscription channels, not here.
 ///
-/// Provider-generic auth (protocol 10.4, §5.27): +5 router methods
+/// Provider-generic auth (protocol 10.5, §5.27): +5 router methods
 /// (`sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
 /// `getUser`); the `github.*` auth quintet stays as byte-identical aliases.
 const EXPECTED_TOTAL_METHODS: usize = 383;

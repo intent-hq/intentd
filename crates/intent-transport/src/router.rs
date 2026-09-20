@@ -3033,7 +3033,7 @@ async fn dispatch(
             Ok(r)
         }
         // Provider-generic auth (§5.27 "Provider-generic auth —
-        // `sourceControl.*`", v10.4): `provider` is required on every method
+        // `sourceControl.*`", v10.5): `provider` is required on every method
         // (`github` | `gitlab`), `host` is optional and gitlab-only; both are
         // validated by the service so the `-32602` messages stay in one place.
         "sourceControl.authStatus" => {

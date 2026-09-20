@@ -506,25 +506,28 @@
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release
 //! installs are asynchronous and never fall back to channel updates.
 //!
-//! Version 10.4 is an additive minor bump over 10.3. The `/tunnel` endpoint
-//! gains the client→daemon `CREDIT` frame (opcode `0x07`) and a per-stream
-//! daemon→client credit window (§1.4); a client sends `CREDIT` only to a
-//! daemon whose `client.hello` `protocolVersion` is ≥ 10.4, and a pre-10.4
-//! daemon closes the connection with `1002` on the unknown opcode. It also
-//! adds the provider-generic auth surface (§5.27): `sourceControl.authStatus`
-//! / `connect` / `cancelAuth` / `revoke` / `getUser` with
-//! `provider: "github" | "gitlab"` and an optional gitlab `host`, the
-//! `device-grant-unsupported` / `source-control-unauthorized` typed errors,
-//! the `sourceControl:auth-changed { provider, host, status }` event and the
-//! `sourceControl.gitlab.*` settings. The `github.*` auth quintet is served
-//! as byte-identical aliases. The catalog contains 328 router methods, 53
-//! fast-path methods, and two aliases: 383 client-callable names.
+//! Version 10.4 is an additive minor bump over 10.3 (method catalog
+//! unchanged): the `/tunnel` endpoint gains the client→daemon `CREDIT` frame
+//! (opcode `0x07`) and a per-stream daemon→client credit window (§1.4). A
+//! client sends `CREDIT` only to a daemon whose `client.hello`
+//! `protocolVersion` is ≥ 10.4; a pre-10.4 daemon closes the connection with
+//! `1002` on the unknown opcode.
+//!
+//! Version 10.5 adds the provider-generic auth surface (§5.27):
+//! `sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
+//! `getUser` with `provider: "github" | "gitlab"` and an optional gitlab
+//! `host`, the `device-grant-unsupported` / `source-control-unauthorized`
+//! typed errors, the `sourceControl:auth-changed { provider, host, status }`
+//! event and the `sourceControl.gitlab.*` settings. The `github.*` auth
+//! quintet is served as byte-identical aliases. The catalog contains 328
+//! router methods, 53 fast-path methods, and two aliases: 383
+//! client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.4";
+pub const PROTOCOL_VERSION: &str = "10.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

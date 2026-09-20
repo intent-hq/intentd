@@ -462,7 +462,7 @@ pub const SETTINGS_CHANGED: &str = "settings:changed";
 // device code — so subscribers refresh via `github.authStatus`.
 pub const GITHUB_AUTH_CHANGED: &str = "github:auth-changed";
 
-// Provider-generic forge auth events (new in intentd v10.4; PROTOCOL §5.27
+// Provider-generic forge auth events (new in intentd v10.5; PROTOCOL §5.27
 // "Provider-generic auth — `sourceControl.*`"). Emitted on every terminal
 // transition of any provider's auth surface: device-grant outcomes, a
 // successful PAT connect (`authorized`), and `sourceControl.revoke`

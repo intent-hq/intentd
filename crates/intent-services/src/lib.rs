@@ -968,7 +968,7 @@ pub struct Services {
     /// reaches github.com.
     github_login_base_uri: Option<String>,
     /// The GitLab device-grant slot + unsupported-host memory backing the
-    /// `sourceControl.*` auth methods for `provider: "gitlab"` (§5.27, v10.4).
+    /// `sourceControl.*` auth methods for `provider: "gitlab"` (§5.27, v10.5).
     /// Shared across clones like [`Self::github_auth_flow`].
     gitlab_auth: source_control_auth_ops::GitlabAuthStateHandle,
     /// The file-backed secret store the GitLab engine persists its credential
@@ -30396,7 +30396,7 @@ impl WorkspaceApi for Services {
     }
 
     // ========================================================================
-    // sourceControl.* — provider-generic auth (§5.27, v10.4); see
+    // sourceControl.* — provider-generic auth (§5.27, v10.5); see
     // `source_control_auth_ops`. The `github.*` quintet above is the
     // byte-identical legacy projection of these with `provider: "github"`.
     // ========================================================================

@@ -4341,7 +4341,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     // ========================================================================
     // sourceControl.* — provider-generic forge auth (PROTOCOL §5.27
-    // "Provider-generic auth — `sourceControl.*`", v10.4). `provider` is
+    // "Provider-generic auth — `sourceControl.*`", v10.5). `provider` is
     // `"github"` | `"gitlab"` (anything else → `-32602`); `host` is
     // gitlab-only (a non-empty host with `provider: "github"` → `-32602`).
     // The `github.authStatus` / `connect` / `cancelAuth` / `revoke` /

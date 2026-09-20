@@ -1,6 +1,6 @@
 //! Provider-generic forge auth (`sourceControl.authStatus` / `connect` /
 //! `cancelAuth` / `revoke` / `getUser`, PROTOCOL §5.27 "Provider-generic auth
-//! — `sourceControl.*`", v10.4): param parsing, the GitLab device-grant slot +
+//! — `sourceControl.*`", v10.5): param parsing, the GitLab device-grant slot +
 //! poll loop, the GitLab credential probe with proactive / 401-triggered
 //! refresh, and the wire DTOs. The `github.*` auth quintet is served as
 //! aliases of these with `provider: "github"` pinned (see `lib.rs`); the
@@ -45,7 +45,7 @@ pub(crate) const GITLAB_TOKEN_ENV: &str = "GITLAB_TOKEN";
 /// Secret-store marker written next to `sourceControl.github.token` when the
 /// GitHub device flow authorized, so `sourceControl.authStatus` can report
 /// `method: "device"` for it; a token without the marker (settings.update
-/// PAT, pre-10.4) reports `"pat"`. Deleted with the token on revoke.
+/// PAT, pre-10.5) reports `"pat"`. Deleted with the token on revoke.
 pub(crate) const GITHUB_TOKEN_METHOD_ACCOUNT: &str = "sourceControl.github.tokenMethod";
 
 /// The `host` every GitHub auth result reports.
@@ -79,7 +79,7 @@ impl Provider {
 }
 
 /// A validated `(provider, host)` target. `host` is gitlab-only; the GitHub
-/// side has no instance selection in v10.4.
+/// side has no instance selection in v10.5.
 #[derive(Debug, Clone)]
 pub(crate) enum Target {
     Github,
