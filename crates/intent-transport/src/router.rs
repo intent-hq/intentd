@@ -2231,6 +2231,12 @@ async fn dispatch(
             let result = api.agent_list_interrupted().await.map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.memoryUsage" => {
+            // No workspaceId: per-agent memory attribution spans every live
+            // agent the daemon's descendant-tree sampler bucketed (§5.5).
+            let result = api.agent_memory_usage().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.resolveInterrupted" => {
             // Optional resume/abandon arrays; ids must be pending interrupted_agent rows.
             // If present, must be arrays of strings (reject non-array and non-string elements).

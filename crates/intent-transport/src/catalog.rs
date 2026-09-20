@@ -66,6 +66,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "agent.listInterrupted",
     "agent.listUserMessages",
     "agent.markSeen",
+    "agent.memoryUsage",
     "agent.pendingPermissions",
     "agent.queueMessage",
     "agent.removeQueuedMessage",

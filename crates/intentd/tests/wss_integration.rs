@@ -19804,6 +19804,8 @@ impl SystemControl for WatchHealthControl {
             child_processes: None,
             child_memory_bytes: None,
             child_memory_peak_bytes: None,
+            agent_memory_bytes: None,
+            agent_process_count: None,
             agent_memory_budget_bytes: None,
             agent_memory_charged_bytes: None,
             queued_spawns: None,

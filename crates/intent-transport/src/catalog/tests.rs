@@ -149,12 +149,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// `note.presence.update`) and +1 router method (`presence.snapshot`); the
 /// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
 /// counted with the other subscription channels, not here.
-const EXPECTED_TOTAL_METHODS: usize = 378;
+///
+/// Agent memory attribution (§5.5): +1 router method (`agent.memoryUsage`).
+const EXPECTED_TOTAL_METHODS: usize = 379;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 323;
+const EXPECTED_ROUTER_METHODS: usize = 324;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 53;
@@ -495,6 +497,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.listInterrupted",
     "agent.listUserMessages",
     "agent.markSeen",
+    "agent.memoryUsage",
     "agent.pendingPermissions",
     "agent.removeQueuedMessage",
     "agent.rename",
@@ -1103,6 +1106,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.delete",
     "agent.diagnostics",
     "agent.enhancePrompt",
+    "agent.memoryUsage",
     "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveProposal",
@@ -1575,6 +1579,9 @@ mod unbound_owner_only_methods {
     /// growing it needs a reason on the row. The failure message prints the
     /// recomputed list.
     const UNGATED_AT_SERVICE_LAYER: &[(&str, &str)] = &[
+        // No gate: daemon-wide per-agent memory read; no-manager early
+        // return `{ sampledAt: null, totalBytes: null, agents: [] }`.
+        ("agent.memoryUsage", "ok"),
         // No gate: daemon-wide reverse-client listing.
         ("client.list", "ok"),
         // No gate: process-wide stack sampler.
@@ -1674,6 +1681,7 @@ mod unbound_owner_only_methods {
                 "agent.enhancePrompt",
                 json!({ "prompt": "p", "timeoutMs": 1 }),
             ),
+            ("agent.memoryUsage", json!({})),
             (
                 "agent.replaceMessages",
                 json!({ "agentId": "a1", "messages": [] }),

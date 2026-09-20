@@ -1092,6 +1092,22 @@ pub trait TreeMemoryProbe: Send + Sync {
     fn agent_process_samples(&self) -> HashMap<AgentId, Vec<ProcessSample>> {
         HashMap::new()
     }
+
+    /// RFC-3339 UTC timestamp of the sweep behind [`Self::sample`], or `None`
+    /// before the first sample lands and for probes that don't record it.
+    fn sampled_at(&self) -> Option<String> {
+        None
+    }
+}
+
+/// What the manager knows about a live agent's spawned child, for
+/// `agent.memoryUsage` rows (§5.5): the provider command it was spawned
+/// with, the model requested at spawn, and the child's root pid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSpawnDetails {
+    pub provider: String,
+    pub model: Option<String>,
+    pub root_pid: Option<u32>,
 }
 
 /// Host headroom the budget defends (monorepo#2063 follow-up). Below this much
@@ -2838,6 +2854,44 @@ impl AgentManager {
             .get()
             .map(|p| p.agent_process_samples())
             .unwrap_or_default()
+    }
+
+    /// Whether the installed probe has published a sweep yet. `false` when
+    /// no probe is wired.
+    pub fn agent_memory_sampled(&self) -> bool {
+        self.tree_probe.get().is_some_and(|p| p.sample().is_some())
+    }
+
+    /// RFC-3339 timestamp of the sweep behind [`Self::agent_process_memory_samples`],
+    /// or `None` when no probe is wired, no sample has landed, or the probe
+    /// does not record it.
+    pub fn agent_memory_sampled_at(&self) -> Option<String> {
+        self.tree_probe.get().and_then(|p| p.sampled_at())
+    }
+
+    /// Spawn details of every tracked handle, for `agent.memoryUsage` rows.
+    /// A handle whose child pid is unknown (fake/transport-only handles)
+    /// reports `root_pid: None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn agent_spawn_details(&self) -> HashMap<AgentId, AgentSpawnDetails> {
+        self.handles
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(agent_id, handle)| {
+                (
+                    agent_id.clone(),
+                    AgentSpawnDetails {
+                        provider: handle.spawned_provider.clone(),
+                        model: handle.spawned_model.clone(),
+                        root_pid: handle.child_pid,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Snapshot of `spawned child pid -> agent id` for every live handle that

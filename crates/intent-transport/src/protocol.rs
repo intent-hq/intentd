@@ -505,12 +505,21 @@
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release
 //! installs are asynchronous and never fall back to channel updates.
+//!
+//! Version 10.4 adds agent memory attribution (additive; §5.5, §5.7): the
+//! daemon-global `agent.memoryUsage` router method — one row per spawned
+//! agent the descendant-tree sampler bucketed, with its per-process rows —
+//! and two always-present `system.status` fields from the same sweep,
+//! `agentMemoryBytes` (the agent-attributed share of `childMemoryBytes`)
+//! and `agentProcessCount` (buckets with a live root pid), `null` until the
+//! first sample lands. The catalog contains 324 router methods, 53
+//! fast-path methods, and two aliases: 379 client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.3";
+pub const PROTOCOL_VERSION: &str = "10.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

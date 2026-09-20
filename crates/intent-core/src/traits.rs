@@ -5271,6 +5271,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.memoryUsage`: daemon-wide per-agent memory attribution from the
+    /// descendant-tree sampler (§5.5) — `{ sampledAt, totalBytes, agents:
+    /// [{ agentId, agentName, workspaceId, provider, model?, rootPid,
+    /// processCount, memoryBytes, processes: [{ pid, parentPid, name,
+    /// cmdline, memoryBytes }] }] }`, `agents` sorted by `memoryBytes`
+    /// descending; a bucket whose session row is gone is omitted. No
+    /// workspace id: the sample spans every live agent.
+    /// `{ sampledAt: null, totalBytes: null, agents: [] }` before the first
+    /// sample lands or when no tree probe is installed.
+    fn agent_memory_usage(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_memory_usage not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // rules.* — user-rule overrides + (internal) prompt-injection (§18.1,
     // PROTOCOL §5.21). `list`/`get` are reads; `update` upserts the user

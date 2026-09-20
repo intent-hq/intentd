@@ -3314,6 +3314,10 @@ struct ChildTreeSample {
     /// sweep with a byte total from the next would make it discard a correction
     /// it should keep, or keep one it should discard.
     seq: u64,
+    /// RFC-3339 UTC time the sweep was stored, for `agent.memoryUsage`'s
+    /// `sampledAt` (§5.5) — the sample a client reads is up to one
+    /// [`CHILD_TREE_BASE_PERIOD`] old, and the stamp lets it say so.
+    sampled_at: String,
 }
 
 /// The three fields are published together under one lock rather than as
@@ -3349,6 +3353,7 @@ impl ChildTreeUsage {
             agent_processes: std::sync::Arc::new(agent_processes),
             available_memory_bytes,
             seq,
+            sampled_at: intent_core::now_iso(),
         });
     }
 
@@ -3412,6 +3417,10 @@ impl TreeMemoryProbe for ChildTreeUsage {
         self.load()
             .map(|s| s.agent_processes.as_ref().clone())
             .unwrap_or_default()
+    }
+
+    fn sampled_at(&self) -> Option<String> {
+        self.load().map(|s| s.sampled_at)
     }
 }
 
@@ -3938,6 +3947,8 @@ impl SystemControl for DaemonControl {
             child_processes: child_tree.as_ref().map(|s| s.count),
             child_memory_bytes: child_tree.as_ref().map(|s| s.memory_bytes),
             child_memory_peak_bytes: child_tree.as_ref().map(|s| s.peak_memory_bytes),
+            agent_memory_bytes: child_tree.as_ref().map(|s| s.agent_bytes.values().sum()),
+            agent_process_count: child_tree.as_ref().map(|s| s.agent_bytes.len()),
             agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
             agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
             queued_spawns: budget.map(|(_, _, queued)| queued),
