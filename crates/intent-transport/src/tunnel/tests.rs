@@ -1308,12 +1308,15 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
     let response_listener = response_socket.listen(1).unwrap();
     let response_port = response_listener.local_addr().unwrap().port();
     let written = Arc::new(AtomicUsize::new(0));
-    // Flushes the oversized reply first, then reads the requests queued behind
-    // it, then stays connected so no EOF/CLOSE races the assertions.
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    // Once released, flushes the oversized reply first, then reads the
+    // requests queued behind it, then stays connected so no EOF/CLOSE races
+    // the assertions.
     let response_consumer = tokio::spawn({
         let written = written.clone();
         async move {
             let (mut tcp, _) = response_listener.accept().await.unwrap();
+            start_rx.await.unwrap();
             let chunk = vec![0xAB; READ_CHUNK_BYTES];
             for _ in 0..RESPONSE_BYTES / READ_CHUNK_BYTES {
                 tcp.write_all(&chunk).await.unwrap();
@@ -1329,9 +1332,9 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_consumer = tokio::spawn(async move {
         let (mut tcp, _) = echo_listener.accept().await.unwrap();
-        let byte = tcp.read_u8().await.unwrap();
-        tcp.write_u8(byte).await.unwrap();
-        std::future::pending::<()>().await;
+        while let Ok(byte) = tcp.read_u8().await {
+            tcp.write_u8(byte).await.unwrap();
+        }
     });
     let (server_io, client_io) = tokio::io::duplex(4 * 1024);
     let server = WebSocketStream::from_raw_socket(
@@ -1354,8 +1357,6 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
         Arc::new(AtomicI64::new(0)),
         TunnelLimits::default(),
     ));
-    // The response stream opens last: its consumer starts flushing as soon as
-    // the relay connects, so nothing else may still be awaiting an OPEN_OK.
     for (stream_id, port) in [(2, echo_port), (1, response_port)] {
         client_send(&mut client_sink, Frame::Open { stream_id, port }).await;
         match client_next(&mut client_stream).await {
@@ -1367,9 +1368,13 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
         }
     }
     // The client is slow, not blocked: it has room for the whole reply, so it
-    // grants the credit beyond the initial window up front. The pause below
-    // is then the shared queue and the parked sink, not the per-stream window
-    // (#5482).
+    // grants the credit beyond the initial window up front, while the
+    // connection is idle. The pause below is then the shared queue and the
+    // parked sink, not the per-stream window (#5482). The grant carries no
+    // acknowledgement, so a sibling echo sent behind it proves the connection
+    // loop consumed it (inbound frames are handled in order) before the reply
+    // is released — otherwise the grant races the first reply chunks for the
+    // loop and can sit unread behind a parked `sink.send`.
     client_send(
         &mut client_sink,
         Frame::Credit {
@@ -1378,6 +1383,25 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
         },
     )
     .await;
+    client_send(
+        &mut client_sink,
+        Frame::Data {
+            stream_id: 2,
+            payload: vec![0],
+        },
+    )
+    .await;
+    match client_next(&mut client_stream).await {
+        Message::Binary(bytes) => assert!(
+            matches!(
+                Frame::decode(&bytes).unwrap(),
+                Frame::Data { stream_id: 2, payload } if payload == [0]
+            ),
+            "sibling echo did not confirm the credit grant"
+        ),
+        other => panic!("unexpected message {other:?}"),
+    }
+    start_tx.send(()).unwrap();
     // Client pauses: the connection loop parks in `sink.send` on one chunk,
     // the relay fills the shared queue and holds the next, and the consumer
     // has therefore pushed at least that many chunks — then stalls, because
