@@ -1,11 +1,12 @@
 name: CI
 on:
-  # Push-to-main runs only the release build matrix (+ deb-packaging + gate).
-  # The main ruleset routes every merge through the merge queue (see
-  # `merge_group` below) and blocks direct pushes, so every main commit's
-  # tree is identical to one a merge-queue (or, pre-queue, strict-up-to-date
-  # PR) run just tested — the test jobs (route/check/coverage-e2e/
-  # coverage-all) are push-skipped via their `if`s (CI audit, 2026-08).
+  # Push-to-main runs only the release build matrix (+ route, which places
+  # its Windows entry, + deb-packaging + gate). The main ruleset routes
+  # every merge through the merge queue (see `merge_group` below) and
+  # blocks direct pushes, so every main commit's tree is identical to one a
+  # merge-queue (or, pre-queue, strict-up-to-date PR) run just tested — the
+  # test jobs (check/coverage-e2e/coverage-all) are push-skipped via their
+  # `if`s (CI audit, 2026-08).
   push:
     branches: [main]
   # Fork PRs get no CI: external PRs are not accepted (intent-hq/monorepo#417).
@@ -77,19 +78,18 @@ jobs:
   # mac build is intentionally not routed — it runs on the self-hosted m1mac
   # (see the build job's matrix).
   route:
-    # Skipped on push to main: its Linux consumers (check / coverage-e2e /
-    # coverage-all / coverage-changed) are push-skipped as redundant (see the
-    # `on: push` comment), and the build job keeps the historical
-    # self-hosted Windows pin on push when this job did not run (see its
-    # matrix), so the probe would spend API calls on a decision nothing
-    # consumes.
-    # Also skipped on fork PRs (see the `pull_request` trigger comment):
-    # route's skip cascades over the needs chain, skipping check /
-    # coverage-e2e / coverage-all / coverage-changed, so fork PRs can never
-    # reach tinybox.
+    # Runs on every event that runs the build job (push / merge_group /
+    # same-repo pull_request) because the build job's Windows entry consumes
+    # its decision (intent-hq/intent#5518). On push its Linux consumers
+    # (check / coverage-e2e / coverage-all / coverage-changed) are
+    # push-skipped by their own `if`s (see the `on: push` comment), so only
+    # the Windows decision is used there.
+    # Skipped on fork PRs (see the `pull_request` trigger comment): route's
+    # skip cascades over the needs chain, skipping check / coverage-e2e /
+    # coverage-all / coverage-changed, so fork PRs can never reach tinybox.
     # Runs on merge_group (see the trigger comment) — merge groups come from
     # the repo's own ruleset, so no same-repo guard applies there.
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -669,13 +669,14 @@ jobs:
     # empty, and a fast-path failure leaves it empty too, so all fall back
     # to running the full job. `!cancelled()` keeps the job from being
     # auto-skipped when a `needs` dependency was skipped (release-fast-path
-    # on push / merge_group, route on push) — which is exactly why
+    # on push / merge_group) or failed (route) — which is exactly why
     # the fork guard must be explicit here: on a fork PR both dependencies
     # are skipped, and without the guard `!cancelled()` would still run this
     # job on the self-hosted macOS/Windows runners.
     # `route` places the Windows entry (intent-hq/intent#5518; see the
-    # matrix). route runs on ubuntu-latest, so this dependency can never
-    # queue behind the self-hosted runners it decides about.
+    # matrix) and runs on every event this job runs on. route runs on
+    # ubuntu-latest, so this dependency can never queue behind the
+    # self-hosted runners it decides about.
     needs: [release-fast-path, route]
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     strategy:
@@ -697,17 +698,15 @@ jobs:
           # gh-windows-16x runner otherwise (fail-open to burst, like the
           # Linux jobs — an offline 5090pc used to leave this required check
           # QUEUED forever and block every merge: intent-hq/intent#1382,
-          # #1583). When route produced no output (`fromJSON('')` would
-          # fail the matrix expansion and drop the required contexts) the
-          # fallback is event-dependent: on push route is skipped by design
-          # and the release build keeps the historical self-hosted pin; on
-          # every other event (pull_request / merge_group) an empty output
-          # means route itself failed or timed out (`!cancelled()` still
-          # runs this job), and that is a probe failure — burst, never pin
-          # to a runner nothing confirmed online. The name below pins the
-          # required-check context — do not rename it.
+          # #1583). The self-hosted labels are selected ONLY when route
+          # positively emitted them: an empty output — route failed, timed
+          # out, or was skipped (`!cancelled()` still runs this job) — falls
+          # back to the burst label, never to a runner nothing confirmed
+          # online. (The fallback also keeps `fromJSON('')` from failing the
+          # matrix expansion and dropping the required contexts.) The name
+          # below pins the required-check context — do not rename it.
           - target: x86_64-pc-windows-msvc
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || (github.event_name == 'push' && '["self-hosted","Windows","X64"]' || '["gh-windows-16x"]')) }}
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
             name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
     # Explicit per-entry names (instead of the default matrix-value join) so
     # the required-check contexts in the main ruleset stay stable even when a
@@ -815,8 +814,8 @@ jobs:
     # the skip (required outright on merge_group, accepted elsewhere). The
     # event check makes the intent visible; the route.result guard preserves
     # the pre-existing behavior that a route failure skips this job (and
-    # would skip it on push / fork PRs anyway, where route itself is
-    # skipped). Nothing here may reference github.event.pull_request — that
+    # would skip it on fork PRs anyway, where route itself is skipped).
+    # Nothing here may reference github.event.pull_request — that
     # context does not exist on merge_group. release-fast-path is no longer a
     # dependency: it is pull_request-only, so its output is empty on
     # merge_group and must not be required; the fast-path skip it used to
