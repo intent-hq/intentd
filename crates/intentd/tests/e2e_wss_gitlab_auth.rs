@@ -18,7 +18,7 @@ mod common;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -261,12 +261,13 @@ fn read_secrets(path: &Path) -> Value {
 // and `/api/v4/user`. The token endpoint answers `authorization_pending` until
 // `authorize` is flipped, then mints the access + refresh token pair (a
 // 60 s access token with `short_lived`, inside the daemon's refresh leeway);
-// a `grant_type=refresh_token` exchange rotates the pair exactly once (only
-// `REFRESH_TOKEN` is accepted; a rotated one is `invalid_grant`). The user
+// a `grant_type=refresh_token` exchange rotates the pair exactly once — like
+// a real instance, `REFRESH_TOKEN` is consumed by its first exchange and any
+// later one (with it or with the rotated token) is `invalid_grant`. The user
 // endpoint accepts the minted / rotated token or `PAT_TOKEN` as bearer and
 // answers 401 for anything else (`reject_rotated` revokes the rotated token
-// server-side). With `unsupported` set, the device endpoint answers 404 (a
-// GitLab < 17.1 instance).
+// server-side); `user_requests` counts every hit on it. With `unsupported`
+// set, the device endpoint answers 404 (a GitLab < 17.1 instance).
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -275,6 +276,8 @@ struct MockFlags {
     unsupported: AtomicBool,
     short_lived: AtomicBool,
     reject_rotated: AtomicBool,
+    refresh_exchanges: AtomicUsize,
+    user_requests: AtomicUsize,
 }
 
 struct MockGitlab {
@@ -357,7 +360,11 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
     let bearer_ok = bearer == ACCESS_TOKEN
         || bearer == PAT_TOKEN
         || (bearer == ROTATED_ACCESS_TOKEN && !flags.reject_rotated.load(Ordering::SeqCst));
-    let (status, body) = match (method, path.split('?').next().unwrap_or_default()) {
+    let route = path.split('?').next().unwrap_or_default();
+    if method == "GET" && route == "/api/v4/user" {
+        flags.user_requests.fetch_add(1, Ordering::SeqCst);
+    }
+    let (status, body) = match (method, route) {
         ("POST", "/oauth/authorize_device") if flags.unsupported.load(Ordering::SeqCst) => {
             (404, json!({ "error": "Not Found" }))
         }
@@ -373,7 +380,9 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
             }),
         ),
         ("POST", "/oauth/token")
-            if is_refresh && form_field("refresh_token").as_deref() == Some(REFRESH_TOKEN) =>
+            if is_refresh
+                && form_field("refresh_token").as_deref() == Some(REFRESH_TOKEN)
+                && flags.refresh_exchanges.fetch_add(1, Ordering::SeqCst) == 0 =>
         {
             (
                 200,
@@ -436,15 +445,22 @@ struct Harness {
 }
 
 async fn boot(mock: &MockGitlab) -> Harness {
+    boot_with_env(mock, &[]).await
+}
+
+/// [`boot`] with extra daemon environment (applied after the harness's own,
+/// so a test can put `GITLAB_TOKEN` back).
+async fn boot_with_env(mock: &MockGitlab, extra_env: &[(&str, &str)]) -> Harness {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_s = secrets_file.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    let mut env: Vec<(&str, &str)> = vec![
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_SECRETS_FILE", &secrets_s),
         ("INTENTD_GITLAB_API_BASE_URI", &mock.base_uri),
     ];
+    env.extend_from_slice(extra_env);
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
@@ -998,4 +1014,178 @@ async fn gitlab_revoke_is_host_scoped_and_idempotent_over_wss() {
     assert_eq!(v["result"], json!({ "ok": true }));
     let v = wss_rpc(&mut rpc, 21, "sourceControl.cancelAuth", gitlab).await;
     assert_eq!(v["result"], json!({ "ok": true, "cancelled": false }));
+}
+
+/// Every credential the daemon holds belongs to the bound instance — the
+/// `GITLAB_TOKEN` fallback included. A probe of another host (a typo, an
+/// instance switch) resolves no credential at all and sends no request:
+/// `authStatus` is a plain not-configured answer, `getUser` is `{ user: null }`,
+/// never an error carrying the bound instance's secret off-host.
+#[tokio::test]
+async fn gitlab_env_token_is_bound_to_the_configured_host_over_wss() {
+    const OTHER_HOST: &str = "gitlab.acme.internal";
+    let mock = spawn_mock_gitlab().await;
+    let h = boot_with_env(&mock, &[("GITLAB_TOKEN", PAT_TOKEN)]).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let gitlab = json!({ "provider": "gitlab" });
+    let other = json!({ "provider": "gitlab", "host": OTHER_HOST });
+
+    // The bound instance resolves the env credential (provenance "env").
+    let v = wss_rpc(&mut rpc, 10, "sourceControl.authStatus", gitlab.clone()).await;
+    let r = &v["result"];
+    assert_eq!(r["isConfigured"], json!(true), "{r}");
+    assert_eq!(r["method"], json!("env"));
+    assert_eq!(r["host"], json!(HOST));
+    assert_eq!(r["user"]["login"], json!("glab-octocat"));
+    let probes = mock.flags.user_requests.load(Ordering::SeqCst);
+    assert!(probes >= 1, "the bound probe reached the instance");
+
+    // Another host: not configured, no error, and nothing leaves the daemon
+    // (the bound instance's API override is not applied to another host, so
+    // the only observable request path is the one that must stay silent).
+    let v = wss_rpc(&mut rpc, 11, "sourceControl.authStatus", other.clone()).await;
+    let r = &v["result"];
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(r["isConfigured"], json!(false), "{r}");
+    assert_eq!(r["method"], Value::Null);
+    assert!(r.get("user").is_none(), "{r}");
+    assert_eq!(r["host"], json!(OTHER_HOST));
+    let v = wss_rpc(&mut rpc, 12, "sourceControl.getUser", other).await;
+    assert_eq!(v["result"], json!({ "user": null }), "{v}");
+    assert_eq!(
+        mock.flags.user_requests.load(Ordering::SeqCst),
+        probes,
+        "an unbound host's probe never reaches an instance"
+    );
+
+    // The bound instance is untouched by the other host's probes.
+    let v = wss_rpc(&mut rpc, 13, "sourceControl.getUser", gitlab).await;
+    assert_eq!(v["result"]["user"]["login"], json!("glab-octocat"), "{v}");
+}
+
+/// Two probes that overlap on the same near-expiry device credential must
+/// not both replay the refresh token: a real instance consumes it on the
+/// first exchange, so the loser's `invalid_grant` would tear down a live
+/// connection. The mock accepts `REFRESH_TOKEN` exactly once; the daemon
+/// serialises the rotation, the second probe re-reads the rotated pair and
+/// simply uses it — one exchange, both probes configured, no `expired`.
+#[tokio::test]
+async fn gitlab_concurrent_probes_rotate_the_pair_once_over_wss() {
+    let mock = spawn_mock_gitlab().await;
+    mock.flags.short_lived.store(true, Ordering::SeqCst);
+    let h = boot(&mock).await;
+    let mut sub = subscriber(&h).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let gitlab = json!({ "provider": "gitlab" });
+
+    let v = wss_rpc(&mut rpc, 10, "sourceControl.connect", gitlab.clone()).await;
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE), "{v}");
+    mock.flags.authorize.store(true, Ordering::SeqCst);
+    let ev = await_auth_changed(&mut sub, "authorized", 30).await;
+    assert_eq!(ev["status"], json!("authorized"));
+    assert_eq!(
+        read_secrets(&h.secrets_file)["sourceControl.gitlab.refreshToken"],
+        json!(REFRESH_TOKEN)
+    );
+
+    // Two connections race a probe of the same near-expiry pair.
+    let mut a = connect_ws(h.port, h.cfg.clone()).await;
+    let mut b = connect_ws(h.port, h.cfg.clone()).await;
+    let (va, vb) = tokio::join!(
+        wss_rpc(&mut a, 20, "sourceControl.authStatus", gitlab.clone()),
+        wss_rpc(&mut b, 21, "sourceControl.getUser", gitlab.clone()),
+    );
+    assert_eq!(va["result"]["isConfigured"], json!(true), "{va}");
+    assert_eq!(va["result"]["method"], json!("device"));
+    assert_eq!(va["result"]["user"]["login"], json!("glab-octocat"));
+    assert_eq!(vb["result"]["user"]["login"], json!("glab-octocat"), "{vb}");
+    assert_eq!(
+        mock.flags.refresh_exchanges.load(Ordering::SeqCst),
+        1,
+        "exactly one refresh exchange for two overlapping probes"
+    );
+    let secrets = read_secrets(&h.secrets_file);
+    assert_eq!(
+        secrets["sourceControl.gitlab.token"],
+        json!(ROTATED_ACCESS_TOKEN),
+        "{secrets}"
+    );
+    assert_eq!(
+        secrets["sourceControl.gitlab.refreshToken"],
+        json!(ROTATED_REFRESH_TOKEN)
+    );
+
+    // Still connected afterwards, and no `expired` was ever emitted: the
+    // next auth-changed observed is the `revoked` this revoke triggers.
+    let v = wss_rpc(&mut rpc, 11, "sourceControl.authStatus", gitlab.clone()).await;
+    assert_eq!(v["result"]["isConfigured"], json!(true), "{v}");
+    let v = wss_rpc(&mut rpc, 12, "sourceControl.revoke", gitlab).await;
+    assert_eq!(v["result"], json!({ "ok": true }));
+    let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "revoked" }),
+        "no expired event may precede the deliberate revoke"
+    );
+}
+
+/// `sourceControl.revoke` on the bound host with nothing stored — a fresh
+/// daemon, a repeat revoke, or only a pending device grant — is a successful
+/// no-op that ends no connection: no delete and no `revoked` event. Only a
+/// stored credential's removal emits `revoked`, exactly once.
+#[tokio::test]
+async fn gitlab_revoke_without_a_connection_emits_nothing_over_wss() {
+    let mock = spawn_mock_gitlab().await;
+    let h = boot(&mock).await;
+    let mut sub = subscriber(&h).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let gitlab = json!({ "provider": "gitlab" });
+    let pat = json!({ "provider": "gitlab", "method": "pat", "token": PAT_TOKEN });
+
+    // Fresh daemon: first and repeated revoke are ok and silent.
+    for id in [10, 11] {
+        let v = wss_rpc(&mut rpc, id, "sourceControl.revoke", gitlab.clone()).await;
+        assert_eq!(v["result"], json!({ "ok": true }), "{v}");
+    }
+    // A pending grant without a stored credential: revoke aborts it, silently.
+    let v = wss_rpc(&mut rpc, 12, "sourceControl.connect", gitlab.clone()).await;
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE), "{v}");
+    let v = wss_rpc(&mut rpc, 13, "sourceControl.revoke", gitlab.clone()).await;
+    assert_eq!(v["result"], json!({ "ok": true }));
+    let v = wss_rpc(&mut rpc, 14, "sourceControl.authStatus", gitlab.clone()).await;
+    assert_eq!(v["result"]["isConfigured"], json!(false), "{v}");
+    assert_eq!(v["result"]["deviceFlow"], Value::Null);
+    assert!(read_secrets(&h.secrets_file)
+        .get("sourceControl.gitlab.token")
+        .is_none());
+
+    // The FIRST auth-changed ever observed is the one this connect triggers.
+    let v = wss_rpc(&mut rpc, 15, "sourceControl.connect", pat.clone()).await;
+    assert_eq!(v["result"], json!({ "ok": true, "method": "pat" }), "{v}");
+    let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "authorized" }),
+        "no revoked may be emitted while nothing is stored"
+    );
+
+    // A stored credential's revoke emits `revoked` once; the repeat emits
+    // nothing — the next event observed is the following connect's.
+    let v = wss_rpc(&mut rpc, 16, "sourceControl.revoke", gitlab.clone()).await;
+    assert_eq!(v["result"], json!({ "ok": true }));
+    let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "revoked" })
+    );
+    let v = wss_rpc(&mut rpc, 17, "sourceControl.revoke", gitlab).await;
+    assert_eq!(v["result"], json!({ "ok": true }));
+    let v = wss_rpc(&mut rpc, 18, "sourceControl.connect", pat).await;
+    assert_eq!(v["result"], json!({ "ok": true, "method": "pat" }), "{v}");
+    let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "authorized" }),
+        "a repeated revoke emits nothing"
+    );
 }

@@ -976,6 +976,10 @@ pub struct Services {
     /// Production wiring uses the daemon default (`$INTENTD_SECRETS_FILE`);
     /// tests inject a scratch path.
     gitlab_secret_store: intent_core::FileSecretStore,
+    /// Serialises refresh / persist / delete of the GitLab credential pair
+    /// (see [`source_control_auth_ops::GitlabCredentialGate`]). Shared across
+    /// clones.
+    gitlab_credential_gate: source_control_auth_ops::GitlabCredentialGate,
     /// When the primary principal's GitHub profile was last refreshed from
     /// `GET /user` on a `principal.me` read (multiplayer w1); shared across
     /// clones so the rate limit spans every RPC handle.
@@ -1366,6 +1370,7 @@ impl Services {
             github_login_base_uri: None,
             gitlab_auth: source_control_auth_ops::new_gitlab_state(),
             gitlab_secret_store: intent_core::FileSecretStore::new(),
+            gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
             invite_flows: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -30444,6 +30449,7 @@ impl WorkspaceApi for Services {
                         bound,
                         client_id.as_deref(),
                         self.gitlab_secret_store.clone(),
+                        &self.gitlab_credential_gate,
                         self.event_bus.as_ref(),
                     )
                     .await?;
@@ -30576,13 +30582,29 @@ impl WorkspaceApi for Services {
                     }
                     // Only the bound instance owns the stored token: revoking
                     // another host is a successful no-op that never deletes
-                    // it and never emits `revoked` for it.
-                    if bound {
-                        intent_sourcecontrol::gitlab_auth::revoke_gitlab_token(
+                    // it and never emits `revoked` for it. With nothing
+                    // stored (never connected / already revoked) there is no
+                    // connection to end either: ok, no delete, no event.
+                    let had_credential = if bound {
+                        let _gate = self.gitlab_credential_gate.lock().await;
+                        let stored = intent_sourcecontrol::gitlab_auth::stored_credential(
                             self.gitlab_secret_store.clone(),
                         )
                         .await
                         .map_err(pr_ops::map_sc_err)?;
+                        let had = stored != intent_sourcecontrol::StoredCredential::None;
+                        if had {
+                            intent_sourcecontrol::gitlab_auth::revoke_gitlab_token(
+                                self.gitlab_secret_store.clone(),
+                            )
+                            .await
+                            .map_err(pr_ops::map_sc_err)?;
+                        }
+                        had
+                    } else {
+                        false
+                    };
+                    if had_credential {
                         source_control_auth_ops::publish_auth_changed(
                             self.event_bus.as_ref(),
                             source_control_auth_ops::Provider::Gitlab,
@@ -30643,6 +30665,7 @@ impl WorkspaceApi for Services {
                         bound,
                         client_id.as_deref(),
                         self.gitlab_secret_store.clone(),
+                        &self.gitlab_credential_gate,
                         self.event_bus.as_ref(),
                     )
                     .await?;

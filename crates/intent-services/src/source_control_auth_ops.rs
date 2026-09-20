@@ -177,6 +177,18 @@ pub(crate) fn new_gitlab_state() -> GitlabAuthStateHandle {
     Arc::new(tokio::sync::Mutex::new(GitlabAuthState::default()))
 }
 
+/// Serialises every mutation of the stored GitLab credential pair — token
+/// refresh (rotation), PAT persist, revoke / expiry deletion — so that two
+/// concurrent probes never race a rotation (the instance accepts a refresh
+/// token once; a second exchange with the consumed one is `invalid_grant`
+/// and would disconnect a live connection). Never held across the `GET
+/// /api/v4/user` probe itself, only across a read-check-write of the store.
+pub(crate) type GitlabCredentialGate = Arc<tokio::sync::Mutex<()>>;
+
+pub(crate) fn new_gitlab_credential_gate() -> GitlabCredentialGate {
+    Arc::new(tokio::sync::Mutex::new(()))
+}
+
 /// Build a `sourceControl:auth-changed { provider, host, status }` event —
 /// global like `settings:changed` (empty workspace id); never a token.
 pub(crate) fn auth_changed_event(provider: Provider, host: &str, status: &str) -> NewEvent {
@@ -326,21 +338,27 @@ pub(crate) enum ProbeOutcome {
     Rejected,
 }
 
-/// Read the GitLab access token for the probe: the stored slot when `bound`
-/// (the stored token belongs to the bound instance only), then `GITLAB_TOKEN`.
-/// Returns the token with its provenance; `None` when nothing resolves.
+/// The stored GitLab access token, `None` when the slot is absent / blank.
+async fn stored_access_token(store: &FileSecretStore) -> Result<Option<String>> {
+    let store = store.clone();
+    let loaded = tokio::task::spawn_blocking(move || store.load(GITLAB_SECRET_ACCOUNT))
+        .await
+        .map_err(|e| Error::Internal(format!("secret-store read task failed: {e}")))?
+        .map_err(|e| Error::Internal(format!("could not read gitlab token: {e}")))?;
+    Ok(loaded.filter(|t| !t.trim().is_empty()))
+}
+
+/// Read the GitLab access token for a probe of the **bound** instance: the
+/// stored slot, then `GITLAB_TOKEN`. Every credential the daemon holds —
+/// stored or environment — belongs to the bound instance only, so callers
+/// never resolve one for another host (see [`probe_gitlab`]). Returns the
+/// token with its provenance; `None` when nothing resolves.
 async fn load_gitlab_token(
     store: &FileSecretStore,
-    bound: bool,
     credential: StoredCredential,
 ) -> Result<Option<(String, &'static str)>> {
-    if bound && credential != StoredCredential::None {
-        let store = store.clone();
-        let loaded = tokio::task::spawn_blocking(move || store.load(GITLAB_SECRET_ACCOUNT))
-            .await
-            .map_err(|e| Error::Internal(format!("secret-store read task failed: {e}")))?
-            .map_err(|e| Error::Internal(format!("could not read gitlab token: {e}")))?;
-        if let Some(token) = loaded.filter(|t| !t.trim().is_empty()) {
+    if credential != StoredCredential::None {
+        if let Some(token) = stored_access_token(store).await? {
             let method = match credential {
                 StoredCredential::Device { .. } => "device",
                 _ => "pat",
@@ -356,12 +374,30 @@ async fn load_gitlab_token(
 }
 
 /// Clear a device-grant connection whose access token can no longer be
-/// renewed, and tell subscribers (`status: "expired"`).
+/// renewed, and tell subscribers (`status: "expired"`). The caller holds the
+/// [`GitlabCredentialGate`].
 async fn disconnect_gitlab(store: FileSecretStore, bus: Option<&EventBus>, host: &str) {
     if let Err(e) = revoke_gitlab_token(store).await {
         tracing::warn!(error = %e, host, "could not clear the gitlab credential");
     }
     publish_auth_changed(bus, Provider::Gitlab, host, "expired").await;
+}
+
+/// [`disconnect_gitlab`] only if the stored access token is still `rejected`
+/// — a peer probe that rotated the pair in the meantime holds a credential
+/// the instance never saw fail, and that connection stays.
+async fn disconnect_gitlab_if_current(
+    store: FileSecretStore,
+    gate: &GitlabCredentialGate,
+    bus: Option<&EventBus>,
+    host: &str,
+    rejected: &str,
+) -> Result<()> {
+    let _gate = gate.lock().await;
+    if stored_access_token(&store).await?.as_deref() == Some(rejected) {
+        disconnect_gitlab(store, bus, host).await;
+    }
+    Ok(())
 }
 
 /// Probe the credential in use for `host` against `GET /api/v4/user`, running
@@ -374,6 +410,17 @@ async fn disconnect_gitlab(store: FileSecretStore, bus: Option<&EventBus>, host:
 /// the stored pair and falls through to the probe. PAT / env credentials are
 /// never refreshed.
 ///
+/// An **unbound** host (not the configured instance) never resolves a
+/// credential — stored or `GITLAB_TOKEN` — and is answered
+/// [`ProbeOutcome::NotConfigured`] without a request, so a typo'd / switched
+/// host never receives the bound instance's secret.
+///
+/// Both refresh paths run under `gate` and re-read the stored pair first: a
+/// concurrent probe may already have rotated it, in which case this one just
+/// uses the rotated token instead of replaying the consumed refresh token
+/// (which the instance would refuse, disconnecting a live connection). A
+/// disconnect only happens while the stored token is still the one rejected.
+///
 /// # Errors
 ///
 /// Rate limiting and non-auth forge failures propagate (mapped like the
@@ -384,32 +431,38 @@ pub(crate) async fn probe_gitlab(
     bound: bool,
     client_id: Option<&str>,
     store: FileSecretStore,
+    gate: &GitlabCredentialGate,
     bus: Option<&EventBus>,
 ) -> Result<ProbeOutcome> {
-    let mut credential = if bound {
-        stored_credential(store.clone())
-            .await
-            .map_err(crate::pr_ops::map_sc_err)?
-    } else {
-        StoredCredential::None
-    };
+    if !bound {
+        return Ok(ProbeOutcome::NotConfigured);
+    }
+    let mut credential = stored_credential(store.clone())
+        .await
+        .map_err(crate::pr_ops::map_sc_err)?;
     let mut refreshed = false;
     if credential.needs_refresh() {
-        match try_refresh(host, client_id, store.clone()).await {
-            Ok(()) => {
-                refreshed = true;
-                credential = stored_credential(store.clone())
-                    .await
-                    .map_err(crate::pr_ops::map_sc_err)?;
+        let _gate = gate.lock().await;
+        credential = stored_credential(store.clone())
+            .await
+            .map_err(crate::pr_ops::map_sc_err)?;
+        if credential.needs_refresh() {
+            match try_refresh(host, client_id, store.clone()).await {
+                Ok(()) => {
+                    refreshed = true;
+                    credential = stored_credential(store.clone())
+                        .await
+                        .map_err(crate::pr_ops::map_sc_err)?;
+                }
+                Err(RefreshFailure::Unrecoverable) => {
+                    disconnect_gitlab(store, bus, host.host()).await;
+                    return Ok(ProbeOutcome::NotConfigured);
+                }
+                Err(RefreshFailure::Transient) => {}
             }
-            Err(RefreshFailure::Unrecoverable) => {
-                disconnect_gitlab(store, bus, host.host()).await;
-                return Ok(ProbeOutcome::NotConfigured);
-            }
-            Err(RefreshFailure::Transient) => {}
         }
     }
-    let Some((token, method)) = load_gitlab_token(&store, bound, credential).await? else {
+    let Some((token, method)) = load_gitlab_token(&store, credential).await? else {
         return Ok(ProbeOutcome::NotConfigured);
     };
     match validate_pat(host, &token).await {
@@ -418,25 +471,31 @@ pub(crate) async fn probe_gitlab(
         Err(intent_sourcecontrol::Error::Auth(_)) => return Ok(ProbeOutcome::Rejected),
         Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
     }
-    // 401 on a device credential: one refresh, one retry.
-    match try_refresh(host, client_id, store.clone()).await {
-        Ok(()) => {}
-        Err(RefreshFailure::Unrecoverable) => {
-            disconnect_gitlab(store, bus, host.host()).await;
-            return Ok(ProbeOutcome::NotConfigured);
+    // 401 on a device credential: one refresh, one retry. Skip the exchange
+    // when a peer already replaced the rejected token; retry with theirs.
+    {
+        let _gate = gate.lock().await;
+        if stored_access_token(&store).await?.as_deref() == Some(token.as_str()) {
+            match try_refresh(host, client_id, store.clone()).await {
+                Ok(()) => {}
+                Err(RefreshFailure::Unrecoverable) => {
+                    disconnect_gitlab(store, bus, host.host()).await;
+                    return Ok(ProbeOutcome::NotConfigured);
+                }
+                Err(RefreshFailure::Transient) => return Ok(ProbeOutcome::Rejected),
+            }
         }
-        Err(RefreshFailure::Transient) => return Ok(ProbeOutcome::Rejected),
     }
     let credential = stored_credential(store.clone())
         .await
         .map_err(crate::pr_ops::map_sc_err)?;
-    let Some((token, method)) = load_gitlab_token(&store, bound, credential).await? else {
+    let Some((token, method)) = load_gitlab_token(&store, credential).await? else {
         return Ok(ProbeOutcome::NotConfigured);
     };
     match validate_pat(host, &token).await {
         Ok(user) => Ok(ProbeOutcome::Configured { user, method }),
         Err(intent_sourcecontrol::Error::Auth(_)) => {
-            disconnect_gitlab(store, bus, host.host()).await;
+            disconnect_gitlab_if_current(store, gate, bus, host.host(), &token).await?;
             Ok(ProbeOutcome::NotConfigured)
         }
         Err(e) => Err(crate::pr_ops::map_sc_err(e)),
@@ -620,12 +679,15 @@ impl crate::Services {
             }
             Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
         }
-        intent_sourcecontrol::gitlab_auth::persist_gitlab_token(
-            self.gitlab_secret_store.clone(),
-            intent_sourcecontrol::SecretString::from(token),
-        )
-        .await
-        .map_err(crate::pr_ops::map_sc_err)?;
+        {
+            let _gate = self.gitlab_credential_gate.lock().await;
+            intent_sourcecontrol::gitlab_auth::persist_gitlab_token(
+                self.gitlab_secret_store.clone(),
+                intent_sourcecontrol::SecretString::from(token),
+            )
+            .await
+            .map_err(crate::pr_ops::map_sc_err)?;
+        }
         {
             let mut guard = self.gitlab_auth.lock().await;
             if guard.flow.as_ref().is_some_and(|f| f.host == host.host()) {
