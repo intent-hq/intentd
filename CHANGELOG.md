@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.86] - 2026-09-20
+
+### 🚀 Features
+
+- Principals - caller binding, principal.me and role on workspace payloads ([#1868](https://github.com/intent-hq/intentd/pull/1868))
+- Principal attribution on human chat messages ([#1869](https://github.com/intent-hq/intentd/pull/1869))
+- Membership and capability matrix enforcement in the service layer ([#1870](https://github.com/intent-hq/intentd/pull/1870))
+- Invite links and identity-only device-flow join ([#1872](https://github.com/intent-hq/intentd/pull/1872))
+- *(presence)* Workspace presence and per-note caret channel ([#1887](https://github.com/intent-hq/intentd/pull/1887))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Keep tunnel inbound draining while a large reply waits on a lagging client ([#2017](https://github.com/intent-hq/intentd/pull/2017))
+- *(services)* Bound one-shot ACP response sends by the running phase timeout ([#2016](https://github.com/intent-hq/intentd/pull/2016))
+- *(services)* Fail closed on an unbound caller at every capability gate ([#1877](https://github.com/intent-hq/intentd/pull/1877))
+
+### 🧪 Testing
+
+- *(multiplayer)* Emit-path taxonomy golden and collaborator e2e (w3 follow-up) ([#1871](https://github.com/intent-hq/intentd/pull/1871))
+
+### ⚙️ Miscellaneous Tasks
+
+- Arm INTENTD_ASSERT_BOUND_CALLER in the coverage jobs ([#2020](https://github.com/intent-hq/intentd/pull/2020))
+
+
 ## [0.9.85] - 2026-09-20
 
 ### 🐛 Bug Fixes

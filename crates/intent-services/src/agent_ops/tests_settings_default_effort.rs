@@ -246,7 +246,7 @@ async fn explicit_effort_param_and_explicit_clear_outrank_the_setting() {
 /// Specialist frontmatter `reasoningEffort` and the chosen model option's
 /// effort both outrank the settings default, even when the model itself came
 /// from the settings chain.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_efforts_outrank_the_settings_default() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
@@ -286,7 +286,7 @@ async fn specialist_efforts_outrank_the_settings_default() {
 /// model (it pins no `model` of its own) still gets that option's effort:
 /// the delegate/wakeOrCreate effort seam resolves the effective model through
 /// the full default-model chain, not just the specialist's own pin.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn model_option_keyed_on_the_settings_default_model_is_selected() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
@@ -439,7 +439,7 @@ async fn blank_settings_default_effort_leaves_the_session_unset() {
 /// The model-option effort rung matches on the effective `{ provider, model }`
 /// pair: two options sharing a bare model id under different providers apply
 /// their own efforts, keyed by the provider the delegate actually resolves.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_model_option_effort_matches_the_effective_provider() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
@@ -477,7 +477,7 @@ async fn delegate_model_option_effort_matches_the_effective_provider() {
 /// on the settings-derived default — the specialist's `codingAgent` never
 /// participates in that spawn chain — so the pair match must key on the
 /// settings default too, not on `codingAgent`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_explicit_model_pair_match_ignores_the_specialist_coding_agent() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
@@ -516,7 +516,7 @@ async fn delegate_explicit_model_pair_match_ignores_the_specialist_coding_agent(
 
 /// The settings rung also applies through `agent.delegate` (which routes into
 /// `agent_create_op`) when neither the caller nor a specialist decided it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_applies_the_settings_default_effort() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog(&svc);

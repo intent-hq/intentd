@@ -73,7 +73,7 @@ fn create_specialist_with_coding_agent(dir: &std::path::Path, id: &str, coding_a
 /// (`model.defaultProvider`) is resolved onto the created session's
 /// `provider` when it is available — never left to fall through to the
 /// hardcoded default provider (Auggie) at spawn time.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_with_no_explicit_model_resolves_configured_default_provider() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     set(&svc, "model.defaultProvider", json!("mock"));
@@ -135,7 +135,7 @@ async fn delegate_unknown_default_provider_fails_loudly() {
 
 /// A specialist's frontmatter `codingAgent` takes precedence over the
 /// configured default (D2 step 1 beats step 2).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_specialist_explicit_coding_agent_beats_configured_default() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_with_coding_agent(specialists_dir.path(), "mock-specialist", "mock");
@@ -258,7 +258,7 @@ async fn delegate_with_nothing_configured_fails_loudly() {
 /// made its own provider-adjacent choice by supplying a model — so the child
 /// runs on the settings-derived default provider with the caller's model,
 /// never on a specialist's `codingAgent` rung.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_with_explicit_model_skips_d2_resolution() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     set(&svc, "model.defaultProvider", json!("mock"));
@@ -289,7 +289,7 @@ async fn delegate_with_explicit_model_skips_d2_resolution() {
 /// An explicit `provider` param pins the child's provider, outranking the
 /// settings-derived default (PROTOCOL §5.5: param > specialist frontmatter >
 /// settings default).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_explicit_provider_param_beats_configured_default() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     // The configured default names a DIFFERENT provider — the explicit
@@ -326,7 +326,7 @@ async fn delegate_explicit_provider_param_beats_configured_default() {
 
 /// The explicit `provider` param also outranks the specialist's frontmatter
 /// `codingAgent` (D2 step 1) — the caller's word is final.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_explicit_provider_param_beats_specialist_coding_agent() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     // The specialist pins a DIFFERENT (unavailable) provider — if the param
@@ -360,7 +360,7 @@ async fn delegate_explicit_provider_param_beats_specialist_coding_agent() {
 /// An explicit `provider` alongside a BARE `model` disambiguates which
 /// provider serves the model — the exact multi-provider-model use case the
 /// param exists for (monorepo#3044).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_explicit_provider_with_bare_model_pins_provider() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     set(&svc, "model.defaultProvider", json!("codex"));
@@ -910,7 +910,7 @@ fn auth_gate_names_each_providers_catalog_login_hint() {
 /// the resolved provider fails fast with the actionable `-32602` — before
 /// any session row is persisted — and flipping the cache back to unknown
 /// lets the same delegate proceed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_hard_false_auth_verdict_rejected_before_session_row() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);

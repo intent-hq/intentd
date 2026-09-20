@@ -1317,7 +1317,7 @@ async fn golden_questions_dismissed_notice_bytes() {
 }
 
 /// Report-to-parent wake: exact bytes of the ungrouped immediate parent wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn golden_report_to_parent_wake_bytes() {
     let (_t, svc, ws) = setup().await;
     let parent = AgentId::from("agent-parent");
@@ -1354,7 +1354,7 @@ async fn golden_report_to_parent_wake_bytes() {
 }
 
 /// Attention-request wakes: exact bytes for the blocker and discussion verbs.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn golden_attention_request_wake_bytes() {
     let (_t, svc, ws) = setup().await;
     let parent = AgentId::from("agent-parent");
@@ -1412,7 +1412,7 @@ async fn golden_attention_request_wake_bytes() {
 /// Watcher fan-out attention wake (monorepo#1229/#2051): an explicit
 /// non-parent `ws.agent.watch` watcher gets the remains-armed variant, with
 /// the ungrouped completion promise.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn golden_watcher_attention_wake_bytes() {
     let (_t, svc, ws) = setup().await;
     let parent = AgentId::from("agent-parent");
