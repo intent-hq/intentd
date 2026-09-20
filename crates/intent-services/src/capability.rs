@@ -1378,7 +1378,8 @@ mod tests {
     /// `addedPrincipalId` `workspace:updated`, and makes the guest's next
     /// read succeed; a second add is `{ added: false }` and publishes
     /// nothing. An unknown principal, the primary principal and a guest
-    /// without an active credential are `InvalidParams`.
+    /// without an active credential — including one already seated whose
+    /// credentials were since revoked — are `InvalidParams`.
     #[tokio::test]
     async fn add_member_grants_visibility_and_is_idempotent() {
         let tmp = TempDb::new();
@@ -1457,6 +1458,36 @@ mod tests {
                 .await
                 .is_err(),
             "an idempotent add publishes nothing"
+        );
+
+        // Seated, then every credential revoked: the credential predicate
+        // has no already-member exception, so the add is `InvalidParams`
+        // rather than `added: false`, publishes nothing, and leaves the
+        // existing row alone.
+        f.services
+            .store
+            .revoke_all_principal_credentials(&f.outsider)
+            .await
+            .expect("revoke outsider");
+        let seated_revoked = add(&f.outsider).await.unwrap_err();
+        assert!(
+            matches!(seated_revoked, Error::InvalidParams(ref m) if m.contains("no active credential")),
+            "{seated_revoked:?}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
+                .await
+                .is_err(),
+            "a refused add publishes nothing"
+        );
+        assert_eq!(
+            f.services
+                .store
+                .get_workspace_member_role(&f.ws, &f.outsider)
+                .await
+                .expect("role"),
+            Some(WorkspaceRole::Collaborator),
+            "the refusal writes nothing"
         );
     }
 }
