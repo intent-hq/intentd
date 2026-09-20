@@ -884,13 +884,16 @@ async fn blocked_loopback_write_does_not_hold_back_admitted_output() {
     let (msg_tx, msg_rx) = mpsc::channel(STREAM_QUEUE_FRAMES);
     let (out_tx, mut out_rx) = mpsc::channel(OUTBOUND_QUEUE_FRAMES);
     let queued_bytes = Arc::new(AtomicUsize::new(0));
+    // Credit covers the whole reply so this test exercises only the outbound
+    // queue slot, never the credit window.
+    let reply_bytes = u32::try_from((OUTBOUND_QUEUE_FRAMES + 1) * READ_CHUNK_BYTES).unwrap();
     let relay = tokio::spawn(run_stream(
         1,
         Arc::new(()),
         port,
         msg_rx,
         queued_bytes.clone(),
-        CreditWindow::new(TUNNEL_INITIAL_CREDIT_BYTES),
+        CreditWindow::new(reply_bytes),
         out_tx.clone(),
         TunnelLimits::default(),
     ));
