@@ -328,6 +328,25 @@ fn status_code(response: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// Assert `response` is the guest-cap refusal: `503` carrying
+/// `Retry-After: GUEST_CAP_RETRY_AFTER_SECS` (header name case-insensitive).
+fn assert_guest_cap_refused(response: &str, ctx: &str) {
+    assert_eq!(status_code(response), 503, "{ctx}: {response}");
+    let want = intent_transport::GUEST_CAP_RETRY_AFTER_SECS.to_string();
+    let retry_after = response
+        .split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.trim().to_owned());
+    assert_eq!(
+        retry_after.as_deref(),
+        Some(want.as_str()),
+        "{ctx}: Retry-After header: {response}"
+    );
+}
+
 /// Build a WebSocket upgrade request head with optional Origin / bearer token.
 fn upgrade_req(target: &str, origin: Option<&str>, bearer: Option<&str>) -> String {
     let mut r = format!(
@@ -4726,9 +4745,12 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
 /// call only the vetted `COLLABORATOR_METHODS`; everything else is refused
 /// before dispatch with the forbidden error (`-32003`, docs/protocol §9).
 /// The happy-path client boot trace (`client.hello`, `system.capabilities`,
-/// `host.status`, `principal.me`, `workspace.list`, `events.subscribe`,
-/// `workspace.subscribe`) succeeds; `host.exec`, `browser.exec`,
-/// `forward.create`, `github.authStatus`, `mcp.servers.list` are refused;
+/// `system.status`, `host.status`, `principal.me`, `workspace.list`,
+/// `events.subscribe`, `workspace.subscribe`) succeeds — `system.status`
+/// answers the daemon snapshot (`running`, `hostname`, `prettyHostname`,
+/// `host.locality == "remote"`) so the guest's status panel and route
+/// refresh work; `host.exec`, `browser.exec`, `forward.create`,
+/// `github.authStatus`, `mcp.servers.list`, `system.shutdown` are refused;
 /// the alias `git.diff` is canonicalised to `git.diffs` before the lookup
 /// (allowed, so it reaches the router and fails on params, not on -32003);
 /// a `/tunnel` upgrade with the collaborator credential is refused (403). The
@@ -4760,7 +4782,12 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         .expect("reply within 10s")
     }
 
-    let srv = start(WsOptions::default()).await;
+    // Wire the control surface so `system.status` is answered from the
+    // connection-task fast path, exactly as the composition root does.
+    let control: Arc<dyn SystemControl> = Arc::new(WatchHealthControl {
+        health: WatchHealth::default(),
+    });
+    let srv = start_with_control(WsOptions::default(), None, None, Some(control)).await;
 
     let guest_token = "dcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc";
     let guest = Principal {
@@ -4798,6 +4825,7 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
             json!({ "clientId": "w3-guest", "name": "guest fe", "capabilities": {} }),
         ),
         ("system.capabilities", json!({})),
+        ("system.status", json!({})),
         ("host.status", json!({})),
         ("principal.me", json!({})),
         ("workspace.list", json!({})),
@@ -4815,11 +4843,32 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
             v.get("error").is_none(),
             "{method} must succeed for a collaborator: {v}"
         );
+        if method == "system.status" {
+            // The guest's daemon-status panel reads the guest-safe projection
+            // (`wss_collaborator_system_status_is_projected_to_guest_safe_fields`
+            // pins its exact shape): running flag, hostnames and the serving
+            // transport's locality (WSS ⇒ `remote`).
+            let result = &v["result"];
+            assert_eq!(result["running"], true, "system.status: {v}");
+            assert!(
+                result["hostname"].is_string(),
+                "system.status hostname: {v}"
+            );
+            assert!(
+                result["prettyHostname"].is_string(),
+                "system.status prettyHostname: {v}"
+            );
+            assert_eq!(
+                result["host"]["locality"], "remote",
+                "system.status host.locality: {v}"
+            );
+        }
     }
 
     // Owner-only methods are refused before dispatch with -32003.
     for (method, params) in [
         ("host.exec", json!({ "command": "true" })),
+        ("system.shutdown", json!({})),
         (
             "browser.exec",
             json!({ "actions": [{ "action": "listTabs" }] }),
@@ -4882,6 +4931,255 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         admin["error"]["code"], -32003,
         "administrator must not be allowlisted: {admin}"
     );
+
+    srv.ws.stop().await;
+}
+
+/// [`SystemControl`] whose snapshot reports daemon-wide activity — connected
+/// clients, live and busy agents, process / disk / file-watch / fd telemetry,
+/// the agent-memory budget and the idle-update handshake — standing in for
+/// the manager-backed counters the composition root wires. None of it is
+/// scoped to a workspace, so for a collaborator all of it is activity outside
+/// its member workspaces.
+struct BusyDaemonControl;
+
+impl SystemControl for BusyDaemonControl {
+    fn status(&self) -> SystemStatus {
+        SystemStatus {
+            listen_mode: "both".to_string(),
+            uds: true,
+            tcp: true,
+            port: Some(5180),
+            clients: 4,
+            agents: 3,
+            fingerprint: Some("AB:CD".to_string()),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            has_display: true,
+            max_agents: 20,
+            version: "0.0.0-test".to_string(),
+            build_commit: Some("0123456789abcdef".to_string()),
+            uptime_seconds: 4242,
+            local_ips: vec!["192.168.1.10".to_string()],
+            tc_address: Some("tc7f2a91.tailcat.net".to_string()),
+            hostname: "studio.local".to_string(),
+            pretty_hostname: "Owner's Studio".to_string(),
+            device_kind: Some("macStudio".to_string()),
+            hardware_model: Some("Mac Studio".to_string()),
+            cpu_percent: 42.0,
+            memory_bytes: 104_857_600,
+            child_processes: Some(9),
+            child_memory_bytes: Some(2_684_354_560),
+            child_memory_peak_bytes: Some(5_368_709_120),
+            agent_memory_budget_bytes: Some(21_474_836_480),
+            agent_memory_charged_bytes: Some(3_221_225_472),
+            queued_spawns: Some(1),
+            workspaces_disk_available_bytes: Some(250_000_000_000),
+            workspaces_disk_total_bytes: Some(1_000_000_000_000),
+            file_watch: Some(FileWatchStatus {
+                active_streams: 6,
+                total_roots: 7,
+                failed_roots: 1,
+            }),
+            fd_count: Some(312),
+            fd_limit: Some(10240),
+            update_supported: true,
+            busy_agents: 2,
+            idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+        }
+    }
+    fn host_environment(&self) -> intent_transport::HostEnvironment {
+        intent_transport::HostEnvironment {
+            hostname: "studio.local".to_string(),
+            pretty_hostname: "Owner's Studio".to_string(),
+            device_kind: Some("macStudio".to_string()),
+            hardware_model: Some("Mac Studio".to_string()),
+        }
+    }
+    fn request_shutdown(&self) {}
+    fn request_update(&self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    fn import_legacy(
+        &self,
+        _force: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
+    > {
+        Box::pin(async { Err("not supported in this test".to_string()) })
+    }
+    fn git_credential(
+        &self,
+        _client_pid: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
+    {
+        Box::pin(async { None })
+    }
+}
+
+/// Multiplayer w3, least privilege: a collaborator's `system.status` is the
+/// guest-safe projection, not the administrator's snapshot. With the daemon
+/// reporting activity a guest is not a member of (connected clients, live and
+/// busy agents, process / disk / watcher telemetry — [`BusyDaemonControl`]),
+/// the collaborator's result over WSS carries exactly the boot / routing /
+/// host-identity fields (`running`, `listenMode`, `port`, `version`,
+/// `buildCommit`, `protocolVersion`, `fingerprint`, `localIps`, `tcAddress`,
+/// `hostname`, `prettyHostname`, `host.{os, arch, locality, deviceKind,
+/// hardwareModel}`) with the administrator's values, and none of the counts,
+/// telemetry or `transports`; the administrator's own `system.status` on the
+/// same daemon still returns them all. `system.shutdown` and
+/// `system.requestUpdate` stay refused (-32003) for the collaborator even
+/// though the control surface would serve them.
+#[intent_test_macros::daemon_test]
+async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
+    use intent_core::{Principal, PrincipalId};
+    use serde_json::json;
+
+    let control: Arc<dyn SystemControl> = Arc::new(BusyDaemonControl);
+    let srv = start_with_control(WsOptions::default(), None, None, Some(control)).await;
+
+    let guest_token = "dedededededededededededededededededededededededededededededededede";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+
+    // Administrator (legacy token): the full snapshot, activity included.
+    let admin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"system.status","params":{}}"#,
+    )
+    .await;
+    assert!(admin.get("error").is_none(), "administrator: {admin}");
+    let full = &admin["result"];
+    assert_eq!(full["clients"], 4, "{admin}");
+    assert_eq!(full["agents"], 3, "{admin}");
+    assert_eq!(full["busyAgents"], 2, "{admin}");
+    assert_eq!(full["maxAgents"], 20, "{admin}");
+    assert_eq!(full["uptimeSeconds"], 4242, "{admin}");
+    assert_eq!(full["childProcesses"], 9, "{admin}");
+    assert_eq!(full["fileWatch"]["activeStreams"], 6, "{admin}");
+    assert_eq!(full["fdCount"], 312, "{admin}");
+    assert_eq!(full["updateSupported"], true, "{admin}");
+    assert!(full["idleUpdateCheck"].is_object(), "{admin}");
+    assert_eq!(full["host"]["hasDisplay"], true, "{admin}");
+
+    // Collaborator: the projection.
+    let url = format!("wss://localhost:{}/ws?token={guest_token}", srv.port);
+    let mut ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+    let resp = drive_frames(
+        &mut ws,
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"method":"system.status","params":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"system.shutdown","params":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"system.requestUpdate","params":{}}"#.to_string(),
+        ],
+    )
+    .await;
+    let guest_status = &resp[0];
+    assert_eq!(guest_status["jsonrpc"], "2.0");
+    assert_eq!(guest_status["id"], 1);
+    assert!(
+        guest_status.get("error").is_none(),
+        "collaborator system.status: {guest_status}"
+    );
+    let projected = &guest_status["result"];
+
+    let mut keys: Vec<&str> = projected
+        .as_object()
+        .expect("result object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "buildCommit",
+            "fingerprint",
+            "host",
+            "hostname",
+            "listenMode",
+            "localIps",
+            "port",
+            "prettyHostname",
+            "protocolVersion",
+            "running",
+            "tcAddress",
+            "version",
+        ],
+        "collaborator system.status keys: {guest_status}"
+    );
+    let mut host_keys: Vec<&str> = projected["host"]
+        .as_object()
+        .expect("host object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    host_keys.sort_unstable();
+    assert_eq!(
+        host_keys,
+        ["arch", "deviceKind", "hardwareModel", "locality", "os"],
+        "collaborator system.status host keys: {guest_status}"
+    );
+
+    // Retained fields carry the administrator's values (both connections are
+    // WSS, so `host.locality` is `remote` for both).
+    for key in [
+        "running",
+        "listenMode",
+        "port",
+        "version",
+        "buildCommit",
+        "protocolVersion",
+        "fingerprint",
+        "localIps",
+        "tcAddress",
+        "hostname",
+        "prettyHostname",
+    ] {
+        assert_eq!(projected[key], full[key], "{key}: {guest_status}");
+    }
+    assert!(
+        full.get("transports").is_some(),
+        "administrator snapshot carries transports: {full}"
+    );
+    assert_eq!(
+        projected["host"],
+        json!({
+            "os": full["host"]["os"],
+            "arch": full["host"]["arch"],
+            "locality": "remote",
+            "deviceKind": "macStudio",
+            "hardwareModel": "Mac Studio",
+        })
+    );
+    assert_eq!(projected["tcAddress"], "tc7f2a91.tailcat.net");
+    assert_eq!(projected["localIps"], json!(["192.168.1.10"]));
+
+    // The other `system.*` methods are refused before the control surface.
+    for (i, method) in [(1usize, "system.shutdown"), (2, "system.requestUpdate")] {
+        let v = &resp[i];
+        assert_eq!(v["id"], i + 1);
+        assert_eq!(
+            v["error"]["code"], -32003,
+            "{method} must be refused for a collaborator: {v}"
+        );
+        assert!(v.get("result").is_none(), "{v}");
+    }
+    let _ = ws.close(None).await;
 
     srv.ws.stop().await;
 }
@@ -8967,6 +9265,368 @@ async fn health_reports_ok_and_client_count() {
     )
     .await;
     assert!(resp.contains("\"clients\":1"), "health body: {resp}");
+    srv.ws.stop().await;
+}
+
+/// Guest connection caps at the `/ws` upgrade: with
+/// `maxConnectionsPerGuest = 1` a guest's second connection is `503` (with
+/// `Retry-After`) while another guest still connects; with
+/// `maxGuestConnections = 2` the third guest is `503` while the owner
+/// (legacy token, never counted) still
+/// connects; `/health` carries `guestConnections`; and a guest that
+/// disconnects gives its seat back so the refused guest is admitted.
+#[intent_test_macros::daemon_test]
+async fn wss_guest_connection_caps_refuse_503_and_release_on_disconnect() {
+    use intent_core::{Principal, PrincipalId};
+    use intent_transport::GuestConnectionLimits;
+
+    let srv = start(WsOptions {
+        guest_limits: GuestConnectionLimits {
+            max_guest_connections: 2,
+            max_connections_per_guest: 1,
+        }
+        .into(),
+        ..WsOptions::default()
+    })
+    .await;
+
+    let tokens = [
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+    ];
+    for (n, token) in tokens.iter().enumerate() {
+        let guest = Principal {
+            id: PrincipalId::new(),
+            github_user_id: None,
+            login: Some(format!("guest-{n}")),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        srv.store.upsert_principal(&guest).await.expect("guest");
+        srv.store
+            .insert_principal_credential(&guest.id, &sha256_hex(token.as_bytes()))
+            .await
+            .expect("guest credential");
+    }
+
+    let (port, cfg) = (srv.port, srv.cfg.clone());
+    let health = || {
+        let cfg = cfg.clone();
+        async move {
+            https_request(
+                port,
+                cfg,
+                "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .await
+        }
+    };
+    let guest_upgrade = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move { https_request(port, cfg, &upgrade_req("/ws", None, Some(token))).await }
+    };
+    let guest_connect = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move {
+            let url = format!("wss://localhost:{port}/ws?token={token}");
+            common::wss_connect_with_retry(port, cfg, &url).await
+        }
+    };
+    let await_guest_connections = |want: &'static str| {
+        let health = &health;
+        async move {
+            for _ in 0..100 {
+                let resp = health().await;
+                if resp.contains(want) {
+                    return resp;
+                }
+                // timing-guard: poll interval
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("guestConnections never reached {want}")
+        }
+    };
+
+    assert!(
+        health().await.contains("\"guestConnections\":0"),
+        "fresh listener"
+    );
+
+    // Guest A takes its one seat; its second upgrade is refused at the
+    // per-guest cap while guest B is still admitted.
+    let a = guest_connect(tokens[0]).await;
+    await_guest_connections("\"guestConnections\":1").await;
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "guest A over its cap");
+    let _b = guest_connect(tokens[1]).await;
+    await_guest_connections("\"guestConnections\":2").await;
+
+    // The listener-wide cap is spent: guest C is refused, the owner is not.
+    assert_guest_cap_refused(&guest_upgrade(tokens[2]).await, "listener full");
+    let _owner = connect_ws(srv.port, srv.cfg.clone()).await;
+    let resp = health().await;
+    assert!(resp.contains("\"clients\":3"), "health body: {resp}");
+    assert!(
+        resp.contains("\"guestConnections\":2"),
+        "health body: {resp}"
+    );
+
+    // Guest A leaves; its seat admits guest C.
+    drop(a);
+    await_guest_connections("\"guestConnections\":1").await;
+    let _c = guest_connect(tokens[2]).await;
+    await_guest_connections("\"guestConnections\":2").await;
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "listener full again");
+
+    srv.ws.stop().await;
+}
+
+/// Guest connection caps hot-reload: `settings.update` on
+/// `sharing.maxGuestConnections` / `sharing.maxConnectionsPerGuest` changes
+/// admission for the NEXT `/ws` upgrade with the listener still running —
+/// no daemon restart, no listener toggle. Lowering below the admitted count
+/// evicts nobody (the next guest gets `503` until connections drain);
+/// raising again lets the next upgrade through with `101`. The live cell is
+/// followed exactly as the composition root wires it
+/// (`SharedGuestLimits::follow` over the daemon's settings registry).
+#[intent_test_macros::daemon_test]
+async fn wss_guest_connection_caps_apply_live_on_settings_update() {
+    use intent_core::{Principal, PrincipalId};
+    use intent_transport::{GuestConnectionLimits, SharedGuestLimits};
+
+    let live = SharedGuestLimits::new(GuestConnectionLimits {
+        max_guest_connections: 0,
+        max_connections_per_guest: 0,
+    });
+    let srv = start(WsOptions {
+        guest_limits: live.clone(),
+        ..WsOptions::default()
+    })
+    .await;
+    let _follower = live.follow(srv.registry.clone());
+
+    let tokens = [
+        "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+    ];
+    for (n, token) in tokens.iter().enumerate() {
+        let guest = Principal {
+            id: PrincipalId::new(),
+            github_user_id: None,
+            login: Some(format!("guest-{n}")),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        srv.store.upsert_principal(&guest).await.expect("guest");
+        srv.store
+            .insert_principal_credential(&guest.id, &sha256_hex(token.as_bytes()))
+            .await
+            .expect("guest credential");
+    }
+
+    let (port, cfg) = (srv.port, srv.cfg.clone());
+    let health = || {
+        let cfg = cfg.clone();
+        async move {
+            https_request(
+                port,
+                cfg,
+                "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .await
+        }
+    };
+    let guest_upgrade = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move { https_request(port, cfg, &upgrade_req("/ws", None, Some(token))).await }
+    };
+    let guest_connect = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move {
+            let url = format!("wss://localhost:{port}/ws?token={token}");
+            common::wss_connect_with_retry(port, cfg, &url).await
+        }
+    };
+    let await_guest_connections = |want: &'static str| {
+        let health = &health;
+        async move {
+            for _ in 0..100 {
+                let resp = health().await;
+                if resp.contains(want) {
+                    return resp;
+                }
+                // timing-guard: poll interval
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("guestConnections never reached {want}")
+        }
+    };
+    // `settings.update` over the owner's WSS connection, then wait for the
+    // follower task to publish the new caps to the live cell.
+    let update_caps = |id: u64, path: &'static str, value: u32| {
+        let cfg = cfg.clone();
+        let live = live.clone();
+        async move {
+            let frame = format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"settings.update","params":{{"changes":[{{"path":"{path}","value":{value}}}]}}}}"#
+            );
+            let resp = wss_call(port, cfg, &frame).await;
+            assert_eq!(resp["id"], id);
+            assert_eq!(
+                resp["result"]["applied"][0]["path"], path,
+                "settings.update {path}: {resp}"
+            );
+            for _ in 0..100 {
+                let caps = live.get();
+                let current = match path {
+                    "sharing.maxGuestConnections" => caps.max_guest_connections,
+                    _ => caps.max_connections_per_guest,
+                };
+                if current == value {
+                    return;
+                }
+                // timing-guard: poll interval
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!(
+                "{path} never reached {value} in the live cell: {:?}",
+                live.get()
+            );
+        }
+    };
+
+    // Unlimited at start: both guests connect, guest A twice.
+    let a1 = guest_connect(tokens[0]).await;
+    let _a2 = guest_connect(tokens[0]).await;
+    let _b1 = guest_connect(tokens[1]).await;
+    await_guest_connections("\"guestConnections\":3").await;
+
+    // Lower the listener-wide cap below the admitted count: nobody is
+    // disconnected, the next upgrade is refused.
+    update_caps(1, "sharing.maxGuestConnections", 1).await;
+    let resp = health().await;
+    assert!(
+        resp.contains("\"guestConnections\":3"),
+        "no eviction on lowering: {resp}"
+    );
+    assert_guest_cap_refused(&guest_upgrade(tokens[1]).await, "over the lowered cap");
+
+    // Raise it: the next upgrade succeeds with the listener never restarted.
+    update_caps(2, "sharing.maxGuestConnections", 0).await;
+    let _b2 = guest_connect(tokens[1]).await;
+    await_guest_connections("\"guestConnections\":4").await;
+
+    // Per-guest cap: guest A holds 2 seats; a cap of 1 refuses A only, and
+    // A is admitted again once it drains below the new cap.
+    update_caps(3, "sharing.maxConnectionsPerGuest", 1).await;
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "A over its new cap");
+    let resp = health().await;
+    assert!(
+        resp.contains("\"guestConnections\":4"),
+        "no eviction on lowering the per-guest cap: {resp}"
+    );
+    drop(a1);
+    await_guest_connections("\"guestConnections\":3").await;
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "A still at its new cap");
+    update_caps(4, "sharing.maxConnectionsPerGuest", 2).await;
+    let _a3 = guest_connect(tokens[0]).await;
+    await_guest_connections("\"guestConnections\":4").await;
+
+    srv.ws.stop().await;
+}
+
+/// Guest seats are released on every exit path, not only a clean close:
+/// a malformed upgrade refused after admission returns its permit, a
+/// heartbeat-reaped connection returns its permit, and the same guest is
+/// re-admitted afterwards. The administrator credential never occupies a
+/// guest seat. Real TLS, single-seat listener, deterministic reaper via
+/// `heartbeat_gate` (promoted from the #1917 verification probe).
+#[intent_test_macros::daemon_test]
+async fn wss_guest_connection_caps_release_after_early_reject_and_heartbeat_abort() {
+    let (reap_tx, reap_rx) = tokio::sync::watch::channel(false);
+    let srv = start(WsOptions {
+        guest_limits: intent_transport::GuestConnectionLimits {
+            max_guest_connections: 1,
+            max_connections_per_guest: 1,
+        }
+        .into(),
+        heartbeat_interval: Duration::from_millis(25),
+        heartbeat_timeout: Duration::from_millis(75),
+        heartbeat_gate: Some(reap_rx),
+        ..WsOptions::default()
+    })
+    .await;
+    let token = "d6".repeat(32);
+    seed_principal(&srv.store, "caps-guest", &token).await;
+    let (port, cfg) = (srv.port, srv.cfg.clone());
+    let health = || {
+        let cfg = cfg.clone();
+        async move {
+            let response = https_request(
+                port,
+                cfg,
+                "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            let body = response.split_once("\r\n\r\n").expect("HTTP body").1;
+            serde_json::from_str::<Value>(body).expect("health JSON")["guestConnections"]
+                .as_u64()
+                .expect("guest count")
+        }
+    };
+    let wait_count = |wanted: u64| {
+        let health = &health;
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while health().await != wanted {
+                    // timing-guard: poll interval
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("guest count converges");
+        }
+    };
+
+    // A malformed upgrade (no Sec-WebSocket-Key) is refused after the seat
+    // was taken; the permit must come back every time.
+    let bad = upgrade_req("/ws", None, Some(&token))
+        .replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", "");
+    for _ in 0..3 {
+        let response = https_request(port, cfg.clone(), &bad).await;
+        assert_eq!(status_code(&response), 400);
+        assert_eq!(health().await, 0, "early-reject permit is returned");
+    }
+
+    // A silent guest occupies the only seat until the reaper aborts it; the
+    // administrator credential connects regardless and never counts.
+    let url = format!("wss://localhost:{port}/ws?token={token}");
+    for _ in 0..3 {
+        let silent = common::wss_connect_with_retry(port, cfg.clone(), &url).await;
+        wait_count(1).await;
+        let response =
+            https_request(port, cfg.clone(), &upgrade_req("/ws", None, Some(&token))).await;
+        assert_guest_cap_refused(&response, "cap is really occupied");
+        let owner = connect_ws(port, cfg.clone()).await;
+        assert_eq!(health().await, 1, "administrator credential is exempt");
+        reap_tx.send(true).expect("open heartbeat gate");
+        wait_count(0).await;
+        reap_tx.send(false).expect("close heartbeat gate");
+        drop((silent, owner));
+    }
+
+    // Re-admitted after the reaper released the seat; clean close releases too.
+    let mut readmitted = common::wss_connect_with_retry(port, cfg.clone(), &url).await;
+    wait_count(1).await;
+    readmitted.close(None).await.expect("clean close");
+    drop(readmitted);
+    wait_count(0).await;
     srv.ws.stop().await;
 }
 

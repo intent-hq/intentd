@@ -2246,6 +2246,20 @@ async fn cmd_serve(
         );
     }
     ws_options.rpc_limiter = rpc_limiter.clone();
+    // Guest connection caps (`sharing.maxGuestConnections` /
+    // `sharing.maxConnectionsPerGuest`, 0 = unlimited): ONE live cell built
+    // here (like `rpc_limiter`) and carried by every listener the runtime
+    // toggle builds later, so a toggle keeps the current values. The follower
+    // task applies `settings.update` / config.toml live-reload changes to the
+    // cell; they reach the next guest upgrade without a listener restart and
+    // never evict an admitted connection.
+    let guest_limits =
+        intent_transport::SharedGuestLimits::new(intent_transport::GuestConnectionLimits {
+            max_guest_connections: boot_settings.effective.sharing.max_guest_connections,
+            max_connections_per_guest: boot_settings.effective.sharing.max_connections_per_guest,
+        });
+    let guest_limits_task = guest_limits.follow(settings_registry.clone());
+    ws_options.guest_limits = guest_limits;
 
     // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
     // the token store for auth layers (§5.2/§5.3). Always provision for runtime
@@ -2531,6 +2545,13 @@ async fn cmd_serve(
         } else {
             None
         };
+    // Let `workspace.invite.list` stamp each open invite with its `url`
+    // (multiplayer w4): the same envelope the create fast path resolves.
+    if let Some(provider) = pairing_info.clone() {
+        services.attach_invite_link_builder(Arc::new(intent_transport::InviteLinkResolver::new(
+            provider,
+        )));
+    }
 
     let shutdown = {
         let notify = shutdown_notify.clone();
@@ -2674,6 +2695,7 @@ async fn cmd_serve(
     // that hold them.
     watcher_init_task.abort();
     config_watcher_task.abort();
+    guest_limits_task.abort();
     // Stop the MCP health monitor and reap every external MCP server's process
     // group so no orphan stdio servers survive the daemon (§18.3). The deferred
     // start task is JOINED (bounded) rather than merely aborted: a server still

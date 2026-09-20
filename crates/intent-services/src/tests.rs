@@ -16192,6 +16192,10 @@ pub(crate) mod pr {
         /// Runs at the start of every `list_comments` (the last forge read
         /// of `pr_state`), so a test can move daemon state mid-snapshot.
         on_list_comments: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Every `(query, limit)` handed to `search_users`, in call order
+        /// (the `github.users.search` tests assert trimming, the clamp and
+        /// the blank-query short-circuit).
+        seen_user_searches: std::sync::Mutex<Vec<(String, u8)>>,
         /// When true, `check_auth` reports no working credential (a revoked
         /// or missing token), exercising the invite-create live auth gate
         /// (multiplayer w4).
@@ -16283,6 +16287,28 @@ pub(crate) mod pr {
                 avatar_url: Some("https://avatars.example/u/1".into()),
                 html_url: Some("https://github.com/octocat".into()),
             })
+        }
+        async fn search_users(&self, query: &str, limit: u8) -> ScResult<Vec<UserIdentity>> {
+            self.seen_user_searches
+                .lock()
+                .unwrap()
+                .push((query.to_string(), limit));
+            Ok(vec![
+                UserIdentity {
+                    login: "octocat".into(),
+                    id: Some(583_231),
+                    name: Some("The Octocat".into()),
+                    avatar_url: Some("https://avatars.example/u/1".into()),
+                    html_url: Some("https://github.com/octocat".into()),
+                },
+                UserIdentity {
+                    login: "octodog".into(),
+                    id: Some(7),
+                    name: None,
+                    avatar_url: None,
+                    html_url: None,
+                },
+            ])
         }
         async fn list_repos(&self, page: PageParams) -> ScResult<Page<Repo>> {
             if self.paginate {
@@ -17270,6 +17296,85 @@ pub(crate) mod pr {
         assert_eq!(user["htmlUrl"], "https://github.com/octocat");
         assert!(user.get("id").is_none());
         assert!(user.get("name").is_none());
+    }
+
+    /// `github.users.search`: hits carry `id` / `login` / `avatarUrl` /
+    /// `htmlUrl` (optionals default to `""`, engine `name` dropped); the
+    /// query reaches the forge trimmed with the default limit of 8, and an
+    /// explicit limit is clamped into `[1, 10]`.
+    #[intent_test_macros::daemon_test]
+    async fn github_users_search_shapes_hits_and_clamps_limit() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let v = svc
+            .github_users_search("  octo ".into(), None)
+            .await
+            .expect("search");
+        assert_eq!(
+            v,
+            json!({
+                "users": [
+                    {
+                        "id": 583_231,
+                        "login": "octocat",
+                        "avatarUrl": "https://avatars.example/u/1",
+                        "htmlUrl": "https://github.com/octocat",
+                    },
+                    { "id": 7, "login": "octodog", "avatarUrl": "", "htmlUrl": "" },
+                ]
+            })
+        );
+        svc.github_users_search("octo".into(), Some(0))
+            .await
+            .expect("clamped low");
+        svc.github_users_search("octo".into(), Some(99))
+            .await
+            .expect("clamped high");
+        assert_eq!(
+            *forge.seen_user_searches.lock().unwrap(),
+            vec![
+                ("octo".to_string(), 8),
+                ("octo".to_string(), 1),
+                ("octo".to_string(), 10),
+            ]
+        );
+    }
+
+    /// A blank / whitespace-only `query` answers `{ users: [] }` without a
+    /// forge round trip.
+    #[intent_test_macros::daemon_test]
+    async fn github_users_search_blank_query_short_circuits() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        for query in ["", "   ", "\t\n"] {
+            let v = svc
+                .github_users_search(query.into(), Some(5))
+                .await
+                .expect("blank search");
+            assert_eq!(v, json!({ "users": [] }), "query {query:?}");
+        }
+        assert!(forge.seen_user_searches.lock().unwrap().is_empty());
+    }
+
+    /// `github.users.search` is administrator-only: a collaborator wire
+    /// caller is refused `-32003` before the forge is reached (default-deny,
+    /// the method is not in `COLLABORATOR_METHODS`).
+    #[tokio::test]
+    async fn github_users_search_refuses_collaborator_caller() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let collaborator = intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            is_administrator: false,
+        };
+        let err =
+            intent_core::with_caller(collaborator, svc.github_users_search("octo".into(), None))
+                .await
+                .expect_err("collaborator must be refused");
+        assert!(matches!(err, Error::Forbidden(_)), "{err:?}");
+        assert_eq!(err.code(), -32003);
+        assert!(err.to_string().contains("github.users.search"), "{err}");
+        assert!(forge.seen_user_searches.lock().unwrap().is_empty());
     }
 
     #[intent_test_macros::daemon_test]

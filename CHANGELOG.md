@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.87] - 2026-09-20
+
+### 🚀 Features
+
+- *(transport)* Tunnel CREDIT frame and per-stream daemon→client credit window ([#2022](https://github.com/intent-hq/intentd/pull/2022))
+
+
 ## [0.9.86] - 2026-09-20
 
 ### 🚀 Features

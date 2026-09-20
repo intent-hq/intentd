@@ -498,9 +498,32 @@
 //! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-denied`, …). Also
 //! within 10.3, ephemeral presence (multiplayer w5): `presence.update` /
 //! `note.presence.update` (fast path), `presence.snapshot`, and the
-//! `note.presence.subscribe` / `note.presence.unsubscribe` channel pair. The
-//! catalog contains 323 router methods, 53 fast-path methods, and two
-//! aliases: 378 client-callable names.
+//! `note.presence.subscribe` / `note.presence.unsubscribe` channel pair.
+//! Also within 10.3, the collaborator picker's `github.users.search`
+//! router method (additive; §5.27, administrator-only): login-prefix user
+//! search over `GET /search/users` — `{ query, limit? }` → `{ users: [{ id,
+//! login, avatarUrl, htmlUrl }] }`. `query` is required (`-32602` when
+//! missing; a blank query answers `{ users: [] }` without a forge call); the
+//! forge request keeps only the leading run of login characters (ASCII
+//! alphanumerics and `-`), so search qualifiers / booleans typed after it
+//! never reach GitHub's search parser and a query with no such prefix
+//! answers `{ users: [] }`; `limit` defaults to 8 and is clamped into
+//! `[1, 10]`. Also within 10.3,
+//! `workspace.invite.list` rows (and the `invite` of `workspace.invite.create`)
+//! carry the additive `url` — the open invite's `intent://invite?…` link
+//! rebuilt from the stored secret — omitted when the row predates the
+//! stored secret or no link can be built right now (listener down, no
+//! dialable route); the secret itself never appears as a field. Also within
+//! 10.3, guest caps: `workspace.invite.create` refuses with
+//! `error.data.code` `guest-limit` once a workspace's collaborators plus
+//! open invites reach `sharing.maxGuestsPerWorkspace`, the join refuses with
+//! `workspace-full` (the invite stays open) once its collaborators do, and
+//! `workspace.members.list` carries the additive `guestCount` / `guestLimit`;
+//! a per-principal credential's `/ws` upgrade is refused with `503` while
+//! `sharing.maxGuestConnections` / `sharing.maxConnectionsPerGuest` are
+//! spent, and `GET /health` carries the additive `guestConnections`. The
+//! catalog contains 324 router methods, 53 fast-path methods, and two
+//! aliases: 379 client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release
@@ -519,8 +542,8 @@
 //! `host`, the `device-grant-unsupported` / `source-control-unauthorized`
 //! typed errors, the `sourceControl:auth-changed { provider, host, status }`
 //! event and the `sourceControl.gitlab.*` settings. The `github.*` auth
-//! quintet is served as byte-identical aliases. The catalog contains 328
-//! router methods, 53 fast-path methods, and two aliases: 383
+//! quintet is served as byte-identical aliases. The catalog contains 329
+//! router methods, 53 fast-path methods, and two aliases: 384
 //! client-callable names.
 
 use std::sync::Mutex;
