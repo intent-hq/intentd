@@ -387,7 +387,7 @@ fn text_block_entities(delta: &Value) -> Vec<(&'static str, Value)> {
 /// fragment (`textDelta`, never accumulated `text`), non-text blocks pass
 /// through whole, the terminal reconcile emits authoritative full blocks, and
 /// the documented append reducer converges to `agent.getConversation` (§7.1).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_incremental_subscription_streams_fragments_and_converges() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -560,7 +560,7 @@ async fn chat_incremental_subscription_streams_fragments_and_converges() {
 /// Omitting `deltaEncoding` keeps the wire byte-identical to today: no
 /// `deltaEncoding` echo on the snapshot and full accumulated `text` (no
 /// `textDelta`) on live chunk deltas.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_default_subscription_still_streams_full_text() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -620,7 +620,7 @@ async fn chat_default_subscription_still_streams_full_text() {
 
 /// An unknown `deltaEncoding` is rejected as invalid params (`-32602`), never
 /// silently coerced to a mode the client did not ask for.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_rejects_unknown_delta_encoding() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -649,7 +649,7 @@ async fn chat_subscribe_rejects_unknown_delta_encoding() {
 /// Lag recovery on an incremental subscription re-emits a BOUNDED snapshot at
 /// the next seq that ALSO echoes `deltaEncoding: "incremental"`, and the
 /// replacement mapper keeps streaming fragments afterwards.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_incremental_lag_recovery_snapshot_echoes_encoding() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;

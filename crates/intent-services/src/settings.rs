@@ -366,7 +366,7 @@ impl AsyncSecretStore {
         let inner = self.inner.clone();
         let state = self.state.clone();
         let ttl = self.cache_ttl;
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let load_account = account.clone();
             let result: Result<Option<String>> =
                 match tokio::task::spawn_blocking(move || inner.load(&load_account)).await {

@@ -4445,6 +4445,292 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.members.list` (multiplayer w3): the members of a workspace
+    /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
+    /// addedAt }] }`, owners first. Member-visible; a non-member gets
+    /// `NotFound`.
+    fn workspace_members_list(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_members_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.members.remove` (multiplayer w3): drop a collaborator from
+    /// a workspace → `{ removed: bool }`. Owner-only; the owner membership
+    /// itself cannot be removed (`InvalidParams`). The removed member's
+    /// queued user messages in the workspace are dropped.
+    fn workspace_members_remove(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_members_remove not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.members.leave` (multiplayer w4): the bound caller drops its
+    /// own collaborator membership → `{ left: bool }`. An owner cannot leave
+    /// (`InvalidParams`); a non-member gets `NotFound`. Same teardown as
+    /// `workspace.members.remove` (queued messages dropped, `workspace:updated`
+    /// with `removedPrincipalId`).
+    fn workspace_members_leave(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_members_leave not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `principal.revokeSelf` (multiplayer w4): a per-principal wire caller
+    /// revokes every one of its own credentials and leaves every workspace it
+    /// collaborates in → `{ revoked: true, credentials, workspaces }`. Its
+    /// live connections are closed (the transport observes
+    /// [`Self::subscribe_principal_revocations`]). The daemon administrator
+    /// (legacy token) cannot revoke itself (`InvalidParams`).
+    fn principal_revoke_self(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::principal_revoke_self not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Transport seam (multiplayer w4): a live feed of principal ids whose
+    /// credentials were just revoked, so a listener can close the connections
+    /// still bound to them. `None` when the implementation has no principal
+    /// store (test stubs).
+    fn subscribe_principal_revocations(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<PrincipalId>> {
+        None
+    }
+
+    // Presence (multiplayer w5). The daemon keeps an ephemeral, in-memory
+    // presence table keyed by (principal, connection); `connection_id` is the
+    // transport's per-connection token (never a wire parameter). Every call
+    // resolves the principal from the bound `Caller::Wire`; agent / daemon
+    // callers and unbound requests are refused (`Forbidden`). Nothing here is
+    // persisted: the events are transient only.
+
+    /// A hello'd connection came online for its principal. Publishes
+    /// `presence:changed` to every workspace the principal is a member of
+    /// when this is its first live connection.
+    fn presence_connect(&self, connection_id: String) -> BoxFuture<'_, Result<()>> {
+        let _ = connection_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::presence_connect not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `presence.update({ focus: [{ workspaceId, agentId?, noteId? }],
+    /// typing?: { agentId } })`: replace the connection's focus set (sent
+    /// whole) and typing target → `{ ok: true, typingSource }`, where
+    /// `typingSource` is the connection's own opaque, daemon-minted typing
+    /// source handle (the `source` its typing entry carries in
+    /// `presence:changed`, so the client can suppress only itself). Every
+    /// update naming a typing agent is a keystroke pulse: the entry's
+    /// `pulse` counter advances (a receiver restarts its expiry timer on an
+    /// unseen `(source, pulse)`, never on wall clocks) while `since` stays
+    /// the episode start; other connections' updates re-project the entry
+    /// unchanged. Requires
+    /// a hello'd connection; every focused workspace and the typing agent's
+    /// workspace must be a member workspace (`NotFound` otherwise). Publishes
+    /// `presence:changed` to each workspace whose aggregate changed.
+    fn presence_update(
+        &self,
+        connection_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (connection_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::presence_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `presence.snapshot({ workspaceId })`: the current `presence:changed`
+    /// roster of a member workspace on demand — `{ workspaceId, members }`
+    /// with the same member rows the event carries — for a client that
+    /// attached its event subscription after its hello (or a second
+    /// connection of an already-online principal, whose hello publishes
+    /// nothing). Member+; a non-member sees `NotFound`.
+    fn presence_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::presence_snapshot not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// A connection closed (clean close or heartbeat reap alike): drop its
+    /// presence row and every note-presence lease it held, publishing the
+    /// resulting `presence:changed` / `note:presence` deltas. Never fails.
+    fn presence_disconnect(&self, connection_id: String) -> BoxFuture<'_, ()> {
+        let _ = connection_id;
+        Box::pin(async {})
+    }
+
+    /// `note.presence.subscribe` join half: register lease `lease_id` of the
+    /// connection as a viewer of `note_id` → the seq-0 snapshot
+    /// `{ viewers: [{ principalId, login?, displayName?, avatarUrl?,
+    /// cursor? }] }` (the caller included). Member-only (`NotFound` for a
+    /// non-member); publishes `note:presence { kind: "joined" }` when the
+    /// principal was not yet viewing the note.
+    fn note_presence_join(
+        &self,
+        connection_id: String,
+        lease_id: String,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (connection_id, lease_id, workspace_id, note_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::note_presence_join not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Release one note-presence lease (unsubscribe or connection close);
+    /// publishes `note:presence { kind: "left" }` when it was the principal's
+    /// last lease on the note. Never fails.
+    fn note_presence_leave(&self, connection_id: String, lease_id: String) -> BoxFuture<'_, ()> {
+        let _ = (connection_id, lease_id);
+        Box::pin(async {})
+    }
+
+    /// `note.presence.update({ workspaceId, noteId, rev, anchor, head })`:
+    /// the connection's caret on a note it is subscribed to → `{ ok: true }`.
+    /// Member+ on every call (`NotFound` for a non-member — a lease outlives
+    /// a membership removal, and a caret still deferred when the membership
+    /// ended is dropped rather than flushed); `InvalidParams` when the
+    /// connection holds no lease on the note. The daemon stamps the
+    /// principal and coalesces the resulting `note:presence { kind:
+    /// "updated" }` deltas to ≤10/s per (principal, note), last writer wins.
+    fn note_presence_update(
+        &self,
+        connection_id: String,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        cursor: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (connection_id, workspace_id, note_id, cursor);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::note_presence_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.invite.create` (multiplayer w4), service half: mint a
+    /// single-use invite for `workspace_id` → `{ invite, secret }` where
+    /// `secret` is returned exactly once (only its hash is stored). Owner-only.
+    /// Refused with `InviteErrorKind::GithubIdentityRequired` unless the
+    /// owner's GitHub identity is linked; `pin_login` (a GitHub login) is
+    /// resolved to its account id and stored as the pin
+    /// (`InviteErrorKind::PinUnknown` when it names no account). The first
+    /// invite of a workspace sets its `legacy_author_principal_id` to the
+    /// owner when unset. `expires_in_secs` defaults to 7 days. The transport
+    /// wraps the result into the `intent://invite?…` link.
+    fn workspace_invite_create(
+        &self,
+        workspace_id: WorkspaceId,
+        pin_login: Option<String>,
+        expires_in_secs: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, pin_login, expires_in_secs);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_invite_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.invite.list` (multiplayer w4): the open invites of a
+    /// workspace → `{ invites: [WorkspaceInvite] }` (secrets never included).
+    /// Owner-only.
+    fn workspace_invite_list(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_invite_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.invite.revoke` (multiplayer w4): revoke an open invite of
+    /// `workspace_id` → `{ revoked: bool }` (`false` when already closed).
+    /// Owner-only; an invite of another workspace is `NotFound`.
+    fn workspace_invite_revoke(
+        &self,
+        workspace_id: WorkspaceId,
+        invite_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, invite_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_invite_revoke not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.redeem` phase 1 (multiplayer w4, unauthenticated `/invite`
+    /// endpoint): validate `(invite_id, secret)` and start an identity-only
+    /// GitHub device flow → `{ flowId, userCode, verificationUri, expiresIn,
+    /// interval, workspaceId, workspaceTitle }`. The access token the flow
+    /// yields is used once for `GET /user` and never persisted.
+    fn invite_redeem_start(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_redeem_start not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.redeem` phase 2 (multiplayer w4): wait for the flow started by
+    /// [`Self::invite_redeem_start`] to settle → `{ status: "authorized",
+    /// token, principalId, login, workspaceId }` exactly once (the flow is
+    /// forgotten after the result is collected), or the terminal
+    /// [`crate::InviteErrorKind`] error (denied / expired / pin mismatch /
+    /// invite closed meanwhile).
+    fn invite_redeem_wait(&self, flow_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = flow_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_redeem_wait not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Transport seam: the daemon's primary principal, bound to UDS
     /// connections and to the legacy file bearer token at WSS upgrade.
     /// Errors when the composition root has no principal store (test stubs);

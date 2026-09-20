@@ -144,6 +144,10 @@ async fn refuse_if_caller_retired(
 /// left to receive it — the wait elapsed, or the host future holding the
 /// receiver was dropped mid-wait — the spawned side itself hands it to
 /// [`log_late_send_outcome`] under `send_label`.
+///
+/// The spawned task re-binds the request's task-local `Caller` (the calling
+/// agent) so the service calls it makes reach the fail-closed capability
+/// gates bound; a bare spawn would arrive unbound and be refused.
 pub(crate) async fn spawn_send_within_budget<F>(
     eval_budget: EvalBudget,
     send_label: String,
@@ -156,7 +160,10 @@ where
     let wait = send_wait_ceiling(eval_budget.remaining());
     let started = Instant::now();
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, String>>();
-    let op = tokio::spawn(fut);
+    let op = match intent_core::current_caller() {
+        Some(caller) => tokio::spawn(intent_core::with_caller(caller, fut)),
+        None => tokio::spawn(fut),
+    };
     tokio::spawn(async move {
         let result = match op.await {
             Ok(result) => result,

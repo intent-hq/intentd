@@ -2590,7 +2590,11 @@ impl Services {
         let Some(manager) = self.agent_manager() else {
             return Ok(json!({ "streams": [] }));
         };
-        let busy = manager.list_busy();
+        let mut busy = manager.list_busy();
+        // Cross-workspace surface: a collaborator sees only member workspaces.
+        if let Some(visible) = self.visible_workspace_ids().await? {
+            busy.retain(|(_, workspace_id)| visible.contains(workspace_id));
+        }
         if busy.is_empty() {
             return Ok(json!({ "streams": [] }));
         }
@@ -4884,7 +4888,7 @@ impl Services {
         if let Some(existing) =
             self.pending_agent_deletes
                 .schedule(key, delete_at.clone(), move |generation| {
-                    tokio::spawn(async move {
+                    intent_core::spawn_daemon(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         // Claim-or-abstain: only the timer that still owns the
                         // entry commits. A cancel or an immediate delete that
@@ -9358,7 +9362,7 @@ impl Services {
                         _release: settled,
                     };
                     let ws_id = workspace_id.clone();
-                    tokio::spawn(async move {
+                    intent_core::spawn_daemon(async move {
                         guard
                             .services
                             .provision_delegate_sandbox(&ws_id, &guard.aid, root)
@@ -12568,7 +12572,7 @@ impl Services {
             // Post-restart recovery: a woken agent must resume pending work.
             if !queued {
                 if let Some(mgr) = self.agent_manager() {
-                    tokio::spawn({
+                    intent_core::spawn_daemon({
                         let mgr = mgr.clone();
                         let agent_id = agent_id.clone();
                         let workspace_id = target_home_ws;
@@ -14009,7 +14013,7 @@ impl Services {
         let services = self.clone();
         let agent = agent_id.clone();
         let mid = message_id.to_string();
-        let task = tokio::spawn(async move {
+        let task = intent_core::spawn_daemon(async move {
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }

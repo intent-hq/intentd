@@ -221,6 +221,36 @@ fn chat_channel_tails_stream_family_and_message() {
     assert!(!channel_is_global(Channel::Chat));
 }
 
+/// Multiplayer w3: every type a collaborator-callable subscription channel
+/// tails is on the collaborator event allowlist, so the match-time
+/// `collaborator_only` guard never silently starves a channel a guest may
+/// open (`note` / `task` / `agent` / `workspace` / `comment` / `chat` are all
+/// in `COLLABORATOR_METHODS`). A channel that starts tailing an owner-only
+/// type must either vet it in `COLLABORATOR_EVENT_TYPES` or be removed from
+/// the method allowlist.
+#[test]
+fn channel_event_types_are_all_collaborator_visible() {
+    for channel in [
+        Channel::Note,
+        Channel::Task,
+        Channel::Agent,
+        Channel::Workspace,
+        Channel::Comment,
+        Channel::Chat,
+    ] {
+        let types = channel_event_types(channel);
+        assert!(!types.is_empty(), "{channel:?} tails no types");
+        let hidden: Vec<&String> = types
+            .iter()
+            .filter(|t| !intent_core::events::is_collaborator_event_type(t))
+            .collect();
+        assert!(
+            hidden.is_empty(),
+            "{channel:?} channel tails types outside COLLABORATOR_EVENT_TYPES: {hidden:?}"
+        );
+    }
+}
+
 #[test]
 fn comment_params_require_workspace_and_note() {
     let ok = parse(r#"{"workspaceId":"w","noteId":"n","replaceGroup":"comment:n"}"#);
@@ -2410,13 +2440,13 @@ mod workspace_delta_chief {
             // Id resolved from `data.workspaceId` …
             let from_data = workspace_event(event_type, "w", Some(CHIEF_WORKSPACE_ID));
             assert!(
-                workspace_delta(&api, &from_data).await.is_none(),
+                workspace_delta(&api, &from_data, None).await.is_none(),
                 "{event_type} with data.workspaceId=__chief__ must map to no delta"
             );
             // … and from the event's own `workspaceId` fallback.
             let from_event = workspace_event(event_type, CHIEF_WORKSPACE_ID, None);
             assert!(
-                workspace_delta(&api, &from_event).await.is_none(),
+                workspace_delta(&api, &from_event, None).await.is_none(),
                 "{event_type} scoped to __chief__ must map to no delta"
             );
         }
@@ -2432,15 +2462,19 @@ mod workspace_delta_chief {
         let api = AnyWorkspaceApi {
             reads: AtomicUsize::new(0),
         };
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_UPDATED, "w", Some("w")))
-            .await
-            .expect("real workspace update maps to a delta");
+        let d = workspace_delta(
+            &api,
+            &workspace_event(WORKSPACE_UPDATED, "w", Some("w")),
+            None,
+        )
+        .await
+        .expect("real workspace update maps to a delta");
         assert_eq!(d["updated"][0]["id"], "w", "delta: {d}");
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_CREATED, "w", None))
+        let d = workspace_delta(&api, &workspace_event(WORKSPACE_CREATED, "w", None), None)
             .await
             .expect("real workspace create maps to a delta");
         assert_eq!(d["added"][0]["id"], "w", "delta: {d}");
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_DELETED, "w", None))
+        let d = workspace_delta(&api, &workspace_event(WORKSPACE_DELETED, "w", None), None)
             .await
             .expect("real workspace delete maps to a delta");
         assert_eq!(d["removedIds"][0], "w", "delta: {d}");
@@ -2538,7 +2572,7 @@ mod workspace_delta_list_projection {
             (WORKSPACE_UPDATED, "updated"),
             (PR_UPDATED, "updated"),
         ] {
-            let d = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type))
+            let d = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type), None)
                 .await
                 .expect("delta");
             let row = &d[key][0];
@@ -4579,5 +4613,735 @@ mod chat_terminal_reconcile_failure {
             );
             assert_eq!(updated[0]["streamingComplete"], true);
         }
+    }
+}
+
+/// Multiplayer w3 delivery-time membership on the channel fast-paths: the
+/// per-agent `chat` channel maps chunk/tool deltas straight from the event
+/// payload, and the global `workspace` channel emits `workspace:deleted`
+/// tombstones without a re-read — both driven through the REAL
+/// [`crate::conn::handle_sub_fast_path`] under a non-administrator caller.
+mod channel_membership {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use futures::future::BoxFuture;
+    use intent_core::events::{
+        AGENT_DELETED, AGENT_TOOL_CALL, CHAT_STREAM_DELTA, NOTE_DELETED, WORKSPACE_DELETED,
+        WORKSPACE_UPDATED,
+    };
+    use intent_core::{
+        ActorType, AgentId, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi,
+        WorkspaceId,
+    };
+    use intent_services::EventBus;
+    use intent_store::{NewEvent, Store};
+    use serde_json::{json, Value};
+
+    use crate::conn::{handle_sub_fast_path, outbound_channel, ConnSubs, OutboundReceiver};
+    use crate::subscriptions::classify;
+
+    /// The service layer as a collaborator sees it: `workspace.get` /
+    /// `workspace.list` answer only the `members` workspaces, and
+    /// `agent.getConversation` is the guarded read — an empty page for a
+    /// member's agent, `NotFound` otherwise (agent `agent-N` lives in
+    /// `ws-N`) — while the live-turn overlay reads (`agent_live_turn`,
+    /// `agent_is_busy`) are NOT gated, exactly as in production.
+    struct MembershipApi {
+        members: Arc<Mutex<HashSet<String>>>,
+    }
+
+    /// Marker entry in `members`: the guarded conversation read fails
+    /// transiently (a store error inside `require_agent_member`) instead of
+    /// answering, for every caller.
+    const STORE_DOWN: &str = "!store-down";
+
+    impl MembershipApi {
+        fn allowed(&self, workspace_id: &str) -> bool {
+            !crate::context::is_non_administrator_caller()
+                || self.members.lock().unwrap().contains(workspace_id)
+        }
+
+        fn store_down(&self) -> bool {
+            self.members.lock().unwrap().contains(STORE_DOWN)
+        }
+    }
+
+    fn agent_workspace(agent_id: &str) -> String {
+        agent_id.replacen("agent-", "ws-", 1)
+    }
+
+    impl WorkspaceApi for MembershipApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
+            let allowed = self.allowed(id.as_str());
+            Box::pin(async move {
+                if allowed {
+                    Ok(Workspace {
+                        id,
+                        ..intent_core::chief_workspace()
+                    })
+                } else {
+                    Err(Error::NotFound(format!("workspace {id}")))
+                }
+            })
+        }
+
+        fn list_workspaces(
+            &self,
+            _include_archived: bool,
+        ) -> BoxFuture<'_, intent_core::Result<Vec<Workspace>>> {
+            let mut ids: Vec<String> = self.members.lock().unwrap().iter().cloned().collect();
+            ids.sort();
+            Box::pin(async move {
+                Ok(ids
+                    .into_iter()
+                    .map(|id| Workspace {
+                        id: WorkspaceId::from(id),
+                        ..intent_core::chief_workspace()
+                    })
+                    .collect())
+            })
+        }
+
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+            _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
+        ) -> BoxFuture<'_, intent_core::Result<Value>> {
+            let store_down = self.store_down();
+            let allowed = self.allowed(&agent_workspace(agent_id.as_str()));
+            Box::pin(async move {
+                if store_down {
+                    return Err(Error::Internal("membership lookup failed".into()));
+                }
+                if !allowed {
+                    return Err(Error::NotFound(format!("agent {agent_id}")));
+                }
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [],
+                    "truncated": false,
+                    "totalMessages": 0,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+
+        fn agent_is_busy(&self, _agent_id: AgentId) -> bool {
+            true
+        }
+
+        fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            Some(json!({
+                "messageId": "msg-live",
+                "contentBlocks": [
+                    { "id": "msg-live:0", "type": "text", "text": "live secret" }
+                ],
+            }))
+        }
+
+        /// The guarded `agent.get` (`require_agent_member`): the agent's
+        /// workspace for a member, `NotFound` otherwise.
+        fn agent_get(
+            &self,
+            agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, intent_core::Result<intent_core::AgentLite>> {
+            let workspace_id = agent_workspace(agent_id.as_str());
+            let allowed = self.allowed(&workspace_id);
+            Box::pin(async move {
+                if !allowed {
+                    return Err(Error::NotFound(format!("agent {agent_id}")));
+                }
+                let now = intent_core::now_iso();
+                Ok(serde_json::from_value(json!({
+                    "id": agent_id.as_str(),
+                    "workspaceId": workspace_id,
+                    "name": agent_id.as_str(),
+                    "status": "idle",
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "messageCount": 0,
+                    "metadata": { "isBackground": false },
+                }))
+                .expect("AgentLite from its wire shape"))
+            })
+        }
+    }
+
+    fn event(
+        event_type: &str,
+        workspace_id: &str,
+        session_id: Option<&str>,
+        data: Value,
+    ) -> NewEvent {
+        NewEvent {
+            workspace_id: WorkspaceId::from(workspace_id),
+            timestamp: intent_core::now_iso(),
+            event_type: event_type.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::System,
+                id: Some("system".to_string()),
+                ..Default::default()
+            },
+            session_id: session_id.map(str::to_string),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        }
+    }
+
+    fn chunk(workspace_id: &str, agent_id: &str, text: &str) -> NewEvent {
+        event(
+            CHAT_STREAM_DELTA,
+            workspace_id,
+            Some(agent_id),
+            json!({
+                "agentId": agent_id,
+                "content": text,
+                "messageId": "m-1",
+                "blockIndex": 0,
+                "blockId": "m-1:0",
+                "blockType": "text",
+            }),
+        )
+    }
+
+    fn tool_call(workspace_id: &str, agent_id: &str) -> NewEvent {
+        event(
+            AGENT_TOOL_CALL,
+            workspace_id,
+            Some(agent_id),
+            json!({
+                "agentId": agent_id,
+                "messageId": "m-1",
+                "toolCallId": "tc-1",
+                "title": "ls",
+                "status": "pending",
+            }),
+        )
+    }
+
+    fn unshare(workspace_id: &str, principal_id: &str) -> NewEvent {
+        event(
+            WORKSPACE_UPDATED,
+            workspace_id,
+            None,
+            json!({ "changes": { "members": true, "removedPrincipalId": principal_id } }),
+        )
+    }
+
+    /// Every `subscription.push` delta on the bulk lane until it stays quiet.
+    async fn deltas(rx: &mut OutboundReceiver) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
+        {
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["method"], "subscription.push");
+            out.push(v["params"]["delta"].clone());
+        }
+        out
+    }
+
+    struct Harness {
+        bus: EventBus,
+        rx: OutboundReceiver,
+        subs: ConnSubs,
+        members: Arc<Mutex<HashSet<String>>>,
+        subscription_id: String,
+        snapshot: Value,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Subscribe `raw` through the real fast path under `caller`, returning
+    /// the harness after the seq-0 snapshot has been received.
+    async fn subscribe(caller: Caller, members: &[&str], raw: Value) -> Harness {
+        let dir = tempfile::Builder::new()
+            .prefix("intent-transport-channel-membership-")
+            .tempdir()
+            .unwrap();
+        let store = Store::open(&dir.path().join("bus.db")).await.unwrap();
+        let bus = EventBus::new(store);
+        let members = Arc::new(Mutex::new(
+            members
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<HashSet<_>>(),
+        ));
+        let api: Arc<dyn WorkspaceApi> = Arc::new(MembershipApi {
+            members: Arc::clone(&members),
+        });
+        let (out_tx, mut rx) = outbound_channel();
+        let mut subs = ConnSubs::default();
+        let sub = classify(&raw).expect("classifies as a fast-path subscribe");
+        let (bus_ref, out_ref, subs_ref, api_ref) = (&bus, &out_tx, &mut subs, &api);
+        let accepted = crate::context::with_request_context(true, Some(caller), async move {
+            handle_sub_fast_path(sub, api_ref, bus_ref, out_ref, subs_ref).await
+        })
+        .await;
+        assert!(accepted);
+        let reply: Value = serde_json::from_str(&rx.priority.recv().await.unwrap()).unwrap();
+        let subscription_id = reply["result"]["subscriptionId"]
+            .as_str()
+            .expect("subscription id")
+            .to_string();
+        let push: Value = serde_json::from_str(&rx.bulk.recv().await.unwrap()).unwrap();
+        assert_eq!(push["params"]["seq"], 0, "{push}");
+        Harness {
+            bus,
+            rx,
+            subs,
+            members,
+            subscription_id,
+            snapshot: push["params"]["snapshot"].clone(),
+            _dir: dir,
+        }
+    }
+
+    fn guest() -> (PrincipalId, Caller) {
+        let principal_id = PrincipalId::new();
+        let caller = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        (principal_id, caller)
+    }
+
+    fn chat_subscribe(agent_id: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"chat.subscribe","params":{"agentId":agent_id}})
+    }
+
+    /// The seq-0 snapshot's live overlay follows the guarded page read: a
+    /// member connecting mid-turn gets the in-flight message, a non-member
+    /// gets the bare empty page — no live message, no streaming flag —
+    /// even though the overlay reads themselves are not gated.
+    #[tokio::test]
+    async fn chat_seq0_live_overlay_follows_the_guarded_read() {
+        let (_, caller) = guest();
+        let member = subscribe(caller.clone(), &["ws-1"], chat_subscribe("agent-1")).await;
+        assert_eq!(member.snapshot["messages"][0]["id"], "msg-live");
+        assert_eq!(
+            member.snapshot["messages"][0]["contentBlocks"][0]["text"],
+            "live secret"
+        );
+        drop(member.subs);
+
+        let stranger = subscribe(caller, &["ws-1"], chat_subscribe("agent-2")).await;
+        assert_eq!(
+            stranger.snapshot["messages"],
+            json!([]),
+            "{}",
+            stranger.snapshot
+        );
+        assert_eq!(stranger.snapshot["totalMessages"], 0);
+        assert!(
+            stranger.snapshot.get("isStreaming").is_none(),
+            "{}",
+            stranger.snapshot
+        );
+        drop(stranger.subs);
+    }
+
+    /// A transient failure of the guarded read has verified nothing: a
+    /// collaborator's seq-0 page then carries no live overlay, while the
+    /// administrator keeps the degrade-with-overlay contract.
+    #[tokio::test]
+    async fn chat_seq0_transient_guard_failure_skips_overlay_for_a_collaborator() {
+        let (_, caller) = guest();
+        let member = subscribe(caller, &["ws-1", STORE_DOWN], chat_subscribe("agent-1")).await;
+        assert_eq!(
+            member.snapshot["messages"],
+            json!([]),
+            "{}",
+            member.snapshot
+        );
+        assert!(
+            member.snapshot.get("isStreaming").is_none(),
+            "{}",
+            member.snapshot
+        );
+        drop(member.subs);
+
+        let owner = Caller::Wire {
+            principal_id: PrincipalId::new(),
+            is_administrator: true,
+        };
+        let admin = subscribe(owner, &[STORE_DOWN], chat_subscribe("agent-1")).await;
+        assert_eq!(
+            admin.snapshot["messages"][0]["id"], "msg-live",
+            "{}",
+            admin.snapshot
+        );
+        drop(admin.subs);
+    }
+
+    /// A non-member's `chat.subscribe` to a private workspace's agent gets
+    /// the empty guarded snapshot and then NO live chunk or tool deltas.
+    #[tokio::test]
+    async fn chat_live_deltas_are_refused_to_a_non_member() {
+        let (_, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], chat_subscribe("agent-2")).await;
+        assert_eq!(h.snapshot["messages"], json!([]));
+        h.bus
+            .publish(&chunk("ws-2", "agent-2", "secret"))
+            .await
+            .unwrap();
+        h.bus.publish(&tool_call("ws-2", "agent-2")).await.unwrap();
+        assert!(deltas(&mut h.rx).await.is_empty(), "no live delta leaks");
+        drop(h.subs);
+    }
+
+    /// A member receives the live stream; its own removal from the agent's
+    /// workspace ends delivery AND exits the forwarder, while another
+    /// member's removal leaves the stream live.
+    #[tokio::test]
+    async fn chat_member_stream_is_torn_down_on_own_removal() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], chat_subscribe("agent-1")).await;
+        h.bus
+            .publish(&chunk("ws-1", "agent-1", "Hel"))
+            .await
+            .unwrap();
+        let first = deltas(&mut h.rx).await;
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0]["added"][0]["block"]["text"], "Hel", "{first:?}");
+
+        // Someone else's unshare of ws-1: still a member, still live.
+        h.bus
+            .publish(&unshare("ws-1", "someone-else"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus
+            .publish(&chunk("ws-1", "agent-1", "lo"))
+            .await
+            .unwrap();
+        assert_eq!(deltas(&mut h.rx).await.len(), 1);
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+
+        // Own removal: the service layer drops the row and publishes the
+        // unshare marker; the forwarder exits and nothing follows.
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&chunk("ws-1", "agent-1", "!")).await.unwrap();
+        h.bus.publish(&tool_call("ws-1", "agent-1")).await.unwrap();
+        assert!(
+            deltas(&mut h.rx).await.is_empty(),
+            "no delivery after removal"
+        );
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+        drop(h.subs);
+    }
+
+    /// The agent's workspace is resolved at subscribe time (guarded
+    /// `agent.get`), so a member removed BEFORE the agent's first stream
+    /// event is still torn down instead of lingering until a chunk names
+    /// the workspace.
+    #[tokio::test]
+    async fn chat_member_removed_before_first_event_is_torn_down() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], chat_subscribe("agent-1")).await;
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+
+        h.bus.publish(&chunk("ws-1", "agent-1", "!")).await.unwrap();
+        assert!(
+            deltas(&mut h.rx).await.is_empty(),
+            "no delivery after removal"
+        );
+        drop(h.subs);
+    }
+
+    /// An administrator's chat stream is untouched by membership events.
+    #[tokio::test]
+    async fn chat_administrator_stream_ignores_membership() {
+        let principal_id = PrincipalId::new();
+        let owner = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: true,
+        };
+        let mut h = subscribe(owner, &[], chat_subscribe("agent-2")).await;
+        h.bus
+            .publish(&unshare("ws-2", principal_id.as_str()))
+            .await
+            .unwrap();
+        h.bus
+            .publish(&chunk("ws-2", "agent-2", "Hi"))
+            .await
+            .unwrap();
+        assert_eq!(deltas(&mut h.rx).await.len(), 1);
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+        drop(h.subs);
+    }
+
+    fn workspace_subscribe() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"workspace.subscribe","params":{}})
+    }
+
+    /// The global `workspace` channel under a guest: a `workspace:deleted`
+    /// tombstone is emitted only for a workspace the guest was shown (its
+    /// snapshot / an `updated` delta); a private workspace's deletion is
+    /// silent, and after the guest's own unshare so is that workspace's.
+    #[tokio::test]
+    async fn workspace_deleted_tombstones_are_scoped_to_visible_workspaces() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1", "ws-3"], workspace_subscribe()).await;
+        let ids: Vec<&str> = h
+            .snapshot
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["ws-1", "ws-3"]);
+
+        // Private ws-2 deleted: nothing. Member ws-1 deleted: tombstone.
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-2",
+                None,
+                json!({ "workspaceId": "ws-2" }),
+            ))
+            .await
+            .unwrap();
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-1",
+                None,
+                json!({ "workspaceId": "ws-1" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-1"] })]
+        );
+
+        // Own unshare of ws-3 is the final `removedIds`; its later deletion
+        // is silent.
+        h.members.lock().unwrap().remove("ws-3");
+        h.bus
+            .publish(&unshare("ws-3", principal_id.as_str()))
+            .await
+            .unwrap();
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-3",
+                None,
+                json!({ "workspaceId": "ws-3" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-3"] })]
+        );
+        drop(h.subs);
+    }
+
+    /// A workspace the guest is added to after subscribing becomes visible
+    /// through its `updated` delta, so its later deletion IS tombstoned.
+    #[tokio::test]
+    async fn workspace_added_after_subscribe_is_tombstoned_on_delete() {
+        let (_, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], workspace_subscribe()).await;
+        h.members.lock().unwrap().insert("ws-2".to_string());
+        h.bus
+            .publish(&event(
+                WORKSPACE_UPDATED,
+                "ws-2",
+                None,
+                json!({ "workspaceId": "ws-2", "changes": { "members": true } }),
+            ))
+            .await
+            .unwrap();
+        let added = deltas(&mut h.rx).await;
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0]["updated"][0]["id"], "ws-2");
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-2",
+                None,
+                json!({ "workspaceId": "ws-2" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-2"] })]
+        );
+        drop(h.subs);
+    }
+
+    fn channel_subscribe(method: &str, workspace_id: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"workspaceId":workspace_id}})
+    }
+
+    fn note_deleted(workspace_id: &str, note_id: &str) -> NewEvent {
+        event(
+            NOTE_DELETED,
+            workspace_id,
+            None,
+            json!({ "workspaceId": workspace_id, "noteId": note_id }),
+        )
+    }
+
+    /// The workspace-scoped collection channels map `removedIds` from the
+    /// event alone, so a non-member's `note.subscribe` to a private
+    /// workspace must not receive its `note:deleted` tombstones.
+    #[tokio::test]
+    async fn note_deleted_tombstone_is_refused_to_a_non_member() {
+        let (_, caller) = guest();
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            channel_subscribe("note.subscribe", "ws-2"),
+        )
+        .await;
+        assert_eq!(h.snapshot, json!([]));
+        h.bus
+            .publish(&note_deleted("ws-2", "n-private"))
+            .await
+            .unwrap();
+        assert!(deltas(&mut h.rx).await.is_empty(), "no tombstone leaks");
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+        drop(h.subs);
+    }
+
+    /// A member's note channel tombstones deletions until its own removal
+    /// from the workspace, which ends the forwarder; another member's
+    /// removal leaves it live.
+    #[tokio::test]
+    async fn note_member_channel_ends_on_own_removal() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            channel_subscribe("note.subscribe", "ws-1"),
+        )
+        .await;
+        h.bus.publish(&note_deleted("ws-1", "n-1")).await.unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["n-1"] })]
+        );
+
+        h.bus
+            .publish(&unshare("ws-1", "someone-else"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&note_deleted("ws-1", "n-2")).await.unwrap();
+        assert_eq!(deltas(&mut h.rx).await.len(), 1);
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&note_deleted("ws-1", "n-3")).await.unwrap();
+        assert!(deltas(&mut h.rx).await.is_empty(), "nothing after removal");
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+        drop(h.subs);
+    }
+
+    /// The generic TB-5 forwarder (`agent` channel here) takes the same
+    /// boundary: a private workspace's `agent:deleted` is silent for a
+    /// non-member and tombstoned for a member.
+    #[tokio::test]
+    async fn agent_deleted_tombstone_is_scoped_to_members() {
+        let (_, caller) = guest();
+        let deleted = |ws: &str, agent: &str| {
+            event(
+                AGENT_DELETED,
+                ws,
+                Some(agent),
+                json!({ "workspaceId": ws, "agentId": agent }),
+            )
+        };
+
+        let mut stranger = subscribe(
+            caller.clone(),
+            &["ws-1"],
+            channel_subscribe("agent.subscribe", "ws-2"),
+        )
+        .await;
+        stranger
+            .bus
+            .publish(&deleted("ws-2", "agent-2"))
+            .await
+            .unwrap();
+        assert!(
+            deltas(&mut stranger.rx).await.is_empty(),
+            "no tombstone leaks"
+        );
+        drop(stranger.subs);
+
+        let mut member = subscribe(
+            caller,
+            &["ws-1"],
+            channel_subscribe("agent.subscribe", "ws-1"),
+        )
+        .await;
+        member
+            .bus
+            .publish(&deleted("ws-1", "agent-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut member.rx).await,
+            vec![json!({ "removedIds": ["agent-1"] })]
+        );
+        drop(member.subs);
+    }
+
+    /// The administrator's global channel still tombstones every deletion.
+    #[tokio::test]
+    async fn workspace_administrator_receives_every_tombstone() {
+        let owner = Caller::Wire {
+            principal_id: PrincipalId::new(),
+            is_administrator: true,
+        };
+        let mut h = subscribe(owner, &["ws-1"], workspace_subscribe()).await;
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-9",
+                None,
+                json!({ "workspaceId": "ws-9" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-9"] })]
+        );
+        drop(h.subs);
     }
 }

@@ -135,7 +135,10 @@ pub(crate) fn classify(value: &Value) -> Option<BrowserRequest> {
 /// envelope, forwards via the reverse channel, and shapes the FE's reply; the
 /// registry methods run against `tabs` (persistence + the connection's host
 /// identity). Returns `None` for a notification (no `id`), which gets no
-/// response.
+/// response. Browser tabs are owner-only (multiplayer w3): a non-administrator
+/// connection gets `-32003` for every `browser.*` method, `listTabs`
+/// included — the allowlist in `process_frame` refuses these first; this is
+/// the defence-in-depth gate at the surface itself.
 pub(crate) async fn handle(
     req: BrowserRequest,
     reverse: &ReverseChannel,
@@ -147,6 +150,15 @@ pub(crate) async fn handle(
         id_echo,
         params,
     } = req;
+    if crate::context::is_non_administrator_caller() {
+        return id_present.then(|| {
+            error_frame(
+                &id_echo,
+                crate::catalog::FORBIDDEN_ERROR_CODE,
+                crate::catalog::FORBIDDEN_ERROR_MESSAGE,
+            )
+        });
+    }
     let frame = match method {
         BrowserMethod::Exec => match exec(&params, reverse).await {
             Ok(v) => success_frame(&id_echo, &v),

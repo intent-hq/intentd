@@ -94,7 +94,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
     (Arc::new(services), ws, tmp)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_subscribe_creates_event_subscription() {
     let (services, ws, _tmp) = setup().await;
 
@@ -129,7 +129,7 @@ async fn agent_subscribe_creates_event_subscription() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_diagnostics_returns_workspace_snapshot() {
     let (services, ws, _tmp) = setup().await;
 
@@ -161,7 +161,7 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_status_returns_full_metadata() {
     use intent_core::AgentStatus;
     let (services, ws, _tmp) = setup().await;
@@ -196,7 +196,7 @@ async fn agent_status_returns_full_metadata() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_list_returns_created_agents() {
     let (services, ws, _tmp) = setup().await;
 
@@ -239,7 +239,7 @@ async fn agent_list_returns_created_agents() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_read_conversation_returns_messages() {
     let (services, ws, _tmp) = setup().await;
 
@@ -309,7 +309,7 @@ async fn agent_read_conversation_returns_messages() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_summary_returns_shape() {
     let (services, ws, _tmp) = setup().await;
 

@@ -1022,7 +1022,7 @@ fn spawn_background_refresh<F>(
     let cache = Arc::clone(cache);
     let provider_id = provider_id.to_string();
     let version_key = version_key.to_string();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let started = tokio::time::Instant::now();
         let outcome_ms = |started: tokio::time::Instant| {
             now_ms.saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))

@@ -68,7 +68,7 @@ impl ExactUpdate {
         let operation = self.clone();
         let target = target.to_string();
         let pid_path = pid_path.to_path_buf();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let install_target = target.clone();
             let install_path = pid_path.clone();
             let result =

@@ -130,7 +130,7 @@ pub(super) fn watch_root(
     let inner = Arc::new(Mutex::new(Inner::default()));
     #[cfg(test)]
     let intended_root = root.clone();
-    let task = tokio::spawn(watch_loop(
+    let task = intent_core::spawn_daemon(watch_loop(
         Arc::clone(hub),
         root,
         filename_matches,

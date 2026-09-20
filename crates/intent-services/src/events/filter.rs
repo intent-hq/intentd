@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use intent_core::events::{is_collaborator_event_type, NOTE_PRESENCE, PRESENCE_CHANGED};
 use intent_core::{parse_iso, ActorType, Event};
 
 /// Category wildcards that a bare `*` subscription expands to. Mirrors
@@ -51,10 +52,25 @@ pub(crate) const AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS: &[&str] = &[
 /// agent-owned event subscriptions (monorepo#1229): every `agent:`-prefixed
 /// type — transcript/tool/stream traffic, lifecycle, and the observability
 /// events the original TS hard-excluded as `INTERNAL_OBSERVABILITY_EVENTS` —
-/// plus `chat:stream:delta`, the one high-volume streaming type outside the
-/// `agent:` prefix. The prefix rule also covers the `agent:*` pattern itself.
+/// plus the high-volume streaming types outside the `agent:` prefix:
+/// `chat:stream:delta` and the transient presence pair (`presence:changed`,
+/// `note:presence` — up to ten caret moves a second per viewer, multiplayer
+/// w5; a `note:*` subscriber must not be woken by them). The prefix rule
+/// also covers the `agent:*` pattern itself.
 pub(crate) fn is_agent_restricted_event_type(event_type: &str) -> bool {
-    event_type.starts_with("agent:") || event_type == "chat:stream:delta"
+    event_type.starts_with("agent:")
+        || event_type == "chat:stream:delta"
+        || event_type == PRESENCE_CHANGED
+        || event_type == NOTE_PRESENCE
+}
+
+/// Whether an event type travels ONLY on its scoped subscription channel and
+/// never on the `events.subscribe` firehose (multiplayer w5): `note:presence`
+/// is delivered exclusively to `note.presence.subscribe` lease holders of the
+/// note — a `note:*`, exact-type or unfiltered raw subscriber of the same
+/// workspace must receive zero caret frames.
+pub(crate) fn is_channel_only_event_type(event_type: &str) -> bool {
+    event_type == NOTE_PRESENCE
 }
 
 /// Default coalescing window applied when a subscriber requests batching
@@ -85,6 +101,17 @@ pub struct SubscriptionFilter {
     /// which also narrows rehydrated legacy `agent:*` rows. FE-facing
     /// subscriptions leave this `false` and keep the full stream.
     pub exclude_agent_events: bool,
+    /// When set, only types on [`intent_core::events::COLLABORATOR_EVENT_TYPES`]
+    /// ever match — the match-time guard for subscriptions owned by a
+    /// non-administrator connection (multiplayer w3, default-deny). Applied
+    /// before the pattern check, so a `terminal:*` or `client:*` pattern is
+    /// accepted at subscribe time but stays silent.
+    pub collaborator_only: bool,
+    /// When set, types on [`is_channel_only_event_type`] never match — the
+    /// match-time guard for the raw `events.subscribe` firehose (owner and
+    /// collaborator alike), which keeps `note:presence` on the lease-gated
+    /// note channel. The channel forwarders leave this `false`.
+    pub exclude_channel_only: bool,
 }
 
 impl SubscriptionFilter {
@@ -173,6 +200,12 @@ pub fn event_type_matches(event_type: &str, pattern: &str) -> bool {
 /// Field order and short-circuiting mirror the TS `matchesFilter`.
 pub(crate) fn event_matches(filter: &SubscriptionFilter, event: &Event) -> bool {
     if filter.exclude_agent_events && is_agent_restricted_event_type(&event.event_type) {
+        return false;
+    }
+    if filter.collaborator_only && !is_collaborator_event_type(&event.event_type) {
+        return false;
+    }
+    if filter.exclude_channel_only && is_channel_only_event_type(&event.event_type) {
         return false;
     }
     if !filter.event_types.is_empty()
@@ -296,10 +329,17 @@ mod tests {
             "agent:woken-by-subscription",
             "agent:subscriptions-restored",
             "chat:stream:delta",
+            "presence:changed",
+            "note:presence",
         ] {
             assert!(is_agent_restricted_event_type(t), "{t} must be restricted");
         }
-        for t in ["file:changed", "task:status-changed", "chat:stream"] {
+        for t in [
+            "file:changed",
+            "task:status-changed",
+            "chat:stream",
+            "note:updated",
+        ] {
             assert!(!is_agent_restricted_event_type(t), "{t} must be allowed");
         }
     }
@@ -339,6 +379,117 @@ mod tests {
         assert!(event_matches(
             &fe,
             &event("agent:message", Some("a"), ActorType::Agent)
+        ));
+    }
+
+    #[test]
+    fn collaborator_only_guards_match_time() {
+        // A non-administrator's subscription may NAME owner-only patterns
+        // (`terminal:*`, `client:connected`, even an empty filter = all
+        // types); none of them ever deliver an off-allowlist event, while
+        // allowlisted types under the same patterns still match.
+        let f = SubscriptionFilter {
+            event_types: vec![
+                "terminal:*".to_string(),
+                "note:*".to_string(),
+                "client:connected".to_string(),
+                "host:exec:stdout".to_string(),
+            ],
+            collaborator_only: true,
+            ..Default::default()
+        };
+        for denied in [
+            "terminal:data",
+            "client:connected",
+            "host:exec:stdout",
+            "note:bogus",
+        ] {
+            assert!(
+                !event_matches(&f, &event(denied, Some("a"), ActorType::User)),
+                "{denied} must not reach a collaborator"
+            );
+        }
+        assert!(event_matches(
+            &f,
+            &event("note:updated", Some("a"), ActorType::User)
+        ));
+
+        let all = SubscriptionFilter {
+            collaborator_only: true,
+            ..Default::default()
+        };
+        assert!(!event_matches(
+            &all,
+            &event("terminal:data", None, ActorType::System)
+        ));
+        assert!(!event_matches(
+            &all,
+            &event("client:disconnected", None, ActorType::System)
+        ));
+        assert!(event_matches(
+            &all,
+            &event("task:status-changed", None, ActorType::User)
+        ));
+
+        // Administrator-owned subscriptions (flag unset) keep the full stream.
+        let owner = SubscriptionFilter {
+            event_types: vec!["terminal:*".to_string()],
+            ..Default::default()
+        };
+        assert!(event_matches(
+            &owner,
+            &event("terminal:data", None, ActorType::System)
+        ));
+    }
+
+    /// Multiplayer w5: with `exclude_channel_only` set (the raw firehose),
+    /// `note:presence` never matches — not through `note:*`, the exact type
+    /// or an unfiltered pattern list, owner or collaborator — while the
+    /// other `note:*` types and `presence:changed` still do. A channel
+    /// forwarder (flag unset) keeps matching it.
+    #[test]
+    fn exclude_channel_only_keeps_note_presence_off_the_firehose() {
+        for (patterns, collaborator_only) in [
+            (vec!["note:*".to_string()], false),
+            (vec![NOTE_PRESENCE.to_string()], false),
+            (vec![], false),
+            (vec!["note:*".to_string()], true),
+            (vec![NOTE_PRESENCE.to_string()], true),
+        ] {
+            let f = SubscriptionFilter {
+                event_types: patterns.clone(),
+                collaborator_only,
+                exclude_channel_only: true,
+                ..Default::default()
+            };
+            assert!(
+                !event_matches(&f, &event(NOTE_PRESENCE, None, ActorType::System)),
+                "{patterns:?} (collaborator_only={collaborator_only}) must not deliver note:presence"
+            );
+            if patterns.iter().all(|p| p != NOTE_PRESENCE) {
+                assert!(
+                    event_matches(&f, &event("note:updated", Some("a"), ActorType::User)),
+                    "{patterns:?}: note:updated still flows"
+                );
+            }
+        }
+        let workspace = SubscriptionFilter {
+            event_types: vec![PRESENCE_CHANGED.to_string()],
+            exclude_channel_only: true,
+            ..Default::default()
+        };
+        assert!(event_matches(
+            &workspace,
+            &event(PRESENCE_CHANGED, None, ActorType::System)
+        ));
+        let channel = SubscriptionFilter {
+            event_types: vec![NOTE_PRESENCE.to_string()],
+            collaborator_only: true,
+            ..Default::default()
+        };
+        assert!(event_matches(
+            &channel,
+            &event(NOTE_PRESENCE, None, ActorType::System)
         ));
     }
 

@@ -40,7 +40,7 @@ use intent_core::{
 use intent_services::Services;
 use intent_store::Store;
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn auggie_context_engine_real_retrieve_e2e() {
     // Gate: opt-in only. Anything other than an explicit "1" skips.
     let gate = std::env::var("INTENTD_AUGGIE_E2E").unwrap_or_default();

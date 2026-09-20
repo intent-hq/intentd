@@ -12,6 +12,9 @@ release = false
 # would tag any main commit whose Cargo.toml version is ahead of the latest
 # tag (e.g. a manual bump in a regular PR).
 release_always = false
+# Label the Release PR so the stale-PR workflow (.github/workflows/stale.yml)
+# exempts it via `exempt-pr-labels`.
+pr_labels = ["release"]
 # Shared defaults for every opted-in package: no crates.io publishing —
 # releases are git-tag-only: versions are determined from git tags matching
 # git_tag_name, never from the cargo registry. NOTE: git_only is set

@@ -1968,7 +1968,7 @@ mod tests {
         let _ = fs::remove_dir_all(&test_root);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn test_manual_merge_works_on_merge_on_turn_end_false_sandbox() {
         // The "decide later" story: after a skipped turn-end merge, the
         // manual sandbox.cow.merge RPC still merges the sandbox.
@@ -2164,7 +2164,7 @@ mod tests {
         let _ = fs::remove_dir_all(&test_root);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn test_manual_merge_on_claimed_row_returns_in_progress() {
         // sandbox.cow.merge on a row already claimed `merging` is an expected
         // state: a structured { status: "in_progress" } result, not an
@@ -2517,7 +2517,7 @@ mod tests {
         let _ = fs::remove_dir_all(&test_root);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn test_manual_merge_reports_dirty_when_auto_commit_off() {
         // The manual sandbox.cow.merge RPC (ws.agent.mergeSandbox) on a dirty
         // sandbox with auto-commit off: status "dirty" with the paths; nothing

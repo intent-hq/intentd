@@ -94,7 +94,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
     (Arc::new(services), ws, tmp)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_send_message_persists_without_manager() {
     let (services, ws, _tmp) = setup().await;
 
@@ -139,7 +139,7 @@ async fn agent_send_message_persists_without_manager() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_send_to_task_delivers_to_assigned_agent() {
     let (services, ws, _tmp) = setup().await;
 
@@ -220,7 +220,7 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_cancel_subscriptions_idempotent() {
     let (services, ws, _tmp) = setup().await;
 
@@ -256,7 +256,7 @@ async fn agent_cancel_subscriptions_idempotent() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_wake_or_create_creates_for_unassigned_task() {
     let (services, ws, _tmp) = setup().await;
 
@@ -314,7 +314,7 @@ async fn agent_wake_or_create_creates_for_unassigned_task() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_get_subscriptions_returns_empty_for_new_agent() {
     let (services, ws, _tmp) = setup().await;
 
@@ -347,7 +347,7 @@ async fn agent_get_subscriptions_returns_empty_for_new_agent() {
     drop(services);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_delegate_creates_new_agent_for_task() {
     let (services, ws, _tmp) = setup().await;
 

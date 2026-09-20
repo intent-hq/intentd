@@ -45,14 +45,14 @@ pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
 };
-pub use caller::{current_caller, with_caller, Caller};
+pub use caller::{current_caller, spawn_daemon, with_caller, Caller};
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd};
 pub use clock::{
     iso_from_unix_secs, iso_minutes_ago, iso_ms_from_now, now_epoch_ms, now_iso, parse_iso,
 };
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
-pub use error::{CloneErrorCategory, Error, Result};
+pub use error::{CloneErrorCategory, Error, InviteErrorKind, Result};
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
 pub use ids::{
@@ -121,7 +121,8 @@ pub use model::{
     BrowserTabVisibility,
 };
 pub use model::{
-    Principal, PrincipalCredential, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+    Principal, PrincipalCredential, WorkspaceInvite, WorkspaceMember, WorkspaceMembership,
+    WorkspaceRole,
 };
 pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,
