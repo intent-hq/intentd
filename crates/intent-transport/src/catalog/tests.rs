@@ -1941,6 +1941,42 @@ mod unbound_owner_only_methods {
             .collect()
     }
 
+    /// `intent_services::capability::ASSERT_BOUND_CALLER_ENV`: armed, an
+    /// unbound capability gate aborts the process instead of answering
+    /// `-32003`, which is the very outcome this module observes.
+    const ASSERT_BOUND_CALLER_ENV: &str = "INTENTD_ASSERT_BOUND_CALLER";
+
+    /// CI's coverage jobs run the suite with [`ASSERT_BOUND_CALLER_ENV`]
+    /// set, so when it is, this re-runs `test` (a name in this module) in a
+    /// copy of this binary with the variable removed, asserts that it
+    /// passed, and answers `true` so the caller returns; unarmed (locally,
+    /// and inside that child) it answers `false` and the caller runs its
+    /// body inline. A re-exec rather than `remove_var`: the harness is
+    /// multi-threaded.
+    fn reran_unarmed(test: &str) -> bool {
+        if std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none() {
+            return false;
+        }
+        let exe = std::env::current_exe().expect("test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                &format!("catalog::tests::unbound_owner_only_methods::{test}"),
+                "--nocapture",
+            ])
+            .env_remove(ASSERT_BOUND_CALLER_ENV)
+            .output()
+            .expect("run unarmed child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "unarmed `{test}`: {:?}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        true
+    }
+
     /// One unbound dispatch through the real router; the outcome label is
     /// `ok` or the JSON-RPC error code.
     async fn dispatch_unbound(services: &Services, method: &str, params: &Value) -> String {
@@ -1962,6 +1998,9 @@ mod unbound_owner_only_methods {
 
     #[tokio::test]
     async fn every_owner_only_router_method_is_forbidden_unbound() {
+        if reran_unarmed("every_owner_only_router_method_is_forbidden_unbound") {
+            return;
+        }
         let f = fixture().await;
         let table: BTreeMap<&str, Value> = minimal_params(&f).into_iter().collect();
         let universe = owner_only_router_methods();
@@ -2098,6 +2137,9 @@ mod unbound_owner_only_methods {
     /// here and moves the cell onto the router path.
     #[tokio::test]
     async fn armed_conditional_gates_are_forbidden_unbound() {
+        if reran_unarmed("armed_conditional_gates_are_forbidden_unbound") {
+            return;
+        }
         let f = fixture().await;
         let table: BTreeMap<&str, Value> = minimal_params(&f).into_iter().collect();
         for (method, unarmed, arming) in CONDITIONALLY_GATED_AT_SERVICE_LAYER {
@@ -2195,6 +2237,9 @@ mod unbound_owner_only_methods {
     /// the missing binding and not the fixture.
     #[tokio::test]
     async fn bound_daemon_control_passes_a_gated_method() {
+        if reran_unarmed("bound_daemon_control_passes_a_gated_method") {
+            return;
+        }
         let f = fixture().await;
         let params = json!({ "workspaceId": f.ws.as_str() });
         let unbound = dispatch_unbound(&f.services, "workspace.invite.list", &params).await;
@@ -2223,6 +2268,9 @@ mod unbound_owner_only_methods {
     /// `-32003`, while a bound daemon caller keeps the unresolved answer.
     #[tokio::test]
     async fn unbound_respond_permission_is_forbidden_without_a_manager() {
+        if reran_unarmed("unbound_respond_permission_is_forbidden_without_a_manager") {
+            return;
+        }
         let f = fixture().await;
         let params = json!({ "requestId": "req-1", "outcome": { "outcome": "cancelled" } });
         let unbound = dispatch_unbound(&f.services, "agent.respondPermission", &params).await;

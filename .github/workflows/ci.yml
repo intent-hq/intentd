@@ -883,6 +883,16 @@ jobs:
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Run e2e coverage
+        # Arm the bound-caller seam for the test processes themselves, not
+        # only the daemons they spawn: a direct-call test that evaluates a
+        # capability gate without a bound `Caller` aborts (nextest runs each
+        # test in its own process, so only that test goes red) instead of
+        # degrading into the `Forbidden` fallback and passing on a stale
+        # subject — #2009's auto-commit tests did exactly that under #1877's
+        # gate (runs 106012504874 / 106012511900; fixed by 638cc64bb). See
+        # `intent_services::capability::ASSERT_BOUND_CALLER_ENV`.
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
         run: |
           cd ${{ github.workspace }}
           GENERATE_LCOV=1 ./scripts/coverage-e2e.sh 40
@@ -1060,6 +1070,9 @@ jobs:
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Run combined coverage
+        # Armed bound-caller seam — see coverage-e2e's run step.
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
         run: |
           cd ${{ github.workspace }}
           GENERATE_LCOV=1 ./scripts/coverage-all.sh 80
@@ -1291,6 +1304,12 @@ jobs:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
+        # Armed bound-caller seam — see coverage-e2e's run step. The plan
+        # lines the script echoes name only the env it prepends itself
+        # (INTENTD_TEST_TIMEOUT_MULTIPLIER); this variable reaches cargo
+        # through the step environment.
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
         run: ./scripts/changed-tests.sh --instrumented --base "$BASE_SHA"
       # Release the `.in-use` marker — see the `check` job's last step
       # (intent-hq/intent#5256). CARGO_TARGET_DIR is empty when the
