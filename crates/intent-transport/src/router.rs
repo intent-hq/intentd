@@ -3036,47 +3036,53 @@ async fn dispatch(
         // `sourceControl.*`", v10.5): `provider` is required on every method
         // (`github` | `gitlab`), `host` is optional and gitlab-only; both are
         // validated by the service so the `-32602` messages stay in one place.
+        // The optional fields are parsed strictly: absent / `null` ⇒ omitted,
+        // but a present non-string is `-32602` before the service runs — a
+        // lax `host` would otherwise route `{"host": 123}` as host-omitted
+        // and, on `revoke`, act on the bound credential instead of failing.
         "sourceControl.authStatus" => {
             let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
             let r = api
-                .source_control_auth_status(provider, opt_str(params, "host"))
+                .source_control_auth_status(provider, host)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "sourceControl.connect" => {
             let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
             let r = api
-                .source_control_connect(
-                    provider,
-                    opt_str(params, "host"),
-                    opt_str(params, "method"),
-                    opt_str(params, "token"),
-                )
+                .source_control_connect(provider, host, method, token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "sourceControl.cancelAuth" => {
             let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
             let r = api
-                .source_control_cancel_auth(provider, opt_str(params, "host"))
+                .source_control_cancel_auth(provider, host)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "sourceControl.revoke" => {
             let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
             let r = api
-                .source_control_revoke(provider, opt_str(params, "host"))
+                .source_control_revoke(provider, host)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "sourceControl.getUser" => {
             let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
             let r = api
-                .source_control_get_user(provider, opt_str(params, "host"))
+                .source_control_get_user(provider, host)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
