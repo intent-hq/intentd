@@ -957,6 +957,11 @@ pub struct Services {
     /// Held as `Arc<OnceLock>` so the control can be attached after the `api`
     /// Arc is built (composition-root wiring, §5.12). Shared across clones.
     server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
+    /// Rebuilds an open invite's `intent://invite?…` link for
+    /// `workspace.invite.list` (multiplayer w4). Attached after
+    /// the `api` Arc like `server_control` (the transport owns the pairing
+    /// envelope); unset means no `url` is stamped. Shared across clones.
+    invite_links: Arc<OnceLock<Arc<dyn intent_core::InviteLinkBuilder>>>,
     /// In-memory watermark cache for incremental token-usage scanning (finding F2).
     /// Maps `workspace_id` → `agent_message` count. When the watermark is unchanged
     /// since the last scan, the workspace is skipped. A restart rescans once.
@@ -1364,6 +1369,7 @@ impl Services {
             last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
+            invite_links: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
@@ -4375,6 +4381,15 @@ impl Services {
     /// Idempotent: a second call is a no-op (the `OnceLock` keeps the first).
     pub fn attach_server_control(&self, control: Arc<dyn intent_core::ServerControl>) {
         let _ = self.server_control.set(control);
+    }
+
+    /// Attach the [`InviteLinkBuilder`](intent_core::InviteLinkBuilder) so
+    /// `workspace.invite.list` can stamp each open invite with its `url`
+    /// (multiplayer w4; `.create` is stamped by the transport, which resolves
+    /// the envelope itself). Idempotent like
+    /// [`attach_server_control`](Self::attach_server_control).
+    pub fn attach_invite_link_builder(&self, builder: Arc<dyn intent_core::InviteLinkBuilder>) {
+        let _ = self.invite_links.set(builder);
     }
 
     /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
@@ -31887,6 +31902,30 @@ impl WorkspaceApi for Services {
             let sc = pr_ops::resolve_source_control(injected).await?;
             let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
+        })
+    }
+
+    fn github_users_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            Self::require_administrator("github.users.search")?;
+            let query = query.trim();
+            if query.is_empty() {
+                return Ok(serde_json::json!({ "users": [] }));
+            }
+            let limit = github_browse_ops::clamp_user_search_limit(limit);
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let users = sc
+                .search_users(query, limit)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "users": github_browse_ops::user_hits_to_wire(&users)
+            }))
         })
     }
 

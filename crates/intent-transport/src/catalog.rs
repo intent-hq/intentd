@@ -178,6 +178,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "github.resolveThread",
     "github.revoke",
     "github.unresolveThread",
+    "github.users.search",
     "hook.cancel",
     "hook.list",
     "hook.runNow",

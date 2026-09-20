@@ -150,16 +150,19 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
 /// counted with the other subscription channels, not here.
 ///
+/// Also within 10.3: +1 router method (`github.users.search`, the
+/// collaborator picker's login-prefix user search).
+///
 /// Execution environments (protocol 10.5): +4 router methods
 /// (`sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
-/// `sandbox.image.check`) on top of the 10.3 / 10.4 catalog (378; 10.4 was
+/// `sandbox.image.check`) on top of the 10.3 / 10.4 catalog (379; 10.4 was
 /// a tunnel-only bump).
-const EXPECTED_TOTAL_METHODS: usize = 382;
+const EXPECTED_TOTAL_METHODS: usize = 383;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 327;
+const EXPECTED_ROUTER_METHODS: usize = 328;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 53;
@@ -622,6 +625,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.resolveThread",
     "github.revoke",
     "github.unresolveThread",
+    "github.users.search",
     "hook.cancel",
     "hook.list",
     "hook.runNow",
@@ -1161,6 +1165,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.resolveThread",
     "github.revoke",
     "github.unresolveThread",
+    "github.users.search",
     "hook.cancel",
     "hook.runNow",
     "host.checkAuggie",
@@ -1753,6 +1758,7 @@ mod unbound_owner_only_methods {
             ("github.resolveThread", json!({ "threadId": "t" })),
             ("github.revoke", json!({})),
             ("github.unresolveThread", json!({ "threadId": "t" })),
+            ("github.users.search", json!({ "query": "q" })),
             ("hook.cancel", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("linear.authStatus", json!({})),

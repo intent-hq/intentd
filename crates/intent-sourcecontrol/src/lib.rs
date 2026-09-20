@@ -76,6 +76,15 @@ pub trait SourceControl: Send + Sync {
         )))
     }
 
+    /// Search user accounts by login prefix (`GET /search/users`), at most
+    /// `limit` hits. Backs `github.users.search`. Providers without a user
+    /// search answer `Unsupported`.
+    async fn search_users(&self, query: &str, limit: u8) -> Result<Vec<UserIdentity>> {
+        Err(Error::Unsupported(format!(
+            "user search is not supported by this provider (query {query:?}, limit {limit})"
+        )))
+    }
+
     // --- Repositories ---
 
     /// List repositories the authenticated user has access to, one §5.5 page at

@@ -195,6 +195,12 @@ pub enum InviteErrorKind {
     FlowNotFound,
     /// Too many identity-only device flows are in flight; retry later.
     FlowBusy,
+    /// The workspace's guest cap (`sharing.maxGuestsPerWorkspace`) is spent
+    /// by its collaborators plus open invites; no further invite is minted.
+    GuestLimit,
+    /// The workspace's collaborators already reach the guest cap; the join
+    /// is refused and the invite stays open.
+    WorkspaceFull,
 }
 
 impl InviteErrorKind {
@@ -215,6 +221,8 @@ impl InviteErrorKind {
             InviteErrorKind::FlowError => "invite-flow-error",
             InviteErrorKind::FlowNotFound => "invite-flow-not-found",
             InviteErrorKind::FlowBusy => "invite-flow-busy",
+            InviteErrorKind::GuestLimit => "guest-limit",
+            InviteErrorKind::WorkspaceFull => "workspace-full",
         }
     }
 
@@ -249,6 +257,14 @@ impl InviteErrorKind {
             InviteErrorKind::FlowBusy => {
                 "internal error: too many invite redemptions in flight; retry shortly"
             }
+            InviteErrorKind::GuestLimit => {
+                "invalid params: this workspace has reached its guest limit (collaborators \
+                 plus open invites); revoke an invite or remove a member first"
+            }
+            InviteErrorKind::WorkspaceFull => {
+                "invalid params: this workspace has reached its guest limit; ask the owner \
+                 to make room"
+            }
         }
     }
 
@@ -264,7 +280,9 @@ impl InviteErrorKind {
             | InviteErrorKind::PinUnknown
             | InviteErrorKind::FlowDenied
             | InviteErrorKind::FlowExpired
-            | InviteErrorKind::FlowNotFound => -32602,
+            | InviteErrorKind::FlowNotFound
+            | InviteErrorKind::GuestLimit
+            | InviteErrorKind::WorkspaceFull => -32602,
             InviteErrorKind::GithubIdentityRequired
             | InviteErrorKind::IdentityLocked
             | InviteErrorKind::FlowError
