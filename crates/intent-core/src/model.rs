@@ -3188,9 +3188,13 @@ fn agent_list_rows_bytes(rows: &[AgentLite]) -> usize {
 /// ([`AgentLite::cap_list_previews_to`] is monotone, so re-capping an
 /// already-capped row only shortens it) until the array fits or the budget
 /// reaches [`AGENT_LIST_PREVIEW_FLOOR_BYTES`], whichever comes first. Row
-/// shape and field presence never change — the same fields ride with harder
-/// silent truncation, so no client sees a new wire shape. O(rows) work: at
-/// most four serialization passes over the rows.
+/// shape is unchanged and no new key is introduced: the one presence effect
+/// stays inside the documented `lastToolUse` contract
+/// `{ name, input?, inputTruncated?, inputBytes? }` — an `input` that passed
+/// the 400-byte list cap unflagged and is truncated by a tighter re-cap gains
+/// `inputTruncated: true` + `inputBytes` (original serialized size), exactly
+/// as the normal cap stamps them — so no client sees a new wire shape.
+/// O(rows) work: at most four serialization passes over the rows.
 pub fn fit_agent_list_frame(rows: &mut [AgentLite]) -> Option<AgentListFrameFit> {
     let bytes_before = agent_list_rows_bytes(rows);
     if bytes_before <= AGENT_LIST_FRAME_BUDGET_BYTES {
