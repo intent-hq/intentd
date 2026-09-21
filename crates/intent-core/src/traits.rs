@@ -4736,8 +4736,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// `invite.redeem` phase 1 (multiplayer w4, unauthenticated `/invite`
     /// endpoint): validate `(invite_id, secret)` and start an identity-only
     /// GitHub device flow → `{ flowId, userCode, verificationUri, expiresIn,
-    /// interval, workspaceId, workspaceTitle }`. The access token the flow
-    /// yields is used once for `GET /user` and never persisted.
+    /// interval, workspaceId, workspaceTitle }`. The `/invite` transport
+    /// extends this with the host's `hostname` / `prettyHostname` (same
+    /// sources as `system.status`) so the guest's consent prompt can name
+    /// the machine. The access token the flow yields is used once for
+    /// `GET /user` and never persisted.
     fn invite_redeem_start(
         &self,
         invite_id: String,
@@ -4762,6 +4765,54 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_redeem_wait not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
+    /// endpoint): validate `(invite_id, secret)` exactly as
+    /// [`Self::invite_redeem_start`] does — same [`crate::InviteErrorKind`]
+    /// refusals for an unknown / expired / revoked / redeemed link — and
+    /// answer `{ workspaceId, workspaceTitle }` **without** starting a device
+    /// flow: no flow slot is taken and GitHub is never contacted. The
+    /// `/invite` transport extends the result with the host's `hostname` /
+    /// `prettyHostname`, so a client can show the consent prompt before it
+    /// decides between `invite.accept` and `invite.redeem`.
+    fn invite_inspect(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_inspect not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.accept` (multiplayer w4, unauthenticated `/invite` endpoint):
+    /// the returning guest's join. `credential` is a per-principal bearer
+    /// credential this host minted earlier (another workspace's redeem);
+    /// its hash resolves the principal like the `/ws` bearer gate does —
+    /// unknown or revoked is [`crate::InviteErrorKind::CredentialInvalid`]
+    /// (`credential-invalid`). The invite is then validated like
+    /// [`Self::invite_redeem_start`], a pin is checked against the
+    /// principal's stored `github_user_id` (`invite-pin-mismatch`), and the
+    /// join commits with the stored identity (no GitHub call, no profile
+    /// refresh) → the [`Self::invite_redeem_wait`] shape
+    /// `{ status: "authorized", token, principalId, login, workspaceId }`
+    /// with a fresh credential.
+    fn invite_accept(
+        &self,
+        invite_id: String,
+        secret: String,
+        credential: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret, credential);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_accept not implemented".to_string(),
             ))
         })
     }

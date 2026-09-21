@@ -155,10 +155,13 @@ fn extract_fastpath_methods() -> HashSet<String> {
 ///
 /// Agent memory attribution (§5.5): +1 router method (`agent.memoryUsage`).
 ///
+/// Returning guest (multiplayer w4): +2 fast-path methods on the `/invite`
+/// endpoint (`invite.inspect`, `invite.accept`).
+///
 /// Provider-generic auth (protocol 10.5, §5.27): +5 router methods
 /// (`sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
 /// `getUser`); the `github.*` auth quintet stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 385;
+const EXPECTED_TOTAL_METHODS: usize = 387;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
@@ -166,7 +169,7 @@ const EXPECTED_TOTAL_METHODS: usize = 385;
 const EXPECTED_ROUTER_METHODS: usize = 330;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 53;
+const EXPECTED_FASTPATH_METHODS: usize = 55;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -652,6 +655,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
+    "invite.accept",
+    "invite.inspect",
     "invite.redeem",
     "linear.authStatus",
     "linear.createIssue",
@@ -1192,6 +1197,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
+    "invite.accept",
+    "invite.inspect",
     "invite.redeem",
     "linear.authStatus",
     "linear.createIssue",
@@ -1534,7 +1541,8 @@ fn reverse_methods_are_never_on_the_collaborator_allowlist() {
 ///
 /// The remaining refused methods — the connection-task fast paths (`host.*`,
 /// `browser.*`, `forward.*`, `system.*`, `pairing.*`, `server.*`,
-/// `providers.setup.*`, `invite.redeem`) and the subscription channels — have
+/// `providers.setup.*`, `invite.redeem` / `invite.inspect` / `invite.accept`)
+/// and the subscription channels — have
 /// no `WorkspaceApi` method to gate; they are protected only by the
 /// transport allowlist in `conn::process_frame` (`-32003`) and stay out of
 /// this table by construction. That partition is asserted, not assumed.
