@@ -8,11 +8,14 @@
 //!
 //! The GitHub identity of the primary principal is attached lazily and off
 //! the read path (stale-while-revalidate): a `principal.me` read for the
-//! primary user (or a `workspace.members.list` by the primary user whose
-//! row has no login yet) serves the cached `principal` row and, at most
-//! once per [`IDENTITY_REFRESH_INTERVAL`] per process, spawns a bounded
-//! background refresh from `GET /user` when the source-control auth is
-//! configured. An offline daemon keeps serving the cache.
+//! primary user (or a `workspace.members.list` / `principal.list` by the
+//! primary user, or daemon startup, while the row has no login yet) serves
+//! the cached `principal` row and, at most once per
+//! [`IDENTITY_REFRESH_INTERVAL`] per process, spawns a bounded background
+//! refresh from `GET /user` when the source-control auth is configured. An
+//! offline daemon keeps serving the cache, and a roster that predates the
+//! GitHub connection does not stay nameless until the next `principal.me`
+//! (intent-hq/intent#5534).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -607,8 +610,16 @@ impl Services {
     /// Owner-only via the administrator gate: the method is not scoped to a
     /// workspace and the primary user owns every workspace (no transfer
     /// RPC), so a per-principal wire caller is refused outright.
+    ///
+    /// Lists guests only. The primary row is read solely to decide whether
+    /// to spawn the off-path identity refresh: exactly one extra primary-row
+    /// SELECT in the foreground, no network (intent-hq/intent#5534).
     pub(crate) async fn principal_list_op(&self) -> Result<Value> {
         Self::require_administrator("principal.list")?;
+        match self.store.get_primary_principal().await {
+            Ok(primary) => self.refresh_primary_identity_if_unlinked(&primary).await,
+            Err(e) => tracing::debug!(error = %e, "principal.list: primary row unavailable"),
+        }
         let principals: Vec<Value> = self
             .store
             .list_credentialed_guest_principals()
@@ -627,10 +638,55 @@ impl Services {
         Ok(json!({ "principals": principals }))
     }
 
-    /// Spawn a rate-limited, bounded background refresh of the primary
-    /// principal's GitHub identity from `GET /user`. Detached: the read that
-    /// triggered it never waits, and any failure (not configured, offline,
-    /// timeout) leaves the cached row untouched.
+    /// A primary row that predates the GitHub connection stays `login: null`
+    /// until something calls `principal.me`. When the primary row is still
+    /// unlinked and the caller acts for the primary user (the owner's wire
+    /// caller, an agent, or the daemon itself — the same gate
+    /// `workspace.members.list` applies), spawn the same off-path refresh
+    /// `principal.me` does — one refresh per [`IDENTITY_REFRESH_INTERVAL`]
+    /// across all trigger sites, bounded; a linked row costs nothing
+    /// (intent-hq/intent#5534). Callers: `principal.list` and startup (each
+    /// one primary-row SELECT); `workspace.members.list` has the primary row
+    /// in hand and spawns directly.
+    pub(crate) async fn refresh_primary_identity_if_unlinked(&self, primary: &Principal) {
+        if !primary.is_primary || primary.login.is_some() {
+            return;
+        }
+        let caller_is_primary = match current_caller() {
+            Some(Caller::Wire { principal_id, .. }) => principal_id == primary.id,
+            Some(Caller::Agent { .. } | Caller::Daemon) => true,
+            None => false,
+        };
+        if caller_is_primary {
+            self.spawn_primary_identity_refresh(primary.clone()).await;
+        }
+    }
+
+    /// Daemon boot: when the primary row is still unlinked (`login: None`),
+    /// spawn the same off-path refresh the roster reads use so the identity
+    /// is populated without waiting for a client to call `principal.me`
+    /// (intent-hq/intent#5534). Runs under the composition root's
+    /// `Caller::Daemon` binding. Foreground cost is exactly one primary-row
+    /// SELECT; never blocks on the network and never fails startup: a store
+    /// error is logged at debug, and without GitHub auth the spawned refresh
+    /// is a no-op (its own auth gate).
+    pub async fn refresh_primary_identity_at_startup(&self) {
+        match self.store.get_primary_principal().await {
+            Ok(primary) => self.refresh_primary_identity_if_unlinked(&primary).await,
+            Err(e) => tracing::debug!(
+                error = %e,
+                "startup primary identity refresh skipped: primary row unavailable"
+            ),
+        }
+    }
+
+    /// Spawn a bounded background refresh of the primary principal's GitHub
+    /// identity from `GET /user` — one refresh per
+    /// [`IDENTITY_REFRESH_INTERVAL`] across all trigger sites (`principal.me`,
+    /// the roster reads, startup). Detached: the read that triggered it never
+    /// waits, and any failure (not configured, offline, timeout) leaves the
+    /// cached row untouched. Note a refresh is two `GET /user` on the real
+    /// forge (`check_auth` probe, then `get_user`; pre-existing).
     pub(crate) async fn spawn_primary_identity_refresh(&self, principal: Principal) {
         {
             let mut last = self.principal_identity_refreshed_at.lock().await;
@@ -848,8 +904,10 @@ impl Services {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::pr::StubForge;
     use crate::tests::{workspace, TempDb};
     use intent_core::{with_caller, AgentId};
+    use std::sync::atomic::Ordering;
 
     fn wire(principal_id: &PrincipalId) -> Caller {
         Caller::Wire {
@@ -940,6 +998,363 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(refused.code(), -32003);
+    }
+
+    // --- primary identity refresh from roster reads (intent-hq/intent#5534) --
+
+    /// A store whose primary row predates the GitHub connection (`login`
+    /// `None`), one workspace the primary owns, and a `Services` talking to
+    /// `sc` for identity reads.
+    async fn unlinked_primary_fixture(sc: Arc<StubForge>) -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let primary = store.get_primary_principal().await.expect("primary");
+        assert!(primary.login.is_none(), "fixture precondition: {primary:?}");
+        let services = Services::new(store).with_source_control(sc);
+        (tmp, services, ws)
+    }
+
+    fn administrator(primary: &PrincipalId) -> Caller {
+        Caller::Wire {
+            principal_id: primary.clone(),
+            is_administrator: true,
+        }
+    }
+
+    /// Poll the primary row until the background refresh linked it (bounded;
+    /// no fixed sleep — the poll yields to the spawned task each round).
+    async fn wait_until_linked(store: &Store) -> Principal {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let primary = store.get_primary_principal().await.expect("primary");
+                if primary.login.is_some() {
+                    return primary;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("primary identity refresh linked the row within the bound")
+    }
+
+    /// Poll until `probe` is true (bounded; yields to spawned tasks).
+    async fn wait_until(probe: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !probe() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("observable outcome within the bound");
+    }
+
+    fn assert_linked_to_octocat(primary: &Principal) {
+        assert_eq!(primary.login.as_deref(), Some("octocat"));
+        assert_eq!(primary.display_name.as_deref(), Some("The Octocat"));
+        assert_eq!(
+            primary.avatar_url.as_deref(),
+            Some("https://avatars.example/u/1")
+        );
+        assert_eq!(primary.github_user_id, Some(583_231));
+    }
+
+    /// `principal.list` (administrator) triggers the same refresh
+    /// `workspace.members.list` does even though its rows never include the
+    /// primary: the cached (empty) roster is served and the primary row is
+    /// then persisted with the `GET /user` profile.
+    #[tokio::test]
+    async fn principal_list_refreshes_unlinked_primary_identity_off_path() {
+        let sc = Arc::new(StubForge::default());
+        let (_tmp, services, _ws) = unlinked_primary_fixture(sc.clone()).await;
+        let primary_id = services
+            .store
+            .get_primary_principal()
+            .await
+            .expect("primary")
+            .id;
+
+        let listed = with_caller(administrator(&primary_id), services.principal_list_op())
+            .await
+            .expect("principal.list");
+        assert_eq!(listed, json!({ "principals": [] }));
+
+        let linked = wait_until_linked(&services.store).await;
+        assert_linked_to_octocat(&linked);
+        assert_eq!(sc.get_user_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// One refresh per [`IDENTITY_REFRESH_INTERVAL`] across all trigger
+    /// sites: after `principal.list` spawned it, a `workspace.members.list`
+    /// and a second `principal.list` inside the window (with the row forced
+    /// back to unlinked, so the trigger condition holds again) do not
+    /// refresh, and the first trigger stamped the refresh instant. (The stub
+    /// counts `get_user` calls, one per refresh; the real forge also probes
+    /// `check_auth`, so a refresh is two `GET /user` there.)
+    #[intent_test_macros::daemon_test]
+    async fn roster_identity_refresh_is_rate_limited_per_process() {
+        let sc = Arc::new(StubForge::default());
+        let (_tmp, services, ws) = unlinked_primary_fixture(sc.clone()).await;
+        let primary_id = services
+            .store
+            .get_primary_principal()
+            .await
+            .expect("primary")
+            .id;
+
+        with_caller(administrator(&primary_id), services.principal_list_op())
+            .await
+            .expect("principal.list");
+        let stamped_at = *services.principal_identity_refreshed_at.lock().await;
+        assert!(stamped_at.is_some(), "first trigger stamps the instant");
+        let mut linked = wait_until_linked(&services.store).await;
+        assert_eq!(sc.get_user_calls.load(Ordering::SeqCst), 1);
+
+        linked.login = None;
+        services
+            .store
+            .upsert_principal(&linked)
+            .await
+            .expect("unlink again");
+        with_caller(
+            administrator(&linked.id),
+            services.workspace_members_list_op(&ws),
+        )
+        .await
+        .expect("members.list within the window");
+        with_caller(administrator(&linked.id), services.principal_list_op())
+            .await
+            .expect("principal.list within the window");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sc.get_user_calls.load(Ordering::SeqCst),
+            1,
+            "no second fetch inside the refresh window"
+        );
+        assert_eq!(
+            *services.principal_identity_refreshed_at.lock().await,
+            stamped_at,
+            "the stamp is untouched by rate-limited triggers"
+        );
+        assert!(services
+            .store
+            .get_primary_principal()
+            .await
+            .expect("primary")
+            .login
+            .is_none());
+    }
+
+    /// An already-linked primary triggers nothing from either read.
+    #[intent_test_macros::daemon_test]
+    async fn roster_reads_skip_refresh_for_linked_primary() {
+        let sc = Arc::new(StubForge::default());
+        let (_tmp, services, ws) = unlinked_primary_fixture(sc.clone()).await;
+        let mut primary = services
+            .store
+            .get_primary_principal()
+            .await
+            .expect("primary");
+        primary.login = Some("already".into());
+        services
+            .store
+            .upsert_principal(&primary)
+            .await
+            .expect("link");
+
+        with_caller(
+            administrator(&primary.id),
+            services.workspace_members_list_op(&ws),
+        )
+        .await
+        .expect("members.list");
+        with_caller(administrator(&primary.id), services.principal_list_op())
+            .await
+            .expect("principal.list");
+        tokio::task::yield_now().await;
+
+        assert_eq!(sc.get_user_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sc.check_auth_calls.load(Ordering::SeqCst), 0);
+        assert!(services
+            .principal_identity_refreshed_at
+            .lock()
+            .await
+            .is_none());
+        assert_eq!(
+            services
+                .store
+                .get_primary_principal()
+                .await
+                .expect("primary")
+                .login
+                .as_deref(),
+            Some("already")
+        );
+    }
+
+    /// GitHub auth not configured: `principal.list` spawns the refresh (the
+    /// instant is stamped, the auth gate probed) but no `GET /user` is
+    /// attempted and the row stays unlinked — the read itself is unaffected.
+    #[intent_test_macros::daemon_test]
+    async fn principal_list_leaves_primary_unlinked_without_github_auth() {
+        let sc = Arc::new(StubForge::unauthenticated());
+        let (_tmp, services, _ws) = unlinked_primary_fixture(sc.clone()).await;
+        let primary_id = services
+            .store
+            .get_primary_principal()
+            .await
+            .expect("primary")
+            .id;
+
+        with_caller(administrator(&primary_id), services.principal_list_op())
+            .await
+            .expect("principal.list");
+        assert!(services
+            .principal_identity_refreshed_at
+            .lock()
+            .await
+            .is_some());
+        wait_until(|| sc.check_auth_calls.load(Ordering::SeqCst) >= 1).await;
+        assert_eq!(sc.get_user_calls.load(Ordering::SeqCst), 0);
+        let primary = services
+            .store
+            .get_primary_principal()
+            .await
+            .expect("primary");
+        assert!(primary.login.is_none(), "{primary:?}");
+        assert!(primary.github_user_id.is_none());
+    }
+
+    // --- primary identity refresh at daemon startup (intent-hq/intent#5534) --
+
+    /// The composition root runs startup work under `Caller::Daemon`.
+    async fn boot(services: &Services) {
+        with_caller(
+            Caller::Daemon,
+            services.refresh_primary_identity_at_startup(),
+        )
+        .await;
+    }
+
+    /// Boot with an unlinked primary: the startup entry point spawns the
+    /// refresh and the row is persisted with the `GET /user` profile without
+    /// any RPC op being called.
+    #[intent_test_macros::daemon_test]
+    async fn startup_refreshes_unlinked_primary_identity_off_path() {
+        let sc = Arc::new(StubForge::default());
+        let (_tmp, services, _ws) = unlinked_primary_fixture(sc.clone()).await;
+
+        boot(&services).await;
+        assert!(
+            services
+                .principal_identity_refreshed_at
+                .lock()
+                .await
+                .is_some(),
+            "startup trigger stamps the refresh instant"
+        );
+
+        let linked = wait_until_linked(&services.store).await;
+        assert_linked_to_octocat(&linked);
+        assert_eq!(sc.get_user_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// GitHub auth not configured at boot: no `GET /user` is attempted and
+    /// the row stays unlinked; startup itself is unaffected.
+    #[intent_test_macros::daemon_test]
+    async fn startup_leaves_primary_unlinked_without_github_auth() {
+        let sc = Arc::new(StubForge::unauthenticated());
+        let (_tmp, services, _ws) = unlinked_primary_fixture(sc.clone()).await;
+
+        boot(&services).await;
+        wait_until(|| sc.check_auth_calls.load(Ordering::SeqCst) >= 1).await;
+        assert_eq!(sc.get_user_calls.load(Ordering::SeqCst), 0);
+        let primary = services
+            .store
+            .get_primary_principal()
+            .await
+            .expect("primary");
+        assert!(primary.login.is_none(), "{primary:?}");
+        assert!(primary.github_user_id.is_none());
+    }
+
+    /// An already-linked primary spawns nothing at boot.
+    #[intent_test_macros::daemon_test]
+    async fn startup_skips_refresh_for_linked_primary() {
+        let sc = Arc::new(StubForge::default());
+        let (_tmp, services, _ws) = unlinked_primary_fixture(sc.clone()).await;
+        let mut primary = services
+            .store
+            .get_primary_principal()
+            .await
+            .expect("primary");
+        primary.login = Some("already".into());
+        services
+            .store
+            .upsert_principal(&primary)
+            .await
+            .expect("link");
+
+        boot(&services).await;
+        tokio::task::yield_now().await;
+
+        assert!(services
+            .principal_identity_refreshed_at
+            .lock()
+            .await
+            .is_none());
+        assert_eq!(sc.get_user_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sc.check_auth_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            services
+                .store
+                .get_primary_principal()
+                .await
+                .expect("primary")
+                .login
+                .as_deref(),
+            Some("already")
+        );
+    }
+
+    /// The startup trigger and the roster reads share the one refresh per
+    /// [`IDENTITY_REFRESH_INTERVAL`]: a `workspace.members.list` inside the
+    /// window refreshes nothing more — exactly one refresh (one stub
+    /// `get_user`) in total.
+    #[intent_test_macros::daemon_test]
+    async fn startup_and_members_list_share_one_refresh_per_interval() {
+        let sc = Arc::new(StubForge::default());
+        let (_tmp, services, ws) = unlinked_primary_fixture(sc.clone()).await;
+
+        boot(&services).await;
+        let stamped_at = *services.principal_identity_refreshed_at.lock().await;
+        assert!(stamped_at.is_some());
+        let mut linked = wait_until_linked(&services.store).await;
+        assert_eq!(sc.get_user_calls.load(Ordering::SeqCst), 1);
+
+        linked.login = None;
+        services
+            .store
+            .upsert_principal(&linked)
+            .await
+            .expect("unlink again");
+        with_caller(
+            administrator(&linked.id),
+            services.workspace_members_list_op(&ws),
+        )
+        .await
+        .expect("members.list within the window");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sc.get_user_calls.load(Ordering::SeqCst),
+            1,
+            "members.list inside the startup refresh window does not fetch again"
+        );
+        assert_eq!(
+            *services.principal_identity_refreshed_at.lock().await,
+            stamped_at
+        );
     }
 
     /// A wire caller's principal overwrites a client-supplied stamp, is

@@ -2023,6 +2023,13 @@ async fn cmd_serve(
         Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
         Err(e) => tracing::warn!(error = %e, "PR monitor rehydration failed"),
     }
+    // Populate the primary principal's GitHub identity once at boot when the
+    // row still predates the GitHub connection (`login: null`), so roster
+    // reads do not wait for a `principal.me` (intent-hq/intent#5534).
+    // Fire-and-forget: only spawns the bounded off-path refresh (one refresh
+    // per IDENTITY_REFRESH_INTERVAL across all trigger sites); a no-op
+    // without GitHub auth and never a startup failure.
+    services.refresh_primary_identity_at_startup().await;
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
     // recursive removal (monorepo#473). Spawned so the potentially multi-GB

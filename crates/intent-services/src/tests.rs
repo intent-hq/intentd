@@ -16220,6 +16220,10 @@ pub(crate) mod pr {
         /// before [`Self::get_user_gate`] is awaited, so a held call is
         /// still visible.
         pub(crate) get_user_calls: std::sync::atomic::AtomicU64,
+        /// How many times `check_auth` was called (the unauthenticated
+        /// refresh tests wait on the auth-gate probe, then assert no
+        /// `get_user` followed).
+        pub(crate) check_auth_calls: std::sync::atomic::AtomicU64,
         /// When set, `get_user` holds until the test releases a permit
         /// (`add_permits(1)`): the caller proves the read it triggered from
         /// returned while `GET /user` was still in flight.
@@ -16298,6 +16302,8 @@ pub(crate) mod pr {
             })
         }
         async fn check_auth(&self) -> ScResult<AuthStatus> {
+            self.check_auth_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.unauthenticated {
                 return Ok(AuthStatus {
                     authenticated: false,
