@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.91] - 2026-09-21
+
+### 🐛 Bug Fixes
+
+- *(identity)* Refresh the primary identity from workspace.members.list ([#2044](https://github.com/intent-hq/intentd/pull/2044))
+
+### 📚 Documentation
+
+- *(core)* Note lastToolUse flag presence in fit_agent_list_frame rustdoc ([#2043](https://github.com/intent-hq/intentd/pull/2043))
+
+
 ## [0.9.90] - 2026-09-21
 
 ### 🐛 Bug Fixes
