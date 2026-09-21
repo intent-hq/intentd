@@ -28,6 +28,14 @@ pub const RPC_DISPATCH_SPAN_TARGET: &str = "intent_transport::rpc_dispatch";
 /// Name of the per-dispatch profiling span (the literal passed to
 /// `info_span!` in [`handle_message`]).
 pub const RPC_DISPATCH_SPAN_NAME: &str = "rpc_dispatch";
+/// Optional string field on the per-dispatch profiling span naming the
+/// request VARIANT a handler served (intent-hq/intent#5531): today only
+/// `agent.list` records it — `default`, `includeRetired`, `retiredOnly`, or
+/// `scope=<bin>` (+ ` parentAgentId` when the delegated read is narrowed) —
+/// so the profiling layer's oversize / slow WARNs say which read shape
+/// overflowed. Flags only, never ids or payload. Absent on every other
+/// dispatch.
+pub const RPC_REQUEST_SHAPE_FIELD: &str = "request_shape";
 
 const PARSE_ERROR: i32 = -32700;
 const INVALID_REQUEST: i32 = -32600;
@@ -332,11 +340,15 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
 
     // Keep one span alive through dispatch AND response encoding. The writer
     // queue consumes the returned frame later, so queue latency is deliberately
-    // excluded from `encode_elapsed_ms`.
+    // excluded from `encode_elapsed_ms`. `request_shape` is recorded by the
+    // handlers that opt in (see [`RPC_REQUEST_SHAPE_FIELD`]) so the
+    // rpc_profile WARNs can attribute an oversize / slow dispatch to a
+    // request variant — flags only, never payload.
     let span = tracing::info_span!(
         target: RPC_DISPATCH_SPAN_TARGET,
         RPC_DISPATCH_SPAN_NAME,
         method,
+        request_shape = tracing::field::Empty,
         response_bytes = tracing::field::Empty,
         encode_elapsed_ms = tracing::field::Empty,
         oversized_replacement = tracing::field::Empty,
@@ -1447,6 +1459,12 @@ async fn dispatch(
             // aggregate over the non-retired rows) under the same
             // no-snapshot-isolation tolerance as `retiredCount`.
             let scope = parse_agent_list_scope(params, include_retired || retired_only)?;
+            // Attribute the dispatch to its read variant for the profiling
+            // WARNs (flags only — see `RPC_REQUEST_SHAPE_FIELD`).
+            tracing::Span::current().record(
+                RPC_REQUEST_SHAPE_FIELD,
+                agent_list_request_shape(scope.as_ref(), include_retired, retired_only).as_str(),
+            );
             let agents = if let Some(scope) = scope {
                 api.agent_list_scoped(ws.clone(), scope)
                     .await
@@ -4634,6 +4652,26 @@ fn parse_projection(
 /// any other scope, including the default. A bin scope combined with
 /// `includeRetired` / `retiredOnly` (`retired_flag`) is `-32602`: retired
 /// sessions are their own bin.
+/// The [`RPC_REQUEST_SHAPE_FIELD`] value for one `agent.list` read: which
+/// variant the parsed params selected. Flags only — a `parentAgentId`
+/// narrowing reads as the literal ` parentAgentId` suffix, never the id.
+fn agent_list_request_shape(
+    scope: Option<&intent_core::AgentListRowScope>,
+    include_retired: bool,
+    retired_only: bool,
+) -> String {
+    use intent_core::AgentListRowScope;
+    match scope {
+        Some(AgentListRowScope::Delegated {
+            parent_agent_id: Some(_),
+        }) => "scope=delegated parentAgentId".to_string(),
+        Some(scope) => format!("scope={}", scope.wire_name()),
+        None if retired_only => "retiredOnly".to_string(),
+        None if include_retired => "includeRetired".to_string(),
+        None => "default".to_string(),
+    }
+}
+
 fn parse_agent_list_scope(
     params: &Map<String, Value>,
     retired_flag: bool,

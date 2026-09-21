@@ -24,7 +24,12 @@
 //! dispatch span: `response_bytes`, `encode_elapsed_ms`,
 //! `oversized_replacement`, and `encode_failed`. Notifications record zero
 //! bytes/time and false states. A hard-cap replacement records the rejected
-//! envelope's size, not the replacement frame's size.
+//! envelope's size, not the replacement frame's size. When the handler
+//! recorded a request variant on the span
+//! ([`RPC_REQUEST_SHAPE_FIELD`] — `agent.list` records `default` /
+//! `includeRetired` / `retiredOnly` / `scope=<bin>`, intent-hq/intent#5531)
+//! every WARN additionally carries it as `request_shape`; the field is
+//! omitted for dispatches that recorded none.
 //!
 //! Duration budgets are tiered: methods that fan out to a network-bound
 //! upstream ([`is_network_tier_method`] — `github.*`, `linear.*`, `sentry.*`,
@@ -61,7 +66,9 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
-use intent_transport::router::{RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET};
+use intent_transport::router::{
+    RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET, RPC_REQUEST_SHAPE_FIELD,
+};
 
 /// Default statement-count threshold: a dispatch executing more than this
 /// many SQL statements draws a WARN.
@@ -314,6 +321,12 @@ impl RpcProfileLayer {
 /// Span-extension state for one in-flight dispatch.
 struct DispatchProfile {
     method: String,
+    /// The request variant the handler recorded on the span
+    /// ([`RPC_REQUEST_SHAPE_FIELD`]; `agent.list` only today) — carried on
+    /// every WARN as `request_shape` so an oversize / slow dispatch is
+    /// attributable to a read shape (intent-hq/intent#5531). `None` when
+    /// the handler recorded nothing; the field is then omitted.
+    request_shape: Option<String>,
     statements: u64,
     started: Instant,
     response_bytes: u64,
@@ -343,6 +356,12 @@ impl Visit for MethodVisitor<'_> {
 struct ResponseFieldsVisitor<'a>(&'a mut DispatchProfile);
 
 impl Visit for ResponseFieldsVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == RPC_REQUEST_SHAPE_FIELD {
+            self.0.request_shape = Some(value.to_string());
+        }
+    }
+
     fn record_u64(&mut self, field: &Field, value: u64) {
         match field.name() {
             "response_bytes" => self.0.response_bytes = value,
@@ -407,6 +426,7 @@ where
         if let Some(span) = ctx.span(id) {
             span.extensions_mut().insert(DispatchProfile {
                 method,
+                request_shape: None,
                 statements: 0,
                 started: Instant::now(),
                 response_bytes: 0,
@@ -459,10 +479,12 @@ where
         let elapsed_ms =
             u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         let statement_threshold = self.statement_threshold_for(&profile.method);
+        let request_shape = profile.request_shape.as_deref();
         if profile.statements > statement_threshold {
             tracing::warn!(
                 target: WARN_TARGET,
                 method = %profile.method,
+                request_shape,
                 statements = profile.statements,
                 threshold = statement_threshold,
                 elapsed_ms,
@@ -478,6 +500,7 @@ where
             tracing::warn!(
                 target: WARN_TARGET,
                 method = %profile.method,
+                request_shape,
                 statements = profile.statements,
                 threshold_ms = u64::try_from(duration_threshold.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
                 elapsed_ms,
@@ -492,6 +515,7 @@ where
             tracing::warn!(
                 target: WARN_TARGET,
                 method = %profile.method,
+                request_shape,
                 statements = profile.statements,
                 threshold_bytes = RESPONSE_SIZE_WARN_THRESHOLD_BYTES,
                 elapsed_ms,
@@ -506,6 +530,7 @@ where
             tracing::warn!(
                 target: WARN_TARGET,
                 method = %profile.method,
+                request_shape,
                 statements = profile.statements,
                 elapsed_ms,
                 response_bytes = profile.response_bytes,
@@ -577,6 +602,7 @@ mod tests {
                 target: RPC_DISPATCH_SPAN_TARGET,
                 "rpc_dispatch",
                 method,
+                request_shape = tracing::field::Empty,
                 response_bytes = tracing::field::Empty,
                 encode_elapsed_ms = tracing::field::Empty,
                 oversized_replacement = tracing::field::Empty,
@@ -754,6 +780,50 @@ mod tests {
             )),
             "{warns:?}"
         );
+    }
+
+    /// intent-hq/intent#5531: a handler-recorded request variant rides the
+    /// oversize WARN as `request_shape` (so the log says WHICH `agent.list`
+    /// read overflowed); a dispatch that recorded none omits the field
+    /// rather than printing an empty value.
+    #[test]
+    fn request_shape_rides_the_oversize_warn_when_recorded() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "agent.list", || {
+            let span = tracing::Span::current();
+            span.record(RPC_REQUEST_SHAPE_FIELD, "scope=delegated");
+            span.record("response_bytes", RESPONSE_SIZE_WARN_THRESHOLD_BYTES + 1);
+            span.record("encode_elapsed_ms", 3_u64);
+            span.record("oversized_replacement", false);
+            span.record("encode_failed", false);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("method=agent.list"), "{warns:?}");
+        assert!(
+            warns[0].contains("request_shape=scope=delegated"),
+            "{warns:?}"
+        );
+
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "note.list", || {
+            let span = tracing::Span::current();
+            span.record("response_bytes", RESPONSE_SIZE_WARN_THRESHOLD_BYTES + 1);
+            span.record("encode_elapsed_ms", 3_u64);
+            span.record("oversized_replacement", false);
+            span.record("encode_failed", false);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(!warns[0].contains("request_shape"), "{warns:?}");
     }
 
     #[test]
