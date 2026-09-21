@@ -1543,8 +1543,8 @@ jobs:
           dpkg-deb --contents intentd_0.0.0_amd64.deb
           test "$(dpkg-deb --field intentd_0.0.0_amd64.deb Package)" = intentd
           test "$(dpkg-deb --field intentd_0.0.0_amd64.deb Architecture)" = amd64
-          dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/bin/intentd$'
-          dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
+          dpkg-deb --contents intentd_0.0.0_amd64.deb | grep ' \./usr/bin/intentd$' >/dev/null
+          dpkg-deb --contents intentd_0.0.0_amd64.deb | grep ' \./usr/lib/systemd/user/intentd\.service$' >/dev/null
 
   # Release-script regression tests: runs the stubbed-gh harnesses for
   # scripts/aggregate-channel-notes.sh (an idempotent re-promotion must
