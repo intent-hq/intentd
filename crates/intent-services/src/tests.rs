@@ -922,6 +922,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
             .collect(),
         totals: totals(9),
         by_model: BTreeMap::from([("claude-opus-4-1".to_string(), totals(1))]),
+        by_agent_model: None,
         last_scan_at: Some(now_iso()),
     });
     row.cow_supported = Some(true);
