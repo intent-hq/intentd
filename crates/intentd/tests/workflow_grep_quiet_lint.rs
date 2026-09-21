@@ -17,8 +17,8 @@
 //!
 //! - variable input: drop the pipe — `grep -qE pattern <<<"$VAR"` (no
 //!   producer process, so no SIGPIPE) or a bash pattern test;
-//! - real producer: drain instead of quitting — `producer | grep -E pattern
-//!   >/dev/null`;
+//! - real producer: drain instead of quitting —
+//!   `producer | grep -E pattern >/dev/null`;
 //! - file input: `grep -q pattern file`.
 //!
 //! Limits: this is a bounded textual check (no shell parser). A quiet grep
@@ -144,23 +144,23 @@ mod fixture {
     #[test]
     fn quiet_flag_spellings_after_a_pipe_are_hits() {
         for line in [
-            r#"          printf x | grep -q x"#,
+            r"          printf x | grep -q x",
             r#"          echo "$OUTPUT" | grep -q "Cannot find package 'svelte'""#,
             r#"          printf '%s' "$BASE" | grep -Eq '^v?[0-9]+'"#,
             r#"          printf '%s' "$BASE" | grep -qE '^v?[0-9]+'"#,
-            r#"          cat f | grep -Fxq beta.json"#,
-            r#"          cat f | grep -i -q beta.json"#,
-            r#"          cat f | grep --quiet beta.json"#,
-            r#"          cat f | grep --silent beta.json"#,
-            r#"          cat f|grep -q beta.json"#,
-            r#"          cat f |grep -q beta.json"#,
-            r#"          cat f | grep -q beta.json && echo yes"#,
+            r"          cat f | grep -Fxq beta.json",
+            r"          cat f | grep -i -q beta.json",
+            r"          cat f | grep --quiet beta.json",
+            r"          cat f | grep --silent beta.json",
+            r"          cat f|grep -q beta.json",
+            r"          cat f |grep -q beta.json",
+            r"          cat f | grep -q beta.json && echo yes",
             r#"          if xcrun simctl list runtimes 2>/dev/null | grep -q "^iOS "; then"#,
             r#"          dpkg-deb --contents "$deb" | grep -q ' \./usr/bin/intentd$'"#,
-            r#"          cmd 2>&1 | grep -q err"#,
-            r#"          cmd |& grep -q err"#,
-            r#"            | grep -q err"#,
-            r#"          x=$(cat f | grep -q beta.json)"#,
+            r"          cmd 2>&1 | grep -q err",
+            r"          cmd |& grep -q err",
+            r"            | grep -q err",
+            r"          x=$(cat f | grep -q beta.json)",
         ] {
             assert!(line_is_quiet_grep_pipeline(line), "expected hit: {line}");
         }
@@ -169,23 +169,23 @@ mod fixture {
     #[test]
     fn non_pipeline_quiet_greps_and_drained_pipes_are_not_hits() {
         for line in [
-            r#"          grep -q pattern file"#,
+            r"          grep -q pattern file",
             r#"          grep -Fxq "beta.json" "$tmpdir/assets.txt""#,
             r#"          grep -qE pattern <<<"$VAR""#,
             r#"          if ! grep -qE pattern <<<"$VAR"; then"#,
-            r#"          producer | grep -E pattern >/dev/null"#,
-            r#"          producer | grep pattern >/dev/null"#,
-            r#"          producer | grep -c pattern"#,
-            r#"          producer | grep -E pattern | tail -1"#,
-            r#"          test -f x || grep -q pattern file"#,
-            r#"          a || grep -q pattern file"#,
-            r#"          # cat f | grep -q beta.json"#,
-            r#"            # producer | grep --quiet x"#,
-            r#"        run: |"#,
-            r#"          producer | grepper -q x"#,
-            r#"          producer | egrep -q x"#,
-            r#"          producer | grep pat -1"#,
-            r#"          producer | grep -E pat >/dev/null || grep -q pat file"#,
+            r"          producer | grep -E pattern >/dev/null",
+            r"          producer | grep pattern >/dev/null",
+            r"          producer | grep -c pattern",
+            r"          producer | grep -E pattern | tail -1",
+            r"          test -f x || grep -q pattern file",
+            r"          a || grep -q pattern file",
+            r"          # cat f | grep -q beta.json",
+            r"            # producer | grep --quiet x",
+            r"        run: |",
+            r"          producer | grepper -q x",
+            r"          producer | egrep -q x",
+            r"          producer | grep pat -1",
+            r"          producer | grep -E pat >/dev/null || grep -q pat file",
         ] {
             assert!(!line_is_quiet_grep_pipeline(line), "unexpected hit: {line}");
         }
