@@ -11,21 +11,22 @@ use crate::ids::{
     AgentId, ClientId, HookId, NoteId, PrMonitorId, PrincipalId, WorkspaceGitRootId, WorkspaceId,
 };
 use crate::model::{
-    AgentDelegateInput, AgentListRowScope, AgentLite, AgentScopeCounts, AgentSession, BrowserTab,
-    BrowserTabInput, ClientHostInfo, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentResolveThreadResult, CommentRespondResult, ContextItem, Draft,
-    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
-    LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
-    NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
-    ScriptCreateParams, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    AgentDelegateInput, AgentDelegatedCounts, AgentListRowScope, AgentLite, AgentScopeCounts,
+    AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo, CommentAddResult,
+    CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentResolveThreadResult,
+    CommentRespondResult, ContextItem, Draft, EventQueryParams, EventSubscribeResult,
+    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
+    GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
+    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
+    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
+    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
+    WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -1526,6 +1527,20 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_scope_counts not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Per-parent non-retired delegated session counts — the `delegatedCounts`
+    /// field attached to every `agent.list` response variant (PROTOCOL §5.5).
+    fn agent_delegated_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<AgentDelegatedCounts>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_delegated_counts not implemented".to_string(),
             ))
         })
     }
