@@ -3129,7 +3129,11 @@ pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 6 * 1024;
 /// over, re-applies [`AgentLite::cap_list_previews_to`] with a tighter
 /// preview budget. 1,000 KiB leaves ≈ 24 KiB under the warn threshold for
 /// the envelope (`{"jsonrpc":"2.0","id":…,"result":{"agents":[…],
-/// "retiredCount":…,"scopeCounts":{…}}}`, well under 300 B).
+/// "retiredCount":…,"scopeCounts":{…}}}`, well under 300 B with the small
+/// counter / UUID `id`s real clients send). The `id` is client-chosen and
+/// echoed by the router; the service layer never sees it, so a client that
+/// sends a multi-KiB `id` adds its own bytes on top of this budget and can
+/// still draw the WARN — that is the client's contribution, not the rows'.
 pub const AGENT_LIST_FRAME_BUDGET_BYTES: usize = 1000 * 1024;
 
 /// Smallest per-field preview budget the frame fit descends to
