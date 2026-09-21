@@ -74,10 +74,11 @@ pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
-    cap_json_value, format_key_bytes_table, last_tool_use_preview, note_list_slim_row,
-    serialized_key_bytes, slim_body_size, slim_heavy_body, AgentListRowScope, AgentScopeCounts,
-    ConversationProjection, NoteListProjection, AGENT_LIST_NAME_CAP_BYTES,
-    AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
+    cap_json_value, fit_agent_list_frame, format_key_bytes_table, last_tool_use_preview,
+    note_list_slim_row, serialized_key_bytes, slim_body_size, slim_heavy_body, AgentListFrameFit,
+    AgentListRowScope, AgentScopeCounts, ConversationProjection, NoteListProjection,
+    AGENT_LIST_FRAME_BUDGET_BYTES, AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES,
+    AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
     AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS,
     SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
