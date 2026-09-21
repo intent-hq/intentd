@@ -4,6 +4,10 @@
 //! `#!/usr/bin/env node` shebang resolves the right `node`, applies Codex
 //! `-c model=…` overrides, and spawns with all three pipes captured and
 //! `kill_on_drop(true)`. The captured pipes are handed to a [`Connection`].
+//!
+//! Children start at reduced scheduling priority (nice 5 on Unix,
+//! `BELOW_NORMAL_PRIORITY_CLASS` on Windows; see [`agent_nice`]) so an agent
+//! process tree competing for CPU never starves the daemon that drives it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -206,8 +210,97 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     args
 }
 
+/// Env var tuning the nice value ACP agent children start at. `0` disables
+/// the priority reduction; other values are clamped to `0..=19`.
+pub const AGENT_NICE_ENV: &str = "INTENTD_AGENT_NICE";
+
+/// Nice value ACP agent children start at when [`AGENT_NICE_ENV`] is unset.
+pub const DEFAULT_AGENT_NICE: i32 = 5;
+
+/// The nice value ACP agent children start at: [`AGENT_NICE_ENV`] when set
+/// (clamped to `0..=19`; an unparseable value falls back to the default), else
+/// [`DEFAULT_AGENT_NICE`]. `0` leaves the child at the daemon's priority. On
+/// Windows any non-zero value maps to `BELOW_NORMAL_PRIORITY_CLASS`.
+#[must_use]
+pub fn agent_nice() -> i32 {
+    agent_nice_from(std::env::var(AGENT_NICE_ENV).ok().as_deref())
+}
+
+/// [`agent_nice`] over an injected raw env value.
+fn agent_nice_from(raw: Option<&str>) -> i32 {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_AGENT_NICE;
+    };
+    let Ok(n) = raw.parse::<i64>() else {
+        tracing::warn!(
+            env = AGENT_NICE_ENV,
+            value = raw,
+            default = DEFAULT_AGENT_NICE,
+            "unparseable agent nice value; using the default"
+        );
+        return DEFAULT_AGENT_NICE;
+    };
+    i32::try_from(n.clamp(0, 19)).unwrap_or(DEFAULT_AGENT_NICE)
+}
+
+/// Configure `cmd` so the child starts at reduced scheduling priority.
+/// `nice <= 0` leaves the command untouched.
+///
+/// A failure to lower the priority must never fail the spawn, so on Unix the
+/// `setpriority` result is deliberately ignored inside `pre_exec` (logging is
+/// not async-signal-safe there); [`reduced_priority_shortfall`] reports it
+/// from the parent once the child is up.
+fn apply_reduced_priority(cmd: &mut Command, nice: i32) {
+    if nice <= 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: `setpriority` is a plain syscall wrapper that takes no
+        // pointers and touches no locks or heap state, so it is safe to call
+        // between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS);
+    }
+}
+
+/// Why the freshly spawned child `pid` is NOT running at nice `nice` or
+/// lower priority, if it is not (`None` when it is, when `nice <= 0`, or when
+/// the child is already gone). `Command::spawn` returns only after the exec,
+/// so the `pre_exec` `setpriority` has already run when this is read.
+#[cfg(unix)]
+fn reduced_priority_shortfall(pid: u32, nice: i32) -> Option<String> {
+    use nix::errno::Errno;
+    if nice <= 0 {
+        return None;
+    }
+    Errno::clear();
+    // SAFETY: plain syscall wrapper with no pointer arguments.
+    let got = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
+    let errno = Errno::last_raw();
+    if got == -1 && errno != 0 {
+        if errno == libc::ESRCH {
+            return None;
+        }
+        return Some(format!(
+            "could not read the child's priority: {}",
+            std::io::Error::from_raw_os_error(errno)
+        ));
+    }
+    (got < nice).then(|| format!("child runs at nice {got}, expected at least {nice}"))
+}
+
 /// Build the `tokio` command (args + env + enriched `PATH` + piped stdio +
-/// `kill_on_drop`) without spawning it. Exposed for testing/inspection.
+/// `kill_on_drop` + reduced priority per [`agent_nice`]) without spawning
+/// it. Exposed for testing/inspection.
 ///
 /// When `opts.provider_binary` is set (resolved to an absolute path), spawns
 /// that path directly; otherwise, when `opts.npx_fallback_binary` is set,
@@ -215,7 +308,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
 /// and relies on the enriched `PATH`.
 #[must_use]
 pub fn build_command(opts: &SpawnOptions) -> Command {
-    build_command_with_captured_env(opts, captured_credential_env())
+    build_command_with_captured_env(opts, captured_credential_env(), agent_nice())
 }
 
 /// The login-shell credential capture merged by [`build_command`]. In this
@@ -240,11 +333,13 @@ fn captured_credential_env() -> &'static BTreeMap<String, String> {
 }
 
 /// [`build_command`] with an injectable captured credential-env map (the
-/// cached login-shell capture in production). Captured vars are gap-fill
-/// only — see the precedence comment at the merge site below.
+/// cached login-shell capture in production) and nice value ([`agent_nice`]
+/// in production). Captured vars are gap-fill only — see the precedence
+/// comment at the merge site below.
 fn build_command_with_captured_env(
     opts: &SpawnOptions,
     captured: &BTreeMap<String, String>,
+    nice: i32,
 ) -> Command {
     let args = build_args(opts);
 
@@ -315,6 +410,7 @@ fn build_command_with_captured_env(
     // only reaches the direct child, leaving grandchildren orphaned (§5.6).
     #[cfg(unix)]
     cmd.process_group(0);
+    apply_reduced_priority(&mut cmd, nice);
     cmd
 }
 
@@ -391,7 +487,8 @@ impl SpawnedAgent {
 /// [`AcpError::Spawn`] for every other spawn failure or when the stdio pipes
 /// cannot be taken.
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
-    let mut cmd = build_command(opts);
+    let nice = agent_nice();
+    let mut cmd = build_command_with_captured_env(opts, captured_credential_env(), nice);
     let (launch, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
     let mut child = cmd.spawn().map_err(|e| {
@@ -401,6 +498,18 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
             AcpError::Spawn(format!("{command_name}: {e}"))
         }
     })?;
+    #[cfg(unix)]
+    if let Some(shortfall) = child
+        .id()
+        .and_then(|pid| reduced_priority_shortfall(pid, nice))
+    {
+        tracing::warn!(
+            command = %command_name,
+            pid = child.id(),
+            nice,
+            "agent child not started at reduced priority: {shortfall}"
+        );
+    }
     let stdin = child
         .stdin
         .take()
@@ -1120,7 +1229,7 @@ mod captured_env_tests {
         let name = absent_var_name();
         let mut captured = BTreeMap::new();
         captured.insert(name.clone(), "captured-value".to_string());
-        let cmd = build_command_with_captured_env(&opts, &captured);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
         assert_eq!(env_value(&cmd, &name).as_deref(), Some("captured-value"));
     }
 
@@ -1134,7 +1243,7 @@ mod captured_env_tests {
         // Restricted to stable well-known names: scanning all of
         // `std::env::vars()` can race sibling tests that mutate process env
         // (e.g. session.rs's INTENTD_PROMPT_IDLE_TIMEOUT_MS guard).
-        let baseline = build_command_with_captured_env(&opts, &BTreeMap::new());
+        let baseline = build_command_with_captured_env(&opts, &BTreeMap::new(), DEFAULT_AGENT_NICE);
         let preset: std::collections::HashSet<String> = baseline
             .as_std()
             .get_envs()
@@ -1147,7 +1256,7 @@ mod captured_env_tests {
             .to_string();
         let mut captured = BTreeMap::new();
         captured.insert(present.clone(), "captured-must-lose".to_string());
-        let cmd = build_command_with_captured_env(&opts, &captured);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
         assert!(
             !cmd.as_std()
                 .get_envs()
@@ -1168,7 +1277,7 @@ mod captured_env_tests {
             "OPENCODE_CONFIG_CONTENT".to_string(),
             "captured-must-lose".to_string(),
         );
-        let cmd = build_command_with_captured_env(&opts, &captured);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
         let value = env_value(&cmd, "OPENCODE_CONFIG_CONTENT")
             .expect("opencode provider env sets OPENCODE_CONFIG_CONTENT");
         assert_ne!(value, "captured-must-lose");
@@ -1187,7 +1296,7 @@ mod captured_env_tests {
             "ANTHROPIC_API_KEY".to_string(),
             "captured-must-lose".to_string(),
         );
-        let cmd = build_command_with_captured_env(&opts, &captured);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
         assert_eq!(
             env_value(&cmd, "ANTHROPIC_API_KEY").as_deref(),
             Some("from-extra")
@@ -1207,7 +1316,7 @@ mod captured_env_tests {
         let mut captured = BTreeMap::new();
         captured.insert("CODEX_PATH".to_string(), "/tmp/evil".to_string());
         captured.insert("CODEX_CONFIG".to_string(), "/tmp/evil.toml".to_string());
-        let cmd = build_command_with_captured_env(&opts, &captured);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
         for key in ["CODEX_PATH", "CODEX_CONFIG"] {
             assert!(
                 cmd.as_std()
@@ -1216,5 +1325,130 @@ mod captured_env_tests {
                 "{key} must be env_remove'd from the npx-fallback codex spawn even when captured"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_nice_tests {
+    use super::*;
+
+    #[test]
+    fn agent_nice_defaults_when_unset_or_blank() {
+        assert_eq!(agent_nice_from(None), DEFAULT_AGENT_NICE);
+        assert_eq!(agent_nice_from(Some("")), DEFAULT_AGENT_NICE);
+        assert_eq!(agent_nice_from(Some("  ")), DEFAULT_AGENT_NICE);
+    }
+
+    #[test]
+    fn agent_nice_zero_disables() {
+        assert_eq!(agent_nice_from(Some("0")), 0);
+    }
+
+    #[test]
+    fn agent_nice_honours_and_clamps_values() {
+        assert_eq!(agent_nice_from(Some("7")), 7);
+        assert_eq!(agent_nice_from(Some(" 12 ")), 12);
+        assert_eq!(agent_nice_from(Some("19")), 19);
+        assert_eq!(agent_nice_from(Some("40")), 19);
+        assert_eq!(agent_nice_from(Some("-3")), 0);
+        assert_eq!(agent_nice_from(Some("99999999999999")), 19);
+    }
+
+    #[test]
+    fn agent_nice_unparseable_falls_back_to_default() {
+        assert_eq!(agent_nice_from(Some("high")), DEFAULT_AGENT_NICE);
+        assert_eq!(agent_nice_from(Some("5.5")), DEFAULT_AGENT_NICE);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod reduced_priority_tests {
+    use super::*;
+
+    /// A provider whose child is `sh -c <script>` with no ACP flags (the
+    /// args slice is leaked to satisfy the registry's `'static` lifetime).
+    fn sh_provider(script: &'static str) -> intent_providers::ProviderConfig {
+        let base = *intent_providers::find_provider("auggie").unwrap();
+        intent_providers::ProviderConfig {
+            command: "sh",
+            base_args: Box::leak(vec!["-c", script].into_boxed_slice()),
+            model_flag: None,
+            rules_flag: None,
+            mcp_config_flag: None,
+            quiet_flag: None,
+            supports_mcp_config: false,
+            supports_rules_file: false,
+            ..base
+        }
+    }
+
+    /// This test process's own nice value.
+    fn own_nice() -> i32 {
+        nix::errno::Errno::clear();
+        // SAFETY: plain syscall wrapper with no pointer arguments.
+        let got = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        assert!(
+            got != -1 || nix::errno::Errno::last_raw() == 0,
+            "getpriority(self) failed"
+        );
+        got
+    }
+
+    /// Nice value the child reports via `nice(1)` when built with `nice`.
+    async fn child_nice(nice: i32) -> i32 {
+        let provider = sh_provider("nice");
+        let opts = SpawnOptions::new(&provider);
+        let mut cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), nice);
+        let out = cmd.output().await.expect("spawn `sh -c nice`");
+        assert!(out.status.success(), "nice(1) failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("nice(1) prints an integer")
+    }
+
+    #[tokio::test]
+    async fn child_starts_at_default_nice() {
+        // An unprivileged process can only RAISE nice, so a test runner
+        // already niced above the target keeps the child at its own level.
+        let expected = own_nice().max(DEFAULT_AGENT_NICE);
+        assert_eq!(child_nice(DEFAULT_AGENT_NICE).await, expected);
+    }
+
+    #[tokio::test]
+    async fn child_starts_at_configured_nice() {
+        let expected = own_nice().max(12);
+        assert_eq!(child_nice(12).await, expected);
+    }
+
+    #[tokio::test]
+    async fn nice_zero_leaves_child_at_daemon_priority() {
+        assert_eq!(child_nice(0).await, own_nice());
+    }
+
+    #[tokio::test]
+    async fn reduced_priority_shortfall_reports_only_when_child_is_not_niced() {
+        let provider = sh_provider("exec sleep 30");
+        let opts = SpawnOptions::new(&provider);
+        let mut cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), DEFAULT_AGENT_NICE);
+        let child = cmd.spawn().expect("spawn sleeper");
+        let pid = child.id().expect("child pid");
+
+        assert_eq!(reduced_priority_shortfall(pid, 0), None);
+        assert_eq!(reduced_priority_shortfall(pid, DEFAULT_AGENT_NICE), None);
+        if own_nice() < 19 {
+            let shortfall = reduced_priority_shortfall(pid, 19).expect("child is below nice 19");
+            assert!(shortfall.contains("expected at least 19"), "{shortfall}");
+        }
+        drop(child);
+    }
+
+    #[test]
+    fn reduced_priority_shortfall_is_silent_for_a_gone_child() {
+        // pid_max on Linux is at most 2^22; this pid cannot exist.
+        assert_eq!(
+            reduced_priority_shortfall(0x7fff_fff0, DEFAULT_AGENT_NICE),
+            None
+        );
     }
 }
