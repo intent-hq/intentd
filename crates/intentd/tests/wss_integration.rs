@@ -2546,6 +2546,156 @@ async fn wss_agent_list_caps_previews_get_serves_full() {
     srv.ws.stop().await;
 }
 
+/// Response-level frame fit (intent-hq/intent#5531, fourth recurrence of
+/// the oversize `agent.list` frame): a workspace of 460 delegated sessions
+/// whose rows all sit inside the #2001 row contract — every preview at
+/// `AGENT_LIST_PREVIEW_BUDGET_BYTES`, detail fields stripped — used to
+/// encode to ~1.1 MB on the reproducing request shapes (the unscoped
+/// default read every FE reconciliation caller issues, and the sidebar's
+/// `scope: "delegated"` expand). Both frames must now stay under the 1 MiB
+/// `rpc_profile` soft limit, with every row keeping its fields (harder
+/// truncation, same shape) and no preview over the default cap. Seeds the
+/// sessions through the in-process API (one WSS round-trip per shape keeps
+/// the test fast); the assertion is on the literal frame bytes.
+#[intent_test_macros::daemon_test]
+async fn wss_agent_list_frame_stays_under_soft_limit_at_460_sessions() {
+    const ROWS: usize = 460;
+    const SOFT_LIMIT_BYTES: usize = 1024 * 1024;
+    const BUDGET: usize = intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES;
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Frame Fit"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let workspace_id = WorkspaceId(ws_id.clone());
+
+    let create = |name: String, parent: Option<intent_core::AgentId>| {
+        let api = srv.api.clone();
+        let workspace_id = workspace_id.clone();
+        async move {
+            let created = api
+                .agent_create(
+                    workspace_id,
+                    Some(name),
+                    None,
+                    None,
+                    parent,
+                    None,
+                    intent_core::AgentCreateExtra::default(),
+                )
+                .await
+                .expect("agent.create");
+            intent_core::AgentId::from(created["agent"]["id"].as_str().expect("agent id"))
+        }
+    };
+    let coordinator = create("Coordinator".to_string(), None).await;
+    let long_user = format!("delegated task {}", "u".repeat(BUDGET * 2));
+    let long_response = format!("done {}", "a".repeat(BUDGET * 2));
+    let long_report = format!("report {}", "r".repeat(BUDGET * 2));
+    for i in 0..ROWS {
+        let id = create(format!("worker-{i}"), Some(coordinator.clone())).await;
+        srv.api
+            .agent_append_message(
+                id.clone(),
+                Some(workspace_id.clone()),
+                "user".to_string(),
+                serde_json::json!([{ "type": "text", "text": long_user }]),
+                None,
+            )
+            .await
+            .expect("append user message");
+        srv.api
+            .agent_append_message(
+                id.clone(),
+                Some(workspace_id.clone()),
+                "assistant".to_string(),
+                serde_json::json!([
+                    {
+                        "type": "tool_use", "id": format!("m:{i}"), "name": "launch-process",
+                        "input": { "command": "x".repeat(BUDGET * 2) },
+                        "toolCallId": format!("t{i}"),
+                    },
+                    { "type": "text", "text": long_response },
+                ]),
+                None,
+            )
+            .await
+            .expect("append assistant message");
+        srv.api
+            .agent_update(
+                id,
+                Some(workspace_id.clone()),
+                serde_json::json!({ "completionReport": long_report }),
+            )
+            .await
+            .expect("set completionReport");
+    }
+
+    for (label, params) in [
+        ("default", String::new()),
+        ("scope=delegated", r#","scope":"delegated""#.to_string()),
+    ] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.list","params":{{"workspaceId":"{ws_id}"{params}}}}}"#
+        );
+        let text = wss_call_text(srv.port, srv.cfg.clone(), &frame).await;
+        assert!(
+            text.len() < SOFT_LIMIT_BYTES,
+            "{label}: agent.list frame is {} B, at or over the {SOFT_LIMIT_BYTES} B soft limit",
+            text.len()
+        );
+        let listed: Value = serde_json::from_str(&text).expect("json frame");
+        let rows = listed["result"]["agents"].as_array().expect("agents array");
+        let expected_rows = if label == "default" { ROWS + 1 } else { ROWS };
+        assert_eq!(
+            rows.len(),
+            expected_rows,
+            "{label}: every session is listed"
+        );
+        for row in rows.iter().filter(|r| r["parentAgentId"].is_string()) {
+            // Same shape as the per-row contract: every preview field is
+            // still present (truncated harder, never omitted) and under the
+            // default cap; the tool name survives.
+            for (field, value) in [
+                ("lastUserMessage", &row["lastUserMessage"]),
+                ("lastAgentResponse", &row["lastAgentResponse"]),
+                (
+                    "metadata.completionReport",
+                    &row["metadata"]["completionReport"],
+                ),
+            ] {
+                let len = value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{label}: {field} present on every row: {row}"))
+                    .len();
+                assert!(
+                    (1..=BUDGET).contains(&len),
+                    "{label}: {field} is {len} B, expected 1..={BUDGET}: {row}"
+                );
+            }
+            assert_eq!(
+                row["lastToolUse"]["name"].as_str(),
+                Some("launch-process"),
+                "{label}: tool name survives the frame fit: {row}"
+            );
+            assert_eq!(
+                row["lastToolUse"]["inputTruncated"].as_bool(),
+                Some(true),
+                "{label}: re-capped tool input stays flagged: {row}"
+            );
+        }
+    }
+
+    srv.ws.stop().await;
+}
+
 /// Wait up to 10 s for the next `subscription.push` notification on `ws`,
 /// answering pings and skipping unrelated frames; returns its `params`
 /// (`{ subscriptionId, kind, seq, snapshot|delta }`).

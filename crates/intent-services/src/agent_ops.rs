@@ -2656,10 +2656,17 @@ impl Services {
     /// `metadata.pendingProposals`, `metadata.proposalResolutions` — read only
     /// by the open agent's UI, intent-hq/intent#5383) are stripped from list
     /// rows ([`AgentLite::strip_detail_only_fields`]) and served by
-    /// `agent.get` / `agent.getSession` only. Together these keep a
-    /// ~250-session response well under the 1 MiB outbound frame warn
-    /// threshold; the row-budget / key-allowlist goldens in `tests.rs` pin
-    /// the resulting shape.
+    /// `agent.get` / `agent.getSession` only. Together these bound each ROW
+    /// (the row-budget / key-allowlist goldens in `tests.rs` pin the
+    /// shape), and the response-level frame fit
+    /// ([`intent_core::fit_agent_list_frame`], intent-hq/intent#5531)
+    /// bounds the RESPONSE: when the serialized rows array exceeds
+    /// [`intent_core::AGENT_LIST_FRAME_BUDGET_BYTES`] — a 459-session
+    /// workspace did at 2,338 B/row with every row inside the row
+    /// contract — every row's previews are re-capped at a halved budget
+    /// until it fits (floor
+    /// [`intent_core::AGENT_LIST_PREVIEW_FLOOR_BYTES`]), so the frame stays
+    /// under the 1 MiB outbound warn threshold without a wire change.
     ///
     /// The agent channel's seq-0 snapshot goes through this op (capped,
     /// stripped rows); its per-agent deltas re-read via `agent.get` and the
@@ -2816,7 +2823,7 @@ impl Services {
                 self.active_pr_monitors_by_agent(&workspace_id).await,
             )
         };
-        Ok(sessions
+        let mut rows: Vec<AgentLite> = sessions
             .into_iter()
             .map(|s| {
                 let projection = projections.remove(&s.id.0).unwrap_or_default();
@@ -2835,7 +2842,24 @@ impl Services {
                 lite.cap_list_previews();
                 lite
             })
-            .collect())
+            .collect();
+        // Response-level frame fit (intent-hq/intent#5531): the per-row pass
+        // bounds each row, not the response — a large enough workspace still
+        // encodes past the 1 MiB frame warn with every row inside the row
+        // contract. Re-cap previews harder until the rows array fits
+        // `AGENT_LIST_FRAME_BUDGET_BYTES`; same fields, same shape.
+        if let Some(fit) = intent_core::fit_agent_list_frame(&mut rows) {
+            tracing::info!(
+                workspace = %workspace_id.0,
+                rows = rows.len(),
+                bytes_before = fit.bytes_before,
+                bytes_after = fit.bytes_after,
+                preview_budget = fit.preview_budget,
+                frame_budget = intent_core::AGENT_LIST_FRAME_BUDGET_BYTES,
+                "agent.list rows over the frame budget; previews re-capped"
+            );
+        }
+        Ok(rows)
     }
 
     /// Drop the cached agent.list message projections for `workspace_id`.

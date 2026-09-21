@@ -3113,8 +3113,102 @@ pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
 /// field-by-field. Meeting the ≈ 1 KB/row frame goal for 1,000 worst-case
 /// rows would require lowering the preview cap (each 100 B off
 /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] takes ≈ 600 B off this budget) or
-/// paging `agent.list` — separate protocol decisions.
+/// paging `agent.list` — separate protocol decisions. The response-level
+/// frame fit ([`fit_agent_list_frame`]) is the non-protocol half of that:
+/// it lowers the preview cap per response when the row count demands it.
 pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 6 * 1024;
+
+/// Response-level byte budget for the serialized `agent.list` rows array
+/// (intent-hq/intent#5531, fourth recurrence of the oversize frame): the
+/// per-field and per-row caps above bound each ROW, but the frame the
+/// transport warns on (1 MiB = 1,048,576 B, `rpc_profile`) is the whole
+/// RESPONSE, and a 459-session workspace whose rows all sat inside the row
+/// contract (2,338 B/row average — previews at the 400 B cap, detail fields
+/// stripped) still encoded to 1.07 MB. [`fit_agent_list_frame`] measures the
+/// serialized rows against this budget after the per-row pass and, when
+/// over, re-applies [`AgentLite::cap_list_previews_to`] with a tighter
+/// preview budget. 1,000 KiB leaves ≈ 24 KiB under the warn threshold for
+/// the envelope (`{"jsonrpc":"2.0","id":…,"result":{"agents":[…],
+/// "retiredCount":…,"scopeCounts":{…}}}`, well under 300 B).
+pub const AGENT_LIST_FRAME_BUDGET_BYTES: usize = 1000 * 1024;
+
+/// Smallest per-field preview budget the frame fit descends to
+/// (intent-hq/intent#5531): the fit halves [`AGENT_LIST_PREVIEW_BUDGET_BYTES`]
+/// (400 → 200 → 100 → this floor) until the rows array fits
+/// [`AGENT_LIST_FRAME_BUDGET_BYTES`], and stops here so every list row keeps
+/// a one-line-render-sized preview even on a workspace too large to fit —
+/// the non-preview part of a row (ids, timestamps, flags) measures ≈ 1,140 B
+/// on the motivating workspace, so with previews at zero the frame would
+/// still overflow at ≈ 900 rows; bounding THAT needs paging (a protocol
+/// decision), not harder truncation.
+pub const AGENT_LIST_PREVIEW_FLOOR_BYTES: usize = 50;
+
+/// Outcome of [`fit_agent_list_frame`] when the rows array was over
+/// [`AGENT_LIST_FRAME_BUDGET_BYTES`] at the default preview cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentListFrameFit {
+    /// Serialized size of the rows array at [`AGENT_LIST_PREVIEW_BUDGET_BYTES`].
+    pub bytes_before: usize,
+    /// Serialized size of the rows array after the tightened re-cap. May
+    /// still exceed the budget when `preview_budget` reached
+    /// [`AGENT_LIST_PREVIEW_FLOOR_BYTES`].
+    pub bytes_after: usize,
+    /// The preview budget the rows were re-capped to.
+    pub preview_budget: usize,
+}
+
+/// Serialized size of the JSON array `rows` would encode to
+/// (`[` + rows + separating commas + `]`), counted through a discarding writer.
+fn agent_list_rows_bytes(rows: &[AgentLite]) -> usize {
+    struct CountingSink(usize);
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = CountingSink(0);
+    serde_json::to_writer(&mut sink, rows).map_or(0, |()| sink.0)
+}
+
+/// Response-level frame fit for `agent.list` rows (intent-hq/intent#5531):
+/// the list path's per-row strip + cap pass
+/// ([`AgentLite::strip_detail_only_fields`] + [`AgentLite::cap_list_previews`])
+/// must already have run on every row. Measures the serialized rows array
+/// against [`AGENT_LIST_FRAME_BUDGET_BYTES`]; when it fits, nothing changes
+/// and `None` is returned. Otherwise the preview budget is halved from
+/// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] and every row re-capped
+/// ([`AgentLite::cap_list_previews_to`] is monotone, so re-capping an
+/// already-capped row only shortens it) until the array fits or the budget
+/// reaches [`AGENT_LIST_PREVIEW_FLOOR_BYTES`], whichever comes first. Row
+/// shape and field presence never change — the same fields ride with harder
+/// silent truncation, so no client sees a new wire shape. O(rows) work: at
+/// most four serialization passes over the rows.
+pub fn fit_agent_list_frame(rows: &mut [AgentLite]) -> Option<AgentListFrameFit> {
+    let bytes_before = agent_list_rows_bytes(rows);
+    if bytes_before <= AGENT_LIST_FRAME_BUDGET_BYTES {
+        return None;
+    }
+    let mut preview_budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+    let mut bytes_after = bytes_before;
+    while bytes_after > AGENT_LIST_FRAME_BUDGET_BYTES
+        && preview_budget > AGENT_LIST_PREVIEW_FLOOR_BYTES
+    {
+        preview_budget = (preview_budget / 2).max(AGENT_LIST_PREVIEW_FLOOR_BYTES);
+        for row in rows.iter_mut() {
+            row.cap_list_previews_to(preview_budget);
+        }
+        bytes_after = agent_list_rows_bytes(rows);
+    }
+    Some(AgentListFrameFit {
+        bytes_before,
+        bytes_after,
+        preview_budget,
+    })
+}
 
 /// Key allowlist golden for a serialized `agent.list` row
 /// (intent-hq/intent#5383): the top-level keys a list row may carry. The
@@ -4287,8 +4381,23 @@ impl AgentLite {
     /// classification keeps working. These fields exist to render a one-line
     /// summary in list contexts, so `agent.list` applies this to every row;
     /// the detail reads (`agent.get` / `agent.getSession`) never call it and
-    /// keep serving full values.
+    /// keep serving full values. Equivalent to
+    /// [`Self::cap_list_previews_to`] at [`AGENT_LIST_PREVIEW_BUDGET_BYTES`].
     pub fn cap_list_previews(&mut self) {
+        self.cap_list_previews_to(AGENT_LIST_PREVIEW_BUDGET_BYTES);
+    }
+
+    /// [`Self::cap_list_previews`] with an explicit per-field preview budget
+    /// in place of [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] — the seam the
+    /// response-level frame fit ([`fit_agent_list_frame`],
+    /// intent-hq/intent#5531) uses to re-cap every row of an over-budget
+    /// `agent.list` response harder. Only the six preview slots
+    /// (`lastAgentResponse`, `lastUserMessage`, `digest`,
+    /// `metadata.completionReport`, `metadata.attentionRequestReason`,
+    /// `lastToolUse.input`) follow `preview_budget`; `name` / `model` and the
+    /// sandbox strings keep their own fixed caps. Monotone: re-capping an
+    /// already-capped row at a smaller budget only shortens it.
+    pub fn cap_list_previews_to(&mut self, preview_budget: usize) {
         use serde_json::Value;
         // JSON-escaped content bytes of `s` as it will hit the wire (quotes
         // excluded), counted through a discarding writer like
@@ -4333,20 +4442,11 @@ impl AgentLite {
                 cap_str(s, budget);
             }
         }
-        cap_string(
-            &mut self.last_agent_response,
-            AGENT_LIST_PREVIEW_BUDGET_BYTES,
-        );
-        cap_string(&mut self.last_user_message, AGENT_LIST_PREVIEW_BUDGET_BYTES);
-        cap_string(&mut self.digest, AGENT_LIST_PREVIEW_BUDGET_BYTES);
-        cap_string(
-            &mut self.metadata.completion_report,
-            AGENT_LIST_PREVIEW_BUDGET_BYTES,
-        );
-        cap_string(
-            &mut self.metadata.attention_request_reason,
-            AGENT_LIST_PREVIEW_BUDGET_BYTES,
-        );
+        cap_string(&mut self.last_agent_response, preview_budget);
+        cap_string(&mut self.last_user_message, preview_budget);
+        cap_string(&mut self.digest, preview_budget);
+        cap_string(&mut self.metadata.completion_report, preview_budget);
+        cap_string(&mut self.metadata.attention_request_reason, preview_budget);
         cap_str(&mut self.name, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.model, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.metadata.sandbox_path, AGENT_LIST_PATH_CAP_BYTES);
@@ -4355,8 +4455,8 @@ impl AgentLite {
             Some(Value::Object(preview)) => {
                 if let Some(input) = preview.get("input") {
                     let size = slim_body_size(input);
-                    if size > AGENT_LIST_PREVIEW_BUDGET_BYTES {
-                        let mut budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+                    if size > preview_budget {
+                        let mut budget = preview_budget;
                         let capped = cap_json_value(input, &mut budget);
                         preview.insert("input".to_string(), capped);
                         preview.insert("inputTruncated".to_string(), Value::Bool(true));
@@ -4369,8 +4469,8 @@ impl AgentLite {
             // Defensive: the persisted 0098 preview is always the object
             // shape above; a non-object value still gets the whole-value
             // bound so no row can smuggle an unbounded payload.
-            Some(other) if slim_body_size(other) > AGENT_LIST_PREVIEW_BUDGET_BYTES => {
-                let mut budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+            Some(other) if slim_body_size(other) > preview_budget => {
+                let mut budget = preview_budget;
                 *other = cap_json_value(other, &mut budget);
             }
             _ => {}
@@ -7604,6 +7704,153 @@ mod tests {
             lite.last_user_message.as_deref().map(str::len),
             Some(AGENT_LIST_PREVIEW_BUDGET_BYTES),
             "escaping-free content at exactly the budget passes untouched"
+        );
+    }
+
+    /// [`fit_agent_list_frame`] (intent-hq/intent#5531): a rows array that
+    /// fits [`AGENT_LIST_FRAME_BUDGET_BYTES`] at the default preview cap is
+    /// left untouched (`None`); one that overflows — the motivating shape,
+    /// hundreds of delegated rows each inside the row contract with every
+    /// preview at the cap — is re-capped at successively halved preview
+    /// budgets until it fits, the fit reports the applied budget and the
+    /// before/after sizes, and rows keep every field (harder truncation,
+    /// same shape). The floor bounds the descent: a workspace too large to
+    /// fit even at the floor still gets floor-sized previews, never zero.
+    #[test]
+    fn fit_agent_list_frame_tightens_previews_until_rows_fit() {
+        let row = |i: usize| {
+            let session = AgentSession {
+                harness_version: CURRENT_HARNESS_VERSION.to_string(),
+                harness_features: None,
+                id: AgentId::from(format!("agent-{i:0>36}").as_str()),
+                workspace_id: WorkspaceId::from("ws-1"),
+                parent_agent_id: Some(AgentId::from("agent-parent-0000-0000-0000-000000000000")),
+                backend_session_id: None,
+                acp_session_id: Some(format!("acp-{i:0>36}")),
+                name: "Delegated worker".to_string(),
+                name_explicitly_set: false,
+                model: Some("claude-sonnet-4-5-20250929".to_string()),
+                reasoning_effort: None,
+                effort_levels: None,
+                provider: Some("auggie".to_string()),
+                system_prompt: None,
+                specialist: Some("implementor".to_string()),
+                status: AgentStatus::Idle,
+                is_active: false,
+                messages: vec![],
+                stats: None,
+                task_note_id: Some(format!("task-{i:0>32}").into()),
+                skip_auto_commit: false,
+                completion_report: Some("r".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2)),
+                completion_report_timestamp: Some("2026-09-21T05:00:00.000000000Z".to_string()),
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: Some(1),
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                file_blocks: None,
+                is_background: false,
+                metadata: Some(
+                    json!({ "createdByAgentId": "agent-parent-0000-0000-0000-000000000000" }),
+                ),
+                stop_reason: None,
+                stop_reason_timestamp: None,
+                session_corrupted: false,
+                pending_delete_at: None,
+                retired_at: None,
+                notifications_muted: false,
+                created_at: "2026-09-21T04:00:00.000000000Z".to_string(),
+                updated_at: "2026-09-21T05:00:00.000000000Z".to_string(),
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+            };
+            let mut lite = AgentLite::from_session(
+                session,
+                40,
+                Some("a".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2)),
+                Some("u".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2)),
+                None,
+                Some("assistant".to_string()),
+                Some(format!("msg-{i:0>36}")),
+            );
+            lite.last_tool_use = Some(json!({
+                "name": "launch-process",
+                "input": { "command": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2) },
+            }));
+            lite.strip_detail_only_fields();
+            lite.cap_list_previews();
+            lite
+        };
+
+        // A small workspace fits at the default cap: untouched.
+        let mut few: Vec<AgentLite> = (0..10).map(row).collect();
+        let before = serde_json::to_string(&few).unwrap();
+        assert_eq!(fit_agent_list_frame(&mut few), None);
+        assert_eq!(serde_json::to_string(&few).unwrap(), before);
+
+        // 460 rows at the default cap encode past the frame budget (each row
+        // is inside the row budget); the fit tightens until they fit.
+        let mut many: Vec<AgentLite> = (0..460).map(row).collect();
+        let per_row = serde_json::to_string(&many[0]).unwrap().len();
+        assert!(
+            per_row <= AGENT_LIST_ROW_BUDGET_BYTES,
+            "fixture row {per_row} B"
+        );
+        let fit = fit_agent_list_frame(&mut many).expect("over budget at the default cap");
+        assert!(
+            fit.bytes_before > AGENT_LIST_FRAME_BUDGET_BYTES,
+            "fixture must overflow at the default cap: {fit:?}"
+        );
+        assert!(
+            fit.bytes_after <= AGENT_LIST_FRAME_BUDGET_BYTES,
+            "460 rows fit after the re-cap: {fit:?}"
+        );
+        assert_eq!(
+            serde_json::to_string(&many).unwrap().len(),
+            fit.bytes_after,
+            "reported size is the serialized rows array"
+        );
+        assert!(
+            fit.preview_budget < AGENT_LIST_PREVIEW_BUDGET_BYTES
+                && fit.preview_budget >= AGENT_LIST_PREVIEW_FLOOR_BYTES,
+            "tightened budget is between the floor and the default: {fit:?}"
+        );
+        let served = &many[0];
+        assert_eq!(
+            served.last_user_message.as_deref().map(str::len),
+            Some(fit.preview_budget)
+        );
+        assert_eq!(
+            served.last_agent_response.as_deref().map(str::len),
+            Some(fit.preview_budget)
+        );
+        assert_eq!(
+            served.metadata.completion_report.as_deref().map(str::len),
+            Some(fit.preview_budget)
+        );
+        let tool_use = served.last_tool_use.as_ref().unwrap();
+        assert_eq!(tool_use["name"], "launch-process");
+        assert_eq!(tool_use["inputTruncated"], json!(true));
+        assert_eq!(
+            tool_use["inputBytes"],
+            json!(slim_body_size(
+                &json!({ "command": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2) })
+            )),
+            "inputBytes still names the ORIGINAL input size after the re-cap"
+        );
+
+        // Too many rows to fit even at the floor: the descent stops at the
+        // floor and reports the residual overflow rather than zeroing previews.
+        let mut huge: Vec<AgentLite> = (0..2000).map(row).collect();
+        let fit = fit_agent_list_frame(&mut huge).expect("over budget");
+        assert_eq!(fit.preview_budget, AGENT_LIST_PREVIEW_FLOOR_BYTES);
+        assert!(fit.bytes_after > AGENT_LIST_FRAME_BUDGET_BYTES, "{fit:?}");
+        assert_eq!(
+            huge[0].last_user_message.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_FLOOR_BYTES)
         );
     }
 
