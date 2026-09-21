@@ -504,7 +504,8 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
 /// absent defaults, string-only updates, persistence, clearing and reset.
 #[tokio::test]
 async fn notification_sound_path_round_trips_and_resets_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(&config_path, "[notifications]\nsoundEnabled = false\n")
         .expect("seed legacy notification config");
