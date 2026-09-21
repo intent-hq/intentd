@@ -1456,8 +1456,10 @@ async fn dispatch(
             // `-32602`, never coerced, and a bin scope cannot be combined
             // with either retired flag (retired is its own bin). Every
             // variant additionally carries `scopeCounts` (one grouped SQL
-            // aggregate over the non-retired rows) under the same
-            // no-snapshot-isolation tolerance as `retiredCount`.
+            // aggregate over the non-retired rows) and `delegatedCounts`
+            // (one grouped aggregate over the non-retired delegated rows,
+            // per direct parent) under the same no-snapshot-isolation
+            // tolerance as `retiredCount`.
             let scope = parse_agent_list_scope(params, include_retired || retired_only)?;
             // Attribute the dispatch to its read variant for the profiling
             // WARNs (flags only — see `RPC_REQUEST_SHAPE_FIELD`).
@@ -1484,11 +1486,19 @@ async fn dispatch(
                 .agent_retired_count(ws.clone())
                 .await
                 .map_err(domain_to_rpc)?;
-            let scope_counts = api.agent_scope_counts(ws).await.map_err(domain_to_rpc)?;
+            let scope_counts = api
+                .agent_scope_counts(ws.clone())
+                .await
+                .map_err(domain_to_rpc)?;
+            let delegated_counts = api
+                .agent_delegated_counts(ws)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(json!({
                 "agents": agents,
                 "retiredCount": retired_count,
                 "scopeCounts": scope_counts,
+                "delegatedCounts": delegated_counts,
             }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),

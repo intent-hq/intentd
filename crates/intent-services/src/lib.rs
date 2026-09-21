@@ -27911,6 +27911,13 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_scope_counts_op(workspace_id).await })
     }
 
+    fn agent_delegated_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::AgentDelegatedCounts>> {
+        Box::pin(async move { self.agent_delegated_counts_op(workspace_id).await })
+    }
+
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_list_active_op().await })
     }
