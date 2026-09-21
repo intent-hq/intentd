@@ -25,8 +25,10 @@
 //! double quotes group words (so `-e 'x|y' -q` is a hit and `-E 'has -q
 //! word'` is not), an unquoted `#` at a word start drops the comment tail,
 //! redirections (`2>/dev/null`, `2>&1`) are ordinary non-option words, `--`
-//! ends option scanning, and only an unquoted `|`, `;`, `&`, `&&`, `||`,
-//! `(` or `)` ends grep's argument list. `$(…)` opens a fresh command
+//! ends option scanning, the argument of an option that takes one is not a
+//! flag (`-e '-q'`, `--regexp -q`, `-eq`, `-m 1`), and only an unquoted
+//! `|`, `;`, `&`, `&&`, `||`, `(` or `)` ends grep's argument list. `$(…)`
+//! opens a fresh command
 //! context even inside double quotes. Physical lines ending in `\` are
 //! joined with the next before lexing; a hit is reported on the physical
 //! line holding the `grep` word.
@@ -60,15 +62,20 @@ fn workflow_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Short grep options that take an argument: in a cluster, whatever follows
+/// one of these letters is that argument (`-eq` is pattern `q`, not quiet).
+const SHORT_WITH_ARG: [char; 8] = ['e', 'f', 'm', 'A', 'B', 'C', 'd', 'D'];
+
 /// Whether a single shell token is a grep quiet flag in any spelling.
 fn is_quiet_flag(token: &str) -> bool {
     if token == "--quiet" || token == "--silent" {
         return true;
     }
     match token.strip_prefix('-') {
-        Some(rest) if !rest.starts_with('-') && !rest.is_empty() => {
-            rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('q')
-        }
+        Some(rest) if !rest.starts_with('-') && !rest.is_empty() => rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() && !SHORT_WITH_ARG.contains(c))
+            .any(|c| c == 'q'),
         _ => false,
     }
 }
@@ -308,19 +315,58 @@ fn quiet_grep_lines(toks: &[Tok]) -> Vec<usize> {
         if text != "grep" {
             continue;
         }
-        let quiet = toks[i + 2..]
+        let args = toks[i + 2..]
             .iter()
             .map_while(|t| match t {
                 Tok::Word { text, .. } => Some(text.as_str()),
                 _ => None,
             })
-            .take_while(|arg| *arg != "--")
-            .any(is_quiet_flag);
-        if quiet {
-            lines.push(*line);
+            .take_while(|arg| *arg != "--");
+        let mut skip_next = false;
+        for arg in args {
+            if std::mem::take(&mut skip_next) {
+                continue;
+            }
+            if is_quiet_flag(arg) {
+                lines.push(*line);
+                break;
+            }
+            skip_next = takes_separate_argument(arg);
         }
     }
     lines
+}
+
+/// Whether a grep option consumes the following word as its argument
+/// (`-e PATTERN`, `-f FILE`, `-m NUM`, `--regexp PATTERN`, …), so that word
+/// must not be read as a flag. A cluster whose argument letter is not last
+/// (`-eq`) already carries its argument inline.
+fn takes_separate_argument(arg: &str) -> bool {
+    const LONG: [&str; 14] = [
+        "--regexp",
+        "--file",
+        "--max-count",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--directories",
+        "--devices",
+        "--exclude",
+        "--exclude-dir",
+        "--exclude-from",
+        "--include",
+        "--label",
+        "--group-separator",
+    ];
+    if LONG.contains(&arg) {
+        return true;
+    }
+    match arg.strip_prefix('-') {
+        Some(rest) if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic()) => {
+            rest.chars().position(|c| SHORT_WITH_ARG.contains(&c)) == Some(rest.len() - 1)
+        }
+        _ => false,
+    }
 }
 
 /// Every hit in `text`, as `<name>:<line>: <trimmed text>`; the line is the
@@ -411,6 +457,10 @@ mod fixture {
             r"          printf x | grep x -q;",
             r"          printf x | grep x -q 2>&1",
             r"          printf x | grep x -q&& echo yes",
+            r"          printf x | grep -e q -q",
+            r"          printf x | grep -m 1 -q x",
+            r"          printf x | grep --regexp -q --quiet",
+            r"          printf x | grep -qe x",
             r"          (printf x | grep -q x)",
             r#"        run: "printf x | grep -q x""#,
             r"        run: 'printf x | grep -q x'",
@@ -464,6 +514,13 @@ mod fixture {
             r"          printf x | grep x >'/dev/null' -- -q",
             r"          printf x | grep x>/dev/null",
             r"          printf x | grep x 2>/dev/null",
+            r"          printf '%s\n' -q | grep -e '-q' >/dev/null",
+            r"          printf '%s\n' --quiet | grep -e --quiet >/dev/null",
+            r"          printf x | grep --regexp -q >/dev/null",
+            r"          printf x | grep -eq x >/dev/null",
+            r"          printf x | grep -Eeq x >/dev/null",
+            r"          printf x | grep -f -q >/dev/null",
+            r"          printf x | grep -m 1 -e -q >/dev/null",
             r#"          echo "a | grep -q b""#,
             r"          echo 'a | grep -q b'",
             r"          # comment \",
