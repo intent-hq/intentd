@@ -14,7 +14,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,7 +29,8 @@ use intent_sourcecontrol::{
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
     PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewDecision,
-    ReviewThread, ReviewVerdict, RollupCheck, ScCapabilities, SourceControl, UserIdentity,
+    ReviewThread, ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, SourceControl,
+    UserIdentity,
 };
 use intent_store::{PrMonitorPollUpdate, Store};
 use intent_transport::{
@@ -51,13 +51,6 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -160,6 +153,13 @@ struct ForgeState {
     in_merge_queue: Option<bool>,
     /// The latest merge-queue removal event served by `merge_requirements`.
     merge_queue_removal: Option<MergeQueueRemoval>,
+    /// When set, `get_review_threads` fails with a non-rate-limit API error so
+    /// the requirements probe takes the REST review-comments fallback (no
+    /// per-thread resolution state).
+    review_threads_unreadable: bool,
+    /// When set, `get_pr` fails with `RateLimited` (exhausted forge quota),
+    /// so a monitor sweep opens the daemon's global rate-limit pause.
+    rate_limit_get_pr: bool,
 }
 
 impl Default for ForgeState {
@@ -172,6 +172,8 @@ impl Default for ForgeState {
             review_decision: ReviewDecision::ReviewRequired,
             in_merge_queue: None,
             merge_queue_removal: None,
+            review_threads_unreadable: false,
+            rate_limit_get_pr: false,
         }
     }
 }
@@ -254,6 +256,11 @@ impl SourceControl for StubForge {
         let merged = {
             let mut state = self.state.lock().unwrap();
             state.get_pr_calls += 1;
+            if state.rate_limit_get_pr {
+                return Err(intent_sourcecontrol::Error::RateLimited(
+                    "API rate limit exceeded".into(),
+                ));
+            }
             state.merged
         };
         Ok(PullRequest {
@@ -333,9 +340,11 @@ impl SourceControl for StubForge {
                 .iter()
                 .map(|(name, state, required)| RollupCheck {
                     name: name.clone(),
+                    kind: RollupCheckKind::CheckRun,
                     state: *state,
                     is_required: *required,
                     url: None,
+                    started_at: None,
                 })
                 .collect(),
             checks_known: true,
@@ -381,7 +390,10 @@ impl SourceControl for StubForge {
         _: u64,
         _: PageParams,
     ) -> ScResult<Page<ReviewComment>> {
-        unsupported("list_review_comments")
+        Ok(Page {
+            items: Vec::new(),
+            next_cursor: None,
+        })
     }
     async fn reply_to_review_comment(
         &self,
@@ -398,6 +410,11 @@ impl SourceControl for StubForge {
         _: u64,
         _: PageParams,
     ) -> ScResult<Page<ReviewThread>> {
+        if self.state.lock().unwrap().review_threads_unreadable {
+            return Err(intent_sourcecontrol::Error::Api(
+                "review threads unavailable".into(),
+            ));
+        }
         Ok(Page {
             items: Vec::new(),
             next_cursor: None,
@@ -431,7 +448,7 @@ struct Fixture {
     forge: StubForge,
     ws_id: WorkspaceId,
     agent_id: AgentId,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 fn workspace(id: &WorkspaceId) -> Workspace {
@@ -474,11 +491,14 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -527,6 +547,7 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -535,9 +556,8 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
 /// debounce is parked at an hour so a detected change stays pending until the
 /// test flushes it over the wire.
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-pr-monitor-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-pr-monitor-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -583,7 +603,7 @@ async fn boot() -> Fixture {
         forge,
         ws_id,
         agent_id,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -688,7 +708,7 @@ async fn owner_messages(fx: &Fixture) -> String {
 /// Registration (via the service surface the `ws.pr.monitor` binding calls)
 /// emits `prMonitor:registered`, and `prMonitor.list` over the wire carries
 /// the identity + hover payload PROTOCOL §6.9 documents.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
     let fx = boot().await;
     let mut sub = connect(fx.port, fx.cfg.clone()).await;
@@ -742,6 +762,13 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
     );
     assert_eq!(row["lastSnapshot"]["approvals"]["needed"], 1);
     assert_eq!(row["lastSnapshot"]["threads"]["resolutionRequired"], true);
+    // Readable thread resolution state: the known count is a number, and 0 is
+    // the ordinary clear value (never omitted for "all resolved").
+    assert_eq!(
+        row["lastSnapshot"]["threads"]["unresolved"],
+        json!(0),
+        "readable threads pin a numeric unresolved count: {row}"
+    );
 
     // The owning agent's per-turn state snapshot carries the monitor label.
     let snap = fx
@@ -752,11 +779,70 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
     assert_eq!(snap["prMonitors"], json!(["o/r#42"]), "snapshot: {snap}");
 }
 
+/// `threads.unresolved` over the wire (PROTOCOL §5.42 presence-detected
+/// convention): when the forge's per-thread resolution state is unreadable
+/// (a non-rate-limit threads failure → REST review-comments fallback) the key
+/// is OMITTED from `prMonitor.list`'s `lastSnapshot.threads` — never `null`,
+/// never inflated, never defaulted to `0` — while `resolutionRequired` stays
+/// present; a readable forge serves the numeric count again.
+#[tokio::test]
+async fn pr_monitor_list_omits_unreadable_threads_unresolved_over_wss() {
+    let fx = boot().await;
+    fx.forge.edit(|s| s.review_threads_unreadable = true);
+    let (monitor, requirements) = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register");
+    assert_eq!(requirements.threads.unresolved, None);
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(row["monitorId"], monitor.monitor_id.as_str());
+    let threads = row["lastSnapshot"]["threads"]
+        .as_object()
+        .expect("threads object");
+    assert!(
+        threads.get("unresolved").is_none(),
+        "unreadable resolution state: the key is omitted, not null/0: {row}"
+    );
+    assert_eq!(
+        threads.get("resolutionRequired"),
+        Some(&json!(true)),
+        "resolutionRequired stays present alongside the omitted count: {row}"
+    );
+
+    // The forge becomes readable again: the next poll serves the numeric
+    // count over the wire (0 = every thread resolved, an ordinary value).
+    fx.forge.edit(|s| s.review_threads_unreadable = false);
+    fx.services.poll_pr_monitors().await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(
+        row["lastSnapshot"]["threads"]["unresolved"],
+        json!(0),
+        "readable again: the numeric count is back: {row}"
+    );
+}
+
 /// `isInMergeQueue` over the wire (PROTOCOL §5.42 additive-field convention):
 /// omitted from `prMonitor.list`'s `lastSnapshot` while the forge reports the
 /// PR not queued (or unknown), present as `true` after the PR enters the
 /// merge queue, and the transition surfaces as a `prMonitor:changed` line.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_list_carries_is_in_merge_queue_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -827,7 +913,7 @@ async fn pr_monitor_list_carries_is_in_merge_queue_over_wss() {
 /// value) once the host reports one, the transition surfaces as a
 /// `prMonitor:changed` line keyed on the event identity, and the flushed
 /// monitor wake carries the same humanized ejection line.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_carries_merge_queue_ejection_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -916,7 +1002,7 @@ async fn pr_monitor_carries_merge_queue_ejection_over_wss() {
 
 /// `prMonitor.flush` over the wire delivers the pending debounced wake right
 /// away (emitting `prMonitor:emitted`) and is an explicit no-op afterwards.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_flush_delivers_pending_changes_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -988,7 +1074,7 @@ async fn pr_monitor_flush_delivers_pending_changes_over_wss() {
 /// delivered immediately (emitting `prMonitor:emitted`), while a checked
 /// flush with nothing changed returns `flushed: false`. A non-boolean
 /// `check` is `-32602`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_flush_with_check_repolls_on_demand_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -1075,7 +1161,7 @@ async fn pr_monitor_flush_with_check_repolls_on_demand_over_wss() {
 /// `prMonitor.cancel` over the wire (the FE path) cancels the monitor, removes
 /// it from `prMonitor.list`, emits `prMonitor:cancelled`, and notifies the
 /// owning agent — unlike an agent's own `ws.pr.unmonitor`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_monitor_cancel_removes_the_row_and_notifies_the_owner_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -1139,6 +1225,578 @@ async fn pr_monitor_cancel_removes_the_row_and_notifies_the_owner_over_wss() {
     assert_eq!(resp["error"]["code"], -32602, "error envelope: {resp}");
 }
 
+/// One monitor per PR per workspace (PROTOCOL §5.42): a second agent's
+/// `ws.pr.monitor` on a PR another agent in the same workspace already
+/// watches is REFUSED with the structured `ok: false` payload naming the
+/// owner — no forge fetch, no row, no `prMonitor:registered` event — and
+/// `prMonitor.list` over the wire stays single. After the owner's own
+/// `ws.pr.unmonitor`, the second agent registers normally and the list
+/// carries its row instead.
+#[intent_test_macros::daemon_test]
+async fn a_duplicate_monitor_is_refused_and_the_workspace_list_stays_single_over_wss() {
+    let fx = boot().await;
+    let second_id = AgentId::from("agent-prmon-second");
+    fx.services
+        .store()
+        .insert_agent_session(&agent_session(&fx.ws_id, second_id.as_str()))
+        .await
+        .expect("seed second agent");
+    let api: Arc<dyn WorkspaceApi> = fx.services.clone();
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["prMonitor:registered", "prMonitor:cancelled"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Agent A registers through the `ws.pr.monitor` binding's entry point.
+    let started = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("owner registers");
+    assert_eq!(started["ok"], json!(true), "{started}");
+    assert_eq!(started["monitor"]["agentId"], fx.agent_id.as_str());
+    assert_eq!(started["requirements"]["state"], "open");
+    let owner_monitor_id = started["monitor"]["monitorId"]
+        .as_str()
+        .expect("owner monitorId")
+        .to_string();
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], owner_monitor_id);
+
+    // Agent B's registration on the same PR is a refusal payload, not an
+    // error: it names the owner and its monitor, and carries no `monitor`
+    // or `requirements`.
+    let fetches_before = fx.forge.fetches();
+    let refused = api
+        .pr_monitor_start(fx.ws_id.clone(), second_id.clone(), 42, None)
+        .await
+        .expect("a refusal is a payload, not an error");
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(refused["refused"], json!(true), "{refused}");
+    assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+    assert_eq!(refused["repo"], json!("o/r"), "{refused}");
+    assert_eq!(refused["prNumber"], json!(42), "{refused}");
+    assert_eq!(refused["ownerAgentId"], fx.agent_id.as_str(), "{refused}");
+    assert_eq!(refused["ownerAgentName"], json!("Owner"), "{refused}");
+    assert_eq!(refused["monitorId"], owner_monitor_id, "{refused}");
+    let instruction = refused["instruction"].as_str().expect("instruction");
+    assert!(instruction.contains("o/r#42"), "{instruction}");
+    assert!(instruction.contains("ws.agent.send"), "{instruction}");
+    assert!(instruction.contains("ws.pr.unmonitor"), "{instruction}");
+    assert!(instruction.contains("ws.pr.snapshot"), "{instruction}");
+    assert!(refused.get("monitor").is_none(), "{refused}");
+    assert!(refused.get("requirements").is_none(), "{refused}");
+    assert_eq!(
+        fx.forge.fetches(),
+        fetches_before,
+        "the refusal is decided before the forge fetch"
+    );
+    assert_no_event(&mut sub, "prMonitor:registered").await;
+
+    // The workspace-wide list over the wire stays single and owned by A.
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], owner_monitor_id);
+    assert_eq!(rows[0]["agentId"], fx.agent_id.as_str());
+    assert_eq!(rows[0]["state"], "active");
+
+    // A relinquishes via `ws.pr.unmonitor`; B now registers normally.
+    let stopped = api
+        .pr_monitor_stop(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("owner unmonitors");
+    assert_eq!(stopped["ok"], json!(true), "{stopped}");
+    assert_eq!(stopped["monitor"]["monitorId"], owner_monitor_id);
+    assert_eq!(stopped["monitor"]["state"], "cancelled");
+    let evt = next_event(&mut sub, "prMonitor:cancelled").await;
+    assert_eq!(evt["data"]["monitorId"], owner_monitor_id);
+
+    let taken = api
+        .pr_monitor_start(fx.ws_id.clone(), second_id.clone(), 42, None)
+        .await
+        .expect("second agent registers after the cancel");
+    assert_eq!(taken["ok"], json!(true), "{taken}");
+    assert_eq!(taken["monitor"]["agentId"], second_id.as_str());
+    assert_eq!(taken["requirements"]["state"], "open");
+    let second_monitor_id = taken["monitor"]["monitorId"]
+        .as_str()
+        .expect("second monitorId")
+        .to_string();
+    assert_ne!(
+        second_monitor_id, owner_monitor_id,
+        "a fresh row, not a re-arm"
+    );
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], second_monitor_id);
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "still one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], second_monitor_id);
+    assert_eq!(rows[0]["agentId"], second_id.as_str());
+    assert_eq!(rows[0]["state"], "active");
+}
+
+/// Orphaned-monitor adoption (intent-hq/intent#5079): once the owner can no
+/// longer receive wakes (its session parked in `error`), a second agent's
+/// `ws.pr.monitor` on the same PR is no longer refused — it ADOPTS the
+/// owner's row: the success payload carries `adoptedFrom`, the SAME
+/// `monitorId` re-parents to the adopter with its stale pending state
+/// cleared, `prMonitor:registered` over the wire marks the adoption, and
+/// `prMonitor.list` stays single. The next change then wakes the adopter,
+/// not the dead owner, and a `prMonitor.flush` over the wire delivers to it.
+#[intent_test_macros::daemon_test]
+async fn a_monitor_owned_by_a_dead_agent_is_adopted_over_wss() {
+    let fx = boot().await;
+    let second_id = AgentId::from("agent-prmon-second");
+    fx.services
+        .store()
+        .insert_agent_session(&agent_session(&fx.ws_id, second_id.as_str()))
+        .await
+        .expect("seed second agent");
+    let api: Arc<dyn WorkspaceApi> = fx.services.clone();
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["prMonitor:registered", "prMonitor:emitted"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let started = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("owner registers");
+    assert_eq!(started["ok"], json!(true), "{started}");
+    assert!(started.get("adoptedFrom").is_none(), "{started}");
+    let owner_monitor_id = started["monitor"]["monitorId"]
+        .as_str()
+        .expect("owner monitorId")
+        .to_string();
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], owner_monitor_id);
+    assert!(evt["data"].get("adoptedFrom").is_none(), "{evt}");
+
+    // A change accrues under the owner, then the owner dies (terminal
+    // `error` status) with that change still pending.
+    fx.forge.edit(|s| s.conversation_comments = 1);
+    fx.services.poll_pr_monitors().await;
+    fx.services
+        .store()
+        .set_agent_session_status(
+            &fx.ws_id,
+            &fx.agent_id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            None,
+        )
+        .await
+        .expect("owner fails");
+
+    let adopted = api
+        .pr_monitor_start(fx.ws_id.clone(), second_id.clone(), 42, None)
+        .await
+        .expect("adoption is a success payload");
+    assert_eq!(adopted["ok"], json!(true), "{adopted}");
+    assert!(adopted.get("refused").is_none(), "{adopted}");
+    assert_eq!(adopted["adoptedFrom"], fx.agent_id.as_str(), "{adopted}");
+    assert_eq!(
+        adopted["monitor"]["monitorId"], owner_monitor_id,
+        "same row"
+    );
+    assert_eq!(adopted["monitor"]["agentId"], second_id.as_str());
+    assert_eq!(adopted["monitor"]["state"], "active");
+    assert_eq!(adopted["monitor"]["hasPendingChanges"], false, "{adopted}");
+    assert_eq!(adopted["requirements"]["state"], "open");
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], owner_monitor_id, "{evt}");
+    assert_eq!(evt["data"]["agentId"], second_id.as_str(), "{evt}");
+    assert_eq!(evt["data"]["adoptedFrom"], fx.agent_id.as_str(), "{evt}");
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], owner_monitor_id);
+    assert_eq!(rows[0]["agentId"], second_id.as_str());
+    assert_eq!(rows[0]["state"], "active");
+    assert_eq!(rows[0]["hasPendingChanges"], false);
+
+    // The next change belongs to the adopter: a wire flush wakes it.
+    fx.forge.edit(|s| s.conversation_comments = 2);
+    fx.services.poll_pr_monitors().await;
+    let flushed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": owner_monitor_id }),
+    )
+    .await;
+    assert_eq!(flushed, json!({ "ok": true, "flushed": true }));
+    let evt = next_event(&mut sub, "prMonitor:emitted").await;
+    assert_eq!(evt["data"]["agentId"], second_id.as_str(), "{evt}");
+    let second_session = fx
+        .services
+        .store()
+        .get_agent_session(&second_id)
+        .await
+        .expect("second agent session");
+    assert!(
+        serde_json::to_string(&second_session.messages)
+            .unwrap()
+            .contains("[PR monitor o/r#42]"),
+        "the adopter receives the wake"
+    );
+    assert!(
+        !owner_messages(&fx).await.contains("[PR monitor o/r#42]"),
+        "the dead owner receives nothing"
+    );
+}
+
+/// Seed a live sub-agent of the fixture agent in `status`, so the fixture
+/// agent is its parent for the takeover tests.
+async fn seed_child_agent(fx: &Fixture, id: &str, status: AgentStatus) -> AgentId {
+    let mut child = agent_session(&fx.ws_id, id);
+    child.name = "Child".into();
+    child.parent_agent_id = Some(fx.agent_id.clone());
+    child.status = status;
+    fx.services
+        .store()
+        .insert_agent_session(&child)
+        .await
+        .expect("seed child agent");
+    AgentId::from(id)
+}
+
+/// Create a task note over the wire in `status` and link it to `agent_id` as
+/// its task note (the linkage delegation would set). Returns the note id.
+async fn link_task_note_over_wss(
+    fx: &Fixture,
+    rpc: &mut TlsWs,
+    agent_id: &AgentId,
+    status: &str,
+) -> String {
+    let created = wss_rpc(
+        rpc,
+        100,
+        "note.create",
+        json!({ "workspaceId": fx.ws_id.as_str(), "title": "Task", "content": "body" }),
+    )
+    .await;
+    let note_id = created["note"]["id"].as_str().expect("note id").to_string();
+    let marked = wss_rpc(
+        rpc,
+        101,
+        "task.markAsTask",
+        json!({ "workspaceId": fx.ws_id.as_str(), "noteId": note_id, "status": status }),
+    )
+    .await;
+    assert_eq!(marked["ok"], json!(true), "{marked}");
+    assert_eq!(marked["status"], json!(status), "{marked}");
+    let store = fx.services.store();
+    let mut session = store.get_agent_session(agent_id).await.unwrap();
+    session.task_note_id = Some(intent_core::NoteId::from(note_id.clone()));
+    store
+        .update_agent_session(&fx.ws_id, &session)
+        .await
+        .expect("link task note");
+    note_id
+}
+
+/// The child's transcript rows over the wire whose metadata is a
+/// `pr_monitor_wake`.
+async fn pr_monitor_wakes_over_wss(
+    fx: &Fixture,
+    rpc: &mut TlsWs,
+    agent_id: &AgentId,
+) -> Vec<Value> {
+    let convo = wss_rpc(
+        rpc,
+        102,
+        "agent.getConversation",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": agent_id.as_str() }),
+    )
+    .await;
+    convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["metadata"]["type"] == json!("pr_monitor_wake"))
+        .cloned()
+        .collect()
+}
+
+/// Parent takeover (PROTOCOL §5.42): a monitor held by the caller's DIRECT
+/// sub-agent whose linked task has moved to `complete` (over the wire, via
+/// `task.updateNoteStatus`) is no longer refused to the parent — it is
+/// ADOPTED with the orphan-adoption semantics (same `monitorId` re-parented,
+/// pending cleared, `adoptedFrom` in the payload and in
+/// `prMonitor:registered`, `prMonitor.list` stays single) and, unlike an
+/// orphan's dead owner, the child is told once: its transcript over
+/// `agent.getConversation` carries one `pr_monitor_wake` row with
+/// `reason: "transferred"` and `adoptedBy` naming the parent. The parent
+/// itself is not woken by its own takeover.
+#[intent_test_macros::daemon_test]
+async fn a_settled_childs_monitor_is_adopted_by_its_parent_over_wss() {
+    let fx = boot().await;
+    let child_id = seed_child_agent(&fx, "agent-prmon-child", AgentStatus::Active).await;
+    let api: Arc<dyn WorkspaceApi> = fx.services.clone();
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:registered"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let note_id = link_task_note_over_wss(&fx, &mut rpc, &child_id, "in_progress").await;
+
+    // The child registers and accrues a pending change under its ownership.
+    let started = api
+        .pr_monitor_start(fx.ws_id.clone(), child_id.clone(), 42, None)
+        .await
+        .expect("child registers");
+    assert_eq!(started["ok"], json!(true), "{started}");
+    let monitor_id = started["monitor"]["monitorId"]
+        .as_str()
+        .expect("child monitorId")
+        .to_string();
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], monitor_id);
+    assert!(evt["data"].get("adoptedFrom").is_none(), "{evt}");
+    fx.forge.edit(|s| s.conversation_comments = 1);
+    fx.services.poll_pr_monitors().await;
+
+    // While the child's task is in progress and it is busy, the parent is
+    // refused like any other live holder.
+    let refused = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("a refusal is a payload");
+    assert_eq!(refused["refused"], json!(true), "{refused}");
+    assert_eq!(refused["ownerAgentId"], child_id.as_str(), "{refused}");
+    assert_no_event(&mut sub, "prMonitor:registered").await;
+
+    // The child's task moves to `complete` over the wire: settled.
+    let updated = wss_rpc(
+        &mut rpc,
+        2,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": fx.ws_id.as_str(), "noteId": note_id, "status": "complete" }),
+    )
+    .await;
+    assert_eq!(updated["ok"], json!(true), "{updated}");
+    assert_eq!(updated["status"], json!("complete"), "{updated}");
+
+    let adopted = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("takeover is a success payload");
+    assert_eq!(adopted["ok"], json!(true), "{adopted}");
+    assert!(adopted.get("refused").is_none(), "{adopted}");
+    assert_eq!(adopted["adoptedFrom"], child_id.as_str(), "{adopted}");
+    assert_eq!(adopted["monitor"]["monitorId"], monitor_id, "same row");
+    assert_eq!(adopted["monitor"]["agentId"], fx.agent_id.as_str());
+    assert_eq!(adopted["monitor"]["state"], "active");
+    assert_eq!(adopted["monitor"]["hasPendingChanges"], false, "{adopted}");
+    assert_eq!(adopted["requirements"]["state"], "open");
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], monitor_id, "{evt}");
+    assert_eq!(evt["data"]["agentId"], fx.agent_id.as_str(), "{evt}");
+    assert_eq!(evt["data"]["adoptedFrom"], child_id.as_str(), "{evt}");
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], monitor_id);
+    assert_eq!(rows[0]["agentId"], fx.agent_id.as_str());
+    assert_eq!(rows[0]["state"], "active");
+
+    // The child is told exactly once, through the client-visible transcript.
+    let wakes = pr_monitor_wakes_over_wss(&fx, &mut rpc, &child_id).await;
+    assert_eq!(wakes.len(), 1, "one transfer notice: {wakes:?}");
+    let metadata = &wakes[0]["metadata"];
+    assert_eq!(metadata["reason"], "transferred", "{metadata}");
+    assert_eq!(metadata["adoptedBy"], fx.agent_id.as_str(), "{metadata}");
+    assert_eq!(metadata["monitorId"], monitor_id, "{metadata}");
+    assert_eq!(metadata["repo"], "o/r", "{metadata}");
+    assert_eq!(metadata["prNumber"], 42, "{metadata}");
+    assert_eq!(
+        metadata["url"], "https://github.com/o/r/pull/42",
+        "{metadata}"
+    );
+    let text = wakes[0].to_string();
+    assert!(text.contains("[PR monitor o/r#42]"), "{text}");
+    assert!(text.contains("took over this monitor"), "{text}");
+    assert!(
+        pr_monitor_wakes_over_wss(&fx, &mut rpc, &fx.agent_id)
+            .await
+            .is_empty(),
+        "the adopter is not woken by its own takeover"
+    );
+}
+
+/// The refusal half of parent takeover (PROTOCOL §5.42): a DIRECT sub-agent
+/// whose task is still `in_progress` and which has not settled — here idle
+/// but holding an active hook, a waiting reason other than the monitor —
+/// keeps its monitor: the parent gets the ordinary `already-monitored`
+/// refusal naming the child, no `prMonitor:registered` fires, the list stays
+/// single under the child, and no transfer notice is written. Once the hook
+/// is gone the child is idle with nothing pending but the monitor, and the
+/// same call adopts even though the task still reads `in_progress`.
+#[intent_test_macros::daemon_test]
+async fn a_parent_is_refused_while_its_child_is_still_working_over_wss() {
+    let fx = boot().await;
+    let child_id = seed_child_agent(&fx, "agent-prmon-child", AgentStatus::RuntimeIdle).await;
+    let api: Arc<dyn WorkspaceApi> = fx.services.clone();
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:registered"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    link_task_note_over_wss(&fx, &mut rpc, &child_id, "in_progress").await;
+
+    let started = api
+        .pr_monitor_start(fx.ws_id.clone(), child_id.clone(), 42, None)
+        .await
+        .expect("child registers");
+    assert_eq!(started["ok"], json!(true), "{started}");
+    let monitor_id = started["monitor"]["monitorId"]
+        .as_str()
+        .expect("child monitorId")
+        .to_string();
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], monitor_id);
+
+    // An active hook is a waiting reason: the idle child has not settled.
+    let scheduled = api
+        .hook_schedule(
+            fx.ws_id.clone(),
+            child_id.clone(),
+            json!({ "name": "watcher", "code": "return { dispatch: false };", "delayMs": 10_000 }),
+        )
+        .await
+        .expect("child schedules a hook");
+    let hook_id = scheduled["hook"]["hookId"]
+        .as_str()
+        .expect("hookId")
+        .to_string();
+
+    let fetches_before = fx.forge.fetches();
+    let refused = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("a refusal is a payload, not an error");
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(refused["refused"], json!(true), "{refused}");
+    assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+    assert_eq!(refused["ownerAgentId"], child_id.as_str(), "{refused}");
+    assert_eq!(refused["ownerAgentName"], json!("Child"), "{refused}");
+    assert_eq!(refused["monitorId"], monitor_id, "{refused}");
+    let instruction = refused["instruction"].as_str().expect("instruction");
+    assert!(instruction.contains("sub-agent"), "{instruction}");
+    assert!(instruction.contains("still working"), "{instruction}");
+    assert!(refused.get("monitor").is_none(), "{refused}");
+    assert!(refused.get("adoptedFrom").is_none(), "{refused}");
+    assert_eq!(
+        fx.forge.fetches(),
+        fetches_before,
+        "the refusal is decided before the forge fetch"
+    );
+    assert_no_event(&mut sub, "prMonitor:registered").await;
+
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], monitor_id);
+    assert_eq!(rows[0]["agentId"], child_id.as_str(), "not re-parented");
+    assert!(
+        pr_monitor_wakes_over_wss(&fx, &mut rpc, &child_id)
+            .await
+            .is_empty(),
+        "no transfer notice without a transfer"
+    );
+
+    // The child's own cancel clears its last waiting reason; the task still
+    // reads `in_progress`, but idle-with-nothing-pending is enough.
+    api.hook_cancel(
+        fx.ws_id.clone(),
+        intent_core::HookId::from(hook_id.as_str()),
+        Some(child_id.clone()),
+    )
+    .await
+    .expect("child cancels its hook");
+    let adopted = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("takeover is a success payload");
+    assert_eq!(adopted["ok"], json!(true), "{adopted}");
+    assert_eq!(adopted["adoptedFrom"], child_id.as_str(), "{adopted}");
+    assert_eq!(adopted["monitor"]["monitorId"], monitor_id, "same row");
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["adoptedFrom"], child_id.as_str(), "{evt}");
+    let wakes = pr_monitor_wakes_over_wss(&fx, &mut rpc, &child_id).await;
+    assert_eq!(wakes.len(), 1, "one transfer notice: {wakes:?}");
+    assert_eq!(wakes[0]["metadata"]["reason"], "transferred");
+    assert_eq!(wakes[0]["metadata"]["adoptedBy"], fx.agent_id.as_str());
+}
+
 /// A merged PR terminalizes the monitor: `prMonitor:completed` fires, the
 /// owner is woken immediately, and the `completed` row STAYS visible in
 /// `prMonitor.list` so merged PRs remain in the UI's list. The wake's
@@ -1146,7 +1804,7 @@ async fn pr_monitor_cancel_removes_the_row_and_notifies_the_owner_over_wss() {
 /// (`type`/`monitorId`/`repo`/`prNumber`/`reason` + the baseline-sourced
 /// `url`), asserted through `agent.getConversation` over the wire — the
 /// client-visible read path.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -1213,11 +1871,94 @@ async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     assert_eq!(metadata["url"], "https://github.com/o/r/pull/42");
 }
 
+/// `pausedUntil` over the wire (PROTOCOL §5.42 presence-detected
+/// convention): while the daemon's global forge rate-limit pause is active,
+/// every ACTIVE row in `prMonitor.list` carries the pause deadline as an
+/// RFC 3339 `pausedUntil` (and the pause `lastError` naming the same
+/// deadline); the key is OMITTED — never `null` — while the gate is open, and
+/// on terminal (completed) rows even while the gate is paused, since their
+/// checklist is final rather than stale.
+#[tokio::test]
+async fn pr_monitor_list_carries_paused_until_over_wss() {
+    let fx = boot().await;
+    // PR 42 merges first, so its monitor is terminal before the pause opens.
+    let completed = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register 42")
+        .0;
+    fx.forge.edit(|s| s.merged = true);
+    fx.services.poll_pr_monitors().await;
+    fx.forge.edit(|s| s.merged = false);
+    let active = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 43)
+        .await
+        .expect("register 43")
+        .0;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let list_params = json!({ "workspaceId": fx.ws_id.as_str() });
+    let row_of = |listed: &Value, monitor_id: &str| -> Value {
+        listed["monitors"]
+            .as_array()
+            .expect("monitors array")
+            .iter()
+            .find(|r| r["monitorId"] == monitor_id)
+            .unwrap_or_else(|| panic!("row for {monitor_id}: {listed}"))
+            .clone()
+    };
+
+    // Gate open: no row names a pause, whatever its state.
+    let listed = wss_rpc(&mut rpc, 1, "prMonitor.list", list_params.clone()).await;
+    assert_eq!(listed["monitors"].as_array().map(Vec::len), Some(2));
+    let row = row_of(&listed, active.monitor_id.as_str());
+    assert_eq!(row["state"], "active");
+    assert!(row.get("pausedUntil").is_none(), "gate open: {row}");
+    assert!(row.get("lastError").is_none(), "gate open: {row}");
+    let row = row_of(&listed, completed.monitor_id.as_str());
+    assert_eq!(row["state"], "completed");
+    assert!(row.get("pausedUntil").is_none(), "gate open: {row}");
+
+    // The next sweep's fetch hits the exhausted quota and opens the pause.
+    fx.forge.edit(|s| s.rate_limit_get_pr = true);
+    fx.services.poll_pr_monitors().await;
+
+    let listed = wss_rpc(&mut rpc, 2, "prMonitor.list", list_params).await;
+    let row = row_of(&listed, active.monitor_id.as_str());
+    assert_eq!(row["state"], "active");
+    let until = row["pausedUntil"]
+        .as_str()
+        .unwrap_or_else(|| panic!("active row carries pausedUntil: {row}"));
+    assert!(
+        intent_core::parse_iso(until).is_some(),
+        "pausedUntil is RFC 3339: {until}"
+    );
+    assert_eq!(
+        row["lastError"],
+        json!(format!(
+            "rate limited; PR monitor polling paused until {until}"
+        )),
+        "the pause lastError names the same deadline: {row}"
+    );
+    let row = row_of(&listed, completed.monitor_id.as_str());
+    assert_eq!(row["state"], "completed");
+    assert!(
+        row.get("pausedUntil").is_none(),
+        "terminal rows never carry pausedUntil, gate paused or not: {row}"
+    );
+    assert!(
+        row.get("lastError").is_none(),
+        "terminal row untouched: {row}"
+    );
+}
+
 /// A merged PR on a LINKED workspace refreshes the persisted PR linkage as
 /// part of the terminal completion (intent-hq/monorepo#2094): `pr:updated`
 /// fires over the wire and `workspace.get` serves `prStatus: "Merged"` +
 /// the refreshed `activePullRequest` — with no explicit `pr.refresh` call.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn merged_pr_terminal_wake_refreshes_workspace_linkage_over_wss() {
     let fx = boot().await;
     // Link the fixture workspace to the monitored PR up front (the fixture
@@ -1277,7 +2018,7 @@ async fn merged_pr_terminal_wake_refreshes_workspace_linkage_over_wss() {
 /// monitor is ACTIVE — and cancelling it over the wire (`prMonitor.cancel`)
 /// lapses the signal back to `idle` and drops the field (omitted, never
 /// `false`). Both transitions emit `workspace:displayStatus-changed`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn active_monitor_serves_waiting_and_pr_ready_over_wss() {
     let fx = boot().await;
     // Clear every checklist blocker: the required check passes and the
@@ -1411,7 +2152,7 @@ async fn active_monitor_serves_waiting_and_pr_ready_over_wss() {
 /// `waiting: true` off a stale monitor signal. The sweep runs on a detached
 /// tail after the archive RPC returns, so assertions ride the subscribed
 /// events.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_over_wss_cancels_active_monitors_and_drops_waiting() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
@@ -1517,7 +2258,7 @@ async fn archive_over_wss_cancels_active_monitors_and_drops_waiting() {
 /// `workspace.get`, and the PR merging flips the derivation to `pr_merged`
 /// off the COMPLETED monitor's final snapshot — with no further transition
 /// after the terminal one.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_repo_monitor_drives_pr_ready_then_pr_merged_over_wss() {
     let fx = boot().await;
     // Clear every checklist blocker so the open PR reads truly mergeable.
@@ -1608,7 +2349,7 @@ async fn cross_repo_monitor_drives_pr_ready_then_pr_merged_over_wss() {
 /// `agent:idle` event itself lives in `intent-services` unit tests, which
 /// can reach the private `annotate_waiting_on_pr_monitors` helper directly;
 /// this fixture has no ACP provider to drive a real agent turn.)
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_get_surfaces_waiting_on_pr_monitors_over_wss() {
     let fx = boot().await;
     let monitor = fx
@@ -1663,18 +2404,28 @@ async fn agent_get_surfaces_waiting_on_pr_monitors_over_wss() {
 /// on the same PR, both siblings' pending changes surface via
 /// `prMonitor.list`, and `prMonitor.flush` delivers each owner's wake and
 /// emits `prMonitor:emitted` — the same behavior FEs observe from the loop.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
     let fx = boot().await;
+    // The sibling lives in a SECOND workspace on the same `o/r` repo: a
+    // workspace holds one active monitor per PR, and the sweep still groups
+    // siblings across workspaces.
+    let sibling_ws = WorkspaceId::new();
+    fx.services
+        .store()
+        .insert_workspace(&workspace(&sibling_ws))
+        .await
+        .expect("seed sibling workspace");
     let sibling_id = AgentId::from("agent-prmon-sibling");
     fx.services
         .store()
-        .insert_agent_session(&agent_session(&fx.ws_id, sibling_id.as_str()))
+        .insert_agent_session(&agent_session(&sibling_ws, sibling_id.as_str()))
         .await
         .expect("seed sibling agent");
 
-    // Two monitors on the SAME PR (a monitor is unique per (agent, repo, pr)),
-    // registered via the service surface the `ws.pr.monitor` binding calls.
+    // Two monitors on the SAME PR (a monitor is unique per (workspace, repo,
+    // pr)), registered via the service surface the `ws.pr.monitor` binding
+    // calls.
     let first = fx
         .services
         .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
@@ -1683,7 +2434,7 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
         .0;
     let second = fx
         .services
-        .pr_monitor_register(&fx.ws_id, &sibling_id, "o", "r", 42)
+        .pr_monitor_register(&sibling_ws, &sibling_id, "o", "r", 42)
         .await
         .expect("register sibling")
         .0;
@@ -1733,20 +2484,20 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
     );
 
     // Both siblings diffed the shared snapshot against their OWN baselines:
-    // `prMonitor.list` over the wire shows both rows pending (the hour-long
-    // debounce holds the wakes).
+    // `prMonitor.list` over the wire (workspace-scoped) shows each row
+    // pending (the hour-long debounce holds the wakes).
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
-    let listed = wss_rpc(
-        &mut rpc,
-        1,
-        "prMonitor.list",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    let rows = listed["monitors"].as_array().expect("monitors array");
-    assert_eq!(rows.len(), 2, "both monitors listed: {listed}");
-    for row in rows {
-        assert_eq!(row["hasPendingChanges"], true, "row pending: {row}");
+    for (id, ws) in [(1, &fx.ws_id), (5, &sibling_ws)] {
+        let listed = wss_rpc(
+            &mut rpc,
+            id,
+            "prMonitor.list",
+            json!({ "workspaceId": ws.as_str() }),
+        )
+        .await;
+        let rows = listed["monitors"].as_array().expect("monitors array");
+        assert_eq!(rows.len(), 1, "one monitor per workspace: {listed}");
+        assert_eq!(rows[0]["hasPendingChanges"], true, "row pending: {listed}");
     }
 
     // Flushing the first monitor delivers ITS owner's wake (and emits the
@@ -1774,20 +2525,21 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
         owner_messages(&fx).await.contains("[PR monitor o/r#42]"),
         "the flush delivers the owner's consolidated wake"
     );
-    let listed_after = wss_rpc(
-        &mut rpc,
-        4,
-        "prMonitor.list",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    for row in listed_after["monitors"].as_array().expect("monitors array") {
-        let expect_pending = row["monitorId"] != json!(first.monitor_id.as_str());
-        assert_eq!(
-            row["hasPendingChanges"],
-            json!(expect_pending),
-            "sibling pending state independent: {row}"
-        );
+    for (id, ws, expect_pending) in [(4, &fx.ws_id, false), (6, &sibling_ws, true)] {
+        let listed_after = wss_rpc(
+            &mut rpc,
+            id,
+            "prMonitor.list",
+            json!({ "workspaceId": ws.as_str() }),
+        )
+        .await;
+        for row in listed_after["monitors"].as_array().expect("monitors array") {
+            assert_eq!(
+                row["hasPendingChanges"],
+                json!(expect_pending),
+                "sibling pending state independent: {row}"
+            );
+        }
     }
 }
 
@@ -1795,7 +2547,7 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
 /// `pending → passed` transition accumulates NO pending change and emits NO
 /// `prMonitor:changed`; the suite completing produces exactly ONE aggregate
 /// line, and the consolidated wake carries it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_over_wss() {
     let fx = boot().await;
     // Two pending checks so one can pass while the suite is still running.
@@ -1884,7 +2636,7 @@ async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_
 /// anchors, and produces NO owner wake even though the debounce window had
 /// already elapsed (the pre-coalescing accumulated-log behavior would have
 /// delivered the whole journey here).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn full_revert_coalesces_to_empty_and_produces_no_owner_wake_over_wss() {
     let fx = boot().await;
     let monitor = fx

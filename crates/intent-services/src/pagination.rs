@@ -53,6 +53,13 @@ fn decode_token(token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Decode the oldest-indexed exclusive end carried by a backward page token.
+/// Malformed and non-backward tokens return `None`, matching [`page_window`]'s
+/// behavior of restarting from the newest page.
+pub(crate) fn backward_page_boundary(token: &str) -> Option<usize> {
+    usize::try_from(decode_token(token)?.get("b").and_then(Value::as_u64)?).ok()
+}
+
 /// The half-open `start..end` slice (in the source's oldest→newest order) that
 /// makes up the requested page, plus the token for the next (older) page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,9 +79,8 @@ pub fn page_window(len: usize, limit: Option<i64>, token: Option<&str>) -> PageW
     // token we start at the newest end. Clamp to `len` so a stale token against
     // a shrunk collection degrades gracefully rather than panicking.
     let end = token
-        .and_then(decode_token)
-        .and_then(|v| v.get("b").and_then(Value::as_u64))
-        .map_or(len, |b| usize::try_from(b).unwrap_or(usize::MAX).min(len));
+        .and_then(backward_page_boundary)
+        .map_or(len, |boundary| boundary.min(len));
     let start = end.saturating_sub(limit);
     let next_token = if start > 0 {
         Some(encode_token(&json!({ "b": start })))

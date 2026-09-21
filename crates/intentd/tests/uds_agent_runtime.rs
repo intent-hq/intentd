@@ -14,10 +14,12 @@
 //!
 //! Gated by `node` + the mock script (the CI ACP gate); skips cleanly otherwise.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use intent_core::{
@@ -31,7 +33,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 const MARKER: &str = "MCP_TOOL_MARKER_otw_e2e";
 
@@ -75,24 +76,25 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -140,8 +142,7 @@ async fn launch_daemon(data_dir: &PathBuf, script: &str, behavior: &str) -> (Dae
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let child = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    let child = common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -151,10 +152,7 @@ async fn launch_daemon(data_dir: &PathBuf, script: &str, behavior: &str) -> (Dae
         .stderr(Stdio::from(log))
         .spawn()
         .expect("spawn intentd serve");
-    let mut daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let mut daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     common::await_daemon_listening(&mut daemon.child, &socket, &log_path).await;
     (daemon, socket)
@@ -179,7 +177,7 @@ async fn rpc(
     resp["result"].clone()
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -200,9 +198,8 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     // this same data dir on launch). We close the store before launching so the
     // daemon process gets a clean handle.
     // Keep the dir name short: the UDS path must fit within SUN_LEN (~104B).
-    let data_dir =
-        std::env::temp_dir().join(format!("itd-{}", &Uuid::new_v4().simple().to_string()[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir("itd-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let db_path = data_dir.join("intentd.db");
     let ws = WorkspaceId::new();
     let ws_root = common::hermetic_workspaces_root();
@@ -256,8 +253,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let child = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    let child = common::serve_command()
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -267,10 +263,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
         .stderr(Stdio::from(log))
         .spawn()
         .expect("spawn intentd serve");
-    let mut daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let mut daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     common::await_daemon_listening(&mut daemon.child, &socket, &log_path).await;
 
@@ -370,7 +363,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
 /// the single terminal `agent:stream:end`. We then prove keep-alive by sending a
 /// follow-up message that RESUMES the same child/session (the mock reports
 /// `turn=2`, which a respawned process — fresh `promptCount` — could never do).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_stop_interrupts_keep_alive_and_emits_terminal_stream_end_over_uds() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -387,9 +380,8 @@ async fn agent_stop_interrupts_keep_alive_and_emits_terminal_stream_end_over_uds
         return;
     }
 
-    let data_dir =
-        std::env::temp_dir().join(format!("itd-{}", &Uuid::new_v4().simple().to_string()[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir("itd-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let db_path = data_dir.join("intentd.db");
     let ws = WorkspaceId::new();
     {

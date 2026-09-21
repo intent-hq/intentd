@@ -15,10 +15,11 @@
 //! drains legacy one-at-a-time — one turn per queued message, no combined
 //! header, and the queue shrinks 2 → 1 → 0.
 //!
-//! Case 3 (`flushQueuedMessages = "systemOnly"`): two SYSTEM-origin messages
-//! queued behind a busy turn (via `agent.queueMessage`'s system-origin path,
-//! which parks as `user_origin: false`) are delivered as ONE combined turn,
-//! same contract as case 1.
+//! Case 3 (`flushQueuedMessages = "systemOnly"`): `agent.queueMessage` is the
+//! FE's user-typed mid-turn reply path and parks as `user_origin: true`, so
+//! two messages queued behind a busy turn via that RPC are EXCLUDED from the
+//! system-only batch and drain one-at-a-time — same observable shape as
+//! case 2 (one turn per message, no combined header, queue 2 → 1 → 0).
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -27,7 +28,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +43,6 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -65,15 +65,11 @@ impl Drop for Daemon {
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-flush-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-flush-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -81,9 +77,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -310,11 +305,14 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -352,6 +350,8 @@ struct FlushSetup {
     rpc: common::TlsWs,
     agent_id: String,
     prompt_log: PathBuf,
+    /// Queue entry ids of `QUEUED_ONE` / `QUEUED_TWO`, in queue order.
+    queued_ids: [String; 2],
 }
 
 async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> FlushSetup {
@@ -360,9 +360,8 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
     // First turn parks 2s: a deterministic window to queue both messages
     // while the worker is busy. Queue-drained turns run at full mock speed.
     let behavior = json!({ "response": "flush reply", "firstTurnDelayMs": 2000 }).to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         // The 2s busy window sits below the 5s dequeue-wait annotation
         // threshold (monorepo#2353); drop it so the wait-note assertions
         // exercise the annotation without slowing the suite.
@@ -446,6 +445,14 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
     )
     .await;
     assert_eq!(q2["success"], true, "queue two: {q2}");
+    let entry_id = |resp: &Value| {
+        resp["queuedMessage"]["id"]
+            .as_str()
+            .expect("queueMessage returns the entry id")
+            .to_string()
+    };
+    let queued_ids = [entry_id(&q1), entry_id(&q2)];
+    assert_ne!(queued_ids[0], queued_ids[1], "distinct entry ids");
 
     let queue = wss_rpc(
         &mut rpc,
@@ -458,6 +465,8 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
     assert_eq!(entries.len(), 2, "both messages queued mid-turn: {queue}");
     assert_eq!(entries[0]["content"], json!(QUEUED_ONE));
     assert_eq!(entries[1]["content"], json!(QUEUED_TWO));
+    assert_eq!(entries[0]["id"], json!(queued_ids[0]));
+    assert_eq!(entries[1]["id"], json!(queued_ids[1]));
 
     FlushSetup {
         _daemon: daemon,
@@ -465,6 +474,7 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
         rpc,
         agent_id,
         prompt_log,
+        queued_ids,
     }
 }
 
@@ -525,11 +535,14 @@ fn user_row_texts(conv: &Value) -> Vec<String> {
 /// been seen (kick-off turn + drained turn(s)), recording every non-empty
 /// `agent:queue:updated` queue length, every `agent:queue:processing`
 /// `turnId`, and the `turnId` of every user-row `agent:message` echo (the
-/// kick-off send's echo carries its own turn's id, so it appears first).
+/// kick-off send's echo carries its own turn's id, so it appears first),
+/// plus each user-row echo's drain identity link `queuedMessageId`
+/// (intentd#1783; `None` for the direct-send kick-off echo).
 struct DrainObservation {
     queue_lengths: Vec<usize>,
     processing_turn_ids: Vec<String>,
     user_row_turn_ids: Vec<String>,
+    user_row_queued_message_ids: Vec<Option<String>>,
 }
 
 async fn observe_drain(
@@ -540,6 +553,7 @@ async fn observe_drain(
     let mut queue_lengths = Vec::new();
     let mut processing_turn_ids = Vec::new();
     let mut user_row_turn_ids = Vec::new();
+    let mut user_row_queued_message_ids = Vec::new();
     let mut stream_ends = 0usize;
     for _ in 0..400 {
         let frame = wss_event(sub, 30).await;
@@ -565,6 +579,11 @@ async fn observe_drain(
                     if let Some(tid) = event["data"]["turnId"].as_str() {
                         user_row_turn_ids.push(tid.to_string());
                     }
+                    user_row_queued_message_ids.push(
+                        event["data"]["queuedMessageId"]
+                            .as_str()
+                            .map(str::to_string),
+                    );
                 }
             }
             Some("agent:stream:end") => {
@@ -584,6 +603,7 @@ async fn observe_drain(
         queue_lengths,
         processing_turn_ids,
         user_row_turn_ids,
+        user_row_queued_message_ids,
     }
 }
 
@@ -618,12 +638,18 @@ fn shrink_lengths(queue_lengths: &[usize]) -> &[usize] {
 /// 5. Batch grouping: both flushed rows carry the SAME
 ///    `metadata.queueInfo.batchId` on `agent.getConversation`; the direct
 ///    kick-off row carries none.
+/// 6. Drain identity link (intentd#1783): the two flushed rows carry
+///    DISTINCT `metadata.queueInfo.queuedMessageId`s — each its own queue
+///    entry's id, in queue order — and each row's `agent:message` echo
+///    lifts the same id as `queuedMessageId`; the kick-off row/echo carry
+///    none.
 #[tokio::test]
 async fn flush_combines_queued_messages_into_one_turn_over_wss() {
     let Some(script) = gate("WSS queued-message flush E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
 
     // Two terminal stream:ends: the kick-off turn, then the ONE combined
@@ -758,6 +784,30 @@ async fn flush_combines_queued_messages_into_one_turn_over_wss() {
         "the direct-send kick-off row carries no batchId"
     );
 
+    // (6) Drain identity link: each flushed row names ITS OWN queue entry
+    // (distinct ids, queue order), next to the shared batchId; each row's
+    // echo lifted the same id; the kick-off row/echo carry none.
+    let [one_id, two_id] = &setup.queued_ids;
+    assert_eq!(
+        row(QUEUED_ONE)["metadata"]["queueInfo"]["queuedMessageId"],
+        json!(one_id),
+        "first flushed row links its own entry"
+    );
+    assert_eq!(
+        row(QUEUED_TWO)["metadata"]["queueInfo"]["queuedMessageId"],
+        json!(two_id),
+        "second flushed row links its own entry"
+    );
+    assert!(
+        row(KICKOFF_MSG)["metadata"]["queueInfo"]["queuedMessageId"].is_null(),
+        "the direct-send kick-off row carries no queuedMessageId"
+    );
+    assert_eq!(
+        obs.user_row_queued_message_ids,
+        vec![None, Some(one_id.clone()), Some(two_id.clone())],
+        "kick-off echo unlinked; each flushed echo lifts its own entry id"
+    );
+
     // Queue is empty after the flush.
     let queue = wss_rpc(
         &mut setup.rpc,
@@ -781,7 +831,8 @@ async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
     let Some(script) = gate("WSS queued-message flush-disabled E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     seed_flush_mode(&data_dir, "off");
     let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
 
@@ -880,27 +931,31 @@ async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
 }
 
 /// FLUSH-3 (`agents.flushQueuedMessages = "systemOnly"` in `config.toml`):
-/// `agent.queueMessage` enqueues with `user_origin: false` (system-origin),
-/// so two messages queued behind a busy turn via that RPC batch into ONE
-/// combined turn under `systemOnly` — the same wire contract as the default
-/// `"all"` case (FLUSH-1).
+/// `agent.queueMessage` is the FE's user-typed mid-turn reply path and
+/// enqueues with `user_origin: true`, so two messages queued behind a busy
+/// turn via that RPC are excluded from the system-only batch and drain
+/// one-at-a-time over WSS — one turn per message, no batch header, TWO
+/// `agent:queue:processing` signals, and the queue shrinking through 1
+/// (the same observable shape as FLUSH-2). A combined turn here would mean
+/// `agent.queueMessage` regressed to system-origin.
 #[tokio::test]
-async fn flush_system_only_combines_queued_messages_into_one_turn_over_wss() {
+async fn flush_system_only_excludes_queue_message_entries_over_wss() {
     let Some(script) = gate("WSS queued-message flush systemOnly E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     seed_flush_mode(&data_dir, "systemOnly");
     let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
 
-    // Two terminal stream:ends: the kick-off turn, then the ONE combined
-    // flush turn (a third would mean the drain split the batch).
-    let obs = observe_drain(&mut setup.sub, &setup.agent_id, 2).await;
+    // Three terminal stream:ends: kick-off + one turn PER queued message
+    // (two would mean the user-origin entries were batched).
+    let obs = observe_drain(&mut setup.sub, &setup.agent_id, 3).await;
 
     let shrink = shrink_lengths(&obs.queue_lengths);
     assert!(
-        !shrink.contains(&1),
-        "queue must empty in one snapshot (2 → 0), never through 1: {:?}",
+        shrink.contains(&1),
+        "user-origin entries drain one-at-a-time under systemOnly (2 → 1 → 0): {:?}",
         obs.queue_lengths
     );
     assert!(
@@ -910,25 +965,48 @@ async fn flush_system_only_combines_queued_messages_into_one_turn_over_wss() {
     );
     assert_eq!(
         obs.processing_turn_ids.len(),
-        1,
-        "exactly ONE agent:queue:processing for the combined turn: {:?}",
+        2,
+        "one agent:queue:processing per drained message: {:?}",
         obs.processing_turn_ids
     );
 
-    let prompts = await_prompts(&setup.prompt_log, 2).await;
-    assert_eq!(prompts.len(), 2, "kick-off + ONE flush turn: {prompts:?}");
-    let flush = &prompts[1];
-    assert!(
-        flush.starts_with(FLUSH_HEADER),
-        "systemOnly flush prompt starts with the batch header: {flush}"
+    let prompts = await_prompts(&setup.prompt_log, 3).await;
+    assert_eq!(
+        prompts.len(),
+        3,
+        "kick-off + one turn per queued message: {prompts:?}"
     );
-    let i_one = flush
-        .find(QUEUED_ONE)
-        .unwrap_or_else(|| panic!("flush prompt carries {QUEUED_ONE:?}: {flush}"));
-    let i_two = flush
-        .find(QUEUED_TWO)
-        .unwrap_or_else(|| panic!("flush prompt carries {QUEUED_TWO:?}: {flush}"));
-    assert!(i_one < i_two, "messages appear in queue order: {flush}");
+    assert!(
+        prompts[1].starts_with(QUEUED_ONE),
+        "second turn delivers the first queued message: {}",
+        prompts[1]
+    );
+    assert!(
+        prompts[2].starts_with(QUEUED_TWO),
+        "third turn delivers the second queued message: {}",
+        prompts[2]
+    );
+    for p in &prompts {
+        assert!(
+            !p.starts_with(FLUSH_HEADER),
+            "user-origin agent.queueMessage entries never batch under systemOnly: {p}"
+        );
+    }
+
+    // One-at-a-time drains group nothing: no user row carries a batchId.
+    let conv = wss_rpc(
+        &mut setup.rpc,
+        20,
+        "agent.getConversation",
+        json!({ "agentId": setup.agent_id }),
+    )
+    .await;
+    for needle in [KICKOFF_MSG, QUEUED_ONE, QUEUED_TWO] {
+        assert!(
+            user_row(&conv, needle)["metadata"]["queueInfo"]["batchId"].is_null(),
+            "single-message drains never stamp a batchId: {needle:?}"
+        );
+    }
 
     let queue = wss_rpc(
         &mut setup.rpc,
@@ -939,6 +1017,6 @@ async fn flush_system_only_combines_queued_messages_into_one_turn_over_wss() {
     .await;
     assert!(
         queue["queue"].as_array().expect("queue array").is_empty(),
-        "queue empty after flush: {queue}"
+        "queue empty after drain: {queue}"
     );
 }

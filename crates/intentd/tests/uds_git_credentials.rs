@@ -17,43 +17,38 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 /// A deterministic fake token; never a real credential.
 const TEST_TOKEN: &str = "gho_e2e_test_token_1234567890";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-gitcred-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+/// Short `/tmp`-rooted data dir so `data_dir/intentd.sock` fits within `SUN_LEN`.
+/// Declare the guard before the [`Daemon`] so the child is reaped first.
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-gitcred-")
 }
 
 fn spawn_serve(data_dir: &Path) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
@@ -113,10 +108,10 @@ const GITHUB_GET: &str = "protocol=https\nhost=github.com\n\n";
 
 #[tokio::test]
 async fn get_emits_credential_and_other_shapes_stay_silent() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let _daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     assert!(
         await_uds(&data_dir.join("intentd.sock")).await,
@@ -161,7 +156,8 @@ async fn get_emits_credential_and_other_shapes_stay_silent() {
 
 #[tokio::test]
 async fn gate_off_stays_silent() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Persist the opt-out BEFORE the daemon boots so the effective setting is
     // off from the first request.
     std::fs::write(
@@ -171,7 +167,6 @@ async fn gate_off_stays_silent() {
     .expect("write config.toml");
     let _daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     assert!(
         await_uds(&data_dir.join("intentd.sock")).await,
@@ -190,10 +185,9 @@ async fn gate_off_stays_silent() {
 async fn daemon_down_stays_silent() {
     // No daemon at all: the data dir exists but nothing listens on the socket.
     let data_dir = temp_data_dir();
-    let (ok, stdout) = run_helper(&data_dir, "get", GITHUB_GET);
+    let (ok, stdout) = run_helper(data_dir.path(), "get", GITHUB_GET);
     assert!(ok, "helper must exit 0 when the daemon is unreachable");
     assert!(stdout.is_empty(), "no output without a daemon: {stdout:?}");
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Spawn `intentd serve` with the token seeded in the hermetic secrets store
@@ -215,8 +209,7 @@ fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {
         "[sourceControl.github]\ntokenSource = \"explicit\"\n",
     )
     .expect("write config.toml");
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
@@ -240,10 +233,10 @@ fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {
 /// revocation applies immediately to every child.
 #[tokio::test]
 async fn revoke_applies_to_next_helper_get() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let _daemon = Daemon {
         child: spawn_serve_with_stored_token(&data_dir),
-        data_dir: data_dir.clone(),
     };
     assert!(
         await_uds(&data_dir.join("intentd.sock")).await,

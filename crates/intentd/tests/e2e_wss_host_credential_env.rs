@@ -17,7 +17,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +32,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -51,6 +50,7 @@ const SHELL_SHADOW_VALUE: &str = "shell-shadow-value";
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
+    _data_dir_guard: tempfile::TempDir,
     data_dir: PathBuf,
 }
 
@@ -58,15 +58,11 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-credenv-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-credenv-")
 }
 
 /// Write the fake login shell: exports the sentinel vars, then execs the
@@ -92,13 +88,11 @@ fn spawn_serve(data_dir: &Path, fake_shell: &Path) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("SHELL", fake_shell)
         .env(DAEMON_VAR, DAEMON_VALUE)
         .env_remove(GAP_VAR)
@@ -237,11 +231,13 @@ where
 /// Boot the daemon with the fake login shell and return the live handle plus
 /// a pinned WSS client config and the bound TCP port.
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let fake_shell = write_fake_shell(&data_dir);
     let child = spawn_serve(&data_dir, &fake_shell);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");

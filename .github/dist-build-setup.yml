@@ -124,9 +124,22 @@
     tmp=$(mktemp -d)
     fetch_prebuilt() { # $1=asset $2=sha256 $3=binary-name-in-archive
       curl -fsSL --retry 3 -o "$tmp/$1" "$base/$1"
-      echo "$2  $tmp/$1" | shasum -a 256 -c -
+      # Git Bash on the hosted windows-2022 runner ships coreutils'
+      # sha256sum but not the perl shasum; Linux runners have both.
+      if command -v sha256sum >/dev/null 2>&1; then
+        echo "$2  $tmp/$1" | sha256sum -c -
+      else
+        echo "$2  $tmp/$1" | shasum -a 256 -c -
+      fi
       case "$1" in
-        *.zip) unzip -q "$tmp/$1" -d "$tmp/x" ;;
+        *.zip)
+          # unzip is absent from Git Bash and the windows-2022 image;
+          # the image ships 7-Zip (7z on PATH) instead.
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q "$tmp/$1" -d "$tmp/x"
+          else
+            7z x -y -o"$tmp/x" "$tmp/$1" >/dev/null
+          fi ;;
         *) mkdir -p "$tmp/x" && tar -xzf "$tmp/$1" -C "$tmp/x" ;;
       esac
       mv "$tmp/x/$3" "$dest/$3"

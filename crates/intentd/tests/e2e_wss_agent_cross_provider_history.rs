@@ -32,7 +32,7 @@ mod common;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,7 +47,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -55,22 +54,17 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-xprov-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-xprov-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -79,9 +73,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -347,7 +340,7 @@ fn seed_grok_path_override(data_dir: &Path, wrapper: &Path) {
     std::fs::write(&path, text).expect("write config.toml");
 }
 
-#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
+#[expect(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Cross-provider `agent.setModel` regression: switching a live `mock` agent
 /// to `grok:grok-4-fast` must respawn onto the (hermetically wrapped) grok
 /// binary, open a fresh `session/new` there, and prepend the prior
@@ -360,7 +353,8 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let wrapper = write_provider_wrapper(&data_dir, &script);
     seed_grok_path_override(&data_dir, &wrapper);
     let prompt_log = data_dir.join("prompt-log.jsonl");
@@ -368,18 +362,14 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
     // Distinctive assistant text so the replayed history provably carries the
     // FIRST session's exchange, not just the user message.
     let behavior = json!({ "response": "XPROV_E2E_ASSISTANT_REPLY" }).to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
     ];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -552,6 +542,14 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
         second_text.contains("The previous ACP session was lost"),
         "supervisor preamble present: {second_text:?}"
     );
+    // intent#3696: the replay tells the model its tool blocks are abbreviated
+    // by the replay (not failed/empty tools) and how to recover one output.
+    assert!(
+        second_text.contains("abbreviated by the recovery replay")
+            && second_text.contains("does NOT mean the tool failed or returned empty output")
+            && second_text.contains("re-run that ONE call once"),
+        "supervisor preamble carries the truncation hint: {second_text:?}"
+    );
     assert!(
         second_text.contains("XPROV_FIRST_USER_TURN")
             && second_text.contains("XPROV_E2E_ASSISTANT_REPLY"),
@@ -589,6 +587,7 @@ struct LoadSessionHarness {
     agent_id: String,
     prompt_log: PathBuf,
     session_log: PathBuf,
+    _data_dir: tempfile::TempDir,
 }
 
 async fn load_session_harness(
@@ -597,7 +596,8 @@ async fn load_session_harness(
     model: &str,
     provider: &str,
 ) -> LoadSessionHarness {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let wrapper = write_provider_wrapper(&data_dir, script);
     seed_grok_path_override(&data_dir, &wrapper);
     let prompt_log = data_dir.join("prompt-log.jsonl");
@@ -611,19 +611,15 @@ async fn load_session_harness(
         "loadSession": true,
     })
     .to_string();
-    let env: [(&str, &str); 6] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
         ("MOCK_AGENT_SESSION_LOG", &session_log_str),
     ];
     let child = spawn_serve(&data_dir, &env);
-    let daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -691,12 +687,13 @@ async fn load_session_harness(
         agent_id,
         prompt_log,
         session_log,
+        _data_dir: data_dir_guard,
     };
     await_stream_end(&mut harness.sub, &harness.agent_id).await;
     harness
 }
 
-#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
+#[expect(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// monorepo#907 regression: a committed cross-provider switch must NEVER
 /// issue `session/load` with the old provider's session id against the new
 /// provider's binary — even when that provider advertises `loadSession: true`
@@ -759,12 +756,16 @@ async fn cross_provider_switch_skips_foreign_session_load() {
         "history replayed as <supervisor> XML: {text:?}"
     );
     assert!(
+        text.contains("abbreviated by the recovery replay"),
+        "replay preamble carries the truncation hint (intent#3696): {text:?}"
+    );
+    assert!(
         text.contains("XLS_FIRST_USER_TURN") && text.contains("XLS_ASSISTANT_REPLY"),
         "replay carries both sides of the first exchange: {text:?}"
     );
 }
 
-#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
+#[expect(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Same-provider model switches keep the `session/load` resume: the respawned
 /// child is offered the ORIGINAL session id (its owner provider is unchanged)
 /// and no history replay happens. Runs on the grok wrapper (not `mock:` — the
@@ -829,7 +830,7 @@ async fn same_provider_model_switch_resumes_via_session_load() {
     );
 }
 
-#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
+#[expect(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Deferred-commit semantics: a cross-provider switch REVERTED before the
 /// next message is a no-op — the live child and its original session are
 /// reused untouched (no respawn, no session/load, no replay, no notice).

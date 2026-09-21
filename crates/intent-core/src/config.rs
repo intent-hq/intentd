@@ -40,6 +40,22 @@ pub const MAX_CONCURRENT_ADAPTERS_LIMIT: u32 = 64;
 /// unlimited value.
 pub const DEFAULT_MAX_TOP_LEVEL_AGENTS: u32 = 20;
 
+/// Default V8 `--max-old-space-size` cap in MB (`agents.acpNodeMaxOldSpaceMb`)
+/// injected via `NODE_OPTIONS` into Node/Electron ACP provider processes.
+/// V8's own default (~1.7 GB) is too small for long-lived coordinator
+/// sessions, which V8-OOM mid-turn with no error surfaced (STAB-50); 8 GB
+/// gives ample headroom. The `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var
+/// overrides the setting. Applies to newly started agent processes only.
+pub const DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB: u32 = 8192;
+
+/// Lower bound accepted for `agents.acpNodeMaxOldSpaceMb`: below 1 GB the
+/// cap is smaller than V8's own default and would only make the STAB-50
+/// OOM more likely.
+pub const ACP_NODE_MAX_OLD_SPACE_MB_MIN: u32 = 1024;
+
+/// Upper bound accepted for `agents.acpNodeMaxOldSpaceMb` (64 GB).
+pub const ACP_NODE_MAX_OLD_SPACE_MB_MAX: u32 = 65_536;
+
 /// Default grace window in seconds (`agents.reportToParentDebounceSeconds`)
 /// before an ungrouped child's `reportToParent` wake is delivered to the
 /// parent, giving the child time to finish its turn so the parent receives
@@ -47,6 +63,30 @@ pub const DEFAULT_MAX_TOP_LEVEL_AGENTS: u32 = 20;
 /// immediate wake). Read live from the settings snapshot at each call — no
 /// restart required.
 pub const DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS: u32 = 30;
+
+/// Default per-block character cap (`agents.historyReplayToolContentChars`)
+/// applied to each `tool_use` input and `tool_result` output in the recovery
+/// replay that rebuilds a lost ACP session; longer bodies are middle-truncated.
+/// Read live at replay time — no restart required.
+pub const DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS: u32 = 4000;
+
+/// Lower bound accepted for `agents.historyReplayToolContentChars`: below
+/// 500 characters a replayed tool block carries too little of the original
+/// call to orient the resumed agent.
+pub const HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN: u32 = 500;
+
+/// Upper bound accepted for `agents.historyReplayToolContentChars` (100k
+/// characters per block).
+pub const HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX: u32 = 100_000;
+
+/// Default retention window in days (`agents.toolPayloadRetentionDays`) after
+/// which stored tool payloads are shrunk to the replay-shaped preview; `0`
+/// (the default) disables the sweep and keeps full bodies forever. Read live
+/// at each sweep tick — no restart required.
+pub const DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS: u32 = 0;
+
+/// Upper bound accepted for `agents.toolPayloadRetentionDays` (ten years).
+pub const TOOL_PAYLOAD_RETENTION_DAYS_MAX: u32 = 3650;
 
 /// Default ephemeral-event retention TTL in hours (`events.streamRetentionHours`,
 /// §10.2); `0` disables the retention/compaction sweep entirely. Defaults to 72h
@@ -70,6 +110,23 @@ pub const DEFAULT_HOOKS_MAX_PER_AGENT: u32 = 5;
 /// Default daemon-wide cap on outstanding slow-path RPCs
 /// (`server.maxOutstandingRpcs`); `0` means unlimited.
 pub const DEFAULT_SERVER_MAX_OUTSTANDING_RPCS: u32 = 256;
+
+/// Default for `sharing.maxGuestsPerWorkspace` — how many guests
+/// (collaborators plus open invites) one workspace admits besides its owner.
+pub const DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE: u32 = 10;
+
+/// Ceiling for `sharing.maxGuestsPerWorkspace`; `0` closes every workspace
+/// to guests.
+pub const MAX_SHARING_MAX_GUESTS_PER_WORKSPACE: u32 = 100;
+
+/// Default for `sharing.maxGuestConnections` — the listener-wide cap on
+/// concurrent WSS connections held by non-primary principals; `0` means
+/// unlimited. The primary credential is never counted.
+pub const DEFAULT_SHARING_MAX_GUEST_CONNECTIONS: u32 = 40;
+
+/// Default for `sharing.maxConnectionsPerGuest` — concurrent WSS connections
+/// one guest principal may hold; `0` means unlimited.
+pub const DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST: u32 = 4;
 
 /// Default for `wakeResume.enabled` — whether the daemon detects host
 /// sleep/wake and resumes work on wake. On by default.
@@ -95,6 +152,51 @@ pub const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 30;
 /// forge. Sub-minimum values (notably `0`) are clamped up at read time.
 pub const MIN_PR_MONITOR_POLL_SECONDS: u64 = 10;
 
+/// Default for `prMonitor.hourlyRequestBudget` — the forge REST calls per
+/// hour the centralized PR-monitor loop plans to spend across every
+/// monitored PR. This is a **cadence cost model**, not a hard ceiling: the
+/// loop does not count or block requests against it; it derives the per-PR
+/// poll interval from it, costing each distinct-PR poll
+/// `PR_MONITOR_REQUESTS_PER_POLL` (3) steady-state REST calls and stretching
+/// the interval above `pollSeconds` once `distinct PRs × 3 × 3600 / budget`
+/// exceeds it. Actual spend can differ from the model (the 3-call unit is a
+/// single-page estimate — multi-page review lists and degraded-path REST
+/// fallbacks cost more; GraphQL reads ride their own quota); the shared
+/// rate-limit gate is the backstop for genuine quota exhaustion. 1500/h is
+/// ~30% of GitHub's
+/// 5,000/h authenticated core quota, leaving headroom for the PR-refresh
+/// sweep and agents' own `gh` use.
+pub const DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 1500;
+
+/// Floor for `prMonitor.hourlyRequestBudget` (one call per minute). Sub-floor
+/// values (notably `0`, which would divide by zero) are clamped up at read
+/// time.
+pub const MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 60;
+
+/// Ceiling for `prMonitor.hourlyRequestBudget` — GitHub's authenticated core
+/// quota; a larger model would plan more polling than the forge can serve.
+/// Over-ceiling values are clamped down at read time, mirroring the floor
+/// (the settings catalog also rejects them up front).
+pub const MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 5000;
+
+/// Default for `prMonitor.quotaSharePercent` — the share of the forge's
+/// REMAINING core quota (as reported by its quota-free `rate_limit` probe)
+/// the PR-monitor loop may plan to spend before the window resets. The
+/// hourly budget plans the steady state; this stretches the per-PR
+/// interval ahead of exhaustion once the quota is running low (agents'
+/// own `gh` use, the PR-refresh sweep, and paginated reads all draw on the
+/// same window), so the monitor slows down BEFORE the shared rate-limit
+/// pause has to stop it. Half leaves the other half for everything else.
+pub const DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT: u64 = 50;
+
+/// Floor for `prMonitor.quotaSharePercent`. Sub-floor values (notably `0`,
+/// which would plan no polling at all) are clamped up at read time.
+pub const MIN_PR_MONITOR_QUOTA_SHARE_PERCENT: u64 = 1;
+
+/// Ceiling for `prMonitor.quotaSharePercent` — the whole remaining quota.
+/// Over-ceiling values are clamped down at read time.
+pub const MAX_PR_MONITOR_QUOTA_SHARE_PERCENT: u64 = 100;
+
 /// Default quiet window a changed PR must observe before its consolidated
 /// wake is delivered (`prMonitor.debounceSeconds`).
 pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
@@ -102,6 +204,30 @@ pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
 /// Floor for `prMonitor.debounceSeconds`. Sub-minimum values (notably `0`)
 /// are clamped up at read time.
 pub const MIN_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 10;
+
+/// Default for `updates.checkOnIdle` — whether the daemon asks the sitter
+/// (via `SIGUSR2`) to check for updates once it has been continuously idle;
+/// on by default.
+pub const DEFAULT_UPDATES_CHECK_ON_IDLE: bool = true;
+
+/// Default for `updates.idleCheckIntervalMinutes` — minimum spacing (in
+/// minutes) between two idle-triggered update checks, also applied from
+/// process start since the sitter checks at startup.
+pub const DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES: u32 = 60;
+
+/// Floor for `updates.idleCheckIntervalMinutes` — a tighter interval would
+/// re-request checks the sitter already answered. Sub-minimum values
+/// (notably `0`) are clamped up at read time.
+pub const MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES: u32 = 5;
+
+/// Default for `updates.idleGraceSeconds` — how long (in seconds) the daemon
+/// must be continuously idle before it requests an update check.
+pub const DEFAULT_UPDATES_IDLE_GRACE_SECONDS: u32 = 120;
+
+/// Floor for `updates.idleGraceSeconds` — below this a momentary lull between
+/// agent turns would count as idle. Sub-minimum values (notably `0`) are
+/// clamped up at read time.
+pub const MIN_UPDATES_IDLE_GRACE_SECONDS: u32 = 10;
 
 /// Resolved filesystem locations for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]

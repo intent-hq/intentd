@@ -16,7 +16,7 @@
 mod common;
 
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,15 +33,11 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-reap-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-reap-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -277,7 +273,8 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let ws_id = "ws-reap-test";
 
@@ -298,12 +295,10 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     let pid_file = data_dir.join("tree-pids.json");
     let behavior = json!({ "blockUntilCancel": true }).to_string();
     common::enable_ws_api(&data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
         .env("MOCK_AGENT_BEHAVIOR", &behavior)
         .env("MOCK_AGENT_TREE_PID_FILE", &pid_file)
@@ -315,7 +310,7 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     // if the test panics before the graceful path runs.
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn intentd serve");
-    let mut daemon = DaemonGuard::new(child, data_dir.clone(), true);
+    let mut daemon = DaemonGuard::process_only(child);
     if !await_uds(&socket).await {
         if let Ok(log) = std::fs::read_to_string(data_dir.join("daemon.log")) {
             eprintln!("Daemon log:\n{log}");
@@ -481,10 +476,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }

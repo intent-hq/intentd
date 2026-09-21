@@ -12,7 +12,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,23 +28,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-evsub-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-evsub-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -65,7 +56,7 @@ async fn boot() -> Fixture {
     Fixture {
         _ws: ws,
         port,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -139,7 +130,7 @@ async fn conversation_text(rpc: &mut PlainWs, id: i64, ws_id: &str, agent_id: &s
 /// matching event delivers nothing. Agent subscribers use non-agent
 /// categories here because `agent:*` is rejected for them (monorepo#1229),
 /// which is asserted separately below.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_subscribe_delivers_batched_wake_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -273,7 +264,7 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
 /// subscription silently narrows to the non-agent categories (no `agent:*`,
 /// no `chat:stream:delta`), while a front-door subscription (no `agentId`)
 /// keeps the full category expansion including `agent:*`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bare_star_expansion_narrows_for_agent_subscribers_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -363,7 +354,7 @@ async fn event_subscriptions_view(
 /// `agent.diagnostics` reports it; `agent.unsubscribe` removes it from the
 /// view; a second subscription then disappears when its workspace is deleted
 /// (`workspace.delete` sweep).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_subscriptions_introspection_and_workspace_delete_cleanup_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;

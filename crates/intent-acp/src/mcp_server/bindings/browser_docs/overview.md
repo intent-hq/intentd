@@ -81,23 +81,44 @@ Agent-opened tabs start hidden: `openTab` without `visible: true` creates the ta
 hidden — alive, owned by you, emulated (the sizing invariant above is unchanged),
 returned by `listTabs` with `visibility: "hidden"`, and rendering offscreen — with no
 panel mount and no focus or active-tab change. Pass `visible: true` to open directly
-into the user's panel layout. Per-agent `openTab` dedupe matches regardless of
+into the user's panel layout: the tab is mounted AND made its panel's active tab
+without stealing panel/keyboard focus, on every `position` (`adjacent`, `same`, or a
+`replace` that falls back to a new tab). The `openTab` result carries an **optional**
+`displayed` (see below): present when the layout confirmed the tab's display state,
+absent when that state is unknown (the layout could not be read, or the tab was not
+in the fresh tab list) — absence means unknown, NOT `false`; re-check with
+`listTabs`. Only `visible: true` requests carry it (a dedupe reuse under `visible: true`
+reports the reused tab's real display state); default hidden opens and reuses without
+`visible: true` omit it. Per-agent `openTab` dedupe matches regardless of
 visibility — a same-URL reopen reuses your tab whether it is hidden or visible — and a
 dedupe hit never changes the reused tab's visibility: a hidden tab stays hidden even
 when the `openTab` carried `visible: true` (and a visible tab stays visible).
 Revealing an existing tab is `showTab`-only.
 
-- `{ action: "showTab", tabId, focus? }` - Reveal a hidden tab by activating it in a
-  visible panel. Owner-only: on a tab you do not own it returns the structured
+- `{ action: "showTab", tabId, focus? }` - Activate an owned tab in a visible panel:
+  reveals a hidden tab, or brings a visible-but-inactive tab to the front of its
+  panel. Owner-only: on a tab you do not own it returns the structured
   `not-owner` error. `focus` defaults to false: the tab is activated in a visible
   panel without moving panel/keyboard focus and without displacing the
-  currently-viewed conversation; `focus: true` reveals AND focuses — the tab becomes
+  currently-viewed conversation; `focus: true` activates AND focuses — the tab becomes
   its panel's active tab and the panel takes focus. The reveal is persisted: a
-  revealed tab stays visible across app restarts. Idempotent on an already-visible
-  tab: with `focus: false` it is a no-op success; with `focus: true` it still
-  activates the tab and focuses its panel. An unknown `tabId` fails as an
-  action-result error naming the unknown id.
-- `listTabs` results carry `visibility: "visible" | "hidden"` on every tab.
+  revealed tab stays visible across app restarts. Idempotent on an already-displayed
+  tab (a no-op success with `focus: false`; `focus: true` still focuses its panel).
+  An unknown `tabId` fails as an action-result error naming the unknown id.
+- `listTabs` results carry `visibility: "visible" | "hidden"` on every tab, plus
+  `displayed?: boolean` — a fact about the saved layout only: true when the tab is
+  visible AND its panel's active tab (derived from the panel that holds the tab).
+  The field is present only while the daemon holds a current host report for it —
+  absent before the host first reports it, after a later report that omitted it
+  cleared it, and after a daemon restart until the host reconnects — so absent means
+  unknown (never `false`, and not "never reported"); re-read with `listTabs`.
+  `visibility: "visible"` alone does not mean displayed: a visible tab that is not
+  its panel's active tab is in the layout but is not painted on screen, so
+  `visibility: "visible", displayed: false` is the "sits behind another tab" state —
+  `showTab` it (default `focus: false`) to bring it to the front. Hidden tabs are
+  `displayed: false` whenever the field is present. `displayed` says nothing about
+  whether the workspace is in view or the panel is hidden by zoom; what a tab can
+  paint or capture is stated once in the capture-ops contract below.
 - `focusTab` is unchanged for visible tabs (activate + focus the panel). On a hidden
   tab it fails with an action-result error directing you to `showTab` — there is no
   focusTab overload that reveals a hidden tab.
@@ -107,21 +128,53 @@ navigation are deterministic offscreen thanks to viewport emulation. Reveal a ta
 only when the user should see it, and prefer the default `focus: false` so you never
 steal focus.
 
-Tab operations do not require the workspace to be currently open/visible in the app:
-every action (`openTab` hidden or visible, `closeTab`, `showTab`, `evaluate`,
-`screenshot`, …) works regardless of workspace visibility — webviews spin up in the
-background as needed. Visibility/activation effects apply to the persisted layout
-state: `showTab` activates the tab in a visible panel of the workspace's layout (and
-with `focus: true`, also focuses it) so it is correct when the user next opens the
-workspace. When the
-workspace is not currently visible in the UI, no actual UI focus/activation is
+**Capture ops and workspace visibility.** Layout-only actions (`openTab` hidden or
+visible, `closeTab`, `showTab`, `focusTab`, `claimTab`, `resizeTab`, …) do not need
+the workspace to be open/visible in the app: they apply their effects to the
+persisted layout state so it is correct when the user next opens the workspace.
+When the workspace is not visible in the UI, no actual UI focus/activation is
 attempted: `showTab { focus: true }`, `focusTab`, and `openTab { visible: true }`
-succeed, apply their state effects, skip the UI focus attempt, and the action result
-carries an additive `warning` string stating that the workspace is not visible so no
-UI focus was attempted (the field is absent when the workspace is visible).
+succeed, skip the UI focus attempt, and the action result carries an additive
+`warning` string stating that the workspace is not visible so no UI focus was
+attempted (the field is absent when the workspace is visible).
+
+Capture ops (`screenshot`, `getAccessibilityTree`, `evaluate`) and `navigate` (which
+runs through `evaluate`) need a mounted webview. A tab whose webview is not mounted —
+typically a **visible** tab whose workspace is not in view or that sits behind another
+tab in its panel, but also a tab opened while its workspace was not in view, whatever
+its `visibility` — is mounted on demand by the op itself (hydrate the layout, wait for
+the tab to register). For the three capture ops the whole pipeline — mount, wait for
+the page to finish loading, capture — is bounded by one request deadline, so the op
+is designed not to outlive the request; `navigate` runs only the mount step with no
+deadline (its mount wait has its own cap), never waits for the page to settle, and
+does no origin check; `snapshot` does not go through the mount path at all. A mount
+on demand against a not-in-view workspace succeeds with the same additive `warning`
+string. When a mount, settle, or paint cannot happen, the op fails as an
+action-result error (`success: false`, `error` naming the cause and remedy) with an
+additive structured `errorCode`: `workspace-not-visible` (the tab could not be
+mounted while the workspace is not displayed in any window — either no window hosts
+it at all, or a background window hosts it but the offscreen mount wait ran out at
+its cap; retry shortly or `listTabs`, and open the workspace in a window if it is
+open nowhere), `deadline-exhausted` (capture ops only: the request deadline ran out
+at a named stage — retry), `still-loading` (capture ops only: the page was still
+loading after the bounded wait — retry, or `snapshot` with `waitFor: { networkIdle }`
+first), `navigated-away` (capture ops only, and only checked right after a mount on
+demand: the freshly mounted page shows a different origin than the tab list recorded
+— `navigate` back, or `listTabs` to re-check; drift on an already-mounted tab is not
+detected), or `not-painting` (capture ops only: the webview is mounted but its
+surface has not painted — either the capture did not return within the capture
+stage's own cap, or it returned an empty / empty-encoded image, reported as soon as
+observed — e.g. a `displayed: false` tab behind a sibling, or a `displayed: true`
+tab whose panel is hidden by zoom — `showTab` or `focusTab` it, then capture again).
+Other failures
+carry no `errorCode`, except ownership failures, which keep their `not-owner` /
+`already-claimed` codes. One backstop: if a batch still has not settled shortly
+after the request deadline (a stage that takes no deadline, such as `navigate`'s
+mount or evaluate), the whole `ws.browser.exec` call fails with a top-level error
+naming the "action execution" stage instead of a per-action `errorCode`.
 
 ## Basic Actions
-- `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, and visibility info
+- `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, visibility, and `displayed` (visible AND its panel's active tab) info
 - `{ action: "getAccessibilityTree", tabId? }` - Get page structure as YAML
 - `{ action: "screenshot", tabId? }` - Take a screenshot
 - `{ action: "evaluate", expression, tabId? }` - Run JavaScript in the page
@@ -142,10 +195,10 @@ UI focus was attempted (the field is absent when the workspace is visible).
 
 ## UI Control
 - `{ action: "openTab", url, position?, visible?, width?, height? }` - Open a new browser tab, owned by you; hidden by default (see Tab Visibility)
-  - visible: true opens directly into the UI; omitted/false creates the tab hidden
+  - visible: true opens directly into the UI, activated in its panel without stealing focus on any position; the result carries `displayed` when the layout confirmed it and omits it when unknown (absent ≠ false); omitted/false creates the tab hidden
   - position: 'adjacent' (default), 'replace', or 'same'
   - width/height: emulated viewport size in CSS px; omitted width defaults to 1280, omitted height to 800
-- `{ action: "showTab", tabId, focus? }` - Reveal a hidden owned tab; focus: true also activates it (see Tab Visibility)
+- `{ action: "showTab", tabId, focus? }` - Activate an owned tab in a visible panel without stealing focus (reveals a hidden tab, or brings a visible-but-inactive one to the front); focus: true also focuses it (see Tab Visibility)
 - `{ action: "claimTab", tabId, width, height? }` - Claim an unowned (user) tab (see Tab Ownership & Sizing)
 - `{ action: "resizeTab", tabId, width, height? }` - Change an owned tab's emulated size
 - `{ action: "closeTab", tabId }` - Close a browser tab
@@ -223,5 +276,11 @@ lazily reconnects on the next inbound connection.
 - Older Electron clients may still exhibit the previous ephemeral behavior (forwards
   dropping on transport changes or after idling); if a previously returned `localPort`
   refuses connections there, re-open with `openTunnel { remotePort }`.
+
+Do not persist or guess a client `localPort` across app restarts. To recover an ordinary
+Chrome link, find the preview's stable `requestedUrl` in `listTabs`, read its daemon-side
+port, call idempotent `openTunnel { remotePort }`, and use the returned current
+`http://127.0.0.1:<localPort>` URL. This works whether the previous forward survived or
+had to be re-created.
 
 Use `browser_docs` with topic="capture" or topic="examples" for detailed usage.

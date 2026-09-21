@@ -16,8 +16,8 @@
 mod common;
 
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,11 +36,8 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-interrupted-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-interrupted-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -224,7 +221,8 @@ where
 
 #[tokio::test]
 async fn interrupted_agents_persisted_across_restart() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
@@ -235,12 +233,10 @@ async fn interrupted_agents_persisted_across_restart() {
     // Pin resumeInterruptedOnStart=off: this suite asserts pending rows
     // survive a restart, but the `auto` default resumes on headless hosts.
     common::disable_resume_on_start(&data_dir);
-    let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd1.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd1 = common::serve_command();
+    cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -318,6 +314,7 @@ async fn interrupted_agents_persisted_across_restart() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store
             .insert_agent_session(&session)
@@ -334,12 +331,10 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd2.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd2 = common::serve_command();
+    cmd2.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -387,12 +382,10 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd3 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd3.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd3 = common::serve_command();
+    cmd3.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -400,7 +393,7 @@ async fn interrupted_agents_persisted_across_restart() {
     #[cfg(unix)]
     cmd3.process_group(0);
     let child3 = cmd3.spawn().expect("spawn intentd serve 3");
-    let _guard3 = DaemonGuard::new(child3, data_dir.clone(), true);
+    let _guard3 = DaemonGuard::process_only(child3);
     assert!(await_uds(&socket).await, "daemon did not restart 2");
 
     let status = common::await_wss_status(&socket).await;
@@ -446,7 +439,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
     let ws_id = "ws-graceful-test";
@@ -477,12 +471,10 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     // Pin resumeInterruptedOnStart=off: this suite asserts the captured row
     // is still pending after restart, but `auto` resumes on headless hosts.
     common::disable_resume_on_start(&data_dir);
-    let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd1.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd1 = common::serve_command();
+    cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
         .env("MOCK_AGENT_BEHAVIOR", &behavior)
         .stdout(Stdio::null())
@@ -593,12 +585,10 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd2.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd2 = common::serve_command();
+    cmd2.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon2.log")).unwrap(),
@@ -606,7 +596,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     #[cfg(unix)]
     cmd2.process_group(0);
     let child2 = cmd2.spawn().expect("spawn intentd serve 2");
-    let _daemon2 = DaemonGuard::new(child2, data_dir.clone(), true);
+    let _daemon2 = DaemonGuard::process_only(child2);
     assert!(await_uds(&socket).await, "daemon did not restart");
 
     let status = common::await_wss_status(&socket).await;
@@ -684,10 +674,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }

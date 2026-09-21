@@ -22,6 +22,7 @@ fn disable_node_compile_cache() {
     std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
 }
 
+pub mod antigravity;
 pub mod args;
 pub mod config;
 pub mod discover;
@@ -48,15 +49,14 @@ pub(crate) use config::{
 pub use discover::{
     discover_providers_with_overrides, find_auggie_candidates, find_npx, find_pi_cli,
     find_provider_binary, gated_reason, gated_reason_with_env, not_installed_detail, probe_npx,
-    provider_availability_for, resolve_on_path, ProviderAvailability,
+    provider_availability_for, resolve_npx_only_override, resolve_on_path, ProviderAvailability,
 };
 #[cfg(test)]
 pub(crate) use models::{
-    create_compound_model_id, fuzzy_match_model_in_pool, is_model_valid_for_provider,
-    parse_codex_reasoning_effort, parse_grok_initialize_models,
+    fuzzy_match_model_in_pool, parse_codex_reasoning_effort, parse_grok_initialize_models,
     parse_grok_initialize_response_from_stdout, resolve_preferred_model,
 };
-pub use models::{parse_compound_model_id, parse_grok_models_command_output, GrokModel};
+pub use models::{parse_grok_models_command_output, GrokModel};
 pub use version_gate::{
     auggie_cli_gate, auggie_gate_reason, pi_cli_gate, pi_gate_reason, PiCliGate, PiCliProbe,
 };

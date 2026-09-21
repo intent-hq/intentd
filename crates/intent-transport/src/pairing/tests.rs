@@ -58,6 +58,14 @@ impl ServerPairingInfo for MockPairingInfo {
             }
         })
     }
+    fn host_environment(&self) -> crate::host_env::HostEnvironment {
+        crate::host_env::HostEnvironment {
+            hostname: "test".to_string(),
+            pretty_hostname: "test".to_string(),
+            device_kind: None,
+            hardware_model: None,
+        }
+    }
     fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }
@@ -66,7 +74,11 @@ impl ServerPairingInfo for MockPairingInfo {
     }
 }
 
-fn provider(port: Option<u16>, dir: &str, token: &str) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
+fn provider(
+    port: Option<u16>,
+    dir: &str,
+    token: &str,
+) -> (Arc<dyn ServerPairingInfo>, tempfile::TempDir) {
     provider_full(port, None, None, dir, token)
 }
 
@@ -75,30 +87,33 @@ fn provider_with_bind(
     bind_addresses: Option<Vec<std::net::IpAddr>>,
     dir: &str,
     token: &str,
-) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
+) -> (Arc<dyn ServerPairingInfo>, tempfile::TempDir) {
     provider_full(port, bind_addresses, None, dir, token)
 }
 
+/// Builds a mock provider over a fresh RAII data dir for `dir`. The returned
+/// guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
 fn provider_full(
     port: Option<u16>,
     bind_addresses: Option<Vec<std::net::IpAddr>>,
     tc_address: Option<String>,
     dir: &str,
     token: &str,
-) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let tmpdir =
-        std::env::temp_dir().join(format!("intentd-test-{}-{nanos}-{dir}", std::process::id()));
-    std::fs::create_dir_all(&tmpdir).unwrap();
+) -> (Arc<dyn ServerPairingInfo>, tempfile::TempDir) {
+    let mut tmpdir = tempfile::Builder::new()
+        .prefix(&format!("intentd-test-{dir}-"))
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        tmpdir.disable_cleanup(true);
+    }
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with(token)));
     let p: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port,
         bind_addresses,
         tc_address,
-        data_dir: tmpdir.clone(),
+        data_dir: tmpdir.path().to_path_buf(),
         token_store: store,
     });
     (p, tmpdir)
@@ -167,7 +182,7 @@ fn classify_ignores_other_methods_and_bad_envelope() {
 #[tokio::test]
 async fn handle_get_info_local_success_shape() {
     let token = "abababababababababababababababababababababababababababababababab";
-    let (provider, tmpdir) = provider(Some(5181), "pairing_get_info_local", token);
+    let (provider, _tmpdir) = provider(Some(5181), "pairing_get_info_local", token);
     let req = PairingRequest {
         id_present: true,
         id_echo: json!(1),
@@ -194,13 +209,12 @@ async fn handle_get_info_local_success_shape() {
     // carries no tc= param.
     assert!(result.get("tcAddress").is_none());
     assert!(!result["uri"].as_str().unwrap().contains("&tc="));
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
 async fn handle_get_info_includes_tc_address_when_tunnel_up() {
     let token = "abababababababababababababababababababababababababababababababab";
-    let (provider, tmpdir) = provider_full(
+    let (provider, _tmpdir) = provider_full(
         Some(5181),
         None,
         Some("tc7f2a91.tailcat.net".to_string()),
@@ -220,12 +234,11 @@ async fn handle_get_info_includes_tc_address_when_tunnel_up() {
         uri.ends_with("&tc=tc7f2a91.tailcat.net"),
         "tc= is the additive last param: {uri}"
     );
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
 async fn handle_get_info_remote_rejects() {
-    let (provider, tmpdir) = provider(Some(5181), "pairing_get_info_remote", "tok");
+    let (provider, _tmpdir) = provider(Some(5181), "pairing_get_info_remote", "tok");
     let req = PairingRequest {
         id_present: true,
         id_echo: json!(1),
@@ -237,12 +250,11 @@ async fn handle_get_info_remote_rejects() {
         .as_str()
         .unwrap()
         .contains("local-only"));
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
 async fn handle_get_info_no_tcp_listener_errors() {
-    let (provider, tmpdir) = provider(None, "pairing_get_info_no_tcp", "tok");
+    let (provider, _tmpdir) = provider(None, "pairing_get_info_no_tcp", "tok");
     let req = PairingRequest {
         id_present: true,
         id_echo: json!(1),
@@ -257,18 +269,17 @@ async fn handle_get_info_no_tcp_listener_errors() {
     // Machine-readable discriminator so `intentd pair` stops matching on
     // prose (monorepo#1822).
     assert_eq!(parsed["error"]["data"]["code"], "listener-down");
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
 async fn handle_get_info_specific_bind_advertises_only_that_host() {
-    // A listener bound to a specific address (loopback here) is reachable
-    // only there, so the payload must advertise exactly that host — never
-    // LAN IPs the listener does not answer on (monorepo#2900).
+    // A listener bound to a specific address is reachable only there, so the
+    // payload must advertise exactly that host — never LAN IPs the listener
+    // does not answer on (monorepo#2900).
     let token = "abababababababababababababababababababababababababababababababab";
-    let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-    let (provider, tmpdir) =
-        provider_with_bind(Some(5181), Some(vec![bind]), "pairing_bind_loopback", token);
+    let bind: std::net::IpAddr = "192.168.1.23".parse().unwrap();
+    let (provider, _tmpdir) =
+        provider_with_bind(Some(5181), Some(vec![bind]), "pairing_bind_specific", token);
     let req = PairingRequest {
         id_present: true,
         id_echo: json!(1),
@@ -276,9 +287,62 @@ async fn handle_get_info_specific_bind_advertises_only_that_host() {
     let resp = handle(req, &provider, true).await.unwrap();
     let parsed: Value = serde_json::from_str(&resp).unwrap();
     let hosts: Vec<String> = serde_json::from_value(parsed["result"]["hosts"].clone()).unwrap();
-    assert_eq!(hosts, vec!["127.0.0.1".to_string()]);
+    assert_eq!(hosts, vec!["192.168.1.23".to_string()]);
     let fp = parsed["result"]["fingerprint"].as_str().unwrap();
     let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, None);
     assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);
-    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+#[tokio::test]
+async fn handle_get_info_loopback_bind_without_tunnel_errors() {
+    // Loopback is never advertised to pairing clients — it is not dialable
+    // from another device even when bound — and with the tunnel off there is
+    // no dialable route at all: erroring with guidance beats minting a
+    // payload no other device can connect through.
+    let token = "abababababababababababababababababababababababababababababababab";
+    let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let (provider, _tmpdir) =
+        provider_with_bind(Some(5181), Some(vec![bind]), "pairing_bind_loopback", token);
+    let req = PairingRequest {
+        id_present: true,
+        id_echo: json!(1),
+    };
+    let resp = handle(req, &provider, true).await.unwrap();
+    let parsed: Value = serde_json::from_str(&resp).unwrap();
+    let msg = parsed["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("loopback only"),
+        "actionable guidance names the loopback-only bind: {msg}"
+    );
+    assert!(
+        msg.contains("server.bindAddress") && msg.contains("server.tunnel.enabled"),
+        "guidance names both remediations: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn handle_get_info_loopback_bind_with_tunnel_pairs_hostless() {
+    // A loopback-only bind with the tunnel up still pairs: the tc= route
+    // carries it, and the host list stays empty (loopback never advertised).
+    let token = "abababababababababababababababababababababababababababababababab";
+    let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let (provider, _tmpdir) = provider_full(
+        Some(5181),
+        Some(vec![bind]),
+        Some("tc7f2a91.tailcat.net".to_string()),
+        "pairing_bind_loopback_tc",
+        token,
+    );
+    let req = PairingRequest {
+        id_present: true,
+        id_echo: json!(1),
+    };
+    let resp = handle(req, &provider, true).await.unwrap();
+    let parsed: Value = serde_json::from_str(&resp).unwrap();
+    let hosts: Vec<String> = serde_json::from_value(parsed["result"]["hosts"].clone()).unwrap();
+    assert_eq!(hosts, Vec::<String>::new());
+    assert_eq!(parsed["result"]["tcAddress"], "tc7f2a91.tailcat.net");
+    let fp = parsed["result"]["fingerprint"].as_str().unwrap();
+    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, Some("tc7f2a91.tailcat.net"));
+    assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);
 }

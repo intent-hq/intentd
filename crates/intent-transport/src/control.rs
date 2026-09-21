@@ -23,7 +23,7 @@ use crate::protocol::PROTOCOL_VERSION;
 /// is not stored here; it is applied when the snapshot is rendered to JSON.
 // The bools (`uds`, `tcp`, `has_display`, `update_supported`) are independent
 // wire-facing status flags, not an encoded state machine.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct SystemStatus {
     /// Derived listen mode: `both` while the TCP listener (secure WSS, or
@@ -74,6 +74,10 @@ pub struct SystemStatus {
     /// hostname when unavailable (same source as `server.pairingInfo` /
     /// `host.status`).
     pub pretty_hostname: String,
+    /// Detected device category, omitted from the host block when unknown.
+    pub device_kind: Option<String>,
+    /// Raw hardware product/model name, omitted from the host block when unknown.
+    pub hardware_model: Option<String>,
     /// CPU usage of the daemon process, raw `sysinfo` convention: 100 = one
     /// full core, so values may exceed 100 on multi-core hosts. The first
     /// sample after startup may legitimately read 0.
@@ -105,6 +109,17 @@ pub struct SystemStatus {
     /// enough that the baseline alone missed them almost entirely — measured,
     /// a 16-chain burst peaking at 6.97 GB reported 0.01 GB.
     pub child_memory_peak_bytes: Option<u64>,
+    /// The share of [`Self::child_memory_bytes`] attributable to spawned
+    /// agents: the sum of the per-agent subtree buckets from the same sweep
+    /// (each descendant's RSS credited to its nearest registered agent root).
+    /// Descendants under no registered root (one-shot adapter chains,
+    /// `host.exec` children) count only in the aggregate. `None` alongside
+    /// `child_processes`.
+    pub agent_memory_bytes: Option<u64>,
+    /// Spawned agents with a live root pid in the same sweep — the number of
+    /// buckets behind [`Self::agent_memory_bytes`]. `None` alongside
+    /// `child_processes`.
+    pub agent_process_count: Option<usize>,
     /// The installed aggregate agent memory budget in bytes
     /// (`agents.memoryBudgetMb`, monorepo#2063). `None` when the budget is
     /// off. The three budget fields are presence-detected on the wire —
@@ -136,6 +151,14 @@ pub struct SystemStatus {
     /// down), so the whole `fileWatch` object is presence-detected on the
     /// wire — absent when `None`, never null.
     pub file_watch: Option<FileWatchStatus>,
+    /// Open file descriptors held by the daemon process, from the background
+    /// own-process sampler (intent-hq/intent#4390). `None` until the first
+    /// sample lands or where the count is unavailable (non-Linux/macOS).
+    /// Presence-detected on the wire — omitted when `None`, never null.
+    pub fd_count: Option<u64>,
+    /// Soft `RLIMIT_NOFILE` in effect after the startup raise. `None` where
+    /// the limit could not be read (non-Unix). Presence-detected on the wire.
+    pub fd_limit: Option<u64>,
     /// Whether `system.requestUpdate` can currently succeed
     /// (intent-hq/intent#3875): true exactly when the daemon is
     /// sitter-supervised, per the same pidfile + parent/name verification
@@ -143,6 +166,35 @@ pub struct SystemStatus {
     /// `false` on platforms without unix signals, where
     /// `system.requestUpdate` is unsupported.
     pub update_supported: bool,
+    /// Agents with a turn in flight right now (`AgentManager::list_busy`),
+    /// the count the idle-update handshake gates on — distinct from
+    /// [`Self::agents`], which counts every live agent process.
+    pub busy_agents: usize,
+    /// Idle-triggered update check state (the daemon→sitter SIGUSR2
+    /// handshake). Always present on the wire.
+    pub idle_update_check: IdleUpdateCheckStatus,
+}
+
+/// The idle-triggered update check state for `system.status`: the daemon
+/// asks its supervising sitter for an idle-mode update check (SIGUSR2) while
+/// no turn is in flight, and exits for a staged update only once idle.
+/// Timestamps are RFC 3339 UTC strings, `None` (null on the wire) when unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdleUpdateCheckStatus {
+    /// `updates.checkOnIdle` is on.
+    pub enabled: bool,
+    /// Idle checks can actually be sent: the sitter advertised the handshake
+    /// at boot AND the daemon is currently sitter-supervised. Always `false`
+    /// on platforms without unix signals.
+    pub supported: bool,
+    /// When SIGUSR2 was last sent (or last failed to send).
+    pub last_requested_at: Option<String>,
+    /// Earliest time the interval rule allows another request; `None` while
+    /// the requester is disabled.
+    pub next_eligible_at: Option<String>,
+    /// The sitter staged a newer version: the daemon exits for the restart
+    /// at the next moment no turn is in flight.
+    pub restart_pending: bool,
 }
 
 /// Live file-watch coverage for `system.status` (intent-hq/intent#3708):
@@ -171,6 +223,8 @@ pub type GitCredential = (String, String);
 pub trait SystemControl: Send + Sync {
     /// Snapshot the current daemon state.
     fn status(&self) -> SystemStatus;
+    /// Cached host identity, refreshed by the composition root off the RPC path.
+    fn host_environment(&self) -> crate::host_env::HostEnvironment;
     /// Request a graceful shutdown (idempotent). Returns immediately; the daemon
     /// tears the listeners down asynchronously.
     fn request_shutdown(&self);
@@ -184,6 +238,21 @@ pub trait SystemControl: Send + Sync {
     /// sitter-supervised (or signaling is unsupported on this platform);
     /// the handler maps it to `-32603`.
     fn request_update(&self) -> Result<(), String>;
+    /// Whether this daemon can install a fixed release through its supervisor.
+    fn exact_update_supported(&self) -> bool {
+        false
+    }
+    /// Latest exact update operation; absent before the first request.
+    fn target_update_status(&self) -> Option<Value> {
+        None
+    }
+    /// Start an asynchronous fixed-release install. Never falls back to a channel.
+    ///
+    /// # Errors
+    /// Returns a reason when the request cannot be started.
+    fn request_exact_update(&self, _target: &str) -> Result<(), String> {
+        Err("exact-version updates are not supported".into())
+    }
     /// Import legacy workspaces into the daemon's live store.
     fn import_legacy(
         &self,
@@ -204,7 +273,9 @@ pub trait SystemControl: Send + Sync {
 pub(crate) enum SystemMethod {
     Status,
     Shutdown,
-    RequestUpdate,
+    RequestUpdate {
+        target: Result<Option<String>, ()>,
+    },
     ImportLegacy {
         force: Result<bool, ()>,
     },
@@ -241,7 +312,20 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
     let method = match method {
         "system.status" => SystemMethod::Status,
         "system.shutdown" => SystemMethod::Shutdown,
-        "system.requestUpdate" => SystemMethod::RequestUpdate,
+        "system.requestUpdate" => {
+            let target = match obj.get("params") {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Object(params)) if params.keys().all(|key| key == "targetVersion") => {
+                    match params.get("targetVersion") {
+                        None => Ok(None),
+                        Some(Value::String(target)) => Ok(Some(target.clone())),
+                        _ => Err(()),
+                    }
+                }
+                _ => Err(()),
+            };
+            SystemMethod::RequestUpdate { target }
+        }
         "system.importLegacy" => {
             let force = match obj.get("params") {
                 None | Some(Value::Null) => Ok(false),
@@ -312,12 +396,22 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "childProcesses": status.child_processes,
         "childMemoryBytes": status.child_memory_bytes,
         "childMemoryPeakBytes": status.child_memory_peak_bytes,
+        "agentMemoryBytes": status.agent_memory_bytes,
+        "agentProcessCount": status.agent_process_count,
         "fingerprint": status.fingerprint,
         "localIps": status.local_ips,
         "hostname": status.hostname,
         "prettyHostname": status.pretty_hostname,
         "protocolVersion": PROTOCOL_VERSION,
         "updateSupported": status.update_supported,
+        "busyAgents": status.busy_agents,
+        "idleUpdateCheck": {
+            "enabled": status.idle_update_check.enabled,
+            "supported": status.idle_update_check.supported,
+            "lastRequestedAt": status.idle_update_check.last_requested_at,
+            "nextEligibleAt": status.idle_update_check.next_eligible_at,
+            "restartPending": status.idle_update_check.restart_pending,
+        },
         "host": {
             "os": status.os,
             "arch": status.arch,
@@ -326,6 +420,16 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         },
     });
     let obj = v.as_object_mut().expect("status_json literal is an object");
+    let host = obj
+        .get_mut("host")
+        .and_then(Value::as_object_mut)
+        .expect("status_json host literal is an object");
+    if let Some(device_kind) = &status.device_kind {
+        host.insert("deviceKind".into(), device_kind.clone().into());
+    }
+    if let Some(hardware_model) = &status.hardware_model {
+        host.insert("hardwareModel".into(), hardware_model.clone().into());
+    }
     if let Some(tc) = &status.tc_address {
         obj.insert("tcAddress".into(), tc.clone().into());
     }
@@ -357,6 +461,60 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
             }),
         );
     }
+    if let Some(count) = status.fd_count {
+        obj.insert("fdCount".into(), count.into());
+    }
+    if let Some(limit) = status.fd_limit {
+        obj.insert("fdLimit".into(), limit.into());
+    }
+    v
+}
+
+/// Top-level `system.status` fields a non-administrator (collaborator)
+/// connection receives — the client boot / routing / host-identity subset the
+/// guest FE reads, every one of which the invite envelope and
+/// `server.pairingInfo` already disclosed (`transports` has no guest
+/// consumer and is derivable from `listenMode`, so it is not served).
+/// Default-deny: a field added to [`status_json`] stays administrator-only
+/// until it is listed here.
+const COLLABORATOR_STATUS_FIELDS: &[&str] = &[
+    "running",
+    "listenMode",
+    "port",
+    "version",
+    "buildCommit",
+    "protocolVersion",
+    "fingerprint",
+    "localIps",
+    "tcAddress",
+    "hostname",
+    "prettyHostname",
+    "host",
+];
+
+/// `host` sub-object fields served to a collaborator: OS / arch / locality
+/// and the device identity `host.status` also serves. `hasDisplay` stays
+/// administrator-only (the guest has no host-shell reach to gate on it).
+const COLLABORATOR_STATUS_HOST_FIELDS: &[&str] =
+    &["os", "arch", "locality", "deviceKind", "hardwareModel"];
+
+/// Render the collaborator projection of `system.status` (multiplayer w3,
+/// least privilege). Same values as [`status_json`] restricted to
+/// [`COLLABORATOR_STATUS_FIELDS`] / [`COLLABORATOR_STATUS_HOST_FIELDS`]:
+/// daemon-global counts (`clients`, `agents`, `busyAgents`, `maxAgents`),
+/// process / disk / file-watch / fd telemetry, the agent-memory budget and
+/// the update handshake (`updateSupported`, `idleUpdateCheck`) are omitted —
+/// they aggregate activity outside the caller's member workspaces
+/// (`agent.listActive` membership-filters the very set `busyAgents` counts),
+/// and `system.requestUpdate` is refused for collaborators anyway. The
+/// administrator's snapshot is unchanged.
+pub(crate) fn collaborator_status_json(status: &SystemStatus, is_local: bool) -> Value {
+    let mut v = status_json(status, is_local);
+    let obj = v.as_object_mut().expect("status_json literal is an object");
+    obj.retain(|key, _| COLLABORATOR_STATUS_FIELDS.contains(&key.as_str()));
+    if let Some(host) = obj.get_mut("host").and_then(Value::as_object_mut) {
+        host.retain(|key, _| COLLABORATOR_STATUS_HOST_FIELDS.contains(&key.as_str()));
+    }
     v
 }
 
@@ -379,15 +537,31 @@ pub(crate) fn git_credential_scope_ok(protocol: Option<&str>, host: Option<&str>
 /// the wire. `system.requestUpdate` is served on BOTH transports (a remote
 /// client is exactly who needs to trigger an update): success returns
 /// `{ ok: true }`, and a daemon that is not sitter-supervised gets `-32603`
-/// with the reason.
+/// with the reason. `system.status` answers the full snapshot to an
+/// administrator and the [`collaborator_status_json`] projection otherwise
+/// (`is_administrator` is the negation of
+/// `context::is_non_administrator_caller()`, resolved by the caller); the
+/// other `system.*` methods never reach here for a collaborator — the
+/// `COLLABORATOR_METHODS` gate in `conn.rs` refuses them first.
 pub(crate) async fn handle(
     req: SystemRequest,
     control: &dyn SystemControl,
     is_local: bool,
     is_uds: bool,
+    is_administrator: bool,
 ) -> Option<String> {
     let result: Result<Value, (i32, String)> = match req.method {
-        SystemMethod::Status => Ok(status_json(&control.status(), is_local)),
+        SystemMethod::Status if !is_administrator => {
+            Ok(collaborator_status_json(&control.status(), is_local))
+        }
+        SystemMethod::Status => {
+            let mut status = status_json(&control.status(), is_local);
+            status["exactUpdateSupported"] = json!(control.exact_update_supported());
+            if let Some(update) = control.target_update_status() {
+                status["targetUpdate"] = update;
+            }
+            Ok(status)
+        }
         SystemMethod::Shutdown if !is_uds => Err((
             -32001,
             "system.shutdown is available over UDS only".to_string(),
@@ -396,7 +570,28 @@ pub(crate) async fn handle(
             control.request_shutdown();
             Ok(json!({ "ok": true, "stopping": true }))
         }
-        SystemMethod::RequestUpdate => control
+        SystemMethod::RequestUpdate { target: Err(()) } => {
+            Err((-32602, "expected optional targetVersion string".into()))
+        }
+        SystemMethod::RequestUpdate {
+            target: Ok(Some(target)),
+        } => match semver::Version::parse(&target) {
+            Ok(version) if target.len() <= 128 && version.build.is_empty() => {
+                if control.exact_update_supported() {
+                    control
+                        .request_exact_update(&target)
+                        .map(|()| json!({ "ok": true, "targetVersion": target }))
+                        .map_err(|message| (-32603, message))
+                } else {
+                    Err((-32603, "exact-version updates are not supported".into()))
+                }
+            }
+            _ => Err((
+                -32602,
+                "targetVersion must be a release semver without prefix or build metadata".into(),
+            )),
+        },
+        SystemMethod::RequestUpdate { target: Ok(None) } => control
             .request_update()
             .map(|()| json!({ "ok": true }))
             .map_err(|message| (-32603, message)),

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::{
-    now_iso, ActorType, AgentId, Event, EventActor, Workspace, WorkspaceActivity,
+    now_iso, ActorType, AgentId, Event, EventActor, MessageOrigin, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
@@ -78,31 +78,29 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
+/// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
+/// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-goldens-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = crate::test_support::test_tempdir("intentd-goldens-");
+        let path = dir.path().join("goldens.db");
+        Self { path, _dir: dir }
     }
 }
 
@@ -118,7 +116,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     let registry = Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
     registry
         .apply(&[
-            ("providers.active".into(), json!("auggie")),
+            ("model.defaultProvider".into(), json!("auggie")),
             ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
             // Goldens assert the legacy immediate report wake — disable the
             // default 30s report debounce.
@@ -201,6 +199,54 @@ fn golden_a2a_sender_note() {
             "header must start with the idempotency-guard prefix: {note}"
         );
         assert!(!note.contains('\n'), "header must be single-line: {note}");
+    }
+}
+
+/// The collaborator sender preamble (multiplayer) is a single plain-prose
+/// line naming the sender and their guest role: login + display name, then
+/// login alone, then display name alone, then the principal id. Control
+/// characters in either name collapse to spaces so a hostile profile
+/// cannot inject a second line.
+#[test]
+fn golden_collaborator_sender_preamble() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("octocat"), Some("The Octocat"), "p-1"),
+        "Message from @octocat (The Octocat), a collaborator (guest) of this workspace — not \
+         the workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("octocat"), None, "p-1"),
+        "Message from @octocat, a collaborator (guest) of this workspace — not the workspace \
+         owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(None, Some("The Octocat"), "p-1"),
+        "Message from The Octocat, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(None, None, "p-1"),
+        "Message from principal p-1, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("evil\nlogin"), Some("  \n"), "p-1"),
+        "Message from @evil login, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    for preamble in [
+        harness.collaborator_sender_preamble(Some("octocat"), Some("The Octocat"), "p-1"),
+        harness.collaborator_sender_preamble(None, None, "p-1"),
+    ] {
+        assert!(
+            preamble.starts_with(crate::harness::v1::COLLABORATOR_SENDER_PREAMBLE_PREFIX),
+            "preamble must start with the stable prefix: {preamble}"
+        );
+        assert!(
+            !preamble.contains('\n'),
+            "preamble must be single-line: {preamble}"
+        );
     }
 }
 
@@ -333,17 +379,31 @@ fn golden_supervisor_history_wrapper() {
         content: json!([{ "type": "text", "text": text }]),
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: "2026-01-02T03:04:05Z".to_string(),
     };
+    // The default per-block cap (4000) keeps the golden byte-identical.
     let xml = crate::history_xml::format_history_as_xml(
         &[msg("user", "hi <&>"), msg("assistant", "done")],
         crate::history_xml::MAX_HISTORY_CHARS,
+        intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS as usize,
     );
+    // intent#3696: the preamble carries the truncation-hint paragraph so the
+    // model does not mistake abbreviated replayed tool blocks for broken tools.
     assert_eq!(
         xml,
         "<supervisor>\n\
          The previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\n\
          Do NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\
+         \n\
+         Note on this replay: some tool inputs and tool outputs below are abbreviated by the recovery \
+         replay. Any tool_use input or tool_result output longer than 4000 characters is \
+         middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a \
+         truncated=\"true\" original_chars=\"N\" attribute on the element); blocks without that \
+         attribute are complete. Older exchanges may be omitted entirely. Truncation here does NOT \
+         mean the tool failed or returned empty output; the original call ran and its full result was \
+         delivered at the time. If you genuinely need one specific full output, re-run that ONE call \
+         once. Do not re-fetch the same inputs repeatedly.\n\
          \n\
          <exchange>\n\
          \x20 <user_request_or_tool_results>\n\
@@ -718,7 +778,7 @@ fn merge_requirements(
             changes_requested: 0,
         },
         threads: crate::pr_ops::MergeRequirementsThreads {
-            unresolved,
+            unresolved: Some(unresolved),
             resolution_required: Some(true),
         },
         merge_state_status: None,
@@ -729,7 +789,7 @@ fn merge_requirements(
     }
 }
 
-fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
+pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
     crate::pr_monitor::PrMonitorSnapshot {
         title: "feat: add adapter".to_string(),
         url: "https://github.com/o/r/pull/42".to_string(),
@@ -738,6 +798,7 @@ fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         review_comment_count: 1,
         requirements: merge_requirements(state, 0, 1),
         ejection_tracked: true,
+        observed_at: None,
     }
 }
 
@@ -878,6 +939,17 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - checks: 2 passed, 0 failed, 1 pending (of 3) (required-check flags unavailable)\n\
          - unresolved threads: 1\n\
          - (branch rules unreadable — approval/thread requirements unknown)"
+    );
+    // Thread resolution state unreadable (`threads.unresolved` absent): the
+    // row says so instead of printing a fabricated 0.
+    let mut s = pr_snapshot("open");
+    s.requirements.threads.unresolved = None;
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&s),
+        "- state: open\n\
+         - approvals: review_required (0/1 required)\n\
+         - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
+         - unresolved threads: unknown (thread resolution state unreadable) (resolution required to merge)"
     );
 }
 
@@ -1230,6 +1302,7 @@ async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     svc.store()
         .insert_agent_session(&session)
@@ -1292,7 +1365,7 @@ async fn golden_questions_dismissed_notice_bytes() {
 }
 
 /// Report-to-parent wake: exact bytes of the ungrouped immediate parent wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn golden_report_to_parent_wake_bytes() {
     let (_t, svc, ws) = setup().await;
     let parent = AgentId::from("agent-parent");
@@ -1329,7 +1402,7 @@ async fn golden_report_to_parent_wake_bytes() {
 }
 
 /// Attention-request wakes: exact bytes for the blocker and discussion verbs.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn golden_attention_request_wake_bytes() {
     let (_t, svc, ws) = setup().await;
     let parent = AgentId::from("agent-parent");
@@ -1387,7 +1460,7 @@ async fn golden_attention_request_wake_bytes() {
 /// Watcher fan-out attention wake (monorepo#1229/#2051): an explicit
 /// non-parent `ws.agent.watch` watcher gets the remains-armed variant, with
 /// the ungrouped completion promise.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn golden_watcher_attention_wake_bytes() {
     let (_t, svc, ws) = setup().await;
     let parent = AgentId::from("agent-parent");
@@ -1480,6 +1553,7 @@ fn golden_supervisor_history_truncation_markers() {
         content: blocks,
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: "2026-01-02T03:04:05Z".to_string(),
     };
     // Two exchanges with a budget that only fits the newest: the omission
@@ -1502,11 +1576,22 @@ fn golden_supervisor_history_truncation_markers() {
             json!([{ "type": "text", "text": "reply" }]),
         ),
     ];
+    // intent#3696: the preamble includes the truncation-hint paragraph.
+    let hint = "Note on this replay: some tool inputs and tool outputs below are abbreviated by \
+                the recovery replay. Any tool_use input or tool_result output longer than 4000 \
+                characters is middle-truncated (marked by an inline \"... [N characters \
+                truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on \
+                the element); blocks without that attribute are complete. Older exchanges may be \
+                omitted entirely. Truncation here does NOT mean the tool failed or returned empty \
+                output; the original call ran and its full result was delivered at the time. If \
+                you genuinely need one specific full output, re-run that ONE call once. Do not \
+                re-fetch the same inputs repeatedly.\n\n";
     let preamble_len = "<supervisor>\nThe previous ACP session was lost. Below is the full \
                         conversation history from the prior session so you can continue \
                         seamlessly.\nDo NOT mention session recovery to the user. Just \
                         continue naturally as if nothing happened.\n\n"
-        .len();
+        .len()
+        + hint.len();
     let closing_len = "Continue the conversation from this point. Do not mention session \
                        recovery or interruption.\n</supervisor>"
         .len();
@@ -1520,7 +1605,9 @@ fn golden_supervisor_history_truncation_markers() {
                            </exchange>\n";
     let max_omission = "<!-- 2 earlier exchanges omitted due to size limits -->\n".len();
     let budget = preamble_len + closing_len + max_omission + newest_exchange.len();
-    let xml = crate::history_xml::format_history_as_xml(&messages, budget);
+    let tool_content_chars =
+        intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS as usize;
+    let xml = crate::history_xml::format_history_as_xml(&messages, budget, tool_content_chars);
     assert_eq!(
         xml,
         format!(
@@ -1530,6 +1617,7 @@ fn golden_supervisor_history_truncation_markers() {
              Do NOT mention session recovery to the user. Just continue naturally as if \
              nothing happened.\n\
              \n\
+             {hint}\
              <!-- 1 earlier exchanges omitted due to size limits -->\n\
              {newest_exchange}\
              Continue the conversation from this point. Do not mention session recovery or \
@@ -1539,21 +1627,44 @@ fn golden_supervisor_history_truncation_markers() {
     );
     // Middle-truncation marker: an oversized tool_result is head+tail kept
     // with the exact `... [N characters truncated] ...` line between. Cap is
-    // 4000 chars with 60 reserved for the marker (half-budget 1970).
+    // 4000 chars with 60 reserved for the marker (half-budget 1970). Since
+    // intent#3696 the element also carries `truncated="true" original_chars="N"`.
     let big = "y".repeat(5000);
     let messages = vec![msg(
         "m5",
         "user",
         json!([{ "type": "tool_result", "tool_use_id": "t1", "content": big }]),
     )];
-    let xml =
-        crate::history_xml::format_history_as_xml(&messages, crate::history_xml::MAX_HISTORY_CHARS);
+    let xml = crate::history_xml::format_history_as_xml(
+        &messages,
+        crate::history_xml::MAX_HISTORY_CHARS,
+        tool_content_chars,
+    );
     let expected_block = format!(
-        "    <tool_result tool_use_id=\"t1\" is_error=\"false\">\n\
+        "    <tool_result tool_use_id=\"t1\" is_error=\"false\" truncated=\"true\" original_chars=\"5000\">\n\
          \x20     {}\n... [1060 characters truncated] ...\n{}\n\
          \x20   </tool_result>\n",
         "y".repeat(1970),
         "y".repeat(1970),
+    );
+    assert!(xml.contains(&expected_block), "{xml}");
+    // An under-cap tool_result is byte-identical to the pre-#3696 rendering
+    // (no `truncated` attribute, no marker).
+    let messages = vec![msg(
+        "m6",
+        "user",
+        json!([{ "type": "tool_result", "tool_use_id": "t2", "content": "y".repeat(4000) }]),
+    )];
+    let xml = crate::history_xml::format_history_as_xml(
+        &messages,
+        crate::history_xml::MAX_HISTORY_CHARS,
+        tool_content_chars,
+    );
+    let expected_block = format!(
+        "    <tool_result tool_use_id=\"t2\" is_error=\"false\">\n\
+         \x20     {}\n\
+         \x20   </tool_result>\n",
+        "y".repeat(4000),
     );
     assert!(xml.contains(&expected_block), "{xml}");
 }
@@ -1566,10 +1677,14 @@ fn golden_supervisor_history_truncation_markers() {
 /// questions, next-steps footer, specialist role wrapper, role-reminder
 /// footer, user-rules wrapper) plus the `\n\n---\n\n` layer separator, pinned
 /// via a hermetic assembly with no workspace path (no rule files, no skills,
-/// no RTK — only the always-on layers).
+/// no RTK — only the always-on layers). Assembled under a session pinned to
+/// `harnessVersion: "1.0"` so the bytes stay frozen as later versions reword
+/// surfaces (v2.3/v2.4 reword the next-steps layer; `v2_3_goldens` /
+/// `v2_4_goldens` pin those).
 #[tokio::test]
 async fn golden_assembled_prompt_static_layers() {
-    let (_t, svc, _ws) = setup().await;
+    let (_t, svc, ws) = setup().await;
+    let session = v1_pinned_session(&svc, &ws, "agent-v1-static").await;
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: Some("Implement the task.".to_string()),
         specialist_name: Some("Implementor".to_string()),
@@ -1585,7 +1700,7 @@ async fn golden_assembled_prompt_static_layers() {
         false,
         &intent_core::settings_file::AgentFeaturesSettings::default(),
         None,
-        None,
+        Some(&session),
         None,
     )
     .await
@@ -1650,9 +1765,12 @@ async fn golden_assembled_prompt_static_layers() {
 
 /// Auto-commit flips the next-steps example line and appends the
 /// auto-commit clause; sub-agents skip questions + next-steps entirely.
+/// Assembled under a `"1.0"`-pinned session (see
+/// `golden_assembled_prompt_static_layers`).
 #[tokio::test]
 async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
-    let (_t, svc, _ws) = setup().await;
+    let (_t, svc, ws) = setup().await;
+    let session = v1_pinned_session(&svc, &ws, "agent-v1-variants").await;
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
     let auto_on = crate::rules::assemble_system_prompt(
         svc.store(),
@@ -1664,7 +1782,7 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
         false,
         &features,
         None,
-        None,
+        Some(&session),
         None,
     )
     .await
@@ -1698,7 +1816,7 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
         false,
         &features,
         None,
-        None,
+        Some(&session),
         None,
     )
     .await
@@ -1708,11 +1826,29 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
     assert!(sub_agent.contains("## Commit Policy"));
 }
 
+/// A seeded session re-stamped to `harnessVersion: "1.0"` so assembly
+/// resolves the v1 harness + doctrine regardless of the current version.
+async fn v1_pinned_session(
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &str,
+) -> intent_core::AgentSession {
+    let owner = AgentId::from(id);
+    seed_agent(svc, ws, &owner).await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&owner)
+        .await
+        .expect("session");
+    session.harness_version = "1.0".to_string();
+    session
+}
+
 /// H2 regression: a session stamped `harnessVersion: "1.0"` (every pre-1.1
 /// session) resolves the v1 doctrine set and assembles the exact bytes the
 /// v1 layout produced — its common layer is the v1 body, not the v1.1
 /// or v2 rewrite (the v1 composition stays byte-pinned by the doctrine hashes
-/// below). A current-stamp session ("2.0") assembles byte-identical to the
+/// below). A current-stamp session assembles byte-identical to the
 /// session-less (latest) assembly, and an unknown/corrupt stamp falls back
 /// to the latest instead of failing.
 #[tokio::test]
@@ -1780,17 +1916,45 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     );
     assert!(!pinned_v1.contains("ws.workspace.proposeSibling"));
     assert!(latest.contains("ws.workspace.proposeSibling"));
-    // Only the doctrine layer differs: the static layers after the
-    // specialization rules are byte-identical.
+    // Only the doctrine layer differs between v1 and v2.2 (the last version
+    // on v1 text surfaces): the static layers after the specialization
+    // rules are byte-identical. Latest (v2.4, like v2.3) additionally
+    // rewords the next-steps layer and nothing else.
+    session.harness_version = "2.2".to_string();
+    let pinned_v2_2 = assemble(Some(session.clone())).await;
+    let v2_2_rules = crate::instructions::get_instruction_with_common_for(
+        crate::harness::resolve_entry("2.2").doctrine.instructions,
+        "task-loop",
+        &features,
+    );
+    let v1_static = pinned_v1.strip_prefix(&v1_rules).expect("v1 prefix");
+    assert_eq!(
+        v1_static,
+        pinned_v2_2.strip_prefix(&v2_2_rules).expect("2.2 prefix"),
+        "static layers identical across v1-surface versions"
+    );
     let latest_rules = crate::instructions::get_instruction_with_common_for(
         crate::harness::latest_entry().doctrine.instructions,
         "task-loop",
         &features,
     );
-    assert_eq!(
-        pinned_v1.strip_prefix(&v1_rules).expect("v1 prefix"),
-        latest.strip_prefix(&latest_rules).expect("latest prefix"),
-        "static layers identical across versions"
+    let latest_static = latest.strip_prefix(&latest_rules).expect("latest prefix");
+    let v1_layers: Vec<&str> = v1_static.split("\n\n---\n\n").collect();
+    let latest_layers: Vec<&str> = latest_static.split("\n\n---\n\n").collect();
+    assert_eq!(v1_layers.len(), latest_layers.len());
+    let mut saw_next_steps = false;
+    for (a, b) in v1_layers.iter().zip(&latest_layers) {
+        if a.starts_with("## Suggested Next Steps") {
+            saw_next_steps = true;
+            assert!(b.starts_with("## Suggested Next Steps"));
+            assert_ne!(a, b, "latest rewords the next-steps layer");
+        } else {
+            assert_eq!(a, b, "static layers identical across versions");
+        }
+    }
+    assert!(
+        saw_next_steps,
+        "top-level assembly carries the next-steps layer"
     );
     // A stale/corrupt stamp falls back to the latest (never fails a spawn).
     session.harness_version = "9.9".to_string();
@@ -1830,14 +1994,14 @@ fn golden_bundled_doctrine_hashes() {
         })
         .collect();
     let expected = vec![
-        "task-loop: f18d40f5c74b12b45c9f656900665c82398fc5aaa716c5770e22068dd839a560".to_string(),
-        "interactive: 072a355b7c77a499b00701c9e175673a4ff4224c486f51677f7caa23986d5788".to_string(),
-        "workspace-agent: 202521ab3e7055486384e3093fc6d1f2b4f507c0248a9808597cae465a4cb268"
+        "task-loop: cc1f40de9643f88529dd5fa61d1f868ae269020aa3ef5d08986a721e19c64c44".to_string(),
+        "interactive: 013e064b03286569622d905efd0ee4c2a227fc18f0364d3277a95b548dd1f6c3".to_string(),
+        "workspace-agent: 6dfa5d333a6a2e8f07192595828772dad2aad6868def3737e5cd9c50363a2718"
             .to_string(),
-        "task-breakdown: 55aeb42266161ca997549cfe887bbc807c3511920d6304f5d4508c327fbad3be"
+        "task-breakdown: 1e9e1e2daf42a8adadd8c31d7697f0bac02bf5a7c818b00ae4e50074e40b9e66"
             .to_string(),
-        "common: e098afd3a53c2313c8e4207a8c07f011119a5f7767270328f4dfa541cf455185".to_string(),
-        "workspace: fe126c3dc9450fdef98bffc0cffdc170e488b26b926e1e2e137dd6f42702b308".to_string(),
+        "common: 45db6f16aec87f11050b5cc1979370c06f00f00149df20e245fce83acd73b2f0".to_string(),
+        "workspace: d0b0ecd88bed6224442633dc3dc026a1276d37536478730969703a35e6a91a90".to_string(),
     ];
     assert_eq!(actual, expected);
 }
@@ -1955,6 +2119,7 @@ fn golden_isolation_hints() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,
@@ -2009,7 +2174,16 @@ async fn golden_snapshot_line_shape() {
     let (_t, svc, ws) = setup().await;
     let owner = AgentId::from("agent-snap");
     seed_agent(&svc, &ws, &owner).await;
-    svc.enqueue_message(&owner, "pending".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &owner,
+        "pending".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let line = svc
         .agent_state_snapshot_line(&owner)
         .await
@@ -2053,6 +2227,12 @@ fn golden_snapshot_full_field_serialization() {
             mergeable: vec!["o/r#3".to_string()],
             unknown: vec!["o/r#4".to_string()],
         }),
+        tasks: [
+            ("in_progress".to_string(), 2),
+            ("review_required".to_string(), 1),
+        ]
+        .into_iter()
+        .collect(),
         pending_attention: Some("blocker".to_string()),
     };
     assert_eq!(
@@ -2064,6 +2244,7 @@ fn golden_snapshot_full_field_serialization() {
          \"intent-hq/monorepo#8 (changes pending)\"],\
          \"prs\":{\"draft\":[\"o/r#1\"],\"blocked\":[\"o/r#2\"],\
          \"mergeable\":[\"o/r#3\"],\"unknown\":[\"o/r#4\"]},\
+         \"tasks\":{\"in_progress\":2,\"review_required\":1},\
          \"pendingAttention\":\"blocker\"}"
     );
 }

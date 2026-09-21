@@ -15,6 +15,9 @@
 //! are never logged, never carried in any `Debug`/`Serialize` shape, and the
 //! token never leaves this module — callers only see [`PollStatus`].
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::FileSecretStore;
@@ -25,6 +28,7 @@ use tokio::time::timeout;
 
 use crate::error::{Error, Result};
 use crate::token::SECRET_ACCOUNT;
+use crate::SourceControl;
 
 #[cfg(test)]
 use intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID as DEFAULT_OAUTH_CLIENT_ID;
@@ -41,8 +45,11 @@ const SLOW_DOWN_BUMP_SECS: u64 = 5;
 const SECRET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default scopes requested by the device flow (§spec: PR/issue/review work,
-/// org-repo listing, and workflow-file pushes).
-pub const DEFAULT_SCOPES: &[&str] = &["repo", "read:org", "workflow"];
+/// org-repo listing, workflow-file pushes, and the secret proof gist of the
+/// gist identity-proof join flow — [`crate::identity_proof`]). Tokens granted
+/// before `gist` was added keep working; they only need a re-authorization
+/// when the user first joins a workspace as a guest.
+pub const DEFAULT_SCOPES: &[&str] = &["repo", "read:org", "workflow", "gist"];
 
 /// User-facing half of the device-flow start response. Deliberately excludes
 /// the secret `device_code` (which stays inside [`DeviceFlow`]) so this shape
@@ -73,7 +80,36 @@ pub enum PollStatus {
     Expired,
     /// The user denied the authorization request.
     Denied,
+    /// The user authorized, but the [`IdentityGuard`] refused the granted
+    /// account: the token was discarded, nothing was persisted, and the
+    /// previously stored credential (if any) is untouched. Terminal.
+    Refused,
 }
+
+/// Opaque value an [`IdentityGuard`] returns on admission. The flow holds
+/// it across the token write and drops it right after, so whatever the
+/// guard pinned while deciding (the daemon's identity transition lock)
+/// stays pinned until the credential and the identity it verified are
+/// both on disk — no invite or concurrent switch can land in between.
+pub type IdentityLease = Box<dyn std::any::Any + Send>;
+
+/// Pre-persist hook of a [`DeviceFlow`] (multiplayer w4): once a grant
+/// arrives, the hook receives a forge client bound to the *new* token —
+/// never the token itself — and decides before anything is written.
+/// `Ok(lease)` persists the token while the [`IdentityLease`] is held;
+/// `Err(reason)` discards it and the poll reports [`PollStatus::Refused`].
+/// The daemon uses it to verify `GET /user` against the primary
+/// principal's reconnect guard so a different GitHub account cannot
+/// replace the publishing credential while collaborators or open invites
+/// depend on the cached identity.
+pub type IdentityGuard = Arc<
+    dyn Fn(
+            Arc<dyn SourceControl>,
+        )
+            -> Pin<Box<dyn Future<Output = std::result::Result<IdentityLease, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Opaque in-flight flow handle returned by [`start`]. Holds the secret
 /// `device_code` privately; intentionally no `Debug`/`Serialize`.
@@ -83,6 +119,9 @@ pub struct DeviceFlow {
     device_code: SecretString,
     interval: u64,
     store: FileSecretStore,
+    /// Optional pre-persist hook plus the API base its client talks to
+    /// (`None` = api.github.com).
+    identity_guard: Option<(Option<String>, IdentityGuard)>,
 }
 
 /// The production login host the device flow talks to.
@@ -151,6 +190,7 @@ pub async fn start_at(
         device_code: SecretString::from(codes.device_code),
         interval: codes.interval,
         store: FileSecretStore::new(),
+        identity_guard: None,
     };
     Ok((auth, flow))
 }
@@ -162,9 +202,24 @@ impl DeviceFlow {
         self.interval
     }
 
+    /// Install an [`IdentityGuard`] consulted between the grant and the
+    /// token write; `api_base_uri` is where its client's API calls go
+    /// (`None` = api.github.com, the test seam points it at a mock).
+    #[must_use]
+    pub fn with_identity_guard(mut self, api_base_uri: Option<&str>, guard: IdentityGuard) -> Self {
+        self.identity_guard = Some((api_base_uri.map(str::to_string), guard));
+        self
+    }
+
     /// Poll the token endpoint once. On [`PollStatus::Authorized`] the access
     /// token has already been persisted to the secret store under
     /// `sourceControl.github.token` — it is never returned to the caller.
+    /// With an [`IdentityGuard`] installed, the grant is first handed to the
+    /// guard as a token-bound client; a refusal drops the token unpersisted
+    /// and reports [`PollStatus::Refused`], and an admission's
+    /// [`IdentityLease`] is held by the token write itself until it returns
+    /// — even when this caller has given up on it after
+    /// [`SECRET_WRITE_TIMEOUT`].
     ///
     /// # Errors
     ///
@@ -189,7 +244,26 @@ impl DeviceFlow {
             .await?;
         match parse_poll_response(&body)? {
             PollResponse::Authorized { access_token } => {
-                persist_token(self.store.clone(), access_token).await?;
+                let mut lease: Option<IdentityLease> = None;
+                if let Some((api_base_uri, guard)) = &self.identity_guard {
+                    let client: Arc<dyn SourceControl> =
+                        Arc::new(crate::github::GitHubSourceControl::new(
+                            access_token.expose_secret(),
+                            api_base_uri.as_deref(),
+                        )?);
+                    match guard(client).await {
+                        Ok(held) => lease = Some(held),
+                        Err(reason) => {
+                            drop(access_token);
+                            tracing::warn!(
+                                reason,
+                                "github device flow grant refused by identity guard"
+                            );
+                            return Ok(PollStatus::Refused);
+                        }
+                    }
+                }
+                persist_token(self.store.clone(), access_token, lease).await?;
                 Ok(PollStatus::Authorized)
             }
             PollResponse::Pending => Ok(PollStatus::Pending),
@@ -268,10 +342,34 @@ fn next_interval(current: u64, hinted: Option<u64>) -> u64 {
 /// (the first slot of the existing resolution chain). Runs on the blocking
 /// pool like the loads in [`crate::token`], bounded by
 /// [`SECRET_WRITE_TIMEOUT`] so a wedged filesystem cannot hang the caller.
-async fn persist_token(store: FileSecretStore, token: SecretString) -> Result<()> {
-    let handle =
-        tokio::task::spawn_blocking(move || store.store(SECRET_ACCOUNT, token.expose_secret()));
-    match timeout(SECRET_WRITE_TIMEOUT, handle).await {
+/// The [`IdentityLease`] travels with the write and is released only once
+/// it returns, so a caller that gives up on the timeout cannot release the
+/// identity transition while the abandoned write is still in flight.
+async fn persist_token(
+    store: FileSecretStore,
+    token: SecretString,
+    lease: Option<IdentityLease>,
+) -> Result<()> {
+    persist_with(
+        move || store.store(SECRET_ACCOUNT, token.expose_secret()),
+        lease,
+        SECRET_WRITE_TIMEOUT,
+    )
+    .await
+}
+
+/// Run the blocking `write` on the pool with `lease` held inside the closure
+/// until the write returns, waiting at most `budget` for the result.
+async fn persist_with<F>(write: F, lease: Option<IdentityLease>, budget: Duration) -> Result<()>
+where
+    F: FnOnce() -> intent_core::Result<()> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(move || {
+        let result = write();
+        drop(lease);
+        result
+    });
+    match timeout(budget, handle).await {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(e))) => Err(Error::Api(format!("could not persist github token: {e}"))),
         Ok(Err(join_err)) => Err(Error::Api(format!(
@@ -387,7 +485,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FileSecretStore::with_path(dir.path().join("secrets.json"));
 
-        persist_token(store.clone(), SecretString::from("gho_roundtrip"))
+        persist_token(store.clone(), SecretString::from("gho_roundtrip"), None)
             .await
             .expect("persist");
         assert_eq!(
@@ -403,6 +501,59 @@ mod tests {
 
         // Revoking an already-absent entry stays an idempotent success.
         revoke_token(store).await.expect("revoke twice");
+    }
+
+    /// The lease outlives the caller's wait: when the write is held past the
+    /// budget the caller times out, but the lease stays held until the
+    /// blocking write actually returns, and is released right after.
+    #[tokio::test]
+    async fn lease_is_held_until_the_abandoned_write_returns() {
+        struct Released(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lease: IdentityLease = Box::new(Released(released.clone()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+
+        let err = persist_with(
+            move || {
+                entered_tx.send(()).expect("signal entry");
+                release_rx.recv().expect("wait for release");
+                returned_tx.send(()).expect("signal return");
+                Ok(())
+            },
+            Some(lease),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("caller times out while the write is held");
+        assert!(matches!(&err, Error::Api(msg) if msg.contains("timed out")));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("write entered");
+        assert!(
+            !released.load(std::sync::atomic::Ordering::SeqCst),
+            "the lease must not be released while the write is still in flight"
+        );
+
+        release_tx.send(()).expect("release the writer");
+        returned_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("write returned");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !released.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lease is released once the write returns"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[test]
@@ -423,7 +574,8 @@ mod tests {
 
     #[test]
     fn default_scopes_and_client_id_match_the_registered_oauth_app() {
-        assert_eq!(DEFAULT_SCOPES, &["repo", "read:org", "workflow"]);
+        assert_eq!(DEFAULT_SCOPES, &["repo", "read:org", "workflow", "gist"]);
+        assert!(DEFAULT_SCOPES.contains(&crate::identity_proof::REQUIRED_SCOPE));
         assert_eq!(DEFAULT_OAUTH_CLIENT_ID, "Ov23li8bvmPsd4B4pW38");
     }
 }

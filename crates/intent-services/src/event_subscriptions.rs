@@ -351,7 +351,7 @@ impl Services {
         let services = self.clone();
         let workspace_id = record.workspace_id.clone();
         let subscription_id = record.id.clone();
-        Some(tokio::spawn(async move {
+        Some(intent_core::spawn_daemon(async move {
             let mut sub = bus.subscribe(filter);
             while let Some(batch) = sub.recv().await {
                 if batch.is_empty() {

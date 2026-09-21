@@ -49,13 +49,6 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
 struct MemTokenStore(Mutex<Option<String>>);
@@ -197,7 +190,7 @@ struct Fixture {
     port: u16,
     cfg: Arc<ClientConfig>,
     workspaces_root: PathBuf,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services resolve the repo
@@ -205,9 +198,8 @@ struct Fixture {
 /// targets `file://<dir>/remotes/<owner>/<repo>.git` — hermetic fixtures
 /// instead of github.com, so a cold-cache read never leaves the machine.
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-gh-brcached-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-gh-brcached-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -237,7 +229,7 @@ async fn boot() -> Fixture {
         port,
         cfg,
         workspaces_root,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -294,14 +286,14 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 /// A warm cache: the response is `{ cached: true, branches, defaultBranch }`
 /// with sorted branch names, `HEAD` excluded, and the default branch resolved
 /// from `origin/HEAD` — all served locally, no network.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_cached_returns_branches_from_warm_cache() {
     if !gate() {
         return;
     }
     let fx = boot().await;
     let origin = make_origin_repo(&fx.workspaces_root.parent().unwrap().join("seed"));
-    let cache_root = fx.workspaces_root.join(".repo-cache");
+    let cache_root = intent_git::repo_cache::cache_root_for(&fx.workspaces_root);
     let cache_path = intent_git::repo_cache::ensure_cached_repo(
         &cache_root,
         &file_url(&origin),
@@ -340,7 +332,7 @@ async fn list_cached_returns_branches_from_warm_cache() {
 /// A cold cache with a reachable remote falls back to one `git ls-remote`:
 /// `{ cached: false, source: "ls-remote", branches, defaultBranch }` with
 /// sorted names and the default branch from the remote's `HEAD` symref.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_cached_cold_cache_falls_back_to_ls_remote() {
     if !gate() {
         return;
@@ -374,7 +366,7 @@ async fn list_cached_cold_cache_falls_back_to_ls_remote() {
 /// A cold cache whose remote is also unreachable stays the graceful
 /// `{ cached: false, branches: [] }` with no `defaultBranch` key — never an
 /// error.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_cached_cold_cache_is_graceful() {
     if !gate() {
         return;
@@ -403,7 +395,7 @@ async fn list_cached_cold_cache_is_graceful() {
 
 /// Missing or traversal-shaped params fail with the JSON-RPC `-32602`
 /// invalid-params envelope.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_cached_invalid_params_fail_with_32602() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;

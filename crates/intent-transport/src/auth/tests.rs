@@ -112,13 +112,43 @@ async fn get_or_create_returns_existing_then_stable() {
     assert_eq!(first, second, "must not regenerate when one already exists");
 }
 
+/// A [`WorkspaceApi`] with no principal store: the trait defaults — no
+/// per-principal credentials, no primary principal.
+struct NoPrincipals;
+
+impl WorkspaceApi for NoPrincipals {}
+
+/// A [`WorkspaceApi`] that knows exactly one hashed credential and a
+/// primary principal.
+struct OneCredential {
+    token_hash: String,
+    principal: intent_core::PrincipalId,
+}
+
+impl WorkspaceApi for OneCredential {
+    fn primary_principal_id(&self) -> intent_core::BoxFuture<'_, Result<intent_core::PrincipalId>> {
+        Box::pin(async { Ok(intent_core::PrincipalId("primary".into())) })
+    }
+
+    fn resolve_principal_credential(
+        &self,
+        token_hash: String,
+    ) -> intent_core::BoxFuture<'_, Result<Option<intent_core::PrincipalId>>> {
+        let hit = (token_hash == self.token_hash).then(|| self.principal.clone());
+        Box::pin(async move { Ok(hit) })
+    }
+}
+
 #[tokio::test]
 async fn validate_token_accepts_the_stored_value() {
     let token = generate_token(&async_of(Arc::new(MemoryStore::default())))
         .await
         .unwrap();
     let store = async_of(Arc::new(MemoryStore::with(&token)));
-    assert!(validate_token(&store, &token).await);
+    assert_eq!(
+        validate_token(&store, &NoPrincipals, &token).await,
+        Some(ResolvedCredential::Legacy)
+    );
 }
 
 #[tokio::test]
@@ -128,22 +158,28 @@ async fn validate_token_rejects_wrong_same_length_value() {
     let candidate = format!("{}b", "a".repeat(63));
     let store = async_of(Arc::new(MemoryStore::with(&stored)));
     assert_eq!(stored.len(), candidate.len());
-    assert!(!validate_token(&store, &candidate).await);
+    assert_eq!(
+        validate_token(&store, &NoPrincipals, &candidate).await,
+        None
+    );
 }
 
 #[tokio::test]
 async fn validate_token_rejects_empty_and_length_mismatch() {
     let store = async_of(Arc::new(MemoryStore::with(&"a".repeat(64))));
-    assert!(
-        !validate_token(&store, "").await,
+    assert_eq!(
+        validate_token(&store, &NoPrincipals, "").await,
+        None,
         "empty candidate rejected"
     );
-    assert!(
-        !validate_token(&store, "a").await,
+    assert_eq!(
+        validate_token(&store, &NoPrincipals, "a").await,
+        None,
         "length mismatch rejected"
     );
-    assert!(
-        !validate_token(&store, &"a".repeat(65)).await,
+    assert_eq!(
+        validate_token(&store, &NoPrincipals, &"a".repeat(65)).await,
+        None,
         "longer rejected"
     );
 }
@@ -151,7 +187,61 @@ async fn validate_token_rejects_empty_and_length_mismatch() {
 #[tokio::test]
 async fn validate_token_rejects_when_nothing_stored() {
     let store = async_of(Arc::new(MemoryStore::default()));
-    assert!(!validate_token(&store, &"a".repeat(64)).await);
+    assert_eq!(
+        validate_token(&store, &NoPrincipals, &"a".repeat(64)).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn validate_token_resolves_hashed_principal_credential() {
+    let token = "b".repeat(64);
+    let api = OneCredential {
+        token_hash: hash_token(&token),
+        principal: intent_core::PrincipalId("p-collab".into()),
+    };
+    // Legacy token is a different value; the hashed row must win.
+    let store = async_of(Arc::new(MemoryStore::with(&"a".repeat(64))));
+    assert_eq!(
+        validate_token(&store, &api, &token).await,
+        Some(ResolvedCredential::Principal(intent_core::PrincipalId(
+            "p-collab".into()
+        )))
+    );
+    // Unknown token: neither legacy nor hashed.
+    assert_eq!(validate_token(&store, &api, &"c".repeat(64)).await, None);
+    // The store never sees plaintext: the lookup key is the hex SHA-256.
+    assert_eq!(hash_token(&token).len(), 64);
+    assert_ne!(hash_token(&token), token);
+}
+
+#[tokio::test]
+async fn resolved_credential_binds_caller() {
+    let api = OneCredential {
+        token_hash: String::new(),
+        principal: intent_core::PrincipalId("p-collab".into()),
+    };
+    assert_eq!(
+        ResolvedCredential::Legacy.into_caller(&api).await,
+        Some(Caller::Wire {
+            principal_id: intent_core::PrincipalId("primary".into()),
+            is_administrator: true,
+        })
+    );
+    assert_eq!(
+        ResolvedCredential::Principal(intent_core::PrincipalId("p-collab".into()))
+            .into_caller(&api)
+            .await,
+        Some(Caller::Wire {
+            principal_id: intent_core::PrincipalId("p-collab".into()),
+            is_administrator: false,
+        })
+    );
+    // No principal store: the legacy token is admitted with no caller bound.
+    assert_eq!(
+        ResolvedCredential::Legacy.into_caller(&NoPrincipals).await,
+        None
+    );
 }
 
 #[test]

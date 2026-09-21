@@ -58,11 +58,14 @@ fn sample_ws() -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -150,6 +153,36 @@ impl WorkspaceApi for FakeApi {
             }))
         })
     }
+    fn workspace_local_changes(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(serde_json::json!({
+                "roots": [
+                    {
+                        "kind": "primary",
+                        "path": "/tmp/ws-1",
+                        "branch": "feat/x",
+                        "hasRemoteRefs": true,
+                        "unpushedCount": 3,
+                        "uncommittedCount": 2,
+                    },
+                    {
+                        "kind": "secondary",
+                        "gitRootId": "gr-1",
+                        "path": "/tmp/ws-1/vendor/sub",
+                        "hasRemoteRefs": false,
+                        "unpushedCount": 0,
+                        "uncommittedCount": 0,
+                        "error": "boom",
+                    },
+                ],
+                "hasUnpushedCommits": true,
+                "hasUncommittedChanges": true,
+            }))
+        })
+    }
     fn workspace_transfer_plan(
         &self,
         id: WorkspaceId,
@@ -176,6 +209,7 @@ impl WorkspaceApi for FakeApi {
                         branch: None,
                         dirty_files: vec![],
                         sandbox_branches: vec![],
+                        submodules: vec![],
                     },
                 },
                 total_size_bytes: 100,
@@ -538,6 +572,7 @@ impl WorkspaceApi for FakeApi {
                 created_task_note_ids: vec![],
                 created_tasks: vec![],
                 warnings: vec![],
+                rev: 1,
             })
         })
     }
@@ -641,6 +676,7 @@ impl WorkspaceApi for FakeApi {
         _text: Option<String>,
         status: Option<String>,
         _expected: Option<String>,
+        _caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateResult>> {
         Box::pin(async move {
             Ok(TaskUpdateResult {
@@ -654,7 +690,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
         _workspace_id: WorkspaceId,
@@ -688,7 +723,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
         _workspace_id: WorkspaceId,
@@ -771,7 +805,7 @@ impl WorkspaceApi for FakeApi {
     }
 
     // Small test values: loss-free in f64.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn event_workspace_summary(
         &self,
         _workspace_id: WorkspaceId,
@@ -1264,6 +1298,46 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn github_users_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "users": [],
+                "echoQuery": query,
+                "echoLimit": limit,
+            }))
+        })
+    }
+
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            // The fake refuses a sentinel nonce with the bounded scope error
+            // so the wire mapping (`-32603` + `data.code`) is exercised.
+            if nonce == "no-scope" {
+                return Err(Error::IdentityProof(
+                    intent_core::IdentityProofErrorKind::ScopeMissing,
+                ));
+            }
+            Ok(serde_json::json!({
+                "gistId": "g1",
+                "login": "octocat",
+                "echoNonce": nonce,
+                "echoHostLabel": host_label,
+            }))
+        })
+    }
+
+    fn github_identity_proof_delete(&self, gist_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "echoGistId": gist_id })) })
+    }
+
     fn git_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -1281,7 +1355,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -2656,6 +2729,59 @@ async fn workspace_disk_usage_not_found_maps_to_workspace_err() {
     );
 }
 
+/// `workspace.localChanges` returns the service payload verbatim:
+/// `{ roots, hasUnpushedCommits, hasUncommittedChanges }` with no extra
+/// envelope nesting (PROTOCOL §5.1).
+#[tokio::test]
+async fn workspace_local_changes_returns_payload() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.localChanges","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["hasUnpushedCommits"], serde_json::json!(true));
+    assert_eq!(
+        v["result"]["hasUncommittedChanges"],
+        serde_json::json!(true)
+    );
+    let roots = v["result"]["roots"].as_array().expect("roots array");
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0]["kind"], serde_json::json!("primary"));
+    assert!(roots[0].get("gitRootId").is_none());
+    assert_eq!(roots[0]["branch"], serde_json::json!("feat/x"));
+    assert_eq!(roots[0]["unpushedCount"], serde_json::json!(3));
+    assert_eq!(roots[0]["uncommittedCount"], serde_json::json!(2));
+    assert_eq!(roots[1]["kind"], serde_json::json!("secondary"));
+    assert_eq!(roots[1]["gitRootId"], serde_json::json!("gr-1"));
+    assert_eq!(roots[1]["error"], serde_json::json!("boom"));
+}
+
+#[tokio::test]
+async fn workspace_local_changes_missing_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.localChanges","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+}
+
+#[tokio::test]
+async fn workspace_local_changes_not_found_maps_to_workspace_err() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.localChanges","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
 /// `workspace.transfer.plan` wraps the service payload as `{ plan }` with the
 /// camelCase manifest/size fields (PROTOCOL §5.1).
 #[tokio::test]
@@ -3673,6 +3799,67 @@ async fn singular_event_subscribe_aliases_are_not_routable() {
     }
 }
 
+/// `agent.list` row-scope params (§5.5): an unknown or non-string `scope` is
+/// `-32602` (never coerced, unlike the lenient retired flags), a bin scope
+/// cannot ride with either retired flag, and `parentAgentId` must be a
+/// canonical `agent-{uuid}` paired with `scope: "delegated"`.
+#[tokio::test]
+async fn agent_list_scope_params_are_validated() {
+    let scope_msg = "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"";
+    for (frame, expected) in [
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"bogus"}}"#,
+            scope_msg,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"top-level"}}"#,
+            scope_msg,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":true}}"#,
+            scope_msg,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","includeRetired":true}}"#,
+            "scope \"topLevel\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","retiredOnly":true}}"#,
+            "scope \"delegated\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","parentAgentId":"a-top"}}"#,
+            "parentAgentId must be a canonical agent-{uuid} id",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","parentAgentId":7}}"#,
+            "parentAgentId must be a canonical agent-{uuid} id",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+            "parentAgentId requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+            "parentAgentId requires scope \"delegated\"",
+        ),
+    ] {
+        let v = call(frame).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "{frame}: {v}");
+        assert_eq!(v["error"]["message"], serde_json::json!(expected), "{frame}");
+    }
+    // The retired-flag contradiction still wins over a scope combination.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","includeRetired":true,"retiredOnly":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("includeRetired and retiredOnly are mutually exclusive")
+    );
+}
+
 #[tokio::test]
 async fn agent_methods_validate_required_params() {
     // agent.list without workspaceId.
@@ -4508,6 +4695,91 @@ async fn github_repos_search_routes_query() {
     .await
     .unwrap();
     assert_eq!(v["result"]["echoQuery"], serde_json::json!("react"));
+}
+
+#[tokio::test]
+async fn github_users_search_requires_query() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.users.search","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn github_identity_proof_create_routes_nonce_and_host_label() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{"nonce":"n1","hostLabel":"Studio"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["gistId"], serde_json::json!("g1"));
+    assert_eq!(v["result"]["login"], serde_json::json!("octocat"));
+    assert_eq!(v["result"]["echoNonce"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["echoHostLabel"], serde_json::json!("Studio"));
+}
+
+#[tokio::test]
+async fn github_identity_proof_create_requires_nonce_and_host_label() {
+    for params in ["{}", r#"{"nonce":"n1"}"#, r#"{"hostLabel":"h"}"#] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
+}
+
+#[tokio::test]
+async fn github_identity_proof_refusal_carries_bounded_data_code() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{"nonce":"no-scope","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "github-scope-missing" })
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("gist")),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn github_identity_proof_delete_routes_gist_id_and_requires_it() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.delete","params":{"gistId":"g1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["echoGistId"], serde_json::json!("g1"));
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.delete","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn github_users_search_routes_query_and_optional_limit() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.users.search","params":{"query":"octo","limit":3}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoQuery"], serde_json::json!("octo"));
+    assert_eq!(v["result"]["echoLimit"], serde_json::json!(3));
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"github.users.search","params":{"query":"octo"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoLimit"], Value::Null);
 }
 
 #[tokio::test]
@@ -5611,6 +5883,7 @@ async fn github_methods_are_routed_not_unknown() {
         r#"{"jsonrpc":"2.0","id":6,"method":"github.pulls.updateBranch","params":{"owner":"o","repo":"r","number":1}}"#,
         r#"{"jsonrpc":"2.0","id":7,"method":"github.issues.list","params":{"owner":"o","repo":"r"}}"#,
         r#"{"jsonrpc":"2.0","id":8,"method":"github.issues.search","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":14,"method":"github.issues.get","params":{"owner":"o","repo":"r","number":1}}"#,
         r#"{"jsonrpc":"2.0","id":9,"method":"github.listReviewComments","params":{"owner":"o","repo":"r","number":1}}"#,
         r#"{"jsonrpc":"2.0","id":10,"method":"github.replyReviewComment","params":{"owner":"o","repo":"r","number":1,"commentId":2,"body":"b"}}"#,
         r#"{"jsonrpc":"2.0","id":11,"method":"github.getReviewThreads","params":{"owner":"o","repo":"r","number":1}}"#,
@@ -5630,6 +5903,9 @@ async fn github_missing_required_params_are_minus_32602() {
         r#"{"jsonrpc":"2.0","id":2,"method":"github.pulls.get","params":{"owner":"o","repo":"r"}}"#,
         // missing number
         r#"{"jsonrpc":"2.0","id":3,"method":"github.pulls.merge","params":{"owner":"o","repo":"r"}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"github.issues.get","params":{"owner":"o","repo":"r"}}"#,
+        // missing owner
+        r#"{"jsonrpc":"2.0","id":8,"method":"github.issues.get","params":{"repo":"r","number":1}}"#,
         // missing required create fields
         r#"{"jsonrpc":"2.0","id":4,"method":"github.pulls.create","params":{"owner":"o","repo":"r","title":"t"}}"#,
         // missing commentId / body
@@ -5639,6 +5915,114 @@ async fn github_missing_required_params_are_minus_32602() {
     ] {
         let v = call(msg).await.unwrap();
         assert_eq!(err_code(&v), -32602, "msg={msg}");
+    }
+}
+
+/// `repos[]` slugs (§5.27 multi-repo search) are interpolated into
+/// `repo:{owner}/{repo}` search qualifiers, so a value carrying whitespace,
+/// `:` or `/` could smuggle in a second qualifier and bypass the repo cap.
+/// Each malformed entry is `-32602` naming its index; well-formed slugs pass
+/// through to the trait (→ -32603 on the default impl).
+#[tokio::test]
+async fn github_search_repos_entries_must_be_valid_slugs() {
+    for (method, repos, needle) in [
+        // qualifier injection via whitespace
+        (
+            "github.issues.search",
+            r#"[{"owner":"o","repo":"r repo:other/private"}]"#,
+            "repos[0].repo",
+        ),
+        (
+            "github.pulls.search",
+            r#"[{"owner":"o","repo":"r repo:other/private"}]"#,
+            "repos[0].repo",
+        ),
+        // colon / slash
+        (
+            "github.issues.search",
+            r#"[{"owner":"o:x","repo":"r"}]"#,
+            "repos[0].owner",
+        ),
+        (
+            "github.pulls.search",
+            r#"[{"owner":"o","repo":"r"},{"owner":"o","repo":"a/b"}]"#,
+            "repos[1].repo",
+        ),
+        // empty / whitespace-only
+        (
+            "github.issues.search",
+            r#"[{"owner":"","repo":"r"}]"#,
+            "repos[0].owner",
+        ),
+        (
+            "github.pulls.search",
+            r#"[{"owner":"o","repo":"  "}]"#,
+            "repos[0].repo",
+        ),
+        // owner may not carry `_` / `.`; repo may not be `.` / `..`
+        (
+            "github.issues.search",
+            r#"[{"owner":"o_x","repo":"r"}]"#,
+            "repos[0].owner",
+        ),
+        (
+            "github.issues.search",
+            r#"[{"owner":"o","repo":".."}]"#,
+            "repos[0].repo",
+        ),
+    ] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"o","repo":"r","repos":{repos}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "msg={msg}");
+        let text = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(text.contains(needle), "msg={msg} error={text}");
+    }
+
+    // Well-formed slugs (letters, digits, `-`, and `.`/`_` in repo names) route.
+    for method in ["github.issues.search", "github.pulls.search"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"o","repo":"r","repos":[{{"owner":"intent-hq","repo":"cloudlands-fe"}},{{"owner":"acme","repo":"my_lib.rs"}}]}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "msg={msg}");
+    }
+}
+
+/// The addressed `owner` / `repo` of the search methods and
+/// `github.relatedRepos.list` get the same slug validation as `repos[]`.
+#[tokio::test]
+async fn github_search_addressed_owner_repo_must_be_valid_slugs() {
+    for method in [
+        "github.issues.search",
+        "github.pulls.search",
+        "github.relatedRepos.list",
+    ] {
+        for (owner, repo, needle) in [
+            ("o", "r repo:other/private", "repo"),
+            ("o x", "r", "owner"),
+            ("o", "r:x", "repo"),
+            ("o/x", "r", "owner"),
+            ("", "r", "owner"),
+            ("o", "", "repo"),
+        ] {
+            let msg = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"{owner}","repo":"{repo}"}}}}"#
+            );
+            let v = call(&msg).await.unwrap();
+            assert_eq!(err_code(&v), -32602, "msg={msg}");
+            let text = v["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(&format!("{needle} is not a valid GitHub")),
+                "msg={msg} error={text}"
+            );
+        }
+        let ok = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"owner":"Intent-HQ","repo":"intent.d_2"}}}}"#
+        );
+        let v = call(&ok).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "msg={ok}");
     }
 }
 
@@ -5662,7 +6046,7 @@ mod send_message_payload_forwarding {
     /// observed shape.
     #[derive(Default, Debug, Clone)]
     // Unasserted fields are written but never read; kept to document the shape.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Capture {
         workspace_id: Option<WorkspaceId>,
         agent_id: Option<AgentId>,
@@ -5685,7 +6069,6 @@ mod send_message_payload_forwarding {
     }
 
     impl WorkspaceApi for RecordingApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_send_message(
             &self,
             workspace_id: WorkspaceId,
@@ -5858,7 +6241,7 @@ mod send_message_payload_forwarding {
                 "agentId":"agent-1",
                 "content":"hi",
                 "imageBlocks":[{"data":"aGVsbG8=","mimeType":"image/png"}],
-                "fileBlocks":[{"data":"Zm9v","mimeType":"text/plain","fileName":"notes.txt"}]
+                "fileBlocks":[{"attachmentId":"att-1","mimeType":"text/plain","fileName":"notes.txt"}]
             }
         }"#;
         handle_message(&api, msg).await.expect("response");
@@ -5870,7 +6253,9 @@ mod send_message_payload_forwarding {
         );
         assert_eq!(
             cap.file_blocks,
-            Some(json!([{"data": "Zm9v", "mimeType": "text/plain", "fileName": "notes.txt"}])),
+            Some(
+                json!([{"attachmentId": "att-1", "mimeType": "text/plain", "fileName": "notes.txt"}])
+            ),
             "fileBlocks must be forwarded verbatim"
         );
     }
@@ -5941,7 +6326,7 @@ mod send_message_payload_forwarding {
     }
 }
 
-/// `agent.dismissQuestions` (PROTOCOL §5.5, question hold): the dispatch arm
+/// `agent.dismissQuestions` (PROTOCOL §5.5, pending questions): the dispatch arm
 /// forwards `workspaceId`/`agentId`/`messageId` verbatim and rejects missing
 /// params with `-32602` before any API call.
 mod dismiss_questions_dispatch {
@@ -6320,7 +6705,6 @@ mod edit_and_regenerate {
     }
 
     impl WorkspaceApi for RecordingApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_edit_and_regenerate(
             &self,
             workspace_id: WorkspaceId,
@@ -6363,7 +6747,7 @@ mod edit_and_regenerate {
                 "messageId":"msg-7",
                 "content":"edited text",
                 "imageBlocks":[{"data":"aGk=","mimeType":"image/png"}],
-                "fileBlocks":[{"data":"aGk=","mimeType":"text/plain","fileName":"a.txt"}],
+                "fileBlocks":[{"attachmentId":"att-a","mimeType":"text/plain","fileName":"a.txt"}],
                 "model":"auggie:sonnet4.5"
             }
         }"#;
@@ -6391,7 +6775,7 @@ mod edit_and_regenerate {
         );
         assert_eq!(
             cap.file_blocks,
-            Some(json!([{"data":"aGk=","mimeType":"text/plain","fileName":"a.txt"}]))
+            Some(json!([{"attachmentId":"att-a","mimeType":"text/plain","fileName":"a.txt"}]))
         );
         assert_eq!(cap.model.as_deref(), Some("auggie:sonnet4.5"));
     }
@@ -6451,7 +6835,6 @@ mod edit_and_regenerate {
     struct RejectingApi;
 
     impl WorkspaceApi for RejectingApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_edit_and_regenerate(
             &self,
             _workspace_id: WorkspaceId,
@@ -6710,7 +7093,6 @@ mod oversized_response {
     struct HugeApi;
 
     impl WorkspaceApi for HugeApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_edit_and_regenerate(
             &self,
             _workspace_id: WorkspaceId,

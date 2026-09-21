@@ -54,6 +54,8 @@ only on `intent-services`, never on `intent-store`.
 | domain logic / `WorkspaceApi`| `crates/intent-services/`                                    |
 | SQLite schema + migrations   | `crates/intent-store/`                                       |
 | ACP streaming / permissions  | `crates/intent-acp/`                                         |
+| user-only agent field (hidden from agents) | `AGENT_HIDDEN_FIELDS` in `crates/intent-core/src/model.rs`; the egress registry + contract test in `crates/intent-acp/src/tests_hidden_field_egress.rs` — a new agent-facing egress that serves session/event data must be registered there |
+| browser tab contract / `ws.browser.docs` text | `crates/intent-acp/src/mcp_server/bindings/browser_docs/*.md` — change together with the cloudlands-fe executor (`src/features/browser/main/browser-action-executor.ts`, `embedded-browser-cdp-service.ts`, the browser-tab-registry saga) and `../../docs/protocol/methods/files-terminal-browser.md`; monorepo `make docs-check` cross-checks the shared `errorCode` / `displayed` tokens |
 | binary CLI + composition     | `crates/intentd/src/`                                        |
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
@@ -158,6 +160,28 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   the UDS suites are a useful reference for shaping new tests, but they do **not** replace
   the WSS e2e requirement; the WSS path has its own concerns (TLS upgrade, bearer auth,
   origin allow-list, fingerprint pinning, heartbeat) that only the WSS harness covers.
+- **Scratch dirs** — create them with `common::test_tempdir(prefix)` /
+  `common::test_tempdir_in("/tmp", prefix)` (or `test_support::test_tempdir` inside
+  `intent-services`), declared before any guard that kills a daemon child: the `TempDir`
+  sweeps on drop (including on panic) and `INTENTD_TEST_KEEP_TMP=1` keeps it for
+  debugging. `tmp_hygiene_lint.rs` fails the suite on any raw `PathBuf::from("/tmp")` /
+  `Path::new("/tmp")` / `temp_dir().join(..)` in test code unless the line ends with
+  `// tmp-hygiene: allow — <reason>` (pure path arithmetic only).
+- **Repo-cache paths** — derive them with `intent_git::repo_cache::cache_root_for` /
+  `cache_path_for`, never `join(".repo-cache")`. `repo_cache_path_lint.rs` fails the
+  suite on a literal `".repo-cache"` in test code unless the line ends with
+  `// repo-cache-path: allow — <reason>`.
+- **Daemon spawns** — build them with `common::serve_command()` (the `intentd` binary,
+  `serve`, and the `INTENTD_TCP_PORT=0` ephemeral-port seam so WSS daemons never race for
+  the port `enable_ws_api` seeded), or `common::serve_command_fixed_port()` only when the
+  test must bind the settings-file port. `serve_spawn_lint.rs` is a bounded textual
+  backstop: it fails the suite on a single-statement
+  `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"` (30-line cap), and on a file
+  whose code calls `enable_ws_api(` without `serve_command` in code (comments stripped;
+  a split-statement raw spawn beside a genuine builder call is not detected). Opt out
+  with `// serve-spawn: allow — <reason>` — on the offending statement's line for the
+  first rule, anywhere in the file for the second (wrapper-program launchers only;
+  reason required).
 
 ### Asserting the protocol contract
 
@@ -173,21 +197,52 @@ that contract:
 
 ## Gates — keep them green
 
-Before opening a submodule PR (and before bumping the monorepo gitlink), all three of the
-following must pass in `packages/intentd`:
+Before opening a submodule PR (and before bumping the monorepo gitlink), the gates must
+pass. Run them from the monorepo root via the top-level `Makefile`:
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test
+make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
+make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
+make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
+make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's pull_request coverage-changed job
+make gate     # check, then test
+scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on every PR
 ```
 
-From the monorepo root the same gates are exposed via the top-level `Makefile`:
+The raw equivalents in `packages/intentd` are `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo nextest run --workspace --show-progress none`. Saved `ws.script` runs are
+PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
+environment (all three) and `--show-progress none` on the nextest command (the `make`
+targets already set both) or progress-bar redraws flood the output buffer.
+Raw invocations must also run under the rustup-managed toolchain pinned in
+`rust-toolchain.toml` (`rustup run <pin> cargo ...` when a non-rustup cargo shadows
+`PATH` — a Homebrew cargo once ran the gates on the wrong toolchain, see
+intent-hq/intentd#1853); the `make` targets are the supported path.
 
-```bash
-make check    # fmt + clippy against packages/intentd
-make test     # cargo test against packages/intentd
-```
+The CI `check` job also runs the **source lints**: every `crates/<crate>/tests/*_lint.rs`
+integration test is a source-scanning lint, selected by convention — run them all with
+`make lint-sources` from the monorepo root or `cargo test --workspace --test '*_lint'` in
+`packages/intentd`. Each lint fails naming `file:line`; its rationale, heuristic, and
+limits live in its module doc. `source_lint_discovery_lint` fails when a `*_lint.rs` file
+exists that the glob does not select (nested dir, `autotests = false`, renamed `[[test]]`)
+or when ci.yml's `check` job has no non-comment `run:` line invoking the glob, so a new
+lint needs no CI, Makefile, or docs wiring — add the file and a row below. Every opt-out
+marker requires a reason; baselines only ratchet down (the lint fails until a fixed
+file's entry is removed or lowered).
+
+| Lint | Fails on | Opt-out / baseline |
+| --- | --- | --- |
+| `repo_slug_fold_lint` | a case-fold call on an `owner` / `repo` / `repository` / `slug` identifier outside `intent_core::RepoRef` (intent-hq/intentd#1809 → #1815); route slug identity through `RepoRef` regardless | `// repo-slug-fold: allow — <reason>` on the line above |
+| `event_type_lint` | a `note:` / `task:` / `workspace:` / `agent:` string literal outside test code not in `intent_core::events::ALL_EVENT_TYPES`; add the type there, regenerate the golden `crates/intent-core/tests/goldens/event_types.json` with `INTENTD_UPDATE_GOLDENS=1`, and emit via the constant | `// event-type-lint: allow — <reason>` on the line above |
+| `fixed_sleep_lint` | `thread::sleep(` / `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**` (intent-hq/intentd#1924); wait on an observable event instead | `// timing-guard: <reason>` on the line or the line above; `crates/intent-core/tests/fixed_sleep_baseline.txt` (`<path> <count>`) |
+| `raw_child_lint` | a test file naming `std::process::Child` as a type instead of holding an `intentd_test_support::GuardedChild` (borrows and `use` paths are not hits) | `// raw-child: allow — <reason>` on the line above; the lint's `BASELINE` |
+| `tmp_hygiene_lint` | a raw `PathBuf::from("/tmp")` / `Path::new("/tmp")` / `temp_dir().join(..)` in test code instead of `test_tempdir` | trailing `// tmp-hygiene: allow — <reason>` |
+| `repo_cache_path_lint` | a literal `".repo-cache"` in test code instead of `intent_git::repo_cache::cache_root_for` / `cache_path_for` | trailing `// repo-cache-path: allow — <reason>` |
+| `serve_spawn_lint` | a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"`, or a file calling `enable_ws_api(` without `serve_command` in code | `// serve-spawn: allow — <reason>` on the statement line, or anywhere in the file for the second rule |
+| `agent_hidden_field_egress_lint` | a `mcp_server/bindings/` file that reads session/event rows (`AgentLite` / `Event`, `agent_get(` / `agent_list(` / `event_query(` …) without a `SCRUBBED_BINDINGS` row (scrubs with `strip_agent_hidden_fields` + `EGRESS_REGISTRY` entries), or an `intent-services` fn copying `.data` wholesale into `json!` without a `WAKE_METADATA_BUILDERS` row; allowlist rows and registry entries are cross-checked for staleness | `HAND_PICKED_BINDINGS` / `SAFE_DATA_COPIES` rows in the lint (reason required) |
+| `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, or a ci.yml `check` job with no non-comment `run:` line invoking the glob | none |
+| `workflow_grep_quiet_lint` | a `\| grep -q` / `-Eq` / `--quiet` / `--silent` pipeline in `.github/workflows/*.yml` — under `bash -eo pipefail` a large matched input makes the producer die of SIGPIPE and the step report "no match" (cloudlands-fe#2709); use a here-string for variable input, `\| grep -E pat >/dev/null` for a real producer, or `grep -q pat file` | none |
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
@@ -209,5 +264,8 @@ single tracker for all components; never track issues in markdown files. Use lab
 `component:intentd` + `agent-filed`. See the [root `AGENTS.md`](../../AGENTS.md) →
 Filing Issues for the full conventions (dedup, cross-referencing,
 `Fixes intent-hq/intent#N` — the release notifier is completeness-gated: it comments
-on the issue only once every linked intentd fix PR is merged and contained in the
-released tag).
+on the issue only once the issue is closed, at least one linked intentd fix PR is
+merged and contained in the released tag, no linked intentd fix PR is still open, and
+every merged one is contained (PRs closed without merging are ignored); a plain
+`intent-hq/intent#N` mention never earns a release comment, only a closing-keyword
+reference on the actual fix PR does).

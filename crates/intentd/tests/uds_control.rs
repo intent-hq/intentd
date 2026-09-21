@@ -18,18 +18,15 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -41,9 +38,8 @@ fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> Chil
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -91,9 +87,8 @@ async fn rpc_with_params(socket: &PathBuf, method: &str, params: Value) -> Value
 #[tokio::test]
 async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     // Keep the data dir short so `data_dir/intentd.sock` fits within SUN_LEN.
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let pidfile = data_dir.join("intentd.pid");
 
@@ -110,6 +105,15 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     assert!(r["host"]["os"].is_string());
     assert!(r["host"]["arch"].is_string());
     assert!(r["host"]["hasDisplay"].is_boolean());
+    if std::env::consts::OS == "linux" {
+        assert!(r["host"]["deviceKind"].is_string(), "deviceKind: {resp}");
+    }
+    assert!(
+        r["host"]
+            .get("deviceKind")
+            .is_none_or(|value| !value.is_null()),
+        "deviceKind is omitted, never null"
+    );
     assert_eq!(r["agents"], 0);
     // New fields: maxAgents, version, uptimeSeconds.
     assert!(
@@ -128,6 +132,37 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     // Supervision probe (intent-hq/intent#3875): always present, and false
     // here — the daemon was spawned by the test harness, not a sitter.
     assert_eq!(r["updateSupported"], false, "updateSupported: {resp}");
+    // Idle-update handshake visibility: no turn in flight, and no sitter
+    // advertised the handshake, so the object is present with `supported`
+    // false and the timestamps explicitly null (never absent).
+    assert_eq!(r["busyAgents"], 0, "busyAgents: {resp}");
+    let idle = &r["idleUpdateCheck"];
+    assert!(
+        idle["enabled"].is_boolean(),
+        "idleUpdateCheck.enabled: {resp}"
+    );
+    assert_eq!(
+        idle["supported"], false,
+        "idleUpdateCheck.supported: {resp}"
+    );
+    assert_eq!(idle["restartPending"], false, "restartPending: {resp}");
+    assert!(idle["lastRequestedAt"].is_null(), "lastRequestedAt: {resp}");
+    assert!(idle["nextEligibleAt"].is_null(), "nextEligibleAt: {resp}");
+    // Descriptor gauge (intent-hq/intent#4390): the startup sample lands
+    // before the socket binds, so both fields are live on Linux/macOS and a
+    // running daemon can never hold zero descriptors or exceed its soft limit.
+    if matches!(std::env::consts::OS, "linux" | "macos") {
+        let fd_count = r["fdCount"].as_u64().expect("fdCount is u64");
+        let fd_limit = r["fdLimit"].as_u64().expect("fdLimit is u64");
+        assert!(fd_count > 0, "fdCount > 0: {resp}");
+        assert!(fd_limit >= fd_count, "fdLimit ≥ fdCount: {resp}");
+    }
+    for key in ["fdCount", "fdLimit"] {
+        assert!(
+            r.get(key).is_none_or(Value::is_u64),
+            "{key} is omitted, never null: {resp}"
+        );
+    }
 
     // host.status is the §5.14 capability probe, answered on the same UDS
     // connection with the resolved locality (UDS ⇒ local) and host fields.
@@ -145,6 +180,22 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
         "prettyHostname non-empty"
     );
     assert!(h["hasDisplay"].is_boolean());
+    assert_eq!(h.get("deviceKind"), r["host"].get("deviceKind"));
+    assert_eq!(h.get("hardwareModel"), r["host"].get("hardwareModel"));
+    if let Some(kind) = h.get("deviceKind").and_then(Value::as_str) {
+        assert!(
+            [
+                "macMini",
+                "macStudio",
+                "laptop",
+                "desktop",
+                "server",
+                "cloudVm"
+            ]
+            .contains(&kind),
+            "known deviceKind: {host}"
+        );
+    }
 
     // `intentd stop` issues the graceful control RPC then escalates if needed.
     // Run it in a blocking thread while we concurrently reap the daemon: the
@@ -186,7 +237,6 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     // UDS analog of a clean port release with no EADDRINUSE.
     let restart = Daemon {
         child: spawn_daemon(&data_dir),
-        data_dir: data_dir.clone(),
     };
     assert!(
         await_socket(&socket).await,
@@ -220,13 +270,11 @@ async fn await_file_watch(socket: &PathBuf, pred: impl Fn(&Value) -> bool) -> Va
 async fn system_status_surfaces_file_watch_coverage_and_degradation() {
     // Healthy daemon: once the registry is up, fileWatch is present with a
     // zero failed count (the hermetic boot has no workspaces, so zero roots).
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdw-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdw-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let healthy = Daemon {
         child: spawn_daemon(&data_dir),
-        data_dir: data_dir.clone(),
     };
     assert!(await_socket(&socket).await, "healthy daemon did not start");
     let resp = await_file_watch(&socket, Value::is_object).await;
@@ -242,13 +290,11 @@ async fn system_status_surfaces_file_watch_coverage_and_degradation() {
 
     // Degraded daemon: every watcher creation fails (test seam), so watching
     // a workspace must surface as failed roots rather than a silent WARN.
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdd-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdd-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let degraded = Daemon {
         child: spawn_daemon_with_env(&data_dir, &[("INTENTD_TEST_FAIL_WATCHER_CREATION", "1")]),
-        data_dir: data_dir.clone(),
     };
     assert!(await_socket(&socket).await, "degraded daemon did not start");
 
@@ -291,4 +337,87 @@ async fn system_status_surfaces_file_watch_coverage_and_degradation() {
         "no watcher can be created under the seam, so no stream is active: {resp}"
     );
     drop(degraded);
+}
+
+/// Per-daemon inotify baseline (intent-hq/intent#4953): every `notify`
+/// watcher is one inotify instance, capped host-wide by
+/// `fs.inotify.max_user_instances` (default 128), and parallel e2e runs boot
+/// dozens of daemons at once. A freshly booted daemon with no workspaces used
+/// to hold six — the config.toml watcher, the specialists user tier and the
+/// four skills user tiers each owned a watcher — which is what exhausted the
+/// cap under package load. All of those now ride the one shared hub stream,
+/// so a booted daemon holds exactly [`INOTIFY_INSTANCE_CEILING`].
+#[cfg(target_os = "linux")]
+const INOTIFY_INSTANCE_CEILING: usize = 1;
+
+/// Count the `anon_inode:inotify` descriptors `pid` holds via `/proc`.
+#[cfg(target_os = "linux")]
+fn inotify_instances(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read /proc/<pid>/fd")
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.to_string_lossy() == "anon_inode:inotify")
+        .count()
+}
+
+/// Poll daemon.log until every watcher family has reported ready, then until
+/// `pid` holds at least one inotify instance, so the census counts the steady
+/// state rather than a half-started daemon. The registry marker fires once its
+/// subscriptions are enqueued; the config marker fires only after the hub's
+/// registrar has actually installed that watch — and no watcher may exist
+/// before the first `watch()` lands — so the instance floor is what proves
+/// the OS-side work has happened at all before the count is trusted.
+#[cfg(target_os = "linux")]
+async fn await_watchers_ready(data_dir: &std::path::Path, pid: u32) {
+    let log_path = data_dir.join("daemon.log");
+    let deadline = tokio::time::Instant::now() + common::daemon_startup_timeout();
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("watcher registry ready")
+            && log.contains("config.toml live-reload watcher ready")
+            && inotify_instances(pid) >= 1
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "watchers never reported ready with a live inotify instance\n\
+             --- daemon log ---\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn booted_daemon_holds_at_most_the_inotify_instance_ceiling() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdi-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    let daemon = Daemon {
+        // The readiness markers are INFO on the `intentd` target; pin the
+        // filter so a stricter ambient RUST_LOG cannot hide them.
+        child: spawn_daemon_with_env(&data_dir, &[("RUST_LOG", "info")]),
+    };
+    assert!(await_socket(&socket).await, "daemon did not start");
+    await_watchers_ready(&data_dir, daemon.child.id()).await;
+
+    // Sample across a settle window rather than once: a late-created extra
+    // watcher (a family that deferred its own creation past the markers)
+    // must not slip in behind a single early read.
+    let settle_until = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let instances = inotify_instances(daemon.child.id());
+        assert!(
+            instances <= INOTIFY_INSTANCE_CEILING,
+            "a booted daemon holds {instances} inotify instances, ceiling is \
+             {INOTIFY_INSTANCE_CEILING}\n--- daemon log ---\n{}",
+            std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default()
+        );
+        if tokio::time::Instant::now() >= settle_until {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(daemon);
 }

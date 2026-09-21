@@ -222,11 +222,25 @@ fn as_port(value: u64) -> Option<u16> {
 /// Handle a classified `forward.*` request against the connection's registry,
 /// returning the response frame (or `None` for a notification). Invalid params
 /// surface as `-32602`; a failed listener bind as `-32603` (PROTOCOL §9).
+/// Port forwarding is owner-only (multiplayer w3): a non-administrator
+/// connection gets `-32003` for every `forward.*` method, reads included —
+/// the allowlist in `process_frame` refuses these first; this is the
+/// defence-in-depth gate at the surface itself.
 pub(crate) async fn handle(
     req: ForwardRequest,
     registry: &mut ForwardRegistry,
     is_local: bool,
 ) -> Option<String> {
+    if crate::context::is_non_administrator_caller() {
+        return frame(
+            req.id_present,
+            &req.id_echo,
+            Err((
+                crate::catalog::FORBIDDEN_ERROR_CODE,
+                crate::catalog::FORBIDDEN_ERROR_MESSAGE.to_string(),
+            )),
+        );
+    }
     let result: Result<Value, (i32, String)> = match req.method {
         ForwardMethod::Create {
             remote_port,

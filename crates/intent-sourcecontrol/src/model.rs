@@ -7,22 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies a repository on a forge (host-agnostic).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoRef {
-    pub owner: String,
-    pub name: String,
-}
-
-impl RepoRef {
-    /// Convenience constructor.
-    pub fn new(owner: impl Into<String>, name: impl Into<String>) -> Self {
-        Self {
-            owner: owner.into(),
-            name: name.into(),
-        }
-    }
-}
+/// Case-insensitive repository identity; defined in `intent-core` so every
+/// slug-holding crate shares one type, re-exported here at its historical path.
+pub use intent_core::RepoRef;
 
 /// Repository metadata (parity with the FE `GithubRepo`). Backs the
 /// `github.repos.list/search/get` browse surface. `url` carries GitHub's
@@ -201,10 +188,11 @@ pub enum PrInvolvement {
 
 /// Filter for listing pull requests.
 ///
-/// When `involvement` or `search` is set, listing routes through
-/// `GET /search/issues` (`is:pr repo:o/r is:<state> [<filter>:@me] [<text>]`)
-/// so callers can express author/assignee/review-requested/involves @me and
-/// free text; otherwise the plain `GET /repos/{o}/{r}/pulls` path is used with
+/// When `involvement`, `search`, or `extra_repos` is set, listing routes
+/// through `GET /search/issues` (`is:pr repo:o/r [repo:o2/r2 …] is:<state>
+/// [<filter>:@me] [<text>]`) so callers can express
+/// author/assignee/review-requested/involves @me, free text, and a multi-repo
+/// scope; otherwise the plain `GET /repos/{o}/{r}/pulls` path is used with
 /// client-side `author` filtering.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -218,6 +206,12 @@ pub struct PrQuery {
     /// non-blank value routes the listing through `/search/issues` even
     /// without `involvement`. Blank/absent leaves listing behavior unchanged.
     pub search: Option<String>,
+    /// Additional repositories searched alongside the addressed repo in ONE
+    /// `/search/issues` request (a `repo:` qualifier each); GitHub blends and
+    /// orders the hits natively. Non-empty routes the listing through search
+    /// even with a blank `search`; empty leaves listing behavior unchanged.
+    #[serde(default)]
+    pub extra_repos: Vec<RepoRef>,
     pub limit: Option<u8>,
     /// Engine-native continuation cursor (a REST page number); `None` is the
     /// first page. The opaque wire `nextToken` is owned by the services layer.
@@ -327,6 +321,12 @@ pub struct CheckRun {
     pub name: String,
     pub state: CheckState,
     pub url: Option<String>,
+    /// When the run started (REST `started_at`, RFC 3339), used only to pick
+    /// the live run among same-name twins on a head (see
+    /// [`RollupCheck::started_at`]). Daemon-internal: never serialized, so
+    /// the documented `CheckRun` wire shape is unchanged.
+    #[serde(skip)]
+    pub started_at: Option<String>,
 }
 
 /// An issue (PRs excluded; gated by capabilities).
@@ -338,13 +338,17 @@ pub struct Issue {
     pub body: Option<String>,
     pub state: String,
     pub url: String,
+    pub author: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Filter for listing issues.
 ///
-/// When `search` is set, listing routes through `GET /search/issues`
-/// (`is:issue repo:o/r [state:<state>] <text>`) so callers can express free
-/// text; otherwise the plain `GET /repos/{o}/{r}/issues` listing is used.
+/// When `search` or `extra_repos` is set, listing routes through
+/// `GET /search/issues` (`is:issue repo:o/r [repo:o2/r2 …] [state:<state>]
+/// <text>`) so callers can express free text and a multi-repo scope;
+/// otherwise the plain `GET /repos/{o}/{r}/issues` listing is used.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueQuery {
@@ -353,6 +357,12 @@ pub struct IssueQuery {
     /// Free-text search term; a non-blank value routes the listing through
     /// `/search/issues`. Blank/absent leaves listing behavior unchanged.
     pub search: Option<String>,
+    /// Additional repositories searched alongside the addressed repo in ONE
+    /// `/search/issues` request (a `repo:` qualifier each); GitHub blends and
+    /// orders the hits natively. Non-empty routes the listing through search
+    /// even with a blank `search`; empty leaves listing behavior unchanged.
+    #[serde(default)]
+    pub extra_repos: Vec<RepoRef>,
     pub limit: Option<u8>,
     /// Engine-native continuation cursor (a REST page number); `None` is the
     /// first page. The opaque wire `nextToken` is owned by the services layer.
@@ -385,9 +395,22 @@ pub struct AuthStatus {
     pub scopes: Vec<String>,
 }
 
+/// The host's REST core quota as reported by its quota-free probe
+/// ([`crate::SourceControl::rate_limit_status`]); every field is `None`
+/// when the host lacks the signal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateLimitStatus {
+    /// When the quota window resets, as a unix timestamp (seconds).
+    pub reset_at: Option<u64>,
+    /// Requests left in the current window.
+    pub remaining: Option<u64>,
+    /// The window's full request quota.
+    pub limit: Option<u64>,
+}
+
 /// Capabilities a concrete host may or may not support (FE gates UI on these).
 // One bool per independent capability; the flat shape IS the wire contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScCapabilities {
@@ -402,17 +425,43 @@ pub struct ScCapabilities {
 /// One entry of the forge's status-check rollup for a pull request, carrying
 /// the per-check "is this required to merge?" flag GitHub only exposes through
 /// GraphQL (`statusCheckRollup.contexts` → `isRequired(pullRequestNumber:)`).
-/// Both check-runs and legacy commit statuses collapse onto this shape.
+/// Both check-runs and legacy commit statuses collapse onto this shape;
+/// [`RollupCheck::kind`] tells them apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RollupCheck {
     pub name: String,
+    /// Which kind of rollup node this is. A legacy commit status posted under
+    /// a check run's name is independent evidence, not another attempt of
+    /// that run: GitHub requires both to pass when their shared name is
+    /// required.
+    #[serde(default)]
+    pub kind: RollupCheckKind,
     pub state: CheckState,
     /// Whether the host reports this check as required for merging. `false`
     /// when the host says so *and* when the signal is unavailable — callers
     /// that need the distinction consult [`MergeRequirementSignals`].
     pub is_required: bool,
     pub url: Option<String>,
+    /// When the check-run started (GraphQL `CheckRun.startedAt`, RFC 3339).
+    /// `None` for legacy commit statuses and hosts that do not report it.
+    /// A head that carries several runs of the same check (a re-run, or a
+    /// `concurrency`-cancelled duplicate beside the live run) is resolved
+    /// onto the latest start, matching how the host reports the required
+    /// check's state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+}
+
+/// The kind of node a [`RollupCheck`] was mapped from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollupCheckKind {
+    /// A check run (GraphQL `CheckRun`, REST `/check-runs`).
+    #[default]
+    CheckRun,
+    /// A legacy commit status (GraphQL `StatusContext`, REST `/statuses`).
+    StatusContext,
 }
 
 /// Merge-relevant branch rules for a pull request's base branch (GitHub
@@ -464,7 +513,9 @@ pub struct MergeRequirementSignals {
     /// the host did not report the rollup at all.
     pub checks_known: bool,
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
-    /// unsupported endpoint) — a degraded but non-fatal probe.
+    /// unsupported endpoint) — a degraded but non-fatal probe. Quota
+    /// exhaustion on that read is never folded into `None`; it fails the
+    /// probe with [`crate::Error::RateLimited`].
     pub branch_rules: Option<BranchRules>,
     /// Whether the PR is currently queued in the host's merge queue (GitHub
     /// GraphQL `isInMergeQueue`). `None` when the host does not report it.
@@ -474,4 +525,36 @@ pub struct MergeRequirementSignals {
     /// not report it (no merge-queue support) or the PR was never ejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_removal: Option<MergeQueueRemoval>,
+}
+
+/// Tallies of a pull request's inline review threads: the total number of
+/// review comments across every thread (replies included) and the number of
+/// unresolved threads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewThreadTally {
+    pub review_comment_count: i64,
+    pub unresolved: i64,
+}
+
+/// Everything the PR monitor's per-poll snapshot needs about one pull
+/// request, read by [`crate::SourceControl::pr_observation`] in ONE forge
+/// round trip where the host can fold it (GitHub GraphQL): the
+/// [`PullRequest`] itself, the merge-requirement signals, the submitted
+/// reviews, the review-thread tally, and the conversation-comment count.
+///
+/// The bounded windows degrade to `None` rather than truncating silently:
+/// `reviews` is `None` when the PR has more reviews than one window carries,
+/// `threads` when it has more review threads — callers then take the paged
+/// per-signal reads for that piece only. `signals.branch_rules` is `None`
+/// unless the host folded the base branch's rules in; callers read them via
+/// [`crate::SourceControl::branch_rules`] when they need them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrObservation {
+    pub pr: PullRequest,
+    pub signals: MergeRequirementSignals,
+    pub reviews: Option<Vec<Review>>,
+    pub threads: Option<ReviewThreadTally>,
+    pub conversation_count: i64,
 }

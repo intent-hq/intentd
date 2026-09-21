@@ -1,7 +1,6 @@
 //! Unit tests for the file-based search surface over a temp worktree.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use intent_core::Error;
 
@@ -9,26 +8,18 @@ use crate::cancel::CancelToken;
 use crate::content::{search_in_files, SearchOpts};
 use crate::paths::search_file_names;
 
-/// A self-cleaning temp directory (no `tempfile` dep in the workspace).
-struct TempTree(PathBuf);
-
-impl Drop for TempTree {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-static SEQ: AtomicU32 = AtomicU32::new(0);
+/// A self-cleaning temp worktree: the `TempDir` guard sweeps the root on drop
+/// (including on panic).
+struct TempTree(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 /// Lay out a small worktree: two source files, a build artifact, and a
 /// `.gitignore` that excludes the artifact.
 fn fixture() -> TempTree {
-    let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("intent-search-{nanos}-{n}"));
+    let dir = tempfile::Builder::new()
+        .prefix("intent-search-")
+        .tempdir()
+        .unwrap();
+    let root = dir.path().to_path_buf();
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
@@ -39,7 +30,7 @@ fn fixture() -> TempTree {
     .unwrap();
     std::fs::write(src.join("lib.rs"), "// TODO: docs\npub fn run() {}\n").unwrap();
     std::fs::write(src.join("ignored.rs"), "// TODO: should be skipped\n").unwrap();
-    TempTree(root)
+    TempTree(root, dir)
 }
 
 #[test]

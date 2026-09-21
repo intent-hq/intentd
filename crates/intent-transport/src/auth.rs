@@ -21,7 +21,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
-use intent_core::{Error, Result};
+use intent_core::{Caller, Error, Result, WorkspaceApi};
 
 /// Secrets-store account/key for the bearer token (`server.auth.token`).
 const TOKEN_ACCOUNT: &str = "server.auth.token";
@@ -109,7 +109,7 @@ struct TokenState {
 /// or a resolved value valid until `expires_at`.
 // Watch channels carry `Option<Option<String>>`: outer `None` = not yet
 // published, inner `Option` = the loaded token (which may be absent).
-#[allow(clippy::option_option)]
+#[expect(clippy::option_option)]
 enum Entry {
     /// A blocking load is in progress. `rx` receives `Some(value)` when the
     /// `spawn_blocking` task finishes; `started_at` lets late waiters shrink
@@ -257,7 +257,7 @@ impl AsyncTokenStore {
     /// overwrite a slot that an intervening `store_token` / newer load
     /// already refreshed: the write only happens if the slot is still the
     /// `InFlight` tagged with `load_id`.
-    #[allow(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
+    #[expect(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
     fn spawn_load(&self, tx: watch::Sender<Option<Option<String>>>, load_id: u64) {
         let inner = self.inner.clone();
         let state = self.state.clone();
@@ -292,7 +292,7 @@ impl AsyncTokenStore {
     /// timeout return `None` (the current caller gives up but the underlying
     /// blocking task keeps running and will populate the cache when it
     /// eventually completes, subject to the generation guard).
-    #[allow(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
+    #[expect(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
     async fn await_load(
         &self,
         rx: &mut watch::Receiver<Option<Option<String>>>,
@@ -348,7 +348,7 @@ impl AsyncTokenStore {
 }
 
 /// Internal choice returned by the entry probe in [`AsyncTokenStore::load_token`].
-#[allow(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
+#[expect(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
 enum LoadAction {
     /// A load is already in flight; wait on the existing receiver.
     Wait {
@@ -391,13 +391,80 @@ pub async fn get_or_create_token(store: &AsyncTokenStore) -> Result<String> {
     }
 }
 
-/// Validate a candidate token against the stored token using a length-checked,
-/// constant-time comparison. Port of `validateToken`.
-pub(crate) async fn validate_token(store: &AsyncTokenStore, candidate: &str) -> bool {
-    let Some(stored) = store.load_token().await else {
-        return false;
-    };
-    token_matches(&stored, candidate)
+/// What a presented bearer token resolved to at the upgrade gate
+/// (multiplayer w1). Never a bare `bool`: the connection is bound to the
+/// resolved principal for its whole lifetime, and identity is never taken
+/// from `client.hello`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedCredential {
+    /// The legacy file token (`server.auth.token`): the primary user,
+    /// administrator of this daemon.
+    Legacy,
+    /// A per-principal credential (`principal_credential` row, matched by
+    /// hex SHA-256 of the token).
+    Principal(intent_core::PrincipalId),
+}
+
+impl ResolvedCredential {
+    /// The caller to bind on the connection. The legacy token needs the
+    /// primary principal's id from the service layer; when the composition
+    /// root exposes none (test stubs) the connection is admitted unbound
+    /// (fail-closed for principal-gated consumers).
+    pub(crate) async fn into_caller(self, api: &dyn WorkspaceApi) -> Option<Caller> {
+        match self {
+            ResolvedCredential::Legacy => match api.primary_principal_id().await {
+                Ok(principal_id) => Some(Caller::Wire {
+                    principal_id,
+                    is_administrator: true,
+                }),
+                Err(e) => {
+                    tracing::debug!(error = %e, "legacy token admitted with no principal bound");
+                    None
+                }
+            },
+            ResolvedCredential::Principal(principal_id) => Some(Caller::Wire {
+                principal_id,
+                is_administrator: false,
+            }),
+        }
+    }
+}
+
+/// Validate a candidate token and resolve it to a credential: the legacy
+/// file token is matched first (length-checked, constant-time; port of
+/// `validateToken`), otherwise the token's hex SHA-256 is looked up among the
+/// per-principal credentials. `None` rejects the upgrade (401).
+pub(crate) async fn validate_token(
+    store: &AsyncTokenStore,
+    api: &dyn WorkspaceApi,
+    candidate: &str,
+) -> Option<ResolvedCredential> {
+    if candidate.is_empty() {
+        return None;
+    }
+    if let Some(stored) = store.load_token().await {
+        if token_matches(&stored, candidate) {
+            return Some(ResolvedCredential::Legacy);
+        }
+    }
+    match api
+        .resolve_principal_credential(hash_token(candidate))
+        .await
+    {
+        Ok(Some(principal_id)) => Some(ResolvedCredential::Principal(principal_id)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "principal credential lookup failed; rejecting upgrade");
+            None
+        }
+    }
+}
+
+/// Hex SHA-256 of a presented token — the only form the store ever sees.
+#[must_use]
+pub fn hash_token(token: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))
 }
 
 /// 32 cryptographically-random bytes, lowercase hex-encoded (64 chars).

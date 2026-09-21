@@ -23,43 +23,30 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{unix::OwnedReadHalf, UnixStream};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-uds-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
 struct TempRepo {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl TempRepo {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-repo-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("mkdir repo");
-        Self { path }
-    }
-}
-
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let dir = common::test_tempdir("intentd-repo-");
+        let path = dir.path().to_path_buf();
+        Self { _dir: dir, path }
     }
 }
 
@@ -128,11 +115,14 @@ fn workspace_row(id: &WorkspaceId, worktree: &Path, branch: &str) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -208,7 +198,7 @@ fn boot(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let bus_clone = bus.clone();
     let socket_clone = socket.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         let _ = serve_uds(services, bus_clone, &socket_clone, None, async {
             let _ = shutdown_rx.await;
         })
@@ -222,7 +212,7 @@ fn boot(
 /// the FE bridge's `git:status-changed` relay) per PROTOCOL §6.5. Emissions
 /// live inside the idempotency scope so a replayed commit (same
 /// idempotencyKey) returns the cached result without re-firing.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn git_commit_emits_git_commit_and_changes_git_status_over_uds() {
     if !gate() {
         eprintln!("skipping git.commit UDS e2e: git not on PATH");

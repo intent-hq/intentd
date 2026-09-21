@@ -19,8 +19,8 @@ mod common;
 use std::os::unix::process::CommandExt;
 
 use common::DaemonGuard;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,11 +38,8 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-resolve-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-resolve-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -214,11 +211,14 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -228,7 +228,8 @@ async fn resolve_interrupted_resume_and_abandon() {
     // message as the last user-role message (and that it no longer mentions
     // "intentd").
     use intent_core::AgentId;
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
@@ -236,12 +237,10 @@ async fn resolve_interrupted_resume_and_abandon() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -250,7 +249,7 @@ async fn resolve_interrupted_resume_and_abandon() {
     #[cfg(unix)]
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn intentd serve");
-    let mut guard = DaemonGuard::new(child, data_dir.clone(), true);
+    let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let ws_id = "ws-resolve-test";
@@ -314,6 +313,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store
             .insert_agent_session(&session1)
@@ -374,6 +374,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store
             .insert_agent_session(&session2)
@@ -549,7 +550,8 @@ async fn resolve_interrupted_resume_and_abandon() {
 
 #[tokio::test]
 async fn resolve_interrupted_invalid_params_validation() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
@@ -557,12 +559,10 @@ async fn resolve_interrupted_invalid_params_validation() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -570,7 +570,7 @@ async fn resolve_interrupted_invalid_params_validation() {
     #[cfg(unix)]
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn intentd serve");
-    let mut guard = DaemonGuard::new(child, data_dir.clone(), true);
+    let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
     // Fetch fingerprint and port

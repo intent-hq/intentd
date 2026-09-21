@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use intent_core::{
-    AgentId, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, WorkspaceApi,
-    WorkspaceId,
+    asset_extension_from_mime, AgentId, NoteAddInput, NoteCreate, NoteEditInput,
+    NoteEditLinesInput, NoteId, WorkspaceApi, WorkspaceId, SUPPORTED_ASSET_MIME_TYPES,
 };
 use serde_json::{json, Value};
 
@@ -26,6 +26,7 @@ pub(crate) const PRELUDE: &str = r"
         list: (tag) => host({ method: 'note.list', args: { tag } }),
         listTasks: (id) => host({ method: 'note.listTasks', args: { id } }),
         readAsset: (asset) => host({ method: 'note.readAsset', args: { asset } }),
+        saveAsset: (asset) => host({ method: 'note.saveAsset', args: asset || {} }),
         setContent: (id, content, confirmReplacement) =>
             host({ method: 'note.setContent', args: { id, content, confirmReplacement } }),
         add: (id, options) => host({ method: 'note.add', args: { id, ...(options || {}) } }),
@@ -51,6 +52,7 @@ pub(crate) async fn dispatch(
         "list" => list(api, ws, args).await,
         "listTasks" => list_tasks(api, ws, args).await,
         "readAsset" => read_asset(api, ws, args).await,
+        "saveAsset" => save_asset(api, ws, args).await,
         "setContent" => set_content(api, ws, caller_agent_id, args).await,
         "add" => add(api, ws, caller_agent_id, args).await,
         "edit" => edit(api, ws, caller_agent_id, args).await,
@@ -236,6 +238,28 @@ async fn read_asset(
     let asset = req_str(args, "asset").map_err(|_| "Asset ID or URL is required".to_string())?;
     let r = api.read_asset(ws.clone(), asset).await.map_err(map_err)?;
     serde_json::to_value(r).map_err(|e| e.to_string())
+}
+
+async fn save_asset(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let data = req_str(args, "data")?;
+    let mime_type = req_str(args, "mimeType")?;
+    if asset_extension_from_mime(&mime_type).is_none() {
+        let supported = SUPPORTED_ASSET_MIME_TYPES
+            .iter()
+            .map(|(mime, _)| *mime)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("mimeType must be one of: {supported}"));
+    }
+    let result = api
+        .save_asset(ws.clone(), data, mime_type, opt_str(args, "originalName"))
+        .await
+        .map_err(map_err)?;
+    serde_json::to_value(result).map_err(|e| e.to_string())
 }
 
 async fn set_content(

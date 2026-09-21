@@ -6,7 +6,10 @@
 //! enable (daemon-host probe → `running`, no pid, toolCount) → getStatus →
 //! `mcp.servers:status-changed` events → update to a dead URL re-probes the
 //! NEW config (error-state fix) → update back to the live URL recovers →
-//! delete. Gated on `node` + the mock fixture; skips cleanly otherwise.
+//! delete. Also proves the redaction round-trip: an update echoing the
+//! `********` placeholder keeps the stored env/headers secrets (secret store +
+//! re-probe header), and create rejects the placeholder with `-32602`.
+//! Gated on `node` + the mock fixture; skips cleanly otherwise.
 
 #![cfg(unix)]
 
@@ -24,37 +27,35 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 /// Sensitive header value that must never appear on the wire un-redacted.
 const SECRET: &str = "supersecret_header_value_0123456789";
+/// Sensitive env value for the redaction round-trip test.
+const ENV_SECRET: &str = "supersecret_env_value_9876543210";
+/// The §5.22 redaction placeholder returned in place of env/headers values.
+const PLACEHOLDER: &str = "********";
 
-/// Live `intentd serve` process; killed and its data dir removed on drop.
+/// Live `intentd serve` process; killed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-mcp-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-mcp-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -63,9 +64,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -252,9 +252,20 @@ fn node_available() -> bool {
 /// Spawn the mock MCP server in `--http` mode and return (child, base url).
 /// The fixture announces its ephemeral port as `PORT=<n>` on stdout.
 async fn spawn_http_fixture(script: &str) -> (tokio::process::Child, String) {
-    let mut child = tokio::process::Command::new("node")
-        .arg(script)
-        .arg("--http")
+    spawn_http_fixture_with_auth(script, None).await
+}
+
+/// Spawn the HTTP fixture with an optional exact Authorization requirement.
+async fn spawn_http_fixture_with_auth(
+    script: &str,
+    required_auth: Option<&str>,
+) -> (tokio::process::Child, String) {
+    let mut command = tokio::process::Command::new("node");
+    command.arg(script).arg("--http");
+    if let Some(required_auth) = required_auth {
+        command.env("MOCK_MCP_REQUIRED_AUTH", required_auth);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -293,13 +304,11 @@ async fn mcp_servers_remote_probe_over_wss() {
     }
     let (_fixture, base_url) = spawn_http_fixture(script).await;
 
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -454,6 +463,394 @@ async fn mcp_servers_remote_probe_over_wss() {
     assert_eq!(list["servers"].as_array().expect("servers array").len(), 0);
 }
 
+/// OAuth-aware remote lifecycle over production WSS: the unauthenticated
+/// probe reports `auth_required`; a presence-only token write followed by
+/// `mcp.servers.restart` performs a real re-probe with the daemon-owned token
+/// and recovers the server to `running` without exposing token material.
+#[tokio::test]
+async fn mcp_servers_oauth_auth_required_and_restart_recovery_over_wss() {
+    const OAUTH_TOKEN: &str = "wss-lifecycle-oauth-token";
+    let Some(script) = node_available().then_some(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mock-mcp-server.mjs"
+    )) else {
+        eprintln!("skipping mcp oauth lifecycle WSS E2E: node not on PATH");
+        return;
+    };
+    if !PathBuf::from(script).exists() {
+        eprintln!("skipping mcp oauth lifecycle WSS E2E: fixture missing");
+        return;
+    }
+    let (_fixture, base_url) =
+        spawn_http_fixture_with_auth(script, Some(&format!("Bearer {OAUTH_TOKEN}"))).await;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("u16 port");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let cfg = client_config(fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let _ = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["mcp.servers:status-changed"] }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "OAuth HTTP",
+            "transport": "http",
+            "url": base_url,
+            "enabled": false,
+        } }),
+    )
+    .await;
+    let server_id = created["server"]["id"].as_str().expect("id").to_string();
+
+    let enabled = wss_rpc(
+        &mut rpc,
+        3,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(enabled["status"]["state"], json!("auth_required"));
+    assert!(!enabled.to_string().contains(OAUTH_TOKEN));
+    let auth_event = wait_for_state(&mut sub, &server_id, "auth_required").await;
+    assert!(!auth_event.to_string().contains(OAUTH_TOKEN));
+
+    let stored = wss_rpc(
+        &mut rpc,
+        4,
+        "mcp.oauth.set",
+        json!({ "serverId": server_id, "tokenBag": {
+            "access_token": OAUTH_TOKEN,
+            "token_type": "bearer",
+        } }),
+    )
+    .await;
+    assert_eq!(stored["value"], json!(PLACEHOLDER));
+    assert!(!stored.to_string().contains(OAUTH_TOKEN));
+
+    let restarted = wss_rpc(
+        &mut rpc,
+        5,
+        "mcp.servers.restart",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(restarted["status"]["state"], json!("running"));
+    assert_eq!(restarted["status"]["toolCount"], json!(2));
+    assert!(!restarted.to_string().contains(OAUTH_TOKEN));
+    let _ = wait_for_state(&mut sub, &server_id, "running").await;
+
+    let got = wss_rpc(
+        &mut rpc,
+        6,
+        "mcp.servers.getStatus",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(got["status"]["state"], json!("running"));
+}
+
+/// Spawn the mock MCP server in `--http --log-auth` mode: (child, stdout line
+/// reader, base url). After the `PORT=` line the fixture prints one
+/// `AUTH=<authorization|none>` line per POST it receives.
+async fn spawn_logging_http_fixture(
+    script: &str,
+) -> (
+    tokio::process::Child,
+    Lines<BufReader<tokio::process::ChildStdout>>,
+    String,
+) {
+    let mut child = tokio::process::Command::new("node")
+        .arg(script)
+        .args(["--http", "--log-auth"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn mock http mcp server");
+    let stdout = child.stdout.take().expect("fixture stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let line = timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("timed out waiting for fixture PORT line")
+        .expect("read fixture stdout")
+        .expect("fixture exited before announcing PORT");
+    let port = line
+        .strip_prefix("PORT=")
+        .expect("fixture PORT line")
+        .trim()
+        .to_string();
+    (child, lines, format!("http://127.0.0.1:{port}"))
+}
+
+/// Drain every `AUTH=` line the fixture has logged so far; returns once the
+/// fixture has been quiet for `idle`.
+async fn drain_auth_lines(
+    lines: &mut Lines<BufReader<tokio::process::ChildStdout>>,
+    idle: Duration,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(Ok(Some(line))) = timeout(idle, lines.next_line()).await {
+        out.push(line);
+    }
+    out
+}
+
+/// The stored `mcp.servers` config for `server_id`, read straight from the
+/// daemon's file-backed secret store (the un-redacted source of truth).
+fn stored_server_config(data_dir: &Path, server_id: &str) -> Value {
+    let store = intent_core::FileSecretStore::with_path(data_dir.join("secrets.json"));
+    let raw = store
+        .load("mcp.servers")
+        .expect("read secret store")
+        .expect("mcp.servers secret present");
+    let map: Value = serde_json::from_str(&raw).expect("mcp.servers json");
+    map[server_id].clone()
+}
+
+/// Redaction round-trip (intent-hq/intent#1181) over the production WSS
+/// transport: create with real env/headers secrets → list/create responses
+/// redact them to `********` → update echoing that redacted body with a
+/// changed non-secret field keeps the stored secrets intact (secret store) and
+/// the re-probe still sends the REAL header (fixture `AUTH=` log), while a
+/// literal value replaces and an omitted key deletes.
+#[tokio::test]
+async fn mcp_servers_update_preserves_redacted_secrets_over_wss() {
+    if !node_available() {
+        eprintln!("skipping mcp.servers redaction WSS E2E: node not on PATH");
+        return;
+    }
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mock-mcp-server.mjs"
+    );
+    if !PathBuf::from(script).exists() {
+        eprintln!("skipping mcp.servers redaction WSS E2E: fixture not found at {script}");
+        return;
+    }
+    let (_fixture, mut auth_lines, base_url) = spawn_logging_http_fixture(script).await;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["mcp.servers:status-changed"] }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "got: {sub_resp}");
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // create with real secrets; the response redacts them.
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "Redacted",
+            "transport": "http",
+            "url": base_url,
+            "headers": { "Authorization": SECRET, "X-Keep": "keep-me" },
+            "env": { "API_KEY": ENV_SECRET, "DROP_ME": "gone" },
+            "enabled": false,
+        } }),
+    )
+    .await;
+    let server_id = created["server"]["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        created["server"]["headers"]["Authorization"],
+        json!(PLACEHOLDER)
+    );
+    assert_eq!(created["server"]["env"]["API_KEY"], json!(PLACEHOLDER));
+
+    // toggle enable → the daemon probes the fixture with the REAL header.
+    let toggled = wss_rpc(
+        &mut rpc,
+        3,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(toggled["status"]["state"], "running");
+    let _ = wait_for_state(&mut sub, &server_id, "running").await;
+    let first_probe = drain_auth_lines(&mut auth_lines, Duration::from_millis(500)).await;
+    assert!(
+        !first_probe.is_empty() && first_probe.iter().all(|l| l == &format!("AUTH={SECRET}")),
+        "initial probe headers: {first_probe:?}"
+    );
+
+    // list — every env/headers value crosses the wire as the placeholder.
+    let list = wss_rpc(&mut rpc, 4, "mcp.servers.list", json!({})).await;
+    let listed = &list["servers"].as_array().expect("servers")[0];
+    assert_eq!(listed["id"], json!(server_id));
+    assert_eq!(listed["enabled"], json!(true));
+    assert_eq!(listed["headers"]["Authorization"], json!(PLACEHOLDER));
+    assert_eq!(listed["headers"]["X-Keep"], json!(PLACEHOLDER));
+    assert_eq!(listed["env"]["API_KEY"], json!(PLACEHOLDER));
+    assert!(
+        !serde_json::to_string(&list).unwrap().contains(SECRET),
+        "secret leaked in list result"
+    );
+
+    // update — echo the redacted body as a client would, changing only the
+    // name; additionally replace X-Keep with a literal and omit DROP_ME.
+    let mut echoed = listed.clone();
+    echoed["name"] = json!("Redacted v2");
+    echoed["headers"]["X-Keep"] = json!("literal-new-value");
+    echoed["env"]
+        .as_object_mut()
+        .expect("env object")
+        .remove("DROP_ME");
+    let updated = wss_rpc(
+        &mut rpc,
+        5,
+        "mcp.servers.update",
+        json!({ "serverId": server_id, "config": echoed }),
+    )
+    .await;
+    assert_eq!(updated["server"]["name"], json!("Redacted v2"));
+    assert_eq!(
+        updated["server"]["headers"]["Authorization"],
+        json!(PLACEHOLDER)
+    );
+    assert_eq!(updated["server"]["env"]["API_KEY"], json!(PLACEHOLDER));
+    assert!(
+        !serde_json::to_string(&updated).unwrap().contains(SECRET),
+        "secret leaked in update result"
+    );
+
+    // Daemon-side seam #1: the stored config kept the real secrets, applied
+    // the literal, and dropped the omitted key.
+    let stored = stored_server_config(&data_dir, &server_id);
+    assert_eq!(stored["name"], json!("Redacted v2"));
+    assert_eq!(stored["headers"]["Authorization"], json!(SECRET));
+    assert_eq!(stored["headers"]["X-Keep"], json!("literal-new-value"));
+    assert_eq!(stored["env"]["API_KEY"], json!(ENV_SECRET));
+    assert!(stored["env"].get("DROP_ME").is_none(), "got: {stored}");
+    assert!(
+        !serde_json::to_string(&stored)
+            .unwrap()
+            .contains(PLACEHOLDER),
+        "placeholder persisted: {stored}"
+    );
+
+    // Daemon-side seam #2: the post-update re-probe reached the fixture with
+    // the REAL Authorization header, never the placeholder.
+    let _ = wait_for_state(&mut sub, &server_id, "running").await;
+    let reprobe = drain_auth_lines(&mut auth_lines, Duration::from_millis(500)).await;
+    assert!(
+        !reprobe.is_empty() && reprobe.iter().all(|l| l == &format!("AUTH={SECRET}")),
+        "re-probe headers after redacted update: {reprobe:?}"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        6,
+        "mcp.servers.getStatus",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(got["status"]["state"], "running");
+    assert_eq!(got["status"]["toolCount"], json!(2));
+}
+
+/// `mcp.servers.create` refuses env/headers values equal to the redaction
+/// placeholder with the §9 `-32602` envelope, and nothing is persisted.
+#[tokio::test]
+async fn mcp_servers_create_rejects_redaction_placeholder_over_wss() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let mut rpc = connect_ws(port, client_config(&fingerprint)).await;
+
+    for (id, config) in [
+        (
+            1,
+            json!({
+                "name": "Bad env",
+                "transport": "stdio",
+                "command": "/does/not/exist-mcp-cmd",
+                "env": { "API_KEY": PLACEHOLDER },
+                "enabled": false,
+            }),
+        ),
+        (
+            2,
+            json!({
+                "name": "Bad header",
+                "transport": "http",
+                "url": "http://127.0.0.1:9/",
+                "headers": { "Authorization": PLACEHOLDER },
+                "enabled": false,
+            }),
+        ),
+    ] {
+        let e = wss_rpc_expect_error(
+            &mut rpc,
+            id,
+            "mcp.servers.create",
+            json!({ "config": config }),
+        )
+        .await;
+        assert_eq!(e["code"], json!(-32602), "got: {e}");
+        assert_eq!(e["data"]["code"], json!("invalid-params"), "got: {e}");
+        assert!(
+            e["message"]
+                .as_str()
+                .expect("message")
+                .contains("redaction placeholder"),
+            "got: {e}"
+        );
+    }
+
+    let list = wss_rpc(&mut rpc, 3, "mcp.servers.list", json!({})).await;
+    assert_eq!(list["servers"].as_array().expect("servers array").len(), 0);
+}
+
 /// Send one JSON-RPC frame and return the raw `error` object whose id
 /// matches (the §9 error-envelope counterpart of [`wss_rpc`]).
 async fn wss_rpc_expect_error<S>(
@@ -510,13 +907,11 @@ async fn mcp_test_connection_over_wss() {
     }
     let (_fixture, base_url) = spawn_http_fixture(script).await;
 
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -588,14 +983,12 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
 /// envelope while the scoped read stays lenient.
 #[tokio::test]
 async fn mcp_servers_workspace_scoped_toggle_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

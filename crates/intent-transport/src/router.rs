@@ -8,11 +8,14 @@
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate, NoteEditInput,
-    NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
-    WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
+    ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
+    NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, RepoRef, ScriptCreateParams,
+    ScriptMode, TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId,
+    WorkspaceUpdate,
 };
+use serde::Serialize;
 use serde_json::{json, Map, Value};
+use std::time::Instant;
 use tracing::Instrument;
 
 /// Target of the per-dispatch profiling span wrapped around [`dispatch`] in
@@ -25,6 +28,14 @@ pub const RPC_DISPATCH_SPAN_TARGET: &str = "intent_transport::rpc_dispatch";
 /// Name of the per-dispatch profiling span (the literal passed to
 /// `info_span!` in [`handle_message`]).
 pub const RPC_DISPATCH_SPAN_NAME: &str = "rpc_dispatch";
+/// Optional string field on the per-dispatch profiling span naming the
+/// request VARIANT a handler served (intent-hq/intent#5531): today only
+/// `agent.list` records it — `default`, `includeRetired`, `retiredOnly`, or
+/// `scope=<bin>` (+ ` parentAgentId` when the delegated read is narrowed) —
+/// so the profiling layer's oversize / slow WARNs say which read shape
+/// overflowed. Flags only, never ids or payload. Absent on every other
+/// dispatch.
+pub const RPC_REQUEST_SHAPE_FIELD: &str = "request_shape";
 
 const PARSE_ERROR: i32 = -32700;
 const INVALID_REQUEST: i32 = -32600;
@@ -160,6 +171,32 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
         e @ (Error::InvalidParams(_) | Error::InvalidInput(_)) => invalid_params(e.to_string()),
+        // Capability refusal (multiplayer w3): the same `-32003 "Forbidden"`
+        // envelope the connection-level allowlist emits, with the reason in
+        // `data.detail` so a client cannot tell the two refusals apart by
+        // code or message.
+        Error::Forbidden(detail) => RpcErr {
+            code: crate::catalog::FORBIDDEN_ERROR_CODE,
+            message: crate::catalog::FORBIDDEN_ERROR_MESSAGE.to_string(),
+            data: Some(json!({ "code": "forbidden", "detail": detail })),
+        },
+        // Invite / identity-only join refusal (multiplayer w4): the kind's
+        // own code with the stable `data.code` so an invite client can route
+        // "expired" / "pin mismatch" / "denied" without matching on prose.
+        ref e @ Error::Invite(kind) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": kind.as_str() })),
+        },
+        // Gist identity-proof refusal (guest half): `-32603` with the stable
+        // `data.code` (`github-not-connected` / `github-scope-missing` /
+        // `github-unreachable`) so the join flow can route "sign in" vs
+        // "retry" without matching on prose.
+        ref e @ Error::IdentityProof(kind) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": kind.as_str() })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -301,33 +338,104 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         }
     };
 
-    // Per-dispatch profiling span: carries the method name so the composition
-    // root's profiling layer can count `sqlx::query` statement events scoped
-    // to this dispatch and time the handler (see RPC_DISPATCH_SPAN_TARGET).
-    let span =
-        tracing::info_span!(target: RPC_DISPATCH_SPAN_TARGET, RPC_DISPATCH_SPAN_NAME, method);
-    let result = dispatch(api, method, &params).instrument(span).await;
-
-    // Notifications never get a response, even on error / unknown method (§3.4).
-    if is_notification {
-        return None;
+    // Keep one span alive through dispatch AND response encoding. The writer
+    // queue consumes the returned frame later, so queue latency is deliberately
+    // excluded from `encode_elapsed_ms`. `request_shape` is recorded by the
+    // handlers that opt in (see [`RPC_REQUEST_SHAPE_FIELD`]) so the
+    // rpc_profile WARNs can attribute an oversize / slow dispatch to a
+    // request variant — flags only, never payload.
+    let span = tracing::info_span!(
+        target: RPC_DISPATCH_SPAN_TARGET,
+        RPC_DISPATCH_SPAN_NAME,
+        method,
+        request_shape = tracing::field::Empty,
+        response_bytes = tracing::field::Empty,
+        encode_elapsed_ms = tracing::field::Empty,
+        oversized_replacement = tracing::field::Empty,
+        encode_failed = tracing::field::Empty,
+    );
+    let profile_span = span.clone();
+    async move {
+        let result = dispatch(api, method, &params).await;
+        let encode_started = Instant::now();
+        let encoded = encode_dispatch_result(
+            &echo_id,
+            method,
+            is_notification,
+            result,
+            crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        );
+        let encode_elapsed_ms = if is_notification {
+            0
+        } else {
+            millis_u64(encode_started.elapsed().as_millis())
+        };
+        profile_span.record(
+            "response_bytes",
+            u64::try_from(encoded.response_bytes).unwrap_or(u64::MAX),
+        );
+        profile_span.record("encode_elapsed_ms", encode_elapsed_ms);
+        profile_span.record("oversized_replacement", encoded.oversized_replacement);
+        profile_span.record("encode_failed", encoded.encode_failed);
+        encoded.frame
     }
-    // The log-only large-frame warning for outbound responses lives in
-    // `panic_guard::guard_frame` (the chokepoint covering fast-path responses
-    // that bypass this dispatcher, e.g. `host.exec`). The `-32010`
-    // replacement below hands a small error frame to that check, so an
-    // oversized response is never double-warned on top of its `error!`.
-    Some(match result {
-        Ok(v) => {
-            let frame = success_string(&echo_id.clone(), &v);
-            if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
-                oversized_response_string(&echo_id, method, frame.len())
-            } else {
-                frame
-            }
+    .instrument(span)
+    .await
+}
+
+fn millis_u64(millis: u128) -> u64 {
+    u64::try_from(millis.min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+}
+
+struct ResponseEncoding {
+    frame: Option<String>,
+    /// Serialized size of the intended envelope. For a hard-cap replacement,
+    /// this remains the rejected envelope's size rather than the small error
+    /// frame's size so profiling retains the payload-cost signal.
+    response_bytes: usize,
+    oversized_replacement: bool,
+    encode_failed: bool,
+}
+
+/// Encode a dispatched result and apply the hard response cap. Notifications
+/// have no envelope, therefore all response-encoding metrics are zero/false.
+fn encode_dispatch_result(
+    id: &Value,
+    method: &str,
+    is_notification: bool,
+    result: Result<Value, RpcErr>,
+    max_response_bytes: usize,
+) -> ResponseEncoding {
+    if is_notification {
+        return ResponseEncoding {
+            frame: None,
+            response_bytes: 0,
+            oversized_replacement: false,
+            encode_failed: false,
+        };
+    }
+
+    let encoded = match result {
+        Ok(value) => success_frame(id, &value),
+        Err(err) => error_frame(id, err.code, &err.message, err.data),
+    };
+    let response_bytes = encoded.frame.len();
+    if response_bytes > max_response_bytes {
+        let replacement = oversized_response_frame(id, method, response_bytes, max_response_bytes);
+        ResponseEncoding {
+            frame: Some(replacement.frame),
+            response_bytes,
+            oversized_replacement: true,
+            encode_failed: encoded.encode_failed || replacement.encode_failed,
         }
-        Err(e) => error_string(&echo_id, e.code, &e.message, e.data),
-    })
+    } else {
+        ResponseEncoding {
+            frame: Some(encoded.frame),
+            response_bytes,
+            oversized_replacement: false,
+            encode_failed: encoded.encode_failed,
+        }
+    }
 }
 
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
@@ -438,6 +546,14 @@ async fn dispatch(
             let result = api.workspace_disk_usage(id).await.map_err(workspace_err)?;
             Ok(result)
         }
+        "workspace.localChanges" => {
+            let id = require_workspace_id(params)?;
+            let result = api
+                .workspace_local_changes(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(result)
+        }
         "workspace.transfer.plan" => {
             let id = require_workspace_id(params)?;
             let plan = api
@@ -512,6 +628,67 @@ async fn dispatch(
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
+        // `workspace.members.*` (multiplayer w3): membership roster of one
+        // workspace. Member+ may list; add / removal are Owner-only in the
+        // service layer (`-32003` for a collaborator, `-32602` for a
+        // non-member).
+        "workspace.members.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_list(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.members.add` (direct member add): attach a credentialed
+        // guest as a collaborator; `-32602` for an unknown / primary /
+        // uncredentialed principal or a spent guest cap.
+        "workspace.members.add" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let r = api
+                .workspace_members_add(id, intent_core::PrincipalId::from(principal_id))
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.members.remove" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let r = api
+                .workspace_members_remove(id, intent_core::PrincipalId::from(principal_id))
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.members.leave` (multiplayer w4): the bound collaborator
+        // drops its own membership; an owner is `-32602`.
+        "workspace.members.leave" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_leave(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.invite.*` (multiplayer w4): owner-only invite links.
+        // `workspace.invite.create` is handled on the connection fast-path
+        // (it wraps the secret into the `intent://invite` link with the
+        // listener's own hosts/port); only list/revoke route here.
+        "workspace.invite.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.invite.revoke" => {
+            let id = require_workspace_id(params)?;
+            let invite_id = require_str_param(params, "inviteId")?;
+            let r = api
+                .workspace_invite_revoke(id, invite_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "workspace.getTokenUsage" => {
             let id = require_workspace_id(params)?;
             let token_usage = api.get_token_usage(id).await.map_err(workspace_err)?;
@@ -545,6 +722,42 @@ async fn dispatch(
                 .await
                 .map_err(workspace_err)?;
             Ok(json!({ "autoCommit": auto_commit }))
+        }
+        "client.list" => {
+            let clients = api.client_list().await.map_err(workspace_err)?;
+            Ok(json!({ "clients": clients }))
+        }
+        "workspace.getBrowserClient" => {
+            let id = require_workspace_id(params)?;
+            let browser_client = api
+                .get_workspace_browser_client(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "browserClient": browser_client }))
+        }
+        "workspace.setBrowserClient" => {
+            let id = require_workspace_id(params)?;
+            let client_id = match params.get("clientId") {
+                Some(Value::String(s)) if !s.trim().is_empty() => {
+                    Some(ClientId::from_string(s.clone()))
+                }
+                Some(Value::Null) => None,
+                Some(_) => {
+                    return Err(invalid_params(
+                        "Invalid parameter: clientId must be a non-empty string or null",
+                    ))
+                }
+                None => {
+                    return Err(invalid_params(
+                        "Missing required parameter: clientId (string | null)",
+                    ))
+                }
+            };
+            let browser_client = api
+                .set_workspace_browser_client(id, client_id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "browserClient": browser_client }))
         }
         "workspace.getSetupScript" => {
             let id = require_workspace_id(params)?;
@@ -902,8 +1115,11 @@ async fn dispatch(
             let note_id = require_note_id(params)?;
             let task_text = require_str_param(params, "taskText")?;
             let status = require_str_param(params, "status")?;
+            // FE/RPC front door: no agent provenance (the MCP path passes the
+            // caller agent so a redirected write's `task:status-changed`
+            // carries `agentId`).
             let result = api
-                .task_update_status(ws, note_id, task_text, status)
+                .task_update_status(ws, note_id, task_text, status, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -932,7 +1148,7 @@ async fn dispatch(
             let status = opt_str(params, "status");
             let expected = opt_str(params, "expected");
             let result = api
-                .task_update(ws, note_id, line, text, status, expected)
+                .task_update(ws, note_id, line, text, status, expected, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -1233,7 +1449,29 @@ async fn dispatch(
                     "includeRetired and retiredOnly are mutually exclusive",
                 ));
             }
-            let agents = if retired_only {
+            // Row scope (§5.5): `scope` selects ONE bin of the non-retired
+            // sessions — `"topLevel"` / `"delegated"` / `"background"` —
+            // while absent / null / `"all"` keep today's read. Unlike the
+            // lenient retired flags, an unknown or non-string `scope` is
+            // `-32602`, never coerced, and a bin scope cannot be combined
+            // with either retired flag (retired is its own bin). Every
+            // variant additionally carries `scopeCounts` (one grouped SQL
+            // aggregate over the non-retired rows) and `delegatedCounts`
+            // (one grouped aggregate over the non-retired delegated rows,
+            // per direct parent) under the same no-snapshot-isolation
+            // tolerance as `retiredCount`.
+            let scope = parse_agent_list_scope(params, include_retired || retired_only)?;
+            // Attribute the dispatch to its read variant for the profiling
+            // WARNs (flags only — see `RPC_REQUEST_SHAPE_FIELD`).
+            tracing::Span::current().record(
+                RPC_REQUEST_SHAPE_FIELD,
+                agent_list_request_shape(scope.as_ref(), include_retired, retired_only).as_str(),
+            );
+            let agents = if let Some(scope) = scope {
+                api.agent_list_scoped(ws.clone(), scope)
+                    .await
+                    .map_err(domain_to_rpc)?
+            } else if retired_only {
                 api.agent_list_retired_only(ws.clone())
                     .await
                     .map_err(domain_to_rpc)?
@@ -1244,8 +1482,24 @@ async fn dispatch(
             } else {
                 api.agent_list(ws.clone()).await.map_err(domain_to_rpc)?
             };
-            let retired_count = api.agent_retired_count(ws).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "agents": agents, "retiredCount": retired_count }))
+            let retired_count = api
+                .agent_retired_count(ws.clone())
+                .await
+                .map_err(domain_to_rpc)?;
+            let scope_counts = api
+                .agent_scope_counts(ws.clone())
+                .await
+                .map_err(domain_to_rpc)?;
+            let delegated_counts = api
+                .agent_delegated_counts(ws)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({
+                "agents": agents,
+                "retiredCount": retired_count,
+                "scopeCounts": scope_counts,
+                "delegatedCounts": delegated_counts,
+            }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
         "agent.get" => {
@@ -1531,9 +1785,9 @@ async fn dispatch(
             // unconsumed: assistant rows are keyed on the server-minted
             // UUIDv7 id.
             let message_metadata = merge_user_app_message_id(params, message_metadata)?;
-            // Question hold (PROTOCOL §5.5): the FE RPC front door is the
-            // ONLY user-originated entry point — user sends are never held.
-            // They do not release the hold either: only an answer-tagged row
+            // Origin (PROTOCOL §5.5): the FE RPC front door is the ONLY
+            // user-originated entry point. A user send does not by itself
+            // resolve pending questions: only an answer-tagged row
             // (`messageMetadata.type = "question_answers"`) or
             // `agent.dismissQuestions` retires the pending Q&A.
             let result = api
@@ -1624,8 +1878,26 @@ async fn dispatch(
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
+            // Opaque per-message payload (PROTOCOL §5.5), captured on the
+            // queued entry so the drain-time persist writes the same row
+            // metadata a direct `agent.sendMessage` would (a queued
+            // `question_answers` answer resolves the pending question set).
+            // Same user-origin front door as `agent.sendMessage`: the
+            // reserved attribution fields are stripped; a non-object value
+            // is rejected.
+            let message_metadata = match opt_value(params, "messageMetadata") {
+                None => None,
+                Some(Value::Object(obj)) => strip_sender_attribution(Some(Value::Object(obj))),
+                Some(_) => return Err(invalid_params("messageMetadata must be an object")),
+            };
             let result = api
-                .agent_queue_message(agent_id, content, image_blocks, file_blocks)
+                .agent_queue_message(
+                    agent_id,
+                    content,
+                    image_blocks,
+                    file_blocks,
+                    message_metadata,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -2007,6 +2279,12 @@ async fn dispatch(
         "agent.listInterrupted" => {
             // No required params; returns pending interrupted agents across all workspaces.
             let result = api.agent_list_interrupted().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.memoryUsage" => {
+            // No workspaceId: per-agent memory attribution spans every live
+            // agent the daemon's descendant-tree sampler bucketed (§5.5).
+            let result = api.agent_memory_usage().await.map_err(domain_to_rpc)?;
             Ok(result)
         }
         "agent.resolveInterrupted" => {
@@ -2575,12 +2853,31 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.relatedRepos.list" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let git_ref = opt_str(params, "ref");
+            let r = api
+                .github_related_repos_list(owner, repo, git_ref)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "github.pulls.get" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
             let number = require_u64(params, "number")?;
             let r = api
                 .github_pulls_get(owner, repo, number)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.issues.get" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let number = require_u64(params, "number")?;
+            let r = api
+                .github_issues_get(owner, repo, number)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2621,15 +2918,15 @@ async fn dispatch(
             Ok(r)
         }
         "github.pulls.search" => {
-            let owner = require_str_param(params, "owner")?;
-            let repo = require_str_param(params, "repo")?;
+            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
+            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_pulls_search(owner, repo, filter, state, query, limit, next_token)
+                .github_pulls_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2679,15 +2976,15 @@ async fn dispatch(
             Ok(r)
         }
         "github.issues.search" => {
-            let owner = require_str_param(params, "owner")?;
-            let repo = require_str_param(params, "repo")?;
+            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
+            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_issues_search(owner, repo, filter, state, query, limit, next_token)
+                .github_issues_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2762,6 +3059,65 @@ async fn dispatch(
         }
         "github.getUser" => {
             let r = api.github_get_user().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.users.search" => {
+            let query = require_str_param(params, "query")?;
+            let limit = opt_int(params, "limit");
+            let r = api
+                .github_users_search(query, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `github.identityProof.*` (gist identity-proof join flow, guest
+        // half): the local daemon publishes a host-issued nonce in a secret
+        // gist made with the stored token; owner-client only, the token
+        // never crosses the wire.
+        "github.identityProof.create" => {
+            let nonce = require_str_param(params, "nonce")?;
+            let host_label = require_str_param(params, "hostLabel")?;
+            let r = api
+                .github_identity_proof_create(nonce, host_label)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.identityProof.delete" => {
+            let gist_id = require_str_param(params, "gistId")?;
+            let r = api
+                .github_identity_proof_delete(gist_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `principal.me` (multiplayer w1): the principal this connection was
+        // bound to at admission; no params. Fails when no caller is bound.
+        "principal.me" => {
+            let r = api.principal_me().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `principal.list` (direct member add): the host's credentialed
+        // guests for the owner's share dialog; no params. Owner-only in the
+        // service layer (`-32003` for a collaborator).
+        "principal.list" => {
+            let r = api.principal_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `principal.revokeSelf` (multiplayer w4): the bound collaborator
+        // revokes its own credentials and leaves its workspaces; the
+        // transport then closes its connections. The administrator is
+        // `-32602`.
+        "principal.revokeSelf" => {
+            let r = api.principal_revoke_self().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `presence.snapshot` (multiplayer w5): the current `presence:changed`
+        // roster of a member workspace, on demand. Member+; a non-member is
+        // `-32602 not-found` like any other membership-narrowed read.
+        "presence.snapshot" => {
+            let id = require_workspace_id(params)?;
+            let r = api.presence_snapshot(id).await.map_err(workspace_err)?;
             Ok(r)
         }
         // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key
@@ -3372,15 +3728,35 @@ async fn dispatch(
             let data = opt_str(params, "data");
             let source_path = opt_str(params, "sourcePath");
             let mime_type = opt_str(params, "mimeType");
-            api.file_place_attachment(ws, file_name, data, source_path, mime_type)
+            let idempotency_key = opt_str_strict(params, "idempotencyKey")?;
+            api.file_place_attachment(ws, file_name, data, source_path, mime_type, idempotency_key)
                 .await
                 .map_err(domain_to_rpc)
         }
         "file.getAttachmentInfo" => {
-            let attachment_id = require_str_param(params, "attachmentId")?;
-            api.file_get_attachment_info(attachment_id)
-                .await
-                .map_err(domain_to_rpc)
+            // Exactly one of `attachmentId` | (`workspaceId` + `idempotencyKey`)
+            // (intent-hq/intent#4691). Presence is decided on the raw params
+            // so a key arm never silently degrades to the id arm.
+            let has_id = params.get("attachmentId").is_some_and(|v| !v.is_null());
+            let has_key = params.get("idempotencyKey").is_some_and(|v| !v.is_null());
+            match (has_id, has_key) {
+                (true, false) => {
+                    let attachment_id = require_str_param(params, "attachmentId")?;
+                    api.file_get_attachment_info(attachment_id)
+                        .await
+                        .map_err(domain_to_rpc)
+                }
+                (false, true) => {
+                    let ws = require_ws_note(params)?;
+                    let idempotency_key = require_str_param(params, "idempotencyKey")?;
+                    api.file_get_attachment_info_by_key(ws, idempotency_key)
+                        .await
+                        .map_err(domain_to_rpc)
+                }
+                _ => Err(invalid_params(
+                    "exactly one of attachmentId or idempotencyKey (with workspaceId) is required",
+                )),
+            }
         }
         "file.attachmentUpload.begin" => {
             let ws = require_ws_note(params)?;
@@ -3388,9 +3764,17 @@ async fn dispatch(
             let size_bytes = require_u64(params, "sizeBytes")?;
             let sha256 = require_str_param(params, "sha256")?;
             let mime_type = opt_str(params, "mimeType");
-            api.file_attachment_upload_begin(ws, file_name, size_bytes, sha256, mime_type)
-                .await
-                .map_err(domain_to_rpc)
+            let idempotency_key = opt_str_strict(params, "idempotencyKey")?;
+            api.file_attachment_upload_begin(
+                ws,
+                file_name,
+                size_bytes,
+                sha256,
+                mime_type,
+                idempotency_key,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "file.attachmentUpload.chunk" => {
             let upload_id = require_str_param(params, "uploadId")?;
@@ -3540,7 +3924,12 @@ async fn dispatch(
         // surfaces as `-32602` (`Error::NotFound` → invalid params).
         "hook.list" => {
             let ws = require_ws_note(params)?;
-            api.hook_list(ws, None).await.map_err(domain_to_rpc)
+            // Active hooks only by default; `includeRetired` appends the
+            // terminal rows as a light projection (no code/lastState/lastLogs).
+            let include_retired = opt_bool(params, "includeRetired").unwrap_or(false);
+            api.hook_list(ws, None, include_retired)
+                .await
+                .map_err(domain_to_rpc)
         }
         "hook.cancel" => {
             let ws = require_ws_note(params)?;
@@ -3968,6 +4357,84 @@ fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     params.get(name).and_then(Value::as_str).map(str::to_string)
 }
 
+/// GitHub's own length ceilings for a login (user / org) and a repository
+/// name; anything longer cannot name a real repo and is rejected up front.
+const MAX_GITHUB_OWNER_LEN: usize = 39;
+const MAX_GITHUB_REPO_LEN: usize = 100;
+
+/// Validate one half of a GitHub `owner/repo` slug against GitHub's naming
+/// rules — owner: `[A-Za-z0-9-]`, repo: `[A-Za-z0-9._-]` (never `.` / `..`),
+/// both non-empty and length-capped. The slugs are interpolated verbatim
+/// into search qualifiers (`repo:{owner}/{repo}`) and REST paths, so a value
+/// carrying whitespace, `:` or `/` could smuggle in extra qualifiers or path
+/// segments; `label` names the offending param in the `-32602` message.
+fn validate_repo_slug_part(label: &str, value: &str, is_owner: bool) -> Result<(), RpcErr> {
+    let (what, max_len) = if is_owner {
+        ("GitHub owner", MAX_GITHUB_OWNER_LEN)
+    } else {
+        ("GitHub repository name", MAX_GITHUB_REPO_LEN)
+    };
+    let allowed =
+        |c: char| c.is_ascii_alphanumeric() || c == '-' || (!is_owner && (c == '_' || c == '.'));
+    let valid = !value.is_empty()
+        && value.len() <= max_len
+        && value != "."
+        && value != ".."
+        && value.chars().all(allowed);
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_params(format!(
+            "{label} is not a valid {what}: {value:?}"
+        )))
+    }
+}
+
+/// Require the `(owner, repo)` pair addressing a GitHub repository (§5.27)
+/// and validate both halves via [`validate_repo_slug_part`]; missing/non-string
+/// → the usual "Missing required parameter" `-32602`.
+fn require_repo_slug(params: &Map<String, Value>) -> Result<(String, String), RpcErr> {
+    let owner = require_str_param(params, "owner")?;
+    let repo = require_str_param(params, "repo")?;
+    validate_repo_slug_part("owner", &owner, true)?;
+    validate_repo_slug_part("repo", &repo, false)?;
+    Ok((owner, repo))
+}
+
+/// Optional `[{ owner, repo }]` param (the `github.*.search` `repos` extras,
+/// §5.27): absent/null → empty. Anything else must be an array whose every
+/// entry is an object with string `owner` and `repo` that pass
+/// [`validate_repo_slug_part`] → `-32602` naming the entry index otherwise.
+/// Dedup and the total-repo cap are applied downstream by the services layer.
+fn opt_repo_refs(params: &Map<String, Value>, name: &str) -> Result<Vec<RepoRef>, RpcErr> {
+    let entries = match params.get(name) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(invalid_params(format!(
+                "{name} must be an array of {{ owner, repo }} objects"
+            )))
+        }
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let field = |key: &str, is_owner: bool| {
+                let label = format!("{name}[{idx}].{key}");
+                let value = entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| invalid_params(format!("{label} must be a non-empty string")))?;
+                validate_repo_slug_part(&label, value, is_owner)?;
+                Ok::<_, RpcErr>(value.to_string())
+            };
+            Ok(RepoRef::new(field("owner", true)?, field("repo", false)?))
+        })
+        .collect()
+}
+
 /// Like [`opt_str`] but treats empty and whitespace-only values as absent, so
 /// downstream code cannot distinguish `Some("")` from `None`. Used at the
 /// router boundary for optional hints where an empty string would be
@@ -4132,6 +4599,18 @@ fn opt_bool_strict(params: &Map<String, Value>, name: &str) -> Result<Option<boo
     }
 }
 
+/// Like [`opt_str`] but strict: absent/null → `None`, a string →
+/// `Some(..)`, anything else → `-32602`. Used where silently dropping a
+/// non-string would change semantics (e.g. an attachment `idempotencyKey`,
+/// whose absence means "not idempotent").
+fn opt_str_strict(params: &Map<String, Value>, name: &str) -> Result<Option<String>, RpcErr> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(invalid_params(format!("{name} must be a string"))),
+    }
+}
+
 /// Optional string→string map param (absent/non-object → `None`); non-string
 /// values are skipped. Used for the `script.create` `env` overrides.
 fn opt_string_map(
@@ -4149,7 +4628,7 @@ fn opt_string_map(
 /// Used by the `event.*` `limit` / `minutesAgo` knobs, whose defaults are
 /// applied in the service layer (`value || default`).
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
     match params.get(name) {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -4172,6 +4651,85 @@ fn parse_projection(
         }
         Some(_) => Err(invalid_params("projection must be \"slim\"")),
     }
+}
+
+/// Parse the optional `agent.list` `scope` + `parentAgentId` params (§5.5).
+/// Absent / `null` / `"all"` is `None` — today's read; `"topLevel"` /
+/// `"delegated"` / `"background"` select one bin of the non-retired rows.
+/// Any other value (unknown string OR non-string) is `-32602`, never
+/// coerced. `parentAgentId` (a canonical `agent-{uuid}`) narrows a
+/// `delegated` read to that parent's direct sub-agents and is `-32602` with
+/// any other scope, including the default. A bin scope combined with
+/// `includeRetired` / `retiredOnly` (`retired_flag`) is `-32602`: retired
+/// sessions are their own bin.
+/// The [`RPC_REQUEST_SHAPE_FIELD`] value for one `agent.list` read: which
+/// variant the parsed params selected. Flags only — a `parentAgentId`
+/// narrowing reads as the literal ` parentAgentId` suffix, never the id.
+fn agent_list_request_shape(
+    scope: Option<&intent_core::AgentListRowScope>,
+    include_retired: bool,
+    retired_only: bool,
+) -> String {
+    use intent_core::AgentListRowScope;
+    match scope {
+        Some(AgentListRowScope::Delegated {
+            parent_agent_id: Some(_),
+        }) => "scope=delegated parentAgentId".to_string(),
+        Some(scope) => format!("scope={}", scope.wire_name()),
+        None if retired_only => "retiredOnly".to_string(),
+        None if include_retired => "includeRetired".to_string(),
+        None => "default".to_string(),
+    }
+}
+
+fn parse_agent_list_scope(
+    params: &Map<String, Value>,
+    retired_flag: bool,
+) -> Result<Option<intent_core::AgentListRowScope>, RpcErr> {
+    use intent_core::AgentListRowScope;
+    let parent_agent_id = match params.get("parentAgentId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let id = AgentId::from(s.as_str());
+            if !id.is_canonical() {
+                return Err(invalid_params(
+                    "parentAgentId must be a canonical agent-{uuid} id",
+                ));
+            }
+            Some(id)
+        }
+        Some(_) => {
+            return Err(invalid_params(
+                "parentAgentId must be a canonical agent-{uuid} id",
+            ));
+        }
+    };
+    let scope = match params.get("scope") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "all" => None,
+        Some(Value::String(s)) if s == "topLevel" => Some(AgentListRowScope::TopLevel),
+        Some(Value::String(s)) if s == "delegated" => Some(AgentListRowScope::Delegated {
+            parent_agent_id: parent_agent_id.clone(),
+        }),
+        Some(Value::String(s)) if s == "background" => Some(AgentListRowScope::Background),
+        Some(_) => {
+            return Err(invalid_params(
+                "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"",
+            ));
+        }
+    };
+    if let Some(scope) = &scope {
+        if retired_flag {
+            return Err(invalid_params(format!(
+                "scope \"{}\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+                scope.wire_name()
+            )));
+        }
+    }
+    if parent_agent_id.is_some() && !matches!(scope, Some(AgentListRowScope::Delegated { .. })) {
+        return Err(invalid_params("parentAgentId requires scope \"delegated\""));
+    }
+    Ok(scope)
 }
 
 /// Parse the optional `projection` param on `note.list` (§5.2): absent /
@@ -4236,7 +4794,7 @@ fn parse_confirm(params: &Map<String, Value>) -> bool {
 /// for parity with the other paginated reads we fall back to top-level `limit`
 /// and `nextToken` when no `page` object is present.
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_page_params(params: &Map<String, Value>) -> (Option<i64>, Option<String>) {
     if let Some(Value::Object(page)) = params.get("page") {
         let limit = page
@@ -4281,7 +4839,7 @@ fn normalize_acceptance_criteria(params: &Map<String, Value>) -> Vec<String> {
 /// Loosely parse an integer from a JSON number or leading-int string
 /// (`parseInt`-like), returning `None` when no integer is present.
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_int_loose(value: Option<&Value>) -> Option<i64> {
     match value {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -4332,13 +4890,13 @@ fn workspace_err(e: Error) -> RpcErr {
 }
 
 /// Serialize a success envelope. `result` is always a JSON object (§3.2).
-fn success_string(id: &Value, result: &Value) -> String {
+fn success_frame(id: &Value, result: &Value) -> EncodedEnvelope {
     let resp = json!({ "jsonrpc": "2.0", "result": result, "id": id });
-    serde_json::to_string(&resp).unwrap_or_else(|_| internal_fallback())
+    serialize_envelope(&resp)
 }
 
 /// Serialize an error envelope, optionally carrying `data`.
-fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> String {
+fn error_frame(id: &Value, code: i32, message: &str, data: Option<Value>) -> EncodedEnvelope {
     let mut err = Map::new();
     err.insert("code".to_string(), json!(code));
     err.insert("message".to_string(), json!(message));
@@ -4346,7 +4904,11 @@ fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> St
         err.insert("data".to_string(), d);
     }
     let resp = json!({ "jsonrpc": "2.0", "error": Value::Object(err), "id": id });
-    serde_json::to_string(&resp).unwrap_or_else(|_| internal_fallback())
+    serialize_envelope(&resp)
+}
+
+fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> String {
+    error_frame(id, code, message, data).frame
 }
 
 /// Replace a serialized response that exceeds
@@ -4354,32 +4916,135 @@ fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> St
 /// echoing the request id, so the client fails fast instead of hitting its
 /// RPC timeout on a silently dropped frame. The writer-task cap remains as a
 /// last-resort backstop for non-response frames (subscription pushes/events).
-fn oversized_response_string(id: &Value, method: &str, response_bytes: usize) -> String {
+fn oversized_response_frame(
+    id: &Value,
+    method: &str,
+    response_bytes: usize,
+    max_response_bytes: usize,
+) -> EncodedEnvelope {
     tracing::error!(
         method,
         response_bytes,
-        limit = crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        limit = max_response_bytes,
         "oversized JSON-RPC response replaced with error"
     );
-    error_string(
+    error_frame(
         id,
         OVERSIZED_RESPONSE,
         &format!(
-            "response for {method} exceeds maximum outbound frame size: {response_bytes} bytes > {} bytes",
-            crate::MAX_OUTBOUND_MESSAGE_BYTES
+            "response for {method} exceeds maximum outbound frame size: {response_bytes} bytes > {max_response_bytes} bytes"
         ),
         Some(json!({
             "code": "oversized-response",
             "method": method,
             "responseBytes": response_bytes,
-            "limit": crate::MAX_OUTBOUND_MESSAGE_BYTES,
+            "limit": max_response_bytes,
         })),
     )
+}
+
+struct EncodedEnvelope {
+    frame: String,
+    encode_failed: bool,
+}
+
+fn serialize_envelope(value: &impl Serialize) -> EncodedEnvelope {
+    match serde_json::to_string(value) {
+        Ok(frame) => EncodedEnvelope {
+            frame,
+            encode_failed: false,
+        },
+        Err(_) => EncodedEnvelope {
+            frame: internal_fallback(),
+            encode_failed: true,
+        },
+    }
 }
 
 /// Last-resort response if serialization itself fails (should never happen).
 fn internal_fallback() -> String {
     r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null}"#.to_string()
+}
+
+#[cfg(test)]
+mod response_profile_tests {
+    use super::*;
+    use serde::ser::Error as _;
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(S::Error::custom("intentional test failure"))
+        }
+    }
+
+    #[test]
+    fn serialization_failure_returns_profiled_fallback() {
+        let encoded = serialize_envelope(&FailingSerialize);
+        assert!(encoded.encode_failed);
+        assert_eq!(encoded.frame, internal_fallback());
+    }
+
+    #[test]
+    fn response_metrics_cover_success_error_replacement_and_notification() {
+        let success = encode_dispatch_result(
+            &json!(1),
+            "workspace.list",
+            false,
+            Ok(json!({ "workspaces": [] })),
+            usize::MAX,
+        );
+        assert_eq!(
+            success.response_bytes,
+            success.frame.as_ref().unwrap().len()
+        );
+        assert!(!success.oversized_replacement);
+        assert!(!success.encode_failed);
+
+        let error = encode_dispatch_result(
+            &json!(2),
+            "workspace.get",
+            false,
+            Err(invalid_params("bad params")),
+            usize::MAX,
+        );
+        assert_eq!(error.response_bytes, error.frame.as_ref().unwrap().len());
+        assert_eq!(
+            serde_json::from_str::<Value>(error.frame.as_ref().unwrap()).unwrap()["error"]["code"],
+            INVALID_PARAMS
+        );
+
+        let oversized = encode_dispatch_result(
+            &json!(3),
+            "note.list",
+            false,
+            Ok(json!({ "content": "x".repeat(256) })),
+            64,
+        );
+        assert!(oversized.response_bytes > 64);
+        assert!(oversized.oversized_replacement);
+        assert_eq!(
+            serde_json::from_str::<Value>(oversized.frame.as_ref().unwrap()).unwrap()["error"]
+                ["code"],
+            OVERSIZED_RESPONSE
+        );
+
+        let notification = encode_dispatch_result(
+            &Value::Null,
+            "workspace.list",
+            true,
+            Ok(json!({ "workspaces": [] })),
+            usize::MAX,
+        );
+        assert!(notification.frame.is_none());
+        assert_eq!(notification.response_bytes, 0);
+        assert!(!notification.oversized_replacement);
+        assert!(!notification.encode_failed);
+    }
 }
 
 #[cfg(test)]

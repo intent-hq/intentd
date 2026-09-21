@@ -4,8 +4,8 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -21,7 +21,6 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
@@ -33,7 +32,6 @@ impl Drop for Daemon {
             Signal::SIGKILL,
         );
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -113,13 +111,8 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-fn temp_data_dir() -> PathBuf {
-    let dir = PathBuf::from("/tmp").join(format!(
-        "itd-wss-active-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-active-")
 }
 
 fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
@@ -128,25 +121,20 @@ fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("daemon log");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut command = common::serve_command();
     command
-        .arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", script)
         .env("MOCK_AGENT_BEHAVIOR", behavior)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     command.process_group(0);
     let child = command.spawn().expect("spawn intentd serve");
-    Daemon {
-        child,
-        data_dir: data_dir.to_path_buf(),
-    }
+    Daemon { child }
 }
 
 fn mock_agent_script() -> Option<String> {
@@ -208,11 +196,14 @@ async fn seed_workspace(data_dir: &Path) -> String {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store
         .insert_workspace(&workspace)
@@ -254,7 +245,8 @@ async fn list_active_tracks_only_mid_turn_agents_over_real_wss() {
     let Some(script) = mock_agent_script() else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let workspace_id = seed_workspace(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
     let _daemon = spawn_serve(&data_dir, &script, &behavior);

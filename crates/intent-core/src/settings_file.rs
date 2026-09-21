@@ -35,13 +35,22 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS,
-    DEFAULT_MAX_TOP_LEVEL_AGENTS, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
-    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
+    ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN,
+    DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, DEFAULT_HOOKS_MAX_PER_AGENT,
+    DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
+    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+    DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+    DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST, DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE,
+    DEFAULT_SHARING_MAX_GUEST_CONNECTIONS, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_UPDATES_CHECK_ON_IDLE,
+    DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
     DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
     DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
-    MAX_CONCURRENT_ADAPTERS_LIMIT,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+    MAX_CONCURRENT_ADAPTERS_LIMIT, MAX_SHARING_MAX_GUESTS_PER_WORKSPACE,
+    MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
+    TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
 use crate::error::{Error, Result};
 
@@ -59,6 +68,7 @@ pub struct SettingsFile {
     pub notifications: NotificationsSettings,
     pub rtk: RtkSettings,
     pub server: ServerSettings,
+    pub sharing: SharingSettings,
     pub source_control: SourceControlSettings,
     pub accounts: AccountsSettings,
     pub voice: VoiceSettings,
@@ -73,13 +83,16 @@ pub struct SettingsFile {
     pub agent_features: AgentFeaturesSettings,
     pub wake_resume: WakeResumeSettings,
     pub pr_monitor: PrMonitorSettings,
+    pub updates: UpdatesSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProvidersSettings {
-    /// `providers.active` — default agent provider.
+    /// `providers.active` — deprecated legacy default-provider key, superseded
+    /// by `model.defaultProvider`. Still parsed so an upgraded config loads,
+    /// but the boot migration carries it over and removes it from the file.
     pub active: Option<String>,
     /// `providers.enabled` — providers offered to users (id → enabled).
     pub enabled: Option<BTreeMap<String, bool>>,
@@ -93,8 +106,14 @@ pub struct ProvidersSettings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ModelSettings {
-    /// `model.default` — fallback model for new agents.
+    /// `model.default` — fallback model for new agents (a bare model id;
+    /// pair with `model.defaultProvider`).
     pub default: Option<String>,
+    /// `model.defaultProvider` — the provider leg of the default-model
+    /// triple: the provider new agents run on when none is requested
+    /// explicitly. A blank value reads as unset.
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub default_provider: Option<String>,
     /// `model.providerDefaults` — default model per provider.
     pub provider_defaults: BTreeMap<String, String>,
     /// `model.defaultReasoningEffort` — fallback reasoning effort for new
@@ -389,6 +408,35 @@ impl Default for ServerSettings {
     }
 }
 
+/// `[sharing]` — guest (collaborator) caps (`sharing.*`). The membership cap
+/// is read live by the invite flow; the connection caps are read live by the
+/// WSS listener's guest admission gate, so a change applies to the next guest
+/// upgrade (never evicting an admitted connection) without a restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct SharingSettings {
+    /// `sharing.maxGuestsPerWorkspace` — guests one workspace admits besides
+    /// its owner: open invites count against it at mint time, collaborators
+    /// at join time (0–100; `0` closes every workspace to guests).
+    pub max_guests_per_workspace: u32,
+    /// `sharing.maxGuestConnections` — listener-wide cap on concurrent WSS
+    /// connections held by non-primary principals; `0` means unlimited.
+    pub max_guest_connections: u32,
+    /// `sharing.maxConnectionsPerGuest` — concurrent WSS connections one
+    /// guest principal may hold; `0` means unlimited.
+    pub max_connections_per_guest: u32,
+}
+
+impl Default for SharingSettings {
+    fn default() -> Self {
+        Self {
+            max_guests_per_workspace: DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE,
+            max_guest_connections: DEFAULT_SHARING_MAX_GUEST_CONNECTIONS,
+            max_connections_per_guest: DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST,
+        }
+    }
+}
+
 /// `[server.wsApi]` — WSS listener runtime toggle (`server.wsApi.*`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -669,10 +717,13 @@ pub struct AgentsSettings {
     /// on system RAM; changes apply on daemon restart; max 200).
     pub max_concurrent: u32,
     /// `agents.memoryBudgetMb` — aggregate resident-memory budget for the
-    /// daemon's whole child-process tree, above which new agent spawns queue
-    /// behind idle-process eviction instead of starting immediately and the
-    /// periodic reap sweep drains idle agents largest-first without waiting
-    /// for a spawn or the idle TTL (monorepo#2063 level 2). Absent
+    /// daemon's whole child-process tree. It reclaims only while the tree is
+    /// over budget *and* the host's available memory is below 8 GiB plus one
+    /// provisional agent: then new agent spawns queue behind idle-process
+    /// eviction instead of starting immediately and the periodic reap sweep
+    /// drains idle agents largest-first without waiting for a spawn or the
+    /// idle TTL (monorepo#2063 level 2); when available memory cannot be
+    /// sampled, over budget alone reclaims. Absent
     /// (`None`, the default) = auto (budget derived from system RAM); explicit
     /// `0` = off — preserved because config files written before the auto
     /// default carried a literal `memoryBudgetMb = 0` meaning off, and per the
@@ -680,6 +731,16 @@ pub struct AgentsSettings {
     /// positive = budget in MB (changes apply on daemon restart; max
     /// 1,024,000).
     pub memory_budget_mb: Option<u32>,
+    /// `agents.acpNodeMaxOldSpaceMb` — V8 `--max-old-space-size` cap in MB
+    /// injected via `NODE_OPTIONS` into Node/Electron ACP provider processes.
+    /// Absent (`None`, the default) = [`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB`]
+    /// (8192); an explicit value must lie within
+    /// [`ACP_NODE_MAX_OLD_SPACE_MB_MIN`]–[`ACP_NODE_MAX_OLD_SPACE_MB_MAX`].
+    /// Applies to newly started agent processes; the
+    /// `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB` env var overrides it.
+    ///
+    /// [`DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB`]: crate::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB
+    pub acp_node_max_old_space_mb: Option<u32>,
     /// `agents.maxConcurrentAdapters` — daemon-wide cap on concurrently live
     /// ephemeral ACP adapters (one-shot `agent.completeOnce` completions and
     /// model probes; changes apply on daemon restart; range 1–64). Unlike
@@ -703,6 +764,20 @@ pub struct AgentsSettings {
     /// one combined wake instead of two (0 disables the debounce — legacy
     /// immediate wake; read live per call, no restart required).
     pub report_to_parent_debounce_seconds: u32,
+    /// `agents.historyReplayToolContentChars` — per-block character cap
+    /// applied to each `tool_use` input and `tool_result` output in the
+    /// recovery replay that rebuilds a lost ACP session; longer bodies are
+    /// middle-truncated (range
+    /// [`HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN`]–[`HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX`];
+    /// read live at replay time, no restart required).
+    pub history_replay_tool_content_chars: u32,
+    /// `agents.toolPayloadRetentionDays` — retention window in days after
+    /// which stored tool payloads older than the window are shrunk to the
+    /// replay-shaped preview (the full body is deleted and cannot be
+    /// recovered); `0` disables the sweep and keeps full bodies forever (max
+    /// [`TOOL_PAYLOAD_RETENTION_DAYS_MAX`]; read live at each sweep tick, no
+    /// restart required).
+    pub tool_payload_retention_days: u32,
     /// `agents.flushQueuedMessages` — how the whole queued-message backlog
     /// is delivered when an idle agent drains its queue: `all` batches every
     /// ready entry into one turn, `systemOnly` batches only system-origin
@@ -722,10 +797,13 @@ impl Default for AgentsSettings {
         Self {
             max_concurrent: 0,
             memory_budget_mb: None,
+            acp_node_max_old_space_mb: None,
             max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
             max_top_level_agents: DEFAULT_MAX_TOP_LEVEL_AGENTS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
             report_to_parent_debounce_seconds: DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+            history_replay_tool_content_chars: DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
+            tool_payload_retention_days: DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
             flush_queued_messages: FlushQueuedMessagesMode::All,
             resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
         }
@@ -865,7 +943,7 @@ impl Default for HooksSettings {
 /// changes apply to new agent sessions only.
 // One bool per independent settings toggle; the flat shape IS the settings
 // file contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentFeaturesSettings {
@@ -964,7 +1042,7 @@ impl Default for WakeResumeSettings {
     }
 }
 
-/// `[prMonitor]` — centralized PR-monitor loop knobs (`prMonitor.*`). Both
+/// `[prMonitor]` — centralized PR-monitor loop knobs (`prMonitor.*`). All
 /// values are read live by the monitor loop, so a change applies without a
 /// daemon restart; sub-floor values are clamped at read time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -973,9 +1051,24 @@ pub struct PrMonitorSettings {
     /// `prMonitor.debounceSeconds` — quiet window a changed PR must observe
     /// before its consolidated wake is delivered.
     pub debounce_seconds: u64,
-    /// `prMonitor.pollSeconds` — poll cadence for the centralized monitor
-    /// loop (config-file key; not exposed in the Settings UI).
+    /// `prMonitor.pollSeconds` — tick cadence of the centralized monitor
+    /// loop and the per-PR poll interval floor (config-file key; not exposed
+    /// in the Settings UI).
     pub poll_seconds: u64,
+    /// `prMonitor.hourlyRequestBudget` — the forge REST calls per hour the
+    /// loop plans to spend across every monitored PR. A cadence cost model,
+    /// not an enforced ceiling: the per-PR interval stretches above
+    /// `pollSeconds` once the monitored-PR count would exceed it, but no
+    /// request is counted or blocked against it (config-file key; not
+    /// exposed in the Settings UI).
+    pub hourly_request_budget: u64,
+    /// `prMonitor.quotaSharePercent` — the share of the forge's REMAINING
+    /// quota (read once per tick from its quota-free `rate_limit` probe)
+    /// the loop may plan to spend before the window resets. Stretches the
+    /// per-PR interval ahead of exhaustion; a host without the signal
+    /// falls back to the hourly-budget model alone (config-file key; not
+    /// exposed in the Settings UI).
+    pub quota_share_percent: u64,
 }
 
 impl Default for PrMonitorSettings {
@@ -983,6 +1076,52 @@ impl Default for PrMonitorSettings {
         Self {
             debounce_seconds: DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
             poll_seconds: DEFAULT_PR_MONITOR_POLL_SECONDS,
+            hourly_request_budget: DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            quota_share_percent: DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+        }
+    }
+}
+
+/// `[updates]` — idle-triggered update-check knobs (`updates.*`). The raw
+/// values are kept as parsed; consumers read them through the `effective_*`
+/// accessors, which clamp sub-floor values up to their floors (mirroring the
+/// `prMonitor.*` read-time clamp).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct UpdatesSettings {
+    /// `updates.checkOnIdle` — ask the sitter (via `SIGUSR2`) to check for
+    /// updates once the daemon has been continuously idle.
+    pub check_on_idle: bool,
+    /// `updates.idleCheckIntervalMinutes` — minimum spacing (minutes) between
+    /// two idle-triggered checks, also applied from process start.
+    pub idle_check_interval_minutes: u32,
+    /// `updates.idleGraceSeconds` — how long (seconds) the daemon must be
+    /// continuously idle before requesting a check.
+    pub idle_grace_seconds: u32,
+}
+
+impl UpdatesSettings {
+    /// `idleCheckIntervalMinutes` clamped up to
+    /// [`MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES`].
+    #[must_use]
+    pub fn effective_idle_check_interval_minutes(&self) -> u32 {
+        self.idle_check_interval_minutes
+            .max(MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES)
+    }
+
+    /// `idleGraceSeconds` clamped up to [`MIN_UPDATES_IDLE_GRACE_SECONDS`].
+    #[must_use]
+    pub fn effective_idle_grace_seconds(&self) -> u32 {
+        self.idle_grace_seconds.max(MIN_UPDATES_IDLE_GRACE_SECONDS)
+    }
+}
+
+impl Default for UpdatesSettings {
+    fn default() -> Self {
+        Self {
+            check_on_idle: DEFAULT_UPDATES_CHECK_ON_IDLE,
+            idle_check_interval_minutes: DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+            idle_grace_seconds: DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
         }
     }
 }
@@ -1003,12 +1142,12 @@ where
             Ok(v)
         }
         // Precision loss beyond 2^53 is accepted for JSON-sourced numbers.
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<f64, E> {
             Ok(v as f64)
         }
         // Precision loss beyond 2^53 is accepted for JSON-sourced numbers.
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<f64, E> {
             Ok(v as f64)
         }
@@ -1079,6 +1218,11 @@ impl SettingsFile {
                 Error::InvalidInput(format!("invalid config.toml at `{key_path}`: {detail}"))
             }
         })?;
+        // Normalize BEFORE validating so semantic checks (present and
+        // future) always observe split values — the same shape every
+        // downstream consumer sees.
+        let mut file = file;
+        file.normalize_legacy_compounds();
         file.validate()?;
         Ok(file)
     }
@@ -1124,8 +1268,60 @@ impl SettingsFile {
                     Error::InvalidInput(format!("invalid config.toml at `{key_path}`: {detail}"))
                 }
             })?;
+        // Normalize before validating — see `parse_str`.
+        let mut file = file;
+        file.normalize_legacy_compounds();
         file.validate()?;
         Ok((file, legacy))
+    }
+
+    /// Normalize legacy compound `provider:model` values on read (the
+    /// settings model triple): user-authored TOML that predates the bare-id
+    /// wire contract is split, never rejected.
+    ///
+    /// - A compound `model.default` splits at the first `:`: the prefix
+    ///   fills `model.defaultProvider` when that key is unset (an explicit
+    ///   split-form value always wins), the remainder becomes the bare
+    ///   `model.default`. Blank halves read as unset.
+    /// - A `model.providerDefaults` entry whose value carries its own map
+    ///   key as the prefix (`codex = "codex:gpt-5"`) is stripped to the bare
+    ///   id, with both halves trimmed exactly like `model.default`; a blank
+    ///   remainder (`codex = "codex:"`) reads as unset (the entry is
+    ///   removed). A foreign prefix is left as-is — the read-side ownership
+    ///   guards drop it per use, exactly like any other foreign model id.
+    ///
+    /// Runs in both parse entry points BEFORE `validate()`, so semantic
+    /// validation and every layer built on a parsed file (registry
+    /// snapshots, effective JSON, consumers) observe only split values; a
+    /// legacy file behaves identically to its split form. The on-disk TOML
+    /// is deliberately NOT rewritten.
+    fn normalize_legacy_compounds(&mut self) {
+        if let Some((provider, model)) = self
+            .model
+            .default
+            .as_deref()
+            .and_then(|raw| raw.split_once(':'))
+        {
+            let provider = provider.trim();
+            let model = model.trim();
+            if self.model.default_provider.is_none() && !provider.is_empty() {
+                self.model.default_provider = Some(provider.to_string());
+            }
+            self.model.default = (!model.is_empty()).then(|| model.to_string());
+        }
+        for (provider, value) in &mut self.model.provider_defaults {
+            if let Some(rest) = value
+                .trim()
+                .strip_prefix(provider.as_str())
+                .map(str::trim_start)
+                .and_then(|r| r.strip_prefix(':'))
+            {
+                *value = rest.trim().to_string();
+            }
+        }
+        // A stripped-to-blank remainder reads as unset, mirroring
+        // `model.default = "codex:"`.
+        self.model.provider_defaults.retain(|_, v| !v.is_empty());
     }
 
     /// Range/semantic checks the type system cannot express. Errors name the
@@ -1195,6 +1391,17 @@ impl SettingsFile {
                 ));
             }
         }
+        if let Some(mb) = self.agents.acp_node_max_old_space_mb {
+            if !(ACP_NODE_MAX_OLD_SPACE_MB_MIN..=ACP_NODE_MAX_OLD_SPACE_MB_MAX).contains(&mb) {
+                return Err(bad(
+                    "agents.acpNodeMaxOldSpaceMb",
+                    &format!(
+                        "must be absent (default {}) or between {ACP_NODE_MAX_OLD_SPACE_MB_MIN} and {ACP_NODE_MAX_OLD_SPACE_MB_MAX}, got {mb}",
+                        crate::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB
+                    ),
+                ));
+            }
+        }
         // No `0` escape hatch here (unlike maxOutstandingRpcs): an unbounded
         // adapter spawn is the monorepo#2062 failure itself, so a hand-edited
         // config.toml cannot boot without a ceiling.
@@ -1214,6 +1421,26 @@ impl SettingsFile {
                 &format!("must be at least 1, got {top_level}"),
             ));
         }
+        let replay_chars = self.agents.history_replay_tool_content_chars;
+        if !(HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN..=HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX)
+            .contains(&replay_chars)
+        {
+            return Err(bad(
+                "agents.historyReplayToolContentChars",
+                &format!(
+                    "must be between {HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN} and {HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX}, got {replay_chars}"
+                ),
+            ));
+        }
+        let retention_days = self.agents.tool_payload_retention_days;
+        if retention_days > TOOL_PAYLOAD_RETENTION_DAYS_MAX {
+            return Err(bad(
+                "agents.toolPayloadRetentionDays",
+                &format!(
+                    "must be 0 (keep forever) or between 1 and {TOOL_PAYLOAD_RETENTION_DAYS_MAX}, got {retention_days}"
+                ),
+            ));
+        }
         let chars = self.workspace_api.max_output_chars;
         if chars != 0 && !(1_000..=10_000_000).contains(&chars) {
             return Err(bad(
@@ -1226,6 +1453,32 @@ impl SettingsFile {
             return Err(bad(
                 "voice.workspaceVocabulary.maxTerms",
                 &format!("must be between 0 and 100, got {terms}"),
+            ));
+        }
+        // Mirror the catalog bounds so a hand-edited config.toml cannot admit
+        // more guests (or size larger permit pools) than the `settings.update`
+        // RPC would allow (`0` = closed / unlimited respectively).
+        let guests = self.sharing.max_guests_per_workspace;
+        if guests > MAX_SHARING_MAX_GUESTS_PER_WORKSPACE {
+            return Err(bad(
+                "sharing.maxGuestsPerWorkspace",
+                &format!(
+                    "must be between 0 and {MAX_SHARING_MAX_GUESTS_PER_WORKSPACE}, got {guests}"
+                ),
+            ));
+        }
+        let guest_conns = self.sharing.max_guest_connections;
+        if guest_conns > 100_000 {
+            return Err(bad(
+                "sharing.maxGuestConnections",
+                &format!("must be 0 (unlimited) or between 1 and 100000, got {guest_conns}"),
+            ));
+        }
+        let per_guest = self.sharing.max_connections_per_guest;
+        if per_guest > 1_000 {
+            return Err(bad(
+                "sharing.maxConnectionsPerGuest",
+                &format!("must be 0 (unlimited) or between 1 and 1000, got {per_guest}"),
             ));
         }
         Ok(())
@@ -1313,16 +1566,18 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret
 # they belong in .secrets.json next to this file.
 
 [providers]
-# Active provider -- default agent provider.
-# active = "claude-code"
 # Enabled providers -- providers offered to users (id -> enabled).
 # enabled = { claude-code = true }
 # Provider paths -- per-provider CLI path overrides.
 paths = {}
 
 [model]
-# Default model -- fallback model for new agents.
+# Default model -- fallback model for new agents (a bare model id; pair with
+# defaultProvider).
 # default = "claude-sonnet-4-5"
+# Default provider -- the provider leg of the default-model triple: the
+# provider new agents run on when none is requested explicitly.
+# defaultProvider = "claude-code"
 # Provider default models -- default model per provider.
 providerDefaults = {}
 # Default reasoning effort -- fallback reasoning effort for new agents; the
@@ -1425,6 +1680,20 @@ enabled = false
 # secret and lives in .secrets.json.
 enabled = true
 
+[sharing]
+# Max guests per workspace -- guests one workspace admits besides its owner;
+# open invites count at mint time, collaborators at join time (0-100, 0
+# closes every workspace to guests).
+maxGuestsPerWorkspace = 10
+# Max guest connections -- listener-wide cap on concurrent WSS connections
+# held by guests (the owner's credential is never counted; 0 = unlimited;
+# applies live to new connections, never disconnects admitted guests).
+maxGuestConnections = 40
+# Max connections per guest -- concurrent WSS connections one guest may hold
+# (0 = unlimited; applies live to new connections, never disconnects
+# admitted guests).
+maxConnectionsPerGuest = 4
+
 [sourceControl]
 # Source-control provider -- active forge implementation: "github".
 activeProvider = "github"
@@ -1502,26 +1771,39 @@ level = "info"
 # idle, up to 9.6 GB running a test suite), so slot count does not predict
 # memory -- idleReapMinutes and memoryBudgetMb are the memory bounds.
 maxConcurrent = 0
-# Agent memory budget (MB) -- aggregate resident memory the daemon's whole
-# child-process tree may use before it reclaims: new agent spawns queue behind
-# idle-process eviction, and a background sweep drains idle agents
-# largest-first while over budget (nothing running is ever killed; changes
-# apply on daemon restart).
+# Agent memory budget (MB) -- aggregate resident memory of the daemon's whole
+# child-process tree. The budget reclaims only when two conditions hold at
+# once: the tree is over budget AND the host's available memory is below
+# 8 GiB plus one provisional agent (~660 MB). Then new agent spawns queue
+# behind idle-process eviction, and a background sweep drains idle agents
+# largest-first (nothing running is ever killed; changes apply on daemon
+# restart). An over-budget tree on a host with more available memory than
+# that is left alone, whatever the budget value -- the tree sums resident
+# set sizes of every descendant (dev servers, test runs, headless browsers
+# included, shared pages double-counted), so a small budget on a large host
+# is crossed while tens of gigabytes are still free. When available memory
+# cannot be sampled the budget is strict: over budget alone reclaims.
 # Absent (the default, as in this file) = auto: the daemon picks the budget
 # ((RAM - 8 GB) / 2, min 4 GB). Explicit 0 = off, always. Upgrade note:
 # config files written before this key defaulted to auto carry a literal
 # `memoryBudgetMb = 0`, which stays off -- delete the line to opt into
 # auto. A positive value is the budget in MB (max 1024000). A soft
-# admission gate rather than a ceiling: measured transient overshoot of
-# 65-105% and steady state ~16% over, so budget for roughly 2x the configured
-# value as the transient. The overshoot is a fixed offset, not proportional
-# to demand -- at 1500 MB a 20-agent burst peaked the same as an 8-agent one
-# (3.06 vs 3.09 GB) where the same 20-agent burst unbounded reached 12.37 GB.
-# That 2x rule sizes the admission transient for a burst of comparable
-# agents; the gate runs at spawn only, so an already-admitted agent whose own
-# workload grows (a test suite) is never re-checked and can carry the tree
-# past the budget by itself.
+# admission gate rather than a ceiling: under the strict (host short)
+# policy the measured transient overshoot was 65-105% and steady state ~16%
+# over, so budget for roughly 2x the configured value as the transient. The
+# overshoot is a fixed offset, not proportional to demand -- at 1500 MB a
+# 20-agent burst peaked the same as an 8-agent one (3.06 vs 3.09 GB) where
+# the same 20-agent burst unbounded reached 12.37 GB. That 2x rule sizes
+# the admission transient for a burst of comparable agents; the gate runs
+# at spawn only, so an already-admitted agent whose own workload grows (a
+# test suite) is never re-checked and can carry the tree past the budget by
+# itself.
 # memoryBudgetMb = 8192
+# ACP Node heap limit (MB) -- V8 --max-old-space-size cap injected via
+# NODE_OPTIONS into Node/Electron ACP provider processes (1024-65536; applies
+# to newly started agent processes). Absent (the default, as in this file) =
+# 8192. The INTENTD_ACP_NODE_MAX_OLD_SPACE_MB env var overrides it.
+# acpNodeMaxOldSpaceMb = 8192
 # Max concurrent adapters -- daemon-wide cap on concurrently live ephemeral ACP
 # adapters (one-shot completions and model probes). Each costs ~610 MB and
 # holds no agent slot; over-limit calls queue and fail with "adapter-busy" if
@@ -1558,6 +1840,16 @@ idleReapMinutes = 10
 # two (0 disables the debounce -- immediate wake; read live per call, no
 # restart required).
 reportToParentDebounceSeconds = 30
+# History replay tool content chars -- per-block character cap applied to each
+# tool_use input and tool_result output in the recovery replay that rebuilds a
+# lost ACP session; longer bodies are middle-truncated (500-100000; read live
+# at replay time, no restart required).
+historyReplayToolContentChars = 4000
+# Tool payload retention days -- stored tool payloads older than this many days
+# are shrunk to the replay-shaped preview (the full body is deleted and cannot
+# be recovered); 0 disables the sweep and keeps full bodies forever (max 3650;
+# read live at each sweep tick, no restart required).
+toolPayloadRetentionDays = 0
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
 flushQueuedMessages = "all"
@@ -1627,9 +1919,34 @@ thresholdSeconds = 10
 # PR monitor debounce seconds -- quiet window (in seconds) a changed PR must
 # observe before its consolidated wake is delivered (minimum 10).
 debounceSeconds = 60
-# PR monitor poll seconds -- how often (in seconds) the centralized loop polls
-# each monitored PR (minimum 10).
+# PR monitor poll seconds -- tick cadence (in seconds) of the centralized loop
+# and the per-PR poll interval floor (minimum 10).
 pollSeconds = 30
+# PR monitor hourly request budget -- forge REST calls per hour the loop
+# plans to spend across all monitored PRs. A cadence cost model, not a hard
+# ceiling: each PR poll is costed at 3 calls (a single-page estimate), so the
+# per-PR interval stretches above pollSeconds once PRs x 3 x 3600 / budget
+# exceeds it; requests are not counted or blocked against it (minimum 60,
+# maximum 5000).
+hourlyRequestBudget = 1500
+# PR monitor quota share percent -- the share of the forge's REMAINING core
+# quota (read once per tick from its quota-free rate_limit probe) the loop
+# may plan to spend before the window resets; the per-PR interval stretches
+# ahead of exhaustion so the monitor slows down before the rate-limit pause
+# has to stop it. A host without the signal uses the hourly budget alone
+# (minimum 1, maximum 100).
+quotaSharePercent = 50
+
+[updates]
+# Check for updates when idle -- ask the sitter (via SIGUSR2) to check for
+# updates once the daemon has been continuously idle.
+checkOnIdle = true
+# Idle check interval minutes -- minimum spacing (in minutes) between two
+# idle-triggered update checks, also applied from process start (minimum 5).
+idleCheckIntervalMinutes = 60
+# Idle grace seconds -- how long (in seconds) the daemon must be continuously
+# idle before it requests an update check (minimum 10).
+idleGraceSeconds = 120
 "#;
 
 #[cfg(test)]
@@ -1653,13 +1970,14 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
+    #[expect(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn defaults_match_catalog() {
         let d = SettingsFile::default();
         assert_eq!(d.providers.active, None);
         assert_eq!(d.providers.enabled, None);
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
+        assert_eq!(d.model.default_provider, None);
         assert_eq!(d.model.default_reasoning_effort, None);
         assert!(d.quick_actions.provider_settings.is_empty());
         assert!(!d.workspace.cow_isolation);
@@ -1713,6 +2031,14 @@ mod tests {
         assert_eq!(d.agents.max_concurrent, 0);
         assert_eq!(d.agents.max_top_level_agents, DEFAULT_MAX_TOP_LEVEL_AGENTS);
         assert_eq!(d.agents.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
+        assert_eq!(
+            d.agents.history_replay_tool_content_chars,
+            DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS
+        );
+        assert_eq!(
+            d.agents.tool_payload_retention_days,
+            DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS
+        );
         assert_eq!(d.agents.flush_queued_messages, FlushQueuedMessagesMode::All);
         assert_eq!(
             d.events.stream_retention_hours,
@@ -1747,11 +2073,13 @@ mod tests {
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nhistoryReplayToolContentChars = 8000\ntoolPayloadRetentionDays = 30\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
         assert_eq!(parsed.agents.max_concurrent, 4);
+        assert_eq!(parsed.agents.history_replay_tool_content_chars, 8000);
+        assert_eq!(parsed.agents.tool_payload_retention_days, 30);
         assert_eq!(
             parsed.agents.flush_queued_messages,
             FlushQueuedMessagesMode::Off
@@ -2066,7 +2394,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
+    #[expect(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn floats_accept_integer_literals() {
         let parsed = SettingsFile::parse_str("[notifications]\nvolume = 1\n").unwrap();
         assert_eq!(parsed.notifications.volume, 1.0);
@@ -2141,6 +2469,8 @@ mod tests {
         file.providers.active = Some("claude-code".to_string());
         file.server.ws_api.enabled = true;
         file.agents.idle_reap_minutes = 15;
+        file.agents.history_replay_tool_content_chars = 12_000;
+        file.agents.tool_payload_retention_days = 90;
         // An explicit 0 (off) must survive the round trip as `Some(0)`, never
         // collapsing into the absent-key auto default.
         file.agents.memory_budget_mb = Some(0);
@@ -2275,6 +2605,137 @@ mod tests {
     }
 
     #[test]
+    fn model_default_provider_parses_as_an_optional_string() {
+        let parsed =
+            SettingsFile::parse_str("[model]\ndefault = \"m0\"\ndefaultProvider = \"codex\"\n")
+                .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("m0"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("codex"));
+
+        // Absent from `[model]` leaves it unset.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"m0\"\n").expect("parse");
+        assert_eq!(parsed.model.default_provider, None);
+
+        // A blank value reads as unset, so no consumer ever observes an
+        // explicit empty provider.
+        for text in [
+            "[model]\ndefaultProvider = \"\"\n",
+            "[model]\ndefaultProvider = \"   \"\n",
+        ] {
+            let parsed = SettingsFile::parse_str(text).expect("parse");
+            assert_eq!(parsed.model.default_provider, None, "{text}");
+        }
+    }
+
+    #[test]
+    fn legacy_compound_model_default_splits_into_the_triple() {
+        // A legacy compound `model.default` normalizes on read into the
+        // split (defaultProvider, default) form — never rejected — so a
+        // legacy file behaves identically to the split form.
+        let parsed =
+            SettingsFile::parse_str("[model]\ndefault = \"codex:gpt-5\"\n").expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("codex"));
+        let split =
+            SettingsFile::parse_str("[model]\ndefault = \"gpt-5\"\ndefaultProvider = \"codex\"\n")
+                .expect("parse");
+        assert_eq!(parsed, split, "legacy and split forms must be identical");
+
+        // An explicit defaultProvider wins over the compound prefix; the
+        // model half is still stripped bare.
+        let parsed = SettingsFile::parse_str(
+            "[model]\ndefault = \"codex:gpt-5\"\ndefaultProvider = \"auggie\"\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("auggie"));
+
+        // Only the FIRST colon splits; the rest stays in the model id.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"pi:org:m1\"\n").expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("org:m1"));
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("pi"));
+
+        // Blank halves read as unset — nothing is invented.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"codex:\"\n").expect("parse");
+        assert_eq!(parsed.model.default, None);
+        assert_eq!(parsed.model.default_provider.as_deref(), Some("codex"));
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \":gpt-5\"\n").expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed.model.default_provider, None);
+
+        // The tolerant legacy-path parse normalizes identically.
+        let (file, _) = SettingsFile::parse_str_with_legacy(
+            "[model]\ndefault = \"codex:gpt-5\"\nworkspaceOverrides = { ws1 = \"m1\" }\n",
+        )
+        .expect("tolerant parse");
+        assert_eq!(file.model.default.as_deref(), Some("gpt-5"));
+        assert_eq!(file.model.default_provider.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn legacy_compound_provider_defaults_strip_their_own_prefix() {
+        // A providerDefaults value prefixed with its own map key strips to
+        // the bare id; a foreign prefix is left as-is for the read-side
+        // ownership guards to drop per use.
+        let parsed = SettingsFile::parse_str(
+            "[model]\nproviderDefaults = { codex = \"codex:gpt-5\", auggie = \"codex:gpt-5\", pi = \"m2\" }\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed
+                .model
+                .provider_defaults
+                .get("codex")
+                .map(String::as_str),
+            Some("gpt-5"),
+            "own-prefix compound strips to the bare id"
+        );
+        assert_eq!(
+            parsed
+                .model
+                .provider_defaults
+                .get("auggie")
+                .map(String::as_str),
+            Some("codex:gpt-5"),
+            "a foreign prefix is left untouched"
+        );
+        assert_eq!(
+            parsed.model.provider_defaults.get("pi").map(String::as_str),
+            Some("m2"),
+            "bare values pass through"
+        );
+
+        // Both halves are trimmed exactly like `model.default`: padding
+        // around the value, the prefix, or the remainder never defeats the
+        // own-prefix strip.
+        let parsed = SettingsFile::parse_str(
+            "[model]\nproviderDefaults = { codex = \" codex : gpt-5 \" }\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed
+                .model
+                .provider_defaults
+                .get("codex")
+                .map(String::as_str),
+            Some("gpt-5"),
+            "padded own-prefix compound still strips and trims"
+        );
+
+        // An own-prefix with a blank remainder reads as unset — the entry is
+        // removed, mirroring `model.default = \"codex:\"`.
+        let parsed = SettingsFile::parse_str(
+            "[model]\nproviderDefaults = { codex = \"codex:\", pi = \"pi:  \" }\n",
+        )
+        .expect("parse");
+        assert!(
+            parsed.model.provider_defaults.is_empty(),
+            "blank remainders read as unset, got {:?}",
+            parsed.model.provider_defaults
+        );
+    }
+
+    #[test]
     fn legacy_parse_captures_and_tolerates_workspace_overrides() {
         let text =
             "[model]\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\", ws2 = \"m2\" }\n";
@@ -2355,6 +2816,14 @@ mod tests {
             parsed.pr_monitor.poll_seconds,
             DEFAULT_PR_MONITOR_POLL_SECONDS
         );
+        assert_eq!(
+            parsed.pr_monitor.hourly_request_budget,
+            DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET
+        );
+        assert_eq!(
+            parsed.pr_monitor.quota_share_percent,
+            DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT
+        );
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[prMonitor]"));
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.pr_monitor, parsed.pr_monitor);
@@ -2405,6 +2874,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sharing_defaults_and_template_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(parsed.sharing.max_guests_per_workspace, 10);
+        assert_eq!(parsed.sharing.max_guest_connections, 40);
+        assert_eq!(parsed.sharing.max_connections_per_guest, 4);
+        assert_eq!(parsed.sharing, SharingSettings::default());
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[sharing]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.sharing, parsed.sharing);
+    }
+
+    #[test]
+    fn sharing_explicit_override_parses() {
+        let parsed = SettingsFile::parse_str(
+            "[sharing]\nmaxGuestsPerWorkspace = 0\nmaxGuestConnections = 0\nmaxConnectionsPerGuest = 1\n",
+        )
+        .expect("override parses");
+        assert_eq!(parsed.sharing.max_guests_per_workspace, 0);
+        assert_eq!(parsed.sharing.max_guest_connections, 0);
+        assert_eq!(parsed.sharing.max_connections_per_guest, 1);
+    }
+
+    /// The file path enforces the catalog bounds: `0..=100` on the membership
+    /// cap, `0..=100000` / `0..=1000` on the connection caps.
+    #[test]
+    fn sharing_out_of_range_is_rejected() {
+        let err = SettingsFile::parse_str("[sharing]\nmaxGuestsPerWorkspace = 101\n")
+            .expect_err("out-of-range value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sharing.maxGuestsPerWorkspace") && msg.contains("101"),
+            "error names the offending key and value: {msg}"
+        );
+        assert!(
+            SettingsFile::parse_str("[sharing]\nmaxGuestsPerWorkspace = 100\n").is_ok(),
+            "the upper bound itself is legal"
+        );
+        assert!(SettingsFile::parse_str("[sharing]\nmaxGuestConnections = 100000\n").is_ok());
+        let err = SettingsFile::parse_str("[sharing]\nmaxGuestConnections = 100001\n")
+            .expect_err("over-ceiling listener cap is rejected");
+        assert!(err.to_string().contains("sharing.maxGuestConnections"));
+        assert!(SettingsFile::parse_str("[sharing]\nmaxConnectionsPerGuest = 1000\n").is_ok());
+        let err = SettingsFile::parse_str("[sharing]\nmaxConnectionsPerGuest = 1001\n")
+            .expect_err("over-ceiling per-guest cap is rejected");
+        assert!(err.to_string().contains("sharing.maxConnectionsPerGuest"));
+    }
+
+    #[test]
+    fn sharing_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[sharing]\nmaxGuests = 3\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sharing"), "names the table: {msg}");
+        assert!(msg.contains("maxGuests"), "names the bad key: {msg}");
+    }
+
     /// The `agents.memoryBudgetMb` parse matrix (monorepo#2063): an absent
     /// key is auto (`None`), an explicit `0` is off (`Some(0)` — every config
     /// file the old template wrote carries that literal, so its behaviour is
@@ -2442,6 +2967,48 @@ mod tests {
             SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 1024000\n").is_ok(),
             "the upper bound itself is legal"
         );
+    }
+
+    /// The `agents.acpNodeMaxOldSpaceMb` parse matrix: an absent key is the
+    /// default (`None`, resolved to 8192 by the spawn path), an in-range value
+    /// is an explicit MB cap, both bounds are legal, and out-of-range values
+    /// are rejected naming the key.
+    #[test]
+    fn acp_node_max_old_space_mb_absent_default_in_range_explicit() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.agents.acp_node_max_old_space_mb, None,
+            "absent key = default"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TEMPLATE.contains("\nacpNodeMaxOldSpaceMb ="),
+            "the template for new installs must not write the key (default)"
+        );
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("# acpNodeMaxOldSpaceMb = 8192"),
+            "the template documents the key as a commented-out example"
+        );
+
+        let overridden = SettingsFile::parse_str("[agents]\nacpNodeMaxOldSpaceMb = 16384\n")
+            .expect("override parses");
+        assert_eq!(overridden.agents.acp_node_max_old_space_mb, Some(16_384));
+
+        for bound in [ACP_NODE_MAX_OLD_SPACE_MB_MIN, ACP_NODE_MAX_OLD_SPACE_MB_MAX] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agents]\nacpNodeMaxOldSpaceMb = {bound}\n"))
+                    .expect("both bounds are legal");
+            assert_eq!(parsed.agents.acp_node_max_old_space_mb, Some(bound));
+        }
+
+        for bad in ["0", "1023", "65537"] {
+            let err = SettingsFile::parse_str(&format!("[agents]\nacpNodeMaxOldSpaceMb = {bad}\n"))
+                .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("agents.acpNodeMaxOldSpaceMb") && msg.contains(bad),
+                "error names the offending key and value: {msg}"
+            );
+        }
     }
 
     /// The ephemeral-adapter bound ships enabled: an empty file and the
@@ -2495,15 +3062,109 @@ mod tests {
         );
     }
 
+    /// Both retention knobs ship at today's behaviour: an empty file and the
+    /// shipped template resolve to the 4000-char replay cap and a disabled
+    /// (0-day) payload sweep, and the template documents both keys.
+    #[test]
+    fn tool_payload_retention_defaults_and_template_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.agents.history_replay_tool_content_chars,
+            DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS
+        );
+        assert_eq!(parsed.agents.tool_payload_retention_days, 0);
+        assert_eq!(DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, 4000);
+        assert_eq!(DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, 0);
+
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("historyReplayToolContentChars = 4000"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("toolPayloadRetentionDays = 0"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(
+            templated.agents.history_replay_tool_content_chars,
+            DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS
+        );
+        assert_eq!(
+            templated.agents.tool_payload_retention_days,
+            DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS
+        );
+    }
+
+    /// `agents.historyReplayToolContentChars` is bounded on both sides (no
+    /// `0` escape hatch — a 0-char replay block is useless) and
+    /// `agents.toolPayloadRetentionDays` accepts `0` (keep forever) up to
+    /// ten years; out-of-range values fail the load with an error naming the
+    /// key and the value.
+    #[test]
+    fn tool_payload_retention_ranges_are_enforced() {
+        for bound in [
+            HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+            HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+        ] {
+            let parsed = SettingsFile::parse_str(&format!(
+                "[agents]\nhistoryReplayToolContentChars = {bound}\n"
+            ))
+            .expect("both bounds are legal");
+            assert_eq!(parsed.agents.history_replay_tool_content_chars, bound);
+        }
+        for bad in ["0", "499", "100001"] {
+            let err = SettingsFile::parse_str(&format!(
+                "[agents]\nhistoryReplayToolContentChars = {bad}\n"
+            ))
+            .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("agents.historyReplayToolContentChars") && msg.contains(bad),
+                "error names the offending key and value: {msg}"
+            );
+        }
+
+        for legal in [0, 1, TOOL_PAYLOAD_RETENTION_DAYS_MAX] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agents]\ntoolPayloadRetentionDays = {legal}\n"))
+                    .expect("0, 1 and the upper bound are legal");
+            assert_eq!(parsed.agents.tool_payload_retention_days, legal);
+        }
+        for bad in ["3651", "-1"] {
+            let err =
+                SettingsFile::parse_str(&format!("[agents]\ntoolPayloadRetentionDays = {bad}\n"))
+                    .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("agents.toolPayloadRetentionDays"),
+                "error names the offending key: {msg}"
+            );
+        }
+    }
+
+    /// Out-of-range retention values fail `load_or_init` (not just
+    /// `parse_str`) with the file path and key in the message.
+    #[test]
+    fn tool_payload_retention_out_of_range_fails_load_or_init() {
+        let dir = temp_path("retention-range");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[agents]\ntoolPayloadRetentionDays = 4000\n").unwrap();
+        let err = SettingsFile::load_or_init(&path).expect_err("out-of-range value must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("config.toml"), "names the file: {msg}");
+        assert!(
+            msg.contains("agents.toolPayloadRetentionDays") && msg.contains("4000"),
+            "names the key and value: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn pr_monitor_explicit_override_parses() {
         let parsed = SettingsFile::parse_str(
-            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\n",
+            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\nhourlyRequestBudget = 500\nquotaSharePercent = 25\n",
         )
         .expect("override parses");
         assert!(!parsed.agent_features.pr_monitor);
         assert_eq!(parsed.pr_monitor.debounce_seconds, 15);
         assert_eq!(parsed.pr_monitor.poll_seconds, 90);
+        assert_eq!(parsed.pr_monitor.hourly_request_budget, 500);
+        assert_eq!(parsed.pr_monitor.quota_share_percent, 25);
     }
 
     #[test]
@@ -2512,6 +3173,84 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("prMonitor"), "names the table: {msg}");
         assert!(msg.contains("debounceSecs"), "names the bad key: {msg}");
+    }
+
+    #[test]
+    fn updates_defaults_and_template_round_trip() {
+        // A file with no [updates] section resolves to the shipped defaults.
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(parsed.updates.check_on_idle, DEFAULT_UPDATES_CHECK_ON_IDLE);
+        assert!(parsed.updates.check_on_idle);
+        assert_eq!(
+            parsed.updates.idle_check_interval_minutes,
+            DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES
+        );
+        assert_eq!(parsed.updates.idle_check_interval_minutes, 60);
+        assert_eq!(
+            parsed.updates.idle_grace_seconds,
+            DEFAULT_UPDATES_IDLE_GRACE_SECONDS
+        );
+        assert_eq!(parsed.updates.idle_grace_seconds, 120);
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[updates]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.updates, parsed.updates);
+    }
+
+    #[test]
+    fn updates_explicit_override_parses() {
+        let parsed = SettingsFile::parse_str(
+            "[updates]\ncheckOnIdle = false\nidleCheckIntervalMinutes = 15\nidleGraceSeconds = 30\n",
+        )
+        .expect("override parses");
+        assert!(!parsed.updates.check_on_idle);
+        assert_eq!(parsed.updates.idle_check_interval_minutes, 15);
+        assert_eq!(parsed.updates.idle_grace_seconds, 30);
+        assert_eq!(parsed.updates.effective_idle_check_interval_minutes(), 15);
+        assert_eq!(parsed.updates.effective_idle_grace_seconds(), 30);
+    }
+
+    #[test]
+    fn updates_sub_floor_values_clamp_at_read_time() {
+        let parsed = SettingsFile::parse_str(
+            "[updates]\nidleCheckIntervalMinutes = 0\nidleGraceSeconds = 3\n",
+        )
+        .expect("sub-floor values parse");
+        // Raw values are preserved…
+        assert_eq!(parsed.updates.idle_check_interval_minutes, 0);
+        assert_eq!(parsed.updates.idle_grace_seconds, 3);
+        // …and the effective accessors clamp up to the floors.
+        assert_eq!(
+            parsed.updates.effective_idle_check_interval_minutes(),
+            MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES
+        );
+        assert_eq!(parsed.updates.effective_idle_check_interval_minutes(), 5);
+        assert_eq!(
+            parsed.updates.effective_idle_grace_seconds(),
+            MIN_UPDATES_IDLE_GRACE_SECONDS
+        );
+        assert_eq!(parsed.updates.effective_idle_grace_seconds(), 10);
+    }
+
+    #[test]
+    fn updates_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[updates]\ncheckOnIdel = true\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("updates"), "names the table: {msg}");
+        assert!(msg.contains("checkOnIdel"), "names the bad key: {msg}");
+    }
+
+    #[test]
+    fn updates_wrong_type_is_rejected() {
+        let err = SettingsFile::parse_str("[updates]\nidleGraceSeconds = \"soon\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("updates.idleGraceSeconds"),
+            "names the key: {err}"
+        );
+        let err = SettingsFile::parse_str("[updates]\nidleGraceSeconds = -1\n").unwrap_err();
+        assert!(
+            err.to_string().contains("updates.idleGraceSeconds"),
+            "negative value names the key: {err}"
+        );
     }
 
     #[test]

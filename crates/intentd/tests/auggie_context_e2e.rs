@@ -40,7 +40,7 @@ use intent_core::{
 use intent_services::Services;
 use intent_store::Store;
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn auggie_context_engine_real_retrieve_e2e() {
     // Gate: opt-in only. Anything other than an explicit "1" skips.
     let gate = std::env::var("INTENTD_AUGGIE_E2E").unwrap_or_default();
@@ -89,8 +89,8 @@ async fn auggie_context_engine_real_retrieve_e2e() {
     // Wire a Services over a temp store with a workspace pointing at that
     // worktree, backed by the *real* auggie engine. Under Option A `retrieve()`
     // degrades instantly, so `search.codebase` must be served by ripgrep.
-    let db_path =
-        std::env::temp_dir().join(format!("intentd-auggie-e2e-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-auggie-e2e-");
+    let db_path = db_dir.path().join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
     let ws = WorkspaceId::new();
     store
@@ -144,8 +144,6 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         matches.len(),
         matches.first()
     );
-
-    let _ = std::fs::remove_file(&db_path);
 }
 
 /// Build a minimal active workspace whose worktree points at `worktree` so
@@ -190,10 +188,13 @@ fn workspace(id: &WorkspaceId, worktree: &Path) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }

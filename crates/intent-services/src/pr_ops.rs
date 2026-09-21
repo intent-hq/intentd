@@ -15,9 +15,10 @@ use std::sync::Arc;
 
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
-    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrQuery, PrState,
-    PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
-    ReviewVerdict, RollupCheck, SourceControl, SourceControlRegistry, SourceControlSettings,
+    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrObservation,
+    PrQuery, PrState, PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
+    ReviewThreadComment, ReviewVerdict, RollupCheck, RollupCheckKind, SourceControl,
+    SourceControlRegistry, SourceControlSettings,
 };
 use time::OffsetDateTime;
 
@@ -59,16 +60,11 @@ pub(crate) async fn resolve_source_control(
     }
 }
 
-/// The `(owner, repo)` pair for the workspace's active provider, or
-/// [`NO_ACTIVE_PR`] when either is unset (§7.6).
-pub(crate) fn repo_of(ws: &Workspace) -> Result<(String, String)> {
-    match (
-        ws.repository_owner.as_deref().filter(|s| !s.is_empty()),
-        ws.repository_name.as_deref().filter(|s| !s.is_empty()),
-    ) {
-        (Some(owner), Some(name)) => Ok((owner.to_string(), name.to_string())),
-        _ => Err(Error::Internal(NO_ACTIVE_PR.to_string())),
-    }
+/// The workspace's forge repository ([`Workspace::repo`]) for its active
+/// provider, or [`NO_ACTIVE_PR`] when either slug half is unset (§7.6).
+pub(crate) fn repo_of(ws: &Workspace) -> Result<RepoRef> {
+    ws.repo()
+        .ok_or_else(|| Error::Internal(NO_ACTIVE_PR.to_string()))
 }
 
 /// Parse the `ws.pr.snapshot` cross-repo override: an `"owner/name"` slug
@@ -334,6 +330,47 @@ pub(crate) fn upsert_pr_info(
     }
     let first = items.iter().position(|p| p.number == info.number).unwrap();
     items.retain(|p| p.number != info.number);
+    items.insert(first, info.clone());
+    true
+}
+
+/// PR URL identity for the passive `github.pulls.get` fold. The forge serves
+/// PR URLs in its canonical slug casing while persisted URLs may carry a
+/// client-supplied variant (`workspace.update` accepts them unchanged), so
+/// two URLs name the same PR when they agree ignoring ASCII case — the
+/// in-memory counterpart of the `COLLATE NOCASE` store lookups
+/// (`list_workspaces_referencing_pr_url` and its git-root sibling).
+pub(crate) fn same_pr_url(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// URL-keyed sibling of [`upsert_pr_info`] for the passive `github.pulls.get`
+/// fold: a fetched snapshot replaces every pool entry sharing its `url`
+/// ([`same_pr_url`]; appending when absent) and never a same-numbered PR from
+/// another repository. Pre-existing same-URL duplicates collapse into the
+/// single fetched snapshot at the first duplicate's position, so no stale
+/// copy outlives the fold. Returns `true` when the list actually changed.
+pub(crate) fn upsert_pr_info_by_url(
+    list: &mut Option<Vec<PullRequestInfo>>,
+    info: &PullRequestInfo,
+) -> bool {
+    let items = list.get_or_insert_with(Vec::new);
+    let same = |p: &PullRequestInfo| same_pr_url(&p.url, &info.url);
+    let matches = items.iter().filter(|p| same(p)).count();
+    if matches == 1 {
+        let existing = items.iter_mut().find(|p| same(p)).unwrap();
+        if *existing == *info {
+            return false;
+        }
+        *existing = info.clone();
+        return true;
+    }
+    if matches == 0 {
+        items.push(info.clone());
+        return true;
+    }
+    let first = items.iter().position(&same).unwrap();
+    items.retain(|p| !same(p));
     items.insert(first, info.clone());
     true
 }
@@ -782,7 +819,13 @@ pub struct MergeQueueEjection {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeRequirementsThreads {
-    pub unresolved: i64,
+    /// The number of unresolved review threads; `None` (key omitted on the
+    /// wire, presence-detected like `mergeable`) when the per-thread
+    /// resolution state was unreadable — the GraphQL threads read failed and
+    /// the REST comments fallback carries no resolution state — rather than
+    /// inflating every thread to unresolved or defaulting to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved: Option<i64>,
     /// Whether the base branch requires every thread resolved before merging;
     /// `None` when the rules are unreadable.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -796,7 +839,7 @@ pub struct MergeRequirementsThreads {
 /// rollups.
 // The bool fields mirror the wire checklist shape; grouping them would
 // change the serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeRequirements {
@@ -848,24 +891,157 @@ fn check_status_word(state: CheckState) -> &'static str {
     }
 }
 
+/// One run of a named check, before the checklist collapses same-name runs.
+struct CheckRunSignal {
+    name: String,
+    kind: RollupCheckKind,
+    state: CheckState,
+    required: bool,
+    url: Option<String>,
+    started_at: Option<OffsetDateTime>,
+}
+
+/// What the checklist holds for one check name: the live check run (several
+/// attempts collapse onto one, see [`live_key`]) and, separately, the legacy
+/// commit status posted under the same context name. The two are independent
+/// evidence — GitHub requires BOTH to pass when their shared name is required
+/// — so a run never supersedes a status, nor a status a run.
+#[derive(Default)]
+struct NameEvidence {
+    run: Option<CheckRunSignal>,
+    status: Option<CheckRunSignal>,
+}
+
+impl NameEvidence {
+    fn slot(&mut self, kind: RollupCheckKind) -> &mut Option<CheckRunSignal> {
+        match kind {
+            RollupCheckKind::CheckRun => &mut self.run,
+            RollupCheckKind::StatusContext => &mut self.status,
+        }
+    }
+
+    /// The outcome the checklist reports for the name: the worse of its
+    /// independent live outcomes (failed over pending over passed), the run
+    /// on a tie so it supplies the link.
+    fn reported(&self) -> &CheckRunSignal {
+        [self.run.as_ref(), self.status.as_ref()]
+            .into_iter()
+            .flatten()
+            .reduce(|held, next| {
+                if outcome_severity(next.state) > outcome_severity(held.state) {
+                    next
+                } else {
+                    held
+                }
+            })
+            .expect("a name is only slotted by a run")
+    }
+}
+
+/// How far a check outcome is from letting the PR merge.
+fn outcome_severity(state: CheckState) -> u8 {
+    match check_status_word(state) {
+        "failed" => 2,
+        "pending" => 1,
+        _ => 0,
+    }
+}
+
+/// Last resort among same-name runs with equal (or equally unknown) starts:
+/// a real failure over a success, and a `cancelled` run last — a
+/// `concurrency`-cancelled duplicate must never shadow the run that actually
+/// completed.
+fn check_state_rank(state: CheckState) -> u8 {
+    match state {
+        CheckState::Pending => 4,
+        CheckState::Failure => 3,
+        CheckState::Success => 2,
+        CheckState::Neutral => 1,
+        CheckState::Cancelled => 0,
+    }
+}
+
+/// The liveness key of one run of a named check: the greatest key among a
+/// name's runs of the same [`RollupCheckKind`] is the live one. A single
+/// lexicographic key — not a pairwise rule that switches criteria on missing
+/// data — so the maximum, and with it the checklist, is the same for every
+/// order the host lists the runs in.
+///
+/// 1. In-flight beats completed: a re-run in progress (even one the host has
+///    not stamped a start on yet) makes the check pending.
+/// 2. The later start wins — a re-run, or the run that superseded a
+///    `concurrency`-cancelled duplicate (intent-hq/intent#5372). A run with
+///    no reported start (a host that omits it) sorts below every timed run:
+///    an unknown start is never evidence of being newer.
+/// 3. [`check_state_rank`] settles equal or equally unknown starts.
+fn live_key(run: &CheckRunSignal) -> (bool, Option<OffsetDateTime>, u8) {
+    (
+        run.state == CheckState::Pending,
+        run.started_at,
+        check_state_rank(run.state),
+    )
+}
+
+/// Whether `candidate` is the live run of its name over `held`; equal keys
+/// keep `held`, so the first-listed of identical twins supplies the link.
+fn supersedes(candidate: &CheckRunSignal, held: &CheckRunSignal) -> bool {
+    live_key(candidate) > live_key(held)
+}
+
+/// One checklist entry per check name. A head that carries several runs of
+/// the same check (a concurrency-cancelled duplicate beside the live run, a
+/// re-run beside its predecessor) is collapsed onto the run with the greatest
+/// [`live_key`]; a legacy commit status under the same name is kept beside
+/// the live run and the entry reports the worse of the two
+/// ([`NameEvidence::reported`]). The first occurrence keeps its position, and
+/// the name is required when any of its runs is.
+fn dedupe_checks(runs: impl IntoIterator<Item = CheckRunSignal>) -> Vec<MergeRequirementCheck> {
+    let mut slots: HashMap<String, usize> = HashMap::new();
+    let mut kept: Vec<(String, bool, NameEvidence)> = Vec::new();
+    for run in runs {
+        let i = *slots.entry(run.name.clone()).or_insert_with(|| {
+            kept.push((run.name.clone(), false, NameEvidence::default()));
+            kept.len() - 1
+        });
+        let (_, required, evidence) = &mut kept[i];
+        *required |= run.required;
+        let slot = evidence.slot(run.kind);
+        if slot.as_ref().is_none_or(|held| supersedes(&run, held)) {
+            *slot = Some(run);
+        }
+    }
+    kept.into_iter()
+        .map(|(name, required, evidence)| {
+            let live = evidence.reported();
+            MergeRequirementCheck {
+                name,
+                status: check_status_word(live.state).to_string(),
+                required,
+                url: live.url.clone(),
+            }
+        })
+        .collect()
+}
+
 /// Compose the merge-requirements checklist (§ task 1) from a PR snapshot, the
 /// host's merge-requirement signals, the aggregated reviews, and the
-/// unresolved-thread count.
+/// unresolved-thread count (`None` when the resolution state was unreadable).
 ///
 /// Degradation is per-signal, never fatal: a host that reports no rollup
 /// yields `checks.requiredKnown == false` (with every `required` flag
 /// `false`), unreadable branch rules yield `rulesKnown == false` with
-/// `approvals.needed` / `threads.resolutionRequired` omitted, and a probe that
-/// failed entirely (`signals: None`) still produces the state / conflicts /
-/// approvals / threads rows from the snapshot alone. When the rollup is
-/// unavailable, the `checks` tallies fall back to `fallback_runs` (the REST
-/// check-runs the snapshot already fetched).
+/// `approvals.needed` / `threads.resolutionRequired` omitted, an unreadable
+/// thread resolution state yields `threads.unresolved` omitted, and a probe
+/// that failed entirely (`signals: None`) still produces the state /
+/// conflicts / approvals / threads rows from the snapshot alone. When the
+/// rollup is unavailable, the `checks` tallies fall back to `fallback_runs`
+/// (the REST check-runs the snapshot already fetched).
 pub(crate) fn merge_requirements(
     pr: &PullRequest,
     signals: Option<&MergeRequirementSignals>,
     fallback_runs: &[CheckRun],
     agg: &ReviewAggregate,
-    unresolved_threads: i64,
+    unresolved_threads: Option<i64>,
 ) -> MergeRequirements {
     let state = derive_status_state(pr);
     let mergeable_state = pr.mergeable_state.as_deref().unwrap_or("unknown");
@@ -881,24 +1057,22 @@ pub(crate) fn merge_requirements(
         .filter(|s| s.checks_known)
         .map(|s| s.checks.as_slice());
     let items: Vec<MergeRequirementCheck> = match rollup {
-        Some(checks) => checks
-            .iter()
-            .map(|c| MergeRequirementCheck {
-                name: c.name.clone(),
-                status: check_status_word(c.state).to_string(),
-                required: c.is_required,
-                url: c.url.clone(),
-            })
-            .collect(),
-        None => fallback_runs
-            .iter()
-            .map(|r| MergeRequirementCheck {
-                name: r.name.clone(),
-                status: check_status_word(r.state).to_string(),
-                required: false,
-                url: r.url.clone(),
-            })
-            .collect(),
+        Some(checks) => dedupe_checks(checks.iter().map(|c| CheckRunSignal {
+            name: c.name.clone(),
+            kind: c.kind,
+            state: c.state,
+            required: c.is_required,
+            url: c.url.clone(),
+            started_at: c.started_at.as_deref().and_then(parse_iso),
+        })),
+        None => dedupe_checks(fallback_runs.iter().map(|r| CheckRunSignal {
+            name: r.name.clone(),
+            kind: RollupCheckKind::CheckRun,
+            state: r.state,
+            required: false,
+            url: r.url.clone(),
+            started_at: r.started_at.as_deref().and_then(parse_iso),
+        })),
     };
     let tally = |word: &str| {
         i64::try_from(items.iter().filter(|c| c.status == word).count()).expect("value fits in i64")
@@ -963,40 +1137,61 @@ pub(crate) fn merge_requirements(
 /// merge-requirements probe (non-GitHub hosts) falls back to the REST
 /// check-runs on the PR head, a failing check-run read reports an empty
 /// tally, a failing review read leaves the approvals aggregate empty, and a
-/// failing review-thread read reports zero unresolved threads. Only
+/// failing review-thread read leaves `threads.unresolved` unknown. Only
 /// [`SourceControl::get_pr`] is load-bearing, so a partially-visible forge
-/// still yields a usable checklist.
+/// still yields a usable checklist. The one exception is quota exhaustion:
+/// [`Error::RateLimited`] from ANY sub-read propagates (see
+/// [`merge_requirements_for_pr`]).
 #[cfg(test)]
 pub(crate) async fn fetch_merge_requirements(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
 ) -> Result<MergeRequirements> {
-    let (_, requirements, _, _) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
-    Ok(requirements)
+    let (_, read) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
+    Ok(read.requirements)
 }
 
 /// [`fetch_merge_requirements`] plus the by-products the PR monitor needs
 /// for its own snapshot — the [`PullRequest`] the checklist was composed from
-/// (title / url / head SHA), the review-comment count from the same thread
-/// fetch, and the probe-answered flag (see [`merge_requirements_for_pr`]) —
-/// so a poll never repeats the `get_pr` / thread reads.
+/// (title / url / head SHA) and the [`MergeRequirementsRead`] it came with
+/// (review-comment count from the same thread fetch, probe-answered flag,
+/// sub-read completeness) — so a poll never repeats the `get_pr` / thread
+/// reads.
 pub(crate) async fn fetch_merge_requirements_detailed(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-) -> Result<(PullRequest, MergeRequirements, i64, bool)> {
+) -> Result<(PullRequest, MergeRequirementsRead)> {
     let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
-    let (requirements, review_comments, ejection_known) =
-        merge_requirements_for_pr(sc, repo_ref, number, &pr).await;
-    Ok((pr, requirements, review_comments, ejection_known))
+    let read = merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
+    Ok((pr, read))
+}
+
+/// Split a best-effort forge read into "answered" / "degraded" while
+/// preserving quota exhaustion: an ordinary error becomes `Ok(None)` for the
+/// caller to degrade on, but [`intent_sourcecontrol::Error::RateLimited`]
+/// propagates as [`Error::RateLimited`] so a quota hit on a secondary read is
+/// never mistaken for a degraded-but-successful poll (the sweep must pause
+/// the shared gate, not persist the degraded snapshot).
+fn degrade_unless_rate_limited<T>(
+    result: std::result::Result<T, intent_sourcecontrol::Error>,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(intent_sourcecontrol::Error::RateLimited(msg)) => Err(Error::RateLimited(msg)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// [`fetch_merge_requirements_detailed`] for a [`PullRequest`] the caller
 /// already read — the composition shared by the PR monitor and the one-shot
 /// `ws.pr.snapshot`, so both surfaces describe a PR with the same object.
-/// Infallible: every forge sub-read degrades on its own (see
-/// [`fetch_merge_requirements`]). Returns the checklist, the review-comment
+/// Every forge sub-read degrades on its own (see
+/// [`fetch_merge_requirements`]); the ONLY error is [`Error::RateLimited`],
+/// returned as soon as any sub-read reports quota exhaustion so no further
+/// forge calls are issued and the caller never persists a degraded snapshot
+/// as a successful poll. Returns the checklist, the review-comment
 /// count from the same thread fetch, and whether the merge-requirements
 /// probe itself answered — the probe is the ONLY source of the merge-queue
 /// ejection signal, so `false` means the checklist's `mergeQueueEjection` is
@@ -1007,23 +1202,57 @@ pub(crate) async fn merge_requirements_for_pr(
     repo_ref: &RepoRef,
     number: u64,
     pr: &PullRequest,
-) -> (MergeRequirements, i64, bool) {
+) -> Result<(MergeRequirements, i64, bool)> {
+    let read = merge_requirements_for_pr_detailed(sc, repo_ref, number, pr).await?;
+    Ok((
+        read.requirements,
+        read.review_comment_count,
+        read.ejection_known,
+    ))
+}
+
+/// [`merge_requirements_for_pr`]'s result plus whether EVERY sub-read behind
+/// it answered — the PR monitor's precondition for reusing a checklist on
+/// later polls instead of re-fetching it.
+#[derive(Debug, Clone)]
+pub(crate) struct MergeRequirementsRead {
+    pub(crate) requirements: MergeRequirements,
+    /// Review-comment count from the same thread fetch.
+    pub(crate) review_comment_count: i64,
+    /// Whether the merge-requirements probe itself answered (the only source
+    /// of the merge-queue ejection signal).
+    pub(crate) ejection_known: bool,
+    /// `false` when ANY sub-read degraded — probe, reviews, review decision,
+    /// fallback check runs, or review threads (whose fallback cannot report
+    /// thread resolution) — so the checklist carries a default in place of a
+    /// signal the forge may answer on the next read.
+    pub(crate) complete: bool,
+}
+
+/// [`merge_requirements_for_pr`] reporting per-sub-read completeness (see
+/// [`MergeRequirementsRead::complete`]).
+pub(crate) async fn merge_requirements_for_pr_detailed(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    pr: &PullRequest,
+) -> Result<MergeRequirementsRead> {
     let (signals, reviews) = tokio::join!(
         sc.merge_requirements(repo_ref, number),
         sc.list_reviews(repo_ref, number)
     );
-    let mut signals = signals
-        .inspect_err(|e| {
-            tracing::debug!(
-                error = %e,
-                pr_number = number,
-                "merge requirements: probe unavailable, degrading to snapshot-only checklist"
-            );
-        })
-        .ok();
+    let mut signals = degrade_unless_rate_limited(signals.inspect_err(|e| {
+        tracing::debug!(
+            error = %e,
+            pr_number = number,
+            "merge requirements: probe unavailable, degrading to snapshot-only checklist"
+        );
+    }))?;
+    let reviews = degrade_unless_rate_limited(reviews)?;
     // Captured BEFORE the review-decision backfill below can fabricate a
     // stub `signals` for a failed probe.
     let ejection_known = signals.is_some();
+    let mut complete = ejection_known && reviews.is_some();
     let agg = aggregate_reviews(&reviews.unwrap_or_default());
 
     // The probe carries the forge's `reviewDecision`; when it did not — no
@@ -1032,70 +1261,154 @@ pub(crate) async fn merge_requirements_for_pr(
     // aggregate merely because the probe is unavailable. A failing read
     // degrades to `None` (aggregate-derived decision).
     if signals.as_ref().is_none_or(|s| s.review_decision.is_none()) {
-        let decision = sc
-            .review_decision(repo_ref, number)
-            .await
-            .inspect_err(|e| {
+        let decision = degrade_unless_rate_limited(
+            sc.review_decision(repo_ref, number).await.inspect_err(|e| {
                 tracing::debug!(
                     error = %e,
                     pr_number = number,
                     "merge requirements: review_decision fetch failed, falling back to aggregate"
                 );
-            })
-            .ok()
-            .flatten();
-        if let Some(decision) = decision {
+            }),
+        )?;
+        complete &= decision.is_some();
+        if let Some(decision) = decision.flatten() {
             signals.get_or_insert_with(Default::default).review_decision = Some(decision);
         }
     }
 
-    // The REST check-runs are only needed when the probe carried no rollup.
-    let rollup_known = signals.as_ref().is_some_and(|s| s.checks_known);
+    let (fallback_runs, runs_complete) =
+        fallback_check_runs(sc, repo_ref, pr, signals.as_ref()).await?;
+    complete &= runs_complete;
+    let (review_comments, unresolved, threads_complete) =
+        read_review_thread_tally(sc, repo_ref, number).await?;
+    complete &= threads_complete;
+
+    let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
+    Ok(MergeRequirementsRead {
+        requirements,
+        review_comment_count: review_comments,
+        ejection_known,
+        complete,
+    })
+}
+
+/// [`merge_requirements_for_pr_detailed`] composed from a folded
+/// [`PrObservation`] (the PR monitor's one-round-trip read) instead of the
+/// per-signal reads: the observation already carries the probe, the reviews,
+/// the thread tally and the review decision — its `reviewDecision` IS the
+/// standalone read's answer, so a `None` there is authoritative and never
+/// re-fetched — leaving only the base branch's rules to read (when the host
+/// did not fold them in), plus the same per-piece fallbacks as the
+/// per-signal path: the REST check-runs when the probe carried no rollup,
+/// and the paged reviews / review threads when the PR outgrew the
+/// observation's windows. Same completeness and quota semantics.
+pub(crate) async fn merge_requirements_from_observation(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    observation: &PrObservation,
+) -> Result<MergeRequirementsRead> {
+    let pr = &observation.pr;
+    let mut signals = observation.signals.clone();
+    let mut complete = true;
+    if signals.branch_rules.is_none() && !pr.target_branch.is_empty() {
+        signals.branch_rules =
+            degrade_unless_rate_limited(sc.branch_rules(repo_ref, &pr.target_branch).await)?;
+    }
+    let reviews = if let Some(reviews) = &observation.reviews {
+        Some(reviews.clone())
+    } else {
+        let reviews = degrade_unless_rate_limited(sc.list_reviews(repo_ref, number).await)?;
+        complete &= reviews.is_some();
+        reviews
+    };
+    let agg = aggregate_reviews(&reviews.unwrap_or_default());
+
+    let (fallback_runs, runs_complete) =
+        fallback_check_runs(sc, repo_ref, pr, Some(&signals)).await?;
+    complete &= runs_complete;
+    let (review_comments, unresolved, threads_complete) = match observation.threads {
+        Some(tally) => (tally.review_comment_count, Some(tally.unresolved), true),
+        None => read_review_thread_tally(sc, repo_ref, number).await?,
+    };
+    complete &= threads_complete;
+
+    let requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
+    Ok(MergeRequirementsRead {
+        requirements,
+        review_comment_count: review_comments,
+        ejection_known: true,
+        complete,
+    })
+}
+
+/// The REST check-runs on the PR head, read only when the probe carried no
+/// rollup (and the host supports check-runs). Returns the runs — empty when
+/// not needed — and whether the read (if issued) answered.
+async fn fallback_check_runs(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    pr: &PullRequest,
+    signals: Option<&MergeRequirementSignals>,
+) -> Result<(Vec<CheckRun>, bool)> {
+    let rollup_known = signals.is_some_and(|s| s.checks_known);
     let head_ref = pr
         .head_sha
         .clone()
         .filter(|s| !s.is_empty())
         .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
-    let fallback_runs = match head_ref {
+    match head_ref {
         Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
-            sc.check_runs(repo_ref, &git_ref).await.unwrap_or_default()
+            let runs = degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?;
+            let complete = runs.is_some();
+            Ok((runs.unwrap_or_default(), complete))
         }
-        _ => Vec::new(),
-    };
+        _ => Ok((Vec::new(), true)),
+    }
+}
 
-    // Inline review comments: threads via GraphQL when available, else the
-    // flat REST list grouped by reply parent. Resolution state is unavailable
-    // on the fallback path, so every fallback thread counts as unresolved —
-    // both degradations are logged at `warn` so they are visible at the
-    // default log level instead of silently skewing the unresolved count.
-    let (review_comments, unresolved) = match fetch_all_pages(|p| {
-        sc.get_review_threads(repo_ref, number, p)
-    })
-    .await
-    {
-        Ok((threads, _, _)) => count_thread_comments(&threads),
+/// Inline review comments: threads via GraphQL when available, else the
+/// flat REST list grouped by reply parent. Resolution state is unavailable
+/// on the fallback path, so the unresolved count is reported as unknown
+/// (`None`) there rather than inflated to every thread or defaulted to
+/// zero — both degradations are logged at `warn` so they are visible at
+/// the default log level. Returns `(review_comment_count, unresolved,
+/// complete)`, `complete` being false on either degradation.
+async fn read_review_thread_tally(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+) -> Result<(i64, Option<i64>, bool)> {
+    match fetch_all_pages(|p| sc.get_review_threads(repo_ref, number, p)).await {
+        Ok((threads, _, _)) => {
+            let (comments, unresolved) = count_thread_comments(&threads);
+            Ok((comments, Some(unresolved), true))
+        }
+        Err(intent_sourcecontrol::Error::RateLimited(msg)) => Err(Error::RateLimited(msg)),
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 pr_number = number,
-                "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count may be inflated)"
+                "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count reported as unknown)"
             );
             match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
-                Ok((comments, _, _)) => count_thread_comments(&fallback_threads(comments)),
+                Ok((comments, _, _)) => Ok((
+                    count_thread_comments(&fallback_threads(comments)).0,
+                    None,
+                    false,
+                )),
+                Err(intent_sourcecontrol::Error::RateLimited(msg)) => Err(Error::RateLimited(msg)),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         pr_number = number,
-                        "merge requirements: review comments unavailable, reporting zero unresolved"
+                        "merge requirements: review comments unavailable, reporting zero review comments and unknown unresolved"
                     );
-                    (0, 0)
+                    Ok((0, None, false))
                 }
             }
         }
-    };
-
-    let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
-    (requirements, review_comments, ejection_known)
+    }
 }
 
 // ===========================================================================
@@ -1319,6 +1632,81 @@ mod tests {
         assert_eq!(items[0].number, merged.number);
         assert_eq!(items[0].status, PullRequestStatus::Merged);
         assert_eq!(items[1].number, 2);
+    }
+
+    #[test]
+    fn upserts_pr_info_by_url_never_touches_a_same_numbered_stranger() {
+        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut list: Option<Vec<PullRequestInfo>> = None;
+
+        // Insert into an absent list; identical snapshot is a no-op.
+        assert!(upsert_pr_info_by_url(&mut list, &open));
+        assert!(!upsert_pr_info_by_url(&mut list, &open));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+
+        // Same URL, different snapshot: replaced in place.
+        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info_by_url(&mut list, &merged));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+        assert_eq!(list.as_ref().unwrap()[0].status, PullRequestStatus::Merged);
+
+        // Same number from another repository (cross-repo pool): appended,
+        // and the original entry is left untouched.
+        let mut other_repo = pr(PrState::Open, false, None, None);
+        other_repo.url = "https://github.com/other/repo/pull/1".into();
+        let other_info = build_pr_info(&other_repo);
+        assert!(upsert_pr_info_by_url(&mut list, &other_info));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].number, items[1].number);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[1].url, other_info.url);
+    }
+
+    /// Regression (intent-hq/intentd#1923 review): a persisted pool holding
+    /// the same URL twice (`workspace.update` accepts duplicates) collapses
+    /// into the single fetched snapshot at the first duplicate's position —
+    /// never `[Merged, Open]` with a stale copy keeping the rollup at
+    /// `pr_ready` — while a distinct cross-repo URL survives.
+    #[test]
+    fn upserts_pr_info_by_url_collapses_same_url_duplicates() {
+        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut other_repo = pr(PrState::Open, false, None, None);
+        other_repo.url = "https://github.com/other/repo/pull/1".into();
+        let other_info = build_pr_info(&other_repo);
+        let mut list = Some(vec![open.clone(), other_info.clone(), open.clone()]);
+
+        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info_by_url(&mut list, &merged));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[1].url, other_info.url);
+        // The collapsed pool is stable: an identical re-fetch is a no-op.
+        assert!(!upsert_pr_info_by_url(&mut list, &merged));
+    }
+
+    /// Regression (intent-hq/intentd#1923 review): PR URL identity folds
+    /// ASCII case — a persisted `example/repo` URL is the same PR as the
+    /// forge's canonical `Example/Repo` casing, so the fetched snapshot
+    /// replaces it (adopting the forge casing) instead of appending a
+    /// duplicate.
+    #[test]
+    fn upserts_pr_info_by_url_matches_case_variant_urls() {
+        let mut persisted = pr(PrState::Open, false, Some(true), Some("clean"));
+        persisted.url = "https://github.com/example/repo/pull/42".into();
+        let mut list = Some(vec![build_pr_info(&persisted)]);
+
+        let mut fetched = pr(PrState::Merged, false, None, None);
+        fetched.url = "https://github.com/Example/Repo/pull/42".into();
+        let fetched_info = build_pr_info(&fetched);
+        assert!(same_pr_url(&persisted.url, &fetched.url));
+        assert!(upsert_pr_info_by_url(&mut list, &fetched_info));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[0].url, fetched_info.url);
+        assert!(!upsert_pr_info_by_url(&mut list, &fetched_info));
     }
 
     #[test]
@@ -1574,9 +1962,11 @@ mod tests {
     fn rollup(name: &str, state: CheckState, required: bool) -> RollupCheck {
         RollupCheck {
             name: name.into(),
+            kind: RollupCheckKind::CheckRun,
             state,
             is_required: required,
             url: None,
+            started_at: None,
         }
     }
 
@@ -1608,7 +1998,7 @@ mod tests {
             is_in_merge_queue: None,
             merge_queue_removal: None,
         };
-        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 3);
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), Some(3));
 
         assert_eq!(req.state, "open");
         assert!(!req.is_draft);
@@ -1626,7 +2016,7 @@ mod tests {
         assert_eq!(req.approvals.decision, "review_required");
         assert_eq!(req.approvals.have, 1);
         assert_eq!(req.approvals.needed, Some(2));
-        assert_eq!(req.threads.unresolved, 3);
+        assert_eq!(req.threads.unresolved, Some(3));
         assert_eq!(req.threads.resolution_required, Some(true));
         assert_eq!(req.merge_state_status.as_deref(), Some("BLOCKED"));
         assert_eq!(
@@ -1665,7 +2055,7 @@ mod tests {
             is_in_merge_queue: None,
             merge_queue_removal: None,
         };
-        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 0);
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), Some(0));
 
         assert!(!req.rules_known);
         assert_eq!(req.approvals.needed, None);
@@ -1686,15 +2076,17 @@ mod tests {
                 name: "build".into(),
                 state: CheckState::Success,
                 url: Some("https://ci/1".into()),
+                started_at: None,
             },
             CheckRun {
                 name: "test".into(),
                 state: CheckState::Failure,
                 url: None,
+                started_at: None,
             },
         ];
         // A probe that failed entirely still yields the snapshot-derived rows.
-        let req = merge_requirements(&p, None, &runs, &agg(0, 0), 2);
+        let req = merge_requirements(&p, None, &runs, &agg(0, 0), Some(2));
         assert_eq!(req.checks.total, 2);
         assert_eq!((req.checks.passed, req.checks.failed), (1, 1));
         assert!(!req.checks.required_known);
@@ -1704,7 +2096,7 @@ mod tests {
         assert_eq!(req.checks.items[0].url.as_deref(), Some("https://ci/1"));
         assert!(!req.rules_known);
         assert_eq!(req.approvals.decision, "none");
-        assert_eq!(req.threads.unresolved, 2);
+        assert_eq!(req.threads.unresolved, Some(2));
         assert!(req.merge_state_status.is_none());
 
         // A host that reports the signals but no rollup degrades the same way.
@@ -1713,11 +2105,350 @@ mod tests {
             checks_known: false,
             ..Default::default()
         };
-        let req = merge_requirements(&p, Some(&signals), &runs, &agg(0, 0), 0);
+        let req = merge_requirements(&p, Some(&signals), &runs, &agg(0, 0), Some(0));
         assert_eq!(req.checks.total, 2);
         assert!(!req.checks.required_known);
         assert_eq!(req.merge_state_status.as_deref(), Some("UNSTABLE"));
     }
+
+    /// Regression (intent-hq/intent#5372): a head carrying two runs of the
+    /// same workflow — the live `completed/success` run and an earlier
+    /// `concurrency`-cancelled duplicate whose gate job reports a genuine
+    /// `failure` — reports ONE `passed` entry per check name, whichever
+    /// order the host lists the nodes in: the latest-started run is the
+    /// live one, so the tally never counts the superseded twin and never
+    /// depends on rollup order. Without start times a genuine failure
+    /// still wins over a same-name success, an in-flight re-run over any
+    /// completed outcome, and a cancelled run over nothing.
+    #[test]
+    fn merge_requirements_dedupes_same_name_checks_by_live_outcome() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let signals = |checks: Vec<RollupCheck>| MergeRequirementSignals {
+            merge_state_status: Some("CLEAN".into()),
+            checks,
+            checks_known: true,
+            ..Default::default()
+        };
+        // The superseding run started 24 minutes after the duplicate.
+        let live = |name: &str, state: CheckState| RollupCheck {
+            url: Some(format!("https://ci/live/{name}")),
+            started_at: Some("2026-09-18T11:32:04Z".into()),
+            ..rollup(name, state, true)
+        };
+        let dup = |name: &str, state: CheckState| RollupCheck {
+            url: Some(format!("https://ci/dup/{name}")),
+            started_at: Some("2026-09-18T11:08:02Z".into()),
+            ..rollup(name, state, true)
+        };
+
+        let cancelled_first = vec![
+            dup("CI Gate", CheckState::Failure),
+            dup("route", CheckState::Cancelled),
+            live("CI Gate", CheckState::Success),
+            live("route", CheckState::Success),
+        ];
+        let cancelled_last = cancelled_first.iter().rev().cloned().collect::<Vec<_>>();
+        for order in [cancelled_first, cancelled_last] {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 2, "{:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed, req.checks.pending),
+                (2, 0, 0),
+                "{:?}",
+                req.checks.items
+            );
+            assert!(req.checks.failing_required.is_empty(), "{:?}", req.checks);
+            let gate = req
+                .checks
+                .items
+                .iter()
+                .find(|c| c.name == "CI Gate")
+                .expect("one CI Gate entry");
+            assert_eq!(gate.status, "passed");
+            assert!(gate.required);
+            assert_eq!(gate.url.as_deref(), Some("https://ci/live/CI Gate"));
+        }
+
+        // A later re-run that failed IS the live outcome, whichever side it
+        // is listed on — the latest start decides, not the friendlier state.
+        let rerun = |name: &str, state: CheckState| RollupCheck {
+            started_at: Some("2026-09-18T12:00:00Z".into()),
+            ..rollup(name, state, true)
+        };
+        for order in [
+            vec![
+                live("test", CheckState::Success),
+                rerun("test", CheckState::Failure),
+            ],
+            vec![
+                rerun("test", CheckState::Failure),
+                live("test", CheckState::Success),
+            ],
+        ] {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1);
+            assert_eq!((req.checks.passed, req.checks.failed), (0, 1));
+            assert_eq!(req.checks.failing_required, vec!["test".to_string()]);
+        }
+
+        // Without start times (a host that omits them) the state decides: a
+        // failure over a success, an in-flight run over any completed twin,
+        // and a cancelled run only when it is alone.
+        let untimed = |name: &str, state: CheckState| rollup(name, state, true);
+        for order in [
+            vec![
+                untimed("lint", CheckState::Success),
+                untimed("lint", CheckState::Failure),
+            ],
+            vec![
+                untimed("lint", CheckState::Failure),
+                untimed("lint", CheckState::Success),
+            ],
+        ] {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.passed, req.checks.failed), (0, 1));
+        }
+        let req = merge_requirements(
+            &p,
+            Some(&signals(vec![
+                untimed("e2e", CheckState::Failure),
+                untimed("e2e", CheckState::Pending),
+                untimed("docs", CheckState::Cancelled),
+                untimed("docs", CheckState::Success),
+            ])),
+            &[],
+            &agg(0, 0),
+            Some(0),
+        );
+        assert_eq!(
+            (req.checks.passed, req.checks.failed, req.checks.pending),
+            (1, 0, 1),
+            "{:?}",
+            req.checks.items
+        );
+        assert_eq!(req.checks.pending_required, vec!["e2e".to_string()]);
+
+        // Mixed evidence — two timed runs plus an untimed run under one name
+        // — must reduce to the same answer in every one of the six orders:
+        // the reduction is a single total order, not a pairwise rule that
+        // switches criteria on missing data. The latest timed run wins; an
+        // untimed run never outranks a timed one. An in-flight run with no
+        // start stamped yet still wins outright.
+        let mixed = [
+            dup("gate", CheckState::Failure),
+            live("gate", CheckState::Success),
+            untimed("gate", CheckState::Failure),
+        ];
+        for perm in PERMUTATIONS_OF_THREE {
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| mixed[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1, "{perm:?}: {:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed),
+                (1, 0),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/live/gate"),
+                "{perm:?}"
+            );
+        }
+        let queued = [
+            dup("gate", CheckState::Failure),
+            live("gate", CheckState::Success),
+            untimed("gate", CheckState::Pending),
+        ];
+        for perm in PERMUTATIONS_OF_THREE {
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| queued[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.passed, req.checks.failed, req.checks.pending),
+                (0, 0, 1),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+        }
+
+        // The REST check-runs fallback carries `started_at` too, so the
+        // older duplicate's genuine failure loses to the newer success there
+        // as well, and an untimed cancelled twin never wins.
+        let rest = |state: CheckState, started_at: Option<&str>, url: Option<&str>| CheckRun {
+            name: "build".into(),
+            state,
+            url: url.map(String::from),
+            started_at: started_at.map(String::from),
+        };
+        for runs in [
+            vec![
+                rest(CheckState::Failure, Some("2026-09-18T11:08:02Z"), None),
+                rest(
+                    CheckState::Success,
+                    Some("2026-09-18T11:32:04Z"),
+                    Some("https://ci/live/build"),
+                ),
+            ],
+            vec![
+                rest(
+                    CheckState::Success,
+                    Some("2026-09-18T11:32:04Z"),
+                    Some("https://ci/live/build"),
+                ),
+                rest(CheckState::Failure, Some("2026-09-18T11:08:02Z"), None),
+            ],
+            vec![
+                rest(CheckState::Cancelled, None, None),
+                rest(CheckState::Success, None, Some("https://ci/live/build")),
+            ],
+        ] {
+            let req = merge_requirements(&p, None, &runs, &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1, "{:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed),
+                (1, 0),
+                "{:?}",
+                req.checks.items
+            );
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/live/build")
+            );
+        }
+    }
+
+    /// A legacy commit status posted under a check run's name is independent
+    /// evidence, not an older attempt of the run: GitHub requires both to
+    /// pass when the shared name is required. Deduping the run's attempts
+    /// must never let a timed success hide the status's failure (or vice
+    /// versa), in either order; the entry reports the worse of the two.
+    #[test]
+    fn merge_requirements_keeps_a_same_name_legacy_status_beside_the_live_run() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let signals = |checks: Vec<RollupCheck>| MergeRequirementSignals {
+            merge_state_status: Some("CLEAN".into()),
+            checks,
+            checks_known: true,
+            ..Default::default()
+        };
+        let run = |state: CheckState, started_at: &str| RollupCheck {
+            url: Some(format!("https://ci/run/{started_at}")),
+            started_at: Some(started_at.into()),
+            ..rollup("build", state, true)
+        };
+        let status = |state: CheckState| RollupCheck {
+            kind: RollupCheckKind::StatusContext,
+            url: Some("https://ci/status".into()),
+            ..rollup("build", state, true)
+        };
+        let both_orders = |a: RollupCheck, b: RollupCheck| [vec![a.clone(), b.clone()], vec![b, a]];
+        let live = "2026-09-18T11:32:04Z";
+        let dup = "2026-09-18T11:08:02Z";
+
+        // Timed success + failing status: failed, required, the status's link.
+        for order in both_orders(run(CheckState::Success, live), status(CheckState::Failure)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1, "{:?}", req.checks.items);
+            assert_eq!(
+                (req.checks.passed, req.checks.failed, req.checks.pending),
+                (0, 1, 0),
+                "{:?}",
+                req.checks.items
+            );
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/status")
+            );
+        }
+        // Failing run + passing status is just as blocked, with the run's link.
+        for order in both_orders(run(CheckState::Failure, live), status(CheckState::Success)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.passed, req.checks.failed), (0, 1));
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/run/2026-09-18T11:32:04Z")
+            );
+        }
+        // A status still pending holds the name pending; an in-flight run
+        // beside a failed status is still a failure.
+        for order in both_orders(run(CheckState::Success, live), status(CheckState::Pending)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.passed, req.checks.pending), (0, 1));
+            assert_eq!(req.checks.pending_required, vec!["build".to_string()]);
+        }
+        for order in both_orders(run(CheckState::Pending, live), status(CheckState::Failure)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!((req.checks.failed, req.checks.pending), (1, 0));
+        }
+        // Both green: one passed entry, the run's link.
+        for order in both_orders(run(CheckState::Success, live), status(CheckState::Success)) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.checks.total, 1);
+            assert_eq!((req.checks.passed, req.checks.failed), (1, 0));
+            assert_eq!(
+                req.checks.items[0].url.as_deref(),
+                Some("https://ci/run/2026-09-18T11:32:04Z")
+            );
+        }
+        // A green status never covers for a check run that only ever got
+        // cancelled: the run is still the name's live run, and it failed.
+        for order in both_orders(
+            run(CheckState::Cancelled, live),
+            status(CheckState::Success),
+        ) {
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.failed),
+                (1, 0, 1),
+                "{:?}",
+                req.checks.items
+            );
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+        }
+        // The cancelled duplicate still collapses onto the live run when a
+        // status shares the name, and the status's failure still counts.
+        let triple = [
+            run(CheckState::Failure, dup),
+            run(CheckState::Success, live),
+            status(CheckState::Success),
+        ];
+        let blocked = [
+            run(CheckState::Failure, dup),
+            run(CheckState::Success, live),
+            status(CheckState::Failure),
+        ];
+        for perm in PERMUTATIONS_OF_THREE {
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| triple[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.failed),
+                (1, 1, 0),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+            let order: Vec<RollupCheck> = perm.iter().map(|&i| blocked[i].clone()).collect();
+            let req = merge_requirements(&p, Some(&signals(order)), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.failed),
+                (1, 0, 1),
+                "{perm:?}: {:?}",
+                req.checks.items
+            );
+            assert_eq!(req.checks.failing_required, vec!["build".to_string()]);
+        }
+    }
+
+    /// Every ordering of three rollup nodes, as index triples.
+    const PERMUTATIONS_OF_THREE: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
 
     #[test]
     fn merge_requirements_reports_draft_and_conflicts() {
@@ -1726,7 +2457,7 @@ mod tests {
             merge_state_status: Some("DRAFT".into()),
             ..Default::default()
         };
-        let req = merge_requirements(&draft, Some(&signals), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&draft, Some(&signals), &[], &agg(0, 0), Some(0));
         assert_eq!(req.state, "draft");
         assert!(req.is_draft);
         assert_eq!(
@@ -1735,7 +2466,7 @@ mod tests {
         );
 
         let dirty = pr(PrState::Open, false, Some(false), Some("dirty"));
-        let req = merge_requirements(&dirty, None, &[], &agg(0, 0), 0);
+        let req = merge_requirements(&dirty, None, &[], &agg(0, 0), Some(0));
         assert!(req.has_conflicts);
         assert_eq!(req.merge_blocked_reason.as_deref(), Some("merge conflicts"));
 
@@ -1746,7 +2477,7 @@ mod tests {
             merge_state_status: Some("BEHIND".into()),
             ..Default::default()
         };
-        let req = merge_requirements(&unknown, Some(&signals), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&unknown, Some(&signals), &[], &agg(0, 0), Some(0));
         assert!(req.is_behind);
         assert!(!req.has_conflicts);
     }
@@ -1759,7 +2490,7 @@ mod tests {
             is_in_merge_queue: Some(true),
             ..Default::default()
         };
-        let req = merge_requirements(&p, Some(&queued), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&p, Some(&queued), &[], &agg(0, 0), Some(0));
         assert_eq!(req.is_in_merge_queue, Some(true));
         let wire = serde_json::to_value(&req).unwrap();
         assert_eq!(wire["isInMergeQueue"], serde_json::json!(true));
@@ -1774,7 +2505,7 @@ mod tests {
             Some(MergeRequirementSignals::default()),
             None,
         ] {
-            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), 0);
+            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), Some(0));
             assert_eq!(req.is_in_merge_queue, None);
             let wire = serde_json::to_value(&req).unwrap();
             assert!(wire.get("isInMergeQueue").is_none());
@@ -1794,7 +2525,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
         let wire = serde_json::to_value(&req).unwrap();
         assert_eq!(
             wire["mergeQueueEjection"],
@@ -1803,7 +2534,7 @@ mod tests {
 
         // No event, or no probe at all: the key is omitted, never null.
         for signals in [Some(MergeRequirementSignals::default()), None] {
-            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), 0);
+            let req = merge_requirements(&p, signals.as_ref(), &[], &agg(0, 0), Some(0));
             assert_eq!(req.merge_queue_ejection, None);
             let wire = serde_json::to_value(&req).unwrap();
             assert!(wire.get("mergeQueueEjection").is_none());
@@ -1817,7 +2548,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let req = merge_requirements(&p, Some(&no_reason), &[], &agg(0, 0), 0);
+        let req = merge_requirements(&p, Some(&no_reason), &[], &agg(0, 0), Some(0));
         let wire = serde_json::to_value(&req).unwrap();
         assert_eq!(
             wire["mergeQueueEjection"],
@@ -1828,7 +2559,7 @@ mod tests {
     #[test]
     fn merge_requirements_leaves_unknown_mergeability_unresolved() {
         let p = pr(PrState::Open, false, None, Some("unknown"));
-        let req = merge_requirements(&p, None, &[], &agg(0, 0), 0);
+        let req = merge_requirements(&p, None, &[], &agg(0, 0), Some(0));
         assert_eq!(req.mergeable, None);
         assert!(!req.has_conflicts);
         assert!(!req.is_behind);
@@ -1837,6 +2568,38 @@ mod tests {
         let wire = serde_json::to_value(&req).unwrap();
         assert!(wire.get("mergeable").is_none());
         assert!(wire.get("mergeBlockedReason").is_none());
+    }
+
+    #[test]
+    fn unknown_unresolved_thread_count_is_omitted_on_the_wire() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let req = merge_requirements(&p, None, &[], &agg(0, 0), None);
+        assert_eq!(req.threads.unresolved, None);
+        let wire = serde_json::to_value(&req).unwrap();
+        // Presence-detected: the key is omitted, never `null`.
+        assert!(wire["threads"].get("unresolved").is_none());
+        assert!(wire["threads"].get("resolutionRequired").is_none());
+        let back: MergeRequirements = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, req);
+
+        // A known count still serializes as before, and a pre-existing
+        // persisted snapshot without the key deserializes as unknown.
+        let known = merge_requirements(&p, None, &[], &agg(0, 0), Some(2));
+        let wire = serde_json::to_value(&known).unwrap();
+        assert_eq!(wire["threads"]["unresolved"], 2);
+        let present: MergeRequirementsThreads = serde_json::from_value(serde_json::json!({
+            "unresolved": 2,
+            "resolutionRequired": true
+        }))
+        .unwrap();
+        assert_eq!(present.unresolved, Some(2));
+        assert_eq!(present.resolution_required, Some(true));
+        let back: MergeRequirements = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.threads.unresolved, Some(2));
+        let legacy: MergeRequirementsThreads =
+            serde_json::from_value(serde_json::json!({ "resolutionRequired": true })).unwrap();
+        assert_eq!(legacy.unresolved, None);
+        assert_eq!(legacy.resolution_required, Some(true));
     }
 
     #[test]

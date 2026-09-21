@@ -22,23 +22,16 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-uds-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -73,7 +66,7 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>, budget: Duration) -> V
 /// serialized dispatch the slow id=1 response would always be written first;
 /// with concurrent dispatch the fast id=2 response arrives first. Ordering is
 /// robust under host load, unlike fixed wall-clock latency budgets.
-#[tokio::test(flavor = "multi_thread")]
+#[intent_test_macros::daemon_test(flavor = "multi_thread")]
 async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -87,7 +80,7 @@ async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let socket = socket.clone();
         async move {
             let _ = serve_uds(services, bus, &socket, None, async {

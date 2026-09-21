@@ -12,8 +12,8 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,13 +28,12 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -42,19 +41,15 @@ impl Drop for Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
         // Print daemon log for debugging
-        let log_path = self.data_dir.join("daemon.log");
+        let log_path = self.data_dir.path().join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-retry-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-retry-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -64,9 +59,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -298,11 +292,14 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -315,7 +312,8 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
     let Some(script) = gate("WSS spawn retry session/new stall E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let attempt_file = data_dir.join("attempts.txt");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
@@ -325,9 +323,8 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
     })
     .to_string();
     // Fast retry: 500ms timeouts + 100ms,200ms backoff for fast e2e
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -338,7 +335,7 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -438,7 +435,8 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
     let Some(script) = gate("WSS spawn retry stdout closed E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let attempt_file = data_dir.join("attempts.txt");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
@@ -447,9 +445,8 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
         "response": "retry succeeded after exit",
     })
     .to_string();
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -460,7 +457,7 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -553,7 +550,8 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
     let Some(script) = gate("WSS spawn exhaustion terminal failure E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let attempt_file = data_dir.join("attempts.txt");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
@@ -562,9 +560,8 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
         "ignoreSessionNewAttempts": 999,
     })
     .to_string();
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -575,7 +572,7 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -677,7 +674,8 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     let Some(script) = gate("WSS agent.retry recovery E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let attempt_file = data_dir.join("attempts.txt");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
@@ -688,9 +686,8 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
         "response": "retry recovery succeeded",
     })
     .to_string();
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -701,7 +698,7 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -912,7 +909,8 @@ async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
         eprintln!("skipping WSS pi CLI fail-fast E2E: npx not found");
         return;
     }
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
 
     // Fake `pi` that reports a version older than PI_CLI_MIN_VERSION.
@@ -925,16 +923,15 @@ async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
     }
     let fake_pi_str = fake_pi.to_string_lossy().into_owned();
 
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("PI_ACP_PI_COMMAND", &fake_pi_str),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -1071,7 +1068,8 @@ async fn agent_spawn_slow_initialize_succeeds_over_wss() {
     let Some(script) = gate("WSS slow initialize E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
         "initializeDelayMs": 6000,
@@ -1080,9 +1078,8 @@ async fn agent_spawn_slow_initialize_succeeds_over_wss() {
     .to_string();
     // No INTENTD_ACP_INITIALIZE_TIMEOUT_MS: exercise the 30s default, which
     // must tolerate the 6s initialize delay without a handshake timeout.
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
@@ -1090,7 +1087,7 @@ async fn agent_spawn_slow_initialize_succeeds_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");

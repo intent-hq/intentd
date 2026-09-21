@@ -66,18 +66,44 @@ struct ReverseState {
 
 type Pending = Arc<Mutex<ReverseState>>;
 
+/// Remove the registration even when the caller drops the request future.
+struct PendingRequest<'a> {
+    pending: &'a Mutex<ReverseState>,
+    id: &'a str,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .requests
+            .remove(self.id);
+    }
+}
+
 /// Daemon→client reverse-RPC channel for one connection. Cheap to clone (`Arc`
 /// inside); cloning shares the same pending map and id counter.
+///
+/// A channel carries the connection's administrator standing (multiplayer
+/// w3): every reverse RPC (`REVERSE_METHODS` — `browser.exec`,
+/// `host.openExternal`, `host.openInEditor`, `host.pickApplication`,
+/// `providers.setup.openLogin`) is refused before it leaves the daemon when
+/// the connection is bound to a non-administrator principal, and such a
+/// connection is never an eligible target in the [`PrimaryReverseRegistry`].
 #[derive(Clone)]
 pub struct ReverseChannel {
     out_tx: mpsc::Sender<String>,
     pending: Pending,
     next_id: Arc<AtomicU64>,
+    administrator: bool,
 }
 
 impl ReverseChannel {
     /// Build a channel that pushes reverse requests through `out_tx` (the
-    /// connection's outbound frame queue).
+    /// connection's outbound frame queue). The connection is taken to be the
+    /// administrator's (the legacy single-user default); see
+    /// [`ReverseChannel::with_administrator`].
     #[must_use]
     pub fn new(out_tx: mpsc::Sender<String>) -> Self {
         Self {
@@ -87,7 +113,24 @@ impl ReverseChannel {
                 closed: false,
             })),
             next_id: Arc::new(AtomicU64::new(0)),
+            administrator: true,
         }
+    }
+
+    /// Record whether the connection this channel serves is bound to the
+    /// daemon's administrator. `false` makes every [`ReverseChannel::request`]
+    /// fail with [`crate::catalog::FORBIDDEN_ERROR_CODE`] and excludes the
+    /// connection from reverse-target resolution.
+    #[must_use]
+    pub fn with_administrator(mut self, administrator: bool) -> Self {
+        self.administrator = administrator;
+        self
+    }
+
+    /// Whether the connection this channel serves is the administrator's.
+    #[must_use]
+    pub fn is_administrator(&self) -> bool {
+        self.administrator
     }
 
     /// Mint the next `rev-<n>` reverse-request id.
@@ -102,7 +145,10 @@ impl ReverseChannel {
     ///
     /// # Errors
     ///
-    /// Returns [`ReverseError`] if the connection is closed, the response channel is dropped, or the client does not reply within `timeout`.
+    /// Returns [`ReverseError`] if the connection is bound to a
+    /// non-administrator principal (`-32003`, nothing is sent), the connection
+    /// is closed, the response channel is dropped, or the client does not
+    /// reply within `timeout`.
     ///
     /// # Panics
     ///
@@ -113,6 +159,15 @@ impl ReverseChannel {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, ReverseError> {
+        if !self.administrator {
+            return Err(ReverseError {
+                code: i64::from(crate::catalog::FORBIDDEN_ERROR_CODE),
+                message: format!(
+                    "{}: reverse RPC {method} is never routed to a non-administrator connection",
+                    crate::catalog::FORBIDDEN_ERROR_MESSAGE
+                ),
+            });
+        }
         let id = self.mint_id();
         let (tx, rx) = oneshot::channel();
         {
@@ -125,12 +180,16 @@ impl ReverseChannel {
             }
             state.requests.insert(id.clone(), tx);
         }
+        let _registration = PendingRequest {
+            pending: &self.pending,
+            id: &id,
+        };
 
         let frame = serde_json::to_string(&json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params,
         }))
         .unwrap_or_default();
-        let result = match tokio::time::timeout(timeout, async {
+        match tokio::time::timeout(timeout, async {
             self.out_tx.send(frame).await.map_err(|_| ReverseError {
                 code: 0,
                 message: "client connection closed".to_string(),
@@ -147,16 +206,7 @@ impl ReverseChannel {
                 code: 0,
                 message: format!("reverse request timed out: {method}"),
             }),
-        };
-        // `route_response` normally removes the entry first. Every other exit
-        // (queue timeout, response timeout, or closed connection) cleans it up
-        // here so a late response cannot address an abandoned request.
-        self.pending
-            .lock()
-            .expect("reverse pending poisoned")
-            .requests
-            .remove(&id);
-        result
+        }
     }
 
     /// Try to route an inbound frame as a response to a pending reverse request.
@@ -215,7 +265,10 @@ impl ReverseChannel {
 }
 
 pub mod primary;
-pub use primary::{PrimaryReverseGuard, PrimaryReverseRegistry};
+pub use primary::{
+    ClientPresence, ClientTransition, LiveClient, PrimaryReverseGuard, PrimaryReverseRegistry,
+    ResolvedClient, ReverseClientIdentity, ReverseTransport, CLIENT_CONNECTED, CLIENT_DISCONNECTED,
+};
 
 #[cfg(test)]
 mod tests;

@@ -1,27 +1,42 @@
 //! Conversation-history → `<supervisor>` XML formatter for session recovery
-//! (faithful port of `acp-provider.ts` `formatHistoryAsXml` +
+//! (ported from `acp-provider.ts` `formatHistoryAsXml` +
 //! `sanitizeMessagesForHistory`).
 //!
 //! When the resume-impossible fallback creates a fresh `session/new`, the new
 //! ACP session has no prior context. This renders the persisted `agent_message`
-//! log into the same `<supervisor>`-wrapped exchange XML the TS provider sends so
-//! the agent continues seamlessly. Operates on the stored JSON content blocks
-//! (`serde_json::Value`) rather than typed blocks, mirroring the persisted shape.
+//! log into `<supervisor>`-wrapped exchange XML so the agent continues
+//! seamlessly. Operates on the stored JSON content blocks (`serde_json::Value`)
+//! rather than typed blocks, mirroring the persisted shape.
+//!
+//! Sanitization, grouping, budgets and escaping match the TS original; the
+//! output deliberately diverges from it in two places (intent#3696): the
+//! preamble carries a truncation-hint paragraph, and over-cap tool blocks carry
+//! a `truncated="true" original_chars="N"` element attribute.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
+use intent_core::replay_preview::{
+    retruncate_replay_preview, safe_stringify, INPUT_REPLAY_ORIGINAL_CHARS_KEY,
+    OUTPUT_REPLAY_ORIGINAL_CHARS_KEY,
+};
 use intent_core::AgentMessage;
 use serde_json::{json, Value};
 
 /// Max characters of history to include (TS `MAX_HISTORY_CHARS`).
 pub(crate) const MAX_HISTORY_CHARS: usize = 200_000;
-/// Max characters per tool input/output block (TS `MAX_TOOL_CONTENT_CHARS`).
-const MAX_TOOL_CONTENT_CHARS: usize = 4_000;
 /// Max characters for a tool name (TS `MAX_TOOL_NAME_CHARS`).
 const MAX_TOOL_NAME_CHARS: usize = 200;
 
-const SUPERVISOR_PREAMBLE: &str = "<supervisor>\nThe previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\nDo NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\n";
+/// Recovery-replay preamble. The truncation-hint paragraph (intent#3696) tells
+/// the model that abbreviated tool blocks are a replay artefact, not broken or
+/// empty tool output, so it does not loop re-fetching the same inputs; it
+/// names the configured per-block cap (`agents.historyReplayToolContentChars`).
+fn supervisor_preamble(tool_content_chars: usize) -> String {
+    format!(
+        "<supervisor>\nThe previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\nDo NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\nNote on this replay: some tool inputs and tool outputs below are abbreviated by the recovery replay. Any tool_use input or tool_result output longer than {tool_content_chars} characters is middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element); blocks without that attribute are complete. Older exchanges may be omitted entirely. Truncation here does NOT mean the tool failed or returned empty output; the original call ran and its full result was delivered at the time. If you genuinely need one specific full output, re-run that ONE call once. Do not re-fetch the same inputs repeatedly.\n\n"
+    )
+}
 const SUPERVISOR_CLOSING: &str =
     "Continue the conversation from this point. Do not mention session recovery or interruption.\n</supervisor>";
 
@@ -35,33 +50,46 @@ pub(crate) fn escape_xml(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Middle-truncate `text` to `max_chars`, keeping the head and tail (TS
-/// `truncateMiddleContent`). Operates on chars to stay on UTF-8 boundaries.
-/// Also used by the restart-resume tail recap (monorepo#2539) to bound the
-/// replayed user/partial-response text.
-pub(crate) fn truncate_middle_content(text: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    if len <= max_chars {
-        return text.to_string();
-    }
-    // 60 chars reserved for the "... [N characters truncated] ..." marker.
-    let half_budget = max_chars.saturating_sub(60) / 2;
-    if half_budget == 0 {
-        return chars[..max_chars.min(len)].iter().collect();
-    }
-    let start: String = chars[..half_budget].iter().collect();
-    let end: String = chars[len - half_budget..].iter().collect();
-    let omitted = len - half_budget * 2;
-    format!("{start}\n... [{omitted} characters truncated] ...\n{end}")
+/// The element attribute suffix (` truncated="true" original_chars="N"`) that
+/// marks a block as abbreviated (intent#3696), or `""` when it fit whole.
+fn truncated_attrs(original_chars: Option<usize>) -> String {
+    original_chars.map_or_else(String::new, |n| {
+        format!(" truncated=\"true\" original_chars=\"{n}\"")
+    })
 }
 
-/// Stringify a value (TS `safeStringify`): strings pass through; everything else
-/// is JSON-encoded.
-fn safe_stringify(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
+/// Middle-truncate `text` to `max_chars` and return the truncation attribute
+/// suffix (see [`truncated_attrs`]). Shared by the history replay's tool
+/// blocks and the restart-resume tail recap's segments (monorepo#2539) so
+/// both recovery prompts carry the same marker convention; the truncation
+/// itself is `intent_core::replay_preview::truncate_marked`.
+pub(crate) fn truncate_marked(text: &str, max_chars: usize) -> (String, String) {
+    let (text, original_chars) = intent_core::replay_preview::truncate_marked(text, max_chars);
+    (text, truncated_attrs(original_chars))
+}
+
+/// Middle-truncate a tool input/output (`heavy` is the `input` / `output`
+/// value) to `max_chars` and return the truncation attribute suffix. A block
+/// carrying the replay-preview marker (`marker_key`, see
+/// `intent_core::replay_preview`) holds a pre-truncated string: it renders as
+/// the full body would at `max_chars` (re-truncated when the cap shrank,
+/// never expanded).
+fn truncate_tool_content(
+    block: &Value,
+    marker_key: &str,
+    heavy: &Value,
+    max_chars: usize,
+) -> (String, String) {
+    let original_chars = block
+        .get(marker_key)
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok());
+    match (original_chars, heavy) {
+        (Some(n), Value::String(preview)) => {
+            let (text, original) = retruncate_replay_preview(preview, n, max_chars);
+            (text, truncated_attrs(original))
+        }
+        _ => truncate_marked(&safe_stringify(heavy), max_chars),
     }
 }
 
@@ -220,8 +248,8 @@ fn sanitize_messages_for_history(messages: &[AgentMessage]) -> Vec<Msg> {
 
 /// Render a message's content blocks into XML fragments (TS
 /// `renderContentBlocks`): `text/thinking/tool_use/tool_result`, each escaped and
-/// (for tool blocks) middle-truncated.
-fn render_content_blocks(blocks: &[Value], indent: &str) -> String {
+/// (for tool blocks) middle-truncated to `tool_content_chars`.
+fn render_content_blocks(blocks: &[Value], indent: &str, tool_content_chars: usize) -> String {
     let mut xml = String::new();
     for block in blocks {
         match block.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -251,13 +279,16 @@ fn render_content_blocks(blocks: &[Value], indent: &str) -> String {
                     Some(v) if is_truthy(v) => v.clone(),
                     _ => json!({}),
                 };
-                let input_str = escape_xml(&truncate_middle_content(
-                    &safe_stringify(&raw_input),
-                    MAX_TOOL_CONTENT_CHARS,
-                ));
+                let (input_str, truncated_attrs) = truncate_tool_content(
+                    block,
+                    INPUT_REPLAY_ORIGINAL_CHARS_KEY,
+                    &raw_input,
+                    tool_content_chars,
+                );
+                let input_str = escape_xml(&input_str);
                 let _ = writeln!(
                     xml,
-                    "{indent}<tool_use name=\"{tool_name}\" tool_use_id=\"{tool_use_id}\">"
+                    "{indent}<tool_use name=\"{tool_name}\" tool_use_id=\"{tool_use_id}\"{truncated_attrs}>"
                 );
                 let _ = writeln!(xml, "{indent}  {input_str}");
                 let _ = writeln!(xml, "{indent}</tool_use>");
@@ -267,13 +298,16 @@ fn render_content_blocks(blocks: &[Value], indent: &str) -> String {
                 let is_error = bool_field(block, &["is_error", "isError"]);
                 let content = first_truthy(block, &["output", "content"])
                     .unwrap_or(Value::String(String::new()));
-                let content_str = escape_xml(&truncate_middle_content(
-                    &safe_stringify(&content),
-                    MAX_TOOL_CONTENT_CHARS,
-                ));
+                let (content_str, truncated_attrs) = truncate_tool_content(
+                    block,
+                    OUTPUT_REPLAY_ORIGINAL_CHARS_KEY,
+                    &content,
+                    tool_content_chars,
+                );
+                let content_str = escape_xml(&content_str);
                 let _ = writeln!(
                     xml,
-                    "{indent}<tool_result tool_use_id=\"{tool_use_id}\" is_error=\"{is_error}\">"
+                    "{indent}<tool_result tool_use_id=\"{tool_use_id}\" is_error=\"{is_error}\"{truncated_attrs}>"
                 );
                 let _ = writeln!(xml, "{indent}  {content_str}");
                 let _ = writeln!(xml, "{indent}</tool_result>");
@@ -293,12 +327,19 @@ struct Exchange {
 
 /// Format conversation `messages` as `<supervisor>`-wrapped exchange XML for
 /// session recovery (TS `formatHistoryAsXml`). Groups user→assistant pairs,
-/// renders newest-first within a `max_chars` budget, and emits an omission
+/// renders newest-first within a `max_chars` budget, middle-truncates each
+/// tool input/output to `tool_content_chars` (the live
+/// `agents.historyReplayToolContentChars` setting), and emits an omission
 /// comment for older exchanges that did not fit. Returns `""` for empty input.
-pub(crate) fn format_history_as_xml(messages: &[AgentMessage], max_chars: usize) -> String {
+pub(crate) fn format_history_as_xml(
+    messages: &[AgentMessage],
+    max_chars: usize,
+    tool_content_chars: usize,
+) -> String {
     if messages.is_empty() {
         return String::new();
     }
+    let preamble = supervisor_preamble(tool_content_chars);
     let sanitized = sanitize_messages_for_history(messages);
 
     let mut exchanges: Vec<Exchange> = Vec::new();
@@ -342,7 +383,11 @@ pub(crate) fn format_history_as_xml(messages: &[AgentMessage], max_chars: usize)
             let mut s = String::from("<exchange>\n");
             if let Some(user) = &ex.user {
                 s.push_str("  <user_request_or_tool_results>\n");
-                s.push_str(&render_content_blocks(&user.blocks, "    "));
+                s.push_str(&render_content_blocks(
+                    &user.blocks,
+                    "    ",
+                    tool_content_chars,
+                ));
                 s.push_str("  </user_request_or_tool_results>\n");
             }
             for assistant in &ex.assistants {
@@ -352,7 +397,11 @@ pub(crate) fn format_history_as_xml(messages: &[AgentMessage], max_chars: usize)
                     "agent_response_or_tool_uses"
                 };
                 let _ = writeln!(s, "  <{tag}>");
-                s.push_str(&render_content_blocks(&assistant.blocks, "    "));
+                s.push_str(&render_content_blocks(
+                    &assistant.blocks,
+                    "    ",
+                    tool_content_chars,
+                ));
                 let _ = writeln!(s, "  </{tag}>");
             }
             s.push_str("</exchange>\n");
@@ -360,7 +409,7 @@ pub(crate) fn format_history_as_xml(messages: &[AgentMessage], max_chars: usize)
         })
         .collect();
 
-    let wrapper_overhead = SUPERVISOR_PREAMBLE.len() + SUPERVISOR_CLOSING.len();
+    let wrapper_overhead = preamble.len() + SUPERVISOR_CLOSING.len();
     let max_omission_comment = format!(
         "<!-- {} earlier exchanges omitted due to size limits -->\n",
         exchange_xml_strings.len()
@@ -391,7 +440,7 @@ pub(crate) fn format_history_as_xml(messages: &[AgentMessage], max_chars: usize)
     }
     exchanges_xml.push_str(&included.concat());
 
-    format!("{SUPERVISOR_PREAMBLE}{exchanges_xml}{SUPERVISOR_CLOSING}")
+    format!("{preamble}{exchanges_xml}{SUPERVISOR_CLOSING}")
 }
 
 #[cfg(test)]

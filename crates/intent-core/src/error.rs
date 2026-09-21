@@ -124,6 +124,233 @@ pub enum Error {
     /// "source control auth error" (monorepo#2961). Surfaces as `-32603`.
     #[error("source control rate limited: {0}")]
     RateLimited(String),
+
+    /// The bound caller lacks the capability for this operation (multiplayer
+    /// w3 capability matrix: an Owner-only or administrator-only method
+    /// invoked by a collaborator). Surfaces as `-32003 Forbidden` — the same
+    /// code the transport's default-deny allowlist uses — so a client cannot
+    /// tell a service-layer refusal from a transport one. A non-member is
+    /// answered with `NotFound`, never `Forbidden`, so membership itself is
+    /// not disclosed.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
+    /// A workspace-invite operation was refused for a reason the client must
+    /// key off machine-readably (multiplayer w4): the invite is unknown /
+    /// expired / revoked / already redeemed, the pinned GitHub login does not
+    /// match the authorizing account, the owner has no GitHub identity to
+    /// invite from, or the gist identity proof did not check out. Surfaces
+    /// as `-32602` (`-32603` for the daemon-side conditions) with
+    /// `error.data = { code: kind.as_str() }`.
+    #[error("{}", .0.message())]
+    Invite(InviteErrorKind),
+
+    /// A guest-side gist identity-proof operation
+    /// (`github.identityProof.create` / `github.identityProof.delete`) was
+    /// refused for a reason the client must key off machine-readably: no
+    /// GitHub token is stored, the stored token lacks the `gist` scope, or
+    /// GitHub could not be reached. Surfaces as `-32603` with
+    /// `error.data = { code: kind.as_str() }`.
+    #[error("{}", .0.message())]
+    IdentityProof(IdentityProofErrorKind),
+}
+
+/// Machine-readable reason a gist identity-proof operation was refused,
+/// surfaced on the wire as `error.data.code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProofErrorKind {
+    /// No GitHub token is stored (`github.connect` never completed, or the
+    /// token was revoked / rejected by GitHub).
+    NotConnected,
+    /// The stored token lacks the `gist` OAuth scope; the user must
+    /// re-authorize (`github.connect`) to grant it.
+    ScopeMissing,
+    /// GitHub could not be reached.
+    Unreachable,
+}
+
+impl IdentityProofErrorKind {
+    /// Stable wire identifier for this kind (`error.data.code`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentityProofErrorKind::NotConnected => "github-not-connected",
+            IdentityProofErrorKind::ScopeMissing => "github-scope-missing",
+            IdentityProofErrorKind::Unreachable => "github-unreachable",
+        }
+    }
+
+    /// Human-readable message for this kind.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            IdentityProofErrorKind::NotConnected => {
+                "internal error: GitHub is not connected — sign in (github.connect) before \
+                 proving your identity"
+            }
+            IdentityProofErrorKind::ScopeMissing => {
+                "internal error: the stored GitHub token lacks the `gist` scope — sign in again \
+                 (github.connect) to grant it"
+            }
+            IdentityProofErrorKind::Unreachable => "internal error: GitHub could not be reached",
+        }
+    }
+}
+
+/// Machine-readable reason an invite / join operation was refused, surfaced
+/// on the wire as `error.data.code` (multiplayer w4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteErrorKind {
+    /// No invite has this id, or the secret does not match it.
+    NotFound,
+    /// The invite's `expiresAt` has passed.
+    Expired,
+    /// The owner revoked the invite.
+    Revoked,
+    /// The invite was already redeemed (single use).
+    Redeemed,
+    /// The invite is pinned to another GitHub login.
+    PinMismatch,
+    /// The pinned login does not name a GitHub account.
+    PinUnknown,
+    /// Minting an invite requires the owner's linked GitHub identity
+    /// (`github.authStatus.isConfigured`).
+    GithubIdentityRequired,
+    /// The primary user's GitHub identity cannot change while other
+    /// principals or open invites exist (reconnect guard).
+    IdentityLocked,
+    /// The host is throttling unauthenticated invite requests: the
+    /// listener-wide start budget (a token bucket, so a burst of serial
+    /// requests trips it with nothing in flight) or the outstanding-nonce
+    /// cap is spent; retry later.
+    FlowBusy,
+    /// The workspace's guest cap (`sharing.maxGuestsPerWorkspace`) is spent
+    /// by its collaborators plus open invites; no further invite is minted.
+    GuestLimit,
+    /// The workspace's collaborators already reach the guest cap; the join
+    /// is refused and the invite stays open.
+    WorkspaceFull,
+    /// The `credential` an `invite.accept` presented is unknown to this host
+    /// or was revoked; the guest must join through the gist identity proof.
+    CredentialInvalid,
+    /// The gist an `invite.prove` named does not prove the claimed login:
+    /// unknown gist, another owner, no proof file or a first line that is
+    /// not the nonce, a gist created before the nonce was issued, or a
+    /// nonce this host never issued for the invite (or already consumed).
+    ProofInvalid,
+    /// The nonce an `invite.prove` presented was issued but its 10-minute
+    /// lifetime passed; the guest must start over with `invite.challenge`.
+    ProofExpired,
+    /// GitHub could not be reached (or answered a server error) while
+    /// verifying the proof gist; the nonce stays valid for a retry.
+    GithubUnreachable,
+    /// The proven (or credential-bound) GitHub account is the host owner's
+    /// own — the primary principal. The owner cannot join its own host as a
+    /// guest: no per-principal credential is ever minted for the primary
+    /// row, and the invite stays open.
+    OwnerSelfJoin,
+}
+
+impl InviteErrorKind {
+    /// Stable wire identifier for this kind (`error.data.code`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InviteErrorKind::NotFound => "invite-not-found",
+            InviteErrorKind::Expired => "invite-expired",
+            InviteErrorKind::Revoked => "invite-revoked",
+            InviteErrorKind::Redeemed => "invite-redeemed",
+            InviteErrorKind::PinMismatch => "invite-pin-mismatch",
+            InviteErrorKind::PinUnknown => "invite-pin-unknown",
+            InviteErrorKind::GithubIdentityRequired => "github-identity-required",
+            InviteErrorKind::IdentityLocked => "primary-identity-locked",
+            InviteErrorKind::FlowBusy => "invite-flow-busy",
+            InviteErrorKind::GuestLimit => "guest-limit",
+            InviteErrorKind::WorkspaceFull => "workspace-full",
+            InviteErrorKind::CredentialInvalid => "credential-invalid",
+            InviteErrorKind::ProofInvalid => "proof-invalid",
+            InviteErrorKind::ProofExpired => "proof-expired",
+            InviteErrorKind::GithubUnreachable => "github-unreachable",
+            InviteErrorKind::OwnerSelfJoin => "owner-self-join",
+        }
+    }
+
+    /// Human-readable message for this kind.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            InviteErrorKind::NotFound => "invalid params: invite not found",
+            InviteErrorKind::Expired => "invalid params: invite has expired",
+            InviteErrorKind::Revoked => "invalid params: invite was revoked",
+            InviteErrorKind::Redeemed => "invalid params: invite was already redeemed",
+            InviteErrorKind::PinMismatch => {
+                "invalid params: this invite is pinned to a different GitHub account"
+            }
+            InviteErrorKind::PinUnknown => {
+                "invalid params: pinLogin does not name a GitHub account"
+            }
+            InviteErrorKind::GithubIdentityRequired => {
+                "unsupported: inviting requires a linked GitHub identity — connect GitHub \
+                 (github.connect) before creating an invite"
+            }
+            InviteErrorKind::IdentityLocked => {
+                "unsupported: the primary GitHub identity cannot change while other \
+                 principals or open invites exist"
+            }
+            InviteErrorKind::FlowBusy => {
+                "internal error: the host is throttling invite requests; retry shortly"
+            }
+            InviteErrorKind::GuestLimit => {
+                "invalid params: this workspace has reached its guest limit (collaborators \
+                 plus open invites); revoke an invite or remove a member first"
+            }
+            InviteErrorKind::WorkspaceFull => {
+                "invalid params: this workspace has reached its guest limit; ask the owner \
+                 to make room"
+            }
+            InviteErrorKind::CredentialInvalid => {
+                "invalid params: the credential is unknown to this host or was revoked; \
+                 join through the GitHub identity proof instead"
+            }
+            InviteErrorKind::ProofInvalid => {
+                "invalid params: the gist does not prove the claimed GitHub identity for \
+                 this invite"
+            }
+            InviteErrorKind::ProofExpired => {
+                "invalid params: the identity-proof nonce expired; request a new challenge"
+            }
+            InviteErrorKind::GithubUnreachable => {
+                "internal error: GitHub could not be reached to verify the identity proof"
+            }
+            InviteErrorKind::OwnerSelfJoin => {
+                "invalid params: this GitHub account owns the host; open it from your \
+                 paired daemons instead of joining as a guest"
+            }
+        }
+    }
+
+    /// JSON-RPC 2.0 numeric error code for this kind.
+    #[must_use]
+    pub fn code(self) -> i32 {
+        match self {
+            InviteErrorKind::NotFound
+            | InviteErrorKind::Expired
+            | InviteErrorKind::Revoked
+            | InviteErrorKind::Redeemed
+            | InviteErrorKind::PinMismatch
+            | InviteErrorKind::PinUnknown
+            | InviteErrorKind::GuestLimit
+            | InviteErrorKind::WorkspaceFull
+            | InviteErrorKind::CredentialInvalid
+            | InviteErrorKind::ProofInvalid
+            | InviteErrorKind::ProofExpired
+            | InviteErrorKind::OwnerSelfJoin => -32602,
+            InviteErrorKind::GithubIdentityRequired
+            | InviteErrorKind::IdentityLocked
+            | InviteErrorKind::FlowBusy
+            | InviteErrorKind::GithubUnreachable => -32603,
+        }
+    }
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -199,9 +426,12 @@ impl Error {
             | Error::WarmInFlight { .. }
             | Error::AdapterBusy { .. }
             | Error::RateLimited(_)
+            | Error::IdentityProof(_)
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
+            Error::Forbidden(_) => -32003,
+            Error::Invite(kind) => kind.code(),
         }
     }
 }

@@ -13,6 +13,7 @@ pub use intent_core::{
 };
 
 pub use cow::{cow_clone, cow_probe, CowSupport, TEST_COW_CLONE_UNSUPPORTED_PATH_ENV};
+pub use local_changes::{local_changes, LocalChanges, MAX_UNPUSHED_COUNT};
 
 pub mod auth;
 pub mod branches;
@@ -25,6 +26,7 @@ pub mod fetch;
 pub mod fs_remove;
 pub mod history;
 pub mod identity;
+pub mod local_changes;
 pub mod ls_remote;
 pub mod pull;
 pub mod push;
@@ -51,7 +53,7 @@ pub(crate) const SLOW_GIT_WARN_THRESHOLD: std::time::Duration = std::time::Durat
 
 /// Map a libgit2 error into the domain [`Error::Internal`] (`-32603`).
 // By-value so it slots point-free into `map_err(map_git_err)` everywhere.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub(crate) fn map_git_err(e: git2::Error) -> Error {
     Error::Internal(e.message().to_string())
 }

@@ -71,10 +71,10 @@ pub struct ResumeEvent {
     /// Detected suspend duration (wall skew) preceding this resume.
     pub suspended_for: Duration,
     /// Monotonic instant of the last sample before the gap.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub before: Instant,
     /// Monotonic instant of the first sample after the gap (the resume tick).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub after: Instant,
 }
 
@@ -260,7 +260,7 @@ pub fn spawn_suspend_detector(threshold: Duration) -> Arc<SuspendTracker> {
         threshold_secs = threshold.as_secs(),
         "suspend/wake detector started"
     );
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let period = Duration::from_secs(1);
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

@@ -17,13 +17,14 @@ use tokio::sync::broadcast;
 
 use intent_core::{Error, Result};
 
-use crate::scrollback::{Scrollback, DEFAULT_SCROLLBACK_BYTES};
+use crate::scrollback::{LineSnapshot, Scrollback, DEFAULT_SCROLLBACK_BYTES};
 
 /// Broadcast backlog of output chunks buffered per subscriber before lagging.
 const FANOUT_CAPACITY: usize = 2048;
 /// Read chunk size for the PTY reader loop.
 const READ_CHUNK: usize = 8192;
 /// Grace period between SIGTERM and SIGKILL during teardown (mirrors M5).
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for a signalled child to exit.
 const REAP_POLL: Duration = Duration::from_millis(20);
@@ -96,10 +97,34 @@ impl PtySize {
 /// that need richer parity treat a non-success code as the failure indicator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PtyExit {
-    /// The raw process exit code as reported by the platform.
+    /// The raw process exit code as reported by the platform. When
+    /// `observed` is `false` this is the placeholder failure code
+    /// [`PtyExit::UNOBSERVABLE_CODE`], not anything the child reported.
     pub exit_code: u32,
     /// Whether the process exited successfully (code 0).
     pub success: bool,
+    /// Whether the platform actually reported the status. `false` when the
+    /// child is gone but its status could not be read — `waitpid` failed
+    /// (e.g. `ECHILD` after an out-of-band reap) — so the exit is terminal but
+    /// its real code is unknown; callers surface it as unobservable rather
+    /// than trusting `exit_code`.
+    pub observed: bool,
+}
+
+impl PtyExit {
+    /// Placeholder `exit_code` for an exit whose status could not be read.
+    pub const UNOBSERVABLE_CODE: u32 = 1;
+
+    /// The terminal-but-unobservable exit: the child is gone, its status is
+    /// not readable, and consumers must not wait for it any longer.
+    #[must_use]
+    pub const fn unobservable() -> Self {
+        Self {
+            exit_code: Self::UNOBSERVABLE_CODE,
+            success: false,
+            observed: false,
+        }
+    }
 }
 
 /// A signal to deliver to a PTY's process group.
@@ -228,22 +253,31 @@ struct PtySession {
 
 /// Latch and return a session's exit status: returns the cached value, or polls
 /// the child once (non-blocking) and caches the result when it has exited.
+///
+/// A `try_wait` failure other than `EINTR` (e.g. `ECHILD`: the child was
+/// already reaped out of band, so its status is gone for good) is latched as
+/// [`PtyExit::unobservable`] — terminal, so `wait()` and every exit-polling
+/// consumer settle instead of reporting "still running" forever.
 fn observe_exit(session: &PtySession) -> Option<PtyExit> {
     let mut cached = session.exit.lock().unwrap();
     if let Some(exit) = cached.as_ref() {
         return Some(exit.clone());
     }
-    match session.child.lock().unwrap().try_wait() {
-        Ok(Some(status)) => {
-            let exit = PtyExit {
-                exit_code: status.exit_code(),
-                success: status.success(),
-            };
-            *cached = Some(exit.clone());
-            Some(exit)
+    let exit = match session.child.lock().unwrap().try_wait() {
+        Ok(Some(status)) => PtyExit {
+            exit_code: status.exit_code(),
+            success: status.success(),
+            observed: true,
+        },
+        Ok(None) => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return None,
+        Err(e) => {
+            tracing::warn!(pid = ?session.pid, error = %e, "pty child status unobservable; latching exit");
+            PtyExit::unobservable()
         }
-        _ => None,
-    }
+    };
+    *cached = Some(exit.clone());
+    Some(exit)
 }
 
 fn internal(e: impl std::fmt::Display) -> Error {
@@ -429,6 +463,61 @@ impl PtyHost {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
         Ok(guard.scrollback.snapshot())
+    }
+
+    /// Snapshot at most the trailing `max_bytes` of retained scrollback without
+    /// first cloning the retained prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned.
+    pub fn scrollback_tail(&self, id: PtyId, max_bytes: usize) -> Result<Vec<u8>> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.snapshot_tail(max_bytes))
+    }
+
+    /// Snapshot an oldest-indexed line window from retained scrollback. The
+    /// total line count and bytes come from one lock acquisition, so concurrent
+    /// appends cannot make the header/cursor disagree with the copied range.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned.
+    pub fn scrollback_lines(
+        &self,
+        id: PtyId,
+        max_lines: usize,
+        end_line: Option<usize>,
+    ) -> Result<LineSnapshot> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.snapshot_lines(max_lines, end_line))
+    }
+
+    /// Cumulative line-snapshot call and backward-scan counts for regression
+    /// tests that exercise scrollback through the service surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session fanout mutex is poisoned.
+    #[doc(hidden)]
+    pub fn scrollback_line_snapshot_metrics(&self, id: PtyId) -> Result<(usize, usize)> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.line_snapshot_metrics())
     }
 
     /// The PTY child's process id, if the platform reported one at spawn.
@@ -626,6 +715,13 @@ impl PtyHost {
     /// # Panics
     ///
     /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_async,
+            reason = "async on every platform; the group escalation awaits only on unix"
+        )
+    )]
     pub async fn reap_group_stragglers(&self, id: PtyId) {
         let Ok(session) = self.get(id) else { return };
         #[cfg(unix)]
@@ -643,7 +739,7 @@ impl PtyHost {
 
     /// Kill every PTY under `scope` (session/workspace teardown). Returns the
     /// number reaped. No process-group orphans are left behind.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn kill_scope(&self, scope: &str) -> usize {
         let victims: Vec<Arc<PtySession>> = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -694,6 +790,41 @@ impl PtyHost {
             }
         }
         count
+    }
+
+    /// SIGKILL every tracked session's process group immediately, without
+    /// awaiting: the synchronous, drop-safe counterpart to
+    /// [`kill_all`](Self::kill_all) for guards that run while a runtime is
+    /// unwinding (a panicking test harness) and so cannot await the TERM
+    /// grace. Latches the host closed exactly like `kill_all`, so a
+    /// supervisor that observes the exit and respawns is refused and its
+    /// child reaped in place. Sessions stay registered: each exit watcher
+    /// reaps its direct child and latches the status. Tolerates a poisoned
+    /// sessions lock so a panicking caller never double-panics. Returns the
+    /// number of sessions signalled.
+    pub fn kill_all_sync(&self) -> usize {
+        self.closed.store(true, Ordering::SeqCst);
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for session in sessions.values() {
+            #[cfg(unix)]
+            {
+                if let Some(pid) = session.pid {
+                    let _ = kill_group(pid, PtySignal::Kill);
+                } else if let Ok(mut killer) = session.killer.lock() {
+                    let _ = killer.kill();
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Ok(mut killer) = session.killer.lock() {
+                    let _ = killer.kill();
+                }
+            }
+        }
+        sessions.len()
     }
 
     fn get(&self, id: PtyId) -> Result<Arc<PtySession>> {
@@ -809,6 +940,13 @@ fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
 /// Terminate a session's whole process group (SIGTERM→grace→SIGKILL), then drop
 /// the master and join the reader thread. The PTY child is a `setsid` session
 /// leader so `killpg` reaps grandchildren too (no orphans, mirroring M5).
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unused_async,
+        reason = "async on every platform; the group escalation awaits only on unix"
+    )
+)]
 async fn teardown(session: &PtySession) {
     #[cfg(unix)]
     {
@@ -1292,6 +1430,72 @@ mod tests {
         assert_eq!(host.count(), 0);
     }
 
+    /// Stand-in for a child that was reaped out of band: every `waitpid`
+    /// fails with `ECHILD`, so the real status is gone for good.
+    #[derive(Debug)]
+    struct ReapedElsewhere;
+
+    impl ChildKiller for ReapedElsewhere {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(ReapedElsewhere)
+        }
+    }
+
+    impl Child for ReapedElsewhere {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Err(nix::errno::Errno::ECHILD.into())
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Err(nix::errno::Errno::ECHILD.into())
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A `try_wait` failure (the child was reaped by someone else, so
+    /// `waitpid` reports `ECHILD` forever) is latched as a terminal,
+    /// unobservable exit instead of being reported as "still running" on
+    /// every poll — otherwise `wait()` and every exit-polling consumer would
+    /// spin until the daemon dies.
+    #[tokio::test]
+    async fn try_exit_latches_unobservable_exit_when_try_wait_fails() {
+        let host = PtyHost::new();
+        let mut spec = SpawnSpec::new("s", "sleep");
+        spec.args = vec!["30".into()];
+        let id = host.spawn(spec).unwrap();
+        assert_eq!(host.try_exit(id).unwrap(), None, "child is alive");
+
+        let session = host.get(id).unwrap();
+        *session.child.lock().unwrap() = Box::new(ReapedElsewhere);
+
+        let exit = host
+            .try_exit(id)
+            .unwrap()
+            .expect("try_wait failure is a terminal exit, not None");
+        assert!(!exit.observed, "status could not be read: {exit:?}");
+        assert!(!exit.success, "unobservable counts as failure: {exit:?}");
+        assert_eq!(
+            host.try_exit(id).unwrap().as_ref(),
+            Some(&exit),
+            "latched: later polls return the same exit"
+        );
+        let waited = tokio::time::timeout(Duration::from_secs(5), host.wait(id))
+            .await
+            .expect("wait() settles instead of spinning")
+            .unwrap();
+        assert_eq!(waited, exit);
+
+        host.kill(id).await;
+        assert_eq!(host.count(), 0);
+    }
+
     /// A long-running child keeps the held slave and its reader thread until
     /// teardown; `kill()` releases both and joins the reader and watcher
     /// threads promptly (no leak on the kill path either).
@@ -1472,6 +1676,71 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// `kill_all_sync` (intent-hq/intentd#1822 follow-up): a synchronous
+    /// sweep SIGKILLs every tracked process group — including a TERM+HUP
+    /// trapping descendant — returns without awaiting, leaves the sessions
+    /// registered with their exit latched by the watcher, and closes the host
+    /// so a respawn racing the sweep is refused.
+    #[tokio::test]
+    async fn kill_all_sync_kills_every_group_and_closes_host() {
+        let host = PtyHost::new();
+        let plain = host.spawn(cat_spec("scope-a")).unwrap();
+        let mut spec = SpawnSpec::new("scope-b", "sh");
+        spec.args = vec![
+            "-c".into(),
+            r#"sh -c 'trap "" TERM HUP; echo "trapped-$$"; while :; do sleep 1; done' & sleep 300"#
+                .into(),
+        ];
+        let trapped = host.spawn(spec).unwrap();
+        let leader = host.pid(trapped).expect("leader pid");
+
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        let descendant: u32 = loop {
+            let out = host.scrollback(trapped).unwrap();
+            let text = String::from_utf8_lossy(&out);
+            if let Some(pid) = text
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("trapped-").and_then(|p| p.parse().ok()))
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid never printed within deadline; scrollback: {text:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            pid_alive(descendant),
+            "descendant alive before kill_all_sync"
+        );
+
+        let started = Instant::now();
+        assert_eq!(host.kill_all_sync(), 2);
+        assert!(
+            started.elapsed() < TERM_GRACE,
+            "kill_all_sync must not await the TERM grace"
+        );
+        assert_eq!(host.count(), 2, "sessions stay registered");
+
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        while pid_alive(descendant) || !process_group_empty(leader) {
+            assert!(
+                Instant::now() < deadline,
+                "process group {leader} (descendant {descendant}) survived kill_all_sync"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for id in [plain, trapped] {
+            let exit = host.wait(id).await.expect("exit latched");
+            assert!(!exit.success, "{id} was killed: {exit:?}");
+        }
+        let err = host
+            .spawn(cat_spec("scope-late"))
+            .expect_err("spawn refused after kill_all_sync");
+        assert!(err.to_string().contains("shut down"), "{err}");
     }
 
     /// A `spawn` racing `kill_all` (monorepo#1526): a request already in

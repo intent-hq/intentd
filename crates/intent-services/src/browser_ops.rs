@@ -219,6 +219,25 @@ pub fn shape_agent_result(
     shape_result(fe_response)
 }
 
+/// The tab ids of every `claimTab` action the FE reports as succeeded in
+/// `fe_response` (`{ action: "claimTab", success: true, result: { tabId } }`),
+/// restricted to the `requested` ids of the batch. Used by the claim
+/// migration (REV-2 Model 5): only a claim the driving client actually
+/// executed re-homes its registry row. A malformed envelope yields nothing.
+#[must_use]
+pub fn successful_claims(fe_response: &Value, requested: &[String]) -> Vec<String> {
+    fe_response
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|r| r["action"] == "claimTab" && r["success"] == true)
+        .filter_map(|r| r["result"]["tabId"].as_str())
+        .filter(|id| requested.iter().any(|req| req == id))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Build the wire payload for the single-action case: pass the FE's action
 /// envelope through unchanged. The daemon neither unwraps `result` nor
 /// re-maps action-level `error`s — it forwards exactly what the FE gave us.

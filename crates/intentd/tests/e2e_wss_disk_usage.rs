@@ -15,7 +15,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,13 +41,6 @@ use common::TlsWs;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -145,7 +137,7 @@ struct Fixture {
     cfg: Arc<ClientConfig>,
     ws_id: WorkspaceId,
     skip_ws_id: WorkspaceId,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Seed a minimal workspace row. `worktree_path` decides whether the row has
@@ -192,9 +184,12 @@ fn seed_workspace(title: &str, worktree_path: Option<String>, skip_worktree: boo
         waiting: false,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -203,9 +198,8 @@ fn seed_workspace(title: &str, worktree_path: Option<String>, skip_worktree: boo
 /// (`<root>/<id>/repo` checkout containing a file of known size) and one
 /// direct-mode (`skipWorktree: true`, no directory at all).
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-disk-usage-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = common::test_tempdir("intentd-disk-usage-");
+    let dir = tmp.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -251,7 +245,7 @@ async fn boot() -> Fixture {
         cfg,
         ws_id: managed.id,
         skip_ws_id: skip.id,
-        _dir: TempDir(dir),
+        _dir: tmp,
     }
 }
 
@@ -320,7 +314,7 @@ fn assert_disk_usage_shape(du: &Value) {
 /// entry reads `refreshing: false`. The direct-mode row answers
 /// `{ refreshing: false }` without the field, and an unknown id is the
 /// standard not-found error envelope.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn disk_usage_method_serves_on_demand_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
@@ -390,7 +384,7 @@ async fn disk_usage_method_serves_on_demand_over_wss() {
 /// The aggregate left the hot read path: `workspace.get` and `workspace.list`
 /// rows never carry `diskUsage`, even after an on-demand call populated the
 /// cache for the same workspace.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn disk_usage_never_appears_on_list_or_get_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;

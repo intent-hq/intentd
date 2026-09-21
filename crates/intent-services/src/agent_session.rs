@@ -26,7 +26,7 @@ use intent_core::events::{
 };
 use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, AgentSession, ContextUsage, Error, EventActor,
-    Result, UsageCost, WorkspaceId, WorkspaceStatus,
+    MessageOrigin, Result, UsageCost, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -147,6 +147,41 @@ pub(crate) const PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX: &str = "[turn streamed out
 pub(crate) const PROMPT_SUSPEND_INTERRUPT_PREFIX: &str =
     "session/prompt interrupted by system suspend:";
 
+/// Prefix of the auth-required `session/prompt` failure mapping
+/// (intent-hq/intent#3941): [`Services::run_prompt_turn`] surfaces such a
+/// failure as `Error::InvalidParams("session/prompt: provider \"…\" … is not
+/// authenticated …")` and has ALREADY emitted the terminal `agent:failed` +
+/// `agent:stream:end` pair (and persisted + stashed the Error status), so the
+/// turn worker's terminal-failure path must not re-emit the pair
+/// ([`prompt_auth_required_turn_error`]). The mapped message is composed as
+/// `session/prompt: ` + [`crate::provider_auth::not_authenticated_message`]
+/// (which starts with `provider "…"`); a unit test pins that composition
+/// against this prefix so the contract cannot drift.
+pub(crate) const PROMPT_AUTH_REQUIRED_PREFIX: &str = "session/prompt: provider \"";
+
+/// Whether a turn error is the auth-required `session/prompt` mapping from
+/// [`Services::run_prompt_turn`] (see [`PROMPT_AUTH_REQUIRED_PREFIX`]).
+/// Prefix-anchored on the `InvalidParams` payload — mid-string mentions and
+/// other `InvalidParams` shapes never classify.
+pub(crate) fn prompt_auth_required_turn_error(err: &Error) -> bool {
+    matches!(err, Error::InvalidParams(msg) if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX))
+}
+
+/// Prefix of the auth-required `session/load` mapping
+/// ([`map_acp_session_error`] with context `session/load`); same composition
+/// contract as [`PROMPT_AUTH_REQUIRED_PREFIX`].
+pub(crate) const LOAD_AUTH_REQUIRED_PREFIX: &str = "session/load: provider \"";
+
+/// Whether a resume failure is the auth-required `session/load` mapping.
+/// `AgentManager::start_session` propagates such a failure instead of
+/// falling through to recreate (PR #1650 review): the provider just said it
+/// is not logged in, and for claude-code the recreate's `session/new` can
+/// succeed while logged out — deferring the actionable login error to a
+/// later opaque prompt failure.
+pub(crate) fn load_auth_required_error(err: &Error) -> bool {
+    matches!(err, Error::InvalidParams(msg) if msg.starts_with(LOAD_AUTH_REQUIRED_PREFIX))
+}
+
 /// Debounce before the self-healing resume that [`enroll_suspend_interrupted_turn`]
 /// fires directly (independent of the host-wake broadcast). It must outlast the
 /// turn worker's post-enrollment teardown (`kill_child_only` + `end_turn`) so the
@@ -212,6 +247,12 @@ fn transient_prompt_retry_base_ms() -> u64 {
         }
     }
     1000
+}
+
+/// A candidate session that has not changed the canonical stored ACP identity.
+pub(crate) struct PreparedAcpSession {
+    pub response: session::NewSessionResponse,
+    stored: AgentSession,
 }
 
 /// Result of opening or resuming an ACP session: the canonical `acpSessionId`
@@ -313,6 +354,13 @@ struct Transcript {
     /// long tool runs are legitimately silent. Anonymous updates dropped by
     /// `record_tool` (STAB-124) never enter this set.
     open_tool_calls: HashSet<String>,
+    /// `toolCallId`s whose recorded name came from an authoritative
+    /// identifier (`MappedToolCall::name_authoritative`: MCP `server`/`tool`
+    /// metadata or a namespaced title) on any frame so far. The §7.1 registry
+    /// claim's input-shape gate is withheld for these ids: a foreign tool
+    /// whose arguments happen to be `{ code, summary }` keeps its own name
+    /// and must never claim a `workspace_api` batch (intent-hq/intent#4491).
+    identified_tool_calls: HashSet<String>,
 }
 
 /// The block indices one [`Transcript::record_tool`] call materialized. The
@@ -343,6 +391,7 @@ impl Transcript {
             proposal_index: HashMap::new(),
             usage_cost: None,
             open_tool_calls: HashSet::new(),
+            identified_tool_calls: HashSet::new(),
         }
     }
 
@@ -350,6 +399,31 @@ impl Transcript {
     /// `tool_call_update` (see [`open_tool_calls`](Self::open_tool_calls)).
     fn open_tool_call_count(&self) -> usize {
         self.open_tool_calls.len()
+    }
+
+    /// Human-readable label of one open tool call — `"{id} ({name}: {title})"`
+    /// (title omitted when absent) — for the open-tool terminal provider-stall
+    /// error and attention reason (intent-hq/intent#5395). Deterministic
+    /// under several open calls (smallest id), `None` when none is open.
+    fn open_tool_call_label(&self) -> Option<String> {
+        let id = self.open_tool_calls.iter().min()?;
+        let block = self
+            .tool_use_index
+            .get(id)
+            .and_then(|&index| self.blocks.get(index));
+        let name = block
+            .and_then(|b| b.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown tool");
+        let title = block
+            .and_then(|b| b.get("input"))
+            .and_then(|input| input.get("_acpTitle"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty());
+        Some(match title {
+            Some(title) => format!("{id} ({name}: {title})"),
+            None => format!("{id} ({name})"),
+        })
     }
 
     /// The stable block id for a 0-based block index (`{messageId}:{index}`).
@@ -517,6 +591,9 @@ impl Transcript {
                 index
             }
         };
+        if tc.name_authoritative {
+            self.identified_tool_calls.insert(tc.tool_call_id.clone());
+        }
         let mut result_index = None;
         let mut proposal_indices = Vec::new();
         let completed = tc.status == "completed" || tc.status == "error";
@@ -625,6 +702,26 @@ impl Transcript {
         self.blocks[i].get("name").and_then(Value::as_str)
     }
 
+    /// The input the §7.1 registry claim's input-shape gate may inspect for
+    /// `tc` (intent-hq/intent#4491): the update's own input when it carries
+    /// one (the freshest — `record_tool` is about to replace the block input
+    /// with it, and a first sight with `rawInput: null` persisted only an
+    /// `_acpTitle` placeholder), otherwise the input recorded at first sight
+    /// (`tool_call_update`s are usually input-less). `None` when the call was
+    /// authoritatively identified on this or any earlier frame
+    /// ([`identified_tool_calls`](Self::identified_tool_calls)) — the gate
+    /// is for identifier-less frames only — or when no input exists.
+    fn unidentified_input_for<'a>(&'a self, tc: &'a MappedToolCall) -> Option<&'a Value> {
+        if tc.name_authoritative || self.identified_tool_calls.contains(&tc.tool_call_id) {
+            return None;
+        }
+        if !tc.input.is_null() {
+            return Some(&tc.input);
+        }
+        let &i = self.tool_use_index.get(&tc.tool_call_id)?;
+        self.blocks[i].get("input").filter(|v| !v.is_null())
+    }
+
     fn into_blocks(mut self) -> Vec<Value> {
         self.flush_text();
         self.blocks
@@ -731,10 +828,8 @@ pub(crate) struct LiveTurn {
 /// interrupt path's downstream decisions agree with the durable row instead of
 /// with a pre-abort clone.
 pub(crate) struct FlushedTurn {
-    /// Id of the interrupted assistant row this flush appended — `None` when
-    /// nothing was appended (the worker's own full row won the `agent_message.id`
-    /// UNIQUE collision, or the store errored).
-    pub(crate) message_id: Option<String>,
+    /// What became of the slot's content — see [`InterruptFlushOutcome`].
+    pub(crate) outcome: InterruptFlushOutcome,
     /// Whether the flushed slot carried any blocks — the zero-output test the
     /// stop-redelivery arm (intent-hq/monorepo#1757) keys off.
     pub(crate) had_output: bool,
@@ -743,6 +838,49 @@ pub(crate) struct FlushedTurn {
     /// The flushed content's `type: "text"` block strings, for the terminal
     /// `agent:stream:end` live-preview fields.
     pub(crate) text_blocks: Vec<String>,
+}
+
+/// Outcome of one
+/// [`flush_partial_turn_on_interruption`](Services::flush_partial_turn_on_interruption)
+/// attempt. The arms are deliberately kept apart: only `Appended` is an
+/// interruption THIS flush recorded; the two `Already*` arms are the
+/// `agent_message.id` UNIQUE collision, split by what the durable row says
+/// (`AlreadyPersisted` — the worker's full row won, the turn was NOT
+/// interrupted at all; `AlreadyInterrupted` — another interrupt flush's row
+/// won); and `Failed` leaves the slot as the only copy of the content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InterruptFlushOutcome {
+    /// This flush appended the interrupted assistant row under the turn's
+    /// minted id (carried here).
+    Appended(String),
+    /// The append hit the `agent_message.id` UNIQUE collision and the durable
+    /// row is NOT tagged `metadata.interrupted`: the worker had already
+    /// persisted the turn's FULL row under this id — the interrupt landed in
+    /// the persist→worker-exit gap of a turn that completed normally. Carries
+    /// that completed row's id so the interrupt path can close the stream as
+    /// the completion it really was, rather than stamp
+    /// `stopReason: "interrupted"` on a turn that was never cut short.
+    AlreadyPersisted(String),
+    /// The append hit the `agent_message.id` UNIQUE collision and the durable
+    /// row IS an interrupted row — a concurrent interrupt flush (the suspend
+    /// enrollment, `owns_slot: false`) persisted it first. Carries that row's
+    /// id and its metadata (`Null` when the row could not be re-read) so the
+    /// interrupt path's terminal emit mirrors the row's `interruptReason` /
+    /// `interruptedBy` rather than misreporting the turn as completed.
+    AlreadyInterrupted { message_id: String, metadata: Value },
+    /// A genuine store error: nothing was persisted; the slot is kept.
+    Failed,
+}
+
+impl InterruptFlushOutcome {
+    /// Id of the interrupted row this flush appended — `None` for the
+    /// collision and error arms.
+    pub(crate) fn appended_message_id(&self) -> Option<&str> {
+        match self {
+            Self::Appended(id) => Some(id.as_str()),
+            Self::AlreadyPersisted(_) | Self::AlreadyInterrupted { .. } | Self::Failed => None,
+        }
+    }
 }
 
 /// Machine-readable cause of a turn interruption, stamped as
@@ -871,12 +1009,14 @@ pub(crate) fn silent_tail_suspect_ms() -> u64 {
 /// silent thinking phases some models run well past 90s while staying below
 /// the 8-minute #2669 silent-tail suspicion window
 /// ([`silent_tail_suspect_ms`]) and far below the 30-minute prompt idle
-/// timeout, which remains the only terminal mechanism — the stall event never
-/// cancels or fails the turn. Tool-call-aware (intent-hq/monorepo#3466):
-/// while ≥1 recorded tool call is still open the stalled advisory is fully
-/// suppressed regardless of silence duration — long tool runs are expected
-/// silence — with the 30-minute prompt idle timeout as the backstop for hung
-/// tools. Overridable via `INTENTD_STREAM_STALL_MS` (test seam).
+/// timeout. The stall event itself never cancels or fails the turn; the
+/// terminal mechanisms are [`provider_stall_terminal_ms`] (tool-free silence),
+/// [`open_tool_call_terminal_ms`] (silence under an open tool call) and the
+/// 30-minute prompt idle timeout. Tool-call-aware
+/// (intent-hq/monorepo#3466): while ≥1 recorded tool call is still open the
+/// advisory is suppressed — long tool runs are expected silence — but only up
+/// to [`open_tool_call_stall_ms`] (intent-hq/intent#5395), past which it fires
+/// regardless. Overridable via `INTENTD_STREAM_STALL_MS` (test seam).
 pub(crate) fn stream_stall_ms() -> u64 {
     if let Ok(val) = std::env::var("INTENTD_STREAM_STALL_MS") {
         if let Ok(ms) = val.parse::<u64>() {
@@ -884,6 +1024,78 @@ pub(crate) fn stream_stall_ms() -> u64 {
         }
     }
     5 * 60 * 1000
+}
+
+/// Silence ceiling for the tool-call-aware stall suppression
+/// (intent-hq/intent#5395): while ≥1 recorded tool call is open, the
+/// `stalled` advisory is suppressed only until the silence reaches this many
+/// ms — then it fires exactly as the tool-free [`stream_stall_ms`] advisory
+/// does. Before this ceiling existed, a `tool_call` that never received its
+/// terminal `tool_call_update` (the opencode/grok signature: the adapter
+/// loses the tool's completion and the prompt hangs) suppressed the advisory
+/// for the whole 30-minute idle window, so the FE showed a bare "Thinking"
+/// for the entire hang. 15 minutes sits well above legitimate long tool runs
+/// (the daemon's own `host.exec` cap is 10 minutes; agent harness shell
+/// tools cap at or below that) while still surfacing the hang midway through
+/// the idle window, and keeps the ordering stall < silent-tail-suspect <
+/// open-tool ceiling < terminal stall < open-tool terminal < 30-minute idle
+/// timeout. Advisory only — the open-tool terminal decision is
+/// [`open_tool_call_terminal_ms`]. Overridable via
+/// `INTENTD_OPEN_TOOL_CALL_STALL_MS` (test seam).
+pub(crate) fn open_tool_call_stall_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_OPEN_TOOL_CALL_STALL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    15 * 60 * 1000
+}
+
+/// Terminal provider-stall threshold (intent-hq/intent#5395): once a turn has
+/// gone this many ms with zero `session/update` traffic AND no recorded tool
+/// call open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn
+/// with [`AcpError::ProviderStall`] — a distinct terminal error naming the
+/// stall — and raises a blocker-style attention request on the agent (the
+/// intent-hq/intent#5419 shape), instead of leaving the silence to the
+/// 30-minute idle timeout's warn-and-continue redrive. A provider that is
+/// neither streaming nor running a tool for this long is hung; silence under
+/// an open tool call gets the longer [`open_tool_call_terminal_ms`] budget
+/// instead. 20 minutes is 4× the advisory threshold and 2.5× the #2669
+/// silent-tail suspicion window — past any observed healthy tool-free
+/// inference tail — and below the 30-minute idle timeout so it is reachable.
+/// Overridable via `INTENTD_PROVIDER_STALL_TERMINAL_MS` (test seam).
+pub(crate) fn provider_stall_terminal_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_PROVIDER_STALL_TERMINAL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    20 * 60 * 1000
+}
+
+/// Terminal provider-stall threshold for silence UNDER an open tool call
+/// (intent-hq/intent#5395): once a turn has gone this many ms with zero
+/// `session/update` traffic of any kind while ≥1 recorded tool call is still
+/// open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn with
+/// [`AcpError::ProviderStall`] naming the hung call and raises the same
+/// blocker-style attention request as the tool-free case. This is the exact
+/// reported signature: the adapter loses the terminal `tool_call_update`
+/// across an event-stream reconnect and the prompt hangs on an open call
+/// forever. Silence means NO update at all — any `tool_call_update` chunk or
+/// content resets the clock, so a legitimately long tool that emits anything
+/// is never killed; a tool call that is completely silent for 25 minutes is
+/// treated as hung (the daemon's own `host.exec` caps at 10 minutes, agent
+/// harness shell tools at or below that). 25 minutes sits above the 15-minute
+/// open-tool advisory and the 20-minute tool-free terminal threshold, and
+/// below the 30-minute idle timeout so it is reachable. Overridable via
+/// `INTENTD_OPEN_TOOL_CALL_TERMINAL_MS` (test seam).
+pub(crate) fn open_tool_call_terminal_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    25 * 60 * 1000
 }
 
 /// Per-agent consecutive suspected-truncation auto-redrive counter
@@ -1006,7 +1218,7 @@ pub(crate) struct HarnessWakeOutcome {
     /// (the persisted-row event pair already carries the id); exercised by
     /// the wake-turn unit tests (hence the allow — the lib build has no
     /// reader).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub message_id: Option<String>,
     /// `true` when the turn's finalized transcript carried no meaningful
     /// content (see [`harness_wake_response_is_empty`]) — the incident
@@ -1092,42 +1304,33 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 }
 
 /// Derive the user-configured default provider from the effective settings:
-/// the provider prefix of the configured default model (`model.default`
-/// compound prefix), else `providers.active`. Each candidate is validated
-/// against the provider registry ([`intent_providers::find_provider`]) so a
-/// stale, mistyped, or foreign-build id falls through to the next precedence
-/// step instead of being trusted (an unknown `model.default` prefix must not
-/// shadow a perfectly valid `providers.active`). `None` when neither yields
-/// a registered provider — no provider carries a hardcoded default
+/// `model.defaultProvider`, validated against the provider registry
+/// ([`intent_providers::find_provider`]) so a stale, mistyped, or
+/// foreign-build id reads as unset instead of being trusted. `None` when it
+/// is unset or fails validation — no provider carries a hardcoded default
 /// designation, and there is no positional last resort (monorepo#3044):
 /// resolution that falls through entirely fails loudly at the caller.
+/// The deprecated `providers.active` is deliberately NOT consulted — the
+/// boot migration ([`crate::settings::migrate_active_provider_setting`])
+/// carries a legacy value into `model.defaultProvider` once at startup.
 pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
-    /// Accept a candidate id only when it names a registered provider
-    /// (whitespace-trimmed, so padded settings values still resolve).
-    fn registered(id: &str) -> Option<String> {
-        let id = id.trim();
-        intent_providers::find_provider(id).map(|p| p.id.to_string())
-    }
-    settings
-        .model
-        .default
-        .as_deref()
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .and_then(|id| registered(&id))
-        .or_else(|| settings.providers.active.as_deref().and_then(registered))
+    settings.model.default_provider.as_deref().and_then(|id| {
+        // Accept the candidate only when it names a registered provider
+        // (whitespace-trimmed, so padded settings values still resolve).
+        intent_providers::find_provider(id.trim()).map(|p| p.id.to_string())
+    })
 }
 
-/// Resolve the effective provider id for an agent session using the same precedence
-/// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
-/// yields a non-empty provider) → `provider` field → `configured_default` (the
-/// settings-derived default — see [`derived_default_provider`] — when the
-/// caller has one to offer). Malformed compound ids like `:sonnet` yield an
-/// empty prefix and fall through to the provider field / configured default.
-/// This ensures `_meta` injection, spawn args, and all provider-keyed logic
-/// use a consistent provider id.
+/// Resolve the effective provider id for an agent session using the same
+/// precedence as the spawn path (§6.9): explicit `provider` field →
+/// `configured_default` (the settings-derived default — see
+/// [`derived_default_provider`] — when the caller has one to offer). Session
+/// `model` is always a bare id and never participates in provider resolution
+/// (compound `provider:model` ids are rejected at the wire). This ensures
+/// `_meta` injection, spawn args, and all provider-keyed logic use a
+/// consistent provider id.
 ///
 /// `None` when nothing resolves (monorepo#3044): the former positional last
 /// resort (the first registered provider, auggie) silently spawned a binary
@@ -1135,24 +1338,75 @@ pub(crate) fn derived_default_provider(
 /// [`no_default_provider_error`] instead; stats-attribution callers (which
 /// pass `configured_default: None`) fall to their existing `"unknown"` tail.
 pub(crate) fn resolve_provider_id(
-    model: Option<&str>,
     provider: Option<&str>,
     configured_default: Option<&str>,
 ) -> Option<String> {
-    model
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
-        .or_else(|| {
-            provider
-                .filter(|p| !p.is_empty())
-                .map(std::string::ToString::to_string)
-        })
+    provider
+        .filter(|p| !p.is_empty())
+        .map(std::string::ToString::to_string)
         .or_else(|| {
             configured_default
                 .filter(|p| !p.is_empty())
                 .map(std::string::ToString::to_string)
         })
+}
+
+/// Resolve the provider id the agent's failing TURN ran on, for event
+/// annotation: `last_turn_provider` (the identity the turn committed) with
+/// the session's persisted `provider` column — under the same precedence
+/// [`resolve_provider_id`] applies at spawn time — as the fallback, so the
+/// reported id matches the binary the failing turn used.
+///
+/// Only for a turn that actually ran. A failure during spawn / ACP session
+/// setup happens BEFORE the new identity commits, so `last_turn_provider`
+/// still names the previous provider there; that publisher reads the
+/// attempt's resolved provider instead
+/// (`agent_manager::FailedProviderSource::SpawnAttempt`).
+///
+/// Best-effort and non-fatal by construction: a store error or an
+/// unresolvable provider yields `None` and the caller simply omits the field.
+/// Nothing durable hangs off this — it exists so a terminal `agent:failed`
+/// can name the provider that failed without the client having to correlate
+/// a follow-up `agent.get` read against a session whose provider a concurrent
+/// `agent.setModel` may already have changed.
+pub(crate) async fn session_provider_id(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Option<String> {
+    // Prefer `last_turn_provider` — the identity the FAILING turn actually
+    // committed — over the session's current `provider`. The session row is
+    // mutable: a concurrent `agent.setModel` landing between the running
+    // provider's quota rejection and this read would otherwise name the newly
+    // selected provider as the exhausted one, steering the client's retry away
+    // from the only provider that still works. NULL until the agent's first
+    // turn commits, so the session row remains the fallback.
+    if let Ok((_, Some(turn_provider))) = services
+        .store
+        .get_agent_session_last_turn_model(workspace_id, agent_id)
+        .await
+    {
+        if let Some(resolved) = resolve_provider_id(
+            Some(turn_provider.as_str()),
+            derived_default_provider(&services.effective_settings()).as_deref(),
+        ) {
+            return Some(resolved);
+        }
+    }
+    match services
+        .store
+        .get_agent_session_token_usage(workspace_id, agent_id)
+        .await
+    {
+        Ok((_, _, provider, _)) => resolve_provider_id(
+            provider.as_deref(),
+            derived_default_provider(&services.effective_settings()).as_deref(),
+        ),
+        Err(e) => {
+            tracing::warn!(agent = %agent_id, error = %e, "read provider for event annotation failed");
+            None
+        }
+    }
 }
 
 /// The loud `-32602`-style error for provider resolution that falls through
@@ -1163,10 +1417,59 @@ pub(crate) fn resolve_provider_id(
 pub(crate) fn no_default_provider_error(context: &str) -> Error {
     Error::InvalidParams(format!(
         "{context}: no default provider/model is configured — no explicit \
-         provider or model was given and neither providers.active nor a \
-         compound model.default is set. Choose a provider in Settings > \
-         Agents, or pass an explicit provider/model."
+         provider or model was given and model.defaultProvider is not set. \
+         Choose a provider in Settings > Agents, or pass an explicit \
+         provider/model."
     ))
+}
+
+/// Whether an ACP failure from the adapter signals "authentication required"
+/// for the provider (intent-hq/intent#3941). [`AcpError::Auth`] is the
+/// structural signal (`session/new` answered with an auth-required error and
+/// no usable auth method); adapters that reject later calls surface it as a
+/// JSON-RPC error instead, classified by the same code/message heuristic as
+/// the model-list auth probe ([`crate::provider_models::is_auth_required_error`]).
+///
+/// Deliberately classifies on `rpc.message` ONLY — not the rendered error
+/// with its bounded `data` like the transient classifiers
+/// (`is_transient_upstream_disconnect` / `is_transient_provider_fetch_failure`).
+/// `data` carries arbitrary provider JSON that can mention "unauthorized" /
+/// "401" in unrelated contexts (tool output, upstream body echoes), and a
+/// false positive here is expensive: it demotes the cached auth verdict and
+/// blocks create/delegate spawns for the cache TTL. A false negative (auth
+/// text riding only in `data`, e.g. the monorepo#3007 bridge shape) degrades
+/// gracefully to today's opaque `Internal` error — the transient classifiers
+/// keep their broader match because their retry/fail-fast outcome is cheap
+/// to get wrong in comparison.
+fn is_acp_auth_required(e: &AcpError) -> bool {
+    match e {
+        AcpError::Auth(_) => true,
+        AcpError::Rpc(rpc) => {
+            crate::provider_models::is_auth_required_error(rpc.code, &rpc.message)
+        }
+        _ => false,
+    }
+}
+
+/// Map an ACP session-setup/prompt failure to the surfaced [`Error`]. An
+/// auth-required failure becomes the same actionable
+/// [`Error::InvalidParams`] login message as the create/delegate gate
+/// ([`crate::provider_auth::not_authenticated_message`]) — non-retryable at
+/// spawn, with the catalog login command and the claude-code desktop-app
+/// caveat — and demotes the provider's cached auth verdict to a hard `false`
+/// so follow-up spawns fail fast at the gate instead of dying on their first
+/// turn. Everything else keeps the existing opaque
+/// `Error::Internal("{context} failed: {e}")` shape (`context` is the ACP
+/// method name, e.g. `session/new`).
+fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
+    if is_acp_auth_required(e) {
+        crate::provider_auth::demote_auth_verdict(provider_id);
+        return Error::InvalidParams(format!(
+            "{context}: {}",
+            crate::provider_auth::not_authenticated_message(provider_id)
+        ));
+    }
+    Error::Internal(format!("{context} failed: {e}"))
 }
 
 /// Resolve the effective model a provider is actually running from the
@@ -1197,7 +1500,7 @@ fn resolve_effective_model(config_options: Option<&[SessionConfigOption]>) -> Op
 
 /// Resolve the display identity of an EXPLICITLY selected model id against
 /// the same `configOptions[id="model"]` option list the default path uses
-/// (D14): match the stored bare id (compound prefix stripped) against an
+/// (D14): match the stored bare id against an
 /// option's `value` and derive a version-bearing family display from that
 /// entry's name/description (e.g. `claude-fable-5[1m]` → name "Fable" is
 /// version-less, description "Fable 5 with 1M context · …" → `"Fable 5"`).
@@ -1319,7 +1622,7 @@ fn select_entry<'a>(
 /// - codex: `{ "sessionTitle": "<agent name>" }?` (present only when a non-blank
 ///   `session_title` is supplied — monorepo#3151; older adapters ignore the
 ///   unknown field). The system prompt stays on the first-turn prepend fallback
-///   because the pinned codex-acp adapter (1.6.2) ignores
+///   because the pinned codex-acp adapter (1.9.0) ignores
 ///   `_meta.developerInstructions` (#479) — it is never moved into `_meta`.
 fn build_session_meta(
     provider_id: &str,
@@ -1735,28 +2038,35 @@ impl Services {
     ///
     /// Callers are exactly the three teardown paths (keep-alive interrupt,
     /// hard stop, graceful shutdown), which pin immediately BEFORE aborting
-    /// the worker and flush AFTER it. Deliberately returns NOTHING (monorepo#2110):
-    /// the flush re-reads the slot — which the pin guarantees is still there,
-    /// against both the [`LiveTurnGuard`] drop and a normal turn end (see
-    /// [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn)) — so a
-    /// `session/update` processed in the pin→abort gap is persisted rather than
-    /// trimmed off a stale pre-abort clone. A no-op when no turn is in flight;
-    /// the flush's `None` says so on its own. Pinning is idempotent and never
-    /// outlives the turn: the next turn's [`begin_live_turn`](Self::begin_live_turn)
-    /// replaces the slot wholesale.
-    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) {
-        if let Ok(mut slots) = self.live_turns.lock() {
-            if let Some(slot) = slots.get_mut(agent_id) {
-                slot.flush_pending = true;
-                // A fresh pin means a fresh flush attempt is in flight, so an
-                // earlier give-up no longer describes this slot: re-pinning a
-                // slot a previous flush abandoned (a later teardown, e.g.
-                // shutdown, reaching the same stranded content) gives it a real
-                // second chance at persisting, and must not leave it looking
-                // abandoned to `try_begin` in the meantime.
-                slot.flush_failed = false;
-            }
-        }
+    /// the worker and flush AFTER it. Deliberately returns no slot CONTENT
+    /// (monorepo#2110): the flush re-reads the slot — which the pin guarantees
+    /// is still there, against both the [`LiveTurnGuard`] drop and a normal
+    /// turn end (see [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn))
+    /// — so a `session/update` processed in the pin→abort gap is persisted
+    /// rather than trimmed off a stale pre-abort clone. Returns whether a slot
+    /// was there to pin: `false` means no turn is in flight at this instant
+    /// (the flush's `None` then agrees), which is the ONE read a caller may
+    /// base an "is there a turn to cut short?" decision on — an unpinned
+    /// `live_turn` snapshot taken before an await can be cleared by a normal
+    /// turn end in that await (intent-hq/intent#5380). Pinning is idempotent
+    /// and never outlives the turn: the next turn's
+    /// [`begin_live_turn`](Self::begin_live_turn) replaces the slot wholesale.
+    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) -> bool {
+        let Ok(mut slots) = self.live_turns.lock() else {
+            return false;
+        };
+        let Some(slot) = slots.get_mut(agent_id) else {
+            return false;
+        };
+        slot.flush_pending = true;
+        // A fresh pin means a fresh flush attempt is in flight, so an
+        // earlier give-up no longer describes this slot: re-pinning a
+        // slot a previous flush abandoned (a later teardown, e.g.
+        // shutdown, reaching the same stranded content) gives it a real
+        // second chance at persisting, and must not leave it looking
+        // abandoned to `try_begin` in the meantime.
+        slot.flush_failed = false;
+        true
     }
 
     /// Read just the text of the live-turn slot's `type: "text"` blocks
@@ -1820,11 +2130,11 @@ impl Services {
         let had_output = !live.blocks.is_empty();
         let block_count = live.blocks.len();
         let text_blocks = text_block_strings(&live.blocks);
-        let message_id = self
+        let outcome = self
             .flush_partial_turn_on_interruption(agent_id, live, reason, interrupted_by, true)
             .await;
         Some(FlushedTurn {
-            message_id,
+            outcome,
             had_output,
             block_count,
             text_blocks,
@@ -1866,9 +2176,13 @@ impl Services {
     /// combined-delivery re-queue check in `preempt_busy_turn` excludes the
     /// row this flush appends.)
     ///
-    /// Returns the persisted interrupted row's message id (`Some` only when
-    /// this flush appended the row), so the interrupt path can carry
-    /// `messageId` on the terminal `agent:stream:end`.
+    /// Returns an [`InterruptFlushOutcome`]: `Appended` (this flush persisted
+    /// the interrupted row) so the interrupt path can carry `messageId` on the
+    /// terminal `agent:stream:end`; on the UNIQUE collision either
+    /// `AlreadyPersisted` (the worker's full row won, so the turn actually
+    /// completed — that path closes the stream as a normal completion) or
+    /// `AlreadyInterrupted` (a concurrent interrupt flush's row won — that
+    /// path mirrors the row's interrupted metadata); or `Failed`.
     /// `owns_slot` says whose slot this flush may release: the teardown flush
     /// owns the pin it is flushing and clears unconditionally; the suspend
     /// enrollment flushes caller-held content and must NOT release a pin a
@@ -1882,7 +2196,7 @@ impl Services {
         reason: InterruptReason,
         interrupted_by: Option<&InterruptedBy>,
         owns_slot: bool,
-    ) -> Option<String> {
+    ) -> InterruptFlushOutcome {
         let block_count = live.blocks.len();
         // A partial tail can already carry proposal blocks (the interrupt
         // landed after the propose tool call): capture their ids BEFORE the
@@ -1964,7 +2278,7 @@ impl Services {
                 } else {
                     self.clear_unpinned_live_turn(agent_id);
                 }
-                Some(live.message_id)
+                InterruptFlushOutcome::Appended(live.message_id)
             }
             // Only the `agent_message.id` violation means "the worker already
             // persisted the full turn under this minted id" — a `(agent_id,
@@ -1981,12 +2295,52 @@ impl Services {
                 } else {
                     self.clear_unpinned_live_turn(agent_id);
                 }
-                tracing::debug!(
-                    agent = %agent_id,
-                    error = %e,
-                    "partial flush skipped: worker already persisted the full turn under this id"
-                );
-                None
+                // The collision alone does not say WHO won: the worker's
+                // normal turn-end append (a completed turn) or another
+                // interrupt flush racing this one (the suspend enrollment
+                // flushing caller-held content while a teardown holds the
+                // pin). Only the durable row's own metadata tells them apart,
+                // and the terminal emit must not call an interrupted row a
+                // completion — re-read it. An unreadable row is reported as
+                // interrupted (metadata `Null`): the conservative shape, and
+                // the one this path always emitted before the split.
+                let durable_metadata = match self
+                    .store
+                    .get_agent_message_by_id(agent_id, &live.message_id)
+                    .await
+                {
+                    Ok(Some(row)) => Some(row.metadata.unwrap_or(Value::Null)),
+                    Ok(None) => None,
+                    Err(read_err) => {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            error = %read_err,
+                            "interrupt flush collided with a durable row that could not be re-read"
+                        );
+                        None
+                    }
+                };
+                let row_interrupted = durable_metadata
+                    .as_ref()
+                    .is_none_or(|m| m.get("interrupted").and_then(Value::as_bool) == Some(true));
+                if row_interrupted {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        error = %e,
+                        "partial flush skipped: a concurrent interrupt flush already persisted this turn's row"
+                    );
+                    InterruptFlushOutcome::AlreadyInterrupted {
+                        message_id: live.message_id,
+                        metadata: durable_metadata.unwrap_or(Value::Null),
+                    }
+                } else {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        error = %e,
+                        "partial flush skipped: worker already persisted the full turn under this id"
+                    );
+                    InterruptFlushOutcome::AlreadyPersisted(live.message_id)
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -2009,7 +2363,7 @@ impl Services {
                 if owns_slot {
                     self.mark_live_turn_flush_failed(agent_id);
                 }
-                None
+                InterruptFlushOutcome::Failed
             }
         }
     }
@@ -2029,13 +2383,6 @@ impl Services {
     /// value (`None` matches NULL), so it loses benignly to a concurrent
     /// `agent.setModel`.
     ///
-    /// Dropped guarantee (intentional): the old rewrite persisted the
-    /// compound `{provider_id}:{effective}`, which as a side effect pinned
-    /// the provider for legacy rows with a NULL `model` AND an empty
-    /// `provider`. Such rows now fall through to the configured default /
-    /// first-registered provider on every resolution — a reversion to
-    /// pre-D13 behavior; current creation paths pin `model` at creation, so
-    /// no new rows enter that population.
     ///
     /// A NON-placeholder (explicitly selected) model takes the D14 branch
     /// instead: its display identity is resolved against the same option
@@ -2092,9 +2439,8 @@ impl Services {
     /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
     /// resolve an EXPLICITLY selected model id's display identity against the
     /// session-open `configOptions` and persist it to `resolved_model`. The
-    /// bare id (compound `{provider}:` prefix stripped — stored explicit
-    /// picks are compound, option values are bare) is matched against the
-    /// model select's option values. The outcome is persisted EITHER way — a
+    /// stored bare id is matched against the model select's option values.
+    /// The outcome is persisted EITHER way — a
     /// `None` resolution overwrites (clears) any previously persisted
     /// display name, so a resolution from an older option list can never go
     /// stale and mis-attribute stats after the provider's catalog changes.
@@ -2110,8 +2456,7 @@ impl Services {
         config_options: Option<&[SessionConfigOption]>,
     ) {
         let Some(stored) = stored_model else { return };
-        let (_, bare_id) = intent_providers::parse_compound_model_id(stored);
-        let resolved = resolve_explicit_display_model(&bare_id, config_options);
+        let resolved = resolve_explicit_display_model(stored, config_options);
         match self
             .store
             .set_agent_session_resolved_model(
@@ -2186,30 +2531,25 @@ impl Services {
         self.session_specialist_is_orchestrator(stored, workspace_path.as_deref())
     }
 
-    /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
-    /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
-    /// modes the provider advertised in `session/new` (used by the caller to
-    /// pick a permissive `session/set_mode` target from `availableModes`).
-    pub(crate) async fn open_acp_session(
+    pub(crate) async fn prepare_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
-    ) -> Result<AcpSessionOpened> {
+    ) -> Result<PreparedAcpSession> {
         // Load the session up front so the store write is scoped to the owning
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
         // resolved this agent id inside a workspace-scoped path.
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
-        // Resolve provider using the same precedence as spawn path (compound model
-        // prefix → provider field → configured default), then build
-        // provider-specific _meta. Reached only after a successful spawn (which
-        // resolved the same inputs), so a fall-through here is a settings race —
-        // fail loudly rather than fabricating a positional default (monorepo#3044).
+        // Resolve provider using the same precedence as spawn path (provider
+        // field → configured default), then build provider-specific _meta.
+        // Reached only after a successful spawn (which resolved the same
+        // inputs), so a fall-through here is a settings race — fail loudly
+        // rather than fabricating a positional default (monorepo#3044).
         let provider_id = resolve_provider_id(
-            stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
@@ -2233,7 +2573,87 @@ impl Services {
         .await;
         let resp = session::new_session(conn, cwd, mcp_servers, meta)
             .await
-            .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
+            .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        Ok(PreparedAcpSession {
+            response: resp,
+            stored,
+        })
+    }
+
+    /// Commit only a confirmed Antigravity candidate. A concurrent winner is
+    /// never used with this candidate's configuration or first-turn context.
+    pub(crate) async fn commit_antigravity_acp_session(
+        &self,
+        prepared: PreparedAcpSession,
+        expected_old: Option<&str>,
+    ) -> Result<AcpSessionOpened> {
+        let PreparedAcpSession {
+            response: resp,
+            stored,
+        } = prepared;
+        let candidate = resp.session_id.0.to_string();
+        if candidate.is_empty() {
+            return Err(Error::InvalidParams(
+                "Antigravity returned an empty session ID".into(),
+            ));
+        }
+        let workspace_id = &stored.workspace_id;
+        let agent_id = &stored.id;
+        // Use the existing transactional CAS even for first-set: an empty
+        // expected id cannot match a valid established session, while the
+        // store's None branch atomically initializes an unclaimed session.
+        let canonical = self
+            .store
+            .replace_acp_session_id(
+                workspace_id,
+                agent_id,
+                expected_old.unwrap_or(""),
+                &candidate,
+            )
+            .await?;
+        if canonical != candidate {
+            return Err(Error::Conflict {
+                current: json!({"acpSessionId": canonical}),
+            });
+        }
+        if expected_old.is_some() {
+            self.clear_context_usage(agent_id);
+        }
+        self.persist_effective_model(
+            workspace_id,
+            agent_id,
+            stored.model.as_deref(),
+            resp.config_options.as_deref(),
+        )
+        .await;
+        let thought_level = discover_thought_level(resp.config_options.as_deref());
+        self.persist_session_effort_levels(workspace_id, agent_id, thought_level.as_ref())
+            .await;
+        Ok(AcpSessionOpened {
+            session_id: candidate,
+            modes: resp.modes,
+            thought_level,
+        })
+    }
+
+    /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
+    /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
+    /// modes the provider advertised in `session/new` (used by the caller to
+    /// pick a permissive `session/set_mode` target from `availableModes`).
+    pub(crate) async fn open_acp_session(
+        &self,
+        conn: &Connection,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<AcpSessionOpened> {
+        let PreparedAcpSession {
+            response: resp,
+            stored,
+        } = self
+            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
+            .await?;
+        let workspace_id = stored.workspace_id.clone();
         let acp_session_id = resp.session_id.0.to_string();
         self.store
             .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
@@ -2273,40 +2693,13 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<AcpSessionOpened> {
-        // Load the session up front so the CAS replace is scoped to the owning
-        // workspace (see [`open_acp_session`]).
-        let stored = self.store.get_agent_session(agent_id).await?;
+        let PreparedAcpSession {
+            response: resp,
+            stored,
+        } = self
+            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
+            .await?;
         let workspace_id = stored.workspace_id.clone();
-        // Resolve provider using the same precedence as spawn path, then build
-        // provider-specific _meta for system-prompt injection (recreate path sends
-        // the same prompt as new/load). Same loud fall-through as
-        // [`open_acp_session`] (monorepo#3044).
-        let provider_id = resolve_provider_id(
-            stored.model.as_deref(),
-            stored.provider.as_deref(),
-            derived_default_provider(&self.effective_settings()).as_deref(),
-        )
-        .ok_or_else(|| no_default_provider_error("session/new"))?;
-        let is_orchestrator = self
-            .resolve_session_is_orchestrator(&provider_id, &stored)
-            .await;
-        let meta = build_session_meta(
-            &provider_id,
-            stored.system_prompt.as_deref(),
-            Some(&stored.name),
-            is_orchestrator,
-        );
-        self.publish_status_event(
-            &workspace_id,
-            agent_id,
-            "session-create",
-            "Creating session\u{2026}",
-            "info",
-        )
-        .await;
-        let resp = session::new_session(conn, cwd, mcp_servers, meta)
-            .await
-            .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let new_acp_session_id = resp.session_id.0.to_string();
         let canonical = self
             .store
@@ -2371,7 +2764,6 @@ impl Services {
         // provider-specific _meta for system-prompt injection. Same loud
         // fall-through as [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
-            stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
@@ -2436,7 +2828,7 @@ impl Services {
         .await;
         let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
             .await
-            .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
+            .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
         self.persist_effective_model(
             &workspace_id,
             agent_id,
@@ -2497,7 +2889,7 @@ impl Services {
     /// id (monorepo#1022), stamped on the failure-arm `agent:failed` when
     /// present; bare callers (tests, harness paths) may pass `None` and the
     /// field is omitted.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     /// # Errors
     ///
     /// Returns `Error::Internal` if the `session/prompt` request fails or the transport drops mid-turn.
@@ -2583,27 +2975,75 @@ impl Services {
         // client-served handler may have side-effected on behalf of this
         // turn, so the attempt is no longer provably idempotent.
         let client_request_watermark = conn.client_request_seq();
+        // Post-output transient fetch failure (intent-hq/intent#5419): the
+        // attempt failed with a transient-shaped provider fetch error AFTER
+        // it streamed output or side-effected, so the #3007 in-place retry is
+        // off the table and the error falls through to terminal
+        // classification. Recorded here so the terminal path below can raise
+        // a blocker-style attention request on the dying agent — the death
+        // is otherwise discovered only later by a delegation-group watch or a
+        // coordinator reading the log. Deliberately NOT a redrive: whether a
+        // redrive is safe after partial output is not yet known. Carries the
+        // number of `session/prompt` dispatches actually made (the failing
+        // attempt's ordinal), captured at each fall-through site because
+        // `fetch_retry_attempt` is bumped BEFORE the backoff and so overcounts
+        // on the abandon-during-backoff path — plus which guard tripped
+        // (streamed output vs. a side-effecting client request), so the
+        // user-visible reason names the actual cause.
+        let mut post_output_transient_fetch_failure: Option<(u32, &'static str)> = None;
+        let retry_guard_cause = |any_update_received: bool| -> &'static str {
+            if any_update_received {
+                "streamed output"
+            } else {
+                "a side-effecting client request"
+            }
+        };
         // Mid-turn stall detection (intent-hq/monorepo#3402): a timer arm in
         // the select loop below samples `activity.idle_ms()` on a fraction of
-        // the stall threshold (clamped to 15s at the 5-minute default) and
+        // the smallest stall threshold (clamped to 15s at the defaults) and
         // emits ONE advisory `stalled` status event once the silence crosses
         // [`stream_stall_ms`].
         // The next received `session/update` emits `resumed` and re-arms the
         // detector, so a later second stall in the same turn reports again.
-        // Advisory only: turn resolution is untouched (the 30-minute prompt
-        // idle timeout stays the terminal backstop).
+        // The advisory itself never resolves the turn.
         //
         // Tool-call-aware (intent-hq/monorepo#3466): while ≥1 recorded tool
         // call is still open (`transcript.open_tool_call_count() > 0`), the
-        // arm emits nothing regardless of silence duration — long tool runs
-        // (builds, test suites) are legitimately silent between `tool_call`
-        // and the terminal `tool_call_update`. Once the last open call
-        // resolves, the standard threshold applies to subsequent silence
-        // (`activity` was touched by the resolving update, so the window
-        // restarts from that point). Hung tools stay covered by the
-        // 30-minute prompt idle timeout.
+        // advisory threshold is [`open_tool_call_stall_ms`] instead — long
+        // tool runs (builds, test suites) are legitimately silent between
+        // `tool_call` and the terminal `tool_call_update`, but not
+        // indefinitely (intent-hq/intent#5395: a `tool_call` whose completion
+        // the adapter lost used to suppress the advisory for the whole idle
+        // window). Once the last open call resolves, the standard threshold
+        // applies to subsequent silence (`activity` was touched by the
+        // resolving update, so the window restarts from that point).
+        //
+        // Terminal provider stall (intent-hq/intent#5395): silence past
+        // [`provider_stall_terminal_ms`] with NO tool call open — or past the
+        // longer [`open_tool_call_terminal_ms`] WITH a tool call open (the
+        // reported opencode/grok signature: the tool's completion was lost
+        // and the call hangs open forever) — ends the attempt with
+        // `AcpError::ProviderStall`. Silence is zero `session/update` traffic
+        // of any kind, so a long tool that keeps emitting `tool_call_update`
+        // chunks resets the clock and is never killed. Breaking out drops
+        // `prompt_fut` (its pending-map entry is cleaned by the transport's
+        // drop guard, exactly like the idle-timeout early return in
+        // `session::prompt`); the error then takes the ordinary terminal
+        // path below (Error status, `agent:failed`, blocker attention raise)
+        // and the worker's `handle_terminal_turn_failure` tears the hung
+        // child down so a retry spawns fresh.
         let stall_threshold_ms = stream_stall_ms();
-        let stall_check = Duration::from_millis((stall_threshold_ms / 6).clamp(10, 15_000));
+        let open_tool_stall_ms = open_tool_call_stall_ms();
+        let stall_terminal_ms = provider_stall_terminal_ms();
+        let open_tool_terminal_ms = open_tool_call_terminal_ms();
+        let stall_check = Duration::from_millis(
+            (stall_threshold_ms
+                .min(open_tool_stall_ms)
+                .min(stall_terminal_ms)
+                .min(open_tool_terminal_ms)
+                / 6)
+            .clamp(10, 15_000),
+        );
         let mut stall_emitted = false;
         let result = loop {
             let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
@@ -2623,17 +3063,43 @@ impl Services {
                         }
                         None => closed = true,
                     },
-                    () = tokio::time::sleep(stall_check), if !stall_emitted => {
+                    () = tokio::time::sleep(stall_check) => {
                         let silent_ms = activity.idle_ms();
-                        if silent_ms >= stall_threshold_ms && transcript.open_tool_call_count() == 0 {
+                        let tool_call_open = transcript.open_tool_call_count() > 0;
+                        let advisory_threshold_ms = if tool_call_open {
+                            open_tool_stall_ms
+                        } else {
+                            stall_threshold_ms
+                        };
+                        if !stall_emitted && silent_ms >= advisory_threshold_ms {
                             stall_emitted = true;
                             tracing::warn!(
                                 agent = %agent_id,
                                 silent_ms,
+                                tool_call_open,
                                 "mid-turn stream stall — no session/update past threshold (monorepo#3402)"
                             );
                             self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
                                 .await;
+                        }
+                        let terminal_ms = if tool_call_open {
+                            open_tool_terminal_ms
+                        } else {
+                            stall_terminal_ms
+                        };
+                        if silent_ms >= terminal_ms {
+                            let open_tool_call = transcript.open_tool_call_label();
+                            tracing::warn!(
+                                agent = %agent_id,
+                                silent_ms,
+                                terminal_ms,
+                                open_tool_call = open_tool_call.as_deref().unwrap_or("none"),
+                                "provider stall — no session/update past the terminal threshold; failing the turn (intent#5395)"
+                            );
+                            break Err(AcpError::ProviderStall {
+                                silent: Duration::from_millis(silent_ms),
+                                open_tool_call,
+                            });
                         }
                     }
                 }
@@ -2698,8 +3164,24 @@ impl Services {
                             attempt = fetch_retry_attempt,
                             "output arrived during retry backoff — abandoning retry (monorepo#3007)"
                         );
+                        // `fetch_retry_attempt` was already bumped for the
+                        // retry that is now abandoned: the failing attempt is
+                        // the one dispatched BEFORE that bump.
+                        post_output_transient_fetch_failure =
+                            Some((fetch_retry_attempt, retry_guard_cause(any_update_received)));
                         break attempt_result;
                     }
+                }
+                Err(e)
+                    if (any_update_received
+                        || conn.client_request_seq() != client_request_watermark)
+                        && intent_acp::is_transient_provider_fetch_failure(e) =>
+                {
+                    post_output_transient_fetch_failure = Some((
+                        fetch_retry_attempt + 1,
+                        retry_guard_cause(any_update_received),
+                    ));
+                    break attempt_result;
                 }
                 _ => break attempt_result,
             }
@@ -2900,7 +3382,7 @@ impl Services {
         // left to today's behavior: root/user-facing agents and taskless
         // agents (WARN + advisory only, per the issue's guard scope),
         // question-bearing turns (the redrive would bury the pending Q&A
-        // behind the question hold's back), and turns with a ready-to-send
+        // the user has not yet answered), and turns with a ready-to-send
         // queue entry (the imminent drain is itself the nudge). The counter
         // clears on any clean (non-truncated) completion — the stall
         // episode is over.
@@ -3014,8 +3496,8 @@ impl Services {
                 .await;
             message_persisted = true;
         }
-        // Stored-on-write pending-questions marker (PROTOCOL §5.5, question
-        // hold): a question-bearing assistant tail arms the hold under this
+        // Stored-on-write pending-questions marker (PROTOCOL §5.5): a
+        // question-bearing assistant tail arms the marker under this
         // turn's message id (a newer question set overwrites an older marker
         // — single-slot). A question-FREE turn end deliberately does NOT
         // clear the marker: pendingness survives the agent's later turns
@@ -3090,7 +3572,7 @@ impl Services {
                 .lock()
                 .ok()
                 .and_then(|mut chain| chain.remove(agent_id));
-            let handle = tokio::spawn(async move {
+            let handle = intent_core::spawn_daemon(async move {
                 if let Some(prev) = prev {
                     let _ = prev.await;
                 }
@@ -3143,6 +3625,109 @@ impl Services {
                 chain.insert(agent_id.clone(), handle);
             }
         }
+        // Post-output transient fetch failure (intent-hq/intent#5419): the
+        // turn is about to fail terminally exactly as today (Error status,
+        // `agent:failed`, no redrive), but the death would otherwise only be
+        // discovered later by a delegation-group watch or a coordinator
+        // reading the log. Raise a blocker-style attention request on the
+        // dying agent through the SAME shared op `ws.agent.reportBlocker`
+        // uses — pending fields persisted on the session, linked task →
+        // `blocked`, immediate parent + watcher wakes — so whoever is waiting
+        // on the agent hears about it at once. Placed AFTER the assistant-row
+        // persist so the transcript notice lands after the streamed partial,
+        // and BEFORE the terminal persist/emits below: the agent is busy
+        // here, so the op parks the user-facing surfacing on the deferred
+        // registry and the `Err` arm's `flush_deferred_attention` surfaces it
+        // ahead of `agent:failed`. The attention columns are written by the
+        // narrow `set_attention_request` writer (not the full-row update the
+        // terminal persist uses), so the two writes cannot clobber each
+        // other; `park_attention_write` guards only the workspace-level
+        // `raise_attention` flag, which this path never touches. Best-effort:
+        // a failed raise logs and the terminal path proceeds unchanged.
+        if let Some((attempts, cause)) = post_output_transient_fetch_failure {
+            if let Err(e) = &result {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    attempts,
+                    cause,
+                    "transient provider fetch failure after output/side effect — not retrying in place; attention raised (monorepo#5419)"
+                );
+                let reason = format!(
+                    "Turn failed with a transient provider fetch failure after {cause} \
+                     (attempt {attempts} of {}; error class: transient provider fetch failure). \
+                     The in-place retry only applies to attempts with no streamed output and no \
+                     side-effecting client request, so the turn was not retried and the agent is \
+                     stopping with status error. Provider error: {e}",
+                    MAX_TRANSIENT_PROMPT_FETCH_RETRIES + 1
+                );
+                if let Err(raise_err) = self
+                    .agent_request_attention_op(
+                        workspace_id.clone(),
+                        "blocker".to_string(),
+                        reason,
+                        Some(agent_id.clone()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %raise_err,
+                        "failed to raise attention for the post-output transient fetch failure (monorepo#5419)"
+                    );
+                }
+            }
+        }
+        // Terminal provider stall (intent-hq/intent#5395): the select loop
+        // above ended the attempt because the provider went silent past
+        // [`provider_stall_terminal_ms`] with no tool call in flight, or past
+        // [`open_tool_call_terminal_ms`] with a tool call hung open. Same
+        // terminal path and same blocker-style attention raise as the #5419
+        // block above (ordering, deferred flush, and best-effort semantics
+        // identical), so the parent / watchers / user learn about the hang at
+        // once instead of after an hour of "Thinking".
+        if let Err(AcpError::ProviderStall {
+            silent,
+            open_tool_call,
+        }) = &result
+        {
+            let reason = match open_tool_call {
+                Some(label) => format!(
+                    "Turn ended after a provider stall: no session/update from the provider for \
+                     {silent:?} with tool call {label} still open (open-tool terminal threshold \
+                     {:?}; error class: provider stall). The tool call never reported completion \
+                     and emitted nothing for the whole window, so the turn was failed instead of \
+                     waiting for the idle timeout; the agent is stopping with status error and its \
+                     provider process is restarted on the next turn. Retry the turn to continue.",
+                    Duration::from_millis(open_tool_terminal_ms),
+                ),
+                None => format!(
+                    "Turn ended after a provider stall: no session/update from the provider for \
+                     {silent:?} with no tool call in flight (terminal threshold {:?}; error class: \
+                     provider stall). The provider is neither streaming nor running a tool, so the \
+                     turn was failed instead of waiting for the idle timeout; the agent is stopping \
+                     with status error and its provider process is restarted on the next turn. Retry \
+                     the turn to continue.",
+                    Duration::from_millis(stall_terminal_ms),
+                ),
+            };
+            if let Err(raise_err) = self
+                .agent_request_attention_op(
+                    workspace_id.clone(),
+                    "blocker".to_string(),
+                    reason,
+                    Some(agent_id.clone()),
+                )
+                .await
+            {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %raise_err,
+                    "failed to raise attention for the provider stall (intent#5395)"
+                );
+            }
+        }
+
         // Durable-before-observable for the streaming terminal-failure path
         // (monorepo#2050): an ordinary mid-turn `session/prompt failed:` error
         // is terminal, and this function emits its own terminal
@@ -3161,9 +3746,78 @@ impl Services {
         // wrapped text matches the ordinary error the final `map_err` returns
         // below, so the persisted `stop_reason` is byte-identical to what the
         // worker would have written.
+        //
+        // Auth-required prompt failure (intent-hq/intent#3941): resolved BEFORE
+        // the persist seam so the persisted `stop_reason` and the returned
+        // error carry the identical actionable message. The provider's cached
+        // auth verdict is demoted to a hard `false` so follow-up spawns fail
+        // fast at the create/delegate gate instead of dying on their first
+        // turn. Falls back to the opaque wrapper when the agent's provider
+        // cannot be resolved from the session row.
+        let prompt_auth_message = match &result {
+            Err(e)
+                if !pre_output_transport_failure
+                    && !prompt_idle_timeout
+                    && is_acp_auth_required(e) =>
+            {
+                match self
+                    .store
+                    .get_agent_session_token_usage(workspace_id, agent_id)
+                    .await
+                {
+                    Ok((_, _, provider, _)) => resolve_provider_id(
+                        provider.as_deref(),
+                        derived_default_provider(&self.effective_settings()).as_deref(),
+                    )
+                    .map(|provider_id| {
+                        crate::provider_auth::demote_auth_verdict(&provider_id);
+                        format!(
+                            "session/prompt: {}",
+                            crate::provider_auth::not_authenticated_message(&provider_id)
+                        )
+                    }),
+                    Err(e) => {
+                        tracing::warn!(agent = %agent_id, error = %e, "read provider for auth-failure mapping failed");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        // Quota-exhaustion observation: resolved in the SAME pre-persist seam
+        // as the auth mapping above, for the same reason — this is the last
+        // place the structured `AcpError` still exists, before the final
+        // `map_err` flattens it into the `session/prompt failed: …` wrapper.
+        //
+        // Unlike the auth branch this changes NOTHING durable: the wrapped
+        // error, the persisted `stop_reason`, and the returned error are
+        // byte-identical to before, and the failure stays terminal exactly as
+        // today. The sole consumer is the additive `errorCode`/`providerId`
+        // stamp on the `agent:failed` emit below, which lets the FE offer
+        // "retry on another provider" without string-matching the rendered
+        // prose. Guarded by the same two suppression predicates as that emit
+        // (a pre-output transport failure and an idle timeout both defer their
+        // terminal events to the turn worker) so the provider read only costs
+        // a row on a failure this path actually reports.
+        let (prompt_quota_failure, prompt_quota_provider) = match &result {
+            Err(e)
+                if !pre_output_transport_failure
+                    && !prompt_idle_timeout
+                    && intent_acp::is_quota_exceeded(e) =>
+            {
+                (
+                    true,
+                    session_provider_id(self, workspace_id, agent_id).await,
+                )
+            }
+            _ => (false, None),
+        };
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout {
-                let wrapped = Error::Internal(format!("session/prompt failed: {e}"));
+                let wrapped = match prompt_auth_message.as_deref() {
+                    Some(msg) => Error::InvalidParams(msg.to_string()),
+                    None => Error::Internal(format!("session/prompt failed: {e}")),
+                };
                 if !crate::agent_manager::prompt_cancellation_error(&wrapped) {
                     let persist = crate::agent_manager::persist_terminal_error_status_via_services(
                         self,
@@ -3315,6 +3969,12 @@ impl Services {
                 if let Ok(session) = self.store.get_agent_session(agent_id).await {
                     data["agentName"] = Value::String(session.name);
                     data["isBackground"] = Value::Bool(session.is_background);
+                    // Mute hint: present only when true (absent ≠ false, like
+                    // `workspaceArchived`) so notification clients stay quiet
+                    // for a muted agent without a follow-up read.
+                    if session.notifications_muted {
+                        data["notificationsMuted"] = Value::Bool(true);
+                    }
                     if let Some(report) = session.completion_report {
                         data["completionReport"] = Value::String(report.clone());
                         data["report"] = Value::String(report);
@@ -3395,9 +4055,25 @@ impl Services {
                 // A turn error also ends the turn — surface a mid-turn raise
                 // now (same ordering rationale as the idle arm above).
                 self.flush_deferred_attention(agent_id, workspace_id).await;
-                let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
+                // Auth-required mapping (intent-hq/intent#3941): the event
+                // carries the same actionable message as the persisted
+                // stop_reason and returned error, not the raw adapter error.
+                let error_text = prompt_auth_message.clone().unwrap_or_else(|| e.to_string());
+                let mut data = json!({ "agentId": agent_id.0, "error": error_text });
                 if let Some(tid) = turn_id {
                     data["turnId"] = json!(tid);
+                }
+                // Additive quota signal (absent on every other failure, never
+                // `false`/`null`), classified above from the structured
+                // `AcpError`. Same shape and same additive contract as
+                // `sessionCorrupted` on `agent:status-changed`: a structured
+                // restatement of a verdict the daemon already reached, so the
+                // client does not have to re-derive it from prose.
+                if prompt_quota_failure {
+                    crate::agent_manager::stamp_quota_failure(
+                        &mut data,
+                        prompt_quota_provider.as_deref(),
+                    );
                 }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_FAILED, data)
                     .await;
@@ -3413,6 +4089,10 @@ impl Services {
                 Error::Internal(format!(
                     "session/prompt failed: {e} {PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX}"
                 ))
+            } else if let Some(msg) = prompt_auth_message {
+                // Auth-required failure: identical message to the persisted
+                // stop_reason above (intent-hq/intent#3941).
+                Error::InvalidParams(msg)
             } else {
                 Error::Internal(format!("session/prompt failed: {e}"))
             }
@@ -3463,10 +4143,10 @@ impl Services {
         };
         // A failed flush deliberately does NOT reap the turn's mid-turn
         // staged rows (unlike the turn-end/wake failure arms): this path does
-        // not own the slot, so a `None` here can coexist with a concurrent
-        // teardown whose pinned retry flush is still entitled to adopt them —
-        // reaping would delete the only copy of the heavy bodies out from
-        // under it. Truly orphaned rows are bounded and reaped by the
+        // not own the slot, so a non-`Appended` outcome here can coexist with
+        // a concurrent teardown whose pinned retry flush is still entitled to
+        // adopt them — reaping would delete the only copy of the heavy bodies
+        // out from under it. Truly orphaned rows are bounded and reaped by the
         // `Store::open` sweep.
         let interrupted_message_id = self
             .flush_partial_turn_on_interruption(
@@ -3476,7 +4156,9 @@ impl Services {
                 None,
                 false,
             )
-            .await;
+            .await
+            .appended_message_id()
+            .map(str::to_owned);
         // Capture the session's running status for restore-on-resume, serialized
         // to the stored form (e.g. "active", "Waiting") exactly like
         // `heal_stale_agent_sessions`. A lookup failure falls back to "active".
@@ -3512,13 +4194,16 @@ impl Services {
                 // row until the NEXT host wake — even though the normal
                 // failure/retry surface was suppressed. Fire a gated, debounced
                 // resume directly for this agent so it recovers on its own; the
-                // wake sweep stays the catch-all. The debounce lets the worker's
-                // post-enrollment `kill_child_only` + `end_turn` settle first,
-                // and the row's atomic claim dedupes against a racing wake sweep
-                // / `resolveInterrupted`.
+                // wake sweep stays the catch-all. The debounce usually lets the
+                // worker's post-enrollment `kill_child_only` settle first, but
+                // it is only a timer: a continuation that lands while the
+                // worker still holds the slot is parked in the queue and
+                // delivered by the worker's own end-of-turn drain
+                // (intent-hq/intent#4972). The row's atomic claim dedupes
+                // against a racing wake sweep / `resolveInterrupted`.
                 let services = self.clone();
                 let debounce = wake_resume_self_heal_debounce();
-                tokio::spawn(async move {
+                intent_core::spawn_daemon(async move {
                     tokio::time::sleep(debounce).await;
                     services.resume_suspend_interrupted_agents().await;
                 });
@@ -3741,7 +4426,7 @@ impl Services {
             tracing::debug!(agent = %agent_id, "harness-wake turn produced no content");
         }
         // Same stored-on-write pending-questions marker as the prompt-turn
-        // persist: a question-bearing wake tail arms the hold (question-free
+        // persist: a question-bearing wake tail arms the marker (question-free
         // tails leave the marker untouched).
         let marker_moved = if message_persisted && questions_persisted {
             self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
@@ -3750,7 +4435,7 @@ impl Services {
             false
         };
         // Same §6.5 step-0 recompute as the prompt-turn persist: only a
-        // question-bearing tail moves the question-hold derivation.
+        // question-bearing tail moves the pending-questions derivation.
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
@@ -3841,7 +4526,7 @@ impl Services {
                     "empty harness-wake response on a delegated in-task agent — enqueueing recovery nudge (monorepo#3262)"
                 );
                 let nudge = crate::harness::latest().empty_wake_redrive_nudge();
-                self.enqueue_message_with_origin(
+                self.enqueue_message(
                     agent_id,
                     nudge,
                     None,
@@ -3849,7 +4534,7 @@ impl Services {
                     Some(json!({ "type": "empty_wake_redrive" })),
                     None,
                     false,
-                    false,
+                    MessageOrigin::Automatic,
                 );
                 self.publish_queue_updated(agent_id).await;
                 return true;
@@ -3918,6 +4603,9 @@ impl Services {
         if let Ok(session) = self.store.get_agent_session(agent_id).await {
             data["agentName"] = Value::String(session.name);
             data["isBackground"] = Value::Bool(session.is_background);
+            if session.notifications_muted {
+                data["notificationsMuted"] = Value::Bool(true);
+            }
             if let Some(report) = session.completion_report {
                 data["completionReport"] = Value::String(report.clone());
                 data["report"] = Value::String(report);
@@ -4030,8 +4718,7 @@ impl Services {
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((model, _, provider, _)) => resolve_provider_id(
-                model.as_deref(),
+            Ok((_, _, provider, _)) => resolve_provider_id(
                 provider.as_deref(),
                 derived_default_provider(&self.effective_settings()).as_deref(),
             ),
@@ -4080,20 +4767,19 @@ impl Services {
     ) {
         // The session row is read unconditionally: the stored snapshot backs
         // both the missing-half fallback and the SUM accumulation, and the
-        // model/provider columns key the report semantics. The configured
-        // default is passed through so the resolution mirrors the spawn
-        // precedence exactly: a bare-model session with `provider = NULL`
-        // actually runs on `providers.active`, and classifying it as the
-        // Cumulative default would reintroduce the undercount for a SUM
-        // default provider (#3794/#3795).
+        // provider column keys the report semantics. The configured default
+        // is passed through so the resolution mirrors the spawn precedence
+        // exactly: a session with `provider = NULL` actually runs on the
+        // settings-derived default, and classifying it as the Cumulative
+        // default would reintroduce the undercount for a SUM default
+        // provider (#3794/#3795).
         let (stored, semantics, per_turn_cost, thought_subset) = match self
             .store
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((model, _, provider, stored)) => {
+            Ok((_, _, provider, stored)) => {
                 let provider_id = resolve_provider_id(
-                    model.as_deref(),
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 );
@@ -4223,17 +4909,16 @@ impl Services {
                 (None, None, None, None, false)
             }
         };
-        // Resolution mirrors the spawn precedence (compound model prefix →
-        // provider field → configured default) so a bare-model session with
-        // `provider = NULL` — which actually runs on `providers.active` —
-        // keys the correct report semantics instead of falling to the
-        // Cumulative default (#3794/#3795). A still-unresolvable provider
-        // falls to the `"unknown"` stats tail (and the cumulative semantics
-        // default below).
+        // Resolution mirrors the spawn precedence (provider field →
+        // configured default) so a session with `provider = NULL` — which
+        // actually runs on the settings-derived default — keys the correct
+        // report semantics instead of falling to the Cumulative default
+        // (#3794/#3795). A still-unresolvable provider falls to the
+        // `"unknown"` stats tail (and the cumulative semantics default
+        // below).
         let provider_id = prev_readable
             .then(|| {
                 resolve_provider_id(
-                    model.as_deref(),
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 )
@@ -4468,16 +5153,20 @@ impl Services {
                 // the echoed output, `workspace_api` FIFO fallback). A hit
                 // yields the canonical resource items to attach — no echo
                 // parsing; a miss falls back to the legacy lift inside
-                // `record_tool`. `tool_call_update`s are name-less, so the
-                // FIFO gate resolves the name recorded at first sight.
+                // `record_tool`. `tool_call_update`s are name-less (and
+                // usually input-less), so the name gate resolves the name
+                // recorded at first sight and the input-shape gate sees the
+                // freshest input — withheld once the call was identified
+                // authoritatively (intent-hq/intent#4491).
                 let known = transcript.tool_name_for(&tc.tool_call_id).is_some();
                 let registered: Vec<Value> = if tc.status == "completed" {
                     let name = transcript
                         .tool_name_for(&tc.tool_call_id)
                         .unwrap_or(&tc.tool_name)
                         .to_string();
+                    let input = transcript.unidentified_input_for(&tc);
                     self.turn_attachments
-                        .claim_at_tool_result(agent_id, tc.output.as_ref(), &name)
+                        .claim_at_tool_result(agent_id, tc.output.as_ref(), &name, input)
                         .iter()
                         .map(intent_core::TurnAttachment::resource_item)
                         .collect()

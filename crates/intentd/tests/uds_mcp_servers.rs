@@ -6,6 +6,8 @@
 //! real keychain) and a mock node MCP stdio server fixture (skipped if node is
 //! unavailable).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
@@ -23,23 +25,16 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-mcp-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-mcp-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -120,7 +115,7 @@ async fn wait_for_state(reader: &mut BufReader<OwnedReadHalf>, state: &str) -> V
 
 const SECRET: &str = "supersecret_env_value_0123456789";
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mcp_servers_lifecycle_redaction_and_status_event() {
     if !node_available() {
         eprintln!("skipping mcp.servers E2E: node not on PATH");
@@ -151,7 +146,7 @@ async fn mcp_servers_lifecycle_redaction_and_status_event() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -332,7 +327,7 @@ async fn spawn_http_fixture(script: &str) -> (tokio::process::Child, String) {
 /// Remote `http` transport: the daemon probes the endpoint over the network
 /// (MCP handshake via streamable HTTP POST) — reachable server → `running` with
 /// the advertised toolCount, dead port → `error` with a reachability message.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mcp_servers_http_probe_running_and_unreachable() {
     if !node_available() {
         eprintln!("skipping mcp.servers http E2E: node not on PATH");
@@ -362,7 +357,7 @@ async fn mcp_servers_http_probe_running_and_unreachable() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -500,7 +495,7 @@ async fn mcp_servers_http_probe_running_and_unreachable() {
 /// untouched), the scoped list carries `workspaceDisabled`, other workspaces
 /// are unaffected, and an unknown workspace id on the write path is
 /// `not-found` while the scoped read stays lenient.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mcp_servers_workspace_scoped_toggle_and_list() {
     use intent_core::{now_iso, WorkspaceId};
 
@@ -532,7 +527,7 @@ async fn mcp_servers_workspace_scoped_toggle_and_list() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {

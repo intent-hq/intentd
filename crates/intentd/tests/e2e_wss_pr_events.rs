@@ -50,13 +50,6 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
 struct MemTokenStore(Mutex<Option<String>>);
@@ -337,7 +330,7 @@ struct Fixture {
     cfg: Arc<ClientConfig>,
     services: Arc<Services>,
     ws_id: WorkspaceId,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the stub forge
@@ -354,9 +347,8 @@ async fn boot_seeded(
     base_ref: Option<&str>,
     pr_number: Option<u64>,
 ) -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-pr-events-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-pr-events-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -402,11 +394,14 @@ async fn boot_seeded(
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("seed workspace");
 
@@ -435,7 +430,7 @@ async fn boot_seeded(
         cfg,
         services,
         ws_id,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -501,7 +496,7 @@ async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
 /// and an open successor (#300) exists on the same branch → the refresh emits
 /// `pr:linked` whose payload carries prNumber 300 plus the full `pullRequests`
 /// list (merged #42 retained, open #300 added), matching PROTOCOL §6.5.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_linked_event_carries_pull_requests_list_over_wss() {
     let fx = boot(StubForge {
         open_pr_number: Some(300),
@@ -547,7 +542,7 @@ async fn pr_linked_event_carries_pull_requests_list_over_wss() {
 /// unlinked review workspace on its own branch (`review-ws`) whose `baseRef`
 /// equals an open PR's head ref (`feature`) links that PR — the refresh
 /// emits `pr:linked` with the discovered PR in the payload.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_linked_via_baseref_discovery_over_wss() {
     let fx = boot_seeded(
         StubForge {
@@ -591,7 +586,7 @@ async fn pr_linked_via_baseref_discovery_over_wss() {
 /// Merged-without-successor over the wire: the linked PR (#42) is fetched as
 /// merged and no open successor exists → the refresh emits `pr:updated` whose
 /// payload carries the status delta plus the seeded `pullRequests` list.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_updated_event_carries_pull_requests_list_over_wss() {
     let fx = boot(StubForge::default()).await;
 
@@ -631,7 +626,7 @@ async fn pr_updated_event_carries_pull_requests_list_over_wss() {
 /// linkage state; the `pr:linked` event flows through the existing refresh
 /// path (no duplicate emission). A separate subscriber connection observes the
 /// event so the RPC response and notification framing stay independent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_refresh_rpc_reports_post_refresh_state_over_wss() {
     let fx = boot(StubForge {
         open_pr_number: Some(300),
@@ -706,7 +701,7 @@ async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Va
 /// fall through the router match to the normal unknown-method path — `-32601
 /// Method not found` over the wire — while `pr.status` / `pr.refresh` stay
 /// recognized (asserted by the other tests in this file).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn removed_pr_methods_return_method_not_found_over_wss() {
     let fx = boot(StubForge::default()).await;
 
@@ -765,7 +760,7 @@ fn run_git(args: &[&str], cwd: &Path) {
 /// the remote-only ref with its commits), `baseRef` is the PR base (`main`),
 /// `prNumber`/`prUrl` are seeded, and `baseCommitSha` records the base
 /// boundary (the merge-base), not the checked-out PR head tip.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_with_pr_context_link_over_wss() {
     let git_ok = matches!(
         Command::new("git")
@@ -784,12 +779,8 @@ async fn workspace_create_with_pr_context_link_over_wss() {
     // A local "remote" whose PR head exists only as a remote-tracking ref in
     // the clone the daemon provisions from: `main` (base) + one commit ahead
     // on `feature` (the PR head), cloned with `main` checked out.
-    let scratch = std::env::temp_dir().join(format!(
-        "intentd-pr-create-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
-    std::fs::create_dir_all(&scratch).unwrap();
-    let _scratch = TempDir(scratch.clone());
+    let scratch_guard = common::test_tempdir("intentd-pr-create-");
+    let scratch = scratch_guard.path().to_path_buf();
     let origin = scratch.join("origin");
     std::fs::create_dir_all(&origin).unwrap();
     run_git(&["init", "-q", "-b", "main"], &origin);

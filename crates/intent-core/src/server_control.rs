@@ -4,11 +4,39 @@
 //! to start/stop the WSS listener without a daemon restart. This trait
 //! is implemented in the binary (`intentd`) and wired into [`Services`] so the
 //! `settings.update` handler can invoke it after persisting the new values.
+//!
+//! [`InviteLinkBuilder`] is the sibling seam for invite links (multiplayer
+//! w4): the transport owns the listener's pairing envelope, so the services
+//! layer asks it to rebuild an open invite's `intent://invite?…` link on
+//! `workspace.invite.list`.
 
 use std::future::Future;
 use std::pin::Pin;
 
 use crate::Result;
+
+/// A resolved envelope, or `None` when no link can be built right now.
+pub type ResolvedInviteLinkEnvelope = Option<Box<dyn InviteLinkEnvelope>>;
+
+/// Builds `intent://invite?…` links for stored invites, implemented by the
+/// transport (it owns the listener's hosts / port / fingerprint / tunnel
+/// envelope) and attached to `Services` by the composition root.
+pub trait InviteLinkBuilder: Send + Sync {
+    /// Resolve the listener's current link envelope once, to stamp a batch
+    /// of invites. `None` whenever no link can be built right now — TCP
+    /// listener down, no dialable route — which is never an error for a
+    /// read like `workspace.invite.list`.
+    fn invite_link_envelope(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = ResolvedInviteLinkEnvelope> + Send + '_>>;
+}
+
+/// One resolved link envelope: formats the link for an `(inviteId, secret)`
+/// pair without touching the listener again.
+pub trait InviteLinkEnvelope: Send + Sync {
+    /// The full `intent://invite?…` link for one invite.
+    fn invite_url(&self, invite_id: &str, secret: &str) -> String;
+}
 
 /// Runtime control surface for the WSS listener, implemented by the
 /// daemon composition root and wired into `Services` so `settings.update` can

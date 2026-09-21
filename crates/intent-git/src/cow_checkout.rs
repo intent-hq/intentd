@@ -20,7 +20,7 @@ use intent_core::{Error, Result};
 
 use crate::cow::cow_clone_with_excludes;
 use crate::map_git_err;
-use crate::repo_cache::{provision_plain_clone_checkout, OriginTarget};
+use crate::repo_cache::{provision_plain_clone_checkout, remove_remote_local_only, OriginTarget};
 
 /// How many of the slowest fast-path subtree clones to name in the
 /// provisioning summary log.
@@ -430,7 +430,7 @@ fn resolve_inherited_origin(source_repo: &Path, checkout_path: &Path) -> Result<
             }
         } else {
             // Deleting the remote drops its pushurl with it.
-            clone.remote_delete("origin").map_err(map_git_err)?;
+            remove_remote_local_only(&clone, "origin")?;
             return Ok(());
         }
     }
@@ -1323,6 +1323,37 @@ mod tests {
         assert_self_contained(&checkout, source.path());
     }
 
+    /// intent-hq/intent#5326: a global `remote.origin.prune=true` inherited by
+    /// the `CoW` clone must not break removal of its self-referencing `origin`
+    /// (libgit2's `remote_delete` tries to delete the inherited key from the
+    /// clone's config and fails with "could not find key").
+    #[test]
+    fn cow_checkout_removes_self_origin_under_global_prune() {
+        let home = crate::testutil::install_global_remote_prune_config();
+        let source = init_repo("cowchk-selforigin-prune");
+        commit_file(source.path(), "a.txt", "one\n");
+        {
+            let repo = Repository::open(source.path()).unwrap();
+            repo.remote("origin", &source.path().display().to_string())
+                .unwrap();
+        }
+        if !cow_available(source.path()) {
+            return;
+        }
+
+        let checkout = unique_checkout("cowchk-selforigin-prune");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin", &[]).unwrap();
+
+        let clone = Repository::open(&checkout).unwrap();
+        assert!(
+            clone.find_remote("origin").is_err(),
+            "an origin naming the source checkout must be removed"
+        );
+        assert_self_contained(&checkout, source.path());
+        assert_global_prune_preserved(home.path());
+    }
+
     /// Origin removal must not break base-ref resolution: a self-referencing
     /// `origin` is removed (dropping `refs/remotes/origin/*` with it) only
     /// AFTER checkout, so a `base_ref` surviving solely as a remote-tracking
@@ -1504,6 +1535,19 @@ mod tests {
         values
     }
 
+    /// The injected global config (see
+    /// `testutil::install_global_remote_prune_config`) must still carry
+    /// `remote.origin.prune=true` after provisioning: removing the clone's
+    /// `origin` may only edit the clone's local config.
+    fn assert_global_prune_preserved(home: &std::path::Path) {
+        let global = git2::Config::open(&home.join(".gitconfig")).unwrap();
+        assert_eq!(
+            global.get_bool("remote.origin.prune").ok(),
+            Some(true),
+            "the inherited global remote.origin.prune entry must survive"
+        );
+    }
+
     /// The clone must be a self-contained repository: a real `.git` directory
     /// (not a worktree gitfile) and no config value naming the source path.
     fn assert_self_contained(checkout: &std::path::Path, source: &std::path::Path) {
@@ -1649,6 +1693,66 @@ mod tests {
         commit_file(source.path(), "a.txt", "two\n");
 
         let checkout = unique_checkout("localclone-base");
+        let _cleanup = Cleanup(checkout.clone());
+        let sha = provision_local_clone_checkout(source.path(), &checkout, "dup-ws", Some("base"))
+            .unwrap();
+
+        assert_eq!(sha, base_sha);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "one\n",
+            "tracked files match the base ref, not the source HEAD"
+        );
+        assert_self_contained(&checkout, source.path());
+    }
+
+    /// intent-hq/intent#5326: with `remote.origin.prune=true` inherited from
+    /// the global config, removing the clone's self-referencing `origin` must
+    /// still succeed, edit only the clone's local config, and leave the
+    /// inherited entry in place. Plain clone, so it runs on any filesystem.
+    #[test]
+    fn local_clone_removes_self_origin_under_global_prune() {
+        let home = crate::testutil::install_global_remote_prune_config();
+        let source = init_repo("localclone-selforigin-prune");
+        commit_file(source.path(), "a.txt", "one\n");
+        {
+            let repo = Repository::open(source.path()).unwrap();
+            repo.remote("origin", &source.path().display().to_string())
+                .unwrap();
+        }
+
+        let checkout = unique_checkout("localclone-selforigin-prune");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_local_clone_checkout(source.path(), &checkout, "dup-ws", None).unwrap();
+
+        let clone = Repository::open(&checkout).unwrap();
+        assert!(
+            clone.find_remote("origin").is_err(),
+            "an origin naming the source checkout must be removed"
+        );
+        assert_self_contained(&checkout, source.path());
+        let local = git2::Config::open(&checkout.join(".git").join("config")).unwrap();
+        assert!(
+            local.get_string("remote.origin.prune").is_err(),
+            "removal must not copy the inherited prune entry into the clone"
+        );
+        assert_global_prune_preserved(home.path());
+    }
+
+    /// intent-hq/intent#5326: the overlay fetch of `refs/remotes/origin/*`
+    /// must not honor an inherited `remote.origin.prune=true` — the source
+    /// has no remote-tracking refs of its own, so pruning would delete every
+    /// copied branch ref and `base_ref` would no longer resolve.
+    #[test]
+    fn local_clone_branches_from_base_ref_under_global_prune() {
+        let _home = crate::testutil::install_global_remote_prune_config();
+        let source = init_repo("localclone-base-prune");
+        commit_file(source.path(), "a.txt", "one\n");
+        let base_sha = head_sha(&source);
+        crate::testutil::create_branch(source.path(), "base");
+        commit_file(source.path(), "a.txt", "two\n");
+
+        let checkout = unique_checkout("localclone-base-prune");
         let _cleanup = Cleanup(checkout.clone());
         let sha = provision_local_clone_checkout(source.path(), &checkout, "dup-ws", Some("base"))
             .unwrap();

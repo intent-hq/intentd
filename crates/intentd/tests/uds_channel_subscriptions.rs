@@ -4,6 +4,8 @@
 //! `{ added, updated, removedIds }` deltas mapped from bus change events via the
 //! re-read strategy (PROTOCOL §6, TB-0 §2/§3).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
@@ -20,23 +22,16 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-uds-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -136,7 +131,7 @@ fn boot(
             .with_event_bus(bus.clone()),
     );
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -153,7 +148,7 @@ fn find<'a>(arr: &'a [Value], id: &str) -> Option<&'a Value> {
     arr.iter().find(|e| e["id"] == id)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_channel_snapshot_then_removed_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -210,7 +205,7 @@ async fn agent_channel_snapshot_then_removed_delta() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -293,7 +288,7 @@ async fn task_channel_snapshot_then_updated_delta() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -361,7 +356,7 @@ async fn comment_channel_snapshot_then_updated_delta() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -431,6 +426,14 @@ async fn workspace_channel_snapshot_then_updated_delta() {
         ws_entry.get("diffSummary").is_none(),
         "snapshot rows omit diffSummary: {ws_entry}"
     );
+    // Multiplayer w1: the forwarder runs with the connection's Caller
+    // re-bound (a UDS connection IS the primary user), so the seq-0 row
+    // carries the caller-relative membership summary (intentd#1868).
+    assert_eq!(
+        ws_entry["myRole"], "owner",
+        "snapshot rows carry the caller's role: {ws_entry}"
+    );
+    assert_eq!(ws_entry["memberCount"], 1, "{ws_entry}");
     // The snapshot's displayStatus matches a subsequent enriched
     // workspace.get for the same data (same derivation, no drift).
     let got = rpc(
@@ -476,6 +479,11 @@ async fn workspace_channel_snapshot_then_updated_delta() {
     assert_eq!(d1["params"]["kind"], "delta");
     assert_eq!(d1["params"]["seq"], 1);
     assert_eq!(d1["params"]["delta"]["updated"][0]["id"], ws_id.as_str());
+    // The delta re-read runs in the same caller scope as the snapshot.
+    assert_eq!(
+        d1["params"]["delta"]["updated"][0]["myRole"], "owner",
+        "delta rows carry the caller's role: {d1}"
+    );
 
     let _ = shutdown_tx.send(());
     let _ = server.await;

@@ -122,7 +122,7 @@ impl OpenAiEngine {
             .and_then(Value::as_f64)
             // Float→int casts saturate; durations are non-negative seconds.
             .map(|secs| {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let ms = (secs * 1000.0) as u64;
                 ms
             });

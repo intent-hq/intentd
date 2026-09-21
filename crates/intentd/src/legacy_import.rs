@@ -632,7 +632,9 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
                 let seen = seen.clone();
                 let dir = dir.clone();
                 let manifest = manifest.clone();
-                tokio::spawn(async move { import_one(&store, &dir, &manifest, &opts, &seen).await })
+                intent_core::spawn_daemon(async move {
+                    import_one(&store, &dir, &manifest, &opts, &seen).await
+                })
             };
             match task.await {
                 Ok((claimed, entry)) => {
@@ -1030,13 +1032,17 @@ async fn import_workspace_notes(
         let note = note_from_legacy_file(workspace, &stem, &text, &path);
         match store.get_note(&workspace.id, &note.id).await {
             Ok(_) => counts.skipped += 1,
-            Err(Error::NotFound(_)) => match store.insert_note(&note).await {
-                Ok(()) => counts.imported += 1,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), note_id = %note.id, error = %e, "legacy note insert failed");
-                    counts.failed += 1;
+            // Row and initial snapshot commit together so the imported rev is
+            // a recoverable merge base from the instant the note is visible.
+            Err(Error::NotFound(_)) => {
+                match intent_services::persist_system_new_note(store, &note).await {
+                    Ok(_) => counts.imported += 1,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), note_id = %note.id, error = %e, "legacy note insert failed");
+                        counts.failed += 1;
+                    }
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(path = %path.display(), note_id = %note.id, error = %e, "legacy note lookup failed");
                 counts.failed += 1;
@@ -1723,6 +1729,7 @@ fn session_from_legacy_json(
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         created_at,
         updated_at,
     };
@@ -1736,7 +1743,6 @@ fn session_from_legacy_json(
 /// (`toolCalls`/`toolResults`/`turnNumber`/`error`/…) are folded into the row
 /// metadata so nothing is dropped. Entries that are not objects or carry no
 /// usable role are malformed and skipped by the caller.
-#[allow(clippy::type_complexity)]
 fn message_from_legacy_json(raw: Value) -> Result<(String, Value, Option<Value>, String), String> {
     let Value::Object(mut obj) = raw else {
         return Err("message entry is not an object".to_string());
@@ -3206,6 +3212,42 @@ mod tests {
         let spec = store.get_note(&ws_id, &NoteId::from("spec")).await.unwrap();
         assert_eq!(spec.content, "Original spec\n");
         assert_eq!(store.list_notes(&ws_id).await.unwrap().len(), 2);
+    }
+
+    /// A legacy note insert snapshots the note at its post-write `rev`, so
+    /// the rev a client loads after the import resolves to the persisted
+    /// content as a merge base.
+    #[tokio::test]
+    async fn legacy_note_import_records_post_write_rev_on_version_snapshot() {
+        let (root, _root_g) = temp_root("notes-rev");
+        let ws_dir = write_legacy_workspace(&root, "ws-note-rev", &json!({}));
+        write_legacy_note(
+            &ws_dir,
+            "spec.md",
+            "---\nid: spec\ntitle: Spec\n---\n\nSpec body\n",
+        );
+        let (store, _db_g) = open_store().await;
+        run(&store, &opts(vec![root.clone()])).await.unwrap();
+
+        let ws_id = WorkspaceId::from("ws-note-rev");
+        let spec = store.get_note(&ws_id, &NoteId::from("spec")).await.unwrap();
+        let newest_rev: Option<i64> = sqlx::query_scalar(
+            "SELECT rev FROM note_version WHERE workspace_id = ? AND note_id = ? \
+             ORDER BY v DESC LIMIT 1",
+        )
+        .bind(&ws_id.0)
+        .bind(&spec.id.0)
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+        assert_eq!(newest_rev, Some(spec.rev));
+        assert_eq!(
+            store
+                .get_note_version_content_by_rev(&ws_id, &spec.id, spec.rev)
+                .await
+                .unwrap(),
+            Some(spec.content)
+        );
     }
 
     /// Write `<ws-dir>/.workspace/notes/.meta/<name>` with raw contents.

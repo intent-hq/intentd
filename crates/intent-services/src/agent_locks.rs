@@ -196,10 +196,10 @@ impl Services {
     pub fn spawn_agent_locks_loop(&self) -> tokio::task::JoinHandle<()> {
         let Some(bus) = self.event_bus.clone() else {
             tracing::info!("agent-locks loop disabled: no event bus");
-            return tokio::spawn(async {});
+            return intent_core::spawn_daemon(async {});
         };
         let services = self.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let filter = SubscriptionFilter {
                 event_types: vec![
                     AGENT_STARTED.to_string(),

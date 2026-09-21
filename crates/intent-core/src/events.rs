@@ -24,6 +24,13 @@ pub(crate) const FILE_RENAMED: &str = "file:renamed";
 // Agent lifecycle events.
 pub const AGENT_STARTED: &str = "agent:started";
 pub const AGENT_COMPLETED: &str = "agent:completed";
+// Terminal turn failure. Payload: `{ agentId, error, turnId? }`, plus — when
+// the failure classifies as a provider usage/quota rejection
+// (`intent_acp::is_quota_exceeded`) — the additive pair `errorCode:
+// "quota-exceeded"` and `providerId` (the provider whose allowance ran out,
+// omitted when it cannot be resolved). Both are ABSENT on every other
+// failure, never `false`/`null`: they exist so clients can offer "retry on
+// another provider" without pattern-matching the rendered `error` prose.
 pub const AGENT_FAILED: &str = "agent:failed";
 pub const AGENT_TOOL_CALL: &str = "agent:tool:call";
 pub const AGENT_MESSAGE: &str = "agent:message";
@@ -359,6 +366,25 @@ pub const COMMENT_ADDED: &str = "comment:added";
 // the thread's resolved state without a follow-up read.
 pub const COMMENT_RESOLVED: &str = "comment:resolved";
 
+// Presence events (multiplayer w5). Both are **transient** (broadcast, never
+// persisted — `event.query` has no presence rows) and workspace-scoped, so
+// the collaborator gate narrows them by membership like any other row.
+// `presence:changed` → `{ workspaceId, members: [{ principalId, login?,
+// displayName?, avatarUrl?, focus: [{ workspaceId, agentId?, noteId? }],
+// typing: [{ source, agentId, since, pulse }] }] }` — the workspace's
+// currently-online members (a row's presence IS its online state; there is
+// no `online` flag) with their focus items *in this workspace* and one
+// typing entry per typing connection, keyed by the connection's opaque
+// daemon-minted `source` (`since` = episode start, `pulse` = per-source
+// activity counter); emitted on every connect / disconnect /
+// `presence.update` that changes the aggregate. `note:presence` → `{ workspaceId, noteId,
+// principalId, login?, displayName?, avatarUrl?, kind: "joined" | "updated"
+// | "left", cursor?: { rev, anchor, head } }` — a per-note viewer delta
+// (the `note.presence` channel filters by `data.noteId`); the daemon stamps
+// `principalId` and coalesces `updated` to ≤10/s per (principal, note).
+pub const PRESENCE_CHANGED: &str = "presence:changed";
+pub const NOTE_PRESENCE: &str = "note:presence";
+
 // Code-changes-review events (new in intentd; PROTOCOL §5.18–§5.20, §6.5). The
 // BE records attribution internally (there is no `file-tracking.trackChange`
 // RPC), so these self-sufficient payloads let the FE re-render without polling:
@@ -458,6 +484,30 @@ pub const SKILLS_CHANGED: &str = "skills:changed";
 // tiers); user-tier changes fan out to one event per workspace. Payload:
 // `{ workspaceId }`.
 pub const SPECIALISTS_CHANGED: &str = "specialists:changed";
+
+// Daemon-owned browser tab registry events (REV-2, intent-hq/intent#461).
+// Workspace-scoped; the self-sufficient payload is `{ tab }` for
+// `browser:tab-opened` / `browser:tab-closed` and `{ tab, changes }` for
+// `browser:tab-updated`, where `changes` is the field-wise diff of the
+// host-reported wire fields (url / requestedUrl / title / owner / visibility /
+// emulatedSize). Emitted from the host-reporting RPCs (`browser.upsertTab`,
+// `browser.removeTab`, `browser.syncTabs`); a report that changes nothing
+// emits nothing. A `tabId` is bound to the workspace that created it: a
+// report naming another `workspaceId` is rejected (-32602) rather than moving
+// the row, since a move would strand the old workspace's subscribers with a
+// ghost tab.
+pub const BROWSER_TAB_OPENED: &str = "browser:tab-opened";
+pub const BROWSER_TAB_UPDATED: &str = "browser:tab-updated";
+pub const BROWSER_TAB_CLOSED: &str = "browser:tab-closed";
+
+// Logical-client presence transitions (REV-2, §6; published by the
+// transport's primary reverse registry). Global (empty `workspaceId`, like
+// `settings:changed`): `client:connected` when a `clientId` gains its first
+// live hello'd connection, `client:disconnected` when it loses its last.
+// Payload `{ clientId, name?, capabilities }` — the owner's device identity,
+// so the pair is owner-only (see [`COLLABORATOR_EVENT_TYPES`]).
+pub const CLIENT_CONNECTED: &str = "client:connected";
+pub const CLIENT_DISCONNECTED: &str = "client:disconnected";
 
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
@@ -577,6 +627,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GOAL_UPDATED,
     COMMENT_ADDED,
     COMMENT_RESOLVED,
+    PRESENCE_CHANGED,
+    NOTE_PRESENCE,
     CHANGES_TRACKED,
     CHANGES_GIT_STATUS,
     CHANGES_METRICS_CHANGED,
@@ -598,10 +650,245 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     APP_WORKSPACE_OPEN,
     SKILLS_CHANGED,
     SPECIALISTS_CHANGED,
+    BROWSER_TAB_OPENED,
+    BROWSER_TAB_UPDATED,
+    BROWSER_TAB_CLOSED,
+    CLIENT_CONNECTED,
+    CLIENT_DISCONNECTED,
+];
+
+/// How an [`EventDiscriminator`]'s `values` relate to the field at its `path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscriminatorKind {
+    /// The field is a string drawn from `values`.
+    Value,
+    /// The field is an object whose keys are drawn from `values`.
+    Keys,
+}
+
+impl DiscriminatorKind {
+    /// The golden's `kind` string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Value => "value",
+            Self::Keys => "keys",
+        }
+    }
+}
+
+/// A payload value clients classify on inside one event type's `data`.
+/// Mirrored into the checked-in golden `tests/goldens/event_types.json`
+/// (`discriminators`), which downstream clients copy verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventDiscriminator {
+    /// The event type whose payload carries the discriminator.
+    pub event_type: &'static str,
+    /// Dotted path from the event envelope to the discriminating field.
+    pub path: &'static str,
+    pub kind: DiscriminatorKind,
+    /// Sorted, deduplicated.
+    pub values: &'static [&'static str],
+    /// What a payload WITHOUT the field means, when the daemon emits that
+    /// shape too; `None` when the field is always present.
+    pub absent: Option<&'static str>,
+}
+
+/// Every payload discriminator the daemon emits. `task:ready-tasks-changed`
+/// carries `triggeredBy.reason` only for non-status triggers (a status
+/// change emits `triggeredBy: { noteId, previousStatus, newStatus }`
+/// instead); `workspace:updated` carries the applied delta under `changes`,
+/// whose keys are the camelCase `WorkspaceUpdate` fields plus the ad-hoc
+/// keys of the archive / unarchive / auto-commit / browser-client /
+/// MCP-toggle emitters.
+pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
+    EventDiscriminator {
+        event_type: TASK_READY_TASKS_CHANGED,
+        path: "data.triggeredBy.reason",
+        kind: DiscriminatorKind::Value,
+        values: &["note-deleted", "relations-changed"],
+        absent: Some("status change: triggeredBy is { noteId, previousStatus, newStatus }"),
+    },
+    EventDiscriminator {
+        event_type: WORKSPACE_UPDATED,
+        path: "data.changes",
+        kind: DiscriminatorKind::Keys,
+        values: &[
+            "activePullRequest",
+            "archived",
+            "archivedAt",
+            "attention",
+            "autoCommitEnabled",
+            "autoUnarchive",
+            "baseCommitSha",
+            "baseRef",
+            "branch",
+            "browserClientId",
+            "defaultModel",
+            "isRemote",
+            "lastActivity",
+            "mcpServerToggled",
+            "members",
+            "path",
+            "prNumber",
+            "prStatus",
+            "prUrl",
+            "pullRequests",
+            "removedPrincipalId",
+            "repositoryName",
+            "repositoryOwner",
+            "repositoryPath",
+            "scope",
+            "setupScript",
+            "skipIsolation",
+            "status",
+            "statusImageAssetId",
+            "statusMessage",
+            "tags",
+            "title",
+            "worktreePath",
+        ],
+        absent: None,
+    },
 ];
 
 /// True iff `event_type` is part of the canonical taxonomy.
 #[must_use]
 pub fn is_known_event_type(event_type: &str) -> bool {
     ALL_EVENT_TYPES.contains(&event_type)
+}
+
+/// Event types a **non-administrator** principal (workspace collaborator)
+/// may receive — live over `events.subscribe` and the subscription channels,
+/// and durably through `event.query` / `event.agentActivity` /
+/// `event.workspaceSummary` / `search.events` (multiplayer w3, default-deny).
+/// Every fan-out matches an event against this list at delivery time when
+/// the subscribing connection is bound to a non-administrator caller, and
+/// the durable readers narrow their SQL query to it, so a type outside the
+/// list is never delivered whatever the subscription pattern asked for (an
+/// all-disallowed subscription still gets its id and simply stays silent).
+///
+/// Each entry is `(canonical type, vetting note)`: what the payload reveals
+/// and why a guest needs it. The golden test in `tests/events.rs` requires
+/// every [`ALL_EVENT_TYPES`] entry to be classified exactly once — here or in
+/// the refused remainder frozen there — so a new event type must be vetted
+/// explicitly.
+///
+/// Owner-only by design (never listed): `terminal:*` (raw PTY bytes),
+/// `host:exec:*` (host command output), `script:*` (host process output /
+/// state), `browser:*` (the owner's tabs), `client:*` (the owner's device
+/// identity and host info), `hook:run-*` (hook code and carried state),
+/// `agent:permission:*` (tool-permission prompts are the owner's to answer),
+/// `workspace:transfer:*` and `git:clone:*` (host paths / transfer
+/// progress), `gitRoot:*` (host paths), `test:*` / `build:*` (host process
+/// results), `app:*` (steers a client's UI; owner clients only, like reverse
+/// RPCs), `settings:changed`, `github:auth-changed`, `mcp:*` /
+/// `mcp.servers:*`, and the agent-to-agent delivery bookkeeping events.
+pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
+    (AGENT_ATTENTION_REQUESTED, "Agent lifecycle: an agent asked for input; { agentId, kind, reason }. Needed to render attention badges."),
+    (AGENT_COMPLETED, "Agent lifecycle: turn finished; agent/workspace ids only."),
+    (AGENT_CREATED, "Agent lifecycle: new agent row of a workspace."),
+    (AGENT_DELETE_CANCELLED, "Agent lifecycle: pending deletion cancelled; { agentId, workspaceId }."),
+    (AGENT_DELETE_SCHEDULED, "Agent lifecycle: deletion scheduled; { agentId, workspaceId, deleteAt }."),
+    (AGENT_DELETED, "Agent lifecycle: agent row removed."),
+    (AGENT_FAILED, "Agent lifecycle: turn failed; { agentId, error, turnId? } — the provider error text an owner also sees in the transcript."),
+    (AGENT_IDLE, "Agent lifecycle: agent went idle."),
+    (AGENT_LAST_MESSAGE, "Agent stream: persisted preview projections of the latest message; conversation content the guest can read anyway."),
+    (AGENT_MESSAGE, "Agent stream: id-only echo of a persisted conversation row."),
+    (AGENT_PROCESS_EVICTED, "Agent lifecycle: process pool eviction of an agent; ids only."),
+    (AGENT_PROCESS_QUEUED, "Agent lifecycle: process pool admission queued; ids only."),
+    (AGENT_PROCESS_RESUMED, "Agent lifecycle: process pool resumed the agent; ids only."),
+    (AGENT_QUEUE_PROCESSING, "Agent lifecycle: queued message being delivered; message ids."),
+    (AGENT_QUEUE_PROCESSING_CANCELLED, "Agent lifecycle: queued delivery cancelled; message ids."),
+    (AGENT_QUEUE_STALE_MESSAGE, "Agent lifecycle: stale queue entry notice; message ids."),
+    (AGENT_QUEUE_UPDATED, "Agent lifecycle: pending message queue changed; the queue is workspace conversation content."),
+    (AGENT_RENAMED, "Agent lifecycle: agent name changed."),
+    (AGENT_RESTORED, "Agent lifecycle: retired agent restored; { agentId, agentName }."),
+    (AGENT_RETIRED, "Agent lifecycle: agent retired; { agentId, agentName }."),
+    (AGENT_SESSION_STATS_CHANGED, "Agent lifecycle: token/session counters of an agent."),
+    (AGENT_STARTED, "Agent lifecycle: turn started; agent/workspace ids only."),
+    (AGENT_STATUS_CHANGED, "Agent lifecycle: runtime status transition."),
+    (AGENT_STREAM_ACTIVITY, "Agent stream: throttled busy signal with the live preview of the streamed text; conversation content."),
+    (AGENT_STREAM_END, "Agent stream: terminal frame of a turn with the final preview; conversation content."),
+    (AGENT_STREAM_START, "Agent stream: a turn started streaming; ids only."),
+    (AGENT_STREAM_STATUS, "Agent stream: pre-first-token phase hint; { phase, message, level }."),
+    (AGENT_SUBSCRIPTIONS_CHANGED, "Agent lifecycle: an agent's event/completion subscriptions changed; ids and event patterns only."),
+    (AGENT_TOOL_CALL, "Agent stream: a recorded tool call; transcript content the guest reads through the conversation."),
+    (AGENT_UPDATED, "Agent lifecycle: agent row fields changed."),
+    (AGENT_USER_MESSAGE_SENT, "Agent stream: a human message reached an agent; conversation content."),
+    (CHANGES_AGENT_LOCKS, "Changes: which agent holds which file lock; workspace-relative paths."),
+    (CHANGES_GIT_STATUS, "Changes: working-tree status counters of the workspace repo."),
+    (CHANGES_METRICS_CHANGED, "Changes: line-count metrics of tracked changes."),
+    (CHANGES_TRACKED, "Changes: a file change was attributed to an agent; workspace-relative path."),
+    (CHAT_STREAM_DELTA, "Chat channel: incremental transcript content of a conversation the guest can read; scoped per agent by the chat forwarder."),
+    (COMMENT_ADDED, "Comment: a comment landed on a note."),
+    (COMMENT_RESOLVED, "Comment: a thread was resolved."),
+    (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
+    (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
+    (FILE_CREATED, "File: a watched file was created; workspace-relative path."),
+    (FILE_DELETED, "File: a watched file was deleted; workspace-relative path."),
+    (FILE_RENAMED, "File: reserved rename type (no emitter); workspace-relative path by contract."),
+    (GIT_BRANCH, "Git: branch switched in the workspace worktree; branch names only."),
+    (GIT_COMMIT, "Git: a commit landed; hash, message and workspace-relative files."),
+    (GIT_MERGE, "Git: a merge ran in the workspace worktree; ref names only."),
+    (GIT_PULL, "Git: a pull ran; the guest may pull (COLLABORATOR_METHODS)."),
+    (GIT_PUSH, "Git: a push ran; the guest may push (COLLABORATOR_METHODS)."),
+    (GOAL_UPDATED, "Note: the goal note changed."),
+    (HOOK_CANCELLED, "Hook lifecycle: a hook was cancelled; hook id and name (hook.list is Collaborator+)."),
+    (HOOK_DISPATCHED, "Hook lifecycle: a hook fired its wake; hook id, name and the dispatch message."),
+    (HOOK_EVICTED, "Hook lifecycle: a hook was evicted; hook id and the evicting error text."),
+    (HOOK_EXPIRED, "Hook lifecycle: a hook's TTL elapsed; hook id and name."),
+    (HOOK_SCHEDULED, "Hook lifecycle: a hook was registered; hook id, name and schedule."),
+    (LINE_ATTRIBUTION_UPDATED, "Note: per-line authorship of a note changed."),
+    (NOTE_CREATED, "Note: a note was created."),
+    (NOTE_DELETED, "Note: a note was deleted."),
+    (NOTE_PRESENCE, "Presence: a member joined / moved its caret in / left a note the guest is a member of; principal profile fields and a caret position (rev/anchor/head) only. Transient."),
+    (NOTE_UPDATED, "Note: note content or metadata changed."),
+    (PR_LINKED, "PR: a pull request was linked to the workspace; PR number/url/state."),
+    (PR_UNLINKED, "PR: the workspace PR link was removed."),
+    (PR_UPDATED, "PR: the linked PR's badge state changed."),
+    (PR_MONITOR_CANCELLED, "PR monitor: a monitor was cancelled; monitor and PR identity (prMonitor.list is Collaborator+)."),
+    (PR_MONITOR_CHANGED, "PR monitor: pending PR changes recorded; PR checklist state."),
+    (PR_MONITOR_COMPLETED, "PR monitor: the PR merged/closed; PR identity."),
+    (PR_MONITOR_EMITTED, "PR monitor: a debounced report was delivered; PR checklist state."),
+    (PR_MONITOR_REGISTERED, "PR monitor: a monitor was registered; monitor and PR identity."),
+    (PRESENCE_CHANGED, "Presence: the online members of a member workspace with their focus in that workspace and typing targets; principal profile fields already exposed by workspace.members.list. Transient."),
+    (SEARCH_DONE, "Search: a workspace-scoped search finished; correlated by the caller's requestId."),
+    (SEARCH_RESULT, "Search: a page of workspace-scoped search matches; correlated by the caller's requestId."),
+    (SKILLS_CHANGED, "Skills: the discovered skill set of a workspace changed; { workspaceId } only."),
+    (SPEC_UPDATED, "Note: the spec note changed."),
+    (SPECIALISTS_CHANGED, "Specialists: the resolved specialist set of a workspace changed; { workspaceId } only."),
+    (TASK_AGENT_LINKED, "Task: an agent was assigned to a task note."),
+    (TASK_AGENT_UNLINKED, "Task: a task note lost its agent."),
+    (TASK_CREATED, "Task: a task note was created."),
+    (TASK_READY_TASKS_CHANGED, "Task: the startable task set changed; task ids."),
+    (TASK_STATUS_CHANGED, "Task: a task's status changed."),
+    (WORKSPACE_ACTIVITY, "Workspace: activity heartbeat of a workspace the guest is a member of."),
+    (WORKSPACE_ACTIVITY_CHANGED, "Workspace: the aggregated activity marker changed (workspace channel delta)."),
+    (WORKSPACE_ATTENTION_CHANGED, "Workspace: the attention marker changed (workspace channel delta)."),
+    (WORKSPACE_CLOSED, "Workspace: a workspace was closed; id only."),
+    (WORKSPACE_CONTEXT_CHANGED, "Workspace: context items (note/link references) changed."),
+    (WORKSPACE_CREATED, "Workspace: a workspace row was created (workspace channel delta; rows are membership-filtered in the service layer)."),
+    (WORKSPACE_DELETE_CANCELLED, "Workspace: a pending deletion was cancelled; id only."),
+    (WORKSPACE_DELETE_SCHEDULED, "Workspace: a deletion was scheduled; id and deadline."),
+    (WORKSPACE_DELETED, "Workspace: a workspace row was deleted; id only."),
+    (WORKSPACE_DISPLAY_STATUS_CHANGED, "Workspace: the display status changed (workspace channel delta)."),
+    (WORKSPACE_OPENED, "Workspace: a workspace was opened; id only."),
+    (WORKSPACE_SETUP_COMPLETED, "Workspace: setup finished; id and outcome."),
+    (WORKSPACE_SETUP_STARTED, "Workspace: setup started; id only."),
+    (WORKSPACE_TOKEN_USAGE_CHANGED, "Workspace: token usage counters changed (workspace.getTokenUsage is Collaborator+)."),
+    (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta); `changes.members` + `removedPrincipalId` on a membership removal, `addedPrincipalId` on an add (invite join or `workspace.members.add`)."),
+    (WORKSPACE_WAITING_CHANGED, "Workspace: the waiting marker changed (workspace channel delta)."),
+];
+
+/// True iff a non-administrator principal may receive `event_type` (it is
+/// listed in [`COLLABORATOR_EVENT_TYPES`]). Types outside the canonical
+/// taxonomy are refused too: the allowlist is default-deny.
+#[must_use]
+pub fn is_collaborator_event_type(event_type: &str) -> bool {
+    static ALLOWED: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    ALLOWED
+        .get_or_init(|| COLLABORATOR_EVENT_TYPES.iter().map(|(t, _)| *t).collect())
+        .contains(event_type)
 }

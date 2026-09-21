@@ -308,10 +308,25 @@ pub async fn set_session_config_option(
     config_id: &str,
     value: &str,
 ) -> AcpResult<()> {
+    set_session_config_option_response(conn, session_id, config_id, value).await?;
+    Ok(())
+}
+
+/// Apply a config option and retain the response for providers that require
+/// confirmation of the exact selected value before a prompt may run.
+///
+/// # Errors
+///
+/// Propagates the transport/RPC error if the request fails.
+pub async fn set_session_config_option_response(
+    conn: &Connection,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) -> AcpResult<Value> {
     let params =
         serde_json::json!({ "sessionId": session_id, "configId": config_id, "value": value });
-    conn.request("session/set_config_option", params).await?;
-    Ok(())
+    conn.request("session/set_config_option", params).await
 }
 
 /// `session/cancel` to interrupt the current turn (fire-and-forget notification;
@@ -394,6 +409,16 @@ pub struct MappedToolCall {
     /// The real tool name (`data.toolName`), derived from the ACP title via
     /// [`derive_tool_name`].
     pub tool_name: String,
+    /// Whether [`tool_name`](Self::tool_name) came from an authoritative
+    /// identifier — MCP `server`/`tool` metadata (Antigravity meta, the codex
+    /// nested-MCP wrapper) or a namespaced title (`mcp.<server>.<tool>`,
+    /// `mcp__<server>__<tool>`) — rather than from a prose title or an input
+    /// shape. Consumers that infer identity from the input shape (the §7.1
+    /// registry's `workspace_api` claim gate) must not do so for an
+    /// authoritatively named call: the unwrapped input no longer carries the
+    /// identifier, and a foreign tool's `{ code, summary }` arguments must
+    /// keep its own name (intent-hq/intent#4491).
+    pub name_authoritative: bool,
     /// The raw human-readable ACP title (`data.title`), verbatim.
     pub title: String,
     /// `data.toolKind`: one of file|terminal|search|note|git|other.
@@ -504,19 +529,58 @@ fn unwrap_codex_mcp_input(raw_input: Option<&Value>) -> Option<(Value, String)> 
 /// yields `read_note` while other servers keep the `{server}_{tool}` name.
 /// Otherwise the input passes through verbatim and the name derives from the
 /// ACP `title`.
-fn resolve_input_and_name(title: &str, raw_input: Option<&Value>) -> (Value, String) {
-    if let Some((input, rewritten)) = unwrap_codex_mcp_input(raw_input) {
-        let name = derive_tool_name(&rewritten, Some(&input));
-        return (input, name);
+fn resolve_input_and_name(
+    title: &str,
+    raw_input: Option<&Value>,
+    meta: Option<&serde_json::Map<String, Value>>,
+) -> (Value, String, bool) {
+    // Antigravity wraps MCP arguments and identifies the tool in ACP metadata.
+    // Require both captured markers and the matching title to avoid unwrapping
+    // an unrelated provider's legitimate `arguments` parameter.
+    if let Some(meta) = meta.filter(|meta| meta.get("is_mcp_tool_call") == Some(&Value::Bool(true)))
+    {
+        if let (Some(server), Some(tool), Some(arguments)) = (
+            meta.get("mcp")
+                .and_then(|m| m.get("server"))
+                .and_then(Value::as_str),
+            meta.get("mcp")
+                .and_then(|m| m.get("tool"))
+                .and_then(Value::as_str),
+            raw_input
+                .and_then(|v| v.get("arguments"))
+                .and_then(Value::as_object),
+        ) {
+            if title == format!("{server}_{tool}") {
+                let mut input = arguments.clone();
+                if let Some(acp_title) = raw_input.and_then(|v| v.get("_acpTitle")) {
+                    input.insert("_acpTitle".into(), acp_title.clone());
+                }
+                return (Value::Object(input), strip_workspace_mcp_affix(title), true);
+            }
+        }
     }
-    let name = derive_tool_name(title, raw_input);
-    (raw_input.cloned().unwrap_or(Value::Null), name)
+    if let Some((input, rewritten)) = unwrap_codex_mcp_input(raw_input) {
+        // `server`/`tool` are authoritative: a foreign tool whose arguments
+        // happen to be `{ code, summary }` must keep its own name.
+        let (name, _) = derive_tool_name_inner(&rewritten, Some(&input), false);
+        return (input, name, true);
+    }
+    let (name, authoritative) = derive_tool_name_inner(title, raw_input, true);
+    (
+        raw_input.cloned().unwrap_or(Value::Null),
+        name,
+        authoritative,
+    )
 }
 
 /// Map a fresh `tool_call` (status defaults to "started").
 fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
     let title = tool_call.title.clone();
-    let (input, tool_name) = resolve_input_and_name(&title, tool_call.raw_input.as_ref());
+    let (input, tool_name, name_authoritative) = resolve_input_and_name(
+        &title,
+        tool_call.raw_input.as_ref(),
+        tool_call.meta.as_ref(),
+    );
     MappedToolCall {
         tool_call_id: tool_call.tool_call_id.0.to_string(),
         tool_kind: tool_kind_word(tool_call.kind, &tool_name),
@@ -524,6 +588,7 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
         output: tool_call.raw_output.clone(),
         status: tool_status_word(tool_call.status),
         tool_name,
+        name_authoritative,
         title,
     }
 }
@@ -532,7 +597,8 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
 fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
     let fields = &update.fields;
     let title = fields.title.clone().unwrap_or_default();
-    let (input, tool_name) = resolve_input_and_name(&title, fields.raw_input.as_ref());
+    let (input, tool_name, name_authoritative) =
+        resolve_input_and_name(&title, fields.raw_input.as_ref(), update.meta.as_ref());
     MappedToolCall {
         tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
         // A bare progress update (no status) is still mid-flight → "started".
@@ -541,6 +607,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
         input,
         output: fields.raw_output.clone(),
         tool_name,
+        name_authoritative,
         title,
     }
 }
@@ -551,28 +618,44 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// ACP providers (auggie, codex, opencode, …) deliver a prose `title` (e.g.
 /// `"sub-agent-explore: Explore the AI agent system…"`) rather than the raw
 /// tool name the model invoked. Rules, in order:
-///  1. A title of the form `<name>: <description>` (`<name>` a bare identifier
-///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
-///     becomes the name.
-///  2. Codex titles MCP tools `mcp.<server>.<tool>` (dot-separated, no
+///  1. Codex titles MCP tools `mcp.<server>.<tool>` (dot-separated, no
 ///     whitespace — prose titles containing dots never match); the title is
 ///     rewritten to `{server}_{tool}` and fed through the affix strip below,
 ///     the same downstream treatment as [`unwrap_codex_mcp_input`]'s
 ///     rewritten name (`mcp.workspace-mcp.workspace_api` → `workspace_api`,
 ///     `mcp.other-server.some_tool` → `other-server_some_tool`).
-///  3. Claude Code titles MCP tools `mcp__<server>__<tool>`
+///  2. Claude Code titles MCP tools `mcp__<server>__<tool>`
 ///     (double-underscore-separated, no whitespace — prose titles containing
 ///     `mcp__` never match); the title is rewritten to `{server}_{tool}` and
 ///     fed through the affix strip below, the same downstream treatment as
 ///     the codex dot rule (`mcp__workspace-mcp__workspace_api` →
 ///     `workspace_api`, `mcp__github__list_issues` → `github_list_issues`).
-///  4. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
+///     Rules 1–2 name the server explicitly and therefore run before the
+///     input-shape inference in rule 3: a foreign MCP tool whose arguments
+///     happen to be `{ code, summary }` keeps its own name.
+///  3. A `raw_input` carrying the daemon's own `workspace_api` schema — an
+///     object holding exactly a non-empty string `code` plus a string
+///     `summary` (an `_acpTitle` echo is tolerated;
+///     [`intent_core::is_workspace_api_input`], shared with the §7.1
+///     registry's claim gate) — is `workspace_api`
+///     regardless of the title. Auggie titles an MCP call with the
+///     model-authored `summary` (plain prose, no `name`, `kind: other`), so
+///     the input shape is the only identifier; it is checked before the
+///     `<name>: <description>` split below because a prose summary can
+///     accidentally match it (intent-hq/intent#4491). Providers that title
+///     the call with the tool name resolve to `workspace_api` through rules
+///     1–2 and 4–5 anyway. Skipped on the [`unwrap_codex_mcp_input`] path,
+///     where `server`/`tool` are authoritative.
+///  4. A title of the form `<name>: <description>` (`<name>` a bare identifier
+///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
+///     becomes the name.
+///  5. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
 ///     `<tool>_<server>` (trailing `_workspace-mcp` suffix), opencode names it
 ///     `<server>_<tool>` (leading `workspace-mcp_` prefix); stripping either
 ///     (repeatedly) recovers the registry name (§18.4).
-///  5. A bare `webfetch` title (opencode's fetch tool) is normalized to the
+///  6. A bare `webfetch` title (opencode's fetch tool) is normalized to the
 ///     canonical `web-fetch` builtin name.
-///  6. When none of the above yielded an identifier (the title is prose
+///  7. When none of the above yielded an identifier (the title is prose
 ///     like `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous
 ///     shapes. Evaluated in the same order as the reference
 ///     (`acp-provider-streaming.ts` ~L1635–1666), first match wins:
@@ -593,7 +676,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///       - string `command` + string `cwd` (no `wait`/`max_wait_seconds`,
 ///         which would mean auggie's `launch-process`) → `bash`
 ///       - `url` → `web-fetch`
-///  7. Otherwise the title passes through as-is.
+///  8. Otherwise the title passes through as-is.
 ///
 /// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
 /// The reference keys off its local `toolName` variable, which may have been
@@ -604,30 +687,46 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// every path.
 #[must_use]
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
-    if let Some(name) = split_name_prefix(title) {
-        return strip_workspace_mcp_affix(name);
-    }
+    derive_tool_name_inner(title, raw_input, true).0
+}
+
+/// [`derive_tool_name`] with the `workspace_api` input-shape rule (rule 3)
+/// switchable off for callers that already hold an authoritative tool name.
+/// The second element is `true` when the name came from a namespaced MCP
+/// title (rules 1–2), i.e. an authoritative identifier
+/// ([`MappedToolCall::name_authoritative`]).
+fn derive_tool_name_inner(
+    title: &str,
+    raw_input: Option<&Value>,
+    infer_workspace_api: bool,
+) -> (String, bool) {
     if let Some(rewritten) = split_codex_mcp_title(title) {
-        return strip_workspace_mcp_affix(&rewritten);
+        return (strip_workspace_mcp_affix(&rewritten), true);
     }
     if let Some(rewritten) = split_claude_mcp_title(title) {
-        return strip_workspace_mcp_affix(&rewritten);
+        return (strip_workspace_mcp_affix(&rewritten), true);
+    }
+    if infer_workspace_api && raw_input.is_some_and(intent_core::is_workspace_api_input) {
+        return ("workspace_api".to_string(), false);
+    }
+    if let Some(name) = split_name_prefix(title) {
+        return (strip_workspace_mcp_affix(name), false);
     }
     let stripped = strip_workspace_mcp_affix(title);
     if stripped != title {
-        return stripped;
+        return (stripped, false);
     }
     // Opencode's fetch tool is titled `webfetch`; normalize to the canonical
     // builtin name so downstream consumers match on one spelling.
     if title == "webfetch" {
-        return "web-fetch".to_string();
+        return ("web-fetch".to_string(), false);
     }
     if let Some(input) = raw_input {
         if let Some(from_input) = derive_tool_name_from_input(title, input) {
-            return from_input;
+            return (from_input, false);
         }
     }
-    stripped
+    (stripped, false)
 }
 
 /// Inspect an ACP `raw_input` object for shapes that unambiguously identify a
@@ -637,6 +736,22 @@ pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
 /// first match wins.
 fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
     let obj = input.as_object()?;
+    // Official Antigravity ACP frames. Require the captured input shapes;
+    // do not infer tool identity from arbitrary prose titles.
+    if is_non_empty_string(obj.get("CommandLine")) && is_non_empty_string(obj.get("Cwd")) {
+        return Some("run_command".to_string());
+    }
+    if title == "Running client_view_file" && is_non_empty_string(obj.get("absolute_path")) {
+        return Some("client_view_file".to_string());
+    }
+    if matches!(
+        title,
+        "Run client_create_file?" | "Running client_create_file"
+    ) && is_non_empty_string(obj.get("target_file"))
+        && obj.get("code_content").and_then(Value::as_str).is_some()
+    {
+        return Some("client_create_file".to_string());
+    }
     // command ∈ {str_replace, insert, create} → str-replace-editor
     if let Some(cmd) = obj.get("command").and_then(Value::as_str) {
         if matches!(cmd, "str_replace" | "insert" | "create") {

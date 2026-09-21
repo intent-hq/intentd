@@ -30,15 +30,11 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-setuplc-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-setuplc-{prefix}-"))
 }
 
 /// Spawn `intentd serve` with a hermetic HOME so host git config (global
@@ -48,13 +44,11 @@ fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("HOME", home_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
@@ -206,8 +200,9 @@ where
 
 /// Create a git repo with one commit so `workspace.create` can provision a
 /// worktree from it.
-fn create_test_repo() -> PathBuf {
-    let repo_path = scratch_dir("repo");
+fn create_test_repo() -> tempfile::TempDir {
+    let repo_dir = scratch_dir("repo");
+    let repo_path = repo_dir.path().to_path_buf();
     let run = |args: &[&str]| {
         let out = Command::new("git")
             .arg("-C")
@@ -227,7 +222,7 @@ fn create_test_repo() -> PathBuf {
     std::fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
     run(&["add", "."]);
     run(&["commit", "-q", "-m", "initial commit"]);
-    repo_path
+    repo_dir
 }
 
 /// The next `events.event` frame's event object (answers pings, skips
@@ -269,13 +264,15 @@ where
 /// control write emits `file:*` normally.
 #[tokio::test]
 async fn setup_lifecycle_events_and_file_suppression_over_wss() {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let home_dir = data_dir.join("home");
     std::fs::create_dir_all(&home_dir).expect("mkdir hermetic home");
-    let repo_path = create_test_repo();
+    let repo_dir = create_test_repo();
+    let repo_path = repo_dir.path().to_path_buf();
 
     let child = spawn_serve(&data_dir, &home_dir);
-    let _guard = common::DaemonGuard::new(child, data_dir.clone(), true);
+    let _guard = common::DaemonGuard::process_only(child);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

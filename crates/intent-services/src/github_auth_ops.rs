@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::events::GITHUB_AUTH_CHANGED;
-use intent_core::{now_iso, Result, WorkspaceId};
+use intent_core::{now_iso, Error, IdentityProofErrorKind, Result, WorkspaceId};
+use intent_sourcecontrol::identity_proof::IdentityProofError;
 use intent_sourcecontrol::{DeviceFlow, PollStatus};
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -43,6 +44,11 @@ pub(crate) enum FlowPhase {
     Denied,
     /// Polling failed repeatedly (network / non-retryable API error).
     Error,
+    /// The user authorized as a *different* GitHub account while other
+    /// principals or open invites depend on the cached primary identity
+    /// (multiplayer w4): the new token was discarded before persistence and
+    /// the previously stored credential is untouched.
+    IdentityLocked,
 }
 
 impl FlowPhase {
@@ -53,6 +59,7 @@ impl FlowPhase {
             Self::Expired => "expired",
             Self::Denied => "denied",
             Self::Error => "error",
+            Self::IdentityLocked => "identity-locked",
         }
     }
 }
@@ -177,6 +184,7 @@ pub(crate) async fn run_poll_loop(
             Ok(PollStatus::Authorized) => break None,
             Ok(PollStatus::Expired) => break Some(FlowPhase::Expired),
             Ok(PollStatus::Denied) => break Some(FlowPhase::Denied),
+            Ok(PollStatus::Refused) => break Some(FlowPhase::IdentityLocked),
             Err(e) => {
                 consecutive_errors += 1;
                 tracing::warn!(
@@ -220,7 +228,7 @@ pub(crate) async fn run_poll_loop(
     if outcome.is_none() && sync_gh {
         // Best-effort gh CLI sync: loads the token back from the secret store
         // (it never leaves the engine) and pipes it to `gh` via stdin only.
-        tokio::spawn(intent_sourcecontrol::gh_sync::sync_token_to_gh(
+        intent_core::spawn_daemon(intent_sourcecontrol::gh_sync::sync_token_to_gh(
             intent_core::FileSecretStore::new(),
         ));
     }
@@ -230,6 +238,62 @@ pub(crate) async fn run_poll_loop(
 /// secret-store seam (cache-coherent with `settings.*`, test-injectable).
 pub(crate) async fn delete_stored_token(secrets: &crate::settings::AsyncSecretStore) -> Result<()> {
     secrets.delete(SECRET_ACCOUNT).await
+}
+
+/// Load the stored `sourceControl.github.token` for the gist identity proof
+/// (`github.identityProof.*`). Only the **stored** device-flow token counts —
+/// the env / `gh` fallbacks of the resolution chain are deliberately not
+/// consulted, so the proof is always made with the account the user signed
+/// in with. An absent or blank token is [`IdentityProofErrorKind::NotConnected`].
+pub(crate) async fn load_stored_token(
+    secrets: &crate::settings::AsyncSecretStore,
+) -> Result<String> {
+    secrets
+        .load(SECRET_ACCOUNT)
+        .await?
+        .filter(|t| !t.trim().is_empty())
+        .ok_or(Error::IdentityProof(IdentityProofErrorKind::NotConnected))
+}
+
+/// Map an engine identity-proof failure onto the bounded wire codes: a token
+/// GitHub rejects is reported like no token (`github-not-connected` — the
+/// remedy is the same sign-in), a missing `gist` scope is
+/// `github-scope-missing`, a transport failure `github-unreachable`; a
+/// `gistId` that names a gist other than an Intent proof gist is a caller
+/// error (`-32602`, nothing deleted); any other forge error stays a plain
+/// `-32603` with its message.
+pub(crate) fn map_identity_proof_err(e: IdentityProofError) -> Error {
+    match e {
+        IdentityProofError::ScopeMissing { .. } => {
+            Error::IdentityProof(IdentityProofErrorKind::ScopeMissing)
+        }
+        IdentityProofError::NotProofGist { gist_id } => Error::InvalidParams(format!(
+            "gistId {gist_id:?} does not name an Intent identity-proof gist (nothing deleted)"
+        )),
+        IdentityProofError::Unauthorized(_) => {
+            Error::IdentityProof(IdentityProofErrorKind::NotConnected)
+        }
+        IdentityProofError::Unreachable(_) => {
+            Error::IdentityProof(IdentityProofErrorKind::Unreachable)
+        }
+        IdentityProofError::Other(other) => crate::pr_ops::map_sc_err(other),
+    }
+}
+
+/// Validate a `github.identityProof.create` param that becomes a line of the
+/// proof gist: trimmed, non-empty, and free of control characters (a newline
+/// would break the two-line proof format the host verifies).
+pub(crate) fn proof_line_param(name: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::InvalidParams(format!("{name} must be non-empty")));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(Error::InvalidParams(format!(
+            "{name} must not contain control characters"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 /// Resolve the login host. The builder override wins over the env override
@@ -275,7 +339,7 @@ pub(crate) fn is_production_login_host(base_uri: &str) -> bool {
 
 /// True iff `uri` is `https://…` or a cleartext `http://` pointing at a
 /// loopback host (`127.0.0.1`, `localhost`, `[::1]`).
-fn is_safe_login_base_uri(uri: &str) -> bool {
+pub(crate) fn is_safe_login_base_uri(uri: &str) -> bool {
     if uri.starts_with("https://") {
         return true;
     }
@@ -409,6 +473,7 @@ mod tests {
         assert_eq!(FlowPhase::Expired.as_wire(), "expired");
         assert_eq!(FlowPhase::Denied.as_wire(), "denied");
         assert_eq!(FlowPhase::Error.as_wire(), "error");
+        assert_eq!(FlowPhase::IdentityLocked.as_wire(), "identity-locked");
     }
 
     #[test]
@@ -443,5 +508,62 @@ mod tests {
     fn poll_sleep_floors_at_one_second() {
         assert_eq!(poll_sleep(0), Duration::from_secs(1));
         assert_eq!(poll_sleep(5), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn identity_proof_errors_map_onto_bounded_codes() {
+        let cases = [
+            (
+                IdentityProofError::ScopeMissing {
+                    granted: "repo".into(),
+                },
+                "github-scope-missing",
+            ),
+            (
+                IdentityProofError::Unauthorized("Bad credentials".into()),
+                "github-not-connected",
+            ),
+            (
+                IdentityProofError::Unreachable("connect refused".into()),
+                "github-unreachable",
+            ),
+        ];
+        for (input, code) in cases {
+            let err = map_identity_proof_err(input);
+            assert_eq!(err.code(), -32603, "{code}");
+            assert!(
+                matches!(err, Error::IdentityProof(kind) if kind.as_str() == code),
+                "{code}: {err:?}"
+            );
+        }
+        let not_proof = map_identity_proof_err(IdentityProofError::NotProofGist {
+            gist_id: "abc".into(),
+        });
+        assert_eq!(not_proof.code(), -32602, "{not_proof:?}");
+        assert!(
+            matches!(&not_proof, Error::InvalidParams(msg) if msg.contains("\"abc\"") && msg.contains("nothing deleted")),
+            "{not_proof:?}"
+        );
+        let other = map_identity_proof_err(IdentityProofError::Other(
+            intent_sourcecontrol::Error::Api("500: boom".into()),
+        ));
+        assert!(matches!(other, Error::Internal(_)), "{other:?}");
+        let limited = map_identity_proof_err(IdentityProofError::Other(
+            intent_sourcecontrol::Error::RateLimited("slow down".into()),
+        ));
+        assert!(matches!(limited, Error::RateLimited(_)), "{limited:?}");
+    }
+
+    #[test]
+    fn proof_line_params_are_trimmed_single_lines() {
+        assert_eq!(proof_line_param("nonce", "  abc ").unwrap(), "abc");
+        assert_eq!(
+            proof_line_param("hostLabel", "Clement's Mac Studio").unwrap(),
+            "Clement's Mac Studio"
+        );
+        for bad in ["", "   ", "a\nb", "tab\there"] {
+            let err = proof_line_param("nonce", bad).expect_err(bad);
+            assert!(matches!(err, Error::InvalidParams(_)), "{bad:?}: {err:?}");
+        }
     }
 }

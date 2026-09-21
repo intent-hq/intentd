@@ -21,7 +21,7 @@ mod common;
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +36,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -48,11 +47,8 @@ const QUEUED_TWO: &str = "preserved queue message two";
 /// per-resume humanized outage duration, so asserts match on this prefix.
 const CONTINUATION_PREFIX: &str = "You were interrupted for about ";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-queue-order-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-queue-order-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -216,9 +212,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
     // inert until the explicit resume path (`--resume-all` still forces the
     // sweep over the pin), but the `auto` default resumes on headless hosts.
     common::disable_resume_on_start(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -278,11 +273,14 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -349,9 +347,8 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
         "firstTurnDelayMs": 600_000
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -608,9 +605,8 @@ async fn boot_restart_daemon(
     WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
 ) {
     let behavior = json!({ "response": "resumed turn done" }).to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -642,7 +638,8 @@ async fn resume_rpc_continuation_first_then_queue_fifo() {
     let Some(script) = gate("resume_rpc_continuation_first_then_queue_fifo") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, agent_id) = interrupt_midturn_with_queued_messages(&data_dir, &script).await;
 
     eprintln!("Phase 2: restart daemon, verify rehydrated pending state over WSS");
@@ -675,8 +672,6 @@ async fn resume_rpc_continuation_first_then_queue_fifo() {
     eprintln!("Phase 4: assert transcript ordering");
     let users = user_message_texts(&data_dir, &agent_id).await;
     assert_continuation_first_then_fifo(&users);
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Abandon path: the preserved queue stays intact and inert (no auto-send),
@@ -687,7 +682,8 @@ async fn abandon_keeps_preserved_queue_inert() {
     let Some(script) = gate("abandon_keeps_preserved_queue_inert") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, agent_id) = interrupt_midturn_with_queued_messages(&data_dir, &script).await;
 
     eprintln!("Phase 2: restart daemon, verify rehydrated pending state over WSS");
@@ -795,8 +791,6 @@ async fn abandon_keeps_preserved_queue_inert() {
         let blocks = last.content.as_array().expect("content blocks");
         assert_eq!(blocks[0]["meta"]["kind"], json!("interruption"));
     }
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Headless `serve --resume-all`: the startup sweep resumes the agent with
@@ -807,7 +801,8 @@ async fn resume_all_continuation_first_then_queue_fifo() {
     let Some(script) = gate("resume_all_continuation_first_then_queue_fifo") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, agent_id) = interrupt_midturn_with_queued_messages(&data_dir, &script).await;
 
     eprintln!("Phase 2: restart daemon with --resume-all, await headless drain");
@@ -832,6 +827,4 @@ async fn resume_all_continuation_first_then_queue_fifo() {
     eprintln!("Phase 3: assert transcript ordering");
     let users = user_message_texts(&data_dir, &agent_id).await;
     assert_continuation_first_then_fifo(&users);
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

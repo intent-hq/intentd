@@ -252,7 +252,7 @@ async fn import_notes(store: &Store, dir: &Path, summary: &mut ImportSummary) {
     }
     for (note, &ok) in notes.iter().zip(&applied) {
         if ok && note.parent_id.is_some() {
-            if let Err(e) = store.update_note(note).await {
+            if let Err(e) = intent_services::persist_system_note_content(store, note).await {
                 summary.skip(format!("note {} parent link failed: {e}", note.id));
             }
         }
@@ -261,15 +261,18 @@ async fn import_notes(store: &Store, dir: &Path, summary: &mut ImportSummary) {
 
 /// Upsert a note by `(workspace_id, id)`; `Ok(true)` when it already existed
 /// (updated). Note identity is composite (`(id, workspace_id)`, migration
-/// 0030), so the same `id` in different workspaces is a distinct row.
+/// 0030), so the same `id` in different workspaces is a distinct row. Each
+/// persisted write snapshots the note at its post-write `rev` so the rev a
+/// client later loads is a recoverable merge base: both the update and the
+/// insert commit row and snapshot in one transaction.
 async fn upsert_note(store: &Store, note: &Note) -> anyhow::Result<bool> {
     match store.get_note(&note.workspace_id, &note.id).await {
         Ok(_) => {
-            store.update_note(note).await?;
+            intent_services::persist_system_note_content(store, note).await?;
             Ok(true)
         }
         Err(Error::NotFound(_)) => {
-            store.insert_note(note).await?;
+            intent_services::persist_system_new_note(store, note).await?;
             Ok(false)
         }
         Err(e) => Err(e.into()),
@@ -560,6 +563,131 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// Every imported note write (insert, re-import update, parent-link
+    /// write) snapshots the note at its post-write `rev`, so the rev a client
+    /// loads after an import resolves to the persisted content as a merge
+    /// base.
+    #[tokio::test]
+    async fn import_writes_record_post_write_rev_on_version_snapshot() {
+        async fn assert_snapshot_at_current_rev(store: &Store, ws: &WorkspaceId, id: &str) {
+            let note = store.get_note(ws, &NoteId::from(id)).await.unwrap();
+            let newest_rev: Option<i64> = sqlx::query_scalar(
+                "SELECT rev FROM note_version WHERE workspace_id = ? AND note_id = ? \
+                 ORDER BY v DESC LIMIT 1",
+            )
+            .bind(&ws.0)
+            .bind(&note.id.0)
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(newest_rev, Some(note.rev), "{id}: newest snapshot rev");
+            assert_eq!(
+                store
+                    .get_note_version_content_by_rev(ws, &note.id, note.rev)
+                    .await
+                    .unwrap(),
+                Some(note.content),
+                "{id}: base lookup by rev"
+            );
+        }
+
+        let source = write_fixture();
+        let (store, _db_dir) = open_store().await;
+        let ws = WorkspaceId::from("ws-1");
+
+        // First run: inserts (+ the child's parent-link update).
+        run(&store, source.path()).await.expect("first import");
+        assert_snapshot_at_current_rev(&store, &ws, "note-parent").await;
+        assert_snapshot_at_current_rev(&store, &ws, "note-child").await;
+        let child_rev = store
+            .get_note(&ws, &NoteId::from("note-child"))
+            .await
+            .unwrap()
+            .rev;
+
+        // Second run: the update path bumps rev and snapshots again.
+        run(&store, source.path()).await.expect("second import");
+        let child = store
+            .get_note(&ws, &NoteId::from("note-child"))
+            .await
+            .unwrap();
+        assert!(child.rev > child_rev, "re-import bumps rev: {child:?}");
+        assert_snapshot_at_current_rev(&store, &ws, "note-parent").await;
+        assert_snapshot_at_current_rev(&store, &ws, "note-child").await;
+    }
+
+    /// Regression (intentd#1817 re-verification): a re-import that rewrites
+    /// an existing note commits the row and its version snapshot together.
+    /// The second run is driven one poll at a time while a second `Store` on
+    /// the same file samples the note between polls: on every sample that
+    /// shows the new rev, the base lookup by that rev must already yield the
+    /// imported content. Before the fix the snapshot was appended in a
+    /// separate transaction, so a client loading rev 1 in the gap recovered
+    /// the rev-0 text as its merge base.
+    #[tokio::test]
+    async fn reimport_content_rev_is_visible_with_its_snapshot() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let source = write_fixture();
+        let (store, db_dir) = open_store().await;
+        let ws = WorkspaceId::from("ws-1");
+        let id = NoteId::from("note-parent");
+        run(&store, source.path()).await.expect("first import");
+        assert_eq!(store.get_note(&ws, &id).await.unwrap().rev, 0);
+
+        std::fs::write(
+            source
+                .path()
+                .join("workspaces/ws-1/.workspace/notes/spec.json"),
+            json!({
+                "id": "note-parent", "workspaceId": "ws-1", "title": "Spec",
+                "content": "# Spec v2", "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-02T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let other = Store::open(&db_dir.path().join("import.db"))
+            .await
+            .expect("open second store");
+        let assert_rev1_has_snapshot = || async {
+            let current = other.get_note(&ws, &id).await.unwrap();
+            if current.rev != 1 {
+                return false;
+            }
+            assert_eq!(current.content, "# Spec v2");
+            assert_eq!(
+                other
+                    .get_note_version_content_by_rev(&ws, &id, 1)
+                    .await
+                    .unwrap(),
+                Some("# Spec v2".to_string()),
+                "rev 1 is visible, so its snapshot must be too"
+            );
+            true
+        };
+
+        let mut second = Box::pin(run(&store, source.path()));
+        let mut samples_at_rev1 = 0;
+        loop {
+            let state = std::future::poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx))).await;
+            if let Poll::Ready(done) = state {
+                done.expect("second import");
+                break;
+            }
+            if assert_rev1_has_snapshot().await {
+                samples_at_rev1 += 1;
+                if samples_at_rev1 >= 50 {
+                    second.await.expect("second import");
+                    break;
+                }
+            }
+        }
+        assert!(assert_rev1_has_snapshot().await);
     }
 
     #[tokio::test]

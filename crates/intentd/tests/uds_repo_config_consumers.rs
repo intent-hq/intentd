@@ -1,6 +1,8 @@
 //! `DoD` tests for repo config consumer integrations (workspace.create fallbacks,
 //! script bootstrap, agent instructions).
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,25 +17,18 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 mod common;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-repo-cfg-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-repo-cfg-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -86,17 +81,12 @@ async fn call(
     resp
 }
 
-struct TempRepo(PathBuf);
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 /// Utility: create a temporary git repo with a .intent/config.json file.
 fn create_test_repo_with_config(config: &str) -> TempRepo {
-    let repo_path = std::env::temp_dir().join(format!("repo-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_path).unwrap();
+    let repo_dir = common::test_tempdir("repo-");
+    let repo_path = repo_dir.path().to_path_buf();
 
     // Initialize a git repo with explicit default branch
     let status = std::process::Command::new("git")
@@ -146,11 +136,11 @@ fn create_test_repo_with_config(config: &str) -> TempRepo {
         .expect("git commit spawn failed");
     assert!(status.status.success(), "git commit command failed");
 
-    TempRepo(repo_path)
+    TempRepo(repo_path, repo_dir)
 }
 
 /// `DoD` test (a): workspace.create with repo branchPrefix and no request prefix -> branch carries prefix.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn test_workspace_create_uses_repo_branch_prefix() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.unwrap();
@@ -168,7 +158,7 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");
     let socket_path = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let services = services.clone();
         let bus = bus.clone();
         let socket = socket_path.clone();
@@ -214,7 +204,7 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
 
 /// `DoD` test (b): workspace.create with repo setupScript and no request script -> readable
 /// via getSetupScript; a request-supplied script is execute-only and never persisted.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn test_workspace_create_setup_script_fallback() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.unwrap();
@@ -231,7 +221,7 @@ async fn test_workspace_create_setup_script_fallback() {
     let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");
     let socket_path = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let services = services.clone();
         let bus = bus.clone();
         let socket = socket_path.clone();
@@ -347,7 +337,7 @@ async fn test_workspace_create_setup_script_fallback() {
 }
 
 /// `DoD` test (c): script.list on empty workspace with repo scripts[] -> seeded.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn test_script_list_bootstrap_from_repo() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.unwrap();
@@ -364,7 +354,7 @@ async fn test_script_list_bootstrap_from_repo() {
     let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");
     let socket_path = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let services = services.clone();
         let bus = bus.clone();
         let socket = socket_path.clone();
@@ -439,7 +429,7 @@ async fn test_script_list_bootstrap_from_repo() {
 /// `DoD` test (d): repo instructions reach the composed system prompt.
 /// This test verifies that when a workspace has a repo config with instructions,
 /// those instructions are included in the agent's system prompt.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn test_repo_instructions_in_system_prompt() {
     // Simulate what rules.rs does at lines 381-386
     use intent_services::repo_config::read_repo_config;
@@ -458,7 +448,7 @@ async fn test_repo_instructions_in_system_prompt() {
     let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");
     let socket_path = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let services = services.clone();
         let bus = bus.clone();
         let socket = socket_path.clone();
@@ -495,7 +485,7 @@ async fn test_repo_instructions_in_system_prompt() {
 /// on an empty workspace with repo config scripts must produce exactly one
 /// set of scripts (no duplicates). The fix uses a per-workspace async lock
 /// (`WorkspaceScriptLocks`) to serialize bootstrap operations.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn concurrent_script_list_no_duplicates() {
     use intent_core::WorkspaceCreate;
     let tmp = TempDb::new();
@@ -531,7 +521,7 @@ async fn concurrent_script_list_no_duplicates() {
         .to_string();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let _server = tokio::spawn({
+    let _server = intent_core::spawn_daemon({
         let services = services.clone();
         let bus = bus.clone();
         let socket = socket_path.clone();
@@ -556,7 +546,7 @@ async fn concurrent_script_list_no_duplicates() {
     for i in 0..10 {
         let socket = socket_path.clone();
         let ws_id = ws_id.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(intent_core::spawn_daemon(async move {
             let stream = UnixStream::connect(&socket).await.unwrap();
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);

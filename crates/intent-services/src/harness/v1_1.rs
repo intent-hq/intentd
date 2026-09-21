@@ -17,8 +17,8 @@ static DOCTRINE: Doctrine = Doctrine {
     specialists: crate::specialists::EMBEDDED_BUNDLED_V1_1,
 };
 
-/// The v1.1 registry row. `version` is intent-core's stamped `"1.1"`
-/// (asserted equal to `CURRENT_HARNESS_VERSION` by registry tests). The
+/// The v1.1 registry row. `version` is the stamped `"1.1"` (resolved by the
+/// registry tests; it was `CURRENT_HARNESS_VERSION` when v1.1 shipped). The
 /// harness (text surfaces), feature defaults, and feature labels are v1's —
 /// only the doctrine changed.
 pub(crate) static ENTRY: HarnessEntry = HarnessEntry {

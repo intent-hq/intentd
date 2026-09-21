@@ -62,11 +62,14 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -92,11 +95,12 @@ fn gate() -> Option<String> {
 // Event bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_bindings_query_and_subscribe() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-event-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-event-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -195,24 +199,22 @@ async fn event_bindings_query_and_subscribe() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 //
 // File bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn file_bindings_read_write_list() {
     let Some(script) = gate() else { return };
 
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-file-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("itd-e2e-file-");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("mkdir ws_root");
     std::fs::write(ws_root.join("existing.txt"), "existing content").expect("write existing");
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-file-{}.db", uuid::Uuid::new_v4()));
+    let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
@@ -362,21 +364,18 @@ async fn file_bindings_read_write_list() {
     }
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 //
 // Agent bindings coverage (read-side: list, status)
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_bindings_list_and_status() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-agent-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-agent-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -482,9 +481,6 @@ async fn agent_bindings_list_and_status() {
     assert_eq!(session.id, agent_id);
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// `ws.agent.listSpecialists` over the real MCP loop: the project tier
@@ -492,19 +488,20 @@ async fn agent_bindings_list_and_status() {
 /// compact dispatch shape (no prompt bodies), and `defaultModel` reflects
 /// per-specialist resolution — a compound-`model` pin wins over the settings
 /// default provider (auggie in this harness).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_bindings_list_specialists() {
     let Some(script) = gate() else { return };
 
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-spec-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("itd-e2e-spec-");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(ws_root.join(".intent/specialists")).expect("mkdir specialists");
     std::fs::write(
         ws_root.join(".intent/specialists/e2e-pinned.md"),
-        "---\nname: \"E2E Pinned\"\ndescription: \"Project-tier pinned specialist\"\nmodel: \"codex:test-model\"\n---\n\nYou are a project-tier e2e specialist.\n",
+        "---\nname: \"E2E Pinned\"\ndescription: \"Project-tier pinned specialist\"\ncodingAgent: \"codex\"\nmodel: \"test-model\"\n---\n\nYou are a project-tier e2e specialist.\n",
     )
     .expect("write project specialist");
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-spec-{}.db", uuid::Uuid::new_v4()));
+    let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
@@ -638,15 +635,11 @@ async fn agent_bindings_list_specialists() {
     assert_eq!(pinned["name"], "E2E Pinned");
     assert_eq!(
         pinned["defaultModel"],
-        serde_json::json!({ "provider": "codex", "model": "codex:test-model" }),
-        "compound-model pin resolved per-specialist, not via the settings default"
+        serde_json::json!({ "provider": "codex", "model": "test-model" }),
+        "codingAgent pin resolved per-specialist, not via the settings default"
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// `ws.agent.getQueue` + `ws.agent.removeQueuedMessage` + the queue merged
@@ -655,11 +648,12 @@ async fn agent_bindings_list_specialists() {
 /// next-delivery-first (interrupt ahead of normal FIFO), removal of the
 /// caller's own entry succeeds, and removal of a foreign entry is rejected
 /// by the ownership guard.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_bindings_get_queue_and_remove_queued_message() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-queue-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-queue-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -947,23 +941,21 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
     assert_eq!(remaining_ids, ["qmsg-foreign", "qmsg-interrupt"]);
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Single-pending-message guard on `ws.agent.send` / `ws.agent.sendToTask`:
-/// the target is pinned behind a question hold so agent-origin sends park in
+/// the target lives in an archived workspace so agent-origin sends park in
 /// its queue. The caller's FIRST send parks fine (a pre-seeded FOREIGN entry
 /// does not trigger the guard); the second send and a `sendToTask` against
 /// the same target are refused with `ok: false` + the full queue echo
 /// (drain order, 200-char truncation); after `removeQueuedMessage` retracts
 /// the caller's entry, a re-send parks again.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_bindings_send_single_pending_message_guard() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-sguard-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-sguard-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -980,9 +972,17 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .await
         .expect("disable toonOutput");
 
+    // The workspace is ARCHIVED up front (intent-hq/monorepo#2732): every
+    // agent-origin send into an archived workspace parks in the target's
+    // queue instead of driving a turn — the deterministic way to exercise
+    // the guard. The caller's own turn below is driven directly through
+    // `run_turn`, which does not consult the archived gate.
     let ws = WorkspaceId::new();
+    let mut archived_ws = workspace(&ws, None);
+    archived_ws.archived = true;
+    archived_ws.archived_at = Some(now_iso());
     store
-        .insert_workspace(&workspace(&ws, None))
+        .insert_workspace(&archived_ws)
         .await
         .expect("insert ws");
 
@@ -1012,27 +1012,6 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .await
         .expect("create target");
     let target_id = AgentId::from(target_val["agent"]["id"].as_str().unwrap());
-
-    // Pin the target behind a question hold (PROTOCOL §5.5): its last
-    // transcript message is an assistant row carrying a question resource
-    // block, so every agent-origin send parks in the queue instead of
-    // driving a turn — the deterministic way to exercise the guard.
-    store
-        .append_agent_message(
-            &target_id,
-            "assistant",
-            &serde_json::json!([{
-                "type": "resource",
-                "resource": {
-                    "uri": "question://hold-1",
-                    "mimeType": "application/vnd.intent.question+json",
-                    "text": "{\"question\":\"Which environment?\"}",
-                },
-            }]),
-            &now_iso(),
-        )
-        .await
-        .expect("seed question hold");
 
     // Seed a FOREIGN pending entry (long content — the refusal echo must
     // truncate it): another agent's parked send must NOT trigger the guard
@@ -1222,16 +1201,16 @@ async fn agent_bindings_send_single_pending_message_guard() {
     let out: serde_json::Value =
         serde_json::from_str(last_output).expect("tool output should be JSON");
 
-    // First send parks (question hold) despite the pre-seeded FOREIGN entry:
+    // First send parks (archived gate) despite the pre-seeded FOREIGN entry:
     // another sender's pending message never triggers the guard. Omitted
     // priority resolves to interrupt in the binding, so the entry parks
     // AHEAD of the foreign normal entry.
     assert_eq!(out["first"]["ok"], true, "{out}");
     assert_eq!(out["first"]["queued"], true, "{out}");
-    assert_eq!(out["first"]["heldForQuestions"], true, "{out}");
+    assert_eq!(out["first"]["archivedParked"], true, "{out}");
     assert_eq!(
-        out["first"]["delivery"], "held",
-        "held-for-questions park is self-describing: {out}"
+        out["first"]["delivery"], "queued",
+        "archived park is self-describing: {out}"
     );
     let first_id = out["first"]["queuedMessage"]["id"]
         .as_str()
@@ -1319,7 +1298,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
     assert_eq!(out["removed"]["ok"], true, "{out}");
     assert_eq!(out["resend"]["ok"], true, "{out}");
     assert_eq!(out["resend"]["queued"], true, "{out}");
-    assert_eq!(out["resend"]["delivery"], "held", "{out}");
+    assert_eq!(out["resend"]["delivery"], "queued", "{out}");
     let resend_id = out["resend"]["queuedMessage"]["id"]
         .as_str()
         .expect("resend parked entry id");
@@ -1334,7 +1313,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
     assert_eq!(replace["replacedMessageId"], resend_id, "{out}");
     assert!(replace.get("refused").is_none(), "{replace}");
     assert_eq!(replace["queued"], true, "{out}");
-    assert_eq!(replace["delivery"], "held", "{out}");
+    assert_eq!(replace["delivery"], "queued", "{out}");
 
     // Backend state: foreign entry untouched, caller's queue slot holds ONLY
     // the replacement (the refused sends never parked; the combined re-send
@@ -1363,16 +1342,13 @@ async fn agent_bindings_send_single_pending_message_guard() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 //
 // Git bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn git_bindings_commit() {
     let Some(script) = gate() else { return };
 
@@ -1387,7 +1363,8 @@ async fn git_bindings_commit() {
     }
 
     // Create a temp git repo
-    let repo_dir = std::env::temp_dir().join(format!("itd-e2e-git-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("itd-e2e-git-");
+    let repo_dir = tmp.path().join("repo");
 
     // Helper to run git commands and assert success
     let run_git = |args: &[&str]| {
@@ -1417,7 +1394,7 @@ async fn git_bindings_commit() {
     // Create new file for git operations
     std::fs::write(repo_dir.join("test.txt"), "test content").expect("write test");
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-git-{}.db", uuid::Uuid::new_v4()));
+    let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
@@ -1515,10 +1492,6 @@ async fn git_bindings_commit() {
     // Note: The git operations may not persist due to how Services resolves the workspace path
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&repo_dir);
 }
 
 /// Attribution-filtered `ws.git.commit` fallback (monorepo#939): an
@@ -1527,7 +1500,7 @@ async fn git_bindings_commit() {
 /// attributed path — a pre-existing unattributed dirty file stays in the
 /// worktree. This drives the full ingest → filter loop over the real MCP
 /// bridge (the same path idle auto-commit takes).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn git_bindings_agent_commit_filters_to_attributed_paths() {
     let Some(script) = gate() else { return };
 
@@ -1540,7 +1513,8 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
         return;
     }
 
-    let repo_dir = std::env::temp_dir().join(format!("itd-e2e-gitattr-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("itd-e2e-gitattr-");
+    let repo_dir = tmp.path().join("repo");
     let run_git = |args: &[&str]| {
         let out = std::process::Command::new("git")
             .args(args)
@@ -1567,7 +1541,7 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
     // Unattributed dirty file: written outside any agent context.
     std::fs::write(repo_dir.join("unattributed.txt"), "someone else\n").expect("write dirty");
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-gitattr-{}.db", uuid::Uuid::new_v4()));
+    let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
@@ -1703,21 +1677,18 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&repo_dir);
 }
 
 //
 // Note bindings - deepen coverage beyond basic ws.note.add
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_bindings_edit_and_edit_lines() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-note-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-note-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -1850,7 +1821,4 @@ async fn note_bindings_edit_and_edit_lines() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }

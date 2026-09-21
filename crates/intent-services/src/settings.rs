@@ -61,6 +61,14 @@ pub(crate) const RETIRED_BACKGROUND_AGENT_PATHS: &[&str] = &[
     "backgroundAgents.providerSettings",
 ];
 
+/// The deprecated legacy default-provider path. Unlike the retired paths
+/// above it keeps a (read-only) catalog entry during the deprecation window,
+/// so `settings.get`/`settings.list` stay answerable — but writes via
+/// `settings.update` are tolerated-and-ignored so a client can never recreate
+/// the key after [`migrate_active_provider_setting`] removed it from
+/// `config.toml`.
+pub(crate) const DEPRECATED_ACTIVE_PROVIDER_PATH: &str = "providers.active";
+
 /// Settings path of the user-editable transcription vocabulary (§5.12).
 pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
 
@@ -358,7 +366,7 @@ impl AsyncSecretStore {
         let inner = self.inner.clone();
         let state = self.state.clone();
         let ttl = self.cache_ttl;
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let load_account = account.clone();
             let result: Result<Option<String>> =
                 match tokio::task::spawn_blocking(move || inner.load(&load_account)).await {
@@ -660,6 +668,45 @@ pub(crate) fn find_definition(path: &str) -> Option<SettingDefinition> {
     definitions().into_iter().find(|d| d.path == path)
 }
 
+/// The model-valued settings keys whose string value must be a BARE model id
+/// (no `provider:model` compounds — the wire contract since the compound-id
+/// rejection). Object-shaped siblings (`model.providerDefaults`,
+/// `quickActions.typeOverrides`) enforce the same rule on their map values.
+const BARE_MODEL_STRING_PATHS: &[&str] = &["model.default", "quickActions.defaultModel"];
+const BARE_MODEL_MAP_PATHS: &[&str] = &["model.providerDefaults", "quickActions.typeOverrides"];
+
+/// `settings.update` guard: reject a compound `provider:model` value written
+/// to a model-valued key with `-32602`, instead of persisting a value the
+/// resolvers would then silently discard (they only accept bare ids). Blank
+/// values pass — they read as unset.
+fn validate_bare_model_id(path: &str, value: &Value) -> Result<()> {
+    let reject = |value: &str| {
+        Err(Error::InvalidParams(format!(
+            "{path}: model values must be bare model ids without ':' (got \"{value}\"); \
+             set the provider via model.defaultProvider instead"
+        )))
+    };
+    if BARE_MODEL_STRING_PATHS.contains(&path) {
+        if let Some(s) = value.as_str() {
+            if s.contains(':') {
+                return reject(s);
+            }
+        }
+    }
+    if BARE_MODEL_MAP_PATHS.contains(&path) {
+        if let Some(map) = value.as_object() {
+            for v in map.values() {
+                if let Some(s) = v.as_str() {
+                    if s.contains(':') {
+                        return reject(s);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn boolean(
     path: &'static str,
     label: &'static str,
@@ -762,12 +809,39 @@ fn number(
 }
 
 /// Catalog max for `agents.memoryBudgetMb` when total RAM cannot be detected
-/// (RAM detection supports Linux and macOS only), and the ceiling on the
-/// detected value. Matches the static bound
+/// ([`host_total_memory_bytes`] is `None`), and the ceiling on the detected
+/// value. Matches the static bound
 /// [`intent_core::settings_file::SettingsFile`] enforces when parsing
 /// `config.toml`, which stays machine-independent on purpose: a config file
 /// written on one seat must not fail to parse on another.
 const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
+
+/// Total physical RAM in bytes, or `None` where `sysinfo` reports it as `0`
+/// (its "unknown" on unsupported platforms).
+///
+/// The **one** RAM reading behind the `agents.memoryBudgetMb` contract: boot
+/// wiring feeds it to [`agent_memory_budget_bytes`] to install the auto budget,
+/// and the catalog derives the advertised `max` and `defaultValue` from it. The
+/// two must not detect RAM independently — an earlier catalog read used the
+/// Linux/macOS-only `/proc/meminfo` / `hw.memsize` probe while boot used
+/// `sysinfo`, so a 32 GiB Windows host installed 12,288 MB and advertised the
+/// 4,096 MB floor as its default.
+///
+/// Detected **once** and cached: `definitions()` is rebuilt by every
+/// `settings.list` / `settings.get`, and the Linux detection reads
+/// `/proc/meminfo`, so computing it inline would put a synchronous file read on
+/// a client-facing read path. Installed physical RAM cannot change under a live
+/// process, so this is the degenerate case of the derived-field ladder — the
+/// value is invalidated by nothing, and one read off the first call is enough.
+#[must_use]
+pub fn host_total_memory_bytes() -> Option<u64> {
+    static DETECTED: OnceLock<Option<u64>> = OnceLock::new();
+    *DETECTED.get_or_init(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        Some(sys.total_memory()).filter(|&bytes| bytes > 0)
+    })
+}
 
 /// Catalog max for `agents.memoryBudgetMb`: total physical RAM in MB, so the
 /// FE renders a slider over the range the setting can meaningfully take,
@@ -793,15 +867,10 @@ const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
 /// The divergence is **one-directional**: this bound is never looser than the
 /// parse bound. See [`memory_budget_max_mb_for`] for why that matters.
 ///
-/// Detected **once** and cached: `definitions()` is rebuilt by every
-/// `settings.list` / `settings.get`, and the Linux detection reads
-/// `/proc/meminfo`, so computing it inline would put a synchronous file read on
-/// a client-facing read path. Installed physical RAM cannot change under a live
-/// process, so this is the degenerate case of the derived-field ladder — the
-/// value is invalidated by nothing, and one read off the first call is enough.
+/// Reads the cached [`host_total_memory_bytes`] — the same reading boot
+/// installs the auto budget from.
 fn memory_budget_max_mb() -> f64 {
-    static DETECTED: OnceLock<f64> = OnceLock::new();
-    *DETECTED.get_or_init(|| memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()))
+    memory_budget_max_mb_for(host_total_memory_bytes())
 }
 
 /// [`memory_budget_max_mb`] against an explicit detection result, so every
@@ -820,7 +889,7 @@ fn memory_budget_max_mb() -> f64 {
 /// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
 /// the invariant every claim in these doc comments depends on.
 // MiB counts above 2^53 do not occur; loss-free in f64.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
     match total_memory_bytes.filter(|&bytes| bytes > 0) {
         // INVARIANT: this bound may be tighter than the `config.toml` parse
@@ -829,6 +898,49 @@ fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
         Some(bytes) => ((bytes / (1024 * 1024)) as f64).min(MEMORY_BUDGET_MAX_MB_FALLBACK),
         None => MEMORY_BUDGET_MAX_MB_FALLBACK,
     }
+}
+
+/// Catalog default for `agents.memoryBudgetMb`: the budget the *absent* key
+/// (auto) resolves to on this host, in MB — the same figure boot wiring
+/// installs through [`agent_memory_budget_bytes`] via
+/// [`crate::agent_manager::recommended_memory_budget_bytes`].
+///
+/// The wire `value` stays `null` while the key is absent (the registry reads
+/// the file, not the catalog), so `defaultValue` is what lets a client tell
+/// "auto, currently N MB" apart from an explicit `0` (off). Without it the FE
+/// rendered the absent key as "Off" while the daemon was enforcing a budget.
+/// Should the auto policy ever resolve to off, this must follow and advertise
+/// `0` — the default describes what auto *does*, not a suggested value.
+///
+/// Reads the cached [`host_total_memory_bytes`] — the same reading boot
+/// installs the auto budget from — so the two agree on every platform
+/// `sysinfo` supports, not only where the older Linux/macOS probe did.
+fn memory_budget_default_mb() -> f64 {
+    memory_budget_default_mb_for(host_total_memory_bytes())
+}
+
+/// [`memory_budget_default_mb`] against an explicit detection result, so the
+/// detected and undetected branches are both testable on one host.
+///
+/// An undetected total is treated as `0`, which the recommendation floors to
+/// its 4 GB minimum — matching what boot installs when `sysinfo` reports no
+/// RAM, so the advertised default never describes a budget the daemon does
+/// not actually run.
+///
+/// The result is **clamped** to [`memory_budget_max_mb_for`] the same total:
+/// `defaultValue` must satisfy the numeric schema it ships in. Above roughly
+/// 2 TiB the recommendation `(RAM − 8 GiB) / 2` outgrows the 1,024,000 MB
+/// parse bound the max is capped at, and below 4 GiB of RAM the 4 GiB floor
+/// outgrows the RAM-sized max; unclamped, either advertises a default the
+/// catalog itself rejects and no client can write back. In those two corners
+/// the daemon still runs the unclamped recommendation — the clamp keeps the
+/// wire description settable, it does not change the policy.
+// MiB counts above 2^53 do not occur; loss-free in f64.
+#[expect(clippy::cast_precision_loss)]
+fn memory_budget_default_mb_for(total_memory_bytes: Option<u64>) -> f64 {
+    let bytes =
+        crate::agent_manager::recommended_memory_budget_bytes(total_memory_bytes.unwrap_or(0));
+    ((bytes / (1024 * 1024)) as f64).min(memory_budget_max_mb_for(total_memory_bytes))
 }
 
 fn enumerated(
@@ -890,15 +1002,23 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         None,
     );
     specialists_dir.read_only = true;
+    // Deprecated: kept in the catalog so `settings.get`/`settings.list` stay
+    // answerable during the deprecation window, but read-only so no write path
+    // can recreate the key after [`migrate_active_provider_setting`] removed
+    // it from config.toml (`settings.update` tolerates-and-ignores it before
+    // the read-only rejection would fire, so old clients never fail a batch).
+    let mut providers_active = string(
+        "providers.active",
+        "Active provider (deprecated)",
+        "Deprecated: superseded by model.defaultProvider (carried over and removed from \
+         config.toml once at startup; never consulted; read-only on the wire)",
+        "providers",
+        None,
+    );
+    providers_active.read_only = true;
     vec![
         // --- Group A: providers / agents -----------------------------------
-        string(
-            "providers.active",
-            "Active provider",
-            "Default agent provider",
-            "providers",
-            None,
-        ),
+        providers_active,
         object(
             "providers.enabled",
             "Enabled providers",
@@ -916,7 +1036,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         string(
             "model.default",
             "Default model",
-            "Fallback model for new agents",
+            "Fallback model for new agents (a bare model id; pair with model.defaultProvider)",
+            "providers",
+            None,
+        ),
+        string(
+            "model.defaultProvider",
+            "Default provider",
+            "Provider new agents run on when none is requested explicitly (blank means unset)",
             "providers",
             None,
         ),
@@ -1165,6 +1292,33 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(100_000.0),
             256.0,
         ),
+        number(
+            "sharing.maxGuestsPerWorkspace",
+            "Max guests per workspace",
+            "Guests one workspace admits besides its owner: open invites count at mint time, collaborators at join time; over-limit invites are refused with guest-limit and over-limit joins with workspace-full (0 closes every workspace to guests)",
+            "sharing",
+            Some(0.0),
+            Some(100.0),
+            10.0,
+        ),
+        number(
+            "sharing.maxGuestConnections",
+            "Max guest connections",
+            "Listener-wide cap on concurrent WSS connections held by guests; the owner's credential is never counted and over-limit upgrades are refused with 503 (0 = unlimited; applies live to new connections, never disconnects admitted guests)",
+            "sharing",
+            Some(0.0),
+            Some(100_000.0),
+            40.0,
+        ),
+        number(
+            "sharing.maxConnectionsPerGuest",
+            "Max connections per guest",
+            "Concurrent WSS connections one guest may hold; over-limit upgrades are refused with 503 (0 = unlimited; applies live to new connections, never disconnects admitted guests)",
+            "sharing",
+            Some(0.0),
+            Some(1_000.0),
+            4.0,
+        ),
         // --- Group B: source control ----------------------------------------
         enumerated(
             "sourceControl.activeProvider",
@@ -1408,22 +1562,32 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(200.0), // Upper bound to prevent resource exhaustion
             0.0,
         ),
-        // No `default_value`: the default is the *absent* key (auto, derived
-        // from system RAM), which `number()` cannot express (monorepo#2063).
+        // The default is the *absent* key (auto, monorepo#2063); `default_value`
+        // advertises the budget auto resolves to on this host so a client can
+        // tell auto apart from an explicit 0 while `value` reads null.
         SettingDefinition {
             path: "agents.memoryBudgetMb",
             label: "Agent memory budget (MB)",
-            description: "Aggregate resident memory the daemon's whole child-process tree may use before it reclaims: new agent spawns queue behind idle-process eviction, and a background sweep drains idle agents largest-first while over budget (absent = auto, derived from system RAM; 0 = off; nothing running is ever killed; changes apply on daemon restart)",
+            description: "Aggregate resident memory of the daemon's whole child-process tree. The budget reclaims only when two conditions hold at once: the tree is over budget AND the host's available memory is below 8 GiB plus one provisional agent (~660 MB); then new agent spawns queue behind idle-process eviction and a background sweep drains idle agents largest-first. An over-budget tree on a host with more available memory than that is left alone, whatever the budget value. When available memory cannot be sampled the budget is strict: over budget alone reclaims (absent = auto, the RAM-derived budget advertised as this setting's default; 0 = off; nothing running is ever killed; changes apply on daemon restart)",
             category: "agents",
             ty: SettingType::Number {
                 min: Some(0.0),
                 max: Some(memory_budget_max_mb()),
             },
-            default_value: None,
+            default_value: Some(json!(memory_budget_default_mb())),
             sensitive: false,
             read_only: false,
             token_impact: None,
         },
+        number(
+            "agents.acpNodeMaxOldSpaceMb",
+            "ACP Node heap limit (MB)",
+            "V8 --max-old-space-size cap in MB injected via NODE_OPTIONS into Node/Electron ACP provider processes (applies to newly started agent processes; the INTENTD_ACP_NODE_MAX_OLD_SPACE_MB env var overrides this setting)",
+            "agents",
+            Some(f64::from(intent_core::config::ACP_NODE_MAX_OLD_SPACE_MB_MIN)),
+            Some(f64::from(intent_core::config::ACP_NODE_MAX_OLD_SPACE_MB_MAX)),
+            f64::from(intent_core::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB),
+        ),
         number(
             "agents.maxConcurrentAdapters",
             "Max concurrent one-shot adapters",
@@ -1459,6 +1623,30 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(0.0),
             None,
             f64::from(intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS),
+        ),
+        number(
+            "agents.historyReplayToolContentChars",
+            "History replay tool content chars",
+            "Per-block character cap applied to each tool_use input and tool_result output in the recovery replay that rebuilds a lost ACP session; longer bodies are middle-truncated (500-100000; applies live at replay time, no restart required)",
+            "agents",
+            Some(f64::from(
+                intent_core::config::HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+            )),
+            Some(f64::from(
+                intent_core::config::HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+            )),
+            f64::from(intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS),
+        ),
+        number(
+            "agents.toolPayloadRetentionDays",
+            "Tool payload retention days",
+            "Stored tool payloads older than this many days are shrunk to the replay preview used by the recovery replay; the full body is deleted and cannot be recovered (0 disables the sweep and keeps full bodies forever; max 3650; applies live at each sweep tick, no restart required)",
+            "agents",
+            Some(0.0),
+            Some(f64::from(
+                intent_core::config::TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+            )),
+            f64::from(intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS),
         ),
         enumerated(
             "agents.flushQueuedMessages",
@@ -1625,11 +1813,54 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "prMonitor.pollSeconds",
             "PR monitor poll seconds",
-            "How often (in seconds) the centralized loop polls each monitored PR (minimum 10)",
+            "Tick cadence (in seconds) of the centralized loop and the per-PR poll interval floor (minimum 10)",
             "prMonitor",
             Some(10.0),
             Some(3_600.0),
             30.0,
+        ),
+        number(
+            "prMonitor.hourlyRequestBudget",
+            "PR monitor hourly request budget",
+            "Forge REST calls per hour the centralized loop plans to spend across all monitored PRs — a cadence cost model, not a hard ceiling: each PR poll is costed at 3 calls (a single-page estimate; paginated review lists and REST fallbacks cost more), so the per-PR interval stretches above pollSeconds once PRs × 3 × 3600 / budget exceeds it; requests are not counted or blocked against it. 1500 is ~30% of GitHub's 5,000/h core quota (minimum 60, maximum 5000)",
+            "prMonitor",
+            Some(60.0),
+            Some(5_000.0),
+            1_500.0,
+        ),
+        number(
+            "prMonitor.quotaSharePercent",
+            "PR monitor quota share percent",
+            "Share of the forge's REMAINING core quota (read once per tick from its quota-free rate_limit probe) the centralized loop may plan to spend before the window resets — the per-PR interval stretches above the hourly-budget cadence once PRs × 3 × secondsToReset would exceed that share of the remaining quota, so the monitor slows down before the shared rate-limit pause has to stop it; never below pollSeconds. A host without the signal uses the hourly budget alone (minimum 1, maximum 100)",
+            "prMonitor",
+            Some(1.0),
+            Some(100.0),
+            50.0,
+        ),
+        boolean(
+            "updates.checkOnIdle",
+            "Check for updates when idle",
+            "Ask the sitter (via SIGUSR2) to check for updates once the daemon has been continuously idle",
+            "updates",
+            true,
+        ),
+        number(
+            "updates.idleCheckIntervalMinutes",
+            "Idle check interval minutes",
+            "Minimum spacing (in minutes) between two idle-triggered update checks, also applied from process start (minimum 5)",
+            "updates",
+            Some(5.0),
+            Some(10_080.0),
+            60.0,
+        ),
+        number(
+            "updates.idleGraceSeconds",
+            "Idle grace seconds",
+            "How long (in seconds) the daemon must be continuously idle before it requests an update check (minimum 10)",
+            "updates",
+            Some(10.0),
+            Some(86_400.0),
+            120.0,
         ),
     ]
 }
@@ -1700,6 +1931,26 @@ pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
 #[must_use]
 pub fn report_to_parent_debounce_seconds(settings: &SettingsFile) -> u32 {
     settings.agents.report_to_parent_debounce_seconds
+}
+
+/// The effective `agents.historyReplayToolContentChars` setting: the
+/// per-block character cap applied to each `tool_use` input and
+/// `tool_result` output in the recovery replay. The schema bounds it to
+/// 500–100000, so the value passes through as-is — read live from the
+/// settings snapshot at replay time, no restart required.
+#[must_use]
+pub fn history_replay_tool_content_chars(settings: &SettingsFile) -> usize {
+    settings.agents.history_replay_tool_content_chars as usize
+}
+
+/// The effective `agents.toolPayloadRetentionDays` setting: `Some(days)` when
+/// the payload retention sweep is enabled, `None` when it is `0` (keep full
+/// tool bodies forever, today's behaviour) — read live from the settings
+/// snapshot at each sweep tick, no restart required.
+#[must_use]
+pub fn tool_payload_retention_days(settings: &SettingsFile) -> Option<u32> {
+    let days = settings.agents.tool_payload_retention_days;
+    (days > 0).then_some(days)
 }
 
 /// One-time boot import of legacy `config.toml` keys back into the `SQLite`
@@ -1829,6 +2080,92 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
     Ok(())
 }
 
+/// One-time boot migration of the deprecated `providers.active` OUT of
+/// `config.toml`: when the file still carries the legacy key, its value is
+/// carried over into `model.defaultProvider` (which superseded it as the
+/// default-provider key; provider resolution never consults
+/// `providers.active` anymore) and the key is removed from the file with a
+/// comment-preserving rewrite. Without the carry-over an upgraded
+/// installation whose config only carries the legacy key would derive NO
+/// default provider and get self-healed to a registry-order pick — silently
+/// switching the user's configured provider.
+///
+/// The value carries over only when it names a registered provider
+/// (whitespace-trimmed) AND `model.defaultProvider` is still unset — an
+/// already-set target always wins, and a blank or unregistered value is
+/// dropped with the key (nothing is invented). Either way the legacy key is
+/// removed and a one-time INFO log records what happened; a file without the
+/// key is never rewritten (the read path stays rewrite-free). Both writes go
+/// through [`SettingsRegistry::apply`] in one atomic batch, so the raw
+/// document, typed file, and effective snapshot stay in sync — origin
+/// tracking and `settings.reset` behave as if the key was never set.
+///
+/// # Errors
+///
+/// Never errors today: migration failures are logged and skipped (the file
+/// stays intact, so the next boot retries). The `Result` keeps parity with
+/// the other startup migrations.
+pub fn migrate_active_provider_setting(registry: &SettingsRegistry) -> Result<()> {
+    let Some(active) = registry
+        .get("providers.active")
+        .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
+    else {
+        return Ok(());
+    };
+    let target_set = registry
+        .get("model.defaultProvider")
+        .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
+        .is_some_and(|v| !v.is_empty());
+    let carried = if target_set || active.is_empty() {
+        None
+    } else {
+        intent_providers::find_provider(&active)
+            .map(|_| intent_providers::provider_config(&active).id)
+    };
+    let mut changes: Vec<(String, Value)> = Vec::with_capacity(2);
+    if let Some(canonical) = carried {
+        changes.push((
+            "model.defaultProvider".to_string(),
+            Value::String(canonical.to_string()),
+        ));
+    }
+    changes.push(("providers.active".to_string(), Value::Null));
+    if let Err(e) = registry.apply(&changes) {
+        tracing::warn!(
+            error = %e,
+            "failed to migrate deprecated providers.active out of config.toml; \
+             continuing (next boot retries)"
+        );
+        return Ok(());
+    }
+    if let Some(canonical) = carried {
+        tracing::info!(
+            provider = canonical,
+            "migrated deprecated providers.active into model.defaultProvider \
+             and removed it from config.toml"
+        );
+    } else if target_set {
+        tracing::info!(
+            value = active,
+            "removed deprecated providers.active from config.toml; the \
+             already-set model.defaultProvider wins"
+        );
+    } else if active.is_empty() {
+        tracing::info!(
+            "removed deprecated providers.active from config.toml; the value \
+             was blank, so nothing was carried over to model.defaultProvider"
+        );
+    } else {
+        tracing::info!(
+            value = active,
+            "removed deprecated providers.active from config.toml; the value \
+             names no registered provider, so nothing was carried over to \
+             model.defaultProvider"
+        );
+    }
+    Ok(())
+}
+
 /// One-time boot cleanup of stale `SQLite` rows for retired settings. The
 /// per-workspace override blob (`model.workspaceOverrides`, monorepo#1000)
 /// no longer has a catalog entry or any reader; delete its row so stale
@@ -1895,7 +2232,7 @@ pub(crate) fn wire_value(def: &SettingDefinition, value: Value) -> Value {
 /// integers via the schema's lenient deserializer.
 // The `n.abs() <= i64::MAX as f64` guard bounds the float→int cast; the
 // i64::MAX→f64 comparison constant rounding up by one ULP is harmless here.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
     if let SettingType::Number { .. } = def.ty {
         if let Some(n) = value.as_f64() {
@@ -2062,6 +2399,13 @@ impl<'a> SettingsService<'a> {
     /// a durable file change without a `settings:changed` event. Returns the
     /// **redacted** applied `{ path, value, origin? }` pairs for the response +
     /// `settings:changed` payload.
+    ///
+    /// A sensitive entry whose value is the [`REDACTED_PLACEHOLDER`] is what a
+    /// client echoes back from `settings.list`/`settings.get` for a secret it
+    /// did not touch (intent#4383): with a stored secret it is a no-op for
+    /// that path (the secret is left as is; the entry is still echoed
+    /// redacted), without one it is `-32602` and the whole batch is rejected
+    /// before anything is applied — the placeholder is never stored.
     pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
         let entries = changes
             .as_array()
@@ -2080,8 +2424,13 @@ impl<'a> SettingsService<'a> {
             // monorepo#1729 compatibility: pre-rename clients still write the
             // `backgroundAgents.*` paths. Same tolerate-and-ignore treatment —
             // the renamed `quickActions.*` keys are the only writable surface.
+            // The deprecated `providers.active` gets the same treatment so a
+            // write can never recreate the key `migrate_active_provider_setting`
+            // removed from config.toml (its catalog entry is read-only, but a
+            // hard rejection would fail whole batches from old clients).
             if path == RETIRED_WORKSPACE_OVERRIDES_PATH
                 || RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
+                || path == DEPRECATED_ACTIVE_PROVIDER_PATH
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
@@ -2095,6 +2444,16 @@ impl<'a> SettingsService<'a> {
                 return Err(Error::InvalidParams(format!("{path} is read-only")));
             }
             def.validate(&value)?;
+            validate_bare_model_id(path, &value)?;
+            if def.sensitive
+                && value.as_str() == Some(REDACTED_PLACEHOLDER)
+                && self.secrets.load(def.path).await?.is_none()
+            {
+                return Err(Error::InvalidParams(format!(
+                    "{path}: the redaction placeholder cannot be stored as a secret \
+                     (no secret is currently stored for this setting)"
+                )));
+            }
             planned.push((def, value));
         }
 
@@ -2107,11 +2466,17 @@ impl<'a> SettingsService<'a> {
         let mut mutations = Vec::with_capacity(planned.len());
         for (def, value) in planned {
             let unchanged = if def.sensitive {
-                let desired = match &value {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
+                // The placeholder stays in the plan so the entry is echoed
+                // (redacted) even though the secret itself is left untouched.
+                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
+                    false
+                } else {
+                    let desired = match &value {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
+                }
             } else if let Some(reg) = self.registry_for(def.path) {
                 match reg.origin(def.path) {
                     Some(SettingOrigin::File) => reg
@@ -2163,14 +2528,20 @@ impl<'a> SettingsService<'a> {
         let mut applied = Vec::with_capacity(planned.len());
         for (def, value) in planned {
             let persisted = if def.sensitive {
-                let secret_value = match &value {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                self.secrets
-                    .store(def.path, &secret_value)
-                    .await
-                    .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
+                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
+                    // Presence was verified during validation: keep the
+                    // stored secret, echo the redacted entry.
+                    Ok(json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
+                } else {
+                    let secret_value = match &value {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    self.secrets
+                        .store(def.path, &secret_value)
+                        .await
+                        .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
+                }
             } else if self.registry_for(def.path).is_some() {
                 // Already applied via the registry batch above. Normalize the
                 // echoed value so number-typed settings keep the float wire
@@ -2622,6 +2993,114 @@ mod tests {
         }
     }
 
+    /// Regression (intent#4383): a client that round-trips `settings.list`
+    /// back into `settings.update` echoes the redaction placeholder for every
+    /// sensitive path it did not touch. The placeholder MUST NOT replace the
+    /// stored secret; the entry is echoed (redacted) without a store write,
+    /// and a literal value still replaces as before.
+    #[tokio::test]
+    async fn update_with_redaction_placeholder_keeps_stored_secret() {
+        let tmp = std::env::temp_dir().join(format!(
+            "intentd-settings-placeholder-keep-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&tmp).await.expect("open store");
+        let raw_secrets = Arc::new(InMemorySecretStore::default());
+        let secrets: Arc<dyn SecretStore> = raw_secrets.clone();
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        svc.update(&json!([{ "path": "linear.token", "value": "lin_original" }]))
+            .await
+            .expect("store the original secret");
+        assert_eq!(
+            raw_secrets.load("linear.token").expect("load"),
+            Some("lin_original".to_string())
+        );
+
+        // Echoing the placeholder is a no-op for the secret; the applied
+        // entry still carries the redacted value.
+        let applied = svc
+            .update(&json!([{ "path": "linear.token", "value": REDACTED_PLACEHOLDER }]))
+            .await
+            .expect("placeholder on a stored secret must be accepted");
+        assert_eq!(
+            applied,
+            vec![json!({ "path": "linear.token", "value": REDACTED_PLACEHOLDER })]
+        );
+        assert_eq!(
+            raw_secrets.load("linear.token").expect("load"),
+            Some("lin_original".to_string()),
+            "placeholder must not clobber the stored secret"
+        );
+
+        // A literal value still replaces the stored secret.
+        svc.update(&json!([{ "path": "linear.token", "value": "lin_rotated" }]))
+            .await
+            .expect("literal replaces");
+        assert_eq!(
+            raw_secrets.load("linear.token").expect("load"),
+            Some("lin_rotated".to_string())
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// Regression (intent#4383): the placeholder on a sensitive path with
+    /// **no** stored secret is `-32602`, and the whole batch is rejected
+    /// atomically — a sibling non-sensitive change in the same batch is not
+    /// applied (registry key stays at its default, config.toml untouched).
+    #[tokio::test]
+    async fn update_with_redaction_placeholder_and_no_secret_rejects_whole_batch() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp =
+            std::env::temp_dir().join(format!("intentd-settings-placeholder-reject-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-placeholder-reject-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let raw_secrets = Arc::new(InMemorySecretStore::default());
+        let secrets: Arc<dyn SecretStore> = raw_secrets.clone();
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let err = svc
+            .update(&json!([
+                { "path": "git.autoCommit", "value": false },
+                { "path": "linear.token", "value": REDACTED_PLACEHOLDER },
+            ]))
+            .await
+            .expect_err("placeholder without a stored secret must be rejected");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "expected Error::InvalidParams, got {err:?}"
+        );
+        assert_eq!(
+            raw_secrets.load("linear.token").expect("load"),
+            None,
+            "the placeholder must never be stored as a secret"
+        );
+        let got = svc.get("git.autoCommit").await.expect("get sibling");
+        assert_eq!(got["value"], json!(true), "sibling change must not apply");
+        assert_eq!(got["origin"], json!("default"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("autoCommit"), "{text}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
     /// `max_concurrent_agents` reads the effective `agents.maxConcurrent`:
     /// positive value → explicit override; 0 (the schema default) → `None`
     /// (fallback to `default_process_cap()`). Negative / garbled values are
@@ -2642,8 +3121,10 @@ mod tests {
     /// matrix (monorepo#2063): absent = auto (resolves to the recommended budget
     /// derived from system RAM), explicit 0 = off (a 0 must stay `None` rather
     /// than becoming a 0-byte budget that would refuse every spawn), positive =
-    /// MB converted to bytes. The catalog carries no `default_value` because the
-    /// default is the absent key.
+    /// MB converted to bytes. The default is the absent key, and the catalog
+    /// advertises the budget auto resolves to on this host as `default_value`
+    /// so a client can tell auto apart from an explicit 0 while `value` is
+    /// null.
     #[test]
     fn agent_memory_budget_matrix_absent_auto_zero_off_positive_bytes() {
         use crate::agent_manager::recommended_memory_budget_bytes;
@@ -2660,7 +3141,15 @@ mod tests {
         // usable range rather than a degenerate 0..0.
         assert_eq!(max, Some(memory_budget_max_mb()));
         assert!(max.expect("bounded") > 0.0);
-        assert_eq!(def.default_value, None, "the default is the absent key");
+        assert_eq!(
+            def.default_value,
+            Some(json!(memory_budget_default_mb())),
+            "the default advertises the auto budget for this host"
+        );
+        assert!(
+            memory_budget_default_mb() > 0.0,
+            "auto never resolves to off, so the advertised default is never 0"
+        );
         assert!(KNOWN_PATHS.contains(&"agents.memoryBudgetMb"));
 
         let mut settings = SettingsFile::default();
@@ -2689,7 +3178,7 @@ mod tests {
     /// always succeeds; a zero reading is treated as undetected so the max
     /// never collapses onto the minimum.
     #[test]
-    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
+    #[expect(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn memory_budget_max_tracks_detected_ram_with_static_fallback() {
         assert_eq!(
             memory_budget_max_mb_for(Some(48 * 1024 * 1024 * 1024)),
@@ -2714,11 +3203,125 @@ mod tests {
             MEMORY_BUDGET_MAX_MB_FALLBACK
         );
 
-        // The wired-up form agrees with the injectable one on this host.
+        // The wired-up form agrees with the injectable one on this host, fed
+        // from the same reading boot installs the auto budget from.
         assert_eq!(
             memory_budget_max_mb(),
-            memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()),
+            memory_budget_max_mb_for(host_total_memory_bytes()),
         );
+    }
+
+    /// The `agents.memoryBudgetMb` catalog default is the budget the absent
+    /// key resolves to — `recommended_memory_budget_bytes` in MB — so what
+    /// `settings.get` advertises as `defaultValue` is what boot installs when
+    /// the key is absent: `(RAM − 8 GB) / 2` floored at 4 GB, and the 4 GB
+    /// floor where RAM is undetected (boot sees a 0 total there too). It is
+    /// never 0, because auto never resolves to off.
+    ///
+    /// Both sides read [`host_total_memory_bytes`], so the agreement asserted
+    /// here holds on every platform `sysinfo` detects RAM on — not only where
+    /// the older Linux/macOS probe did, which left Windows advertising the
+    /// 4,096 MB floor while boot installed the real recommendation.
+    #[test]
+    // Asserting exact whole-valued MB figures; the MiB count fits in f64 exactly.
+    #[expect(clippy::float_cmp, clippy::cast_precision_loss)]
+    fn memory_budget_default_is_the_auto_budget_in_mb() {
+        use crate::agent_manager::recommended_memory_budget_bytes;
+        assert_eq!(
+            memory_budget_default_mb_for(Some(48 * 1024 * 1024 * 1024)),
+            20_480.0
+        );
+        assert_eq!(
+            memory_budget_default_mb_for(Some(16 * 1024 * 1024 * 1024)),
+            4_096.0
+        );
+        assert_eq!(memory_budget_default_mb_for(Some(0)), 4_096.0);
+        assert_eq!(memory_budget_default_mb_for(None), 4_096.0);
+
+        // The wired-up form agrees with the injectable one and with the byte
+        // figure boot installs on this host — clamped to the catalog max, as
+        // the advertised default is (a sub-4 GiB or >~2 TiB host binds it).
+        let detected = host_total_memory_bytes();
+        assert_eq!(
+            memory_budget_default_mb(),
+            memory_budget_default_mb_for(detected)
+        );
+        let settings = SettingsFile::default();
+        let installed = agent_memory_budget_bytes(&settings, detected.unwrap_or(0))
+            .expect("absent key resolves to a budget");
+        assert_eq!(
+            installed,
+            recommended_memory_budget_bytes(detected.unwrap_or(0))
+        );
+        assert_eq!(
+            memory_budget_default_mb(),
+            ((installed / (1024 * 1024)) as f64).min(memory_budget_max_mb_for(detected))
+        );
+        assert!(memory_budget_default_mb() > 0.0);
+    }
+
+    /// `defaultValue` never exceeds the catalog `max` it ships beside: above
+    /// roughly 2 TiB the recommendation `(RAM − 8 GiB) / 2` outgrows the
+    /// 1,024,000 MB parse bound the max is capped at, and unclamped the catalog
+    /// would advertise a default its own numeric schema rejects — a figure no
+    /// client could write back through `settings.update`. The clamp also
+    /// binds at the other end, where the 4 GiB floor outgrows a sub-4 GiB
+    /// host's RAM-sized max.
+    #[test]
+    // Asserting exact whole-valued MB figures; the MiB count fits in f64 exactly.
+    #[expect(clippy::float_cmp)]
+    fn memory_budget_default_is_clamped_to_the_catalog_max() {
+        const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // 3 TiB: the unclamped recommendation is 1,568,768 MB.
+        assert_eq!(
+            memory_budget_default_mb_for(Some(3 * TIB)),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
+        assert_eq!(
+            memory_budget_default_mb_for(Some(3 * TIB)),
+            memory_budget_max_mb_for(Some(3 * TIB))
+        );
+        // 2 TiB exactly: 1,044,480 MB unclamped, already above the bound.
+        assert_eq!(
+            memory_budget_default_mb_for(Some(2 * TIB)),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
+        // 1 TiB: the max is capped but the 520,192 MB recommendation is not.
+        assert_eq!(memory_budget_default_mb_for(Some(TIB)), 520_192.0);
+
+        // Sub-4 GiB host: the 4 GiB floor is above the RAM-sized max.
+        assert_eq!(memory_budget_default_mb_for(Some(2 * GIB)), 2_048.0);
+        assert_eq!(
+            memory_budget_default_mb_for(Some(2 * GIB)),
+            memory_budget_max_mb_for(Some(2 * GIB))
+        );
+
+        for total in [
+            None,
+            Some(0),
+            Some(2 * GIB),
+            Some(16 * GIB),
+            Some(TIB),
+            Some(3 * TIB),
+        ] {
+            assert!(
+                memory_budget_default_mb_for(total) <= memory_budget_max_mb_for(total),
+                "default above max for {total:?}"
+            );
+        }
+
+        // ...and on this host, where the catalog actually ships the pair.
+        let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
+        let SettingType::Number { max: Some(max), .. } = &def.ty else {
+            panic!("agents.memoryBudgetMb is a bounded number");
+        };
+        let default = def.default_value.as_ref().and_then(Value::as_f64);
+        assert_eq!(default, Some(memory_budget_default_mb()));
+        assert!(default.expect("advertised") <= *max);
+        def.validate(&json!(default))
+            .expect("the advertised default must pass the catalog's own schema");
     }
 
     /// The catalog bound may be tighter than the `config.toml` parse bound but
@@ -2739,7 +3342,7 @@ mod tests {
     /// the parse bound, which is every real one but need not be assumed.
     #[test]
     // The advertised max is a small whole-valued float: casts are exact.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn memory_budget_catalog_bound_is_never_looser_than_the_parse_bound() {
         let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
         let max = memory_budget_max_mb();
@@ -2768,6 +3371,138 @@ mod tests {
             ))
             .expect("a config.toml from a larger seat must still parse, not refuse to boot");
             assert_eq!(parsed.agents.memory_budget_mb, Some(over_ram as u32));
+        }
+    }
+
+    /// `agents.acpNodeMaxOldSpaceMb` is a TOML-backed bounded number (default
+    /// 8192, min 1024, max 65536) whose default is the *absent* key: the
+    /// catalog advertises the default the spawn path resolves to, while the
+    /// registry reads `null` until the key is written. It persists through
+    /// `settings.update` to config.toml (never `SQLite`) and rejects
+    /// out-of-range values.
+    #[tokio::test]
+    #[expect(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
+    async fn agents_acp_node_max_old_space_mb_round_trip_via_registry() {
+        let path = "agents.acpNodeMaxOldSpaceMb";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(min),
+                max: Some(max)
+            } if min == 1024.0 && max == 65_536.0
+        ));
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert_eq!(def.label, "ACP Node heap limit (MB)");
+        assert_eq!(def.default_value, Some(json!(8192.0)));
+        assert_eq!(
+            intent_core::config::DEFAULT_ACP_NODE_MAX_OLD_SPACE_MB,
+            8192,
+            "catalog default must track the shipped constant"
+        );
+        assert!(
+            def.description
+                .contains("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB"),
+            "description names the env override"
+        );
+        assert!(KNOWN_PATHS.contains(&path));
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-acpheap-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-acpheap-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Absent key: `null` value with `default` origin; the catalog default
+        // is what the spawn path resolves to.
+        let got = svc.get(path).await.expect("get default");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+        assert_eq!(got["definition"]["defaultValue"], json!(8192.0));
+        assert_eq!(
+            registry
+                .snapshot()
+                .effective
+                .agents
+                .acp_node_max_old_space_mb,
+            None
+        );
+        let listed = svc.list().await.expect("list");
+        assert!(
+            listed["settings"]
+                .as_array()
+                .expect("list is an array")
+                .iter()
+                .any(|entry| entry["path"] == json!(path)),
+            "settings.list must carry the new path"
+        );
+
+        // An updated cap persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([{ "path": path, "value": 16384 }]))
+            .await
+            .expect("update to 16384");
+        let got = svc.get(path).await.expect("get updated");
+        assert_eq!(got["value"], json!(16_384.0));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("acpNodeMaxOldSpaceMb = 16384"), "{text}");
+        assert_eq!(
+            store.get_setting(path).await.expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .effective
+                .agents
+                .acp_node_max_old_space_mb,
+            Some(16_384)
+        );
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(reloaded.get(path), Some(json!(16_384)));
+
+        // Out-of-range and wrong-type values are rejected.
+        svc.update(&json!([{ "path": path, "value": 65_537 }]))
+            .await
+            .expect_err("over max must be rejected");
+        svc.update(&json!([{ "path": path, "value": 1023 }]))
+            .await
+            .expect_err("under min must be rejected");
+        svc.update(&json!([{ "path": path, "value": 0 }]))
+            .await
+            .expect_err("0 is not an off value here");
+        svc.update(&json!([{ "path": path, "value": "8192" }]))
+            .await
+            .expect_err("non-number must be rejected");
+        let got = svc.get(path).await.expect("get after rejected updates");
+        assert_eq!(
+            got["value"],
+            json!(16_384.0),
+            "rejected writes leave the value untouched"
+        );
+
+        // Reset removes the key and restores the absent default.
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], serde_json::Value::Null);
+        let got = svc.get(path).await.expect("get after reset");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("acpNodeMaxOldSpaceMb"), "{text}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
         }
     }
 
@@ -2907,6 +3642,240 @@ mod tests {
             0,
             "0 must pass through — it means disabled, not \"fall back to default\""
         );
+    }
+
+    /// `agents.historyReplayToolContentChars` is a TOML-backed bounded number
+    /// (500–100000, default 4000) in the `agents` category, registered in
+    /// `KNOWN_PATHS`; its catalog default matches the schema default and its
+    /// description states what the cap bounds (chars per `tool_use` input /
+    /// `tool_result` output in the recovery replay). The live accessor passes
+    /// the configured value through.
+    #[test]
+    fn history_replay_tool_content_chars_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.historyReplayToolContentChars")
+            .expect("agents.historyReplayToolContentChars missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(500.0),
+                max: Some(100_000.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(4000.0)));
+        assert_eq!(
+            intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
+            4000
+        );
+        assert_eq!(
+            SettingsFile::default()
+                .agents
+                .history_replay_tool_content_chars,
+            intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.historyReplayToolContentChars"));
+        for needle in ["tool_use input", "tool_result output", "recovery replay"] {
+            assert!(
+                def.description.contains(needle),
+                "description must state what the cap bounds ({needle}): {}",
+                def.description
+            );
+        }
+        def.validate(&json!(500)).expect("the lower bound is legal");
+        def.validate(&json!(100_000))
+            .expect("the upper bound is legal");
+        assert!(def.validate(&json!(0)).is_err(), "no 0 escape hatch");
+        assert!(def.validate(&json!(499)).is_err());
+        assert!(def.validate(&json!(100_001)).is_err());
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(history_replay_tool_content_chars(&settings), 4000);
+        settings.agents.history_replay_tool_content_chars = 12_000;
+        assert_eq!(history_replay_tool_content_chars(&settings), 12_000);
+    }
+
+    /// `agents.toolPayloadRetentionDays` is a TOML-backed bounded number
+    /// (0 = keep forever, max 3650, default 0) in the `agents` category,
+    /// registered in `KNOWN_PATHS`; its description states that the sweep
+    /// shrinks stored payloads older than N days to the replay preview and
+    /// that 0 disables it. The live accessor maps 0 to `None`.
+    #[test]
+    fn tool_payload_retention_days_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.toolPayloadRetentionDays")
+            .expect("agents.toolPayloadRetentionDays missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: Some(3650.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(0.0)));
+        assert_eq!(intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, 0);
+        assert_eq!(
+            SettingsFile::default().agents.tool_payload_retention_days,
+            intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.toolPayloadRetentionDays"));
+        for needle in ["older than", "replay preview", "0 disables"] {
+            assert!(
+                def.description.contains(needle),
+                "description must state the retention semantics ({needle}): {}",
+                def.description
+            );
+        }
+        def.validate(&json!(0))
+            .expect("0 is legal — it keeps full bodies forever");
+        def.validate(&json!(3650))
+            .expect("the upper bound is legal");
+        assert!(def.validate(&json!(3651)).is_err());
+        assert!(def.validate(&json!(-1)).is_err());
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(
+            tool_payload_retention_days(&settings),
+            None,
+            "0 must resolve to None — the sweep is disabled"
+        );
+        settings.agents.tool_payload_retention_days = 30;
+        assert_eq!(tool_payload_retention_days(&settings), Some(30));
+    }
+
+    /// Both retention knobs round-trip through the registry-wired service
+    /// exactly like `workspaceApi.maxOutputChars`: defaults read with
+    /// `default` origin, updates persist to config.toml (`file` origin, never
+    /// `SQLite`) and are visible on the live snapshot, out-of-range values
+    /// reject with `-32602` and leave the prior value untouched, and reset
+    /// restores the defaults.
+    #[tokio::test]
+    async fn tool_payload_retention_settings_round_trip_via_registry() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-retention-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-retention-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(4000.0));
+        assert_eq!(got["origin"], json!("default"));
+        let got = svc
+            .get("agents.toolPayloadRetentionDays")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(0.0));
+        assert_eq!(got["origin"], json!("default"));
+
+        svc.update(&json!([
+            { "path": "agents.historyReplayToolContentChars", "value": 8000 },
+            { "path": "agents.toolPayloadRetentionDays", "value": 30 },
+        ]))
+        .await
+        .expect("update");
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(8000.0));
+        assert_eq!(got["origin"], json!("file"));
+        let got = svc
+            .get("agents.toolPayloadRetentionDays")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(30.0));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("historyReplayToolContentChars"), "{text}");
+        assert!(text.contains("toolPayloadRetentionDays"), "{text}");
+        for path in [
+            "agents.historyReplayToolContentChars",
+            "agents.toolPayloadRetentionDays",
+        ] {
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed keys must never write a SQLite settings row"
+            );
+        }
+        // The live snapshot every accessor reads sees the update immediately.
+        let live = registry.snapshot().effective.clone();
+        assert_eq!(history_replay_tool_content_chars(&live), 8000);
+        assert_eq!(tool_payload_retention_days(&live), Some(30));
+
+        // Out-of-range values reject via the typed schema (-32602) and the
+        // prior values are untouched.
+        for (path, value) in [
+            ("agents.historyReplayToolContentChars", 499),
+            ("agents.historyReplayToolContentChars", 100_001),
+            ("agents.toolPayloadRetentionDays", 3651),
+        ] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("out-of-range value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path}, got {err:?}"
+            );
+        }
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(8000.0));
+        let got = svc
+            .get("agents.toolPayloadRetentionDays")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(30.0));
+        let live = registry.snapshot().effective.clone();
+        assert_eq!(history_replay_tool_content_chars(&live), 8000);
+        assert_eq!(tool_payload_retention_days(&live), Some(30));
+
+        // 0 (keep forever) is accepted for the retention window.
+        svc.update(&json!([{ "path": "agents.toolPayloadRetentionDays", "value": 0 }]))
+            .await
+            .expect("0 = keep forever must be accepted");
+        assert_eq!(
+            tool_payload_retention_days(&registry.snapshot().effective),
+            None
+        );
+
+        let reset = svc
+            .reset("agents.historyReplayToolContentChars")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!(4000.0));
+        let reset = svc
+            .reset("agents.toolPayloadRetentionDays")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!(0.0));
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// `server.maxOutstandingRpcs` is a non-secret TOML-backed bounded number
@@ -3391,33 +4360,74 @@ mod tests {
         );
     }
 
-    /// `[prMonitor]` exposes two TOML-backed numbers with a floor of 10:
-    /// `debounceSeconds` (default 60) and `pollSeconds` (default 30, a
-    /// config-file key the Settings UI does not surface). Both round-trip
-    /// through the registry-wired service and reject sub-floor values.
+    /// `[prMonitor]` exposes four TOML-backed numbers: `debounceSeconds`
+    /// (default 60, floor 10), `pollSeconds` (default 30, floor 10),
+    /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) and
+    /// `quotaSharePercent` (default 50, floor 1, max 100) — the latter
+    /// three are config-file keys the Settings UI does not surface. All
+    /// round-trip through the registry-wired service and reject sub-floor
+    /// values.
     #[tokio::test]
     async fn pr_monitor_intervals_round_trip_via_registry() {
-        for (path, default) in [
-            ("prMonitor.debounceSeconds", 60.0),
-            ("prMonitor.pollSeconds", 30.0),
+        for (path, default, floor) in [
+            ("prMonitor.debounceSeconds", 60.0, 10.0),
+            ("prMonitor.pollSeconds", 30.0, 10.0),
+            ("prMonitor.hourlyRequestBudget", 1500.0, 60.0),
+            ("prMonitor.quotaSharePercent", 50.0, 1.0),
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
             assert!(!def.read_only, "{path} must not be read-only");
             assert_eq!(def.category, "prMonitor");
+            let SettingType::Number { min, .. } = def.ty else {
+                panic!("{path} must be a number setting");
+            };
             assert!(
-                matches!(
-                    def.ty,
-                    SettingType::Number {
-                        min: Some(10.0),
-                        ..
-                    }
-                ),
-                "{path} number with a floor of 10"
+                min.is_some_and(|m| (m - floor).abs() < f64::EPSILON),
+                "{path} floor must be {floor}, got {min:?}"
             );
             assert_eq!(def.default_value, Some(json!(default)), "{path} default");
             assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
         }
+        assert!(
+            matches!(
+                find_definition("prMonitor.hourlyRequestBudget").unwrap().ty,
+                SettingType::Number {
+                    max: Some(5000.0),
+                    ..
+                }
+            ),
+            "hourlyRequestBudget caps at 5000"
+        );
+        assert!(
+            matches!(
+                find_definition("prMonitor.quotaSharePercent").unwrap().ty,
+                SettingType::Number {
+                    max: Some(100.0),
+                    ..
+                }
+            ),
+            "quotaSharePercent caps at 100"
+        );
+        // The catalog range and the read-time clamp constants must agree.
+        assert_eq!(
+            intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            60
+        );
+        assert_eq!(
+            intent_core::config::MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            5000
+        );
+        assert_eq!(
+            intent_core::config::DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            1500
+        );
+        assert_eq!(intent_core::config::MIN_PR_MONITOR_QUOTA_SHARE_PERCENT, 1);
+        assert_eq!(intent_core::config::MAX_PR_MONITOR_QUOTA_SHARE_PERCENT, 100);
+        assert_eq!(
+            intent_core::config::DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+            50
+        );
 
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-prmon-{tag}.db"));
@@ -3429,19 +4439,21 @@ mod tests {
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
 
-        for (path, default) in [
-            ("prMonitor.debounceSeconds", 60.0),
-            ("prMonitor.pollSeconds", 30.0),
+        for (path, default, updated, rejected) in [
+            ("prMonitor.debounceSeconds", 60.0, 120, 5),
+            ("prMonitor.pollSeconds", 30.0, 120, 5),
+            ("prMonitor.hourlyRequestBudget", 1500.0, 120, 5),
+            ("prMonitor.quotaSharePercent", 50.0, 25, 0),
         ] {
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["value"], json!(default), "{path} default");
             assert_eq!(got["origin"], json!("default"), "{path} origin");
 
-            svc.update(&json!([{ "path": path, "value": 120 }]))
+            svc.update(&json!([{ "path": path, "value": updated }]))
                 .await
                 .expect("update");
             let got = svc.get(path).await.expect("get");
-            assert_eq!(got["value"], json!(120.0), "{path} updated");
+            assert_eq!(got["value"], json!(f64::from(updated)), "{path} updated");
             assert_eq!(got["origin"], json!("file"), "{path} origin");
             assert_eq!(
                 store.get_setting(path).await.expect("read settings table"),
@@ -3451,7 +4463,7 @@ mod tests {
 
             // Sub-floor values reject before anything is written.
             let err = svc
-                .update(&json!([{ "path": path, "value": 5 }]))
+                .update(&json!([{ "path": path, "value": rejected }]))
                 .await
                 .expect_err("sub-floor value must reject");
             assert!(matches!(err, Error::InvalidParams(_)), "{err}");
@@ -3461,6 +4473,143 @@ mod tests {
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["origin"], json!("default"), "{path} origin after reset");
         }
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `[updates]` exposes one TOML-backed boolean (`checkOnIdle`, default
+    /// on) and two numbers: `idleCheckIntervalMinutes` (default 60, floor 5)
+    /// and `idleGraceSeconds` (default 120, floor 10). All round-trip through
+    /// the registry-wired service, the numbers reject sub-floor values, and
+    /// the catalog floors agree with the read-time clamp constants.
+    #[tokio::test]
+    async fn updates_settings_round_trip_via_registry() {
+        let check = find_definition("updates.checkOnIdle").expect("updates.checkOnIdle missing");
+        assert!(!check.sensitive);
+        assert!(!check.read_only);
+        assert_eq!(check.category, "updates");
+        assert!(matches!(check.ty, SettingType::Boolean));
+        assert_eq!(check.default_value, Some(json!(true)));
+        assert!(KNOWN_PATHS.contains(&"updates.checkOnIdle"));
+
+        for (path, default, floor) in [
+            ("updates.idleCheckIntervalMinutes", 60.0, 5.0),
+            ("updates.idleGraceSeconds", 120.0, 10.0),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(!def.read_only, "{path} must not be read-only");
+            assert_eq!(def.category, "updates");
+            let SettingType::Number { min, .. } = def.ty else {
+                panic!("{path} must be a number setting");
+            };
+            assert!(
+                min.is_some_and(|m| (m - floor).abs() < f64::EPSILON),
+                "{path} floor must be {floor}, got {min:?}"
+            );
+            assert_eq!(def.default_value, Some(json!(default)), "{path} default");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+        // The catalog floors/defaults and the read-time clamp constants agree.
+        assert_eq!(
+            check.default_value,
+            Some(json!(intent_core::config::DEFAULT_UPDATES_CHECK_ON_IDLE))
+        );
+        assert_eq!(
+            intent_core::config::DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+            60
+        );
+        assert_eq!(
+            intent_core::config::MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+            5
+        );
+        assert_eq!(intent_core::config::DEFAULT_UPDATES_IDLE_GRACE_SECONDS, 120);
+        assert_eq!(intent_core::config::MIN_UPDATES_IDLE_GRACE_SECONDS, 10);
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-updates-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-updates-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Boolean: default on, flips to off through the registry, never SQLite.
+        let got = svc.get("updates.checkOnIdle").await.expect("get");
+        assert_eq!(got["value"], json!(true));
+        assert_eq!(got["origin"], json!("default"));
+        svc.update(&json!([{ "path": "updates.checkOnIdle", "value": false }]))
+            .await
+            .expect("update");
+        let got = svc.get("updates.checkOnIdle").await.expect("get");
+        assert_eq!(got["value"], json!(false));
+        assert_eq!(got["origin"], json!("file"));
+        assert!(!registry.snapshot().effective.updates.check_on_idle);
+        assert_eq!(
+            store
+                .get_setting("updates.checkOnIdle")
+                .await
+                .expect("read settings table"),
+            None,
+            "TOML-backed updates.checkOnIdle must never write a SQLite settings row"
+        );
+        let err = svc
+            .update(&json!([{ "path": "updates.checkOnIdle", "value": "off" }]))
+            .await
+            .expect_err("mistyped boolean must reject");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let reset = svc.reset("updates.checkOnIdle").await.expect("reset");
+        assert_eq!(reset["value"], json!(true));
+
+        for (path, default) in [
+            ("updates.idleCheckIntervalMinutes", 60.0),
+            ("updates.idleGraceSeconds", 120.0),
+        ] {
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(default), "{path} default");
+            assert_eq!(got["origin"], json!("default"), "{path} origin");
+
+            svc.update(&json!([{ "path": path, "value": 45 }]))
+                .await
+                .expect("update");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(45.0), "{path} updated");
+            assert_eq!(got["origin"], json!("file"), "{path} origin");
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed {path} must never write a SQLite settings row"
+            );
+
+            // Sub-floor values reject before anything is written.
+            let err = svc
+                .update(&json!([{ "path": path, "value": 1 }]))
+                .await
+                .expect_err("sub-floor value must reject");
+            assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(
+                got["value"],
+                json!(45.0),
+                "{path} unchanged after rejection"
+            );
+
+            let reset = svc.reset(path).await.expect("reset");
+            assert_eq!(reset["value"], json!(default), "{path} reset");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["origin"], json!("default"), "{path} origin after reset");
+        }
+        let effective = registry.snapshot().effective.clone();
+        assert_eq!(effective.updates.idle_check_interval_minutes, 60);
+        assert_eq!(effective.updates.idle_grace_seconds, 120);
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {
@@ -3817,7 +4966,7 @@ mod tests {
     /// PROTOCOL §5.12, v4.6); it persists through `settings.update` to
     /// config.toml (never `SQLite`) and rejects out-of-range values.
     #[tokio::test]
-    #[allow(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
+    #[expect(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
     async fn voice_workspace_vocabulary_max_terms_is_a_bounded_toml_number() {
         let path = "voice.workspaceVocabulary.maxTerms";
         let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -4005,7 +5154,7 @@ mod tests {
         let applied = svc
             .update(&json!([
                 { "path": "backgroundAgents.defaultModel", "value": "auggie:haiku" },
-                { "path": "quickActions.defaultModel", "value": "auggie:opus" },
+                { "path": "quickActions.defaultModel", "value": "opus" },
             ]))
             .await
             .expect("mixed batch must apply its live entry");
@@ -4013,7 +5162,7 @@ mod tests {
         assert_eq!(applied[0]["path"], "quickActions.defaultModel");
         assert_eq!(
             registry.get("quickActions.defaultModel"),
-            Some(json!("auggie:opus"))
+            Some(json!("opus"))
         );
 
         let _ = std::fs::remove_file(&config_path);
@@ -4137,6 +5286,284 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// True when the TOML text still carries an `active` key line — matched
+    /// as a key assignment, not a bare substring, so fixture keys that merely
+    /// contain "active" (e.g. `interactive`) can never false-fail.
+    fn has_active_key(text: &str) -> bool {
+        text.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix("active")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+    }
+
+    /// Upgrade path: a config that predates `model.defaultProvider` and only
+    /// carries the deprecated `providers.active` has that value carried over
+    /// once at boot ([`migrate_active_provider_setting`]) AND the legacy key
+    /// removed from config.toml — provider resolution never consults the
+    /// legacy key, so without the carry-over an upgraded install would
+    /// degrade to "no default" and get self-healed to a registry-order pick
+    /// (a silent provider switch). User comments survive the rewrite, and a
+    /// second boot from the migrated file is a byte-identical no-op.
+    #[tokio::test]
+    async fn active_provider_migration_carries_legacy_value_over_and_removes_key() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-actmig-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# Operator note — must survive the migration rewrite.\n\
+             [providers]\nactive = \" codex \"\n\n[git]\nautoCommit = false\n",
+        )
+        .expect("seed legacy config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_active_provider_setting(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("model.defaultProvider"),
+            Some(json!("codex")),
+            "the trimmed legacy value must carry over"
+        );
+        assert_eq!(
+            registry.origin("model.defaultProvider"),
+            Some(SettingOrigin::File),
+            "the carried-over value is persisted to the file layer"
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read migrated config");
+        assert!(
+            !has_active_key(&text),
+            "providers.active must be removed from the file: {text}"
+        );
+        assert!(
+            text.contains("defaultProvider = \"codex\""),
+            "the carried-over value must be written to the file: {text}"
+        );
+        assert!(
+            text.contains("# Operator note — must survive the migration rewrite."),
+            "user comments must survive the migration rewrite: {text}"
+        );
+        assert!(
+            text.contains("autoCommit = false"),
+            "untouched keys must survive the migration rewrite: {text}"
+        );
+
+        // Next boot from the migrated file: no key → no rewrite, byte-identical.
+        let registry2 = SettingsRegistry::load(&config_path).expect("reload registry");
+        migrate_active_provider_setting(&registry2).expect("migrate again");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("re-read config"),
+            text,
+            "a file without the legacy key is never rewritten"
+        );
+        assert_eq!(registry2.get("model.defaultProvider"), Some(json!("codex")));
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// The migration removes `providers.active` from the file in every case,
+    /// but never clobbers an already-set `model.defaultProvider` and never
+    /// carries over an unregistered value — nothing is invented, and the
+    /// removed key stays gone across reloads (no resurrection via
+    /// `settings.reset`-style Null applies either).
+    #[tokio::test]
+    async fn active_provider_migration_removes_key_without_inventing_values() {
+        let tag = uuid::Uuid::new_v4();
+
+        // Both keys set: the target wins; the legacy key is still removed.
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-actkeep-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[providers]\nactive = \"codex\"\n\n[model]\ndefaultProvider = \"claude-code\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        migrate_active_provider_setting(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("model.defaultProvider"),
+            Some(json!("claude-code")),
+            "a set model.defaultProvider must win over the legacy key"
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            !has_active_key(&text),
+            "the legacy key is removed even when the target is set: {text}"
+        );
+        assert!(text.contains("defaultProvider = \"claude-code\""), "{text}");
+        // A fresh load of the rewritten file agrees: the key is gone for good.
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(
+            reloaded.origin("providers.active"),
+            Some(SettingOrigin::Default),
+            "the removed key must not resurrect on reload"
+        );
+        // settings.reset-style Null apply on the migrated key is a clean no-op
+        // (the doc no longer carries it), not a resurrection.
+        reloaded
+            .apply(&[("providers.active".into(), Value::Null)])
+            .expect("reset after migration");
+        assert_eq!(
+            reloaded.origin("providers.active"),
+            Some(SettingOrigin::Default)
+        );
+        let _ = std::fs::remove_file(&config_path);
+
+        // Unregistered value: dropped with the key, nothing carried over.
+        let config_path2 = std::env::temp_dir().join(format!("intentd-settings-actbad-{tag}.toml"));
+        std::fs::write(&config_path2, "[providers]\nactive = \"not-a-provider\"\n")
+            .expect("seed config");
+        let registry2 = SettingsRegistry::load(&config_path2).expect("load registry");
+        migrate_active_provider_setting(&registry2).expect("migrate");
+        assert_eq!(
+            registry2.origin("model.defaultProvider"),
+            Some(SettingOrigin::Default),
+            "an unregistered legacy value must not carry over"
+        );
+        let text2 = std::fs::read_to_string(&config_path2).expect("read config");
+        assert!(
+            !has_active_key(&text2),
+            "an unregistered legacy value is still removed from the file: {text2}"
+        );
+        let _ = std::fs::remove_file(&config_path2);
+
+        // No legacy key at all: nothing to do, file untouched byte-for-byte.
+        let config_path3 =
+            std::env::temp_dir().join(format!("intentd-settings-actnone-{tag}.toml"));
+        let seed = "# comment only\n[git]\nautoCommit = true\n";
+        std::fs::write(&config_path3, seed).expect("seed config");
+        let registry3 = SettingsRegistry::load(&config_path3).expect("load registry");
+        migrate_active_provider_setting(&registry3).expect("migrate");
+        assert_eq!(
+            registry3.origin("model.defaultProvider"),
+            Some(SettingOrigin::Default)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path3).expect("re-read config"),
+            seed,
+            "a file without the legacy key is never rewritten"
+        );
+        let _ = std::fs::remove_file(&config_path3);
+    }
+
+    /// The deprecated `providers.active` cannot be recreated through the
+    /// settings API after the boot migration removed it: the catalog entry is
+    /// read-only, and `settings.update` tolerates-and-ignores writes to it
+    /// (nothing validated, persisted, echoed, or published) so an old client's
+    /// batch never fails wholesale — mirroring the retired-path treatment.
+    #[tokio::test]
+    async fn active_provider_update_is_tolerated_and_ignored() {
+        let def = find_definition(DEPRECATED_ACTIVE_PROVIDER_PATH)
+            .expect("providers.active must stay in the catalog during deprecation");
+        assert!(
+            def.read_only,
+            "providers.active must be read-only so no write path recreates it"
+        );
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-actwrite-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-actwrite-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // A lone legacy write is ignored: nothing applied, nothing persisted.
+        let applied = svc
+            .update(&json!([
+                { "path": "providers.active", "value": "codex" },
+            ]))
+            .await
+            .expect("legacy providers.active write must be tolerated");
+        assert_eq!(applied, Vec::<Value>::new());
+        assert_eq!(
+            registry.origin("providers.active"),
+            Some(SettingOrigin::Default),
+            "the ignored write must not resurrect the key"
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!has_active_key(&text), "{text}");
+
+        // A batch mixing the legacy path with a live one still applies the
+        // live entry instead of failing wholesale.
+        let applied = svc
+            .update(&json!([
+                { "path": "providers.active", "value": "codex" },
+                { "path": "model.defaultProvider", "value": "codex" },
+            ]))
+            .await
+            .expect("mixed batch must apply its live entry");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["path"], "model.defaultProvider");
+        assert_eq!(registry.get("model.defaultProvider"), Some(json!("codex")));
+
+        // The catalog entry keeps get/reset answerable during deprecation.
+        let got = svc.get("providers.active").await.expect("get");
+        assert_eq!(got["origin"], json!("default"));
+        svc.reset("providers.active").await.expect("reset");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `settings.update` rejects compound `provider:model` values on the
+    /// model-valued keys with `-32602` (string keys and the map values of the
+    /// object-shaped ones) instead of persisting a value the resolvers would
+    /// silently discard; bare ids and blank values still pass.
+    #[tokio::test]
+    async fn update_rejects_compound_model_values() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-baremdl-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-baremdl-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        for (path, value) in [
+            ("model.default", json!("codex:gpt-5")),
+            ("quickActions.defaultModel", json!("auggie:haiku")),
+            ("model.providerDefaults", json!({ "codex": "codex:gpt-5" })),
+            (
+                "quickActions.typeOverrides",
+                json!({ "commit": "auggie:fast" }),
+            ),
+        ] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("compound model value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path}, got {err:?}"
+            );
+        }
+
+        // Bare ids and blanks pass; the map shape accepts bare values.
+        svc.update(&json!([
+            { "path": "model.default", "value": "gpt-5" },
+            { "path": "quickActions.defaultModel", "value": "" },
+            { "path": "model.providerDefaults", "value": { "codex": "gpt-5" } },
+        ]))
+        .await
+        .expect("bare values must pass");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// [`cleanup_retired_settings`] deletes the stale `SQLite` row left behind

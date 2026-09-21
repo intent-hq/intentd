@@ -28,9 +28,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use intent_core::{Error, GitStatus, Result};
+use tokio::time::Instant;
 
 use crate::git_status_singleflight::{self, Join, StatusKey, StatusSingleFlight};
 
@@ -49,6 +50,9 @@ pub(crate) type ScanProbe = Option<Arc<dyn Fn() + Send + Sync>>;
 
 /// Per-worktree cache state. `generation` advances on every invalidation so a
 /// scan that started against an older state cannot publish into the cache.
+/// The stored-at stamp is a [`tokio::time::Instant`] — identical to
+/// `std::time::Instant` in production — so TTL tests can age an entry with
+/// the paused runtime clock instead of the wall clock.
 #[derive(Default)]
 struct Slot {
     generation: u64,
@@ -80,8 +84,8 @@ impl GitStatusCache {
         }
     }
 
-    /// Test-only: compress the fallback TTL so expiry coverage completes in
-    /// milliseconds instead of [`STATUS_CACHE_TTL`].
+    /// Test-only: override the fallback TTL (expiry coverage pins a generous
+    /// one and advances the paused runtime clock past it).
     #[cfg(test)]
     pub(crate) fn with_ttl(ttl: Duration) -> Self {
         Self { ttl, ..Self::new() }

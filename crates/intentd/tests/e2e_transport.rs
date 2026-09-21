@@ -41,33 +41,27 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use uuid::Uuid;
 
 /// A fixed 64-char hex token (valid shape) the daemon adopts via the
 /// `INTENTD_AUTH_TOKEN` seam, so the client can authenticate hermetically.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
-/// A spawned `intentd serve` process; killed and its data dir removed on drop.
+/// A spawned `intentd serve` process; killed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
 /// Create a short data dir (`/tmp/itd-e2e-XXXXXXXX`) so `data_dir/intentd.sock`
 /// fits within `SUN_LEN` (~104 bytes).
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-e2e-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-e2e-")
 }
 
 /// Spawn `intentd serve` with the given data dir + env. The
@@ -79,9 +73,8 @@ fn spawn_serve(data_dir: &PathBuf, listen: &str, env: &[(&str, &str)]) -> Child 
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -301,11 +294,11 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
 
 #[tokio::test]
 async fn e2e_transport_full() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
     let pidfile = data_dir.join("intentd.pid");
@@ -427,15 +420,14 @@ async fn e2e_transport_full() {
     );
     assert!(!socket.exists(), "socket not cleaned after stop");
     assert!(!pidfile.exists(), "pidfile not cleaned after stop");
-    // The child already exited and was reaped above; don't let `Drop` remove the
-    // data dir before the restart reuses it.
-    std::mem::forget(daemon);
+    // The child already exited and was reaped above; the data dir guard outlives
+    // the restart below.
+    drop(daemon);
 
     // Immediate restart on the SAME data dir + SAME TCP port: the freed UDS and
     // listen port must rebind with no stale-owner refusal / EADDRINUSE.
     let restart = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
-        data_dir: data_dir.clone(),
     };
     assert!(await_uds(&socket).await, "daemon did not restart cleanly");
     let again = common::await_wss_status(&socket).await;
@@ -511,11 +503,14 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -541,7 +536,8 @@ async fn e2e_idle_session_reaping() {
         return;
     }
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws = WorkspaceId::new();
     {
         let store = Store::open(&data_dir.join("intentd.db"))
@@ -565,7 +561,6 @@ async fn e2e_idle_session_reaping() {
                 ("INTENTD_IDLE_REAP_MS", "800"),
             ],
         ),
-        data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -646,7 +641,8 @@ async fn e2e_idle_session_reaping() {
 /// `incremental_vacuum` calls can release freelist pages from then on.
 #[tokio::test]
 async fn e2e_auto_vacuum_activation_on_legacy_db() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let db_path = data_dir.join("intentd.db");
 
     // Pre-seed the legacy database with a raw connection that does NOT apply
@@ -687,7 +683,6 @@ async fn e2e_auto_vacuum_activation_on_legacy_db() {
 
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "uds", &[]),
-        data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
     assert!(

@@ -13,6 +13,8 @@
 //!   `delete` on `__chief__` are safe no-ops that return the synthesized shape
 //!   (or `success: true` for delete) — the seeded row is never mutated.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::Path;
@@ -39,13 +41,11 @@ async fn send(socket: &Path, frame: &str) -> Value {
     serde_json::from_str(line.trim()).expect("valid json")
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_workspace_over_uds() {
     // Short UDS path (`SUN_LEN ~ 104B` on macOS).
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = Path::new("/tmp").join(format!("intentd-chief-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var("INTENTD_DATA_DIR", &dir);
+    let dir = common::test_tempdir_in("/tmp", "intentd-chief-");
+    std::env::set_var("INTENTD_DATA_DIR", dir.path());
     let config = Config::resolve().expect("resolve config");
 
     // Open the store once so migration 0033 seeds the `__chief__` row before
@@ -58,7 +58,7 @@ async fn chief_workspace_over_uds() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -267,5 +267,4 @@ async fn chief_workspace_over_uds() {
 
     let _ = tx.send(());
     let _ = server.await;
-    let _ = std::fs::remove_dir_all(&dir);
 }

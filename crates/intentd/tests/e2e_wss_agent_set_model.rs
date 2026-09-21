@@ -10,8 +10,8 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,28 +26,22 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-setmodel-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-setmodel-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -58,9 +52,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -195,6 +188,72 @@ where
     }
 }
 
+/// Read the live Antigravity catalog over `models.list`, tolerating a failed
+/// probe (intent-hq/intent#4971). A probe that times out or whose adapter
+/// exits is answered with the daemon's static fallback (`source: "static"`,
+/// `models: []`, `warning`) — the designed degraded response, and under
+/// package-level CPU load the fixed 4s `initialize` budget makes it a
+/// reachable one — so asserting `models[0]` on the first response races the
+/// probe and fails with an uninformative `Null`. The first read is a plain,
+/// cache-honoring read so the identity/staleness assertions callers make stay
+/// meaningful (a stale last-good list is still served as `source:
+/// "antigravity"` + `stale: true`, never as `static`); only a static fallback
+/// is re-read, with `forceRefresh` to bypass the 60s negative entry the failed
+/// probe recorded. Panics with the last response (its `warning` names the
+/// probe failure) once the budget is spent.
+async fn antigravity_catalog<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(45));
+    let mut response = wss_rpc(ws, id, "models.list", json!({"providerId":"antigravity"})).await;
+    let mut attempts = 1;
+    while response["source"] == "static" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "antigravity catalog probe kept failing after {attempts} attempts: {response}"
+        );
+        attempts += 1;
+        response = wss_rpc(
+            ws,
+            id,
+            "models.list",
+            json!({"providerId":"antigravity","forceRefresh":true}),
+        )
+        .await;
+    }
+    response
+}
+
+/// Read the live Antigravity auth verdict over `host.providerAuthStatus`
+/// (`force: true`), tolerating an inconclusive probe (intent-hq/intent#4971).
+/// The auth probe is the same one-shot ACP `initialize` against the configured
+/// executable, with the same fixed budget, and the wire folds a failed or
+/// timed-out probe to `authenticated: null` — no reason travels with it, so a
+/// single read under package-level CPU load cannot distinguish "not yet" from
+/// "unauthenticated". Re-probes while the verdict is `null`; a `true` / `false`
+/// verdict is returned as-is for the caller to assert. Panics with the last
+/// response once the budget is spent (the retained daemon.log names the probe
+/// failure).
+async fn antigravity_auth_status<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(45));
+    let params = json!({"providerId":"antigravity","force":true});
+    let mut response = wss_rpc(ws, id, "host.providerAuthStatus", params.clone()).await;
+    let mut attempts = 1;
+    while response["providers"][0]["authenticated"].is_null() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "antigravity auth probe stayed inconclusive after {attempts} attempts: {response}"
+        );
+        attempts += 1;
+        response = wss_rpc(ws, id, "host.providerAuthStatus", params.clone()).await;
+    }
+    response
+}
+
 fn gate() -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -213,6 +272,344 @@ fn gate() -> Option<String> {
     Some(script)
 }
 
+/// Exercise the real Antigravity registry/launch/session path with the existing
+/// deterministic ACP fixture, including both cold load and recreation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn antigravity_catalog_override_change_and_restart_use_current_executable_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(script) = gate() else { return };
+    let node = intent_providers::resolve_on_path("node").unwrap();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let mut wrappers = Vec::new();
+    for model in ["model-a", "model-b"] {
+        let wrapper = data_dir.join(model);
+        let catalog = json!({"configOptions":[{
+            "id":"model", "name":"Model", "type":"select",
+            "currentValue":model, "options":[{"value":model,"name":model}]
+        }]});
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexport MOCK_AGENT_SESSION_RESULT='{}'\nexec '{}' '{}'\n",
+                catalog,
+                node.display(),
+                script,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        wrappers.push(wrapper);
+    }
+    let env = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    for (index, expected) in [(0, "model-a"), (1, "model-b"), (0, "model-a")] {
+        wss_rpc(
+            &mut rpc,
+            1,
+            "settings.update",
+            json!({"changes":[{"path":"providers.paths","value":{"antigravity":wrappers[index]}}]}),
+        )
+        .await;
+        let response = antigravity_catalog(&mut rpc, 2).await;
+        assert_eq!(response["source"], "antigravity");
+        assert_eq!(response["models"][0]["id"], expected, "{response}");
+    }
+    // Persist B's setting while the last saved catalog still belongs to A.
+    wss_rpc(
+        &mut rpc,
+        3,
+        "settings.update",
+        json!({"changes":[{"path":"providers.paths","value":{"antigravity":wrappers[1]}}]}),
+    )
+    .await;
+    drop(rpc);
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon.child = spawn_serve(&data_dir, "both", &env);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let response = antigravity_catalog(&mut rpc, 4).await;
+    assert_eq!(response["source"], "antigravity", "{response}");
+    assert_eq!(response["models"][0]["id"], "model-b", "{response}");
+    assert_eq!(response["models"][0]["isDefault"], true, "{response}");
+    let workspace = wss_rpc(
+        &mut rpc,
+        5,
+        "workspace.create",
+        json!({"title":"Antigravity cache identity", "noPrompt":true}),
+    )
+    .await;
+    let created = wss_rpc(&mut rpc, 6, "agent.create", json!({"workspaceId":workspace["workspace"]["id"],"name":"Cached default", "provider":"antigravity"})).await;
+    assert_eq!(created["agent"]["model"], "model-b", "{created}");
+}
+
+#[tokio::test]
+async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(script) = gate() else { return };
+    let node = intent_providers::resolve_on_path("node").unwrap();
+    for (load, reject_model, dropped_setups) in [
+        (true, false, 0),
+        (false, false, 0),
+        (true, true, 0),
+        (true, false, 2),
+        (true, false, 9),
+    ] {
+        let should_fail = reject_model || dropped_setups == 9;
+        let data_dir_guard = temp_data_dir();
+        let data_dir = data_dir_guard.path().to_path_buf();
+        let wrapper = data_dir.join("antigravity-fixture");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nexec '{}' '{}'\n", node.display(), script),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            data_dir.join("config.toml"),
+            format!(
+                "[providers.paths]\nantigravity = \"{}\"\n",
+                wrapper.display()
+            ),
+        )
+        .unwrap();
+        let log = data_dir.join("acp-rpc.jsonl");
+        let attempt_file = data_dir.join("config-attempts");
+        let behavior =
+            json!({"advertiseLoadSession":load,"rejectSetConfigOption":reject_model,"exitOnModelConfigForAttempts":dropped_setups,"response":"antigravity fixture complete"})
+                .to_string();
+        let catalog = json!({"models":{"currentModelId":"gemini-3.7-flash-low","availableModels":[
+            {"modelId":"gemini-3.7-flash-low","name":"Gemini 3.7 Flash (Low)"},
+            {"modelId":"gemini-3.6-flash-medium","name":"Gemini 3.6 Flash (Medium)"}
+        ]},"configOptions":[{"id":"model","category":"model","name":"Model","type":"select","currentValue":"gemini-3.7-flash-low","options":[
+            {"value":"gemini-3.7-flash-low","name":"Gemini 3.7 Flash (Low)"},
+            {"value":"gemini-3.6-flash-medium","name":"Gemini 3.6 Flash (Medium)"}
+        ]}]})
+        .to_string();
+        let child = spawn_serve(
+            &data_dir,
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("MOCK_AGENT_BEHAVIOR", &behavior),
+                ("MOCK_AGENT_SESSION_RESULT", &catalog),
+                ("MOCK_AGENT_RPC_LOG", log.to_str().unwrap()),
+                ("MOCK_AGENT_ATTEMPT_FILE", attempt_file.to_str().unwrap()),
+                ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "1,1"),
+            ],
+        );
+        let _daemon = Daemon { child };
+        let socket = data_dir.join("intentd.sock");
+        assert!(await_uds(&socket).await, "daemon did not start");
+        let status = common::await_wss_status(&socket).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+        let mut rpc = connect_ws(port, cfg.clone()).await;
+        let discovered = wss_rpc(&mut rpc, 2, "host.providerDiscovery", json!({})).await;
+        let provider = discovered["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "antigravity")
+            .unwrap();
+        assert_eq!(provider["installed"], true);
+        // resolvedPath intentionally reports auto-detection, while installed
+        // and the auth/model/session paths honor the configured override.
+        assert_eq!(provider["command"], "antigravity-acp");
+        let authenticated = antigravity_auth_status(&mut rpc, 3).await;
+        assert_eq!(
+            authenticated["providers"],
+            json!([{"id":"antigravity","authenticated":true}])
+        );
+        let models = antigravity_catalog(&mut rpc, 4).await;
+        assert_eq!(models["models"].as_array().unwrap().len(), 2, "{models}");
+        assert_eq!(models["models"][0]["id"], "gemini-3.7-flash-low");
+        assert_eq!(models["models"][0]["isDefault"], true);
+        assert!(models["models"][0].get("effortLevels").is_none());
+        let workspace = wss_rpc(
+            &mut rpc,
+            10,
+            "workspace.create",
+            json!({"title":"Antigravity session test","noPrompt":true}),
+        )
+        .await;
+        let workspace_id = workspace["workspace"]["id"].as_str().unwrap();
+        let mut events = connect_ws(port, cfg).await;
+        wss_rpc(
+            &mut events,
+            1,
+            "events.subscribe",
+            json!({"workspaceId":workspace_id,"eventTypes":["agent:*"]}),
+        )
+        .await;
+        let created = wss_rpc(&mut rpc, 11, "agent.create", json!({"workspaceId":workspace_id,"name":"Antigravity fixture","provider":"antigravity","model":"gemini-3.7-flash-low"})).await;
+        let agent = created["agent"]["id"].as_str().unwrap();
+        for (turn, model) in [(0, "gemini-3.7-flash-low"), (1, "gemini-3.6-flash-medium")] {
+            if turn == 1 && !should_fail {
+                wss_rpc(&mut rpc, 12, "agent.setModel", json!({"workspaceId":workspace_id,"agentId":agent,"providerId":"antigravity","modelId":model})).await;
+            }
+            wss_rpc(&mut rpc, 20 + turn, "agent.sendMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":format!("test turn {turn}")})).await;
+            timeout(common::test_timeout(Duration::from_secs(40)), async {
+                loop {
+                    if let Some(Ok(Message::Text(text))) = events.next().await {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        let event = &frame["params"]["event"];
+                        if event["data"]["agentId"] == agent {
+                            if event["type"] == "agent:failed" {
+                                assert!(should_fail, "session error: {event}");
+                                let expected = if reject_model {
+                                    "rejected model"
+                                } else {
+                                    "stdout closed"
+                                };
+                                assert!(
+                                    event.to_string().contains(expected),
+                                    "expected a {expected:?} failure, got: {event}"
+                                );
+                                break;
+                            }
+                            if event["type"] == "agent:idle" {
+                                assert!(!should_fail, "failed setup must not run a prompt");
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("Antigravity turn must finish");
+        }
+        let calls: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let prompts: Vec<_> = calls
+            .iter()
+            .filter(|call| call["method"] == "session/prompt")
+            .collect();
+        if should_fail {
+            assert!(
+                prompts.is_empty(),
+                "a failed setup never reaches session/prompt"
+            );
+            let attempts: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "session/set_config_option")
+                .collect();
+            assert_eq!(
+                attempts.len(),
+                if reject_model { 2 } else { 6 },
+                "each redrive is terminal or bounded to three attempts"
+            );
+            assert_ne!(
+                attempts[0]["pid"], attempts[1]["pid"],
+                "failed setup is reaped, not cached"
+            );
+            continue;
+        }
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "session/set_config_option")
+                .count(),
+            2 + dropped_setups
+        );
+        assert_eq!(prompts.len(), 2, "one prompt per turn: {calls:?}");
+        assert_ne!(
+            prompts[0]["pid"], prompts[1]["pid"],
+            "model change respawns"
+        );
+        assert_eq!(
+            prompts[0]["geminiHome"], prompts[1]["geminiHome"],
+            "restore keeps private conversation state"
+        );
+        let home = Path::new(prompts[0]["geminiHome"].as_str().unwrap());
+        assert!(home.starts_with(data_dir.canonicalize().unwrap().join("antigravity")));
+        let hooks = std::fs::read_to_string(home.join("config/hooks.json")).unwrap();
+        assert!(hooks.contains("antigravity-tool-guard"));
+        assert!(!hooks.contains("--allow-tool 'start_subagent'"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &std::fs::read(home.join("config/mcp_config.json")).unwrap()
+            )
+            .unwrap(),
+            json!({"mcpServers":{}})
+        );
+        for (prompt, model) in prompts
+            .iter()
+            .zip(["gemini-3.7-flash-low", "gemini-3.6-flash-medium"])
+        {
+            let process: Vec<_> = calls
+                .iter()
+                .filter(|call| call["pid"] == prompt["pid"])
+                .collect();
+            let mode = process
+                .iter()
+                .position(|call| call["method"] == "session/set_mode")
+                .unwrap();
+            let selected = process
+                .iter()
+                .position(|call| call["method"] == "session/set_config_option")
+                .unwrap();
+            let sent = process
+                .iter()
+                .position(|call| call["method"] == "session/prompt")
+                .unwrap();
+            assert!(mode < selected && selected < sent);
+            assert_eq!(process[mode]["params"]["modeId"], "default");
+            assert_eq!(process[selected]["params"]["value"], model);
+            assert!(!process.iter().any(|call| call["method"] == "authenticate"));
+            let opened = process
+                .iter()
+                .find(|call| call["method"] == "session/new" || call["method"] == "session/load")
+                .unwrap();
+            assert!(opened["params"]["mcpServers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|server| server["name"] == "workspace-mcp"));
+        }
+        assert!(
+            prompts[0]["params"]["prompt"]
+                .to_string()
+                .contains("<system>"),
+            "first-turn instructions delivered"
+        );
+        assert_eq!(
+            calls.iter().any(|call| call["method"] == "session/load"),
+            load
+        );
+        let agent = wss_rpc(
+            &mut rpc,
+            40,
+            "agent.get",
+            json!({"workspaceId":workspace_id,"agentId":agent}),
+        )
+        .await;
+        assert_eq!(agent["agent"]["provider"], "antigravity");
+        assert_eq!(agent["agent"]["model"], "gemini-3.6-flash-medium");
+    }
+}
+
 /// STAB-115: agent.setModel triggers respawn on next turn when provider child is live.
 /// 1. Create agent with model "sonnet4.5" on provider "auggie"
 /// 2. Send message (spawns child with sonnet4.5)
@@ -225,22 +622,19 @@ async fn agent_set_model_triggers_respawn_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let behavior = json!({
         "response": "mock response",
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

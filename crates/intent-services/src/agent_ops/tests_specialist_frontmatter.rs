@@ -50,7 +50,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
     // binary on the test host.
     registry
         .apply(&[
-            ("providers.active".into(), serde_json::json!("auggie")),
+            ("model.defaultProvider".into(), serde_json::json!("auggie")),
             (
                 "providers.paths".into(),
                 serde_json::json!({ "auggie": "/bin/sh" }),
@@ -151,14 +151,14 @@ async fn specialist_frontmatter_model_used_for_delegated_agent() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist with a frontmatter model
-    create_user_specialist(specialists_dir.path(), "test-specialist", "auggie:opus");
+    create_user_specialist(specialists_dir.path(), "test-specialist", "opus");
 
     // Create agent with specialist but no explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("test-specialist".into())).await;
 
     // Verify the specialist frontmatter model was used
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:opus"));
+    assert_eq!(got.model.as_deref(), Some("opus"));
 }
 
 /// Explicit model param beats specialist frontmatter model.
@@ -167,21 +167,21 @@ async fn explicit_model_beats_specialist_frontmatter() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist with a frontmatter model
-    create_user_specialist(specialists_dir.path(), "test-specialist", "auggie:opus");
+    create_user_specialist(specialists_dir.path(), "test-specialist", "opus");
 
     // Create agent with both explicit model and specialist
     let id = create_agent(
         &svc,
         &ws,
         "TestAgent",
-        Some("auggie:haiku".into()),
+        Some("haiku".into()),
         Some("test-specialist".into()),
     )
     .await;
 
     // Verify the explicit model won
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+    assert_eq!(got.model.as_deref(), Some("haiku"));
 }
 
 /// Missing/empty specialist frontmatter model falls through to settings chain.
@@ -195,7 +195,7 @@ async fn missing_frontmatter_falls_through_to_settings() {
     // Set a global default in settings (via the wired registry)
     svc.settings_registry()
         .expect("registry wired")
-        .apply(&[("model.default".to_string(), json!("auggie:haiku"))])
+        .apply(&[("model.default".to_string(), json!("haiku"))])
         .expect("set default model");
 
     // Create agent with specialist but no explicit model
@@ -203,7 +203,7 @@ async fn missing_frontmatter_falls_through_to_settings() {
 
     // Verify the settings chain default was used
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+    assert_eq!(got.model.as_deref(), Some("haiku"));
 }
 
 /// Retirement regression (PROTOCOL §5.11): a lingering frontmatter
@@ -231,17 +231,17 @@ async fn retired_model_tier_falls_through_to_settings() {
 
     svc.settings_registry()
         .expect("registry wired")
-        .apply(&[("model.default".to_string(), json!("auggie:haiku"))])
+        .apply(&[("model.default".to_string(), json!("haiku"))])
         .expect("set default model");
 
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("tiered".into())).await;
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+    assert_eq!(got.model.as_deref(), Some("haiku"));
 }
 
 /// The delegate path ignores the retired `modelTier` identically to direct
 /// create — it funnels through the same resolver in `agent_create_op`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn retired_model_tier_ignored_on_delegate_path() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_with_retired_tier(specialists_dir.path(), "tiered", "smart");
@@ -267,7 +267,7 @@ async fn retired_model_tier_ignored_on_delegate_path() {
 /// the id, BEFORE provider/effort resolution — not a confusing downstream
 /// provider-resolution failure — and no child agent is created
 /// (monorepo#3497). An alias still delegates fine.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn unknown_specialist_rejects_delegate() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
 
@@ -322,7 +322,7 @@ async fn unknown_specialist_rejects_delegate() {
 /// monorepo#1729 (issue repro): a delegated specialist with no frontmatter
 /// model resolves `model.providerDefaults`, NOT the quick-action default —
 /// the quick-action model settings never apply to a delegated session.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_ignores_quick_action_default_model() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_without_model(specialists_dir.path(), "implementor-test");
@@ -336,7 +336,7 @@ async fn delegate_ignores_quick_action_default_model() {
             ),
             (
                 "quickActions.defaultModel".to_string(),
-                json!("auggie:sonnet5-high"),
+                json!("sonnet5-high"),
             ),
         ])
         .expect("set provider default + quick-action default");
@@ -370,7 +370,7 @@ async fn delegate_ignores_quick_action_default_model() {
 /// Seeded through `model.providerDefaults` rather than `model.default`: a
 /// compound `model.default` makes `resolve_delegate_provider` derive that
 /// provider and assert it is installed, which no CI runner guarantees.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_ignores_quick_action_type_override() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_without_model(specialists_dir.path(), "implementor-test");
@@ -384,7 +384,7 @@ async fn delegate_ignores_quick_action_type_override() {
             ),
             (
                 "quickActions.typeOverrides".to_string(),
-                json!({ "implementor-test": "auggie:sonnet5-high" }),
+                json!({ "implementor-test": "sonnet5-high" }),
             ),
         ])
         .expect("set provider default + quick-action type override");
@@ -410,16 +410,26 @@ async fn delegate_ignores_quick_action_type_override() {
     );
 }
 
-/// A specialist frontmatter model owned by another provider is ignored
-/// (provider guard) — resolution falls through to the settings chain; a
-/// lingering `modelTier` no longer bridges the gap.
+/// A specialist frontmatter model provably owned by another provider (cached
+/// catalog evidence) is ignored (provider guard) — resolution falls through
+/// to the settings chain; a lingering `modelTier` no longer bridges the gap.
 #[tokio::test]
 async fn frontmatter_model_of_other_provider_falls_through_to_settings() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
-    let content = "---\nname: \"Mixed\"\ndescription: \"d\"\nmodel: \"auggie:opus\"\nmodelTier: \"smart\"\n---\n\nTest prompt";
+    let content = "---\nname: \"Mixed\"\ndescription: \"d\"\nmodel: \"opus\"\nmodelTier: \"smart\"\n---\n\nTest prompt";
     std::fs::write(specialists_dir.path().join("mixed.md"), content).expect("write specialist");
+    // Cached evidence: auggie owns "opus", grok provably does not (grok's
+    // catalog version key is stable/empty, so the seeded entry always
+    // matches the current registry key).
+    svc.models_catalog.store_for_test(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        vec![json!({ "id": "opus" })],
+    );
+    svc.models_catalog
+        .store_for_test("grok", "", vec![json!({ "id": "grok-4" })]);
 
-    let id = create_agent_with_provider(&svc, &ws, "mixed", "codex").await;
+    let id = create_agent_with_provider(&svc, &ws, "mixed", "grok").await;
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(
         got.model, None,

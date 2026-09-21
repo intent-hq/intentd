@@ -6,9 +6,9 @@
 //! `agent.list`/`agent.get` post-processing; [`parse_model_list_output`]
 //! ports the auggie CLI model-list parser.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
@@ -16,12 +16,14 @@ use intent_core::events::{
     AGENT_QUEUE_UPDATED, AGENT_UPDATED,
 };
 use intent_core::{
-    now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ConversationProjection, Error, Event, EventActor, NoteId, PullRequestInfo, PullRequestStatus,
-    Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
-    PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
+    now_iso, parse_iso, ActorType, AgentCreateExtra, AgentDelegatedCounts, AgentId,
+    AgentListRowScope, AgentLite, AgentMessage, AgentScopeCounts, AgentSession, AgentStatus,
+    AgentWakeCreateOptions, AgentWakeOrCreateInput, ConversationProjection, Error, Event,
+    EventActor, MessageOrigin, NoteId, PullRequestInfo, PullRequestStatus, Result, SessionStats,
+    TaskStatus, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED,
+    PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
 };
+use intent_sourcecontrol::RepoRef;
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
@@ -73,7 +75,7 @@ use uuid::Uuid;
 use crate::Services;
 
 /// Row scope selecting which sessions an `agent.list` read serves (§5.5).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum AgentListScope {
     /// Default read: active (not soft-retired) sessions only.
     Active,
@@ -81,6 +83,9 @@ enum AgentListScope {
     All,
     /// `retiredOnly: true`: soft-retired sessions only.
     RetiredOnly,
+    /// `scope: "topLevel" | "delegated" | "background"`: one bin of the
+    /// active sessions ([`AgentListRowScope`]).
+    Scoped(AgentListRowScope),
 }
 
 /// "Running a turn" statuses for the retire guard (§5.5, confirmed
@@ -94,8 +99,9 @@ fn is_running_turn(status: AgentStatus) -> bool {
 }
 
 /// Terminal statuses the retire cascade never touches (the same set
-/// `count_child_agents` treats as terminal).
-fn is_terminal_status(status: AgentStatus) -> bool {
+/// `count_child_agents` treats as terminal). Also the "owner can no longer
+/// receive wakes" test behind PR-monitor adoption (intent-hq/intent#5079).
+pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     matches!(
         status,
         AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
@@ -154,7 +160,7 @@ impl PendingQuestionMutationLocks {
 /// turn that are still waiting for the turn-end drain (turn-attachment
 /// registry), plus questions already presented on the trailing assistant
 /// message and not yet answered or dismissed (the counting form of the
-/// question-hold derivation) — see [`Services::pending_question_count`].
+/// pending-questions derivation) — see [`Services::pending_question_count`].
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentSnapshot {
@@ -196,6 +202,14 @@ pub(crate) struct AgentSnapshot {
     /// byte-identical for workspaces without PRs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prs: Option<AgentSnapshotPrs>,
+    /// Workspace task-note counts per non-terminal status, keyed by the wire
+    /// `snake_case` `TaskStatus` string (`not_started`, `waiting`,
+    /// `discussion_needed`, `blocked`, `in_progress`, `review_required`).
+    /// `complete` / `cancelled` are never listed and zero counts are absent;
+    /// omitted entirely when nothing qualifies, so prompts stay
+    /// byte-identical for workspaces without open tasks.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) tasks: BTreeMap<String, usize>,
     /// `"blocker"` / `"discussion"` when this agent has raised an attention
     /// request that is still unresolved.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,44 +268,46 @@ impl AgentSnapshotPrs {
 }
 
 /// Group tracked PR pools into the snapshot's `prs` object. `pools` yields
-/// `(owner, name, prs)` per repo; a pool with a blank (empty/whitespace)
-/// owner or name is skipped entirely — no meaningful label can be formed —
-/// matching the identity-less-root skip upstream. A merged/closed entry in
-/// ANY pool suppresses that `(repo, number)` entirely: the freshest terminal
-/// state wins over a stale open duplicate regardless of which pool carries
-/// it. Among surviving open duplicates the workspace pool (yielded first)
-/// wins the grouping. Returns `None` when no open PR survives (the field is
-/// then omitted).
+/// `(repo, prs)` per repo; a pool with a blank (empty/whitespace) owner or
+/// name is skipped entirely — no meaningful label can be formed — matching
+/// the identity-less-root skip upstream. A merged/closed entry in ANY pool
+/// suppresses that `(repo, number)` entirely: the freshest terminal state
+/// wins over a stale open duplicate regardless of which pool carries it.
+/// Among surviving open duplicates the workspace pool (yielded first) wins
+/// the grouping. The repo half of the key is the case-insensitive
+/// [`RepoRef`] identity, so case-variant pools of one repository dedupe
+/// together. Returns `None` when no open PR survives (the field is then
+/// omitted).
 fn grouped_open_prs<'a>(
-    pools: impl IntoIterator<Item = (&'a str, &'a str, &'a [PullRequestInfo])>,
+    pools: impl IntoIterator<Item = (RepoRef, &'a [PullRequestInfo])>,
 ) -> Option<AgentSnapshotPrs> {
-    let pools: Vec<(&str, &str, &[PullRequestInfo])> = pools
+    let pools: Vec<(RepoRef, &[PullRequestInfo])> = pools
         .into_iter()
-        .filter(|(owner, name, _)| !owner.trim().is_empty() && !name.trim().is_empty())
+        .filter(|(repo, _)| !repo.owner.trim().is_empty() && !repo.name.trim().is_empty())
         .collect();
     // Seed the seen-set with every merged/closed key so a terminal state in
     // any pool suppresses stale open duplicates of the same PR.
-    let mut seen: HashSet<(&str, &str, u64)> = HashSet::new();
-    for &(owner, name, prs) in &pools {
-        for pr in prs {
+    let mut seen: HashSet<(RepoRef, u64)> = HashSet::new();
+    for (repo, prs) in &pools {
+        for pr in *prs {
             if matches!(
                 pr.status,
                 PullRequestStatus::Merged | PullRequestStatus::Closed
             ) {
-                seen.insert((owner, name, pr.number));
+                seen.insert((repo.clone(), pr.number));
             }
         }
     }
     let mut groups = AgentSnapshotPrs::default();
-    for &(owner, name, prs) in &pools {
-        for pr in prs {
-            if !seen.insert((owner, name, pr.number)) {
+    for (repo, prs) in &pools {
+        for pr in *prs {
+            if !seen.insert((repo.clone(), pr.number)) {
                 continue;
             }
             if let Some(group) = groups.group_for(pr) {
                 group.push(crate::harness::latest().pr_monitor_label(
-                    owner,
-                    name,
+                    &repo.owner,
+                    &repo.name,
                     pr.number.cast_signed(),
                 ));
             }
@@ -301,7 +317,7 @@ fn grouped_open_prs<'a>(
 }
 
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -320,6 +336,7 @@ impl AgentSnapshot {
             && self.num_questions_asked == 0
             && self.pr_monitors.is_empty()
             && self.prs.is_none()
+            && self.tasks.is_empty()
             && self.pending_attention.is_none()
     }
 }
@@ -383,9 +400,9 @@ fn resolve_default_model_from_settings(
     let settings = services.effective_settings();
 
     // 1. Check provider defaults. With no explicit provider, key the lookup
-    // by the settings-derived default (model.default prefix, else
-    // providers.active); with neither, there is no provider to key on
-    // (monorepo#3044: no positional last resort) and the step is skipped.
+    // by the settings-derived default (model.defaultProvider); with neither,
+    // there is no provider to key on (monorepo#3044: no positional last
+    // resort) and the step is skipped.
     let derived;
     let provider_key = if let Some(p) = provider {
         Some(p)
@@ -424,12 +441,102 @@ pub(crate) enum DefaultModelSource {
     /// Step 3 — the settings chain ([`resolve_default_model_from_settings`]).
     Settings,
     /// Step 4 — the cached provider catalog's `isDefault` row
-    /// ([`crate::model_catalog::ModelCatalogCache::cached_default_model`]).
+    /// ([`crate::model_catalog::ModelCatalogReader::cached_default_model`]).
     /// Not a settings default: the settings default reasoning effort does
     /// NOT apply to it.
     CatalogDefault,
     /// Step 5 — nothing resolved; the provider CLI default applies.
     CliDefault,
+}
+
+/// Output of [`Services::resolve_create_model_and_effort`]: the model and
+/// reasoning effort a new session would persist, after every creation-time
+/// provider / model / effort gate has passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateModelAndEffort {
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+}
+
+/// Output of [`Services::plan_agent_create`]: every value the persist half
+/// ([`Services::persist_agent_create`]) needs that was derived from a
+/// *failing* check — the delegation-depth guard, specialist canonicalization,
+/// display-name derivation, attachment-block validation, and the provider /
+/// model / reasoning-effort chain. Once a plan exists, the agent create has
+/// no input / derived-config rejection (`-32602`) left to raise: persisting
+/// it can only fail on infrastructure ([`AgentPersistError`]). The guarantee
+/// covers the create seam only — a caller's own calls between plan and
+/// persist keep their own errors (e.g. `workspace.create`'s `ensure_spec_note`
+/// can still hit `NotFound` on a concurrent delete).
+///
+/// The plan carries no workspace identity: none of the planner's checks
+/// consult it, and [`Services::persist_agent_create`] takes the
+/// [`WorkspaceId`] as an argument instead — which is what lets
+/// `workspace.create` plan before its id is derived. `skip_auto_commit` is
+/// the one post-plan input `workspace.create`'s `initialAgent` stamps on the
+/// plan between planning and persisting; it is a derivation, not a
+/// validation, and depends on the new workspace's effective auto-commit,
+/// known only once the workspace row exists.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentCreatePlan {
+    /// Error-label method (`agent.create` / `workspace.create`) for the
+    /// persist half's infrastructure failures.
+    pub(crate) method: &'static str,
+    pub(crate) parent_agent_id: Option<AgentId>,
+    pub(crate) task_note_id: Option<NoteId>,
+    pub(crate) skip_auto_commit: bool,
+    pub(crate) name: String,
+    pub(crate) name_explicitly_set: bool,
+    /// Canonical specialist id (alias already rewritten).
+    pub(crate) specialist: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) metadata: Option<Value>,
+    pub(crate) delegation_depth: Option<i64>,
+    pub(crate) initial_message: Option<String>,
+    pub(crate) context_references: Option<Value>,
+    pub(crate) image_blocks: Option<Value>,
+    pub(crate) file_blocks: Option<Value>,
+    pub(crate) is_background: bool,
+}
+
+/// Why [`Services::persist_agent_create`] could not persist a planned session.
+/// Deliberately narrow — infrastructure only — so the persist half cannot
+/// express an input rejection: every variant maps to `-32603` via
+/// [`From<AgentPersistError> for Error`], and there is no `From<Error>` in the
+/// other direction, so a `?` on an [`Error`]-typed result does not compile
+/// inside the persist half.
+#[derive(Debug)]
+pub(crate) enum AgentPersistError {
+    /// The session insert failed.
+    Store(String),
+    /// Encoding the harness snapshot failed.
+    Internal(String),
+    /// The specialist-snapshot blocking task panicked or was cancelled.
+    Join(tokio::task::JoinError),
+}
+
+impl AgentPersistError {
+    fn store(e: Error) -> Self {
+        match e {
+            Error::Internal(msg) => AgentPersistError::Store(msg),
+            other => AgentPersistError::Store(other.to_string()),
+        }
+    }
+}
+
+impl From<AgentPersistError> for Error {
+    fn from(e: AgentPersistError) -> Self {
+        match e {
+            AgentPersistError::Store(msg) | AgentPersistError::Internal(msg) => {
+                Error::Internal(msg)
+            }
+            AgentPersistError::Join(e) => {
+                Error::Internal(format!("specialist snapshot task failed: {e}"))
+            }
+        }
+    }
 }
 
 /// Single daemon-side default-model resolver (spec "New resolution policy").
@@ -475,11 +582,10 @@ pub(crate) fn resolve_agent_default_model_with_source(
 ) -> (Option<String>, DefaultModelSource) {
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
-    // provider, guard against the settings-derived default (model.default
-    // prefix, else providers.active). With neither there is no effective
-    // provider (monorepo#3044: no positional last resort) — the
-    // provider-keyed steps below are skipped and ownership guards pass
-    // compound ids through on their own prefix.
+    // provider, guard against the settings-derived default
+    // (model.defaultProvider). With neither there is no effective provider
+    // (monorepo#3044: no positional last resort) — the provider-keyed steps
+    // below are skipped.
     let derived;
     let effective_provider: Option<&str> = if let Some(p) = provider {
         Some(intent_providers::provider_config(p).id)
@@ -497,7 +603,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
         // bundled) — only if it belongs to the resolved provider; a model
         // owned by another provider falls through instead of leaking.
         if let Some(m) = specialists_svc.resolve_model(spec_id, workspace_path) {
-            if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
+            if default_model_belongs_to_provider(services, effective_provider, &m) {
                 return (Some(m), DefaultModelSource::Specialist);
             }
             tracing::debug!(
@@ -513,7 +619,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // by another provider must not be pinned (monorepo#607); drop to the
     // catalog/CLI default instead of rejecting a model the caller never sent.
     if let Some(m) = resolve_default_model_from_settings(services, provider) {
-        if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
+        if default_model_belongs_to_provider(services, effective_provider, &m) {
             return (Some(m), DefaultModelSource::Settings);
         }
         tracing::warn!(
@@ -530,7 +636,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // needed. Pinning it to session.model freezes the model for the
     // session's lifetime even if the provider later changes its default.
     if let Some(m) =
-        effective_provider.and_then(|p| services.models_catalog.cached_default_model(p))
+        effective_provider.and_then(|p| services.cached_models().cached_default_model(p))
     {
         return (Some(m), DefaultModelSource::CatalogDefault);
     }
@@ -540,47 +646,39 @@ pub(crate) fn resolve_agent_default_model_with_source(
 }
 
 /// Ownership guard for resolver-derived defaults (never explicit client
-/// models). Compound ids must name the resolved provider — except when no
-/// provider was requested, where a known compound prefix *becomes* the
-/// resolved provider (`agent_create_op` derives `session.provider` from it).
-/// Bare ids reuse [`ensure_bare_model_matches_provider`]'s asymmetric
-/// evidence rules (cached dynamic catalogs; absence of evidence passes).
-/// With no effective provider at all (monorepo#3044), only a known compound
-/// id passes — it carries its own provider; a bare id has nothing to be
-/// validated against and falls through.
+/// models). Models are bare ids and reuse
+/// [`ensure_bare_model_matches_provider`]'s asymmetric evidence rules
+/// (cached dynamic catalogs; absence of evidence passes). A legacy compound
+/// `provider:model` value (e.g. an old on-disk specialist frontmatter or
+/// settings default that predates the wire-level rejection) never passes —
+/// `session.model` must stay a bare id. With no effective provider at all
+/// (monorepo#3044), a bare id has nothing to be validated against and falls
+/// through.
 fn default_model_belongs_to_provider(
     services: &Services,
-    provider_param: Option<&str>,
     effective_provider: Option<&str>,
     model: &str,
 ) -> bool {
     if model.contains(':') {
-        let (prefix, _) = intent_providers::parse_compound_model_id(model);
-        if intent_providers::find_provider(&prefix).is_none() {
-            return false;
-        }
-        provider_param.is_none()
-            || effective_provider
-                .is_some_and(|ep| intent_providers::provider_config(&prefix).id == ep)
-    } else {
-        let Some(effective_provider) = effective_provider else {
-            return false;
-        };
-        ensure_bare_model_matches_provider(
-            "agent.create",
-            &services.models_catalog,
-            effective_provider,
-            model,
-        )
-        .is_ok()
+        return false;
     }
+    let Some(effective_provider) = effective_provider else {
+        return false;
+    };
+    ensure_bare_model_matches_provider(
+        "agent.create",
+        &services.cached_models(),
+        effective_provider,
+        model,
+    )
+    .is_ok()
 }
 
 /// Reject a provider id that is not in the ACP registry with `-32602`
 /// (`InvalidParams`). Persisting an unknown provider would make the spawn path
 /// silently fall back to the default binary; hard-fail at the front door
 /// instead (PROTOCOL §5.5). `method` names the rejecting RPC in the message.
-fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
+pub(crate) fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
     if intent_providers::find_provider(provider_id).is_none() {
         return Err(Error::InvalidParams(format!(
             "{method}: unknown provider: {provider_id} (known providers: {})",
@@ -614,7 +712,7 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 ///   spawn would actually run, not as the raw alias string.
 pub(crate) fn ensure_bare_model_matches_provider(
     method: &str,
-    cache: &crate::model_catalog::ModelCatalogCache,
+    cache: &crate::model_catalog::ModelCatalogReader<'_>,
     provider_id: &str,
     model_id: &str,
 ) -> Result<()> {
@@ -643,7 +741,7 @@ pub(crate) fn ensure_bare_model_matches_provider(
 /// Reject a `reasoningEffort` level the resolved model provably does not
 /// support with `-32602` (`InvalidParams`), naming the valid values. Evidence is
 /// the cached model catalog's `effortLevels` for `model_id`
-/// ([`crate::model_catalog::ModelCatalogCache::cached_effort_levels`]) — the
+/// ([`crate::model_catalog::ModelCatalogReader::cached_effort_levels`]) — the
 /// same probe-free, read-only rule as the bare-model ownership guard: with no
 /// evidence (no model, no cached row, or a row declaring no levels) the value
 /// passes through unvalidated, since providers own the effort vocabulary
@@ -651,7 +749,7 @@ pub(crate) fn ensure_bare_model_matches_provider(
 /// caller's spelling.
 fn ensure_effort_supported_by_model(
     method: &str,
-    cache: &crate::model_catalog::ModelCatalogCache,
+    cache: &crate::model_catalog::ModelCatalogReader<'_>,
     model_id: Option<&str>,
     effort: &str,
 ) -> Result<()> {
@@ -700,7 +798,7 @@ fn resolve_settings_default_reasoning_effort(
         .filter(|l| !l.is_empty())?;
     match ensure_effort_supported_by_model(
         "agent.create",
-        &services.models_catalog,
+        &services.cached_models(),
         resolved_model,
         level,
     ) {
@@ -720,8 +818,10 @@ fn resolve_settings_default_reasoning_effort(
 
 /// Resolve the effective `reasoningEffort` for a delegated/woken child
 /// (PROTOCOL §5.11), in precedence order: the caller's explicit `param`, then
-/// the chosen model option's declared effort, then the specialist's
-/// `reasoningEffort` frontmatter scalar, then unset.
+/// the chosen model option's declared effort (matched on the effective
+/// `{ provider, model }` pair — see
+/// [`crate::specialists::SpecialistsService::resolve_model_option_effort`]),
+/// then the specialist's `reasoningEffort` frontmatter scalar, then unset.
 ///
 /// An empty/whitespace-only `param` is an explicit clear and is returned
 /// verbatim rather than as `None`: the create seam reads a present-but-blank
@@ -733,6 +833,7 @@ fn resolve_delegate_reasoning_effort(
     services: &Services,
     param: Option<&str>,
     specialist: Option<&str>,
+    provider: Option<&str>,
     model: Option<&str>,
     workspace_path: Option<&Path>,
 ) -> Option<String> {
@@ -742,7 +843,9 @@ fn resolve_delegate_reasoning_effort(
     let spec_id = specialist?;
     let specialists_svc = services.specialists_service();
     model
-        .and_then(|m| specialists_svc.resolve_model_option_effort(spec_id, workspace_path, m))
+        .and_then(|m| {
+            specialists_svc.resolve_model_option_effort(spec_id, workspace_path, provider, m)
+        })
         .or_else(|| specialists_svc.resolve_reasoning_effort(spec_id, workspace_path))
 }
 
@@ -754,13 +857,12 @@ fn resolve_delegate_reasoning_effort(
 /// which would fall through to the spawn path's positional last resort
 /// regardless of the user's actual configured default.
 ///
-/// 1. The specialist's frontmatter `codingAgent` (3-tier resolution), or —
-///    when that is unset — the provider prefix of its compound `model`
-///    (e.g. `opencode:kimi-k3`). Either must be a known, available provider
-///    or the delegate fails with a clear error (never silently substituted).
-/// 2. The settings-derived default (provider of `model.default`, else
-///    `providers.active` — [`crate::agent_session::derived_default_provider`]),
-///    with the same known/available requirement.
+/// 1. The specialist's frontmatter `codingAgent` (3-tier resolution). It
+///    must be a known, available provider or the delegate fails with a
+///    clear error (never silently substituted).
+/// 2. The settings-derived default (`model.defaultProvider` —
+///    [`crate::agent_session::derived_default_provider`]), with the same
+///    known/available requirement.
 /// 3. Neither is set: a clear `-32602` (monorepo#3044) — the former residual
 ///    `Ok(None)` left the session's `provider` unset, and spawn-time
 ///    resolution bottomed out at the first registered provider (auggie),
@@ -775,14 +877,7 @@ fn resolve_delegate_provider(
 
     if let Some(spec_id) = specialist {
         let specialists_svc = services.specialists_service();
-        let explicit = specialists_svc
-            .resolve_coding_agent(spec_id, workspace_path)
-            .or_else(|| {
-                specialists_svc
-                    .resolve_model(spec_id, workspace_path)
-                    .filter(|m| m.contains(':'))
-                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
-            });
+        let explicit = specialists_svc.resolve_coding_agent(spec_id, workspace_path);
         if let Some(provider_id) = explicit {
             ensure_known_provider("agent.delegate", &provider_id)?;
             ensure_provider_available("agent.delegate", &provider_id, &settings.providers)?;
@@ -803,8 +898,8 @@ fn resolve_delegate_provider(
 }
 
 /// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
-/// the specialist's frontmatter `codingAgent` (or its compound `model`
-/// prefix) when it names a *known* provider, else the settings-derived
+/// the specialist's frontmatter `codingAgent` when it names a *known*
+/// provider, else the settings-derived
 /// default — but tolerant of an unknown/unavailable provider instead of
 /// erroring, since a preview must never fail. `None` when nothing resolves
 /// (monorepo#3044: no positional last resort) — the preview then shows the
@@ -820,14 +915,7 @@ pub(crate) fn resolve_delegate_provider_preview(
 ) -> Option<String> {
     if let Some(spec_id) = specialist {
         let specialists_svc = services.specialists_service();
-        let explicit = specialists_svc
-            .resolve_coding_agent(spec_id, workspace_path)
-            .or_else(|| {
-                specialists_svc
-                    .resolve_model(spec_id, workspace_path)
-                    .filter(|m| m.contains(':'))
-                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
-            });
+        let explicit = specialists_svc.resolve_coding_agent(spec_id, workspace_path);
         if let Some(provider_id) = explicit {
             if intent_providers::find_provider(&provider_id).is_some() {
                 return Some(provider_id);
@@ -844,7 +932,7 @@ pub(crate) fn resolve_delegate_provider_preview(
 /// a disabled provider must fail fast at every create/delegate front door
 /// regardless of whether its binary (or npx) would resolve. An absent map or
 /// absent entry means enabled (the settings default).
-fn ensure_provider_enabled(
+pub(crate) fn ensure_provider_enabled(
     method: &str,
     provider_id: &str,
     enabled: Option<&std::collections::BTreeMap<String, bool>>,
@@ -916,7 +1004,7 @@ fn ensure_provider_available(
 /// verdict, so a retry within the cache TTL (60s) can still reject until
 /// the entry expires or a forced `host.providerAuthStatus` refresh (the
 /// FE's recheck) overwrites it — bounded and deemed acceptable.
-fn ensure_provider_authenticated(
+pub(crate) fn ensure_provider_authenticated(
     method: &str,
     provider_id: &str,
     auth_verdict: Option<bool>,
@@ -924,17 +1012,9 @@ fn ensure_provider_authenticated(
     if auth_verdict != Some(false) {
         return Ok(());
     }
-    let display = intent_providers::provider_config(provider_id).display_name;
-    let login_cmd = intent_providers::login_command(provider_id);
-    let caveat = if provider_id == "claude-code" {
-        " Note: signing into the Claude desktop app does not carry over to the CLI — run \
-         \"claude\" in a terminal, then \"/login\"."
-    } else {
-        ""
-    };
     Err(Error::InvalidParams(format!(
-        "{method}: provider \"{provider_id}\" ({display}) is not authenticated — run \
-         \"{login_cmd}\" in a terminal, then retry.{caveat}"
+        "{method}: {}",
+        crate::provider_auth::not_authenticated_message(provider_id)
     )))
 }
 
@@ -972,6 +1052,35 @@ fn ensure_provider_runnable(
     Ok(())
 }
 
+/// Result of [`Services::claim_parked_recovery_send`] (intent-hq/intent#4962).
+pub(crate) enum RecoverySendClaim {
+    /// The marked entry was queued and ready: it is popped (listed as
+    /// draining until the guard drops) and the marker is retired.
+    Drained(Box<(QueuedMessage, DrainingGuard)>),
+    /// The marker stands but its entry cannot be dispatched right now: it
+    /// is under edit, or it was popped provisionally (an
+    /// `agent.sendQueuedMessageNow` / worker raced pop that has not yet won
+    /// the slot and may hand it back). Nothing changes; a later probe — the
+    /// slot holder's exit, the next recovery send — retries.
+    Deferred,
+    /// No marker, or the marked entry is gone from both the queue and the
+    /// draining overlay (removed, or re-minted under a new id): the stale
+    /// marker is dropped.
+    Absent,
+}
+
+/// Whether a [`Services::pop_draining`] pop commits the popped entries'
+/// delivery (intent-hq/intent#4962): a pop made under a held in-flight slot
+/// does, and retires the parked recovery-send marker on the spot; a pop made
+/// BEFORE the slot claim (`agent.sendQueuedMessageNow`, the worker's raced
+/// pop) is provisional — it may hand the entry back on a lost claim — and
+/// the caller commits once its claim succeeds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PopCommit {
+    Delivery,
+    Provisional,
+}
+
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 ///
 /// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
@@ -985,7 +1094,7 @@ fn ensure_provider_runnable(
 /// flag still rehydrate.
 // The independent bool flags ARE the durable payload shape; grouping them
 // would break persisted-payload rehydration.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
@@ -1044,21 +1153,22 @@ pub(crate) struct QueuedMessage {
     #[serde(default)]
     pub prepend_file_blocks: Option<Value>,
     /// `true` when this entry was enqueued with `priority: "interrupt"`
-    /// (question hold / PROTOCOL §5.5): interrupt entries ALWAYS enter the
+    /// (PROTOCOL §5.5): interrupt entries ALWAYS enter the
     /// queue ahead of all normal entries, preserving arrival order among
     /// themselves ([`Services::enqueue_message`]). Persisted so the ordering
     /// survives daemon restarts; `to_value` emits `interruptPriority: true`
     /// so queue snapshots reflect the marker.
     #[serde(default)]
     pub interrupt_priority: bool,
-    /// `true` when the entry carries a USER-originated `agent.sendMessage`
-    /// that was parked by a queue-fallback path (busy race, quarantine,
-    /// append-failure). The question hold never blocks user messages
-    /// (PROTOCOL §5.5), so the hold-gated drain paths deliver the first
-    /// user-origin entry instead of suspending — without this marker a user
-    /// answer parked by the turn-end busy race would deadlock against the
-    /// hold its answer tag is supposed to release. Persisted so the bypass
-    /// survives daemon restarts.
+    /// `true` when the entry carries a USER-originated message: an
+    /// `agent.sendMessage` parked by a queue-fallback path (busy race,
+    /// quarantine, append-failure) or a user-typed `agent.queueMessage`
+    /// entry (the FE's mid-turn reply front door). A drained user-origin
+    /// entry keeps its originator's semantics (attention-request clear,
+    /// `systemOnly` flush exclusion),
+    /// and a user entry queued into an ARCHIVED workspace is the explicit
+    /// resurrection signal its drain gate exempts (intent-hq/intent#3883).
+    /// Persisted so the marker survives daemon restarts.
     #[serde(default)]
     pub user_origin: bool,
     /// Debounce-hold marker: `Some` marks the entry **held** — excluded from
@@ -1099,13 +1209,17 @@ impl QueuedMessage {
     /// `event_notification` payload) — entries without it keep the legacy shape.
     /// `turnId` is only present when set (monorepo#1022: correlation id stable
     /// across requeues; entries rehydrated from legacy payloads always have one
-    /// backfilled).
+    /// backfilled). `author` is ALWAYS present: `null` here, overwritten with
+    /// the resolved projection by
+    /// [`crate::principal_ops::MessageAuthorResolver::attach_queue`] on the
+    /// surfaces that resolve it — a consumer never sees the key absent.
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
             "content": self.content,
             "queuedAt": self.queued_at,
             "position": position,
+            "author": Value::Null,
         });
         if !self.turn_id.is_empty() {
             v["turnId"] = Value::String(self.turn_id.clone());
@@ -1158,6 +1272,44 @@ impl QueuedMessage {
     /// (PROTOCOL §5.5/§6.5): not under edit and not held.
     pub(crate) fn ready_to_send(&self) -> bool {
         !self.editing && !self.is_held()
+    }
+}
+
+/// Keeps one or more popped queue entries listed in every client-visible
+/// queue snapshot ([`Services::queue_snapshot`]) from dequeue until the
+/// drain arm has persisted their user rows (PROTOCOL §6.5 drain ordering).
+/// Dropping the guard retires the entries from the overlay — on the settled
+/// path right before the shrunk `agent:queue:updated` is published, on every
+/// hand-back / failure path at scope exit, and when an aborted worker's
+/// future is dropped mid-drain, so no ghost entry ever outlives its arm.
+#[must_use = "drop the guard only once the drained rows are persisted"]
+pub(crate) struct DrainingGuard {
+    overlay: Arc<Mutex<HashMap<AgentId, Vec<QueuedMessage>>>>,
+    agent_id: AgentId,
+    ids: Vec<String>,
+}
+
+impl DrainingGuard {
+    /// Fold `other`'s entries into this guard so one drop retires them all
+    /// (a single popped entry folded into a batch flush behind it).
+    pub(crate) fn merge(&mut self, mut other: DrainingGuard) {
+        debug_assert_eq!(self.agent_id, other.agent_id);
+        self.ids.append(&mut other.ids);
+    }
+}
+
+impl Drop for DrainingGuard {
+    fn drop(&mut self) {
+        let mut overlay = self
+            .overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entries) = overlay.get_mut(&self.agent_id) {
+            entries.retain(|m| !self.ids.contains(&m.id));
+            if entries.is_empty() {
+                overlay.remove(&self.agent_id);
+            }
+        }
     }
 }
 
@@ -1703,6 +1855,10 @@ pub(crate) fn new_message_id() -> String {
 /// pre-existing three-field shape (backward compatible). `turn_id` is the
 /// turn correlation id (monorepo#1022) — present on user-row echoes emitted
 /// by a turn that carries one, omitted otherwise (never `null`).
+/// `queuedMessageId` is the drain identity link (intent-hq/intentd#1783):
+/// lifted from the row's `metadata.queueInfo.queuedMessageId` stamp so a
+/// queue-drained user row names the entry it drained from on the echo
+/// itself; omitted for rows without the stamp (never `null`).
 pub(crate) fn agent_message_event_payload(
     agent_id: &AgentId,
     message: &AgentMessage,
@@ -1718,6 +1874,15 @@ pub(crate) fn agent_message_event_payload(
     }
     if let Some(tid) = turn_id {
         payload["turnId"] = json!(tid);
+    }
+    if let Some(qid) = message
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("queueInfo"))
+        .and_then(|q| q.get("queuedMessageId"))
+        .and_then(Value::as_str)
+    {
+        payload["queuedMessageId"] = json!(qid);
     }
     payload
 }
@@ -1807,13 +1972,14 @@ pub(crate) fn annotate_sender_attribution(content: &mut String, message_metadata
     *content = format!("{annotated_head}{content}");
 }
 
-/// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5): every entry
-/// must carry EXACTLY one of inline `data` (base64 payload) or an
-/// attachment-registry `attachmentId` reference, both non-empty strings when
-/// present. Both-or-neither is `Error::InvalidParams` (→ `-32602`) naming the
-/// offending index. A non-array payload and non-object entries are tolerated
-/// (skipped downstream like every other malformed attachment entry) so
-/// legacy callers keep their fail-soft behavior.
+/// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5, v10.0): every
+/// entry must carry a non-empty attachment-registry `attachmentId`
+/// reference. Inline file `data` is no longer accepted: an entry carrying
+/// `data` (with or without `attachmentId`) or missing `attachmentId` is
+/// `Error::InvalidParams` (→ `-32602`) naming the offending index. A
+/// non-array payload and non-object entries are tolerated (skipped
+/// downstream like every other malformed attachment entry) so legacy
+/// callers keep their fail-soft behavior.
 pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) -> Result<()> {
     let Some(files) = file_blocks.and_then(Value::as_array) else {
         return Ok(());
@@ -1822,14 +1988,18 @@ pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) ->
         let Some(obj) = file.as_object() else {
             continue;
         };
-        let has_data = obj.get("data").and_then(Value::as_str).is_some();
+        if obj.contains_key("data") {
+            return Err(Error::InvalidParams(format!(
+                "{method}: fileBlocks[{i}] carries inline `data`; inline file data is no longer accepted — upload the file and reference it by `attachmentId`"
+            )));
+        }
         let has_ref = obj
             .get("attachmentId")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.trim().is_empty());
-        if has_data == has_ref {
+        if !has_ref {
             return Err(Error::InvalidParams(format!(
-                "{method}: fileBlocks[{i}] must carry exactly one of `data` or `attachmentId`"
+                "{method}: fileBlocks[{i}] must carry a non-empty `attachmentId`; inline file data is no longer accepted"
             )));
         }
     }
@@ -2009,7 +2179,7 @@ pub(crate) fn has_question_blocks(content: &Value) -> bool {
 }
 
 /// `messageMetadata.type` marker the FE's question wizard stamps on the
-/// flattened `Q:`/`A:` answer message (PROTOCOL §5.5, question hold). The daemon
+/// flattened `Q:`/`A:` answer message (PROTOCOL §5.5, pending questions). The daemon
 /// keys the pending-questions marker clear on this structured tag plus
 /// [`ANSWERED_QUESTIONS_MESSAGE_ID_FIELD`] — never on the answer TEXT.
 pub(crate) const QUESTION_ANSWERS_METADATA_TYPE: &str = "question_answers";
@@ -2304,6 +2474,33 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// v10.0: degrade legacy inline file blocks (`{ type: "file", data, … }`
+/// without an `attachmentId`) to a text block naming the file, dropping the
+/// bytes. The block transform lives in
+/// [`crate::tool_block::degrade_inline_file_blocks`]; this wrapper adapts it
+/// to the [`AgentMessage`] pipeline. Runs AFTER
+/// [`strip_anonymous_tool_blocks`] and BEFORE [`stamp_synthetic_block_ids`]
+/// so the degraded block receives the same synthetic id as the served
+/// array position.
+fn degrade_legacy_file_blocks(mut message: AgentMessage) -> AgentMessage {
+    if let Some(blocks) = message.content.as_array_mut() {
+        crate::tool_block::degrade_inline_file_blocks(blocks);
+    }
+    message
+}
+
+/// The serve-time projection every persisted or in-flight message passes
+/// through before reaching any read surface (`agent.getConversation` in both
+/// projections, the `chat.subscribe` seq-0 snapshot and delta re-reads, and
+/// `agent.getMessageBlock`): [`strip_anonymous_tool_blocks`] →
+/// [`degrade_legacy_file_blocks`] → [`stamp_synthetic_block_ids`], in that
+/// order so block indices and ids agree byte-for-byte across all of them.
+fn project_served_message(message: AgentMessage) -> AgentMessage {
+    stamp_synthetic_block_ids(degrade_legacy_file_blocks(strip_anonymous_tool_blocks(
+        message,
+    )))
+}
+
 /// monorepo#1114: stamp the stable synthetic `{messageId}:{index}` id onto any
 /// content block that persisted without one, so `agent.getConversation`, the
 /// seq-0 chat snapshot, and the §7.1 delta path (which re-reads through this
@@ -2337,6 +2534,41 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// Flag the blocks of a stored message whose full tool body is no longer
+/// retained. `pruned` is the store's evidence, read from the SAME snapshot as
+/// the hydrated body
+/// ([`intent_store::Store::get_agent_message_by_id_with_pruned`]): the retention sweep
+/// (`agents.toolPayloadRetentionDays`) replaced the block's full side row
+/// with a `*_replay` preview, so the hydrated read left the stored slim
+/// preview and its `inputTruncated` / `outputTruncated` (+ `*Bytes`) flags
+/// in place. Those blocks keep the preview and flags untouched and gain the
+/// additive `inputPruned: true` / `outputPruned: true`, so the response
+/// never implies a full body. A block that merely still carries a slim flag
+/// (corrupt or undecodable full row, body that arrived pre-flagged and was
+/// never extracted) is NOT pruned and is left alone — with retention off the
+/// served block is exactly what it was before the sweep existed. Ordinals
+/// index the STORED content array, so this runs before
+/// [`strip_anonymous_tool_blocks`] re-indexes it.
+fn mark_pruned_tool_bodies(content: &mut Value, pruned: &[intent_store::PrunedToolPayload]) {
+    let Some(blocks) = content.as_array_mut() else {
+        return;
+    };
+    for p in pruned {
+        let Some(obj) = usize::try_from(p.block_ordinal)
+            .ok()
+            .and_then(|i| blocks.get_mut(i))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let flag = match p.field {
+            intent_store::PrunedToolField::ToolUseInput => "inputPruned",
+            intent_store::PrunedToolField::ToolResultOutput => "outputPruned",
+        };
+        obj.insert(flag.to_string(), Value::Bool(true));
+    }
+}
+
 /// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
 /// `projection: "slim"`) to one served message. The block bounding itself
 /// lives in [`crate::tool_block::slim_message_blocks`], shared with the live
@@ -2358,7 +2590,11 @@ impl Services {
         let Some(manager) = self.agent_manager() else {
             return Ok(json!({ "streams": [] }));
         };
-        let busy = manager.list_busy();
+        let mut busy = manager.list_busy();
+        // Cross-workspace surface: a collaborator sees only member workspaces.
+        if let Some(visible) = self.visible_workspace_ids().await? {
+            busy.retain(|(_, workspace_id)| visible.contains(workspace_id));
+        }
         if busy.is_empty() {
             return Ok(json!({ "streams": [] }));
         }
@@ -2415,14 +2651,28 @@ impl Services {
     /// capped rather than omitted) are bounded per row to the render-sized
     /// [`intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES`]
     /// ([`AgentLite::cap_list_previews`]); the detail reads keep full values.
-    /// Together these keep a ~250-session response well under the 1 MiB
-    /// outbound frame warn threshold.
+    /// The detail-only fields (`harnessFeatures`, `effortLevels`,
+    /// `contextReferences`, `fileBlocks`, `stats`,
+    /// `metadata.pendingProposals`, `metadata.proposalResolutions` — read only
+    /// by the open agent's UI, intent-hq/intent#5383) are stripped from list
+    /// rows ([`AgentLite::strip_detail_only_fields`]) and served by
+    /// `agent.get` / `agent.getSession` only. Together these bound each ROW
+    /// (the row-budget / key-allowlist goldens in `tests.rs` pin the
+    /// shape), and the response-level frame fit
+    /// ([`intent_core::fit_agent_list_frame`], intent-hq/intent#5531)
+    /// bounds the RESPONSE: when the serialized rows array exceeds
+    /// [`intent_core::AGENT_LIST_FRAME_BUDGET_BYTES`] — a 459-session
+    /// workspace did at 2,338 B/row with every row inside the row
+    /// contract — every row's previews are re-capped at a halved budget
+    /// until it fits (floor
+    /// [`intent_core::AGENT_LIST_PREVIEW_FLOOR_BYTES`]), so the frame stays
+    /// under the 1 MiB outbound warn threshold without a wire change.
     ///
-    /// Deliberate asymmetry: the agent channel's seq-0 snapshot goes through
-    /// this op (capped rows), while per-agent deltas re-read via `agent.get`
-    /// (full values) — the bound is a property of list-shaped reads, not a
-    /// channel invariant. Delta frames are single-agent, so the size goal
-    /// holds.
+    /// The agent channel's seq-0 snapshot goes through this op (capped,
+    /// stripped rows); its per-agent deltas re-read via `agent.get` and the
+    /// transport applies the same strip + cap pass before push
+    /// (`intent_transport::subscriptions::agent_delta`), so pushed rows
+    /// satisfy the same allowlist and row budget as list rows.
     ///
     /// Soft retire: the default read excludes retired sessions (SQL-side
     /// `retired_at IS NULL` filter — cost stays O(rows returned)); the wire
@@ -2468,12 +2718,55 @@ impl Services {
         self.store.count_retired_agent_sessions(&workspace_id).await
     }
 
+    /// `agent.list` with `scope: "topLevel" | "delegated" | "background"`
+    /// (PROTOCOL §5.5): ONLY the non-retired sessions in that bin (a
+    /// `delegated` read optionally narrowed to one parent's direct
+    /// sub-agents). SQL-side predicate on both the summary read AND the
+    /// message-projection aggregate ([`intent_store::Store::
+    /// list_scoped_agent_session_summaries`]), so cost stays O(rows returned)
+    /// and the active-only projection cache is bypassed — a scoped read never
+    /// loads the full workspace's projections.
+    pub(crate) async fn agent_list_scoped_op(
+        &self,
+        workspace_id: WorkspaceId,
+        scope: AgentListRowScope,
+    ) -> Result<Vec<AgentLite>> {
+        self.agent_list_impl(workspace_id, AgentListScope::Scoped(scope))
+            .await
+    }
+
+    /// `scopeCounts` (PROTOCOL §5.5): per-bin counts of the workspace's
+    /// non-retired sessions — one grouped SQL aggregate attached to every
+    /// `agent.list` response variant by the router.
+    pub(crate) async fn agent_scope_counts_op(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<AgentScopeCounts> {
+        self.store
+            .count_agent_sessions_by_scope(&workspace_id)
+            .await
+    }
+
+    /// `delegatedCounts` (PROTOCOL §5.5): per-parent counts of the
+    /// workspace's non-retired delegated sessions (total and running, the
+    /// [`is_running_turn`] rule on the persisted status) — one grouped SQL
+    /// aggregate attached to every `agent.list` response variant by the
+    /// router, next to `scopeCounts`.
+    pub(crate) async fn agent_delegated_counts_op(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<AgentDelegatedCounts> {
+        self.store
+            .count_delegated_agent_sessions_by_parent(&workspace_id)
+            .await
+    }
+
     async fn agent_list_impl(
         &self,
         workspace_id: WorkspaceId,
         scope: AgentListScope,
     ) -> Result<Vec<AgentLite>> {
-        let sessions = match scope {
+        let sessions = match &scope {
             AgentListScope::All => {
                 self.store
                     .list_agent_session_summaries(&workspace_id)
@@ -2489,6 +2782,11 @@ impl Services {
                     .list_retired_agent_session_summaries(&workspace_id)
                     .await?
             }
+            AgentListScope::Scoped(row_scope) => {
+                self.store
+                    .list_scoped_agent_session_summaries(&workspace_id, row_scope)
+                    .await?
+            }
         };
         // Message projections are the expensive half (full-workspace COUNT
         // aggregate + preview columns). Each scope loads a projection set
@@ -2498,8 +2796,9 @@ impl Services {
         // create/delete); `retiredOnly` loads the retired-only SQL variant
         // directly (never the full-workspace superset); `includeRetired`
         // loads the full set directly, bypassing the cache in both
-        // directions.
-        let mut projections = match scope {
+        // directions; a `scope` read loads its bin's SQL variant directly
+        // (never the active-only superset).
+        let mut projections = match &scope {
             AgentListScope::Active => {
                 self.agent_list_cache
                     .get_or_load(&self.store, &workspace_id)
@@ -2513,6 +2812,11 @@ impl Services {
             AgentListScope::All => {
                 self.store
                     .get_agent_session_message_projections(&workspace_id)
+                    .await?
+            }
+            AgentListScope::Scoped(row_scope) => {
+                self.store
+                    .get_scoped_agent_session_message_projections(&workspace_id, row_scope)
                     .await?
             }
         };
@@ -2533,7 +2837,7 @@ impl Services {
                 self.active_pr_monitors_by_agent(&workspace_id).await,
             )
         };
-        Ok(sessions
+        let mut rows: Vec<AgentLite> = sessions
             .into_iter()
             .map(|s| {
                 let projection = projections.remove(&s.id.0).unwrap_or_default();
@@ -2543,14 +2847,33 @@ impl Services {
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
                 lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
-                // List-payload cost contract: bound the render-preview
-                // fields per row (see the doc comment above); the detail
-                // reads keep full values. Applied AFTER the runtime overlay
-                // so live-turn preview text is capped like persisted text.
+                // List-payload cost contract: drop the detail-only fields
+                // and bound the render-preview fields per row (see the doc
+                // comment above); the detail reads keep full values.
+                // Applied AFTER the runtime overlay so live-turn preview
+                // text is capped like persisted text.
+                lite.strip_detail_only_fields();
                 lite.cap_list_previews();
                 lite
             })
-            .collect())
+            .collect();
+        // Response-level frame fit (intent-hq/intent#5531): the per-row pass
+        // bounds each row, not the response — a large enough workspace still
+        // encodes past the 1 MiB frame warn with every row inside the row
+        // contract. Re-cap previews harder until the rows array fits
+        // `AGENT_LIST_FRAME_BUDGET_BYTES`; same fields, same shape.
+        if let Some(fit) = intent_core::fit_agent_list_frame(&mut rows) {
+            tracing::info!(
+                workspace = %workspace_id.0,
+                rows = rows.len(),
+                bytes_before = fit.bytes_before,
+                bytes_after = fit.bytes_after,
+                preview_budget = fit.preview_budget,
+                frame_budget = intent_core::AGENT_LIST_FRAME_BUDGET_BYTES,
+                "agent.list rows over the frame budget; previews re-capped"
+            );
+        }
+        Ok(rows)
     }
 
     /// Drop the cached agent.list message projections for `workspace_id`.
@@ -2958,7 +3281,7 @@ impl Services {
     /// the slot's stream stamp, so unlike persisted rows it advances across
     /// successive reads of the same turn — deliberate: the row IS the
     /// liveness signal, and the id is the stable reconciliation key.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
@@ -3060,11 +3383,19 @@ impl Services {
                 .get_agent_messages_page(&agent_id, page_offset, page_limit)
                 .await?
         };
-        let mut page: Vec<AgentMessage> = raw_page
-            .into_iter()
-            .map(strip_anonymous_tool_blocks)
-            .map(stamp_synthetic_block_ids)
-            .collect();
+        let mut page: Vec<AgentMessage> =
+            raw_page.into_iter().map(project_served_message).collect();
+        // Serve-time author projection (multiplayer w2): every user row gets
+        // `author` resolved from its `fromPrincipalId` stamp, else the
+        // workspace's legacy author, else its owner — the one projection
+        // `chat.subscribe` snapshots share. Bounded by the distinct authors
+        // on the page (RPC cost contract), never stored. Attached on the
+        // typed page BEFORE the slim byte budget below, so the profile
+        // strings count toward `SLIM_PAGE_BUDGET_BYTES` instead of landing on
+        // top of an already-at-budget page.
+        crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
+            .attach_typed(&mut page)
+            .await;
         if projection == Some(ConversationProjection::Slim) {
             // One bounded thumbnails read sized by the page (RPC cost
             // contract: O(rows returned); the common all-text page selects
@@ -3141,9 +3472,10 @@ impl Services {
                         content: Value::Array(live.blocks),
                         metadata: None,
                         app_message_id: None,
+                        author: None,
                         created_at: live.last_activity_at.clone(),
                     };
-                    let mut row = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(row));
+                    let mut row = project_served_message(row);
                     if projection == Some(ConversationProjection::Slim) {
                         row = apply_slim_projection(row, None);
                     }
@@ -3214,13 +3546,17 @@ impl Services {
     /// `agent.getMessageBlock` (PROTOCOL §5.5): one FULL content block of one
     /// persisted message, by block id — the on-demand counterpart of the slim
     /// conversation projection. The row is served through the same
-    /// [`strip_anonymous_tool_blocks`] + [`stamp_synthetic_block_ids`] passes
-    /// as `agent.getConversation` (NEVER the slim bounding), so block identity
+    /// [`project_served_message`] passes (anonymous-tool strip, legacy
+    /// inline-file degrade, synthetic-id stamp) as `agent.getConversation`
+    /// (NEVER the slim bounding), so block identity
     /// matches the served conversation byte-for-byte — persisted assistant ids
     /// and serve-time synthetic `{messageId}:{index}` ids both resolve — and
-    /// the returned block is always the full, unprojected body. Bounded cost
-    /// (RPC cost contract): a metadata-only session read plus ONE primary-key
-    /// message row read; the transcript is never hydrated.
+    /// the returned block is the full, unprojected body whenever that body is
+    /// still retained; a payload the retention sweep has compacted returns
+    /// the stored preview with its `*Truncated` / `*Bytes` flags plus
+    /// `inputPruned` / `outputPruned` (see "Retention-pruned bodies" below).
+    /// Bounded cost (RPC cost contract): a metadata-only session read plus
+    /// ONE primary-key message row read; the transcript is never hydrated.
     ///
     /// In-progress rows (monorepo#3647): when the message id is not persisted
     /// but matches the live-turn slot's in-flight message, the block resolves
@@ -3240,6 +3576,17 @@ impl Services {
     /// whole page down rather than just itself. The slim flags
     /// (`inputBytes`/`outputBytes`/`dataBytes`) carry the full body size, so
     /// a client can predict the fetch size before calling.
+    ///
+    /// Retention-pruned bodies (`agents.toolPayloadRetentionDays`): when the
+    /// sweep has compacted a block's full side row into its `*_replay`
+    /// preview, the full body no longer exists anywhere — the message row
+    /// still carries the stored slim preview with its `inputTruncated` /
+    /// `outputTruncated` (+ `*Bytes`) flags after hydration (only the two
+    /// FULL-body kinds are spliced). Such a block is served as that stored
+    /// preview, flags intact, PLUS the additive `inputPruned: true` /
+    /// `outputPruned: true` so a client can tell "the full output is no
+    /// longer retained" from "the fetch returned the full body" and does not
+    /// re-request in a loop.
     pub(crate) async fn agent_get_message_block_op(
         &self,
         agent_id: AgentId,
@@ -3256,12 +3603,18 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
+        // One store snapshot for body + pruned metadata: a sweep committing
+        // between two separate reads would stamp a just-served full body as
+        // pruned (and without its `*Truncated` / `*Bytes` flags).
         let message = match self
             .store
-            .get_agent_message_by_id(&agent_id, &message_id)
+            .get_agent_message_by_id_with_pruned(&agent_id, &message_id)
             .await?
         {
-            Some(m) => m,
+            Some((mut m, pruned)) => {
+                mark_pruned_tool_bodies(&mut m.content, &pruned);
+                m
+            }
             // In-progress fallback (monorepo#3647): an unpersisted id that
             // matches the live-turn slot's in-flight message resolves from
             // the slot's streamed blocks, so blocks slim-truncated on the
@@ -3278,6 +3631,7 @@ impl Services {
                     content: Value::Array(live.blocks),
                     metadata: None,
                     app_message_id: None,
+                    author: None,
                     created_at: live.last_activity_at,
                 },
                 None => {
@@ -3287,7 +3641,7 @@ impl Services {
                 }
             },
         };
-        let message = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
+        let message = project_served_message(message);
         let block = message
             .content
             .as_array()
@@ -3398,18 +3752,28 @@ impl Services {
         message: &AgentMessage,
         turn_id: Option<&str>,
     ) {
-        self.publish_agent_mutation_event(
-            workspace_id,
-            agent_id,
-            AGENT_MESSAGE,
-            agent_message_event_payload(agent_id, message, turn_id),
-        )
-        .await;
+        let mut payload = agent_message_event_payload(agent_id, message, turn_id);
+        let mut last_payload = agent_last_message_event_payload(agent_id, message, turn_id);
+        // Serve-time author (multiplayer w2): a user-row echo carries the
+        // same `author` projection `agent.getConversation` serves, so live
+        // subscribers render the sender without a follow-up read.
+        if message.role == "user" {
+            if let Some(author) =
+                crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
+                    .resolve(message.metadata.as_ref())
+                    .await
+            {
+                payload["author"] = author.clone();
+                last_payload["author"] = author;
+            }
+        }
+        self.publish_agent_mutation_event(workspace_id, agent_id, AGENT_MESSAGE, payload)
+            .await;
         self.publish_agent_mutation_event(
             workspace_id,
             agent_id,
             intent_core::events::AGENT_LAST_MESSAGE,
-            agent_last_message_event_payload(agent_id, message, turn_id),
+            last_payload,
         )
         .await;
     }
@@ -3457,10 +3821,227 @@ impl Services {
         self.maybe_emit_waiting_changed(workspace_id).await;
     }
 
+    /// The creation-time provider / model / reasoning-effort chain, in one
+    /// place (no persistence, no event): [`Self::plan_agent_create`] runs it
+    /// on every create seam — before the session insert for `agent.create` /
+    /// delegate / wake, and before the workspace row exists for
+    /// `workspace.create`'s `initialAgent` — so every `-32602` it can produce
+    /// fires ahead of any side effect. In order:
+    /// 1. Default-model resolution when the caller supplied no `model`
+    ///    ([`resolve_agent_default_model_with_source`]: specialist pin →
+    ///    settings chain → catalog default → CLI default), on the blocking
+    ///    pool (monorepo#4148).
+    /// 2. Provider gates: known provider, a default present (monorepo#3044),
+    ///    enabled in settings (monorepo#3178), cached auth verdict not
+    ///    hard-false.
+    /// 3. Bare-model ownership (monorepo#607): a *client-supplied* mismatch
+    ///    hard-fails; a derived default's mismatch drops to the CLI default.
+    /// 4. Reasoning effort: a caller-decided value (even blank, meaning an
+    ///    explicit clear) wins; otherwise the specialist model-option /
+    ///    frontmatter rungs (`resolve_delegate_reasoning_effort`), keyed on
+    ///    the resolved model. The result is validated against the resolved
+    ///    model's cached `effortLevels` (`ensure_effort_supported_by_model`).
+    /// 5. The settings default effort, only when no rung decided and the
+    ///    model came from the settings chain.
+    ///
+    /// `method` labels the errors (`agent.create` / `workspace.create`);
+    /// `spec_wp` is the project-tier hint for the specialist lookups.
+    pub(crate) async fn resolve_create_model_and_effort(
+        &self,
+        method: &'static str,
+        model: Option<String>,
+        specialist: Option<&str>,
+        provider: Option<&str>,
+        reasoning_effort: Option<String>,
+        spec_wp: Option<&Path>,
+    ) -> Result<CreateModelAndEffort> {
+        // A present value — even blank — means the effort was decided by the
+        // caller or by an upstream rung (`resolve_delegate_reasoning_effort`),
+        // so the settings default below must not fill it in. Empty/whitespace
+        // then collapses to None (an explicit clear); a non-empty level is
+        // validated against the resolved model once the model resolution has
+        // settled.
+        let reasoning_effort_decided = reasoning_effort.is_some();
+        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
+        let model_explicit = model.is_some();
+        // Step 1: explicit model from the client (user picked it); otherwise
+        // default-model resolution walks the specialist tier directories —
+        // blocking pool (monorepo#4148).
+        let (mut resolved_model, mut model_source) = if let Some(m) = model {
+            (Some(m), DefaultModelSource::Explicit)
+        } else {
+            let services = self.clone();
+            let specialist = specialist.map(str::to_string);
+            let spec_wp = spec_wp.map(Path::to_path_buf);
+            let provider = provider.map(str::to_string);
+            tokio::task::spawn_blocking(move || {
+                resolve_agent_default_model_with_source(
+                    &services,
+                    specialist.as_deref(),
+                    spec_wp.as_deref(),
+                    provider.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("{method} model resolution task failed: {e}")))?
+        };
+
+        // Validate the explicit provider before persisting anything: an
+        // unknown provider is -32602, never a session row that would
+        // silently spawn the default binary. Absent provider (defaulting)
+        // remains valid.
+        if let Some(p) = provider {
+            ensure_known_provider(method, p)?;
+        }
+        // monorepo#3044: with no explicit provider and no settings-derived
+        // default, no spawn provider could ever resolve for this session.
+        // Fail loudly at the front door — the former behavior persisted the
+        // row and the spawn silently bottomed out at the first registered
+        // provider (auggie), installed or not.
+        let derived_default =
+            crate::agent_session::derived_default_provider(&self.effective_settings());
+        if provider.is_none() && derived_default.is_none() {
+            return Err(crate::agent_session::no_default_provider_error(method));
+        }
+        // monorepo#3178: the provider this session would spawn on must not be
+        // one the user explicitly disabled in `providers.enabled` — fail fast
+        // with the distinct "not enabled" -32602 before any session row is
+        // persisted. Resolve it with the spawn path's own precedence
+        // (`resolve_provider_id`: `provider` field → settings-derived
+        // default). This one gate covers every create seam (`agent.create`,
+        // `agent.wakeOrCreate`, and delegate's child creation). The
+        // hard-false auth-verdict gate (`ensure_provider_authenticated`)
+        // rides the same seam: a provider the daemon already observed as
+        // not-logged-in must fail fast with the login remedy instead of
+        // persisting a session that dies auth-required on its first turn.
+        // Installed-ness stays delegate-only (`ensure_provider_available`):
+        // direct creates on a known, enabled-but-uninstalled provider keep
+        // their existing spawn-time failure mode.
+        if let Some(p) =
+            crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
+        {
+            ensure_provider_enabled(
+                method,
+                &p,
+                self.effective_settings().providers.enabled.as_ref(),
+            )?;
+            ensure_provider_authenticated(
+                method,
+                &p,
+                crate::provider_auth::cached_auth_verdict(&p),
+            )?;
+        }
+        // A bare model that provably belongs to a different provider (cached
+        // dynamic catalogs) must not be persisted: the spawn would feed the
+        // effective provider another provider's model id (monorepo#607). The
+        // effective provider mirrors `resolve_provider_id`: provider field →
+        // settings-derived default (guaranteed present by the guard above).
+        // Bare ids with no ownership evidence pass — ownership cannot be
+        // proven for model lists that were never fetched.
+        //
+        // Only a *client-supplied* mismatch hard-fails. A mismatch in a
+        // derived default (specialist frontmatter / settings chain — e.g. a
+        // global `model.default` naming an auggie model while the caller
+        // asked for `provider: "grok"` with no model param) would reject a
+        // model the caller never sent and make the provider uncreatable
+        // until settings change; drop it to the CLI default instead
+        // (session.model stays None).
+        if let Some(m) = resolved_model.as_deref() {
+            let effective = provider
+                .or(derived_default.as_deref())
+                .expect("guarded above: provider or derived default present");
+            match ensure_bare_model_matches_provider(method, &self.cached_models(), effective, m) {
+                Ok(()) => {}
+                Err(e) if model_explicit => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        model = m,
+                        provider = effective,
+                        error = %e,
+                        "configured default model belongs to another provider; \
+                         falling back to the CLI default"
+                    );
+                    resolved_model = None;
+                    model_source = DefaultModelSource::CliDefault;
+                }
+            }
+        }
+        // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
+        // `agent.create` naming a specialist consults the same model-option >
+        // frontmatter order the delegate/wakeOrCreate seams do, keyed on the
+        // model that was actually resolved above. Those seams pre-decide the
+        // effort and pass it down as a param, so this only fires for callers
+        // that did not (`reasoning_effort_decided == false`) — which is also
+        // what keeps the specialist rungs ahead of the settings default below.
+        let reasoning_effort = if reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            // Effort resolution re-reads specialist frontmatter — blocking
+            // pool (monorepo#4148).
+            let services = self.clone();
+            let specialist = specialist.map(str::to_string);
+            let effective_provider = provider
+                .map(str::to_string)
+                .or_else(|| derived_default.clone());
+            let resolved_model = resolved_model.clone();
+            let spec_wp = spec_wp.map(Path::to_path_buf);
+            tokio::task::spawn_blocking(move || {
+                resolve_delegate_reasoning_effort(
+                    &services,
+                    None,
+                    specialist.as_deref(),
+                    effective_provider.as_deref(),
+                    resolved_model.as_deref(),
+                    spec_wp.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("{method} effort resolution task failed: {e}")))?
+        };
+        // Validate the requested level (PROTOCOL §5.5) against the *resolved*
+        // model's cached `effortLevels`, with the same probe-free,
+        // evidence-only rule the delegate/wakeOrCreate seams use — no evidence
+        // means the value passes through, since providers own the vocabulary.
+        // Runs before the session is persisted so a `-32602` rejection is
+        // side-effect free.
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                method,
+                &self.cached_models(),
+                resolved_model.as_deref(),
+                effort,
+            )?;
+        }
+        // Last rung: the settings default effort, applied only when no rung
+        // above decided the effort AND the model itself came from the settings
+        // default chain (see `resolve_settings_default_reasoning_effort`).
+        let reasoning_effort = if reasoning_effort.is_some() || reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
+        };
+        Ok(CreateModelAndEffort {
+            model: resolved_model,
+            reasoning_effort,
+        })
+    }
+
     /// `agent.create`: persist a new session; the process spawns lazily on first
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
     /// resolve the `Linked-Note-Id:` trailer and honor the opt-out.
+    ///
+    /// Two typed phases: [`Self::plan_agent_create`] owns every `-32602`
+    /// producer and yields an [`AgentCreatePlan`]; [`Self::persist_agent_create`]
+    /// turns the plan into a session row and, by its
+    /// [`AgentPersistError`] return type, cannot raise an input rejection.
+    /// This op is the thin `plan → persist` wrapper for the store-backed
+    /// seams (`agent.create`, `agent.delegate`, `agent.wakeOrCreate`);
+    /// `workspace.create` calls the two phases directly — plan right after
+    /// its request-shape preflight (before the workspaces root is resolved,
+    /// the id is derived, or the workspace row is inserted), persist after
+    /// the insert with the derived id (see the `create_workspace` closure in
+    /// `lib.rs`).
     ///
     /// Agent ids are server-assigned: the op always mints a fresh
     /// `agent-{uuid}` id (client-supplied ids are rejected `-32602` at the
@@ -3481,7 +4062,7 @@ impl Services {
     /// upsert the created session without a follow-up `agent.get` round-trip.
     /// This is a superset of the earlier `{ id, name }` shape, so existing
     /// callers that only read `agent.id` / `agent.name` stay green.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn agent_create_op(
         &self,
         workspace_id: WorkspaceId,
@@ -3493,6 +4074,70 @@ impl Services {
         skip_auto_commit: bool,
         extra: AgentCreateExtra,
     ) -> Result<Value> {
+        // SECURITY: the project tier resolves against the stored workspace
+        // record's path, never a client-supplied one (review thread
+        // PRRT_kwDOS9Wxuc6SIhDc — a malicious client could supply a spoofed
+        // `workspacePath` and read specialist files from other workspaces).
+        // Use worktree_path if available, otherwise repository_path. Read once
+        // and only when a specialist tier is actually consulted (specialist
+        // canonicalization / display name, model resolution, the specialist
+        // reasoning-effort rungs, and/or the specialist prompt snapshot).
+        let spec_wp = if model.is_none() || specialist.is_some() {
+            self.store
+                .get_workspace(&workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w))
+        } else {
+            None
+        };
+        let plan = self
+            .plan_agent_create(
+                "agent.create",
+                name,
+                model,
+                specialist,
+                parent_agent_id,
+                task_note_id,
+                skip_auto_commit,
+                extra,
+                spec_wp.clone(),
+            )
+            .await?;
+        Ok(self
+            .persist_agent_create(plan, workspace_id, spec_wp)
+            .await?)
+    }
+
+    /// Plan half of an agent create: runs, in order, every `-32602` producer
+    /// of the create seam and returns the [`AgentCreatePlan`] the persist half
+    /// consumes — the delegation-depth guard, specialist canonicalization,
+    /// display-name derivation, attachment-block harvest + validation, and the
+    /// provider / model / reasoning-effort chain
+    /// ([`Self::resolve_create_model_and_effort`]). Pure with respect to the
+    /// store: nothing is written, so a rejection here is side-effect free on
+    /// every seam — which is what lets a caller such as `workspace.create`
+    /// run it BEFORE its workspace row is inserted.
+    ///
+    /// `method` labels the errors (`agent.create` / `workspace.create`).
+    /// `spec_wp` is the single project-tier root for the plan's *failing*
+    /// specialist reads (canonical id, display name, model / effort).
+    /// SECURITY: callers pass the stored workspace's worktree path (never a
+    /// client-supplied one) or, for `workspace.create`, the `repositoryPath`
+    /// checkout being adopted.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn plan_agent_create(
+        &self,
+        method: &'static str,
+        name: Option<String>,
+        model: Option<String>,
+        specialist: Option<String>,
+        parent_agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        skip_auto_commit: bool,
+        extra: AgentCreateExtra,
+        spec_wp: Option<PathBuf>,
+    ) -> Result<AgentCreatePlan> {
         // Depth guard at the service layer (LC-1): mirror the MCP `create_agent`
         // front-door check so every path that spawns a child for a parent
         // already at `MAX_DELEGATION_DEPTH` is refused — including RPC/service
@@ -3525,25 +4170,28 @@ impl Services {
         // `create_agent`/`ws.agent.create` tools, `agent.delegate`,
         // `agent.wakeOrCreate`'s create branch, `workspace.create`'s
         // `initialAgent`), so the validation covers them all.
-        // SECURITY: the project tier resolves against the stored workspace
-        // record's path, never a client-supplied one (same rationale as the
-        // model resolution below).
+        // The project tier resolves against `spec_wp` (see the doc comment:
+        // never a client-supplied path).
         let specialist = match specialist {
             Some(spec_id) => {
-                let wp = self
-                    .store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .ok()
-                    .and_then(|w| crate::git_ops::worktree_path(&w));
+                let wp = spec_wp.clone();
+                // Canonicalization walks the specialist tier directories —
+                // blocking pool (monorepo#4148).
+                let services = self.clone();
                 Some(
-                    self.specialists_service()
-                        .canonical_id_or_err(&spec_id, wp.as_deref())?,
+                    tokio::task::spawn_blocking(move || {
+                        services
+                            .specialists_service()
+                            .canonical_id_or_err(&spec_id, wp.as_deref())
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("{method} specialist resolution task failed: {e}"))
+                    })??,
                 )
             }
             None => None,
         };
-        let now = now_iso();
         // Derive an omitted name from the specialist's resolved display name
         // (frontmatter `name`, 3-tier project > user > bundled — the same
         // workspace-path-aware seam the model resolution below uses) so a
@@ -3554,17 +4202,20 @@ impl Services {
         // still applies.
         let specialist_display_name = match (&name, specialist.as_deref()) {
             (None, Some(spec_id)) => {
-                // SECURITY: derive workspace_path from the stored workspace
-                // record, never the client-supplied value (same rationale as
-                // the model resolution below).
-                let wp = self
-                    .store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .ok()
-                    .and_then(|w| crate::git_ops::worktree_path(&w));
-                self.specialists_service()
-                    .resolve_display_name(spec_id, wp.as_deref())
+                let wp = spec_wp.clone();
+                // Display-name resolution walks the specialist tiers —
+                // blocking pool (monorepo#4148); a JoinError degrades to the
+                // generic name fallback, never failing the create.
+                let services = self.clone();
+                let spec_id = spec_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    services
+                        .specialists_service()
+                        .resolve_display_name(&spec_id, wp.as_deref())
+                })
+                .await
+                .ok()
+                .flatten()
             }
             _ => None,
         };
@@ -3584,19 +4235,18 @@ impl Services {
         let name = name
             .or(specialist_display_name)
             .unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
-        let id = AgentId(format!("agent-{}", Uuid::new_v4()));
         // `metadata` is persisted (C1d-10a, closes the metadata half of the
         // P2-12a deferral) so `agent.wakeOrCreate` chains can read back the
         // parent's `delegationDepth`/`createdByAgentId`/`taskNoteId`/
         // `isBackground`/`source`/`skipAutoCommit` without a follow-up round-trip.
-        // `workspace_path` is now used for project-tier specialist resolution;
-        // `agent_type` and `workspace_context` remain deferred.
+        // Project-tier specialist resolution reads the trusted `spec_wp`, not
+        // `workspace_path`; `agent_type` and `workspace_context` remain deferred.
         let AgentCreateExtra {
             provider,
             reasoning_effort,
             agent_type: _,
-            mut metadata,
-            workspace_path: _, // Ignored; derived from workspace record for security
+            metadata,
+            workspace_path: _, // Ignored; `spec_wp` comes from the caller's trusted root
             workspace_context: _,
             context_references,
             image_blocks,
@@ -3604,14 +4254,6 @@ impl Services {
             is_background,
             name_explicitly_set: _,
         } = extra;
-        // A present value — even blank — means the effort was decided by the
-        // caller or by an upstream rung (`resolve_delegate_reasoning_effort`),
-        // so the settings default below must not fill it in. Empty/whitespace
-        // then collapses to None (an explicit clear); a non-empty level is
-        // validated against the resolved model once the model resolution has
-        // settled.
-        let reasoning_effort_decided = reasoning_effort.is_some();
-        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
         let meta = metadata.as_ref().and_then(Value::as_object);
@@ -3635,9 +4277,9 @@ impl Services {
         // image references must name registered attachments in this
         // workspace (monorepo#3338). Runs before any side effect so a
         // `-32602` rejection persists nothing.
-        validate_file_blocks("agent.create", file_blocks.as_ref())?;
-        validate_image_blocks("agent.create", image_blocks.as_ref())?;
-        self.validate_image_block_refs("agent.create", image_blocks.as_ref())
+        validate_file_blocks(method, file_blocks.as_ref())?;
+        validate_image_blocks(method, image_blocks.as_ref())?;
+        self.validate_image_block_refs(method, image_blocks.as_ref())
             .await?;
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
@@ -3648,193 +4290,88 @@ impl Services {
         // `resolve_agent_default_model`). The resolved model is persisted to
         // session.model, pinning it for the agent's lifetime. Settings changes
         // only affect new agents created afterwards; existing agents change
-        // model only via explicit agent.setModel.
-        let model_explicit = model.is_some();
-        // SECURITY: derive workspace_path from the stored workspace record
-        // rather than trusting the client-supplied value (review thread
-        // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
-        // workspacePath and read specialist files from other workspaces.
-        // Use worktree_path if available, otherwise repository_path. Read once
-        // and only when a specialist tier is actually consulted (model
-        // resolution, the specialist reasoning-effort rungs, and/or the
-        // specialist prompt snapshot below).
-        let spec_wp = if model.is_none() || specialist.is_some() {
-            self.store
-                .get_workspace(&workspace_id)
-                .await
-                .ok()
-                .and_then(|w| crate::git_ops::worktree_path(&w))
-        } else {
-            None
-        };
-        let (mut resolved_model, mut model_source) = match model {
-            // Step 1: explicit model from the client (user picked it).
-            Some(m) => (Some(m), DefaultModelSource::Explicit),
-            None => resolve_agent_default_model_with_source(
-                self,
+        // model only via explicit agent.setModel. The provider / model /
+        // reasoning-effort chain is the last `-32602` producer of the plan.
+        let CreateModelAndEffort {
+            model: resolved_model,
+            reasoning_effort,
+        } = self
+            .resolve_create_model_and_effort(
+                method,
+                model,
                 specialist.as_deref(),
-                spec_wp.as_deref(),
                 provider.as_deref(),
-            ),
-        };
-
-        // Initialize provider from the model's compound prefix if not explicitly
-        // set. This ensures sessions created with a compound model id like
-        // "opencode:kimi-k3" have the correct provider from the start.
-        let provider = provider.or_else(|| {
-            resolved_model.as_ref().and_then(|m| {
-                if m.contains(':') {
-                    Some(intent_providers::parse_compound_model_id(m).0)
-                } else {
-                    None
-                }
-            })
-        });
-        // Validate the resolved provider (explicit param or compound-prefix
-        // derived) before persisting anything: an unknown provider is -32602,
-        // never a session row that would silently spawn the default binary.
-        // Absent provider (defaulting) remains valid.
-        if let Some(p) = provider.as_deref() {
-            ensure_known_provider("agent.create", p)?;
-        }
-        // monorepo#3044: with no explicit provider, no compound model prefix
-        // (`provider` was just derived from one when present), and no
-        // settings-derived default, no spawn provider could ever resolve for
-        // this session. Fail loudly at the front door — the former behavior
-        // persisted the row and the spawn silently bottomed out at the first
-        // registered provider (auggie), installed or not.
-        let derived_default =
-            crate::agent_session::derived_default_provider(&self.effective_settings());
-        if provider.is_none() && derived_default.is_none() {
-            return Err(crate::agent_session::no_default_provider_error(
-                "agent.create",
-            ));
-        }
-        // monorepo#3178: the provider this session would spawn on must not be
-        // one the user explicitly disabled in `providers.enabled` — fail fast
-        // with the distinct "not enabled" -32602 before any session row is
-        // persisted. Resolve it with the spawn path's own precedence
-        // (`resolve_provider_id`: compound `resolved_model` prefix →
-        // `provider` field → settings-derived default) so an explicit
-        // `provider` cannot smuggle in a disabled compound-model provider —
-        // spawn would run the prefix, so the prefix is what gets gated. This
-        // one gate covers every create seam (`agent.create`,
-        // `agent.wakeOrCreate`, and delegate's child creation). The
-        // hard-false auth-verdict gate (`ensure_provider_authenticated`)
-        // rides the same seam: a provider the daemon already observed as
-        // not-logged-in must fail fast with the login remedy instead of
-        // persisting a session that dies auth-required on its first turn.
-        // Installed-ness stays delegate-only (`ensure_provider_available`):
-        // direct creates on a known, enabled-but-uninstalled provider keep
-        // their existing spawn-time failure mode.
-        if let Some(p) = crate::agent_session::resolve_provider_id(
-            resolved_model.as_deref(),
-            provider.as_deref(),
-            derived_default.as_deref(),
-        ) {
-            ensure_provider_enabled(
-                "agent.create",
-                &p,
-                self.effective_settings().providers.enabled.as_ref(),
-            )?;
-            ensure_provider_authenticated(
-                "agent.create",
-                &p,
-                crate::provider_auth::cached_auth_verdict(&p),
-            )?;
-        }
-        // Also validate the resolved model's compound prefix unconditionally:
-        // the spawn path (`resolve_provider_id`) gives the model prefix
-        // precedence over session.provider, so a valid explicit provider must
-        // not smuggle in an unknown-prefixed model.
-        if let Some(m) = resolved_model.as_deref() {
-            if m.contains(':') {
-                let (model_provider, _) = intent_providers::parse_compound_model_id(m);
-                ensure_known_provider("agent.create", &model_provider)?;
-            } else {
-                // A bare model that provably belongs to a different provider
-                // (cached dynamic catalogs) must not be persisted either: the
-                // spawn would feed the effective provider another provider's
-                // model id (monorepo#607). The effective provider mirrors
-                // `resolve_provider_id` for a bare model: provider field →
-                // settings-derived default (guaranteed present by the guard
-                // above). Bare ids with no ownership evidence pass —
-                // ownership cannot be proven for model lists that were never
-                // fetched.
-                //
-                // Only a *client-supplied* mismatch hard-fails. A mismatch in
-                // a derived default (specialist frontmatter / settings chain
-                // — e.g. a global `model.default` naming an auggie model
-                // while the caller asked for `provider: "grok"` with no model
-                // param) would reject a model the caller never sent and make
-                // the provider uncreatable until settings change; drop it to
-                // the CLI default instead (session.model stays None).
-                let effective = provider
-                    .as_deref()
-                    .or(derived_default.as_deref())
-                    .expect("guarded above: provider or derived default present");
-                match ensure_bare_model_matches_provider(
-                    "agent.create",
-                    &self.models_catalog,
-                    effective,
-                    m,
-                ) {
-                    Ok(()) => {}
-                    Err(e) if model_explicit => return Err(e),
-                    Err(e) => {
-                        tracing::warn!(
-                            model = m,
-                            provider = effective,
-                            error = %e,
-                            "configured default model belongs to another provider; \
-                             falling back to the CLI default"
-                        );
-                        resolved_model = None;
-                        model_source = DefaultModelSource::CliDefault;
-                    }
-                }
-            }
-        }
-        // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
-        // `agent.create` naming a specialist consults the same model-option >
-        // frontmatter order the delegate/wakeOrCreate seams do, keyed on the
-        // model that was actually resolved above. Those seams pre-decide the
-        // effort and pass it down as a param, so this only fires for callers
-        // that did not (`reasoning_effort_decided == false`) — which is also
-        // what keeps the specialist rungs ahead of the settings default below.
-        let reasoning_effort = if reasoning_effort_decided {
-            reasoning_effort
-        } else {
-            resolve_delegate_reasoning_effort(
-                self,
-                None,
-                specialist.as_deref(),
-                resolved_model.as_deref(),
+                reasoning_effort,
                 spec_wp.as_deref(),
             )
-        };
-        // Validate the requested level (PROTOCOL §5.5) against the *resolved*
-        // model's cached `effortLevels`, with the same probe-free,
-        // evidence-only rule the delegate/wakeOrCreate seams use — no evidence
-        // means the value passes through, since providers own the vocabulary.
-        // Runs before the session is persisted so a `-32602` rejection is
-        // side-effect free.
-        if let Some(effort) = reasoning_effort.as_deref() {
-            ensure_effort_supported_by_model(
-                "agent.create",
-                &self.models_catalog,
-                resolved_model.as_deref(),
-                effort,
-            )?;
-        }
-        // Last rung: the settings default effort, applied only when no rung
-        // above decided the effort AND the model itself came from the settings
-        // default chain (see `resolve_settings_default_reasoning_effort`).
-        let reasoning_effort = if reasoning_effort.is_some() || reasoning_effort_decided {
-            reasoning_effort
-        } else {
-            resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
-        };
+            .await?;
+        Ok(AgentCreatePlan {
+            method,
+            parent_agent_id,
+            task_note_id,
+            skip_auto_commit,
+            name,
+            name_explicitly_set,
+            specialist,
+            model: resolved_model,
+            provider,
+            reasoning_effort,
+            metadata,
+            delegation_depth,
+            initial_message,
+            context_references,
+            image_blocks,
+            file_blocks,
+            is_background,
+        })
+    }
+
+    /// Persist half of an agent create: turns an [`AgentCreatePlan`] into a
+    /// session row and emits `agent:created`. Everything here is either
+    /// non-failing (the specialist prompt / orchestrator snapshot, usage
+    /// stats) or infrastructure ([`AgentPersistError`]) — by construction it
+    /// cannot raise an input / derived-config rejection (`-32602`), so a
+    /// caller such as `workspace.create` can run it AFTER its workspace row
+    /// is inserted without such a rejection stranding that row (store /
+    /// internal / join failures remain possible and map to `-32603`; what the
+    /// caller itself does between insert and persist is outside this claim).
+    ///
+    /// `workspace_id` is the workspace the session row belongs to: the stored
+    /// workspace's id for the store-backed seams, the id derived after the
+    /// plan (from the initial prompt) for `workspace.create`. No planner check
+    /// consults it, which is why it is a persist argument rather than a plan
+    /// field. `snapshot_wp` is the project-tier root for the *non-failing*
+    /// specialist snapshot (`resolve_prompt_injection` /
+    /// `resolve_is_orchestrator`): the stored workspace's worktree for the
+    /// store-backed seams, the freshly provisioned worktree at `baseRef` for
+    /// `workspace.create`.
+    pub(crate) async fn persist_agent_create(
+        &self,
+        plan: AgentCreatePlan,
+        workspace_id: WorkspaceId,
+        snapshot_wp: Option<PathBuf>,
+    ) -> std::result::Result<Value, AgentPersistError> {
+        let AgentCreatePlan {
+            method,
+            parent_agent_id,
+            task_note_id,
+            skip_auto_commit,
+            name,
+            name_explicitly_set,
+            specialist,
+            model: resolved_model,
+            provider,
+            reasoning_effort,
+            mut metadata,
+            delegation_depth,
+            initial_message,
+            context_references,
+            image_blocks,
+            file_blocks,
+            is_background,
+        } = plan;
+        let now = now_iso();
+        let id = AgentId(format!("agent-{}", Uuid::new_v4()));
         // Specialist prompt snapshot: freeze the resolved specialist injection
         // for the session's lifetime by persisting it into the metadata JSON,
         // so later edits/deletes of user/project-tier specialist files never
@@ -3849,10 +4386,24 @@ impl Services {
         // never fails the create; a non-object caller `metadata` is left
         // untouched.
         if let Some(spec_id) = specialist.as_deref() {
-            if let Some((body, spec_name, reminder)) = self
-                .specialists_service()
-                .resolve_prompt_injection(spec_id, spec_wp.as_deref())
-            {
+            // Both snapshot resolutions below walk the specialist tier
+            // directories — blocking pool (monorepo#4148).
+            let services = self.clone();
+            let spec_id_owned = spec_id.to_string();
+            let wp = snapshot_wp.clone();
+            let (injection, frozen_is_orchestrator) = tokio::task::spawn_blocking(move || {
+                (
+                    services
+                        .specialists_service()
+                        .resolve_prompt_injection(&spec_id_owned, wp.as_deref()),
+                    services
+                        .specialists_service()
+                        .resolve_is_orchestrator(&spec_id_owned, wp.as_deref()),
+                )
+            })
+            .await
+            .map_err(AgentPersistError::Join)?;
+            if let Some((body, spec_name, reminder)) = injection {
                 let meta_value =
                     metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
                 if let Some(obj) = meta_value.as_object_mut() {
@@ -3890,9 +4441,7 @@ impl Services {
             // did not resolve above (the fail-closed name fallback decides)
             // — and always overwrites any caller-supplied value, so the
             // frozen readers never consume caller input as a trusted role.
-            let frozen_is_orchestrator = self
-                .specialists_service()
-                .resolve_is_orchestrator(spec_id, spec_wp.as_deref());
+            // (Resolved in the blocking task above.)
             let meta_value = metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
             if let Some(obj) = meta_value.as_object_mut() {
                 obj.insert(
@@ -3908,8 +4457,11 @@ impl Services {
         // wakeOrCreate children funnel through this op and mint the latest
         // version, never inheriting the parent's pinned one.
         let settings = self.effective_settings();
-        let harness_features = serde_json::to_value(&settings.agent_features)
-            .map_err(|e| Error::Internal(format!("encode agentFeatures snapshot failed: {e}")))?;
+        let harness_features = serde_json::to_value(&settings.agent_features).map_err(|e| {
+            AgentPersistError::Internal(format!(
+                "{method}: encode agentFeatures snapshot failed: {e}"
+            ))
+        })?;
         let session = AgentSession {
             id,
             workspace_id,
@@ -3967,6 +4519,7 @@ impl Services {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),
@@ -3980,7 +4533,8 @@ impl Services {
         let task_graph_enabled = settings.agent_features.task_graph;
         self.store
             .insert_agent_session_with_task_graph(&session, task_graph_enabled)
-            .await?;
+            .await
+            .map_err(AgentPersistError::store)?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Global usage-stats (D2): count this session start in the current UTC
         // hour bucket under the session's stats model key (normalized model,
@@ -4044,16 +4598,15 @@ impl Services {
 
     /// `agent.setModel` (PROTOCOL §5.5). Emits `agent:updated`.
     ///
-    /// When the new model is a compound id (`provider:model`) whose provider
-    /// differs from session.provider, this updates session.provider to match,
-    /// ensuring the next spawn uses the correct binary.
+    /// `model_id` is always a bare id (compound `provider:model` ids are
+    /// rejected at the wire).
     ///
     /// `provider_id` is the optional explicit provider (additive param,
     /// monorepo#1657): absent keeps the historical behavior byte-for-byte;
-    /// present it must name a registered provider, a compound `model_id`'s
-    /// prefix must agree with it, and a bare `model_id` is validated against
-    /// — and session.provider reconciled to — the GIVEN provider instead of
-    /// the session's effective one.
+    /// present it must name a registered provider, and `model_id` is
+    /// validated against — and session.provider reconciled to — the GIVEN
+    /// provider instead of the session's effective one (a cross-provider
+    /// switch spawns the new provider's binary on the next turn).
     pub(crate) async fn agent_set_model_op(
         &self,
         agent_id: AgentId,
@@ -4062,49 +4615,75 @@ impl Services {
     ) -> Result<Value> {
         let session = self.load_session_internal(&agent_id).await?;
         // An explicit providerId must be a registered provider before any
-        // mutation (same misroute vector as the compound prefix below).
+        // mutation (persisting an unknown one would make the next spawn
+        // silently fall back to the default binary, -32602).
         if let Some(pid) = provider_id.as_deref() {
             ensure_known_provider("agent.setModel", pid)?;
         }
-        // Parse the compound prefix once: reject unknown providers before any
-        // mutation (the same misroute vector as agent.create — persisting one
-        // would make the next spawn silently fall back to the default binary,
-        // -32602), then reuse the derived provider for session.provider
-        // reconciliation so cross-provider model switches spawn the new
-        // provider's binary.
-        let model_provider = if model_id.contains(':') {
-            let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
-            ensure_known_provider("agent.setModel", &model_provider)?;
-            // An explicit providerId must agree with the compound prefix
-            // (normalized): a conflict is a client bug — reject before any
-            // mutation rather than guessing which provider was meant.
-            if let Some(pid) = provider_id.as_deref() {
-                let prefix = intent_providers::provider_config(&model_provider).id;
-                if prefix != pid {
-                    return Err(Error::InvalidParams(format!(
-                        "agent.setModel: modelId {model_id} names provider {prefix} \
-                         but providerId is {pid}"
-                    )));
-                }
-            }
-            Some(model_provider)
-        } else if let Some(pid) = provider_id {
-            // Bare model with an explicit providerId: ownership is validated
-            // against the GIVEN provider (not the session's effective one),
-            // and session.provider is reconciled to it below — same write
-            // path as the compound-prefix case — so the next spawn runs the
-            // intended binary (monorepo#1657).
+        let model_provider = if let Some(pid) = provider_id {
+            // Explicit providerId: ownership is validated against the GIVEN
+            // provider (not the session's effective one), and
+            // session.provider is reconciled to it below so the next spawn
+            // runs the intended binary (monorepo#1657).
             ensure_bare_model_matches_provider(
                 "agent.setModel",
-                &self.models_catalog,
+                &self.cached_models(),
                 &pid,
                 &model_id,
             )?;
+            // Availability gate for a genuine CROSS-provider switch: hold the
+            // target to the same bar as the create/delegate front door
+            // (`ensure_provider_available`: disabled → not-authenticated →
+            // not-installed, one distinct `-32602` each). `ensure_known_provider`
+            // above only says the id is in the catalog — without this a client
+            // could park the session on a provider that is switched off, logged
+            // out, or not installed at all, and the failure would surface a turn
+            // later as a raw spawn error with nothing tying it back to the
+            // `setModel` that caused it.
+            //
+            // Scoped to a switch that actually MOVES the session: an explicit
+            // `providerId` naming a different provider than the session's
+            // current one. Deliberately NOT applied to a same-provider model
+            // change (nor to the no-`providerId` form, which cannot move the
+            // session anywhere) — an agent already running on a provider must
+            // stay able to change its model even while the availability probe
+            // is unhappy (a hard-false cached auth verdict, a provider disabled
+            // in settings after the agent was created), and gating that would
+            // regress behavior that works today.
+            //
+            // Runs AFTER the model-ownership check so the existing error
+            // precedence is unchanged: a request naming a model the target
+            // provider does not own is still rejected for THAT reason,
+            // installed or not.
+            //
+            // "Current" is the session's EFFECTIVE provider — the one the next
+            // spawn would actually run — not the raw column: a legacy alias
+            // (`acp`/`default`/`augment`) normalizes through `provider_config`
+            // exactly as `resolve_spawn` and the ownership check above do, and
+            // a NULL column resolves to the settings-derived default. Comparing
+            // the raw column would treat an explicit `providerId` naming that
+            // same effective provider as a cross-provider switch and gate a
+            // same-provider model change — the very exemption above.
+            let current_effective = session
+                .provider
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(|p| intent_providers::provider_config(p).id.to_string())
+                .or_else(|| {
+                    crate::agent_session::derived_default_provider(&self.effective_settings())
+                });
+            if current_effective.as_deref() != Some(pid.as_str()) {
+                ensure_provider_available(
+                    "agent.setModel",
+                    &pid,
+                    &self.effective_settings().providers,
+                )?;
+            }
             Some(pid)
         } else {
-            // A bare model is validated against the session's effective
-            // provider (same precedence as `resolve_provider_id` when the
-            // model has no prefix: session.provider → settings-derived
+            // Without an explicit providerId the model is validated against
+            // the session's effective provider (same precedence as
+            // `resolve_provider_id`: session.provider → settings-derived
             // default): a bare id provably owned by another provider (cached
             // dynamic catalogs) is the same misroute vector (monorepo#607).
             // With neither set the session could never spawn — fail loudly
@@ -4123,14 +4702,14 @@ impl Services {
             };
             ensure_bare_model_matches_provider(
                 "agent.setModel",
-                &self.models_catalog,
+                &self.cached_models(),
                 effective,
                 &model_id,
             )?;
             None
         };
-        // Reconcile the provider to the compound prefix or explicit
-        // providerId (bare ids without one keep the session's provider). The
+        // Reconcile the provider to the explicit providerId (models without
+        // one keep the session's provider). The
         // write goes through the narrow
         // `set_agent_session_model` — the ONE writer allowed to change
         // `provider` after first real use — because a cross-provider switch
@@ -4333,7 +4912,7 @@ impl Services {
         if let Some(existing) =
             self.pending_agent_deletes
                 .schedule(key, delete_at.clone(), move |generation| {
-                    tokio::spawn(async move {
+                    intent_core::spawn_daemon(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         // Claim-or-abstain: only the timer that still owns the
                         // entry commits. A cancel or an immediate delete that
@@ -4553,6 +5132,13 @@ impl Services {
         reason: Option<&str>,
     ) -> Result<Option<String>> {
         let now = now_iso();
+        // Unread state observed BEFORE the retire write (derived + stored
+        // flag): a retired session drops out of the unread derivation, so
+        // this is the snapshot the post-retire settle below needs. Both
+        // reads fail closed on emission (derived `false`, stored `unread`),
+        // so a transient probe failure can never publish a spurious
+        // `{ none }` through the settle's fallback.
+        let before = self.snapshot_workspace_unread(&session.workspace_id).await;
         // CAS write: only the request that actually flips NULL → set emits
         // the event.
         let transitioned = self
@@ -4575,6 +5161,16 @@ impl Services {
         // the condition still matters.
         self.cancel_agent_hooks(&session.id).await;
         self.cancel_agent_pr_monitors(&session.id).await;
+        // Drop the retiring agent's OWN outgoing completion watches and
+        // delegation groups (monorepo#4183): a retired watcher can never
+        // consume a wake — every delivery attempt fails on the soft-retire
+        // inertness gate, so a watch left armed feeds the completion
+        // delivery retry loop with permanent failures forever. Mirrors the
+        // delete cascade and `agent.cancelSubscriptions` remove-all sweep.
+        // `agent.restore` does NOT resurrect them (same contract as hooks /
+        // PR monitors above) — the agent re-watches if it still cares.
+        self.remove_all_for_parent(&session.id);
+        self.remove_groups_for_parent(&session.id);
         let mut data = json!({
             "agentId": session.id.0,
             "agentName": session.name,
@@ -4603,6 +5199,29 @@ impl Services {
         // the row): recompute-and-compare (§6.5 step 0).
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
+        // A retired session no longer counts toward the workspace's derived
+        // `unread` (the FE cannot land on a hidden agent to read it), so
+        // settle the stored flag exactly as the last seen-marker advance
+        // would: when this was the last unread top-level session, clear the
+        // stored `unread` and emit ONE `workspace:attention-changed { none }`
+        // (`review_required` untouched; a still-unread workspace stays
+        // silent). Runs after the displayStatus recompute so the attention
+        // rungs settle before the blue dot; the cascade retires children
+        // through this same path. Exact-once under concurrency: the guarded
+        // UPDATE inside the settle affects a row for only one of several
+        // concurrent retires (or seen-marker advances) racing on the same
+        // stored `unread`, and the pre-write snapshot keeps the losers out
+        // of the stored-flag-already-clear fallback.
+        self.settle_workspace_unread_after_seen(&session.workspace_id, before)
+            .await;
+        // The watch/group sweep above may have removed the workspace's last
+        // waiting reason (watches feed
+        // `workspace_has_waiting_agent_subscriptions`); the hook/PR-monitor
+        // sweeps recompute internally but run BEFORE the watch sweep, so
+        // their recompute still saw the live watches. One anchor suffices:
+        // cross-workspace watches only exist for chief parents, and the
+        // recompute early-returns for chief.
+        self.maybe_emit_waiting_changed(&session.workspace_id).await;
         Ok(Some(now))
     }
 
@@ -4655,12 +5274,17 @@ impl Services {
         .await;
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
+        // Restore is SILENT for the workspace `unread` state (decision): the
+        // stored flag is NOT re-raised and no `workspace:attention-changed`
+        // is emitted. Read paths (`workspace.get` / `workspace.list`)
+        // re-derive unread from the store predicate, so a restored session
+        // with an unseen assistant last message surfaces on the next fetch.
         // Re-engage the queue parked by the retired gates (`try_drain_queue`
         // / `deliver_wake_message`): nothing kicks the restored agent's drain
         // organically, so without this a wake parked during retirement would
         // stay stranded until someone happened to message the agent (mirrors
         // `unarchive_workspace`'s kick). Best-effort: `try_drain_queue`
-        // re-checks its own gates (busy, question hold, Error park).
+        // re-checks its own gates (busy, archived, Error park).
         if let Some(manager) = self.agent_manager() {
             if self.has_ready_to_send(&agent_id) {
                 manager
@@ -4691,6 +5315,12 @@ impl Services {
         if session.harness_features.is_none() {
             session.harness_features = self.current_agent_features_snapshot();
         }
+        // Serve-time author projection (multiplayer w2) on the typed
+        // transcript — the same shim `agent.getConversation` applies, so a
+        // client hydrating through either route sees one attribution shape.
+        crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
+            .attach_typed(&mut session.messages)
+            .await;
         Ok(session)
     }
 
@@ -4708,6 +5338,7 @@ impl Services {
         };
         let mut session = self.store.get_agent_session(&agent_id).await?;
         let prior_model = session.model.clone();
+        let prior_muted = session.notifications_muted;
         let allowed = [
             "status",
             "isActive",
@@ -4730,6 +5361,7 @@ impl Services {
             "imageBlocks",
             "fileBlocks",
             "isBackground",
+            "notificationsMuted",
         ];
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
@@ -4812,17 +5444,29 @@ impl Services {
                             .await
                             .ok()
                             .and_then(|w| crate::git_ops::worktree_path(&w));
-                        let canonical = self
-                            .specialists_service()
-                            .canonical_id_or_err(&spec_id, wp.as_deref())?;
-                        // Refresh the frozen orchestrator-role snapshot
-                        // (`specialistIsOrchestrator`, written at create)
-                        // for the NEW specialist so the session-open
-                        // denylist decision tracks the identity change
-                        // instead of the stale creation-time role.
-                        let is_orchestrator = self
-                            .specialists_service()
-                            .resolve_is_orchestrator(&canonical, wp.as_deref());
+                        // Canonicalization + the refreshed orchestrator-role
+                        // snapshot (`specialistIsOrchestrator`, written at
+                        // create, re-resolved here so the session-open
+                        // denylist decision tracks the identity change) both
+                        // walk the specialist tiers — blocking pool
+                        // (monorepo#4148).
+                        let services = self.clone();
+                        let (canonical, is_orchestrator) =
+                            tokio::task::spawn_blocking(move || -> Result<(String, bool)> {
+                                let canonical = services
+                                    .specialists_service()
+                                    .canonical_id_or_err(&spec_id, wp.as_deref())?;
+                                let is_orchestrator = services
+                                    .specialists_service()
+                                    .resolve_is_orchestrator(&canonical, wp.as_deref());
+                                Ok((canonical, is_orchestrator))
+                            })
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!(
+                                    "agent.update specialist resolution task failed: {e}"
+                                ))
+                            })??;
                         let meta = session
                             .metadata
                             .get_or_insert_with(|| json!(serde_json::Map::new()));
@@ -4908,14 +5552,46 @@ impl Services {
                         )
                     })?;
                 }
+                "notificationsMuted" => {
+                    session.notifications_muted = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `notificationsMuted` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
         session.updated_at = now_iso();
         let workspace_id = session.workspace_id.clone();
+        // Muting drops the session out of the workspace unread derivation
+        // (§5.1), so snapshot the unread state BEFORE the write — the
+        // post-write settle below needs it (same contract as `agent.retire`
+        // / `agent.markSeen`).
+        let mute_changed = session.notifications_muted != prior_muted;
+        let unread_before = if mute_changed && session.notifications_muted {
+            Some(self.snapshot_workspace_unread(&workspace_id).await)
+        } else {
+            None
+        };
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
+        // `notifications_muted` is excluded from the full-row write above
+        // (its only post-insert mutator is this scoped UPDATE), so a
+        // concurrent `agent.update` on unrelated fields — or a long-lived
+        // in-memory session persisted at turn end — can never revert the
+        // user's toggle. Same-value writes are a store-level no-op.
+        if obj.contains_key("notificationsMuted") {
+            self.store
+                .set_agent_notifications_muted(
+                    &workspace_id,
+                    &agent_id,
+                    session.notifications_muted,
+                    &session.updated_at,
+                )
+                .await?;
+        }
         // The stored model changed, so any persisted display resolution now
         // names the wrong model — clear it, same anti-staleness contract as
         // `agent.setModel` (the next session open re-resolves). Best-effort:
@@ -4946,12 +5622,25 @@ impl Services {
             Value::Object(event_data),
         )
         .await;
-        // `status` / `isBackground` feed the needs_attention derivation (a
-        // deleted or background session's pending request/question no longer
-        // counts): recompute-and-compare (§6.5 step 0); other fields skip the
-        // probe entirely.
-        if obj.contains_key("status") || obj.contains_key("isBackground") {
+        // `status` / `isBackground` / `notificationsMuted` feed the
+        // needs_attention derivation (a deleted, background, or muted
+        // session's pending request/question/error no longer counts):
+        // recompute-and-compare (§6.5 step 0); other fields skip the probe
+        // entirely.
+        if obj.contains_key("status") || obj.contains_key("isBackground") || mute_changed {
             self.maybe_emit_display_status_changed(&workspace_id).await;
+        }
+        // A muted session no longer counts toward the workspace's derived
+        // `unread`, so settle the stored flag exactly as the last seen-marker
+        // advance would: when this was the last unread top-level session,
+        // clear the stored `unread` and emit ONE `workspace:attention-changed
+        // { none }` (`review_required` untouched; a still-unread workspace
+        // stays silent). Unmuting writes nothing at the workspace level — an
+        // unmuted session with an unseen assistant tail re-derives `unread`
+        // on the next read (the `agent.restore` precedent).
+        if let Some(before) = unread_before {
+            self.settle_workspace_unread_after_seen(&workspace_id, before)
+                .await;
         }
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
@@ -5005,12 +5694,13 @@ impl Services {
         }
         self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
             .await;
-        // Stored-on-write question-hold markers (PROTOCOL §5.5), same contract
-        // as the turn-end and user-send persists: an appended assistant row
-        // bearing question blocks arms the pending marker, an appended user
-        // row tagged `question_answers` for the marked message clears it.
-        // Only those two transitions move the hold — a plain user row leaves
-        // it pending — so they also gate the displayStatus recompute below.
+        // Stored-on-write pending-questions markers (PROTOCOL §5.5), same
+        // contract as the turn-end and user-send persists: an appended
+        // assistant row bearing question blocks arms the pending marker, an
+        // appended user row tagged `question_answers` for the marked message
+        // clears it. Only those two transitions move the marker — a plain user
+        // row leaves it pending — so they also gate the displayStatus
+        // recompute below.
         let hold_moved = if role == "assistant" && has_question_blocks(&content) {
             self.record_pending_questions_marker(&session.workspace_id, &agent_id, &message.id)
                 .await
@@ -5035,9 +5725,9 @@ impl Services {
         } else {
             false
         };
-        // A moved question-hold derivation — an answered question set retires
-        // the hold, an assistant row with a trailing question block raises it
-        // — flips the workspace's needs_attention displayStatus (§6.5 step 0):
+        // A moved pending-questions derivation — an answered question set
+        // retires it, an assistant row with a trailing question block raises
+        // it — flips the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare (monorepo#1266).
         if hold_moved {
             self.maybe_emit_display_status_changed(&session.workspace_id)
@@ -5141,7 +5831,7 @@ impl Services {
         // The swap re-mints row ids, so any surviving pending-questions marker
         // is dangling: re-derive it from the new transcript (same contract as
         // the `agent.editAndRegenerate` truncation). The swapped transcript can
-        // move the question-hold derivation in either direction, so the
+        // move the pending-questions derivation in either direction, so the
         // re-derivation also recomputes the workspace's needs_attention
         // displayStatus (§6.5 step 0, monorepo#1266) and kicks the queue drain
         // for entries a now-released hold parked.
@@ -5195,8 +5885,13 @@ impl Services {
 
     /// `agent.editAndRegenerate` truncation step: atomically truncate the
     /// transcript to just BEFORE the (already validated) user message
-    /// `message_id`, dropping it and everything after it. Reuses the
-    /// replaceMessages store machinery (fresh row ids / 0-based `seq`).
+    /// `message_id`, dropping it and everything after it. Only the suffix is
+    /// deleted ([`intent_store::Store::truncate_agent_messages_from`]): the
+    /// kept rows keep their ids, `seq`, and heavy side rows — including the
+    /// retention sweep's `*_replay` previews, which a remint through the
+    /// replaceMessages machinery would have dropped (a compacted block
+    /// hydrates to its slim placeholder, so re-extraction skipped it and the
+    /// cascade swept the preview with the old envelope).
     /// Emits `agent:updated` with `{ truncatedCount, remainingCount }`.
     /// Returns the number of messages removed.
     ///
@@ -5215,35 +5910,27 @@ impl Services {
         let messages = self.store.get_agent_messages(agent_id, None).await?;
         let idx = Self::find_edit_target(&messages, message_id)?;
         let keep = &messages[..idx];
-        let batch: Vec<intent_store::ReplaceMessage<'_>> = keep
-            .iter()
-            .map(|m| intent_store::ReplaceMessage {
-                role: m.role.as_str(),
-                content: &m.content,
-                metadata: m.metadata.as_ref(),
-                created_at: m.created_at.as_str(),
-            })
-            .collect();
-        let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
+        let truncated_count = self
+            .store
+            .truncate_agent_messages_from(agent_id, messages[idx].seq)
+            .await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
-        let truncated_count = messages.len() - inserted.len();
-        // Question hold (PROTOCOL §5.5): truncation drops the rows the
-        // pending-questions marker may name AND re-mints ids for the kept rows
-        // (`replace_agent_messages`), so a surviving marker would be dangling
-        // — and since the hold derivation never checks that the marked row
-        // still exists, a dangling marker would wedge the hold forever. The
-        // marker is therefore explicitly RE-DERIVED from the post-truncation
-        // transcript (never tolerated as dangling), which also recomputes the
-        // needs_attention displayStatus and kicks the drain when the
-        // truncation released the hold. The dismissal marker keeps its
-        // existing dangling-tolerant laxity.
-        self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, &inserted)
+        // Pending questions (PROTOCOL §5.5): truncation drops the rows the
+        // pending-questions marker may name, so a surviving marker could be
+        // dangling — and since the derivation never checks that the marked
+        // row still exists, a dangling marker would wedge the pending set
+        // forever. The marker is therefore explicitly RE-DERIVED from the
+        // post-truncation transcript (never tolerated as dangling), which
+        // also recomputes the needs_attention displayStatus and kicks the
+        // drain when the truncation released the hold. The dismissal marker
+        // keeps its existing dangling-tolerant laxity.
+        self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, keep)
             .await;
-        // Same re-mint hazard for the pending-proposals list (see
-        // `agent_replace_messages_op`): remap surviving entries onto the
-        // re-minted kept rows and drop entries whose carrying rows were
-        // truncated away.
-        self.reconcile_pending_proposals(&session.workspace_id, agent_id, &inserted)
+        // Same hazard for the pending-proposals list (see
+        // `agent_replace_messages_op`): drop entries whose carrying rows were
+        // truncated away (kept rows keep their ids, so surviving entries map
+        // onto themselves).
+        self.reconcile_pending_proposals(&session.workspace_id, agent_id, keep)
             .await;
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -5252,7 +5939,7 @@ impl Services {
             json!({
                 "agentId": agent_id.0,
                 "truncatedCount": truncated_count,
-                "remainingCount": inserted.len(),
+                "remainingCount": keep.len(),
             }),
         )
         .await;
@@ -5302,14 +5989,36 @@ impl Services {
                 &format!("no dynamic model discovery for provider '{provider_id}'"),
             ));
         };
-        let version_key = (source.version_key)();
+        let antigravity = (source.provider_id == "antigravity").then(|| {
+            crate::model_catalog::AntigravityModelSource::resolve(
+                self.effective_settings()
+                    .providers
+                    .paths
+                    .get("antigravity")
+                    .map(String::as_str),
+            )
+        });
+        let version_key = antigravity
+            .as_ref()
+            .map_or_else(|| (source.version_key)(), |s| s.version_key.clone());
         let resolved = crate::model_catalog::resolve_with_cache(
             &self.models_catalog,
             &provider_id,
             &version_key,
             force_refresh,
             crate::model_catalog::ModelCatalogCache::now_ms(),
-            source.fetch,
+            move || {
+                if let Some(antigravity) = antigravity {
+                    Box::pin(async move {
+                        crate::model_catalog::from_provider_fetch(
+                            crate::provider_models::fetch_antigravity_models_at(antigravity.binary)
+                                .await,
+                        )
+                    })
+                } else {
+                    (source.fetch)()
+                }
+            },
         )
         .await;
         match resolved.models {
@@ -5431,17 +6140,24 @@ impl Services {
         }
     }
 
-    /// `agent.queueMessage` (PROTOCOL §5.5). Enqueues the message, publishes
+    /// `agent.queueMessage` (PROTOCOL §5.5). Enqueues the message as a
+    /// USER-origin entry (this is the FE's front door for a reply typed while
+    /// the agent is mid-turn, so its drain must clear a pending attention
+    /// request like a direct `agent.sendMessage`), publishes
     /// `agent:queue:updated`, and asks the runtime [`AgentManager`] (when attached)
     /// to drain the queue immediately if the agent is idle — closing the bug where
     /// a queued message would never be sent because the BE only drained the queue
-    /// from a live worker loop.
+    /// from a live worker loop. `message_metadata` (already
+    /// attribution-stripped by the router) is captured on the entry so the
+    /// drain-time persist writes it onto the user row — a queued
+    /// `question_answers` answer thereby resolves the pending question set.
     pub(crate) async fn agent_queue_message_op(
         &self,
         agent_id: AgentId,
         content: String,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         // Attachment-reference validation (PROTOCOL §5.5) before any state
         // change, matching `agent.sendMessage`.
@@ -5458,9 +6174,10 @@ impl Services {
             content,
             image_blocks,
             file_blocks,
-            None,
+            message_metadata,
             None,
             false,
+            MessageOrigin::User,
         );
         let result = json!({
             "success": true,
@@ -5479,19 +6196,33 @@ impl Services {
     /// `agent.getQueue` (PROTOCOL §5.5). When `workspace_id` is supplied the
     /// callee verifies the session belongs to that workspace (defense-in-depth
     /// against a bare `agentId` probe across workspaces); a mismatch surfaces
-    /// as `NotFound`.
+    /// as `NotFound`. Entries carry the resolved `author` projection
+    /// ([`crate::principal_ops::MessageAuthorResolver::attach_queue`]) — the
+    /// same shape and resolution order as `agent.getConversation` user rows.
+    /// The key is present on every row regardless: when the unscoped read
+    /// finds no session to resolve against, entries keep the `null` default
+    /// from [`QueuedMessage::to_value`].
     pub(crate) async fn agent_get_queue_op(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
+        let owning_ws = match self.store.get_agent_session_summary(&agent_id).await {
+            Ok(session) => Some(session.workspace_id),
+            Err(e) if workspace_id.is_some() => return Err(e),
+            Err(_) => None,
+        };
         if let Some(ws) = workspace_id.as_ref() {
-            let session = self.store.get_agent_session(&agent_id).await?;
-            if session.workspace_id != *ws {
+            if owning_ws.as_ref() != Some(ws) {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let queue = self.queue_snapshot(&agent_id);
+        let mut queue = self.queue_snapshot(&agent_id);
+        if let Some(ws) = owning_ws.as_ref() {
+            crate::principal_ops::MessageAuthorResolver::new(self, ws)
+                .attach_queue(&mut queue)
+                .await;
+        }
         Ok(json!({ "success": true, "queue": queue }))
     }
 
@@ -5507,13 +6238,38 @@ impl Services {
     /// editing) we additionally fire `try_drain_queue` so the message
     /// self-drains as if it had just been enqueued — honouring the user's
     /// "re-queued on save, which self-drains" semantics (PROTOCOL §5.5/§6.5).
+    /// A parked recovery send (intent-hq/intent#4962) whose redrive deferred
+    /// while it was under edit is probed first: its marker lifts the STAB-52
+    /// `Error` gate for that entry alone, and an unmarked entry still meets
+    /// the ordinary gate.
     pub(crate) async fn agent_edit_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
-        content: String,
+        mut content: String,
         editing: Option<bool>,
     ) -> Result<Value> {
+        // Principal stamp (multiplayer w2): an edit by a wire caller makes
+        // the editor the author of a human-authored entry; an agent /
+        // daemon edit leaves the original stamp alone. Human authorship is
+        // the entry's principal stamp (or a user-origin lifecycle) — NOT
+        // `user_origin` alone: a human wake parked by `deliver_wake_message`
+        // and a direct send that fell into the append-failure auto-queue are
+        // both enqueued as `Automatic` yet carry the author's stamp.
+        let restamp = matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Wire { .. })
+        );
+        // Collaborator sender preamble (multiplayer): the editor's, on the
+        // same human-authored entries the restamp re-attributes. Resolved
+        // (one store read, collaborator callers only) BEFORE the queue lock
+        // is taken; applied to the replacement content below.
+        let preamble = if restamp {
+            self.collaborator_sender_preamble_for_agent(&agent_id)
+                .await?
+        } else {
+            None
+        };
         let (edited, was_editing, now_editing) = {
             let mut guard = self
                 .agent_queues
@@ -5527,7 +6283,30 @@ impl Services {
                 .position(|m| m.id == message_id)
                 .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
             let was = queue[position].editing;
+            let human_authored = queue[position].user_origin
+                || crate::principal_ops::carries_principal_stamp(
+                    queue[position].message_metadata.as_ref(),
+                );
+            // The restamp is the one fallible step (a durable pre-attribution
+            // entry may carry scalar metadata, which the stamp rejects), so
+            // it is computed on a copy BEFORE anything on the entry moves: a
+            // rejected edit leaves content and metadata exactly as they were
+            // instead of a mutated entry that never published and that a
+            // later queue write would persist.
+            let restamped = if restamp && human_authored {
+                Some(crate::principal_ops::stamp_principal_attribution(
+                    queue[position].message_metadata.clone(),
+                )?)
+            } else {
+                None
+            };
+            if let Some(preamble) = preamble.as_deref().filter(|_| human_authored) {
+                crate::principal_ops::prepend_collaborator_preamble(&mut content, preamble);
+            }
             queue[position].content = content;
+            if let Some(metadata) = restamped {
+                queue[position].message_metadata = metadata;
+            }
             if let Some(flag) = editing {
                 queue[position].editing = flag;
             }
@@ -5539,6 +6318,9 @@ impl Services {
         if was_editing && !now_editing {
             if let Some(manager) = self.agent_manager() {
                 if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                    manager
+                        .redrive_parked_recovery_send(&agent_id, &session.workspace_id)
+                        .await;
                     manager
                         .try_drain_queue(agent_id, session.workspace_id)
                         .await;
@@ -5879,7 +6661,7 @@ impl Services {
                 // Publish agent:message events using the store-returned message id.
                 self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
                     .await;
-                // Answer intake (PROTOCOL §5.5, question hold): parity with
+                // Answer intake (PROTOCOL §5.5, pending questions): parity with
                 // the runtime `AgentManager::send_message` persist — a
                 // `question_answers` tag naming the marked assistant message
                 // clears the pending-questions marker, and only that clear can
@@ -5916,7 +6698,7 @@ impl Services {
                 // path's behavior. `message_metadata` rides along too: an
                 // answer auto-queued after a failed write must keep its
                 // `question_answers` tag, or the drain persist can no longer
-                // clear the pending-questions marker and the hold wedges.
+                // clear the pending-questions marker and the pending set wedges.
                 let (queued, position) = self.enqueue_message(
                     &agent_id,
                     content,
@@ -5925,6 +6707,7 @@ impl Services {
                     message_metadata,
                     None,
                     false,
+                    MessageOrigin::Automatic,
                 );
                 let result = json!({
                     "success": true,
@@ -5946,7 +6729,11 @@ impl Services {
     /// ("queued message not found") with NO side effects, so the client knows
     /// the atomic send did not happen. On a persist failure the entry is
     /// restored at the FRONT of the queue before the error surfaces — the
-    /// transactional guarantee that the message is never lost.
+    /// transactional guarantee that the message is never lost. Same §6.5
+    /// drain ordering as the runtime path: the shrunk `agent:queue:updated`
+    /// is published only after the user row is persisted (and the entry stays
+    /// listed in every snapshot until then), and the row carries the
+    /// `queueInfo.queuedMessageId` identity link.
     pub(crate) async fn agent_send_queued_message_now_op(
         &self,
         agent_id: AgentId,
@@ -5955,16 +6742,26 @@ impl Services {
         // Fail closed on a nonexistent target BEFORE touching the queue
         // (monorepo#564).
         let session = self.require_agent_session(&agent_id).await?;
-        let entry = self
-            .take_queued_message(&agent_id, &message_id)
+        let workspace_id = session.workspace_id.clone();
+        // Atomic dequeue; the entry stays listed in queue snapshots (§6.5
+        // drain ordering) until `draining` is dropped right before the shrunk
+        // publish below.
+        let (mut entry, draining) = self
+            .take_queued_message_draining(&agent_id, &message_id)
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
-        // Publish the shrunk snapshot (write-through persist inside).
-        self.publish_queue_updated(&agent_id).await;
+        // Identity link: parity with the runtime path.
+        crate::agent_manager::stamp_queued_message_id(&mut entry);
+        // Durable shrink now; the shrunk `agent:queue:updated` is published
+        // only after the user row below is persisted (§6.5 drain ordering).
+        self.persist_queue_snapshot(&agent_id).await;
         // A terminal-failure requeue whose user row already reached the
         // transcript must not double-append (STAB-112).
         if entry.persisted {
+            drop(draining);
+            self.publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+                .await;
             return Ok(json!({ "success": true, "queued": false, "messageId": entry.id }));
         }
         // Delivery-time unblocked hints (monorepo#2044): on the no-manager
@@ -5972,7 +6769,6 @@ impl Services {
         // — parity with the manager's `send_queued_message_now` and the
         // store-only `deliver_parent_wake` branch. Same idempotency guard:
         // a content that already carries the section is never re-annotated.
-        let mut entry = entry;
         if !entry
             .content
             .contains(ready_delta::UNBLOCKED_SECTION_PREFIX)
@@ -6010,18 +6806,20 @@ impl Services {
             Ok(message) => message,
             Err(e) => {
                 // Transactional guarantee: restore the entry at the front so
-                // the message is never lost, then surface the failure.
+                // the message is never lost, then surface the failure. No
+                // shrunk snapshot is ever published (fail-closed).
                 self.requeue_front(&agent_id, entry);
+                drop(draining);
                 self.publish_queue_updated(&agent_id).await;
                 return Err(e);
             }
         };
-        self.invalidate_agent_list_cache(&session.workspace_id);
+        self.invalidate_agent_list_cache(&workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
             .store
-            .refresh_agent_session_timestamp(&session.workspace_id, &agent_id, &created_at)
+            .refresh_agent_session_timestamp(&workspace_id, &agent_id, &created_at)
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
@@ -6030,30 +6828,34 @@ impl Services {
             // entries only — parity with the queue-drain `persist_user` gate:
             // on this store-only path no turn runs, so the user's force-sent
             // message is itself the boundary.
-            self.schedule_last_activity_event(session.workspace_id.clone());
+            self.schedule_last_activity_event(workspace_id.clone());
         }
         // Publish agent:message events using the store-returned message id.
-        self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
+        self.publish_agent_message_events(&workspace_id, &agent_id, &message, None)
             .await;
-        // Answer intake (PROTOCOL §5.5, question hold): parity with the
+        // Answer intake (PROTOCOL §5.5, pending questions): parity with the
         // runtime `send_queued_message_now` persist — only a matching answer
         // tag clears the marker, and only that clear can retire the
         // workspace's needs_attention displayStatus (§6.5 step 0).
         if self
             .resolve_pending_questions_for_answer(
-                &session.workspace_id,
+                &workspace_id,
                 &agent_id,
                 entry.message_metadata.as_ref(),
             )
             .await
         {
-            self.maybe_emit_display_status_changed(&session.workspace_id)
-                .await;
+            self.maybe_emit_display_status_changed(&workspace_id).await;
         }
+        // §6.5 drain ordering: the shrunk snapshot goes out only now, after
+        // the row's `agent:message` echo and any marker-clearing `agent:updated`.
+        drop(draining);
+        self.publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+            .await;
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
-    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff the
+    /// Pending-questions derivation (PROTOCOL §5.5): `true` iff the
     /// session's persisted pending-questions marker
     /// ([`intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY`], written at turn end
     /// when the assistant tail bears `application/vnd.intent.question+json`
@@ -6066,21 +6868,23 @@ impl Services {
     /// question-bearing turn resolves it.
     ///
     /// Pre-upgrade sessions (marker key absent entirely — the daemon never
-    /// wrote it) fall back to the legacy transcript tail walk so a hold that
-    /// was live across the upgrade is not lost: walk back from the tail past
-    /// any trailing `system` rows (e.g. the resume-interruption marker
-    /// `resume_interrupted_agent` appends BEFORE its `Automatic`
-    /// continuation) and hold when the first non-system row is an
+    /// wrote it) fall back to the legacy transcript tail walk so a pending
+    /// set that was live across the upgrade is not lost: walk back from the
+    /// tail past any trailing `system` rows (e.g. the resume-interruption
+    /// marker `resume_interrupted_agent` appends BEFORE its `Automatic`
+    /// continuation) and report pending when the first non-system row is an
     /// un-dismissed question-bearing assistant message. A marker written as
     /// the empty string is authoritative ("nothing pending") and does NOT
-    /// fall back. A hold derived that way is immediately MATERIALIZED as a
-    /// marker so it survives the very next user message: the tail walk stops
-    /// seeing the question once a plain user row lands, which is exactly the
-    /// disappearance this contract exists to prevent.
+    /// fall back. A pending set derived that way is immediately MATERIALIZED
+    /// as a marker so it survives the very next user message: the tail walk
+    /// stops seeing the question once a plain user row lands, which is
+    /// exactly the disappearance this contract exists to prevent.
     ///
-    /// Fails open (`false`) on store errors so a read failure can never wedge
-    /// deliveries.
-    pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
+    /// Drives ONLY the `needs_attention` derivation and the `numQuestionsAsked`
+    /// snapshot field — it never gates delivery or the queue drain (automatic
+    /// deliveries run under pending questions; the FE wizard stays sticky on
+    /// `pendingQuestionsMessageId`). Fails open (`false`) on store errors.
+    pub(crate) async fn questions_pending(&self, agent_id: &AgentId) -> bool {
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
@@ -6090,7 +6894,7 @@ impl Services {
                 None => false,
             };
         }
-        let Some(pending) = self.question_hold_active_from_tail(agent_id).await else {
+        let Some(pending) = self.pending_questions_from_tail(agent_id).await else {
             return false;
         };
         self.record_pending_questions_marker(&session.workspace_id, agent_id, &pending)
@@ -6098,27 +6902,64 @@ impl Services {
         true
     }
 
+    /// Turn-start materialization of the pre-upgrade fallback in
+    /// [`Services::questions_pending`]: for a session whose pending-questions
+    /// marker key was never written, derive pendingness from the transcript
+    /// tail and persist it as the marker BEFORE the starting turn appends its
+    /// user row (the tail walk stops seeing the question once any later
+    /// non-system row lands). Called from the runtime turn-slot claim
+    /// (`AgentManager::try_begin_outcome`), which every delivery path —
+    /// user or automatic, direct, drained, or wake — passes through ahead of
+    /// its user row INSERT. A session with a written marker (the
+    /// post-upgrade norm) costs one session-row read and returns; store
+    /// errors fail open.
+    pub(crate) async fn materialize_legacy_pending_questions_marker(&self, agent_id: &AgentId) {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return;
+        };
+        if session.pending_questions_marker_written() {
+            return;
+        }
+        if let Some(pending) = self.pending_questions_from_tail(agent_id).await {
+            self.record_pending_questions_marker(&session.workspace_id, agent_id, &pending)
+                .await;
+        }
+    }
+
     /// The number of question resource blocks still pending on the marked
-    /// question message — the counting form of the question-hold derivation
-    /// ([`Services::question_hold_active`] holds exactly when this is
-    /// non-zero, both keyed on the persisted pending-questions marker): the
+    /// question message — the counting form of the pending-questions
+    /// derivation ([`Services::questions_pending`] is `true` exactly when this
+    /// is non-zero, both keyed on the persisted pending-questions marker): the
     /// block count of the marker's message when the marker is set and not
     /// dismissed, `0` otherwise. Pre-upgrade sessions (marker key never
     /// written) fall back to the tail derivation and materialize the marker,
-    /// mirroring [`Services::question_hold_active`]. Backs the
+    /// mirroring [`Services::questions_pending`]. Backs the
     /// `numQuestionsAsked` snapshot field alongside the turn-attachment
     /// registry count ([`Services::pending_question_count`]). Bounded: one
     /// session read plus at most one single-row message read
     /// ([`Store::get_agent_message_by_id`]) per call — this runs on every
-    /// turn prompt. Store errors fail open to `0`.
+    /// turn prompt. Store errors fail open to `0`
+    /// ([`Services::try_pending_question_tail_count`] is the propagating form).
     pub(crate) async fn pending_question_tail_count(&self, agent_id: &AgentId) -> usize {
-        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
-            return 0;
-        };
+        self.try_pending_question_tail_count(agent_id)
+            .await
+            .unwrap_or(0)
+    }
+
+    /// [`Services::pending_question_tail_count`] with store read/decode
+    /// errors PROPAGATED instead of collapsed to `0`, for callers whose
+    /// decision must fail closed on an unknown pending-question state (the
+    /// PR-monitor parent-takeover predicate). A marker pointing at a message
+    /// that no longer exists is an ordinary `0`, not an error.
+    pub(crate) async fn try_pending_question_tail_count(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<usize> {
+        let session = self.store.get_agent_session_summary(agent_id).await?;
         let pending = if session.pending_questions_marker_written() {
             session.pending_questions_message_id().map(str::to_string)
         } else {
-            let pending = self.question_hold_active_from_tail(agent_id).await;
+            let pending = self.try_pending_questions_from_tail(agent_id).await?;
             if let Some(id) = pending.as_deref() {
                 self.record_pending_questions_marker(&session.workspace_id, agent_id, id)
                     .await;
@@ -6126,15 +6967,19 @@ impl Services {
             pending
         };
         let Some(pending) = pending else {
-            return 0;
+            return Ok(0);
         };
         if session.dismissed_questions_message_id() == Some(pending.as_str()) {
-            return 0;
+            return Ok(0);
         }
-        let Ok(Some(msg)) = self.store.get_agent_message_by_id(agent_id, &pending).await else {
-            return 0;
+        let Some(msg) = self
+            .store
+            .get_agent_message_by_id(agent_id, &pending)
+            .await?
+        else {
+            return Ok(0);
         };
-        question_block_count(&msg.content)
+        Ok(question_block_count(&msg.content))
     }
 
     /// This agent's structured questions currently pending — the
@@ -6154,29 +6999,46 @@ impl Services {
         in_turn + self.pending_question_tail_count(agent_id).await
     }
 
-    /// Legacy transcript tail-walk hold derivation, retained as the
-    /// pre-upgrade fallback for sessions with no persisted pending-questions
-    /// marker (see [`Services::question_hold_active`]). Returns the id of the
-    /// question-bearing assistant message holding the session, so the caller
-    /// can materialize it as the marker.
-    async fn question_hold_active_from_tail(&self, agent_id: &AgentId) -> Option<String> {
+    /// [`Services::pending_question_count`] with the tail-count's store
+    /// read/decode errors propagated ([`Services::try_pending_question_tail_count`]);
+    /// the in-turn registry count is in-memory and cannot fail.
+    pub(crate) async fn try_pending_question_count(&self, agent_id: &AgentId) -> Result<usize> {
+        let in_turn = self.turn_attachments.pending_count_by_mime(
+            agent_id,
+            intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+        );
+        Ok(in_turn + self.try_pending_question_tail_count(agent_id).await?)
+    }
+
+    /// Legacy transcript tail-walk derivation, retained as the pre-upgrade
+    /// fallback for sessions with no persisted pending-questions marker (see
+    /// [`Services::questions_pending`]). Returns the id of the
+    /// question-bearing assistant message pending on the session, so the
+    /// caller can materialize it as the marker. Store errors fail open
+    /// (`None`); [`Services::try_pending_questions_from_tail`] propagates them.
+    async fn pending_questions_from_tail(&self, agent_id: &AgentId) -> Option<String> {
+        self.try_pending_questions_from_tail(agent_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn try_pending_questions_from_tail(&self, agent_id: &AgentId) -> Result<Option<String>> {
         // Trailing `system` rows (e.g. repeated interruption notices) are
         // transparent to the derivation, so the anchor is simply the newest
         // non-system row — resolved by the store in one index-backed
         // statement that decodes at most ONE message
         // ([`Store::get_last_non_system_message`]), never by paging full
         // rows back through the tail. An empty or all-system transcript has
-        // no hold; store errors fail open.
-        let Ok(Some(last)) = self.store.get_last_non_system_message(agent_id).await else {
-            return None;
+        // nothing pending.
+        let Some(last) = self.store.get_last_non_system_message(agent_id).await? else {
+            return Ok(None);
         };
         if last.role != "assistant" || !has_question_blocks(&last.content) {
-            return None;
+            return Ok(None);
         }
-        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
-            return None;
-        };
-        (session.dismissed_questions_message_id() != Some(last.id.as_str())).then_some(last.id)
+        let session = self.store.get_agent_session_summary(agent_id).await?;
+        Ok((session.dismissed_questions_message_id() != Some(last.id.as_str())).then_some(last.id))
     }
 
     /// Persist the pending-questions marker for `message_id` — the assistant
@@ -6191,7 +7053,7 @@ impl Services {
     /// `agent:updated` with the marker so clients re-read the `AgentLite`
     /// projection. Returns `true` only when this call committed the latest
     /// marker. Best-effort: a failure is logged and never fails the turn (the
-    /// hold simply stays as it was).
+    /// marker simply stays as it was).
     pub(crate) async fn record_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
@@ -6349,7 +7211,7 @@ impl Services {
                 intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
                 "",
                 expected_guard,
-                &now_iso(),
+                Some(&now_iso()),
             )
             .await
         {
@@ -6558,12 +7420,11 @@ impl Services {
     /// are meaningful). Bounded — the caller already holds the (post-swap)
     /// rows.
     ///
-    /// A swap can move the hold in either direction, so this also performs the
-    /// two follow-ups every other hold-transition path performs: recompute the
-    /// workspace's `needs_attention` displayStatus (transition-only, §6.5 step
-    /// 0) and — when the re-derivation leaves no hold — kick the queue drain
-    /// for the automatic entries the hold parked (these paths start no turn of
-    /// their own, so without the kick those entries sit on an idle agent).
+    /// A swap can move the pending marker in either direction, so this also
+    /// recomputes the workspace's `needs_attention` displayStatus
+    /// (transition-only, §6.5 step 0) and — when the re-derivation leaves
+    /// nothing pending — kicks the queue drain as a best-effort nudge for
+    /// entries parked by other gates (these paths start no turn of their own).
     pub(crate) async fn reconcile_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
@@ -6609,15 +7470,14 @@ impl Services {
     /// Resolve a just-persisted user row against the pending-questions marker:
     /// when the row's `messageMetadata` is a `question_answers` tag naming
     /// EXACTLY the marked message, the questions are answered and the marker
-    /// clears (releasing the hold). A missing/foreign/stale
+    /// clears. A missing/foreign/stale
     /// `answeredQuestionsMessageId` — e.g. an answer for a question set a newer
     /// turn already superseded — is a no-op, so a late answer can neither
-    /// release a newer hold nor re-arm an old one. The daemon never inspects
-    /// the answer TEXT (spec §Decisions 3).
+    /// resolve a newer pending set nor re-arm an old one. The daemon never
+    /// inspects the answer TEXT (spec §Decisions 3).
     ///
     /// Returns `true` when the marker was cleared, so callers can recompute
-    /// displayStatus and — on the persist-only paths that start no turn of
-    /// their own — kick the queue drain for the entries the hold parked.
+    /// displayStatus.
     pub(crate) async fn resolve_pending_questions_for_answer(
         &self,
         workspace_id: &WorkspaceId,
@@ -6646,8 +7506,8 @@ impl Services {
     /// question set never re-surfaces (survives reload), emit `agent:updated`,
     /// deliver the questions-dismissed system notice to the agent
     /// ([`Services::notify_questions_dismissed`] — marker persists FIRST so
-    /// the question hold cannot re-park the notice), and kick the queue drain
-    /// so messages held by the question hold resume. Idempotent: re-dismissing
+    /// the notice's turn observes the dismissed state), and kick the queue
+    /// drain so queued messages resume. Idempotent: re-dismissing
     /// the same message succeeds without a duplicate notice. Fails closed on a
     /// nonexistent target or a workspace mismatch (`NotFound`).
     pub(crate) async fn agent_dismiss_questions_op(
@@ -6708,7 +7568,7 @@ impl Services {
                 intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY,
                 &message_id,
                 None,
-                &now_iso(),
+                Some(&now_iso()),
             )
             .await
         {
@@ -6727,7 +7587,7 @@ impl Services {
         }
         // Self-contained event (monorepo#3180): carry the session's
         // pending-questions marker alongside the dismissal marker so clients
-        // can re-derive the hold from this one event without an extra
+        // can re-derive the pending set from this one event without an extra
         // `agent.get` round-trip. Same projection rule as `AgentLite`:
         // present when the marker was ever written (the empty string is the
         // authoritative clear), omitted for legacy marker-less sessions. The
@@ -6735,7 +7595,7 @@ impl Services {
         // mutation lock — marker set/clear paths hold that lock across their
         // write + event, so the value emitted here is coherent with the event
         // order a client observes; the top-of-op snapshot could be stale by
-        // emit time and would let a client re-derive an already-cleared hold
+        // emit time and would let a client re-derive an already-cleared set
         // (PR #1496 review).
         {
             let lock = self.pending_question_mutation_locks.lock_for(&agent_id);
@@ -6766,21 +7626,20 @@ impl Services {
             self.publish_agent_mutation_event(&workspace_id, &agent_id, AGENT_UPDATED, event_data)
                 .await;
         }
-        // Dismissing the questions retires the question hold, which can
+        // Dismissing the questions resolves the pending marker, which can
         // retire the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare.
         self.maybe_emit_display_status_changed(&workspace_id).await;
         // Deliver the questions-dismissed system notice (first dismissal of
         // this messageId only) BEFORE the drain kick, so an idle agent's next
-        // turn is the notice rather than a previously held entry. The marker
-        // above is already persisted, so the hold cannot re-park it.
+        // turn is the notice rather than a previously queued entry.
         if !already_dismissed {
             self.notify_questions_dismissed(&workspace_id, &agent_id, &message_id)
                 .await;
         }
-        // The hold (if it was gating this message's questions) is now released:
-        // kick the drain so held queue entries resume without waiting for the
-        // next end-of-turn drain.
+        // Kick the drain so entries parked for other reasons (busy race,
+        // notice enqueued above) resume without waiting for the next
+        // end-of-turn drain.
         if let Some(manager) = self.agent_manager() {
             manager
                 .try_drain_queue(agent_id.clone(), workspace_id)
@@ -6831,16 +7690,13 @@ impl Services {
                 "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
             )));
         }
-        // Pre-write unread derivation (§5.1): whether the workspace read as
-        // unread BEFORE this marker advance, so the settle below only emits
-        // the workspace-level clear on an actual unread→none transition. A
-        // probe failure reads `false` — fail closed on emission (no spurious
-        // clear), the marker write is unaffected.
-        let was_unread = self
-            .store
-            .workspace_has_unread_top_level_session(&workspace_id)
-            .await
-            .unwrap_or(false);
+        // Pre-write unread snapshot (§5.1): whether the workspace read as
+        // unread (derived + stored flag) BEFORE this marker advance, so the
+        // settle below only emits the workspace-level clear on an actual
+        // unread→none transition — and exactly once when several advances
+        // race on the same stored `unread`. Probe failures fail closed on
+        // emission (no spurious clear); the marker write is unaffected.
+        let before = self.snapshot_workspace_unread(&workspace_id).await;
         for _ in 0..MARK_SEEN_CAS_ATTEMPTS {
             // Metadata-only lookup (no transcript hydration); workspace
             // mismatch surfaces as NotFound (defense-in-depth against
@@ -6883,9 +7739,14 @@ impl Services {
             // Guarded atomic single-key write: `json_set` on exactly
             // `lastSeenMessageId` (sibling keys — e.g. a concurrent
             // `dismissedQuestionsMessageId` — are preserved; only
-            // `metadata`+`updated_at` are touched so the stored
-            // `system_prompt` survives), conditioned on the marker still
-            // holding the value the gate above was computed against.
+            // `metadata` is touched so the stored `system_prompt`
+            // survives), conditioned on the marker still holding the value
+            // the gate above was computed against. `updated_at` is
+            // deliberately NOT refreshed: reading a conversation is not
+            // activity, and a bump here would move the session's served
+            // `lastActivity` and the derived workspace `lastActivity`,
+            // re-sorting the workspace merely for being opened
+            // (intent-hq/intent#1466).
             let wrote = self
                 .store
                 .set_agent_session_metadata_key(
@@ -6894,7 +7755,7 @@ impl Services {
                     intent_core::LAST_SEEN_MESSAGE_ID_KEY,
                     &message_id,
                     Some(current.as_deref()),
-                    &now_iso(),
+                    None,
                 )
                 .await?;
             if !wrote {
@@ -6916,8 +7777,9 @@ impl Services {
             // clear the stored legacy flag + emit ONE
             // `workspace:attention-changed { none }`. A workspace with other
             // unread sessions — or one that was not unread to begin with —
-            // stays silent.
-            self.settle_workspace_unread_after_seen(&workspace_id, was_unread)
+            // stays silent; a concurrent advance that loses the guarded
+            // clear stays silent too.
+            self.settle_workspace_unread_after_seen(&workspace_id, before)
                 .await;
             return Ok(json!({
                 "success": true,
@@ -6957,10 +7819,9 @@ impl Services {
     /// any work — it ends its turn and waits for the user's next message.
     /// Reuses the wake-delivery machinery ([`Services::deliver_wake_message`]):
     /// an idle agent gets the notice as an immediate turn; when it lands in
-    /// the queue instead (busy turn, store-append fallback, or a NEWER pending
-    /// question re-holding automatic deliveries) the entry is promoted to the
-    /// FRONT of the queue so the notice is the next delivery, ahead of parked
-    /// interrupts and held wakes. The promotion is a separate queue-lock
+    /// the queue instead (busy turn or store-append fallback) the entry is
+    /// promoted to the FRONT of the queue so the notice is the next delivery,
+    /// ahead of parked interrupts and wakes. The promotion is a separate queue-lock
     /// acquisition from the enqueue, so a concurrent drain can pop a
     /// previously parked entry (or the notice itself) in the window between
     /// them — benign: the notice still delivers, just not strictly first, and
@@ -7449,9 +8310,11 @@ impl Services {
             let mut metadata = json!({
                 "type": "event_notification",
                 "eventCount": 1,
+                // event-type-lint: allow — wake-metadata pseudo-type; never published on the bus
                 "eventTypes": ["agent:reportToParent"],
                 "events": [{
                     "id": uuid::Uuid::new_v4().to_string(),
+                    // event-type-lint: allow — wake-metadata pseudo-type; never published on the bus
                     "type": "agent:reportToParent",
                     "timestamp": saved_at,
                     "data": {
@@ -7754,24 +8617,20 @@ impl Services {
         // Everything below this branch (linked-task transition, parent wake,
         // watcher fan-out) stays immediate either way — backend coordination
         // must not wait for the child's turn to end.
+        let raise = crate::DeferredAttention {
+            meta_kind,
+            reason: reason.clone(),
+            saved_at: saved_at.clone(),
+            attention_data: attention_data.clone(),
+        };
         if self.agent_is_busy(caller.clone()) {
-            self.mark_deferred_attention(
-                &caller,
-                crate::DeferredAttention {
-                    meta_kind,
-                    reason: reason.clone(),
-                    saved_at: saved_at.clone(),
-                    attention_data: attention_data.clone(),
-                },
-            );
+            self.mark_deferred_attention(&caller, raise);
         } else {
             self.surface_attention_request(
                 &workspace_id,
                 &caller,
-                meta_kind,
-                &reason,
-                &saved_at,
-                &attention_data,
+                &raise,
+                session.notifications_muted,
             )
             .await;
         }
@@ -7922,7 +8781,10 @@ impl Services {
     ///   survives rehydration — best-effort, the session fields are the
     ///   durable contract;
     /// - the self-sufficient `agent:attention-requested` event (FE sticky
-    ///   toast);
+    ///   toast), stamped `notificationsMuted: true` (present only when true)
+    ///   when the session is muted — the stamp rides the published event
+    ///   ONLY, never the parent/watcher wake payload (the agent must not
+    ///   learn about the flag);
     /// - the debounced lastActivity schedule and the displayStatus
     ///   recompute (a pending request on a top-level agent promotes the
     ///   derived displayStatus to `needs_attention`, §6.5 step 0;
@@ -7931,16 +8793,21 @@ impl Services {
     ///
     /// Callers: the immediate arm of `agent_request_attention_op` (no
     /// in-flight turn) and [`Services::flush_deferred_attention`] (turn-end
-    /// flush of a mid-turn raise).
+    /// flush of a mid-turn raise). `raise` is the payload captured at raise
+    /// time; `notifications_muted` is the session's flag at surfacing time.
     pub(crate) async fn surface_attention_request(
         &self,
         workspace_id: &WorkspaceId,
         caller: &AgentId,
-        meta_kind: &str,
-        reason: &str,
-        saved_at: &str,
-        attention_data: &Value,
+        raise: &crate::DeferredAttention,
+        notifications_muted: bool,
     ) {
+        let crate::DeferredAttention {
+            meta_kind,
+            reason,
+            saved_at,
+            attention_data,
+        } = raise;
         let kind = attention_data
             .get("kind")
             .and_then(Value::as_str)
@@ -7979,11 +8846,15 @@ impl Services {
                 );
             }
         }
+        let mut event_data = attention_data.clone();
+        if notifications_muted {
+            event_data["notificationsMuted"] = Value::Bool(true);
+        }
         self.publish_agent_mutation_event(
             workspace_id,
             caller,
             intent_core::events::AGENT_ATTENTION_REQUESTED,
-            attention_data.clone(),
+            event_data,
         )
         .await;
         // Schedule debounced lastActivity event (§10.1).
@@ -8035,10 +8906,8 @@ impl Services {
             self.surface_attention_request(
                 workspace_id,
                 agent_id,
-                entry.meta_kind,
-                &entry.reason,
-                &entry.saved_at,
-                &entry.attention_data,
+                &entry,
+                session.notifications_muted,
             )
             .await;
         }
@@ -8136,6 +9005,23 @@ impl Services {
             .as_deref()
             .and_then(first_nonempty)
             .or_else(|| task_text_msg.clone());
+        // Collaborator sender preamble (multiplayer): `agentInstructions` /
+        // `taskText` are caller-supplied free text that reaches the child's
+        // model verbatim, so a collaborator's text is annotated like every
+        // other human-authored front door — BEFORE the TASK-C wrapper below,
+        // so the preamble heads the first message. The task-note fallback is
+        // note content, not the caller's text, and stays byte-identical; the
+        // helper is a no-op for owner / administrator / agent / absent callers.
+        // The same caller-supplied text also carries the caller's principal
+        // stamp (`fromPrincipalId`, exactly what the `agent.sendMessage` front
+        // door stamps) so the served row's author resolves to the sender, not
+        // the workspace owner; the note-content fallback is left unstamped.
+        let mut message_metadata = None;
+        if let Some(text) = message.as_mut() {
+            self.annotate_collaborator_sender(&workspace_id, text)
+                .await?;
+            message_metadata = crate::principal_ops::stamp_principal_attribution(None)?;
+        }
         // Load the linked task note whenever the delegation names one: the
         // note's title/body feeds the message fallback, the child name
         // derivation, and the TASK-C reference preamble that prefixes the
@@ -8246,17 +9132,11 @@ impl Services {
                 + 1
         });
         // D2: resolve the provider up front. Precedence (PROTOCOL §5.5):
-        // explicit `provider` param > compound-`model` prefix > specialist
-        // frontmatter `codingAgent` (or its compound `model` prefix) >
+        // explicit `provider` param > specialist frontmatter `codingAgent` >
         // settings-derived default. An explicit `provider` must be known and
-        // available, and a compound explicit `model` naming a DIFFERENT
-        // known provider is a contradiction — both reject with `-32602`
-        // before any side effect (an unknown compound prefix is left to
-        // `agent_create_op`'s unconditional prefix validation). When nothing
-        // resolves at all, `resolve_delegate_provider` fails loudly with
-        // `-32602` (monorepo#3044: no positional last resort); a compound
-        // explicit `model` (e.g. `opencode:kimi-k3`) pins its own provider
-        // via `agent_create_op`'s existing derivation.
+        // available — it rejects with `-32602` before any side effect. When
+        // nothing resolves at all, `resolve_delegate_provider` fails loudly
+        // with `-32602` (monorepo#3044: no positional last resort).
         // SECURITY: derive workspace_path from the stored workspace record,
         // never a client-supplied value (same rationale as
         // `agent_create_op`'s model resolution).
@@ -8272,82 +9152,87 @@ impl Services {
         // resolution failure (or only fail inside `agent_create_op` after the
         // resolution rungs silently skipped the specialist tiers). Runs
         // before any side effect, so a rejection leaves no orphaned child.
-        if let Some(spec_id) = input.specialist.as_deref() {
-            self.specialists_service()
-                .canonical_id_or_err(spec_id, workspace_path.as_deref())?;
-        }
-        let delegate_provider = if let Some(provider_param) = input.provider.as_deref() {
-            ensure_known_provider("agent.delegate", provider_param)?;
-            ensure_provider_available(
-                "agent.delegate",
-                provider_param,
-                &self.effective_settings().providers,
-            )?;
-            if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
-                let (prefix, _) = intent_providers::parse_compound_model_id(model);
-                if intent_providers::find_provider(&prefix)
-                    .is_some_and(|cfg| cfg.id != provider_param)
-                {
-                    return Err(Error::InvalidParams(format!(
-                        "agent.delegate: model {model} names provider {prefix} but provider is {provider_param}"
-                    )));
+        // The whole resolution cluster below — specialist canonicalization,
+        // provider guard, default-model and effort resolution — re-reads the
+        // specialist tier directories, so it runs on the blocking pool
+        // (monorepo#4148).
+        let services = self.clone();
+        let specialist_param = input.specialist.clone();
+        let provider_param_in = input.provider.clone();
+        let model_param = input.model.clone();
+        let effort_param = input.reasoning_effort.clone();
+        let ws_path = workspace_path.clone();
+        let (delegate_provider, effective_model, reasoning_effort) = tokio::task::spawn_blocking(
+            move || -> Result<(Option<String>, Option<String>, Option<String>)> {
+                if let Some(spec_id) = specialist_param.as_deref() {
+                    services
+                        .specialists_service()
+                        .canonical_id_or_err(spec_id, ws_path.as_deref())?;
                 }
-            }
-            Some(provider_param.to_string())
-        } else if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
-            // A compound explicit `model` pins its own provider (spawn
-            // precedence: the prefix outranks everything), so gate that
-            // prefix on the same full availability check as an explicit
-            // `provider` param — otherwise a disabled/uninstalled/env-gated
-            // provider smuggled in via the model prefix would persist a
-            // session and only fail at spawn (monorepo#3178). An unknown
-            // prefix is left to `agent_create_op`'s unconditional prefix
-            // validation; the provider itself stays `None` because
-            // `agent_create_op`'s existing derivation pins it from the model.
-            let (prefix, _) = intent_providers::parse_compound_model_id(model);
-            if intent_providers::find_provider(&prefix).is_some() {
-                ensure_provider_available(
-                    "agent.delegate",
-                    &prefix,
-                    &self.effective_settings().providers,
-                )?;
-            }
-            None
-        } else if input.model.is_none() {
-            resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
-        } else {
-            None
-        };
-        // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
-        // effort > specialist frontmatter > unset, validated against the
-        // cached catalog's `effortLevels` for the effective model. The
-        // effective model must be the one `agent_create_op` will actually
-        // pin — the explicit `model`, else the full default-model resolution
-        // (specialist frontmatter pin, then the settings chain) — so a
-        // specialist whose `modelOptions` entry keys on the settings default
-        // model still gets its option effort selected. Runs BEFORE the child
-        // is created so a `-32602` rejection is side-effect free.
-        let effective_model = input.model.clone().or_else(|| {
-            resolve_agent_default_model(
-                self,
-                input.specialist.as_deref(),
-                workspace_path.as_deref(),
-                delegate_provider.as_deref(),
-            )
-        });
-        let reasoning_effort = resolve_delegate_reasoning_effort(
-            self,
-            input.reasoning_effort.as_deref(),
-            input.specialist.as_deref(),
-            effective_model.as_deref(),
-            workspace_path.as_deref(),
-        );
+                let delegate_provider = if let Some(provider_param) = provider_param_in.as_deref() {
+                    ensure_known_provider("agent.delegate", provider_param)?;
+                    ensure_provider_available(
+                        "agent.delegate",
+                        provider_param,
+                        &services.effective_settings().providers,
+                    )?;
+                    Some(provider_param.to_string())
+                } else if model_param.is_none() {
+                    resolve_delegate_provider(
+                        &services,
+                        specialist_param.as_deref(),
+                        ws_path.as_deref(),
+                    )?
+                } else {
+                    None
+                };
+                // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
+                // effort > specialist frontmatter > unset, validated against the
+                // cached catalog's `effortLevels` for the effective model. The
+                // effective model must be the one `agent_create_op` will actually
+                // pin — the explicit `model`, else the full default-model resolution
+                // (specialist frontmatter pin, then the settings chain) — so a
+                // specialist whose `modelOptions` entry keys on the settings default
+                // model still gets its option effort selected. Runs BEFORE the child
+                // is created so a `-32602` rejection is side-effect free.
+                let effective_model = model_param.clone().or_else(|| {
+                    resolve_agent_default_model(
+                        &services,
+                        specialist_param.as_deref(),
+                        ws_path.as_deref(),
+                        delegate_provider.as_deref(),
+                    )
+                });
+                // The model-option rung matches on the effective `{ provider,
+                // model }` pair. With an explicit `model` param the provider
+                // was left `None` above, and `agent_create_op` then persists
+                // the settings-derived default (`resolve_provider_id`:
+                // provider field → settings default — the specialist's
+                // `codingAgent` never participates there); mirror exactly
+                // that so the pair match sees the provider the spawn will
+                // actually use.
+                let effective_provider = delegate_provider.clone().or_else(|| {
+                    crate::agent_session::derived_default_provider(&services.effective_settings())
+                });
+                let reasoning_effort = resolve_delegate_reasoning_effort(
+                    &services,
+                    effort_param.as_deref(),
+                    specialist_param.as_deref(),
+                    effective_provider.as_deref(),
+                    effective_model.as_deref(),
+                    ws_path.as_deref(),
+                );
+                Ok((delegate_provider, effective_model, reasoning_effort))
+            },
+        )
+        .await
+        .map_err(|e| Error::Internal(format!("agent.delegate resolution task failed: {e}")))??;
         // A blank resolved value is an explicit clear (see
         // `resolve_delegate_reasoning_effort`); only a real level is validated.
         if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.delegate",
-                &self.models_catalog,
+                &self.cached_models(),
                 effective_model.as_deref(),
                 effort,
             )?;
@@ -8484,7 +9369,7 @@ impl Services {
                         _release: settled,
                     };
                     let ws_id = workspace_id.clone();
-                    tokio::spawn(async move {
+                    intent_core::spawn_daemon(async move {
                         guard
                             .services
                             .provision_delegate_sandbox(&ws_id, &guard.aid, root)
@@ -8581,12 +9466,15 @@ impl Services {
                             workspace_id,
                             message,
                             None,
-                            crate::agent_manager::TurnOptions::default(),
+                            crate::agent_manager::TurnOptions {
+                                message_metadata: message_metadata.clone(),
+                                ..Default::default()
+                            },
                         )
                         .await
                 }
                 None => {
-                    self.agent_send_message_op(child, message, None, None, None, None)
+                    self.agent_send_message_op(child, message, None, None, None, message_metadata)
                         .await
                 }
             };
@@ -8817,13 +9705,9 @@ impl Services {
         // that doesn't override it, so validate it up front — before the
         // classification loop can start any task — rather than surfacing the
         // same failure as N per-row `error` dispositions after earlier rows
-        // already spawned. A top-level compound `model` default gets the same
-        // up-front gate on its prefix-named provider (spawn precedence: the
-        // prefix outranks `provider`), so a disabled/unrunnable provider
-        // smuggled in via the model default also fails once, up front.
-        // Per-entry `provider`/`model` overrides stay per-row (`error`
-        // disposition via the single-task path), consistent with the other
-        // per-entry options.
+        // already spawned. Per-entry `provider`/`model` overrides stay
+        // per-row (`error` disposition via the single-task path), consistent
+        // with the other per-entry options.
         if let Some(provider_param) = input.provider.as_deref() {
             ensure_known_provider("agent.delegate", provider_param)?;
             ensure_provider_available(
@@ -8831,16 +9715,6 @@ impl Services {
                 provider_param,
                 &self.effective_settings().providers,
             )?;
-        }
-        if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
-            let (prefix, _) = intent_providers::parse_compound_model_id(model);
-            if intent_providers::find_provider(&prefix).is_some() {
-                ensure_provider_available(
-                    "agent.delegate",
-                    &prefix,
-                    &self.effective_settings().providers,
-                )?;
-            }
         }
         // The top-level `specialist` is likewise the batch default shared by
         // every entry that doesn't override it — validate it once up front
@@ -8855,8 +9729,22 @@ impl Services {
                 .await
                 .ok()
                 .and_then(|w| crate::git_ops::worktree_path(&w));
-            self.specialists_service()
-                .canonical_id_or_err(spec_id, workspace_path.as_deref())?;
+            // Validation walks the specialist tier directories — blocking
+            // pool (monorepo#4148).
+            let services = self.clone();
+            let spec_id = spec_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                services
+                    .specialists_service()
+                    .canonical_id_or_err(&spec_id, workspace_path.as_deref())
+                    .map(|_| ())
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "agent.delegate batch specialist validation task failed: {e}"
+                ))
+            })??;
         }
         // Depth + watch-scope guards up front (the same checks the
         // single-task path runs before any side-effectful work) so a
@@ -9545,34 +10433,15 @@ impl Services {
             return Ok(());
         }
         let target_id = &target_session.id;
-        if self.has_ready_to_send(target_id)
-            || self.agent_is_busy(target_id.clone())
-            || target_session.attention_request_kind.is_some()
-            || self.agent_is_waiting_on_agents(target_id)
-            || !self
-                .list_event_subscriptions_for_agent(target_id)
-                .is_empty()
-            || self.pending_question_count(target_id).await > 0
+        match self
+            .agent_has_non_monitor_waiting_reason(target_session)
+            .await
         {
-            return Ok(());
-        }
-        match self.store.get_interrupted_agent(target_id).await {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
             Err(e) => {
                 tracing::warn!(
-                    "idle-target watch guard: interrupted_agent check failed for {}: {e}",
-                    target_id.0
-                );
-                return Ok(());
-            }
-        }
-        match self.store.count_active_hooks_by_agent(target_id).await {
-            Ok(0) => {}
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    "idle-target watch guard: active-hook count failed for {}: {e}",
+                    "idle-target watch guard: waiting-reason probe failed for {}: {e}",
                     target_id.0
                 );
                 return Ok(());
@@ -9594,6 +10463,38 @@ impl Services {
              agent.wakeOrCreate resumes its task",
             target_id.0
         )))
+    }
+
+    /// Every waiting reason [`Services::check_idle_target_watchable`] counts
+    /// EXCEPT active PR monitors: a ready-to-send queue entry, a busy
+    /// worker, an unresolved attention request, live outgoing completion
+    /// watches, live event subscriptions, pending structured questions, an
+    /// interrupted row, or active hooks. Shared with the PR-monitor
+    /// parent-takeover predicate (`pr_monitor.rs`), whose "the child has
+    /// nothing left to do but hold the monitor" test is exactly this set
+    /// being empty. The interrupted-row and hook probe failures are
+    /// propagated so each caller picks its own fail-open/fail-closed policy;
+    /// the pending-question probe keeps the convenience API's fail-open
+    /// `0`, so a fail-closed caller pre-checks with
+    /// [`Services::try_pending_question_count`].
+    pub(crate) async fn agent_has_non_monitor_waiting_reason(
+        &self,
+        session: &AgentSession,
+    ) -> Result<bool> {
+        let agent_id = &session.id;
+        if self.has_ready_to_send(agent_id)
+            || self.agent_is_busy(agent_id.clone())
+            || session.attention_request_kind.is_some()
+            || self.agent_is_waiting_on_agents(agent_id)
+            || !self.list_event_subscriptions_for_agent(agent_id).is_empty()
+            || self.pending_question_count(agent_id).await > 0
+        {
+            return Ok(true);
+        }
+        if self.store.get_interrupted_agent(agent_id).await?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.store.count_active_hooks_by_agent(agent_id).await? > 0)
     }
 
     /// The registration-time mutual-wait guard: rejects an explicit watch
@@ -10359,8 +11260,11 @@ impl Services {
         // no cancelled-in-memory group can rehydrate on restart. (A concurrent
         // `try_fire_group` racing this delete is benign: both deletes are
         // idempotent, and whichever removes the in-memory group first wins.)
+        // Routed through the group persistence lane so a create/enroll upsert
+        // still queued ahead cannot land after it (intent-hq/intent#4460).
         if let Some(group) = &target_group {
-            self.store.delete_delegation_group(&group.group_id).await?;
+            self.delete_delegation_group_persisted(&group.group_id)
+                .await?;
         }
 
         // Parent home workspaces to publish `agent:subscriptions-changed` in
@@ -10383,7 +11287,19 @@ impl Services {
             anchors.push(watch.parent_workspace_id);
         }
         if let Some(group) = target_group {
-            self.remove_group_with_watches(&agent_id, &group.group_id);
+            // The group stayed live between the up-front delete and this
+            // removal, so an enroll/completion upsert may sit on the lane
+            // behind that delete. The removal enqueues a trailing delete
+            // ordered after any such upsert; await it so `success` is not
+            // published while an undelivered row could still rehydrate.
+            if let Some((_, ack)) = self.remove_group_with_watches(&agent_id, &group.group_id) {
+                if let Err(e) = Self::await_group_persist(ack).await {
+                    tracing::warn!(
+                        group = %group.group_id,
+                        "trailing delegation_group delete failed after scoped cancel: {e}"
+                    );
+                }
+            }
             if !anchors.contains(&group.workspace_id) {
                 anchors.push(group.workspace_id);
             }
@@ -10405,13 +11321,15 @@ impl Services {
 
     /// Build [`AgentSnapshot`] for `agent_id` — the cheap per-turn digest
     /// behind `ws.agent.snapshot()` and the turn-prompt injection line
-    /// (`ws.agent.diagnostics` stays the deep-dive tool). O(this agent):
-    /// every field reads a per-agent registry length or a bounded per-agent
-    /// count statement — no workspace-wide scans, no transcript or blob
-    /// hydration (`prs` adds the workspace row plus the workspace's
-    /// registered git roots, both single bounded statements). `session` is
-    /// the caller's already-fetched summary row so the op path stays at one
-    /// session read.
+    /// (`ws.agent.diagnostics` stays the deep-dive tool). O(this agent) for
+    /// the per-agent fields: each reads a per-agent registry length or a
+    /// bounded per-agent count statement — no transcript or blob hydration.
+    /// Two fields are workspace-wide bounded aggregates instead: `prs` adds
+    /// the workspace row plus the workspace's registered git roots (both
+    /// single bounded statements), and `tasks` adds one indexed GROUP BY over
+    /// the workspace's task rows' status column (`idx_note_task`; no note
+    /// bodies). `session` is the caller's already-fetched summary row so the
+    /// op path stays at one session read.
     pub(crate) async fn build_agent_snapshot(
         &self,
         session: &AgentSession,
@@ -10463,6 +11381,10 @@ impl Services {
         // registered git roots) — no forge calls, no per-PR statements.
         // Fails open to None.
         let prs = self.tracked_open_prs_grouped(&session.workspace_id).await;
+        // One GROUP BY aggregate over the workspace's task rows (status
+        // column only, no note bodies); terminal statuses dropped here.
+        // Fails open to empty.
+        let tasks = self.open_task_status_counts(&session.workspace_id).await;
         // Whole-second UTC timestamp — the snapshot line is injected into
         // every turn prompt, so sub-second precision only spends tokens.
         let time = {
@@ -10484,8 +11406,33 @@ impl Services {
             num_questions_asked,
             pr_monitors,
             prs,
+            tasks,
             pending_attention: session.attention_request_kind.clone(),
         })
+    }
+
+    /// The snapshot's `tasks` field: the workspace's task-note counts per
+    /// non-terminal status from [`Store::count_tasks_by_status`] (one
+    /// aggregate statement, no content hydration), with `complete` and
+    /// `cancelled` removed. Best-effort — a store failure reads as empty so
+    /// a snapshot build never fails on it.
+    async fn open_task_status_counts(&self, workspace_id: &WorkspaceId) -> BTreeMap<String, usize> {
+        let counts = match self.store.count_tasks_by_status(workspace_id).await {
+            Ok(counts) => counts,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "task status count failed; snapshot tasks omitted"
+                );
+                return BTreeMap::new();
+            }
+        };
+        counts
+            .into_iter()
+            .filter(|(status, n)| *n > 0 && status != "complete" && status != "cancelled")
+            .map(|(status, n)| (status, usize::try_from(n).expect("value fits in usize")))
+            .collect()
     }
 
     /// The snapshot's `prs` field: the workspace's tracked open PRs grouped
@@ -10523,23 +11470,15 @@ impl Services {
                 Vec::new()
             }
         };
-        let mut pools: Vec<(&str, &str, &[PullRequestInfo])> = Vec::new();
+        let mut pools: Vec<(RepoRef, &[PullRequestInfo])> = Vec::new();
         if let Some(ws) = &workspace {
-            if let (Some(owner), Some(name), Some(prs)) = (
-                ws.repository_owner.as_deref(),
-                ws.repository_name.as_deref(),
-                ws.pull_requests.as_deref(),
-            ) {
-                pools.push((owner, name, prs));
+            if let (Some(repo), Some(prs)) = (ws.repo(), ws.pull_requests.as_deref()) {
+                pools.push((repo, prs));
             }
         }
         for root in &roots {
-            if let (Some(owner), Some(name), Some(prs)) = (
-                root.repo_owner.as_deref(),
-                root.repo_name.as_deref(),
-                root.pull_requests.as_deref(),
-            ) {
-                pools.push((owner, name, prs));
+            if let (Some(repo), Some(prs)) = (root.repo(), root.pull_requests.as_deref()) {
+                pools.push((repo, prs));
             }
         }
         grouped_open_prs(pools)
@@ -10603,8 +11542,7 @@ impl Services {
     /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
     /// responding raises a `stale-queue-entry` stuck-risk
     /// (intent-hq/monorepo#1897). Affirmatively-parked queues are excluded:
-    /// archived workspaces park every entry, and an active question hold
-    /// parks automatic (non-user-origin) entries — neither is stuck.
+    /// archived workspaces park every entry — that is not stuck.
     /// The daemon does not track per-agent event queues, deleted-agent
     /// references, or delivery health, so `deletedAgentReferences` and
     /// `recentEvents` are empty and `deliveryStats` is zeroed — honestly
@@ -11099,12 +12037,7 @@ impl Services {
         //
         // Affirmatively-parked queues are expected, not stuck: an archived
         // workspace parks every queue until unarchive (the drain kick then
-        // delivers), and an active question hold (PROTOCOL §5.5) parks
-        // automatic entries until the user answers or dismisses — but never
-        // user-origin entries, which drain through the hold, so a stale
-        // user-origin entry under a hold is still a genuine risk. Both checks
-        // are lazy — one workspace read per call and one bounded
-        // [`Services::question_hold_active`] session read per agent, paid
+        // delivers). The check is lazy — one workspace read per call, paid
         // only when a stale candidate actually exists.
         let mut workspace_archived: Option<bool> = None;
         for q in &queues {
@@ -11122,7 +12055,7 @@ impl Services {
             if actively_responding {
                 continue;
             }
-            let mut stale: Vec<(&str, i64)> = q["entries"]
+            let stale: Vec<(&str, i64)> = q["entries"]
                 .as_array()
                 .map(|entries| {
                     entries
@@ -11161,26 +12094,6 @@ impl Services {
             };
             if archived {
                 break;
-            }
-            let agent = AgentId(aid.to_string());
-            if self.question_hold_active(&agent).await {
-                let user_origin_ids: HashSet<String> = {
-                    let guard = self
-                        .agent_queues
-                        .lock()
-                        .expect("agent queue registry poisoned");
-                    guard
-                        .get(&agent)
-                        .map(|entries| {
-                            entries
-                                .iter()
-                                .filter(|m| m.user_origin)
-                                .map(|m| m.id.clone())
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                };
-                stale.retain(|(id, _)| user_origin_ids.contains(*id));
             }
             let Some((oldest_id, oldest_age)) = stale.iter().max_by_key(|(_, age)| *age) else {
                 continue;
@@ -11418,55 +12331,20 @@ impl Services {
                     .send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
-            (None, interrupt) => {
+            (None, _) => {
                 // Read-only fallback (no `agent_manager` wired): mirrors
                 // `agent_send_message` — plumb the metadata through the
                 // store-only append so attribution is consistent across
-                // deployments with and without a runtime manager. Question
-                // hold (PROTOCOL §5.5): sendToTask is automatic by
-                // definition, so an active hold parks the message instead
-                // of persisting a user row that buries the pending Q&A.
-                if self.question_hold_active(&agent).await {
-                    // A2A sender header (intent-hq/intent#3721, monorepo#1015): this hold-park
-                    // bypasses `agent_send_message_op`'s prepend, so the
-                    // queued entry is annotated here — the drain persist
-                    // then inherits it.
-                    let mut message = message;
-                    annotate_sender_attribution(&mut message, options.message_metadata.as_ref());
-                    let (queued, position) = self.enqueue_message(
-                        &agent,
-                        message,
-                        None,
-                        None,
-                        options.message_metadata,
-                        None,
-                        interrupt,
-                    );
-                    let held = json!({
-                        "success": true,
-                        "queued": true,
-                        "heldForQuestions": true,
-                        "queuedMessage": queued.to_value(position),
-                        "turnId": queued.turn_id,
-                    });
-                    self.publish_queue_updated(&agent).await;
-                    // Race close (hold-check → enqueue vs a concurrent
-                    // `dismissQuestions`/answer): this `(None, _)` arm only
-                    // runs with no `AgentManager` attached, so there is no
-                    // drain to kick here — same as the other store-only
-                    // fallbacks above.
-                    held
-                } else {
-                    self.agent_send_message_op(
-                        agent.clone(),
-                        message,
-                        None,
-                        None,
-                        None,
-                        options.message_metadata,
-                    )
-                    .await?
-                }
+                // deployments with and without a runtime manager.
+                self.agent_send_message_op(
+                    agent.clone(),
+                    message,
+                    None,
+                    None,
+                    None,
+                    options.message_metadata,
+                )
+                .await?
             }
         };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
@@ -11665,8 +12543,19 @@ impl Services {
             // mid-migration, sidestepping the helper's theoretical
             // failure-path duplicate (the rollback restore racing a
             // concurrent dequeue of an already-migrated entry).
+            //
+            // Everything keyed on a workspace from here on uses the live
+            // target's HOME, not the task/caller workspace
+            // (intent-hq/intent#5046): the migration helper's
+            // target-workspace guard would otherwise reject every
+            // cross-workspace target and strand its poisoned siblings'
+            // queues on each wake; `deliver_wake_message` rebinds to the
+            // same home itself; and the explicit drain kick below keys on
+            // it so the drained turn spawns where the wake did, never under
+            // the caller's workspace.
+            let target_home_ws = session.workspace_id.clone();
             let failed = self
-                .migrate_poisoned_queues_to(&poisoned, &agent_id, &workspace_id)
+                .migrate_poisoned_queues_to(&poisoned, &agent_id, &target_home_ws)
                 .await;
             // Failed migrations stay assigned (and out of the response's
             // `cleanedUpAgentIds`) so the next wakeOrCreate retries them.
@@ -11693,10 +12582,10 @@ impl Services {
             // Post-restart recovery: a woken agent must resume pending work.
             if !queued {
                 if let Some(mgr) = self.agent_manager() {
-                    tokio::spawn({
+                    intent_core::spawn_daemon({
                         let mgr = mgr.clone();
                         let agent_id = agent_id.clone();
-                        let workspace_id = workspace_id.clone();
+                        let workspace_id = target_home_ws;
                         async move {
                             mgr.try_drain_queue(agent_id, workspace_id).await;
                         }
@@ -11828,8 +12717,23 @@ impl Services {
         // `-32602`), and BEFORE the stale-assignment purge so a rejected
         // wake leaves task state untouched.
         if let Some(spec_id) = create_opts.specialist.as_deref() {
-            self.specialists_service()
-                .canonical_id_or_err(spec_id, workspace_path.as_deref())?;
+            // Validation walks the specialist tier directories — blocking
+            // pool (monorepo#4148).
+            let services = self.clone();
+            let spec_id = spec_id.to_string();
+            let wp = workspace_path.clone();
+            tokio::task::spawn_blocking(move || {
+                services
+                    .specialists_service()
+                    .canonical_id_or_err(&spec_id, wp.as_deref())
+                    .map(|_| ())
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "agent.wakeOrCreate specialist validation task failed: {e}"
+                ))
+            })??;
         }
 
         // Purge stale (NotFound / soft-deleted) assignments first so the
@@ -11855,14 +12759,26 @@ impl Services {
         // `create.specialist`, never to legacy stored state. Dropping means
         // the `.or()` below falls through to the (already-validated)
         // `create.specialist` when one was supplied, else no specialist.
-        let inherited_specialist = inheritance_source
+        let inherited_specialist = match inheritance_source
             .as_ref()
             .and_then(|s| s.specialist.clone())
-            .filter(|spec_id| {
-                let known = self
-                    .specialists_service()
-                    .canonical_id(spec_id, workspace_path.as_deref())
-                    .is_some();
+        {
+            Some(spec_id) => {
+                // The resolvability probe walks the specialist tiers —
+                // blocking pool (monorepo#4148); a JoinError counts as
+                // unresolved (the warn + fallback below), never failing the
+                // wake.
+                let services = self.clone();
+                let wp = workspace_path.clone();
+                let sid = spec_id.clone();
+                let known = tokio::task::spawn_blocking(move || {
+                    services
+                        .specialists_service()
+                        .canonical_id(&sid, wp.as_deref())
+                        .is_some()
+                })
+                .await
+                .unwrap_or(false);
                 if !known {
                     tracing::warn!(
                         specialist = %spec_id,
@@ -11870,8 +12786,10 @@ impl Services {
                         "agent.wakeOrCreate: dropping inherited specialist that no longer resolves; falling back to create.specialist"
                     );
                 }
-                known
-            });
+                known.then_some(spec_id)
+            }
+            None => None,
+        };
         let specialist = inherited_specialist.or(create_opts.specialist.clone());
         let model = input
             .model
@@ -11889,30 +12807,55 @@ impl Services {
         // full default-model resolution (specialist pin, then the settings
         // chain) so a `modelOptions` entry keyed on the settings default
         // model is still matched.
-        let effort_model = model.clone().or_else(|| {
-            resolve_agent_default_model(
-                self,
-                specialist.as_deref(),
-                workspace_path.as_deref(),
-                provider.as_deref(),
-            )
-        });
-        let reasoning_effort = resolve_delegate_reasoning_effort(
-            self,
-            input
+        // Same tier-walking resolvers as `agent.delegate` — blocking pool
+        // (monorepo#4148).
+        let (effort_model, reasoning_effort) = {
+            let services = self.clone();
+            let model = model.clone();
+            let specialist = specialist.clone();
+            let workspace_path = workspace_path.clone();
+            let provider = provider.clone();
+            let effort_param = input
                 .reasoning_effort
-                .as_deref()
-                .or(create_opts.reasoning_effort.as_deref()),
-            specialist.as_deref(),
-            effort_model.as_deref(),
-            workspace_path.as_deref(),
-        );
+                .clone()
+                .or_else(|| create_opts.reasoning_effort.clone());
+            tokio::task::spawn_blocking(move || {
+                let effort_model = model.or_else(|| {
+                    resolve_agent_default_model(
+                        &services,
+                        specialist.as_deref(),
+                        workspace_path.as_deref(),
+                        provider.as_deref(),
+                    )
+                });
+                // Same effective-provider rule as `agent.delegate`: without
+                // an explicit `create.provider`, `agent_create_op` persists
+                // the settings-derived default, so the model-option pair
+                // match keys on that same provider.
+                let effective_provider = provider.clone().or_else(|| {
+                    crate::agent_session::derived_default_provider(&services.effective_settings())
+                });
+                let reasoning_effort = resolve_delegate_reasoning_effort(
+                    &services,
+                    effort_param.as_deref(),
+                    specialist.as_deref(),
+                    effective_provider.as_deref(),
+                    effort_model.as_deref(),
+                    workspace_path.as_deref(),
+                );
+                (effort_model, reasoning_effort)
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("agent.wakeOrCreate resolution task failed: {e}"))
+            })?
+        };
         // A blank resolved value is an explicit clear (see
         // `resolve_delegate_reasoning_effort`); only a real level is validated.
         if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.wakeOrCreate",
-                &self.models_catalog,
+                &self.cached_models(),
                 effort_model.as_deref(),
                 effort,
             )?;
@@ -12143,21 +13086,53 @@ impl Services {
         // Up-front vanished-session gate (intent-hq/monorepo#2762): reject
         // nonexistent targets BEFORE any state change (the monorepo#564
         // contract). This covers the enqueue-only routes below
-        // (archived-workspace park, question hold, busy-agent fast enqueue)
+        // (archived-workspace park, retired park, busy-agent fast enqueue)
         // that return queued success without ever touching `agent_message` —
         // without it a wake racing an `agent.delete` parks a phantom entry no
         // drain can ever deliver. The append-failure arms keep their own
         // NotFound re-check as the check-then-act race guard.
-        if matches!(
-            self.store.get_agent_session_status(agent_id).await,
-            Err(Error::NotFound(_))
-        ) {
-            self.drop_queue(agent_id);
-            return Err(Error::InvalidParams(format!(
-                "unknown agent id: {}",
-                agent_id.0
-            )));
-        }
+        //
+        // The same session read binds the delivery to the target's OWN
+        // session workspace (intent-hq/intent#5046, the wake-path residual
+        // of intent-hq/intent#5017): `agent.wakeOrCreate` passes the waking
+        // CALLER's workspace, which `check_watch_scope` lets differ from the
+        // target's home (a sibling caller waking a chief-homed agent), and
+        // every scope-sensitive step below — the archived gate, the
+        // `try_begin` claim, the event echo, the drain kicks, and the spawn
+        // (`ensure_started` → `resolve_spawn` cwd + `create_agent`
+        // workspace-MCP scope) — must key on the workspace the target lives
+        // in. Any other lookup error fails CLOSED like the send routes'
+        // `require_agent_session`: unlike the archived/retired gates below
+        // (which fail open because their fallback is the normal path), a
+        // failed read here means the destination identity is unknown, and
+        // binding to the caller's workspace would be exactly the scope leak
+        // this guard exists to prevent. Nothing has been claimed, queued or
+        // published yet, so the caller may simply retry; the queue is left
+        // intact (only a confirmed-vanished session drops it).
+        let workspace_id = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => crate::agent_manager::AgentManager::session_workspace(
+                agent_id,
+                workspace_id,
+                &session,
+            ),
+            Err(Error::NotFound(_)) => {
+                self.drop_queue(agent_id);
+                return Err(Error::InvalidParams(format!(
+                    "unknown agent id: {}",
+                    agent_id.0
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.as_str(),
+                    error = %e,
+                    "wake delivery: session lookup failed; refusing to bind the delivery to the requested workspace"
+                );
+                return Err(e);
+            }
+        };
+        let workspace_id = &workspace_id;
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the wake front door — the
         // `agent.wakeOrCreate` context message carries the daemon-stamped
         // attribution, and this path persists/enqueues directly (it never
@@ -12169,7 +13144,17 @@ impl Services {
             c
         };
         let content = annotated.as_str();
-        let build_block = || match message_metadata {
+        // The `fromPrincipalId` stamp stays row-level only (parity with the
+        // drain-time `persist_user` fold).
+        let block_md = message_metadata.and_then(|md| match md {
+            Value::Object(m) => {
+                let mut m = m.clone();
+                m.remove(intent_core::FROM_PRINCIPAL_ID_KEY);
+                (!m.is_empty()).then_some(Value::Object(m))
+            }
+            other => Some(other.clone()),
+        });
+        let build_block = || match &block_md {
             Some(md) => json!({ "type": "text", "text": content, "messageMetadata": md }),
             None => json!({ "type": "text", "text": content }),
         };
@@ -12210,6 +13195,7 @@ impl Services {
                         message_metadata.cloned(),
                         None,
                         false,
+                        MessageOrigin::Automatic,
                     );
                     let result = json!({
                         "success": true,
@@ -12263,6 +13249,7 @@ impl Services {
                     message_metadata.cloned(),
                     None,
                     false,
+                    MessageOrigin::Automatic,
                 );
                 let result = json!({
                     "success": true,
@@ -12306,41 +13293,6 @@ impl Services {
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
-        // Question hold (PROTOCOL §5.5): wakes are automatic by definition
-        // (`agent.wakeOrCreate` context messages, reportToParent /
-        // completion-watch wakes) — while the target's hold is active they
-        // park in the queue instead of claiming the slot, so the pending Q&A
-        // is never superseded. Checked BEFORE `try_begin_turn` so even an
-        // idle asking agent holds the wake.
-        if self.question_hold_active(agent_id).await {
-            let (queued, position) = self.enqueue_message(
-                agent_id,
-                content_owned,
-                None,
-                None,
-                message_metadata.cloned(),
-                None,
-                false,
-            );
-            self.publish_queue_updated(agent_id).await;
-            // Race close (hold-check → enqueue vs a concurrent
-            // `dismissQuestions`/answer): re-check and kick the drain if the
-            // hold cleared while the enqueue above was in flight, mirroring
-            // `AgentManager::send_message`'s hold-gate re-check — otherwise
-            // this entry could be stranded with no future drain trigger.
-            if !self.question_hold_active(agent_id).await {
-                manager
-                    .clone()
-                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                    .await;
-            }
-            return Ok(json!({
-                "success": true,
-                "queued": true,
-                "heldForQuestions": true,
-                "queuedMessage": queued.to_value(position),
-            }));
-        }
         if !manager.try_begin_turn(agent_id, workspace_id).await {
             // Fast enqueue branch: the manager is already draining a turn. The
             // metadata rides along on the queue entry so the drain re-persist
@@ -12353,6 +13305,7 @@ impl Services {
                 message_metadata.cloned(),
                 None,
                 false,
+                MessageOrigin::Automatic,
             );
             self.publish_queue_updated(agent_id).await;
             return Ok(json!({
@@ -12414,6 +13367,7 @@ impl Services {
                     message_metadata.cloned(),
                     None,
                     false,
+                    MessageOrigin::Automatic,
                 );
                 self.publish_queue_updated(agent_id).await;
                 manager
@@ -12441,11 +13395,18 @@ impl Services {
         // non-goal — the worker still mints one internally at spawn).
         self.publish_agent_message_events(workspace_id, agent_id, &message, None)
             .await;
+        // The worker's options carry the same row-level metadata so a
+        // terminal spawn/turn failure requeues the wake WITH its tag and
+        // principal stamp (`agent.getQueue` / `agent:queue:*` / the retry
+        // turn keep the author); the row itself is already persisted above.
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
             workspace_id.clone(),
             content_owned,
-            crate::agent_manager::TurnOptions::default(),
+            crate::agent_manager::TurnOptions {
+                message_metadata: message_metadata.cloned(),
+                ..Default::default()
+            },
         );
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
@@ -12466,43 +13427,6 @@ impl Services {
     where
         F: Fn() -> Value,
     {
-        // Question hold (PROTOCOL §5.5): same automatic-delivery gate as the
-        // runtime path above — the store-only persist would append the user
-        // row whose turn would bury the pending Q&A, so park the wake in the queue
-        // instead (hermetic wiring keeps the hold contract testable).
-        if self.question_hold_active(agent_id).await {
-            let (queued, position) = self.enqueue_message(
-                agent_id,
-                content.to_string(),
-                None,
-                None,
-                message_metadata.cloned(),
-                None,
-                false,
-            );
-            let result = json!({
-                "success": true,
-                "queued": true,
-                "heldForQuestions": true,
-                "queuedMessage": queued.to_value(position),
-            });
-            self.publish_queue_updated(agent_id).await;
-            // Race close (hold-check → enqueue vs a concurrent
-            // `dismissQuestions`/answer), same shape as the runtime path
-            // above. This wiring has no attached `AgentManager` by
-            // definition (that is why we are in the store-only fallback),
-            // so there is nothing to kick — the re-check only matters if a
-            // manager is (or becomes) attached, which `try_drain_queue`
-            // itself would then handle on its own next trigger.
-            if !self.question_hold_active(agent_id).await {
-                if let Some(manager) = self.agent_manager() {
-                    manager
-                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                        .await;
-                }
-            }
-            return Ok(result);
-        }
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         // Row-level metadata parity with the runtime branch (monorepo#1217).
@@ -12560,6 +13484,7 @@ impl Services {
                     message_metadata.cloned(),
                     None,
                     false,
+                    MessageOrigin::Automatic,
                 );
                 let result = json!({
                     "success": true,
@@ -12597,7 +13522,7 @@ impl Services {
             let now = now_iso();
             note.metadata.task = Some(task);
             note.updated_at = now;
-            self.store.update_note(&note).await?;
+            self.store.update_note_metadata(&note).await?;
         }
         Ok(())
     }
@@ -12626,13 +13551,24 @@ impl Services {
     /// of the interrupt message on drain; sends without prepend content pass
     /// `None`.
     ///
-    /// `interrupt` marks a `priority: "interrupt"` enqueue (question hold /
-    /// PROTOCOL §5.5): the entry is inserted AFTER the queue's leading
-    /// interrupt entries but AHEAD of all normal entries — arrival order is
-    /// preserved among interrupts, and every fallback path that parks an
-    /// interrupt (hold gate, busy race, quarantine park, append-failure
-    /// auto-queue) shares this ordering. Normal enqueues append at the tail.
-    #[allow(clippy::too_many_arguments)]
+    /// `interrupt` marks a `priority: "interrupt"` enqueue (PROTOCOL §5.5):
+    /// the entry is inserted AFTER the queue's leading interrupt entries but
+    /// AHEAD of all normal entries — arrival order is preserved among
+    /// interrupts, and every fallback path that parks an interrupt (archived
+    /// gate, busy race, quarantine park, append-failure auto-queue) shares
+    /// this ordering. Normal enqueues append at the tail.
+    ///
+    /// `origin` is required at every call site — there is deliberately no
+    /// defaulting wrapper (intent-hq/intentd#1790: a user reply parked through
+    /// a defaulting path was recorded as automatic origin, so the drain never
+    /// cleared the pending attention request). `MessageOrigin::User` records
+    /// that the entry carries a USER-originated message — an
+    /// `agent.sendMessage` parked by a queue-fallback path (busy race,
+    /// quarantine, append-failure) or a user-typed `agent.queueMessage`
+    /// entry. The archived-workspace drain gate delivers post-archive
+    /// user-origin entries instead of parking them (intent-hq/intent#3883),
+    /// and a drained user-origin entry keeps its originator's semantics.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
@@ -12642,38 +13578,9 @@ impl Services {
         message_metadata: Option<Value>,
         prepend: Option<QueuedPrepend>,
         interrupt: bool,
+        origin: MessageOrigin,
     ) -> (QueuedMessage, usize) {
-        self.enqueue_message_with_origin(
-            agent_id,
-            content,
-            image_blocks,
-            file_blocks,
-            message_metadata,
-            prepend,
-            interrupt,
-            false,
-        )
-    }
-
-    /// [`Services::enqueue_message`] with an explicit `user_origin` marker:
-    /// `true` records that the entry carries a USER-originated
-    /// `agent.sendMessage` parked by a queue-fallback path (busy race,
-    /// quarantine, append-failure). The question-hold drain gates deliver
-    /// user-origin entries instead of suspending (PROTOCOL §5.5: a user
-    /// answer must never deadlock against the hold its answer tag releases).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn enqueue_message_with_origin(
-        &self,
-        agent_id: &AgentId,
-        content: String,
-        image_blocks: Option<Value>,
-        file_blocks: Option<Value>,
-        message_metadata: Option<Value>,
-        prepend: Option<QueuedPrepend>,
-        interrupt: bool,
-        user_origin: bool,
-    ) -> (QueuedMessage, usize) {
-        self.enqueue_message_with_id_and_origin(
+        self.enqueue_message_with_id(
             agent_id,
             None,
             content,
@@ -12682,15 +13589,16 @@ impl Services {
             message_metadata,
             prepend,
             interrupt,
-            user_origin,
+            origin,
         )
     }
 
     /// Queue a message under a caller-selected durable id. Completion-watch
     /// delivery uses this so a restart retry adopts the already-persisted queue
-    /// entry instead of creating a duplicate terminal wake.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn enqueue_message_with_id_and_origin(
+    /// entry instead of creating a duplicate terminal wake. `origin` is stored
+    /// as the entry's `user_origin` flag (see [`Services::enqueue_message`]).
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_message_with_id(
         &self,
         agent_id: &AgentId,
         message_id: Option<String>,
@@ -12700,7 +13608,7 @@ impl Services {
         message_metadata: Option<Value>,
         prepend: Option<QueuedPrepend>,
         interrupt: bool,
-        user_origin: bool,
+        origin: MessageOrigin,
     ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
         let id = message_id.unwrap_or_else(new_message_id);
@@ -12729,7 +13637,7 @@ impl Services {
             prepend_image_blocks: prepend.image_blocks,
             prepend_file_blocks: prepend.file_blocks,
             interrupt_priority: interrupt,
-            user_origin,
+            user_origin: origin.is_user(),
             hold_kind: None,
             hold_until: None,
             child_agent_id: None,
@@ -12743,6 +13651,49 @@ impl Services {
             queue.push(queued.clone());
             queue.len() - 1
         };
+        (queued, position)
+    }
+
+    /// [`Services::enqueue_message_with_id`] for an `agent.sendMessage` into
+    /// an `Error` session that lost the in-flight slot (intent-hq/intent#4962):
+    /// queues the entry AND records it as the agent's parked recovery send
+    /// in one critical section under the draining lock — the lock every
+    /// committed pop ([`Services::pop_draining`]) holds while it retires the
+    /// marker. A pop therefore either precedes the enqueue (and finds no
+    /// entry) or follows the marker (and retires it); it can never slip
+    /// between the two and leave a marker authorizing an entry a competing
+    /// drain has already dispatched (and then requeued under its ORIGINAL
+    /// id on a context-size failure). Replaces any earlier marker: the newer
+    /// send is the authorization that stands.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_recovery_send(
+        &self,
+        agent_id: &AgentId,
+        message_id: String,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        origin: MessageOrigin,
+    ) -> (QueuedMessage, usize) {
+        let _draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let (queued, position) = self.enqueue_message_with_id(
+            agent_id,
+            Some(message_id),
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            origin,
+        );
+        self.mark_parked_recovery_send(agent_id, queued.id.clone());
         (queued, position)
     }
 
@@ -12816,7 +13767,7 @@ impl Services {
     /// persist/publish the updated queue, and kick delivery (wakes an idle
     /// agent; a busy agent picks the entry up at its next drain). Returns
     /// `true` iff a held entry existed for the key.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) async fn release_held_message(
         &self,
         agent_id: &AgentId,
@@ -12941,6 +13892,7 @@ impl Services {
         };
         !events.is_empty()
             && events.iter().all(|e| {
+                // event-type-lint: allow — matches the wake-metadata pseudo-type above
                 e.get("type").and_then(|t| t.as_str()) == Some("agent:reportToParent")
                     && e.get("data")
                         .and_then(|d| d.get("agentId"))
@@ -13071,7 +14023,7 @@ impl Services {
         let services = self.clone();
         let agent = agent_id.clone();
         let mid = message_id.to_string();
-        let task = tokio::spawn(async move {
+        let task = intent_core::spawn_daemon(async move {
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
@@ -13165,10 +14117,10 @@ impl Services {
         }
     }
 
-    /// Kick the runtime drain for an agent (hold release/flush path): look up
-    /// the owning workspace and defer to the manager's `try_drain_queue` —
-    /// which no-ops when the agent is busy (the released entry then rides the
-    /// normal end-of-turn drain) and starts a turn when idle. Quiet no-op
+    /// Kick the runtime drain for an agent (flush path): look up the owning
+    /// workspace and defer to the manager's `try_drain_queue` — which no-ops
+    /// when the agent is busy (the parked entry then rides the normal
+    /// end-of-turn drain) and starts a turn when idle. Quiet no-op
     /// when no manager is attached (read-only/test wiring) or the session row
     /// is gone.
     async fn kick_queue_drain(&self, agent_id: &AgentId) {
@@ -13233,12 +14185,11 @@ impl Services {
         Some(queue.remove(idx))
     }
 
-    /// Pop the oldest ready-to-send **user-origin** queued message, if any
-    /// (question hold, PROTOCOL §5.5). While the hold is active the drain
-    /// paths deliver ONLY user-origin entries — a user answer parked by the
-    /// turn-end busy race must reach the transcript instead of deadlocking
-    /// behind the hold its answer tag releases; automatic entries stay
-    /// parked.
+    /// Pop the oldest ready-to-send **user-origin** queued message, if any.
+    /// Under the archived-workspace drain exemption
+    /// (intent-hq/intent#3883) the drain delivers ONLY user-origin entries —
+    /// the user's send into the archived workspace is the resurrection
+    /// signal; automatic entries stay parked until unarchive.
     pub(crate) fn dequeue_user_origin_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
@@ -13255,14 +14206,13 @@ impl Services {
     /// EVERY ready-to-send entry in stored order — which IS the drain order
     /// (interrupt-priority first, then FIFO); `editing: true` entries stay
     /// queued — so the drain can deliver them as one combined provider turn.
-    /// `require_user_origin` mirrors the question-hold contract
-    /// (monorepo#1791): while the hold is active the flush fires ONLY when a
-    /// ready user-origin entry is present — a user delivery is starting a
-    /// turn anyway, so the parked automatic entries ride along FIFO instead
-    /// of being bypassed by the newer user message; with NO user-origin
-    /// entry ready the whole batch is a no-op and automatic entries stay
-    /// parked (an automatic delivery must never start a turn over the
-    /// pending Q&A). Returns `None` — leaving the queue untouched — unless
+    /// `require_user_origin` mirrors the archived-workspace drain exemption
+    /// (intent-hq/intent#3883): the flush fires ONLY when a ready
+    /// user-origin entry is present — a user delivery is starting a turn
+    /// anyway, so the parked automatic entries ride along FIFO instead of
+    /// being bypassed by the newer user message; with NO user-origin entry
+    /// ready the whole batch is a no-op and automatic entries stay parked.
+    /// Returns `None` — leaving the queue untouched — unless
     /// at least `min_ready` entries are ready, so callers keep the
     /// single-entry drain path byte-for-byte when too few messages are
     /// waiting.
@@ -13334,14 +14284,15 @@ impl Services {
 
     /// Mode-dispatching batch dequeue for `agents.flushQueuedMessages`: `All`
     /// defers to [`Services::dequeue_ready_batch`] (every ready entry;
-    /// `require_user_origin` under an active hold — the flush fires only
-    /// when a user-origin entry is ready, carrying the parked automatic
-    /// entries along FIFO, monorepo#1791); `SystemOnly` defers to
-    /// [`Services::dequeue_system_only_batch`] (system-origin entries
-    /// anywhere in the queue) but NEVER batches while a hold is active
-    /// (`require_user_origin`) — the hold's release is a user-origin entry,
-    /// which `SystemOnly` by definition excludes; `Off` always returns `None`
-    /// so every caller falls through to the single-entry FIFO path.
+    /// `require_user_origin` under the archived-workspace exemption — the
+    /// flush fires only when a user-origin entry is ready, carrying the
+    /// parked automatic entries along FIFO, intent-hq/intent#3883);
+    /// `SystemOnly` defers to [`Services::dequeue_system_only_batch`]
+    /// (system-origin entries anywhere in the queue) but NEVER batches under
+    /// that exemption (`require_user_origin`) — the exemption's trigger is a
+    /// user-origin entry, which `SystemOnly` by definition excludes; `Off`
+    /// always returns `None` so every caller falls through to the
+    /// single-entry FIFO path.
     pub(crate) fn dequeue_flush_batch(
         &self,
         agent_id: &AgentId,
@@ -13439,9 +14390,134 @@ impl Services {
             .is_some_and(|q| q.iter().any(QueuedMessage::ready_to_send))
     }
 
-    /// `true` iff at least one ready-to-send queued entry is user-origin
-    /// (question hold, PROTOCOL §5.5): the hold-gated drain paths use this
-    /// to decide whether a drain may proceed for the user entry alone.
+    /// `true` iff the agent's queue still holds a ready-to-send entry with
+    /// this exact `id` — the test-side view of what
+    /// [`Self::claim_parked_recovery_send`] would pop.
+    #[cfg(test)]
+    pub(crate) fn is_message_queued(&self, agent_id: &AgentId, message_id: &str) -> bool {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .is_some_and(|q| q.iter().any(|m| m.id == message_id && m.ready_to_send()))
+    }
+
+    /// Record a user send parked by the busy race as the agent's pending
+    /// recovery send (intent-hq/intent#4962); see `Services::parked_recovery_sends`.
+    /// Production records it through [`Self::enqueue_recovery_send`], atomically
+    /// with the enqueue; tests seed markers directly. Replaces any earlier
+    /// marker: the newer send is the authorization that stands.
+    pub(crate) fn mark_parked_recovery_send(&self, agent_id: &AgentId, message_id: String) {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .insert(agent_id.clone(), message_id);
+    }
+
+    /// The agent's pending recovery-send marker, if any — a cheap peek so a
+    /// probe skips the drain's store reads when nothing is parked. Never
+    /// authority: only [`Self::claim_parked_recovery_send`], under the slot
+    /// claim, hands the entry out.
+    pub(crate) fn parked_recovery_send(&self, agent_id: &AgentId) -> Option<String> {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .get(agent_id)
+            .cloned()
+    }
+
+    /// Dispatch the agent's parked recovery send (intent-hq/intent#4962):
+    /// read the marker, pop exactly that entry iff it is queued and
+    /// `ready_to_send`, and retire the marker — one critical section under
+    /// the draining lock, the same lock every committed pop holds while it
+    /// retires the marker, so no delivery can interleave with the decision.
+    /// The redrive calls this INSIDE its in-flight slot claim
+    /// (`AgentManager::claim_slot_sync`): the slot is taken only together
+    /// with the entry, so there is never an authorization living outside
+    /// this registry — no local id to go stale across gate awaits, nothing
+    /// to hand back on a lost claim, and no turn-start side effect (the
+    /// `Active` persist, `stop_reason` clear) unless a delivery follows.
+    ///
+    /// A marker whose entry is under edit, or was popped provisionally by a
+    /// path that has not yet won the slot (`agent.sendQueuedMessageNow`, the
+    /// worker's raced pop), is left standing ([`RecoverySendClaim::Deferred`])
+    /// — the provisional holder either commits the delivery, retiring it,
+    /// or hands the entry back for a later probe. A marker whose entry is in
+    /// neither the queue nor the draining overlay is stale (removed, or
+    /// re-minted under a new id by a terminal-failure requeue) and dropped.
+    pub(crate) fn claim_parked_recovery_send(&self, agent_id: &AgentId) -> RecoverySendClaim {
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let Some(message_id) = self.parked_recovery_send(agent_id) else {
+            return RecoverySendClaim::Absent;
+        };
+        let (popped, queued) = {
+            let mut queues = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            match queues.get_mut(agent_id) {
+                Some(queue) => match queue.iter().position(|m| m.id == message_id) {
+                    Some(idx) if queue[idx].ready_to_send() => (Some(queue.remove(idx)), true),
+                    Some(_) => (None, true),
+                    None => (None, false),
+                },
+                None => (None, false),
+            }
+        };
+        if let Some(entry) = popped {
+            self.parked_recovery_sends
+                .lock()
+                .expect("parked recovery send registry poisoned")
+                .remove(agent_id);
+            let guard =
+                self.register_draining(&mut draining, agent_id, std::slice::from_ref(&entry));
+            return RecoverySendClaim::Drained(Box::new((entry, guard)));
+        }
+        let popped_provisionally = draining
+            .get(agent_id)
+            .is_some_and(|d| d.iter().any(|m| m.id == message_id));
+        if queued || popped_provisionally {
+            return RecoverySendClaim::Deferred;
+        }
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .remove(agent_id);
+        RecoverySendClaim::Absent
+    }
+
+    /// Retire the parked recovery-send marker (intent-hq/intent#4962) when a
+    /// delivery of its entry is committed: the send it authorized is now in
+    /// flight, so a later requeue of the same entry — a context-size requeue
+    /// keeps the ORIGINAL id — must not re-validate it and lift the STAB-52
+    /// gate. Pops made under a held slot commit inside
+    /// [`Self::pop_draining`]; a provisional pop (`agent.sendQueuedMessageNow`,
+    /// the worker's raced pop — both pop BEFORE claiming the slot and hand
+    /// the entry back on a lost claim) calls this once its claim succeeds,
+    /// so an undelivered hand-back never strands the recovery send.
+    pub(crate) fn commit_recovery_send_delivery(
+        &self,
+        agent_id: &AgentId,
+        entries: &[QueuedMessage],
+    ) {
+        let mut parked = self
+            .parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned");
+        if parked
+            .get(agent_id)
+            .is_some_and(|id| entries.iter().any(|m| m.id == *id))
+        {
+            parked.remove(agent_id);
+        }
+    }
+
+    /// `true` iff at least one ready-to-send queued entry is user-origin:
+    /// the archived-drain exemption's legacy-row fallback (no `archivedAt`)
+    /// uses this to decide whether a drain may proceed for the user entry.
     pub(crate) fn has_user_origin_ready(&self, agent_id: &AgentId) -> bool {
         self.agent_queues
             .lock()
@@ -13509,13 +14585,208 @@ impl Services {
     /// Snapshot the current queue contents as wire-shape `QueuedMessage` JSON
     /// (the §5.5 `{id, content, queuedAt, position, imageBlocks?, fileBlocks?}` shape) for
     /// `agent.getQueue` and the `agent:queue:updated` payload (§6).
+    ///
+    /// Entries a drain arm has popped but not yet delivered (§6.5 drain
+    /// ordering; see [`DrainingGuard`]) are listed FIRST, in drain order,
+    /// ahead of the live queue — so a snapshot taken by an unrelated
+    /// concurrent mutation (enqueue / edit / remove of another entry) still
+    /// shows the in-flight entry until its user row is persisted. A draining
+    /// entry that has already been handed back to the live queue (slot race,
+    /// persist-failure requeue — which mints a NEW id but keeps the entry's
+    /// `turnId`) is listed once, from the live queue.
     pub(crate) fn queue_snapshot(&self, agent_id: &AgentId) -> Vec<Value> {
-        self.agent_queues
+        let draining = self
+            .draining_queue_entries
             .lock()
-            .expect("agent queue registry poisoned")
+            .expect("draining queue registry poisoned");
+        let live = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let live = live.get(agent_id).map(Vec::as_slice).unwrap_or_default();
+        draining
             .get(agent_id)
-            .map(|q| q.iter().enumerate().map(|(i, m)| m.to_value(i)).collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter(|d| !live.iter().any(|m| m.id == d.id || m.turn_id == d.turn_id))
+            .chain(live.iter())
+            .enumerate()
+            .map(|(i, m)| m.to_value(i))
+            .collect()
+    }
+
+    /// Pop the next ready-to-send entry ([`Services::dequeue_message`]) and,
+    /// atomically with respect to [`Services::queue_snapshot`], keep it
+    /// listed as draining until the returned [`DrainingGuard`] is dropped
+    /// (§6.5 drain ordering). The caller holds the in-flight slot: the pop
+    /// commits the delivery ([`PopCommit::Delivery`]).
+    pub(crate) fn dequeue_message_draining(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<(QueuedMessage, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_message(agent_id),
+            std::slice::from_ref,
+            PopCommit::Delivery,
+        )
+    }
+
+    /// [`Services::dequeue_message_draining`] for the worker's end-of-turn
+    /// raced pop, which pops BEFORE re-claiming the slot and hands the entry
+    /// back on a lost claim: the pop is provisional
+    /// ([`PopCommit::Provisional`]) and the caller commits with
+    /// [`Services::commit_recovery_send_delivery`] once its claim succeeds.
+    pub(crate) fn dequeue_message_draining_provisional(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<(QueuedMessage, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_message(agent_id),
+            std::slice::from_ref,
+            PopCommit::Provisional,
+        )
+    }
+
+    /// [`Services::dequeue_user_origin_message`] with the same draining
+    /// registration as [`Services::dequeue_message_draining`].
+    pub(crate) fn dequeue_user_origin_message_draining(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<(QueuedMessage, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_user_origin_message(agent_id),
+            std::slice::from_ref,
+            PopCommit::Delivery,
+        )
+    }
+
+    /// [`Services::dequeue_flush_batch`] with the same draining registration
+    /// as [`Services::dequeue_message_draining`]; one guard covers the batch.
+    pub(crate) fn dequeue_flush_batch_draining(
+        &self,
+        agent_id: &AgentId,
+        mode: intent_core::FlushQueuedMessagesMode,
+        require_user_origin: bool,
+        min_ready: usize,
+    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_flush_batch(agent_id, mode, require_user_origin, min_ready),
+            Vec::as_slice,
+            PopCommit::Delivery,
+        )
+    }
+
+    /// [`Services::dequeue_ready_batch`] with the same draining registration
+    /// as [`Services::dequeue_message_draining`]; one guard covers the batch.
+    pub(crate) fn dequeue_ready_batch_draining(
+        &self,
+        agent_id: &AgentId,
+        require_user_origin: bool,
+        min_ready: usize,
+    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_ready_batch(agent_id, require_user_origin, min_ready),
+            Vec::as_slice,
+            PopCommit::Delivery,
+        )
+    }
+
+    /// [`Services::dequeue_system_only_batch`] with the same draining
+    /// registration as [`Services::dequeue_message_draining`].
+    pub(crate) fn dequeue_system_only_batch_draining(
+        &self,
+        agent_id: &AgentId,
+        min_ready: usize,
+    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_system_only_batch(agent_id, min_ready),
+            Vec::as_slice,
+            PopCommit::Delivery,
+        )
+    }
+
+    /// [`Services::take_queued_message`] with the same draining registration
+    /// as [`Services::dequeue_message_draining`] (`agent.sendQueuedMessageNow`).
+    /// The caller pops BEFORE claiming the slot and hands the entry back on
+    /// a lost claim, so the pop is provisional ([`PopCommit::Provisional`]);
+    /// it commits with [`Services::commit_recovery_send_delivery`] once the
+    /// claim succeeds.
+    pub(crate) fn take_queued_message_draining(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Option<(QueuedMessage, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.take_queued_message(agent_id, message_id),
+            std::slice::from_ref,
+            PopCommit::Provisional,
+        )
+    }
+
+    /// Record already-popped `entries` as draining for `agent_id` (a batch a
+    /// caller assembled outside the pop helpers above).
+    #[cfg(test)]
+    pub(crate) fn mark_draining(
+        &self,
+        agent_id: &AgentId,
+        entries: &[QueuedMessage],
+    ) -> DrainingGuard {
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        self.register_draining(&mut draining, agent_id, entries)
+    }
+
+    /// Run a live-queue pop while holding the draining overlay lock (taken
+    /// BEFORE `agent_queues`, the order [`Services::queue_snapshot`] uses), so
+    /// no snapshot can observe the popped entries in neither place; the popped
+    /// entries are recorded as draining and the returned [`DrainingGuard`]
+    /// retires them. A [`PopCommit::Delivery`] pop also retires the parked
+    /// recovery-send marker under the same lock
+    /// ([`Services::commit_recovery_send_delivery`]).
+    fn pop_draining<T>(
+        &self,
+        agent_id: &AgentId,
+        pop: impl FnOnce(&Self) -> Option<T>,
+        entries: impl FnOnce(&T) -> &[QueuedMessage],
+        commit: PopCommit,
+    ) -> Option<(T, DrainingGuard)> {
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let popped = pop(self)?;
+        let entries = entries(&popped);
+        if commit == PopCommit::Delivery {
+            self.commit_recovery_send_delivery(agent_id, entries);
+        }
+        let guard = self.register_draining(&mut draining, agent_id, entries);
+        Some((popped, guard))
+    }
+
+    fn register_draining(
+        &self,
+        draining: &mut HashMap<AgentId, Vec<QueuedMessage>>,
+        agent_id: &AgentId,
+        entries: &[QueuedMessage],
+    ) -> DrainingGuard {
+        draining
+            .entry(agent_id.clone())
+            .or_default()
+            .extend(entries.iter().cloned());
+        DrainingGuard {
+            overlay: Arc::clone(&self.draining_queue_entries),
+            agent_id: agent_id.clone(),
+            ids: entries.iter().map(|m| m.id.clone()).collect(),
+        }
     }
 
     /// Like [`Services::queue_snapshot`] but with each entry's `content`
@@ -13683,19 +14954,16 @@ impl Services {
     /// is wired, the call is a quiet no-op rather than an error: the durable
     /// mutation is the source of truth and a missing event is not fatal.
     ///
-    /// The queue snapshot is taken **outside** the mutex it lives behind, but
-    /// since this method only reads (under a brief lock that is dropped before
-    /// the await) it never holds the queue lock across an `await` point. The
-    /// snapshot is taken after the session lookup so the event payload and the
-    /// write-through snapshot in [`publish_queue_updated_for`] reflect queue
-    /// state from (nearly) the same moment.
+    /// The snapshot itself is read by [`Services::publish_queue_event`] right
+    /// before the bus write, never here: capturing it ahead of the session
+    /// lookup / write-through awaits would let this publisher emit a queue
+    /// older than a mutation that completed while it was suspended.
     pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
         let workspace_id = match self.store.get_agent_session(agent_id).await {
             Ok(s) => s.workspace_id,
             Err(_) => return,
         };
-        let queue = self.queue_snapshot(agent_id);
-        self.publish_queue_updated_for(agent_id, &workspace_id, queue)
+        self.publish_queue_updated_for(agent_id, &workspace_id)
             .await;
     }
 
@@ -13706,28 +14974,69 @@ impl Services {
     /// Every queue mutation flows through here (or through
     /// [`publish_queue_updated`], which delegates here), so this is also the
     /// single write-through choke point: the durable `agent_queue` snapshot is
-    /// refreshed before the event is published.
+    /// refreshed before the event is published. The published snapshot is
+    /// read AFTER the persist await (inside the publish gate), so it is never
+    /// older than the durable state and never older than any mutation that
+    /// landed while the persist was pending.
     pub(crate) async fn publish_queue_updated_for(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-        queue: Vec<Value>,
     ) {
         self.persist_queue_snapshot(agent_id).await;
-        self.publish_queue_event(agent_id, workspace_id, queue)
-            .await;
+        self.publish_queue_event(agent_id, workspace_id).await;
     }
 
-    /// Publish `agent:queue:updated` WITHOUT the write-through persist — for
-    /// the one caller ([`Services::migrate_queue_and_gc_poisoned_session`])
-    /// whose durable snapshot was already committed by an atomic store op.
-    /// Everything else goes through [`Services::publish_queue_updated_for`].
-    async fn publish_queue_event(
+    /// Drain-delivery half of [`Services::publish_queue_updated_for`] (§6.5
+    /// drain ordering): the drain arms run the write-through persist of the
+    /// shrunk queue at dequeue time ([`Services::persist_queue_snapshot`],
+    /// unchanged durability window) but publish the shrunk
+    /// `agent:queue:updated` only AFTER the drained entry's user row is
+    /// persisted — after its `agent:message` echo and, for a tagged
+    /// `question_answers` answer, the marker-clearing `agent:updated` — so a
+    /// client never observes "entry gone from the queue" before it can
+    /// observe the row that replaced it. Between dequeue and this call the
+    /// entry stays listed in every snapshot through the drain arm's
+    /// [`DrainingGuard`], so an unrelated concurrent mutation's own
+    /// `agent:queue:updated` (enqueue / edit / remove of another entry) shows
+    /// it too; callers drop the guard right before this call, and the
+    /// snapshot read here is the first one without the entry.
+    pub(crate) async fn publish_queue_updated_after_drain_persist(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-        queue: Vec<Value>,
     ) {
+        self.publish_queue_event(agent_id, workspace_id).await;
+    }
+
+    /// The single `agent:queue:updated` publish choke point — every publisher
+    /// ends here. Publishes WITHOUT the write-through persist, for callers
+    /// whose durable snapshot was already committed:
+    /// [`Services::publish_queue_updated_for`] (persisted just before),
+    /// [`Services::publish_queue_updated_after_drain_persist`] (persisted at
+    /// dequeue time) and [`Services::migrate_queue_and_gc_poisoned_session`]
+    /// (atomic store op).
+    ///
+    /// Snapshot acquisition and the bus write happen together under
+    /// `agent_queue_publish_gate`: the queue is read
+    /// ([`Services::queue_snapshot`], draining overlay included) immediately
+    /// before the event is written, and no other publisher can interleave
+    /// between the two. Callers therefore never hand in a queue they captured
+    /// earlier — a `Vec` captured before an await could be older than a
+    /// mutation that completed in the meantime (a pre-enqueue snapshot
+    /// omitting an entry that is now draining, or an overlay snapshot
+    /// arriving after the settled shrink and resurrecting a drained entry).
+    /// Publication order thus equals snapshot order, so the stream of
+    /// `agent:queue:updated` payloads is monotone in queue mutation order.
+    /// The `author` projection is attached under the same gate (one batched
+    /// principal read per publish, see
+    /// [`crate::principal_ops::MessageAuthorResolver::attach_queue`]).
+    async fn publish_queue_event(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) {
+        let _gate = self.agent_queue_publish_gate.lock().await;
+        let mut queue = self.queue_snapshot(agent_id);
+        crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
+            .attach_queue(&mut queue)
+            .await;
         let event = intent_store::NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),
@@ -13964,9 +15273,7 @@ impl Services {
                     );
                 }
             }
-            let queue = self.queue_snapshot(target_id);
-            self.publish_queue_event(target_id, workspace_id, queue)
-                .await;
+            self.publish_queue_event(target_id, workspace_id).await;
         }
         self.agent_delete_op(poisoned_id.clone(), Some(workspace_id.clone()))
             .await?;
@@ -14120,6 +15427,21 @@ const RESUME_RECAP_SEGMENT_MAX_CHARS: usize = 8_000;
 /// original lost request are elided (the head segment is the request the
 /// whole recap exists to preserve; the freshest partials matter most).
 const RESUME_RECAP_MAX_SEGMENTS: usize = 8;
+
+/// Recap truncation hint (intent#3696), emitted only when a segment was
+/// middle-truncated or segments were elided. The segments are the user's
+/// message and the model's own partial response — never tool output — so the
+/// hint says the cut parts were trimmed by this recap for size (not lost by a
+/// failing tool), to continue without re-fetching anything, and to ask the
+/// user once if a truncated user message is genuinely needed in full. Uses
+/// the history replay's `truncated="true" original_chars="N"` marker
+/// convention. The literal `8000` must track
+/// [`RESUME_RECAP_SEGMENT_MAX_CHARS`] (asserted below).
+const RESUME_RECAP_TRUNCATION_HINT: &str = "Note on this recap: parts of the replayed exchange below were cut by this recap for size — segments longer than 8000 characters are middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element), and older interrupted segments may be elided entirely. Nothing was lost by a failing tool; the cut text is only the user's message and your own earlier partial response. Continue without re-fetching anything. If you genuinely need the full text of a truncated user message, ask the user for it once.\n\n";
+const _: () = assert!(
+    RESUME_RECAP_SEGMENT_MAX_CHARS == 8000,
+    "RESUME_RECAP_TRUNCATION_HINT names the per-segment cap literally; update both together"
+);
 
 /// `metadata.type` stamped on every restart-resume continuation message
 /// (`resume_interrupted_agent`), riding `messageMetadata` onto the persisted
@@ -14320,15 +15642,12 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     let has_partial = segments
         .iter()
         .any(|s| matches!(s, TailSegment::Partial(_)));
-    let mut recap = String::from(
-        "<supervisor>\nRestart recovery: the harness restarted while you were \
-         responding, and your restored session may predate the exchange below \
-         — it is repeated here (parts of it may or may not already be in your \
-         context).\n\n",
-    );
-    if elided > 0 {
-        let _ = write!(recap, "({elided} older interrupted segment(s) elided.)\n\n");
-    }
+    // Segments render first so the preamble can learn whether any of them
+    // was middle-truncated (the hint is emitted only when something was
+    // actually abbreviated; untruncated, unelided recaps are byte-identical
+    // to before).
+    let mut body = String::new();
+    let mut truncated_any = false;
     for segment in &segments {
         let (label, tag, text) = match segment {
             TailSegment::User(text) => (
@@ -14343,15 +15662,28 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                 text,
             ),
         };
+        let (text, truncated_attrs) =
+            crate::history_xml::truncate_marked(text, RESUME_RECAP_SEGMENT_MAX_CHARS);
+        truncated_any |= !truncated_attrs.is_empty();
         let _ = write!(
-            recap,
-            "{label}\n<{tag}>\n{}\n</{tag}>\n\n",
-            crate::history_xml::escape_xml(&crate::history_xml::truncate_middle_content(
-                text,
-                RESUME_RECAP_SEGMENT_MAX_CHARS,
-            ))
+            body,
+            "{label}\n<{tag}{truncated_attrs}>\n{}\n</{tag}>\n\n",
+            crate::history_xml::escape_xml(&text)
         );
     }
+    let mut recap = String::from(
+        "<supervisor>\nRestart recovery: the harness restarted while you were \
+         responding, and your restored session may predate the exchange below \
+         — it is repeated here (parts of it may or may not already be in your \
+         context).\n\n",
+    );
+    if truncated_any || elided > 0 {
+        recap.push_str(RESUME_RECAP_TRUNCATION_HINT);
+    }
+    if elided > 0 {
+        let _ = write!(recap, "({elided} older interrupted segment(s) elided.)\n\n");
+    }
+    recap.push_str(&body);
     if !has_partial {
         recap.push_str(
             "Your response was cut off before any output was produced — \
@@ -14716,10 +16048,9 @@ impl Services {
 
         // Use the send-message machinery to deliver the continuation (lazily
         // respawns the provider and resumes via ACP `session/load`).
-        // Automatic origin: a resume continuation must not bury a Q&A the
-        // agent had pending when the harness shut down (question hold — the
-        // marker is persisted, so the hold survives the restart). The manager
-        // path is called directly so the recap can ride
+        // Automatic origin: a resume continuation is a system delivery, not a
+        // user action (it must not clear a pending attention request). The
+        // manager path is called directly so the recap can ride
         // `TurnOptions::prepend_content`; the store-only fallback (no manager
         // attached) keeps the plain trait call — it drives no outbound
         // prompt, so there is no context to repair.

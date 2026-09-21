@@ -15,7 +15,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,13 +42,6 @@ use common::TlsWs;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client.
 const TOKEN: &str = "cececececececececececececececececececececececececececececececece";
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -145,13 +137,12 @@ struct Fixture {
     bus: EventBus,
     port: u16,
     cfg: Arc<ClientConfig>,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-chatinc-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = common::test_tempdir("intentd-chatinc-");
+    let dir = tmp.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -178,7 +169,7 @@ async fn boot() -> Fixture {
         bus,
         port,
         cfg,
-        _dir: TempDir(dir),
+        _dir: tmp,
     }
 }
 
@@ -396,7 +387,7 @@ fn text_block_entities(delta: &Value) -> Vec<(&'static str, Value)> {
 /// fragment (`textDelta`, never accumulated `text`), non-text blocks pass
 /// through whole, the terminal reconcile emits authoritative full blocks, and
 /// the documented append reducer converges to `agent.getConversation` (§7.1).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_incremental_subscription_streams_fragments_and_converges() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -569,7 +560,7 @@ async fn chat_incremental_subscription_streams_fragments_and_converges() {
 /// Omitting `deltaEncoding` keeps the wire byte-identical to today: no
 /// `deltaEncoding` echo on the snapshot and full accumulated `text` (no
 /// `textDelta`) on live chunk deltas.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_default_subscription_still_streams_full_text() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -629,7 +620,7 @@ async fn chat_default_subscription_still_streams_full_text() {
 
 /// An unknown `deltaEncoding` is rejected as invalid params (`-32602`), never
 /// silently coerced to a mode the client did not ask for.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_rejects_unknown_delta_encoding() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -658,7 +649,7 @@ async fn chat_subscribe_rejects_unknown_delta_encoding() {
 /// Lag recovery on an incremental subscription re-emits a BOUNDED snapshot at
 /// the next seq that ALSO echoes `deltaEncoding: "incremental"`, and the
 /// replacement mapper keeps streaming fragments afterwards.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_incremental_lag_recovery_snapshot_echoes_encoding() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;

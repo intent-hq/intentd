@@ -18,15 +18,19 @@ fn disable_node_compile_cache() {
 
 pub mod agent_configs;
 pub(crate) mod agent_logs;
+pub mod caller;
 pub mod chief_cwd;
 pub mod clock;
 pub mod config;
 pub mod discovery_cache;
 pub mod error;
 pub mod events;
+pub mod git_remote_url;
 pub mod ids;
 pub mod model;
 pub mod path_utils;
+pub mod replay_preview;
+pub mod repo_ref;
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
@@ -41,18 +45,21 @@ pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
 };
+pub use caller::{current_caller, spawn_daemon, with_caller, Caller};
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd};
 pub use clock::{
     iso_from_unix_secs, iso_minutes_ago, iso_ms_from_now, now_epoch_ms, now_iso, parse_iso,
 };
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
-pub use error::{CloneErrorCategory, Error, Result};
+pub use error::{CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, Result};
 pub use events::is_known_event_type;
+pub use git_remote_url::GitRemoteUrl;
 pub use ids::{
-    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, PrincipalId, WorkspaceGitRootId, WorkspaceId,
     CHIEF_WORKSPACE_ID,
 };
+pub use model::asset_extension_from_mime;
 pub use model::extract_spec_task_ids;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
@@ -67,32 +74,39 @@ pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
-    cap_json_value, last_tool_use_preview, note_list_slim_row, slim_body_size, slim_heavy_body,
-    ConversationProjection, NoteListProjection, AGENT_LIST_PREVIEW_BUDGET_BYTES,
-    NOTE_LIST_PREVIEW_CHARS, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
+    cap_json_value, fit_agent_list_frame, format_key_bytes_table, last_tool_use_preview,
+    note_list_slim_row, serialized_key_bytes, slim_body_size, slim_heavy_body,
+    AgentDelegatedCounts, AgentListFrameFit, AgentListRowScope, AgentParentDelegatedCounts,
+    AgentScopeCounts, ConversationProjection, NoteListProjection, AGENT_LIST_FRAME_BUDGET_BYTES,
+    AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES,
+    AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES, AGENT_LIST_ROW_KEYS,
+    AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS, SLIM_PAGE_BUDGET_BYTES,
+    SLIM_PROJECTION_BUDGET_BYTES,
 };
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
+pub use model::{lift_from_principal_id, FROM_PRINCIPAL_ID_KEY};
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
     AgentMetadata, AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    AuthorType, BatchTaskEntry, BatchTaskOptions, CheckoutMode, Client, Comment, CommentAddResult,
-    CommentAnchor, CommentAnchorType, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentLocation, CommentResolveThreadResult, CommentRespondResult,
-    CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary, CommentType,
-    CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
+    AuthorType, BatchTaskEntry, BatchTaskOptions, CheckoutMode, Client, ClientHostInfo, Comment,
+    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
+    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
+    CommentType, CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
     CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
     GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
-    GitStatus, Hook, HookState, KnownRepo, LineAttributionAuthor, LineAttributionComputeResult,
-    LineAttributionData, LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
-    NoteEditResult, NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow,
-    NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary,
-    NoteVisibility, PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo,
-    PullRequestStatus, ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode,
-    SaveAssetResult, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus,
-    SessionStats, SetupScript, SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult,
+    GitStatus, Hook, HookListRow, HookState, HookSummary, KnownRepo, LineAttributionAuthor,
+    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
+    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
+    PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus,
+    ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode, SaveAssetResult,
+    Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats,
+    SetupScript, SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult,
     TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
     TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
     TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
@@ -100,12 +114,27 @@ pub use model::{
     WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
     WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus,
     WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
+pub use model::{
+    BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
+    BrowserTabVisibility,
+};
+pub use model::{
+    Principal, PrincipalCredential, WorkspaceInvite, WorkspaceMember, WorkspaceMembership,
+    WorkspaceRole,
+};
+pub use model::{
+    WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,
+    WORKSPACE_LIST_ROW_KEYS,
+};
 pub use path_utils::prewarm_login_shell_path;
+pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
-pub use server_control::ServerControl;
+pub use server_control::{
+    InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope, ServerControl,
+};
 pub use settings_file::{
     FlushQueuedMessagesMode, LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE,
     LEGACY_SETTINGS_PATHS,
@@ -113,8 +142,10 @@ pub use settings_file::{
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{
     AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
-    RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,
+    ResolvedClient, RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError,
+    ReverseLiveClient, ReverseTarget, WorkspaceApi,
 };
 pub use turn_attachments::{
-    new_attachment_id, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
+    is_workspace_api_input, new_attachment_id, AttachmentPolicy, TurnAttachment,
+    TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
 };

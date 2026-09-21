@@ -182,6 +182,7 @@ pub(crate) struct AcpAdapterCommand {
     args: Vec<String>,
     envs: Vec<(String, OsString)>,
     envs_removed: Vec<String>,
+    auth_required_stdout_marker: Option<&'static str>,
     /// Working directory for the child and the `session/new` `cwd`. `None`
     /// runs the adapter in the system temp dir (the ephemeral default).
     cwd: Option<PathBuf>,
@@ -197,6 +198,7 @@ impl AcpAdapterCommand {
             args: vec!["-y".to_string(), package.to_string()],
             envs: Vec::new(),
             envs_removed: Vec::new(),
+            auth_required_stdout_marker: None,
             cwd: None,
             via_npx: true,
         }
@@ -209,6 +211,7 @@ impl AcpAdapterCommand {
             args,
             envs: Vec::new(),
             envs_removed: Vec::new(),
+            auth_required_stdout_marker: None,
             cwd: None,
             via_npx: false,
         }
@@ -242,6 +245,17 @@ impl AcpAdapterCommand {
     pub(crate) fn env_remove(mut self, key: impl Into<String>) -> Self {
         self.envs_removed.push(key.into());
         self
+    }
+
+    /// Recognize the controlled browser helper's immediate auth signal.
+    pub(crate) fn auth_required_marker(mut self, marker: &'static str) -> Self {
+        self.auth_required_stdout_marker = Some(marker);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn program(&self) -> &std::path::Path {
+        &self.program
     }
 
     #[cfg(test)]
@@ -397,6 +411,7 @@ fn spawn_admitted_adapter(
     let (note_tx, notifications) = mpsc::unbounded_channel();
     let (req_tx, requests) = mpsc::unbounded_channel();
     let hooks = ConnectionHooks {
+        auth_required_stdout_marker: cmd.auth_required_stdout_marker,
         notifications: Some(note_tx),
         requests: Some(req_tx),
         ..Default::default()
@@ -507,6 +522,7 @@ fn stderr_tail(stderr: &[String]) -> Option<String> {
 
 /// Grace window between SIGTERM and SIGKILL when reaping an adapter child
 /// (mirrors `host_exec::TERM_GRACE` / `mcp_servers::reap`).
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// Kill the adapter child and reap it. Signals the whole process group (the
@@ -654,7 +670,7 @@ mod reap_tests {
     // `intent_acp::descendant_sweep`; this module keeps the adapter-level
     // integration regression.
 
-    #[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
+    #[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
     /// Regression for the live escape: an MCP-server-style grandchild that
     /// moves into its OWN process group survives `killpg` on the adapter
     /// group (observed: codex-acp's auggie ran with pgid == its own pid); the

@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::tool_restrictions::get_tool_denylist_for_agent_type;
 
-mod bindings;
+pub(crate) mod bindings;
 mod dispatch;
 mod tools;
 
@@ -38,8 +38,8 @@ pub use bindings::app::proposal::{
     is_valid_proposal, proposal_resource_uri, PROPOSAL_RESOURCE_MIME_TYPE,
 };
 
-// Canonical question MIME type (§7.1): the question-hold derivation in
-// `intent-services` reuses this so hold detection cannot drift from what
+// Canonical question MIME type (§7.1): the pending-questions derivation in
+// `intent-services` reuses this so question detection cannot drift from what
 // `ws.app.question.ask` emits.
 pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
 
@@ -287,6 +287,15 @@ impl WorkspaceMcpServer {
         features
     }
 
+    /// Names exposed to this caller, for provider-native policy configuration.
+    #[must_use]
+    pub fn available_tool_names(&self) -> Vec<&'static str> {
+        self.available_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
+
     /// The tool definitions exposed to this agent (full registry minus denylist).
     pub(crate) fn available_tools(&self) -> Vec<&'static ToolDef> {
         tools::all_tools(self.is_chief)
@@ -297,13 +306,24 @@ impl WorkspaceMcpServer {
 
     /// Handle one MCP JSON-RPC message. Returns `Some(response)` for requests and
     /// `None` for notifications (port of `MCPServer.handleMessage`).
+    ///
+    /// The whole message runs as the bridge's caller agent — not just the
+    /// `workspace_api` eval — so the service calls around it (output settings
+    /// read, retired-caller guard, feature lookups) reach the fail-closed
+    /// capability gates bound. The bridge listener dispatches every message
+    /// on a fresh task, which would otherwise arrive unbound. A bridge with no
+    /// caller agent leaves whatever caller the enclosing scope bound.
     pub async fn handle_message(&self, message: &Value) -> Option<Value> {
         let method = message.get("method").and_then(Value::as_str)?;
-        let id = message.get("id").cloned();
-        match id {
-            Some(id) => Some(self.handle_request(&id, method, message).await),
-            None => None,
-        }
+        let id = message.get("id").cloned()?;
+        let handled = self.handle_request(&id, method, message);
+        let response = match self.caller_agent_id.clone() {
+            Some(agent_id) => {
+                intent_core::with_caller(intent_core::Caller::Agent { agent_id }, handled).await
+            }
+            None => handled.await,
+        };
+        Some(response)
     }
 
     async fn handle_request(&self, id: &Value, method: &str, message: &Value) -> Value {
@@ -397,7 +417,7 @@ impl WorkspaceMcpServer {
 }
 
 // By-value: callers hand over freshly built payloads.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn ok(id: &Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }

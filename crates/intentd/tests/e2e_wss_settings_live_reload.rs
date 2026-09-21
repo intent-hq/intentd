@@ -8,7 +8,11 @@
 //!    key and `settings.get` reflects the file value;
 //! 3. an invalid external edit (TOML syntax error or unknown key) keeps
 //!    last-good values without crashing the daemon, and a subsequent valid
-//!    edit recovers.
+//!    edit recovers;
+//! 4. the one-time boot migration of the deprecated `providers.active`
+//!    rewrites config.toml (key removed, value carried into
+//!    `model.defaultProvider`, comments preserved) and a restart from the
+//!    migrated file never rewrites it again.
 //!
 //! Adjacent coverage lives elsewhere and is intentionally not duplicated:
 //! startup refusal on malformed config + flag-pin precedence in
@@ -21,7 +25,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +40,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -61,15 +64,11 @@ impl Drop for Daemon {
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-livereload-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-livereload-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -79,7 +78,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut cmd = common::serve_command();
     // Guarantee the config-watcher readiness marker (INFO, target `intentd`)
     // reaches daemon.log even when the caller's RUST_LOG is stricter (e.g.
     // `warn`): append a crate-scoped directive, which EnvFilter resolves in
@@ -89,8 +88,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         Ok(v) if !v.is_empty() => format!("{v},intentd=info"),
         _ => "info".to_string(),
     };
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("RUST_LOG", rust_log)
@@ -311,11 +309,55 @@ async fn await_config_watcher_ready(data_dir: &Path) {
     }
 }
 
+/// The readiness marker `await_config_watcher_ready` gates on must mean the
+/// directory watch is actually live, not merely requested: the registration
+/// runs on the hub's registrar thread after `ConfigWatcher::start` returns
+/// (intent-hq/intent#4953), so a marker logged straight after `start` would
+/// let a test hand-edit config.toml before the watch exists. Under the
+/// watcher-creation-failure seam every registration settles as failed, so
+/// the daemon must report `failed to start` and never `ready`.
+#[tokio::test]
+async fn config_watcher_readiness_marker_waits_for_a_live_watch() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
+        child: spawn_serve(
+            &data_dir,
+            "uds",
+            &[("INTENTD_TEST_FAIL_WATCHER_CREATION", "1")],
+        ),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let log_path = data_dir.join("daemon.log");
+    let deadline = tokio::time::Instant::now() + LIVENESS;
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            !log.contains("config.toml live-reload watcher ready"),
+            "readiness must not be reported while the config directory watch is not live\n\
+             --- daemon log ---\n{log}"
+        );
+        if log.contains("config.toml live-reload watcher failed to start") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon never reported the config watcher failing to start within {LIVENESS:?}\n\
+             --- daemon log ---\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(daemon);
+}
+
 /// Boot with the WSS listener enabled, discover the WSS port + fingerprint via
 /// `system.status` over UDS, and return (daemon, rpc conn, subscriber conn)
 /// with the subscriber already subscribed to `settings:changed`.
 async fn boot_with_wss(data_dir: &Path) -> (Daemon, Wss, Wss) {
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -365,7 +407,8 @@ async fn boot_with_wss(data_dir: &Path) -> (Daemon, Wss, Wss) {
 /// `origin` field on reads).
 #[tokio::test]
 async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(
         &config_path,
@@ -557,7 +600,8 @@ async fn notification_sound_path_round_trips_and_resets_over_wss() {
 /// the daemon up, and a subsequent valid edit recovers.
 #[tokio::test]
 async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(&config_path, "[workspace]\nbranchPrefix = \"before/\"\n")
         .expect("seed config.toml");
@@ -675,7 +719,8 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
 /// still tolerates-and-ignores them for pre-rename clients.
 #[tokio::test]
 async fn background_agents_table_migrates_to_quick_actions_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(
         &config_path,
@@ -757,5 +802,176 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
         get["result"]["value"],
         json!("auggie:haiku"),
         "an ignored retired write must not change the renamed key: {get}"
+    );
+}
+
+/// The settings model triple over the wire: a user-authored config carrying
+/// a legacy compound `model.default` (and an own-prefixed
+/// `model.providerDefaults` entry) reads back over WSS as the split triple —
+/// bare `model.default`, split-off `model.defaultProvider`, both with
+/// `origin: file` — while the on-disk file stays untouched at load. The wire
+/// keeps rejecting compound writes (`settings.update` is bare-id only), so
+/// normalization is strictly read-side.
+#[tokio::test]
+async fn legacy_compound_model_default_reads_back_as_the_split_triple_over_wss() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let config_path = data_dir.join("config.toml");
+    let seed =
+        "[model]\ndefault = \"codex:gpt-5\"\nproviderDefaults = { codex = \"codex:gpt-5-mini\" }\n";
+    std::fs::write(&config_path, seed).expect("seed legacy config.toml");
+
+    let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
+
+    // The compound reads back split: bare model + split-off provider, both
+    // reporting file origin (the value came from the user's file, not a
+    // schema default — origin badges must not mislabel it).
+    let get = wss_rpc(
+        &mut rpc,
+        10,
+        "settings.get",
+        json!({ "path": "model.default" }),
+    )
+    .await;
+    assert_eq!(get["result"]["value"], json!("gpt-5"), "{get}");
+    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+    let get = wss_rpc(
+        &mut rpc,
+        11,
+        "settings.get",
+        json!({ "path": "model.defaultProvider" }),
+    )
+    .await;
+    assert_eq!(get["result"]["value"], json!("codex"), "{get}");
+    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+
+    // The own-prefixed providerDefaults entry reads back bare.
+    let get = wss_rpc(
+        &mut rpc,
+        12,
+        "settings.get",
+        json!({ "path": "model.providerDefaults" }),
+    )
+    .await;
+    assert_eq!(
+        get["result"]["value"],
+        json!({ "codex": "gpt-5-mini" }),
+        "{get}"
+    );
+
+    // Normalization is read-side only: the user's model section is untouched
+    // at load (the harness boot appends `[server.wsApi]`, so compare the
+    // seeded lines, not the whole file).
+    let text = std::fs::read_to_string(&config_path).expect("read config.toml");
+    assert!(
+        text.starts_with(seed),
+        "normalization must not rewrite the user's model section: {text}"
+    );
+
+    // …and the wire still hard-rejects compound writes.
+    let update = wss_rpc(
+        &mut rpc,
+        13,
+        "settings.update",
+        json!({ "changes": [{ "path": "model.default", "value": "codex:gpt-5" }] }),
+    )
+    .await;
+    assert_eq!(update["error"]["code"], json!(-32602), "{update}");
+}
+
+/// One-time boot migration of the deprecated `providers.active`: a real
+/// daemon boot carries the legacy value into `model.defaultProvider` and
+/// removes the key from config.toml with a comment-preserving rewrite, all
+/// observable over WSS (`settings.get` reports the carried value with
+/// `origin: file` and the legacy key back at its schema default). A restart
+/// from the migrated file leaves it byte-identical — the migration rewrite is
+/// genuinely one-time.
+#[tokio::test]
+async fn active_provider_boot_migration_rewrites_config_once_over_wss() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let config_path = data_dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        "# Operator comment — must survive the migration rewrite.\n\
+         [providers]\n\
+         active = \"codex\"\n\
+         \n\
+         [git]\n\
+         autoCommit = false\n",
+    )
+    .expect("seed legacy config.toml");
+
+    let migrated = {
+        let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
+
+        // The legacy value carried over, reading back over the wire with
+        // file origin (it came from the user's config, not a schema default).
+        let get = wss_rpc(
+            &mut rpc,
+            10,
+            "settings.get",
+            json!({ "path": "model.defaultProvider" }),
+        )
+        .await;
+        assert_eq!(get["result"]["value"], json!("codex"), "{get}");
+        assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+
+        // The legacy key is back at its schema default — no file layer left.
+        let get = wss_rpc(
+            &mut rpc,
+            11,
+            "settings.get",
+            json!({ "path": "providers.active" }),
+        )
+        .await;
+        assert_eq!(get["result"]["origin"], json!("default"), "{get}");
+
+        // On disk: key removed, carried value written, comment and untouched
+        // keys preserved (toml_edit comment-preserving rewrite).
+        let text = std::fs::read_to_string(&config_path).expect("read config.toml");
+        let has_active_key = text.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix("active")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        });
+        assert!(
+            !has_active_key,
+            "providers.active must be removed from the file: {text}"
+        );
+        assert!(
+            text.contains("defaultProvider = \"codex\""),
+            "the carried-over value must be persisted: {text}"
+        );
+        assert!(
+            text.contains("# Operator comment — must survive the migration rewrite."),
+            "user comment must survive the migration rewrite: {text}"
+        );
+        assert!(
+            text.contains("autoCommit = false"),
+            "untouched keys must survive the migration rewrite: {text}"
+        );
+        text
+    }; // first daemon killed + data dir removed (Drop)
+
+    // Restart on the migrated file: the migration finds no legacy key and
+    // never rewrites — the file stays byte-identical across the boot. Drop
+    // removed the data dir, so reseed a fresh one with the migrated bytes.
+    std::fs::create_dir_all(&data_dir).expect("recreate data dir for restart");
+    std::fs::write(&config_path, &migrated).expect("reseed migrated config.toml");
+    let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
+    let get = wss_rpc(
+        &mut rpc,
+        12,
+        "settings.get",
+        json!({ "path": "model.defaultProvider" }),
+    )
+    .await;
+    assert_eq!(get["result"]["value"], json!("codex"), "{get}");
+    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
+    let after = std::fs::read_to_string(&config_path).expect("re-read config.toml");
+    assert_eq!(
+        after, migrated,
+        "a file without the legacy key is never rewritten at boot"
     );
 }

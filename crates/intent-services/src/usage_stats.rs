@@ -278,10 +278,9 @@ pub(crate) fn stats_provider_key(provider_id: Option<&str>) -> String {
 /// [`stats_model_key`] (normalized model, falling back to the resolved
 /// provider id when no model is resolved at creation time — D13). `provider`
 /// is the session's raw `provider` field; the resolved id follows the spawn
-/// precedence (compound model prefix → provider field → `configured_default`,
-/// the settings-derived default the create seam passes through). An
-/// unresolvable provider falls to the `"unknown"` stats tail (monorepo#3044:
-/// no positional last resort).
+/// precedence (provider field → `configured_default`, the settings-derived
+/// default the create seam passes through). An unresolvable provider falls
+/// to the `"unknown"` stats tail (monorepo#3044: no positional last resort).
 /// Best-effort: errors are logged, never propagated — stats bookkeeping must
 /// not fail `agent.create`.
 pub(crate) async fn record_session_started(
@@ -293,8 +292,7 @@ pub(crate) async fn record_session_started(
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
     let local = recording_local_offset().map(|o| local_stamp(now, o));
-    let provider_id =
-        crate::agent_session::resolve_provider_id(raw_model, provider, configured_default);
+    let provider_id = crate::agent_session::resolve_provider_id(provider, configured_default);
     // No resolved display model exists at creation time — the configOptions
     // resolution (D13/D14) only happens at session open.
     let model = stats_model_key(raw_model, None, provider_id.as_deref());
@@ -340,11 +338,7 @@ pub(crate) async fn record_lines_changed(
         .await
     {
         Ok((model, resolved, provider, _)) => {
-            let provider_id = crate::agent_session::resolve_provider_id(
-                model.as_deref(),
-                provider.as_deref(),
-                None,
-            );
+            let provider_id = crate::agent_session::resolve_provider_id(provider.as_deref(), None);
             (model, resolved, provider_id)
         }
         Err(e) => {

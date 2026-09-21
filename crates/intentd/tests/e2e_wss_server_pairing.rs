@@ -13,7 +13,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,29 +28,23 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use uuid::Uuid;
 
 /// Fixed 64-char hex token (matching generated token shape) for e2e test.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-server-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-server-")
 }
 
 fn spawn_serve(data_dir: &Path) -> Child {
@@ -77,11 +71,9 @@ fn spawn_serve_inner(data_dir: &Path, extra_env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_TCP_PORT", "0")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -269,10 +261,10 @@ async fn boot(data_dir: &Path) -> (u16, String) {
 
 #[tokio::test]
 async fn server_pairing_info_over_uds() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -286,6 +278,18 @@ async fn server_pairing_info_over_uds() {
     assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
     assert_eq!(result["path"].as_str().unwrap(), "/ws");
     assert!(result["localIps"].is_array());
+    // Additive bind-candidate set: always present, string entries, never
+    // loopback (the FE renders loopback itself).
+    let available_ips = result["availableIps"]
+        .as_array()
+        .expect("availableIps is array");
+    assert!(
+        available_ips.iter().all(|v| v
+            .as_str()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| !ip.is_loopback())),
+        "availableIps entries are non-loopback IPs: {result}"
+    );
     assert!(result["hostname"].is_string());
     assert!(
         !result["prettyHostname"]
@@ -294,16 +298,28 @@ async fn server_pairing_info_over_uds() {
             .is_empty(),
         "prettyHostname non-empty"
     );
+    if std::env::consts::OS == "linux" {
+        assert!(result["deviceKind"].is_string(), "deviceKind: {response}");
+    }
+    assert!(
+        result
+            .get("deviceKind")
+            .is_none_or(|value| !value.is_null()),
+        "deviceKind is omitted, never null"
+    );
+    if let Some(model) = result.get("hardwareModel") {
+        assert!(model.is_string(), "hardwareModel: {response}");
+    }
 
     daemon.child.kill().ok();
 }
 
 #[tokio::test]
 async fn server_rotate_token_env_fixed_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (_port, _fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -323,10 +339,10 @@ async fn server_rotate_token_env_fixed_rejects() {
 
 #[tokio::test]
 async fn server_pairing_info_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -344,51 +360,48 @@ async fn server_pairing_info_over_wss_rejects() {
 }
 
 #[tokio::test]
-async fn pairing_get_info_over_uds() {
-    let data_dir = temp_data_dir();
+async fn pairing_get_info_loopback_default_errors_without_tunnel() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
-    let (port, fp) = boot(&data_dir).await;
+    boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
 
-    // pairing.getInfo over UDS (local) returns the structured QR payload
-    let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
-    let result = &response["result"];
-
-    assert_eq!(result["token"].as_str().unwrap(), TOKEN);
-    assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
-    assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
-    assert_eq!(result["version"].as_u64().unwrap(), 1);
-    assert!(result["hosts"].is_array());
-
     // Fresh config (no server.bindAddress): the listener binds the loopback
-    // default (monorepo#2900), so the payload advertises exactly that host.
-    let hosts: Vec<String> = serde_json::from_value(result["hosts"].clone()).unwrap();
-    assert_eq!(hosts, vec!["127.0.0.1".to_string()]);
-
-    // The uri field is consistent with the component fields
-    let expected_uri = format!(
-        "intent://pair?v=1&host={}&port={port}&fp={fp}&token={TOKEN}",
-        hosts.join(",")
+    // default (monorepo#2900). Loopback is never advertised to pairing
+    // clients (not dialable from another device) and the tunnel is off, so
+    // there is no dialable route at all — pairing.getInfo errors with
+    // actionable guidance instead of minting a payload no other device can
+    // connect through. This is NOT the listener-down error (the listener IS
+    // up — boot() connected over WSS above).
+    let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    let error = &response["error"];
+    let msg = error["message"].as_str().unwrap();
+    assert!(
+        msg.contains("loopback only"),
+        "error names the loopback-only bind: {msg}"
     );
-    assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
-
-    // Tunnel disabled (default): tcAddress is ABSENT, not null, and the
-    // exact-URI assertion above already proves there is no tc= param.
-    assert!(result.get("tcAddress").is_none());
+    assert!(
+        msg.contains("server.bindAddress") && msg.contains("server.tunnel.enabled"),
+        "guidance names both remediations: {msg}"
+    );
+    assert!(
+        error["data"]["code"] != json!("listener-down"),
+        "must not be the listener-down error: {error}"
+    );
 
     daemon.child.kill().ok();
 }
 
 #[tokio::test]
 async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Persist server.tunnel.enabled BEFORE boot so the daemon auto-starts the
     // (fake) sidecar; enable_ws_api inside the spawn helper appends the
     // [server.wsApi] section to the same config.
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     std::fs::write(
         data_dir.join("config.toml"),
         "[server.tunnel]\nenabled = true\n",
@@ -397,24 +410,28 @@ async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
     let tailcat_bin = write_fake_tailcat(&data_dir);
     let mut daemon = Daemon {
         child: spawn_serve_with_tailcat(&data_dir, &tailcat_bin),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
 
     // pairing.getInfo over UDS carries the tunnel address and appends it to
-    // the URI as the additive tc= param.
+    // the URI as the additive tc= param. The tunnel is the payload's one
+    // dialable route here (loopback-default bind, so the host list is empty
+    // — loopback is never advertised), and the structured QR payload fields
+    // are exactly the credential sources the daemon serves.
     let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
     let result = &response["result"];
     let tc = result["tcAddress"]
         .as_str()
         .unwrap_or_else(|| panic!("tcAddress present: {result}"));
     assert!(tc.starts_with("tc-"), "fake sidecar address: {tc}");
-    let uri = result["uri"].as_str().unwrap();
-    assert!(
-        uri.ends_with(&format!("&tc={tc}")),
-        "tc= is the additive last URI param: {uri}"
-    );
+    assert_eq!(result["token"].as_str().unwrap(), TOKEN);
+    assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
+    assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
+    assert_eq!(result["version"].as_u64().unwrap(), 1);
+    assert_eq!(result["hosts"], json!([]));
+    let expected_uri = format!("intent://pair?v=1&host=&port={port}&fp={fp}&token={TOKEN}&tc={tc}");
+    assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
 
     // server.pairingInfo over UDS carries the same field.
     let response = uds_rpc(&socket, 3, "server.pairingInfo", json!({})).await;
@@ -432,7 +449,8 @@ async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
 
 #[tokio::test]
 async fn pairing_get_info_explicit_wide_bind_honored() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Persist an explicit wide bind BEFORE boot: the loopback default only
     // governs unset configs — an intentional 0.0.0.0 keeps the historical
     // behavior (bind all interfaces, advertise enumerated local IPs).
@@ -443,7 +461,6 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
     .expect("seed config.toml with wide bindAddress");
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -483,10 +500,10 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
 
 #[tokio::test]
 async fn pairing_get_info_listener_down_over_uds() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve_wss_disabled(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -510,10 +527,10 @@ async fn pairing_get_info_listener_down_over_uds() {
 
 #[tokio::test]
 async fn pairing_get_info_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -533,10 +550,10 @@ async fn pairing_get_info_over_wss_rejects() {
 
 #[tokio::test]
 async fn server_rotate_token_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -555,10 +572,10 @@ async fn server_rotate_token_over_wss_rejects() {
 
 #[tokio::test]
 async fn system_import_legacy_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let frame = json!({
@@ -580,10 +597,10 @@ async fn system_import_legacy_over_wss_rejects() {
 
 #[tokio::test]
 async fn system_git_credential_over_wss_rejects() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     // system.gitCredential over WSS (TCP) is rejected with -32001: the
@@ -607,10 +624,10 @@ async fn system_git_credential_over_wss_rejects() {
 
 #[tokio::test]
 async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let mut daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);

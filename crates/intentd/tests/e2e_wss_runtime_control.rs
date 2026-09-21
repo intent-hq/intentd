@@ -25,7 +25,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -54,16 +53,12 @@ impl Drop for Daemon {
             if let Ok(log) = std::fs::read_to_string(&log_path) {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
-            let _ = std::fs::remove_dir_all(&self.data_dir);
         }
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-runtime-ctrl-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-runtime-ctrl-")
 }
 
 /// Shared `serve` setup: hermetic dirs, log redirection, env. Used by the
@@ -93,15 +88,25 @@ fn configure_serve(cmd: &mut Command, data_dir: &Path, listen: &str, env: &[(&st
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve");
+    let mut cmd = common::serve_command();
+    configure_serve(&mut cmd, data_dir, listen, env);
+    cmd.spawn().expect("spawn intentd serve")
+}
+
+/// [`spawn_serve`] without the `INTENTD_TCP_PORT=0` seam: the listener binds
+/// the seeded/settings `server.wsApi.port`, for tests whose assertion IS that
+/// port (a same-port listener restart, a batch's explicit port).
+fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    let mut cmd = common::serve_command_fixed_port();
     configure_serve(&mut cmd, data_dir, listen, env);
     cmd.spawn().expect("spawn intentd serve")
 }
 
 /// Spawn `intentd serve` as the CHILD of a stand-in sitter: `sitter_bin` (a
-/// shell symlinked as `intentd-sitter`, so the process name follows the
-/// executed path's basename) backgrounds the daemon, records the daemon's pid
+/// shell COPIED as `intentd-sitter` — the kernel-visible process name comes
+/// from the executed image itself, so a copy carries the name on every
+/// platform, whereas a symlink resolves to the target's name on macOS —
+/// intent-hq/monorepo#4220) backgrounds the daemon, records the daemon's pid
 /// in `daemon_pid_path`, and waits. The returned child (the wrapper) is thus
 /// both sitter-named AND the daemon's parent — the conjunction
 /// `signal_sitter_update` requires.
@@ -119,7 +124,76 @@ fn spawn_serve_under_stand_in_sitter(
         .arg(env!("CARGO_BIN_EXE_intentd"))
         .arg(daemon_pid_path);
     configure_serve(&mut cmd, data_dir, listen, env);
-    cmd.spawn().expect("spawn stand-in sitter wrapper")
+    spawn_retrying_etxtbsy(&mut cmd, "stand-in sitter wrapper")
+}
+
+/// Builder contract: `common::serve_command` spawns the `intentd` bin's
+/// `serve` subcommand with the `INTENTD_TCP_PORT=0` ephemeral-port seam
+/// baked in; `serve_command_fixed_port` omits the seam; a later `.env` on
+/// the same `Command` overrides the seam, so deliberate pins keep working.
+#[test]
+fn serve_command_builders_own_the_tcp_port_seam() {
+    use std::ffi::OsStr;
+
+    fn tcp_port_env(cmd: &Command) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == OsStr::new("INTENTD_TCP_PORT"))
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    let cmd = common::serve_command();
+    assert_eq!(cmd.get_program(), OsStr::new(env!("CARGO_BIN_EXE_intentd")));
+    assert_eq!(
+        cmd.get_args().collect::<Vec<_>>(),
+        vec![OsStr::new("serve")],
+        "serve_command adds exactly the `serve` subcommand"
+    );
+    assert_eq!(
+        tcp_port_env(&cmd),
+        Some("0".to_string()),
+        "serve_command carries the INTENTD_TCP_PORT=0 seam"
+    );
+
+    let fixed = common::serve_command_fixed_port();
+    assert_eq!(
+        fixed.get_program(),
+        OsStr::new(env!("CARGO_BIN_EXE_intentd"))
+    );
+    assert_eq!(
+        fixed.get_args().collect::<Vec<_>>(),
+        vec![OsStr::new("serve")]
+    );
+    assert_eq!(
+        tcp_port_env(&fixed),
+        None,
+        "serve_command_fixed_port sets no INTENTD_TCP_PORT"
+    );
+
+    let mut pinned = common::serve_command();
+    pinned.env("INTENTD_TCP_PORT", "7000");
+    assert_eq!(
+        tcp_port_env(&pinned),
+        Some("7000".to_string()),
+        "a later .env overrides the builder's seam"
+    );
+}
+
+/// `spawn` with a bounded retry on ETXTBSY: a concurrently forked test
+/// child can transiently inherit a just-written copy's write fd (it is
+/// closed only at that child's own exec), making exec of the fresh copy
+/// fail with "Text file busy". Only needed for the COPIED sitter/decoy
+/// binaries (intent-hq/monorepo#4220).
+fn spawn_retrying_etxtbsy(cmd: &mut Command, what: &str) -> Child {
+    for _ in 0..400 {
+        match cmd.spawn() {
+            Ok(child) => return child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("spawn {what}: {e}"),
+        }
+    }
+    panic!("spawn {what} kept failing with ETXTBSY");
 }
 
 /// SIGKILLs a raw pid on drop — cleanup for the daemon grandchild, which
@@ -308,8 +382,9 @@ where
 /// → verify RPCs work → disable over UDS → verify listener stops and new connections fail.
 #[tokio::test]
 async fn runtime_ws_listener_toggle_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     // Start daemon with both UDS and TCP (server.wsApi.enabled seeded in config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -424,9 +499,10 @@ async fn runtime_ws_listener_toggle_over_wss() {
 /// setting was ignored at boot and the listener stayed down until manual toggle.
 #[tokio::test]
 // Port numbers are far below 2^53: loss-free in f64.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let port_s = free_port().to_string();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
 
@@ -623,12 +699,13 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 /// listener starts on the NEW port.
 #[tokio::test]
 async fn batch_hook_ordering_port_before_enable() {
-    let data_dir = temp_data_dir();
-    // No INTENTD_TCP_PORT: the env-0 ephemeral seam would override the batch's
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    // Fixed port: the env-0 ephemeral seam would override the batch's
     // explicit port and the bound port is exactly what proves hook ordering.
     // Boot UDS-only (no wsApi seed) so the batch below exercises a cold start.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    let child = spawn_serve(&data_dir, "uds", &env);
+    let child = spawn_serve_fixed_port(&data_dir, "uds", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -695,8 +772,9 @@ async fn batch_hook_ordering_port_before_enable() {
 async fn wss_system_status_includes_capacity_version_uptime() {
     // system.status over WSS reports maxAgents, version, uptimeSeconds alongside
     // existing fields (additive change for FE health menu).
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
@@ -738,6 +816,32 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     // Supervision probe (intent-hq/intent#3875): always present, and false
     // here — the daemon was spawned by the test harness, not a sitter.
     assert_eq!(r["updateSupported"], false, "updateSupported: {r}");
+    // Idle-update handshake visibility over the real WSS wire: no turn in
+    // flight, no sitter advertised the handshake — the object is present
+    // with `supported` false and the timestamps explicitly null.
+    assert_eq!(r["busyAgents"], 0, "busyAgents: {r}");
+    let idle = &r["idleUpdateCheck"];
+    assert!(idle["enabled"].is_boolean(), "idleUpdateCheck.enabled: {r}");
+    assert_eq!(idle["supported"], false, "idleUpdateCheck.supported: {r}");
+    assert_eq!(idle["restartPending"], false, "restartPending: {r}");
+    assert!(idle["lastRequestedAt"].is_null(), "lastRequestedAt: {r}");
+    assert!(idle["nextEligibleAt"].is_null(), "nextEligibleAt: {r}");
+    // Descriptor gauge (intent-hq/intent#4390) over the real WSS wire: the
+    // startup sample lands before the listeners bind, so both fields are live
+    // on Linux/macOS, and a running daemon can never hold zero descriptors or
+    // exceed its soft limit. Presence-detected: omitted elsewhere, never null.
+    if matches!(std::env::consts::OS, "linux" | "macos") {
+        let fd_count = r["fdCount"].as_u64().expect("fdCount is u64");
+        let fd_limit = r["fdLimit"].as_u64().expect("fdLimit is u64");
+        assert!(fd_count > 0, "fdCount > 0: {r}");
+        assert!(fd_limit >= fd_count, "fdLimit ≥ fdCount: {r}");
+    }
+    for key in ["fdCount", "fdLimit"] {
+        assert!(
+            r.get(key).is_none_or(Value::is_u64),
+            "{key} is omitted, never null: {r}"
+        );
+    }
     // Routing fields (additive): localIps is a string array (may be empty on
     // hosts with no routable interface), hostname and prettyHostname are
     // non-empty strings.
@@ -821,8 +925,11 @@ async fn wss_system_status_includes_capacity_version_uptime() {
 /// exactly who needs to trigger an update). Supervision requires BOTH signals
 /// — the pidfile pid must be the daemon's direct parent AND a sitter-named
 /// process (`intentd-sitter` in dev, `intentd` after the packaged rename) —
-/// so the daemon here runs as the child of a shell symlinked as
-/// `intentd-sitter` (the process name follows the executed path's basename).
+/// so the daemon here runs as the child of a shell copied as
+/// `intentd-sitter` (the process name follows the executed image; a copy —
+/// unlike a symlink — carries the stand-in name on macOS too, and
+/// `intentd-sitter` fits within macOS's 16-byte comm limit —
+/// intent-hq/monorepo#4220).
 /// Unsupervised (no sitter pidfile, a live non-sitter pid, or a sitter-named
 /// pid that is not the parent) the daemon answers `-32603` with the reason;
 /// with the wrapper's pid recorded in `<data_dir>/sitter/sitter.pid` it
@@ -832,13 +939,22 @@ async fn wss_system_status_includes_capacity_version_uptime() {
 async fn wss_system_request_update_signals_the_sitter() {
     use std::os::unix::process::ExitStatusExt;
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let sitter_dir = data_dir.join("sitter");
     std::fs::create_dir_all(&sitter_dir).expect("mkdir sitter dir");
     let sitter_bin = sitter_dir.join("intentd-sitter");
-    std::os::unix::fs::symlink("/bin/sh", &sitter_bin).expect("symlink stand-in sitter shell");
+    // A COPY, not a symlink: macOS names a process after the resolved
+    // executable image (a `/bin/sh` symlink reports `bash`), so only a copy
+    // makes the kernel-visible name `intentd-sitter` cross-platform
+    // (intent-hq/monorepo#4220). Caveat: the copy executes out of the /tmp
+    // data dir, so this assumes /tmp is not mounted noexec (true on CI
+    // runners and macOS); if that ever bites, move the copy destination.
+    std::fs::copy("/bin/sh", &sitter_bin).expect("copy stand-in sitter shell");
     let daemon_pid_path = sitter_dir.join("daemon.pid");
 
+    // The wrapper shell, not the `intentd` bin, is the spawned program, so
+    // `common::serve_command` cannot build it: carry its seam explicitly.
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let mut daemon = Daemon {
         child: spawn_serve_under_stand_in_sitter(
@@ -913,11 +1029,11 @@ async fn wss_system_request_update_signals_the_sitter() {
     let decoy_dir = sitter_dir.join("decoy");
     std::fs::create_dir_all(&decoy_dir).expect("mkdir decoy dir");
     let decoy_bin = decoy_dir.join("intentd-sitter");
-    std::os::unix::fs::symlink(sleep_bin, &decoy_bin).expect("symlink decoy sitter");
-    let mut decoy = std::process::Command::new(&decoy_bin)
-        .arg("30")
-        .spawn()
-        .expect("spawn decoy sitter");
+    // Copy for the same macOS naming reason as the stand-in sitter above:
+    // the decoy must actually be sitter-NAMED for this arm to prove the
+    // name alone is insufficient.
+    std::fs::copy(sleep_bin, &decoy_bin).expect("copy decoy sitter");
+    let mut decoy = spawn_retrying_etxtbsy(Command::new(&decoy_bin).arg("30"), "decoy sitter");
     std::fs::write(sitter_dir.join("sitter.pid"), format!("{}\n", decoy.id()))
         .expect("write sitter pidfile");
     let resp = wss_rpc(&mut ws, 43, "system.requestUpdate", json!({})).await;
@@ -950,13 +1066,14 @@ async fn wss_system_status_reports_budget_fields_when_installed() {
     // agentMemoryChargedBytes once the descendant-tree sampler has landed a
     // sample (absent before — the budget is inert until then), and
     // queuedSpawns (0 with nothing queued).
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     std::fs::write(
         data_dir.join("config.toml"),
         "[agents]\nmemoryBudgetMb = 20480\n",
     )
     .expect("seed config.toml with agents.memoryBudgetMb");
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
@@ -1011,23 +1128,32 @@ async fn runtime_toggled_wss_serves_system_status() {
     // Daemon starts UDS-only, then toggles WSS on at runtime via
     // settings.update. Verify system.status works over the runtime-started
     // WSS listener (tests OnceLock control population, §5.7).
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    // Start daemon with ONLY UDS (no wsApi config seed)
+    // Start daemon with ONLY UDS (no wsApi config seed); fixed port so the
+    // runtime toggle binds exactly the port the settings.update names.
     let _daemon = Daemon {
-        child: spawn_serve(&data_dir, "uds", &env),
+        child: spawn_serve_fixed_port(&data_dir, "uds", &env),
         data_dir: data_dir.clone(),
         cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
-    // Verify no WSS port initially
+    // Verify no WSS port initially — and that a UDS-only daemon advertises
+    // no TCP routes: with the listener down every localIps entry would be a
+    // dead route, so the set is empty (not the interface enumeration).
     let status_before = uds_rpc(&socket, 1, "system.status", json!({})).await;
     assert_eq!(
         status_before["result"]["port"],
         json!(null),
         "WSS should not be running"
+    );
+    assert_eq!(
+        status_before["result"]["localIps"],
+        json!([]),
+        "UDS-only daemon must not advertise TCP routes: {status_before}"
     );
 
     // Toggle WSS on at runtime via settings.update
@@ -1084,7 +1210,16 @@ async fn runtime_toggled_wss_serves_system_status() {
     // which would let a bundle read a count without a byte total. Asserting
     // the pair rather than a concrete value keeps this deterministic: the
     // first tick fires at startup but a fast test can still beat it.
-    for field in ["childProcesses", "childMemoryBytes", "childMemoryPeakBytes"] {
+    // The agent-attributed share (§5.5 `agentMemoryBytes` /
+    // `agentProcessCount`) rides the same sample and follows the same
+    // all-null-or-all-present contract.
+    for field in [
+        "childProcesses",
+        "childMemoryBytes",
+        "childMemoryPeakBytes",
+        "agentMemoryBytes",
+        "agentProcessCount",
+    ] {
         assert!(
             r.get(field).is_some(),
             "{field} must ride the WSS status result: {r}"
@@ -1094,10 +1229,12 @@ async fn runtime_toggled_wss_serves_system_status() {
         &r["childProcesses"],
         &r["childMemoryBytes"],
         &r["childMemoryPeakBytes"],
+        &r["agentMemoryBytes"],
+        &r["agentProcessCount"],
     ];
     let nulls = sampled.iter().filter(|v| v.is_null()).count();
     assert!(
-        nulls == 0 || nulls == 3,
+        nulls == 0 || nulls == 5,
         "descendant-tree fields must be all-null or all-present, got {nulls} nulls: {r}"
     );
     if nulls == 0 {
@@ -1113,22 +1250,67 @@ async fn runtime_toggled_wss_serves_system_status() {
             peak >= bytes,
             "peak {peak} must be >= instantaneous {bytes}"
         );
+        // No agent was spawned: the attributed share is zero, and it can
+        // never exceed the aggregate it is carved out of.
+        let agent_bytes = r["agentMemoryBytes"]
+            .as_u64()
+            .expect("agentMemoryBytes when sampled");
+        assert!(
+            agent_bytes <= bytes,
+            "agentMemoryBytes {agent_bytes} must be <= childMemoryBytes {bytes}"
+        );
+        assert_eq!(r["agentProcessCount"], 0, "no spawned agents: {r}");
+        assert_eq!(agent_bytes, 0, "no spawned agents: {r}");
+    }
+
+    // `agent.memoryUsage` (§5.5) over the same connection: daemon-wide, no
+    // `workspaceId`. The result envelope always carries the three keys;
+    // before the sampler's first tick `sampledAt` / `totalBytes` are null,
+    // afterwards `sampledAt` is an RFC-3339 stamp and `totalBytes` a u64 —
+    // and with no spawned agent the list is empty either way.
+    let resp = wss_rpc(&mut ws, 5, "agent.memoryUsage", json!({})).await;
+    assert_eq!(resp["id"], 5);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    let r = &resp["result"];
+    assert!(
+        resp.get("error").is_none(),
+        "agent.memoryUsage must succeed: {resp}"
+    );
+    let obj = r.as_object().expect("agent.memoryUsage result object");
+    for key in ["sampledAt", "totalBytes", "agents"] {
+        assert!(obj.contains_key(key), "{key} must be present: {r}");
+    }
+    assert_eq!(r["agents"], json!([]), "no spawned agents: {r}");
+    if r["sampledAt"].is_null() {
+        assert!(
+            r["totalBytes"].is_null(),
+            "unsampled ⇒ totalBytes null: {r}"
+        );
+    } else {
+        assert!(
+            r["sampledAt"].as_str().is_some_and(|s| s.contains('T')),
+            "sampledAt is an RFC-3339 stamp: {r}"
+        );
+        assert_eq!(r["totalBytes"], 0, "no spawned agents: {r}");
     }
 }
 
 /// Runtime `server.bindAddress` hook (monorepo#2900): changing the bind
 /// address while the WSS listener is running restarts it on the new address.
 /// Observable end to end: the listener stays connectable on the fixed port
-/// across both restarts, and `pairing.getInfo` advertises the bind-aware
-/// hosts (exactly the specific address for a loopback bind; the non-loopback
-/// enumeration for 0.0.0.0 — which never contains 127.0.0.1).
+/// across both restarts, `system.status` localIps advertises the bind-aware
+/// set (exactly the specific address for a loopback bind; the non-loopback
+/// enumeration for 0.0.0.0 — which never contains 127.0.0.1), and
+/// `pairing.getInfo` errors for the loopback-only bind (no dialable route
+/// without a tunnel) while serving loopback-free hosts for 0.0.0.0.
 #[tokio::test]
 async fn runtime_bind_address_change_restarts_listener() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Fixed seeded port (no INTENTD_TCP_PORT=0 seam) so the restarted
     // listener rebinds the same port and only the address changes.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    let child = spawn_serve(&data_dir, "both", &env);
+    let child = spawn_serve_fixed_port(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -1150,12 +1332,23 @@ async fn runtime_bind_address_change_restarts_listener() {
         .to_string();
     let cfg = client_config(&fingerprint);
 
-    // Default loopback bind: pairing advertises exactly 127.0.0.1.
+    // Default loopback bind: loopback is never dialable from another device
+    // and no tunnel is active, so pairing errors with guidance instead of
+    // minting a route-less payload, while system.status localIps — the
+    // diagnostic surface — reports exactly 127.0.0.1 (never the full
+    // interface enumeration for a loopback-only listener).
     let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    assert!(
+        info["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("loopback only")),
+        "loopback bind without a tunnel errors on pairing.getInfo: {info}"
+    );
+    let status = uds_rpc(&socket, 102, "system.status", json!({})).await;
     assert_eq!(
-        info["result"]["hosts"],
+        status["result"]["localIps"],
         json!(["127.0.0.1"]),
-        "loopback bind advertises exactly 127.0.0.1: {info}"
+        "loopback bind: system.status localIps is exactly 127.0.0.1: {status}"
     );
 
     // Widen the bind while the listener is running: the hook restarts it on
@@ -1188,16 +1381,25 @@ async fn runtime_bind_address_change_restarts_listener() {
     );
 
     // Bind-aware advertisement followed the restart: an unspecified bind
-    // enumerates non-loopback local IPs, never 127.0.0.1.
+    // enumerates non-loopback local IPs, never 127.0.0.1 — on both surfaces.
     let info = uds_rpc(&socket, 4, "pairing.getInfo", json!({})).await;
     let hosts = info["result"]["hosts"].as_array().expect("hosts array");
     assert!(
         !hosts.iter().any(|h| h == "127.0.0.1"),
         "0.0.0.0 bind must not advertise loopback: {info}"
     );
+    let status = uds_rpc(&socket, 104, "system.status", json!({})).await;
+    let local_ips = status["result"]["localIps"]
+        .as_array()
+        .expect("localIps array");
+    assert!(
+        !local_ips.iter().any(|h| h == "127.0.0.1"),
+        "0.0.0.0 bind: system.status localIps must not contain loopback: {status}"
+    );
 
     // Narrow back to loopback: hook restarts again, listener survives, and
-    // the advertisement returns to exactly 127.0.0.1.
+    // the loopback-only posture returns — pairing errors again and the
+    // diagnostic surface reports exactly 127.0.0.1.
     let narrow = uds_rpc(
         &socket,
         5,
@@ -1222,10 +1424,17 @@ async fn runtime_bind_address_change_restarts_listener() {
         "events.subscribe after narrowing back to loopback should work: {sub2}"
     );
     let info = uds_rpc(&socket, 6, "pairing.getInfo", json!({})).await;
+    assert!(
+        info["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("loopback only")),
+        "narrowed bind errors on pairing.getInfo again: {info}"
+    );
+    let status = uds_rpc(&socket, 106, "system.status", json!({})).await;
     assert_eq!(
-        info["result"]["hosts"],
+        status["result"]["localIps"],
         json!(["127.0.0.1"]),
-        "loopback bind advertises exactly 127.0.0.1 again: {info}"
+        "narrowed bind: system.status localIps returns to exactly 127.0.0.1: {status}"
     );
 
     // A non-IP value is rejected at write time (never deferred to the next
@@ -1258,7 +1467,7 @@ async fn runtime_bind_address_change_restarts_listener() {
 
 /// Runtime `server.bindAddress` list form (monorepo#3314): a list of IPs is
 /// accepted end to end over the settings surface — the restart hook applies
-/// it, the listener stays connectable, and `pairing.getInfo` advertises
+/// it, the listener stays connectable, and `system.status` localIps reports
 /// exactly the configured set. Invalid sets (duplicates, unspecified mixed
 /// with specific) are rejected at write time with the running listener
 /// untouched.
@@ -1270,9 +1479,11 @@ async fn runtime_bind_address_list_applies_and_validates() {
         eprintln!("skipping: IPv6 loopback unavailable");
         return;
     }
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    // Fixed seeded port: the list-form restart must rebind the same port.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    let child = spawn_serve(&data_dir, "both", &env);
+    let child = spawn_serve_fixed_port(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -1335,12 +1546,22 @@ async fn runtime_bind_address_list_applies_and_validates() {
         "list form persists and reads back as an array: {get}"
     );
 
-    // Pairing advertises exactly the configured set (specific addresses).
+    // Pairing filters loopback out of the configured set — both entries here
+    // are loopback-family and no tunnel is active, so pairing errors with
+    // guidance — while system.status localIps (diagnostic surface) reports
+    // exactly the configured set.
     let info = uds_rpc(&socket, 4, "pairing.getInfo", json!({})).await;
+    assert!(
+        info["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("loopback only")),
+        "loopback-family list bind errors on pairing.getInfo: {info}"
+    );
+    let status = uds_rpc(&socket, 104, "system.status", json!({})).await;
     assert_eq!(
-        info["result"]["hosts"],
+        status["result"]["localIps"],
         json!(["127.0.0.1", "::1"]),
-        "list bind advertises exactly its entries: {info}"
+        "list bind: system.status localIps is exactly the configured set: {status}"
     );
 
     // Invalid sets are rejected at write time; the listener stays up.
@@ -1374,6 +1595,72 @@ async fn runtime_bind_address_list_applies_and_validates() {
     assert!(
         sub2.get("error").is_none(),
         "listener must survive rejected bindAddress writes: {sub2}"
+    );
+}
+
+/// Tunnel-only advertisement: with `server.tunnel.only = true` the listener
+/// binds loopback regardless of a wide `server.bindAddress`. `system.status`
+/// localIps (diagnostic) advertises exactly 127.0.0.1 — never the machine's
+/// interface enumeration, whose routes are all dead in this posture (direct
+/// LAN connects are refused) — and `pairing.getInfo` advertises no hosts at
+/// all (loopback is never dialable from another device; the tunnel address
+/// carries the reachable route, so the fake sidecar's tc address is what
+/// makes pairing succeed here).
+#[tokio::test]
+async fn tunnel_only_advertises_loopback_only() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    // Seed a wide bindAddress alongside tunnel-only BEFORE boot, so the test
+    // proves the loopback override wins on the advertised surfaces.
+    // configure_serve appends [server.wsApi] after these tables.
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"0.0.0.0\"\n\n[server.tunnel]\nenabled = true\nonly = true\n",
+    )
+    .expect("seed config.toml");
+    let tailcat = write_fake_tailcat(&data_dir);
+    let tailcat_s = tailcat.to_string_lossy().to_string();
+    let env: [(&str, &str); 2] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TAILCAT_BIN", &tailcat_s),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    assert_eq!(
+        status["result"]["localIps"],
+        json!(["127.0.0.1"]),
+        "tunnel-only: system.status localIps is exactly loopback despite the \
+         wide bindAddress: {status}"
+    );
+    // The sidecar registers its address asynchronously after boot; until it
+    // does, pairing correctly errors (no dialable route). Poll bounded by the
+    // startup budget for the success shape: no hosts, tc route present.
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    let info = loop {
+        let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+        if info.get("error").is_none() || std::time::Instant::now() >= deadline {
+            break info;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        info["result"]["hosts"],
+        json!([]),
+        "tunnel-only: pairing advertises no hosts (loopback filtered): {info}"
+    );
+    assert!(
+        info["result"]["tcAddress"]
+            .as_str()
+            .is_some_and(|tc| tc.starts_with("tc-")),
+        "tunnel-only: the tc address carries the dialable route: {info}"
     );
 }
 
@@ -1414,12 +1701,12 @@ esac
 /// fires for a WSS caller and rolls the setting back.
 #[tokio::test]
 async fn tunnel_settings_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let tailcat = write_fake_tailcat(&data_dir);
     let tailcat_s = tailcat.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_TAILCAT_BIN", &tailcat_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -1533,5 +1820,167 @@ async fn tunnel_settings_over_wss() {
     assert!(
         disable.get("error").is_none(),
         "settings.update server.tunnel.enabled=false over WSS should succeed: {disable}"
+    );
+}
+
+/// Exact update control over authenticated, fingerprint-pinned WSS. A staged
+/// release fixture avoids any public network access; updater HTTP tests exercise
+/// archive download and verification separately.
+#[tokio::test]
+async fn wss_exact_update_validates_reports_failure_and_restarts_without_channel_check() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = temp_data_dir();
+    let data_dir = dir.path().to_path_buf();
+    let sitter_dir = data_dir.join("sitter");
+    std::fs::create_dir_all(&sitter_dir).unwrap();
+    let sitter_bin = sitter_dir.join("intentd-sitter");
+    std::fs::copy("/bin/sh", &sitter_bin).unwrap();
+    let daemon_pid_path = sitter_dir.join("daemon.pid");
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SITTER_EXACT_UPDATE", "1"),
+    ];
+    let mut daemon = Daemon {
+        child: spawn_serve_under_stand_in_sitter(
+            &data_dir,
+            "both",
+            &env,
+            &sitter_bin,
+            &daemon_pid_path,
+        ),
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let daemon_pid = std::fs::read_to_string(&daemon_pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _kill_daemon = KillPidOnDrop(daemon_pid);
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut ws = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let unsupported = wss_rpc(&mut ws, 80, "system.status", json!({})).await;
+    assert_eq!(unsupported["result"]["exactUpdateSupported"], false);
+    let unsupported = wss_rpc(
+        &mut ws,
+        81,
+        "system.requestUpdate",
+        json!({"targetVersion":"99.0.0"}),
+    )
+    .await;
+    assert_eq!(unsupported["error"]["code"], -32603);
+    std::fs::write(
+        sitter_dir.join("sitter.pid"),
+        format!("{}\n", daemon.child.id()),
+    )
+    .unwrap();
+    let supported = wss_rpc(&mut ws, 82, "system.status", json!({})).await;
+    assert_eq!(supported["result"]["exactUpdateSupported"], true);
+    let child_env = wss_rpc(&mut ws, 88, "host.exec", json!({
+        "command":"/bin/sh", "args":["-c", "printf '%s' \"${INTENTD_SITTER_EXACT_UPDATE-unset}\""], "timeoutMs":5000
+    })).await;
+    assert_eq!(
+        child_env["result"]["stdout"], "unset",
+        "handshake must not leak to children: {child_env}"
+    );
+
+    for params in [
+        json!({"targetVersion":"../escape"}),
+        json!({"targetVersion":null}),
+        json!({"targetVersion":"99.0.0+build"}),
+        json!({"targetVersion":"99.0.0", "url":"https://attacker/asset"}),
+    ] {
+        let r = wss_rpc(&mut ws, 83, "system.requestUpdate", params).await;
+        assert_eq!(r["jsonrpc"], "2.0");
+        assert_eq!(r["id"], 83);
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
+    for target in ["0.0.1", env!("CARGO_PKG_VERSION")] {
+        let r = wss_rpc(
+            &mut ws,
+            84,
+            "system.requestUpdate",
+            json!({"targetVersion":target}),
+        )
+        .await;
+        assert_eq!(r["error"]["code"], -32603, "{r}");
+    }
+    let paths = intentd_sitter::paths::SitterPaths::from_data_dir(&data_dir);
+    let mut installed = intentd_sitter::state::SitterState {
+        current_version: Some("99.0.0".into()),
+        ..Default::default()
+    };
+    intentd_sitter::state::save(&paths.state_path, &installed).unwrap();
+    let r = wss_rpc(
+        &mut ws,
+        85,
+        "system.requestUpdate",
+        json!({"targetVersion":"98.0.0"}),
+    )
+    .await;
+    assert_eq!(
+        r,
+        json!({"jsonrpc":"2.0", "id":85, "result":{"ok":true,"targetVersion":"98.0.0"}})
+    );
+    let failed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let r = wss_rpc(&mut ws, 86, "system.status", json!({})).await;
+            if r["result"]["targetUpdate"]["state"] == "failed" {
+                break r;
+            }
+            // timing-guard: bounded polling of observable update state / sitter exit.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed["result"]["targetUpdate"]["targetVersion"], "98.0.0");
+    assert!(failed["result"]["targetUpdate"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("newer version"));
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "failed update must not signal sitter"
+    );
+    installed.current_version = Some("100.0.0".into());
+    intentd_sitter::state::save(&paths.state_path, &installed).unwrap();
+    let binary = paths.daemon_binary("100.0.0");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(binary, b"already verified/staged release fixture").unwrap();
+    let r = wss_rpc(
+        &mut ws,
+        87,
+        "system.requestUpdate",
+        json!({"targetVersion":"100.0.0"}),
+    )
+    .await;
+    assert_eq!(
+        r,
+        json!({"jsonrpc":"2.0", "id":87, "result":{"ok":true,"targetVersion":"100.0.0"}})
+    );
+    let exit = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(exit) = daemon.child.try_wait().unwrap() {
+                break exit;
+            }
+            // timing-guard: bounded polling of observable update state / sitter exit.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        exit.signal(),
+        Some(libc::SIGHUP),
+        "exact install must only restart, never SIGUSR1 channel check"
     );
 }

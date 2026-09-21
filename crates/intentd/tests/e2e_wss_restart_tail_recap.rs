@@ -25,8 +25,8 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +41,6 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -58,11 +57,8 @@ const CONTINUATION_PREFIX: &str = "You were interrupted for about ";
 const CONTINUATION_SUFFIX: &str = "due to a harness shutdown and restart. You can now continue \
      your work and pick up where you left off.";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-tail-recap-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-tail-recap-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -234,12 +230,10 @@ fn spawn_daemon(
     // the explicit `agent.resolveInterrupted` call (the `auto` default resumes
     // on headless hosts, which would race the assertions below).
     common::disable_resume_on_start(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", script)
         .env("MOCK_AGENT_BEHAVIOR", behavior.to_string())
         .env("MOCK_AGENT_PROMPT_LOG", prompt_log)
@@ -347,11 +341,14 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -364,7 +361,8 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let prompt_log = data_dir.join("prompts.jsonl");
     let session_log = data_dir.join("sessions.jsonl");
@@ -474,7 +472,7 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         &session_log,
         "daemon2.log",
     );
-    let _daemon2 = common::DaemonGuard::new(child2, data_dir.clone(), true);
+    let _daemon2 = common::DaemonGuard::process_only(child2);
     assert!(await_uds(&socket).await, "daemon2 did not start");
 
     let status = common::await_wss_status(&socket).await;
@@ -535,6 +533,13 @@ async fn resume_via_session_load_replays_interrupted_tail() {
     assert!(
         text.contains("did NOT complete"),
         "continuation prompt must disclose the cut-off explicitly; got: {text}"
+    );
+    // The replayed segments are far under the per-segment cap and nothing was
+    // elided, so the truncation hint (intent#3696) must NOT ride the recap —
+    // it is reserved for recaps that actually cut something.
+    assert!(
+        !text.contains("cut by this recap") && !text.contains("truncated=\""),
+        "an untruncated recap must not carry the truncation hint; got: {text}"
     );
 
     // The tail must have been delivered on the session/load branch — prove

@@ -14,7 +14,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
@@ -42,13 +41,6 @@ use common::TlsWs;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -179,11 +171,14 @@ fn workspace(id: &WorkspaceId, title: &str) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -232,6 +227,7 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -308,7 +304,7 @@ struct Fixture {
     cfg: Arc<ClientConfig>,
     ws_merge: WorkspaceId,
     ws_plain: WorkspaceId,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener over a store seeded with:
@@ -319,9 +315,8 @@ struct Fixture {
 /// whose `pull_requests` list is empty (nothing to merge; field must stay
 /// omitted on the wire).
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-merged-prs-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-merged-prs-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -419,7 +414,7 @@ async fn boot() -> Fixture {
         cfg,
         ws_merge,
         ws_plain,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -511,7 +506,13 @@ fn assert_merged_rows(rows: &[Value], ws_merge: &WorkspaceId, ws_plain: &Workspa
     // Snapshot-backed monitor entry: fields synthesized off the snapshot.
     assert_eq!(prs[1]["title"], json!("Monitored PR"), "{path}");
     assert_eq!(prs[1]["number"], json!(2), "{path}");
-    assert_eq!(prs[1]["headSha"], json!("abc123"), "{path}");
+    // The snapshot's headSha fed the merge, but list rows strip the per-PR
+    // detail fields as a final pass (`Workspace::slim_for_list`).
+    assert!(
+        prs[1].get("headSha").is_none(),
+        "{path}: headSha slimmed off list rows: {}",
+        prs[1]
+    );
     assert_eq!(prs[1]["isDraft"], json!(false), "{path}");
     // Snapshotless completed monitor: synthesized identity; terminal
     // without a verdict reads closed, never merged.
@@ -531,7 +532,7 @@ fn assert_merged_rows(rows: &[Value], ws_merge: &WorkspaceId, ws_plain: &Workspa
 /// `workspace.list` rows over WSS carry the emit-path merged `pullRequests`
 /// (git-root + monitor sources, URL-deduped, cancelled excluded), while the
 /// nothing-to-merge row omits the field entirely.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_list_merges_external_prs_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
@@ -544,7 +545,7 @@ async fn workspace_list_merges_external_prs_over_wss() {
 /// The `workspace.subscribe` seq-0 snapshot rides the same lite list path
 /// and must carry the identical merged `pullRequests` a `workspace.list`
 /// would (docs/protocol/06-events.md).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_subscribe_snapshot_merges_external_prs_over_wss() {
     let fx = boot().await;
     let mut sub = connect(fx.port, fx.cfg.clone()).await;

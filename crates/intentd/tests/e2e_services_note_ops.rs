@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use intent_core::{
@@ -17,13 +17,6 @@ use intent_core::{
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
-
-/// Clean up `SQLite` database including -wal and -shm sidecars.
-fn cleanup_db(db: &PathBuf) {
-    std::fs::remove_file(db).ok();
-    std::fs::remove_file(db.with_extension("db-wal")).ok();
-    std::fs::remove_file(db.with_extension("db-shm")).ok();
-}
 
 fn workspace(id: &WorkspaceId, path: &Path) -> Workspace {
     let ts = now_iso();
@@ -65,38 +58,43 @@ fn workspace(id: &WorkspaceId, path: &Path) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
-async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
-    let db = std::env::temp_dir().join(format!("intentd-e2e-note-ops-{}.db", uuid::Uuid::new_v4()));
-    let ws_root =
-        std::env::temp_dir().join(format!("itd-e2e-note-ops-ws-{}", uuid::Uuid::new_v4()));
+/// Scratch layout: `<tmp>/intentd.db` plus the workspace checkout at
+/// `<tmp>/ws`; the returned guard removes both on drop.
+async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
+    let tmp = common::test_tempdir("intentd-e2e-note-ops-");
+    let db = tmp.path().join("intentd.db");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("create ws root");
 
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(ws_root.parent().unwrap().to_path_buf())
+        .with_workspaces_root(tmp.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&workspace(&ws, &ws_root.clone()))
+        .insert_workspace(&workspace(&ws, &ws_root))
         .await
         .expect("insert ws");
 
-    (Arc::new(services), ws, ws_root, db)
+    (Arc::new(services), ws, tmp)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_add_edit_edit_lines() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Create a note using the proper API
     let create_input = NoteCreate {
@@ -174,13 +172,11 @@ async fn note_add_edit_edit_lines() {
 
     // Cleanup
     drop(services); // Drop store handles before DB cleanup
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_list_tasks() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Create a note with tasks
     let content = "# Tasks\n\n- [ ] Task 1\n- [x] Task 2\n- [ ] Task 3";
@@ -212,13 +208,11 @@ async fn note_list_tasks() {
 
     // Cleanup
     drop(services); // Drop store handles before DB cleanup
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_update_metadata() {
-    let (services, ws, ws_root, db) = setup().await;
+    let (services, ws, _tmp) = setup().await;
 
     // Create a note
     let create_input = NoteCreate {
@@ -260,6 +254,4 @@ async fn note_update_metadata() {
 
     // Cleanup
     drop(services); // Drop store handles before DB cleanup
-    cleanup_db(&db);
-    std::fs::remove_dir_all(&ws_root).ok();
 }

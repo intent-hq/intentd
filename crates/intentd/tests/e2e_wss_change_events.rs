@@ -13,7 +13,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,28 +29,24 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
+    _data_dir_guard: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-events-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-events-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -59,9 +55,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
     common::seed_default_provider(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -194,6 +189,24 @@ where
     v["result"].clone()
 }
 
+/// The actor the daemon stamps on this connection's own actions: every
+/// bound wire principal's event carries `{ type: user, id: principalId,
+/// name }` (multiplayer w4), the name being the GitHub login, else the
+/// display name, else the id — `principal.me` projected accordingly.
+async fn caller_actor<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let me = wss_rpc(ws, id, "principal.me", json!({})).await;
+    let principal_id = me["id"].as_str().expect("principal id").to_string();
+    let name = me["login"]
+        .as_str()
+        .or(me["displayName"].as_str())
+        .unwrap_or(&principal_id)
+        .to_string();
+    json!({ "type": "user", "id": principal_id, "name": name })
+}
+
 /// Like [`wss_rpc`] but returns the full response envelope so tests can
 /// assert `error.code` / `error.message` for expected-failure paths.
 async fn wss_rpc_envelope<S>(
@@ -267,12 +280,14 @@ where
 }
 
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
+        _data_dir_guard: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -342,10 +357,7 @@ async fn workspace_update_emits_workspace_updated_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert!(evt["id"].is_string(), "event id: {evt}");
     assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    assert_eq!(
-        evt["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(evt["actor"], caller_actor(&mut rpc, 90).await);
     // `changes` is the applied delta only; `skip_serializing_if = "Option::is_none"`
     // keeps un-supplied fields out of the payload (reference-parity emitter).
     // The skip toggle round-trips under its canonical `skipIsolation` name
@@ -964,6 +976,14 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!(task_id),
         "assign updated: {evt}"
     );
+    // The in_progress status materializes onto the parent's linked checkbox
+    // line (`[ ]` → `[/]`), which takes its own `note:updated`.
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(parent_id),
+        "parent materialized: {evt}"
+    );
 
     let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
     assert_eq!(evt["data"]["noteId"], json!(task_id));
@@ -1003,6 +1023,64 @@ async fn task_block_author_list_assign_flow_over_wss() {
     )
     .await;
     assert_eq!(got["task"]["status"], json!("in_progress"), "task: {got}");
+
+    // The parent's linked row now reads the materialized in-progress char.
+    let tasks = wss_rpc(
+        &mut rpc,
+        6,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    assert_eq!(tasks[0]["status"], json!("in-progress"), "rows: {tasks}");
+    assert_eq!(tasks[0]["taskNoteId"], json!(task_id));
+
+    // Complete: a checkbox-level write on the parent's linked line redirects
+    // to the task note (intent-hq/intent#4255) — the task transitions
+    // in_progress → complete and the parent char follows via materialization.
+    let done = wss_rpc(
+        &mut rpc,
+        7,
+        "task.updateStatus",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": parent_id,
+            "taskText": "Ship It",
+            "status": "done",
+        }),
+    )
+    .await;
+    assert_eq!(
+        done,
+        json!({ "ok": true, "noteId": parent_id, "taskText": "Ship It", "status": "done" }),
+        "updateStatus: {done}"
+    );
+    let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
+    assert_eq!(evt["data"]["noteId"], json!(task_id), "redirected: {evt}");
+    assert_eq!(evt["data"]["previousStatus"], json!("in_progress"));
+    assert_eq!(evt["data"]["newStatus"], json!("complete"));
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(parent_id),
+        "parent materialized: {evt}"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        8,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": task_id }),
+    )
+    .await;
+    assert_eq!(got["task"]["status"], json!("complete"), "task: {got}");
+    let tasks = wss_rpc(
+        &mut rpc,
+        9,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    assert_eq!(tasks[0]["status"], json!("done"), "rows: {tasks}");
 }
 
 /// End-to-end `task:created` over WSS (docs/protocol/06-events.md §6.5): every path where a
@@ -1072,10 +1150,7 @@ async fn task_created_emitted_on_every_creation_path_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert!(evt["id"].is_string(), "event id: {evt}");
     assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    assert_eq!(
-        evt["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(evt["actor"], caller_actor(&mut rpc, 90).await);
     assert_eq!(evt["data"]["noteId"], json!(child_id));
     assert_eq!(evt["data"]["noteTitle"], json!("Converted Task"));
     assert_eq!(evt["data"]["status"], json!("not_started"));
@@ -1482,10 +1557,7 @@ async fn comment_respond_emits_comment_added_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert!(evt["id"].is_string(), "event id: {evt}");
     assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    assert_eq!(
-        evt["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(evt["actor"], caller_actor(&mut rpc, 90).await);
     assert_eq!(
         evt["data"],
         json!({ "noteId": note_id, "commentId": reply_id })
@@ -2969,6 +3041,96 @@ async fn workspace_subscribe_snapshot_includes_archived_over_wss() {
         archived["status"],
         json!("Archived"),
         "snapshot includes archived workspaces with their status: {archived}"
+    );
+}
+
+/// End-to-end regression: the virtual Chief of Staff workspace (`__chief__`)
+/// never rides a `workspace.subscribe` delta. `workspace.list` and the seq-0
+/// snapshot filter it at the store, but the delta path re-reads the event's
+/// workspace via `workspace.get` — which synthesizes Chief — so a Chief-scoped
+/// `workspace:updated` used to push `updated: [<chief>]` and clients that
+/// upsert unknown ids (iOS/visionOS) grew a "Chief of Staff" row. A control
+/// update on a real workspace must still arrive as the very next delta
+/// (seq 1: nothing was emitted for Chief in between).
+#[tokio::test]
+async fn workspace_subscribe_deltas_never_carry_chief_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Real WS", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let real_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("real workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(&mut sub, 1, "workspace.subscribe", json!({})).await;
+    let sub_id = sub_res["subscriptionId"]
+        .as_str()
+        .expect("subscriptionId")
+        .to_string();
+    let push = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(push["kind"], json!("snapshot"), "push: {push}");
+    let snap = push["snapshot"].as_array().expect("snapshot array");
+    assert!(
+        !snap
+            .iter()
+            .any(|e| e["id"] == json!(intent_core::CHIEF_WORKSPACE_ID)),
+        "seq-0 snapshot must not surface Chief: {snap:?}"
+    );
+
+    // Chief-scoped `workspace:updated` (the update is a virtual no-op that
+    // still publishes the event), then a control update on the real workspace.
+    let resp = uds_rpc(
+        &socket,
+        3,
+        "workspace.update",
+        json!({ "workspaceId": intent_core::CHIEF_WORKSPACE_ID, "statusMessage": "hello" }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["workspace"]["id"],
+        json!(intent_core::CHIEF_WORKSPACE_ID),
+        "workspace.update on Chief: {resp}"
+    );
+    uds_rpc(
+        &socket,
+        4,
+        "workspace.update",
+        json!({ "workspaceId": real_id, "statusMessage": "control" }),
+    )
+    .await;
+
+    let delta = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(delta["subscriptionId"], sub_id.as_str(), "delta: {delta}");
+    assert_eq!(delta["kind"], json!("delta"), "delta: {delta}");
+    assert_eq!(
+        delta["seq"],
+        json!(1),
+        "the Chief-scoped event must not have consumed a delta seq: {delta}"
+    );
+    let updated = delta["delta"]["updated"].as_array().expect("updated array");
+    assert!(
+        !updated
+            .iter()
+            .any(|e| e["id"] == json!(intent_core::CHIEF_WORKSPACE_ID)),
+        "workspace deltas must never carry Chief: {delta}"
+    );
+    assert_eq!(
+        updated[0]["id"],
+        json!(real_id),
+        "control update on the real workspace still arrives: {delta}"
+    );
+    assert_eq!(
+        updated[0]["statusMessage"],
+        json!("control"),
+        "control delta carries the re-read workspace: {delta}"
     );
 }
 

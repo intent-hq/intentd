@@ -10,33 +10,30 @@ use std::path::{Path, PathBuf};
 
 use intent_core::transfer::TransferManifest;
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, ClientId, Error, Hook, HookId, HookState, Note,
-    NoteId, PrMonitor, PrMonitorId, PrMonitorState, Script, ScriptMode, WorkspaceId,
-    WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, ClientHostInfo, ClientId, Error, Hook, HookId,
+    HookState, Note, NoteId, PrMonitor, PrMonitorId, PrMonitorState, Script, ScriptMode,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_store::{AgentQueueRow, PersistedEventSubscription, Sandbox, SandboxStatus, Store};
 
+use crate::test_support::test_tempdir;
 use crate::transfer_export::ExportState;
 use crate::Services;
 
-struct TempDir(PathBuf);
+/// Temp directory swept on drop (see [`test_tempdir`]).
+struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 impl TempDir {
     fn new(prefix: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).expect("mkdir");
-        Self(p)
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let guard = test_tempdir(&format!("{prefix}-"));
+        Self(guard.path().to_path_buf(), guard)
     }
 }
 
-/// One in-process daemon stack: its own `SQLite` store, workspaces root, and
-/// assets root — the same wiring the export/import unit suites use.
-async fn fresh_services(workspaces_root: &Path, assets_root: &Path) -> Services {
-    let db = std::env::temp_dir().join(format!("roundtrip-test-{}.db", uuid::Uuid::new_v4()));
+/// One in-process daemon stack: its own `SQLite` store (under `db_root`),
+/// workspaces root, and assets root — the same wiring the export/import unit
+/// suites use.
+async fn fresh_services(db_root: &Path, workspaces_root: &Path, assets_root: &Path) -> Services {
+    let db = db_root.join("roundtrip.db");
     let store = Store::open(&db).await.expect("open store");
     Services::new(store)
         .with_workspaces_root(workspaces_root.to_path_buf())
@@ -88,6 +85,7 @@ fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSe
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -423,7 +421,7 @@ async fn seed_source(
     // Draft (FKs onto client; dropped by the import transform).
     let client = ClientId::from("client-rt");
     svc.store
-        .upsert_client(&client, None, None)
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
         .await
         .expect("client");
     svc.store
@@ -539,14 +537,16 @@ async fn relay(
 /// (events zero, drafts dropped), path rewrites, nulled ACP session ids,
 /// interrupted-agent capture, git worktree + sandbox dirty state, the
 /// rehydration counts, and the finalized (archived) source.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn transfer_round_trip_between_two_stacks() {
+    let src_db = TempDir::new("rt-src-db");
     let src_ws_root = TempDir::new("rt-src-ws");
     let src_assets_root = TempDir::new("rt-src-assets");
+    let dst_db = TempDir::new("rt-dst-db");
     let dst_ws_root = TempDir::new("rt-dst-ws");
     let dst_assets_root = TempDir::new("rt-dst-assets");
-    let source = fresh_services(&src_ws_root.0, &src_assets_root.0).await;
-    let target = fresh_services(&dst_ws_root.0, &dst_assets_root.0).await;
+    let source = fresh_services(&src_db.0, &src_ws_root.0, &src_assets_root.0).await;
+    let target = fresh_services(&dst_db.0, &dst_ws_root.0, &dst_assets_root.0).await;
 
     let id = WorkspaceId("ws-roundtrip".to_string());
     let seeded = seed_source(&source, &src_ws_root.0, &src_assets_root.0, &id).await;
@@ -785,12 +785,14 @@ async fn transfer_round_trip_between_two_stacks() {
 /// target's import abort cleans its staging with nothing committed.
 #[tokio::test]
 async fn transfer_abort_mid_relay_cleans_both_sides() {
+    let src_db = TempDir::new("rt-abort-src-db");
     let src_ws_root = TempDir::new("rt-abort-src-ws");
     let src_assets_root = TempDir::new("rt-abort-src-assets");
+    let dst_db = TempDir::new("rt-abort-dst-db");
     let dst_ws_root = TempDir::new("rt-abort-dst-ws");
     let dst_assets_root = TempDir::new("rt-abort-dst-assets");
-    let source = fresh_services(&src_ws_root.0, &src_assets_root.0).await;
-    let target = fresh_services(&dst_ws_root.0, &dst_assets_root.0).await;
+    let source = fresh_services(&src_db.0, &src_ws_root.0, &src_assets_root.0).await;
+    let target = fresh_services(&dst_db.0, &dst_ws_root.0, &dst_assets_root.0).await;
 
     let id = WorkspaceId("ws-roundtrip-abort".to_string());
     let seeded = seed_source(&source, &src_ws_root.0, &src_assets_root.0, &id).await;

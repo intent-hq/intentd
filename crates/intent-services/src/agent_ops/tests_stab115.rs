@@ -33,7 +33,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId, tempfile::TempDir) {
     // monorepo#3044: creation requires a resolvable provider (no positional
     // fallback) — seed the pre-existing effective default explicitly.
     registry
-        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
     let services = Services::new(store).with_settings_registry(registry);
     (tmp, services, ws, config_dir)
@@ -85,14 +85,14 @@ async fn agent_create_resolves_model_from_settings_default() {
     let (_t, svc, ws, _cfg) = setup().await;
 
     // Set model.default in settings
-    set(&svc, "model.default", json!("auggie:sonnet4.5"));
+    set(&svc, "model.default", json!("sonnet4.5"));
 
     // Create agent without explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None).await;
 
     // Verify the session has the resolved model persisted
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
+    assert_eq!(got.model.as_deref(), Some("sonnet4.5"));
 }
 
 /// monorepo#1000 regression: a stale `model.workspaceOverrides` `SQLite` row
@@ -103,8 +103,8 @@ async fn agent_create_ignores_stale_workspace_override_row() {
     let (_t, svc, ws, _cfg) = setup().await;
 
     // Plant a stale override row for this workspace plus a global default.
-    set(&svc, "model.default", json!("auggie:sonnet4.5"));
-    let overrides = json!({ ws.as_str(): "auggie:opus" });
+    set(&svc, "model.default", json!("sonnet4.5"));
+    let overrides = json!({ ws.as_str(): "opus" });
     set_blob(&svc, "model.workspaceOverrides", overrides).await;
 
     // Create agent without explicit model
@@ -112,7 +112,7 @@ async fn agent_create_ignores_stale_workspace_override_row() {
 
     // The stale override is ignored; the global default wins.
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
+    assert_eq!(got.model.as_deref(), Some("sonnet4.5"));
 }
 
 /// monorepo#1729: the quick-action default is scoped to single-shot quick
@@ -123,9 +123,9 @@ async fn agent_create_background_agent_ignores_quick_action_default() {
     let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both global default and quick-action default
-    set(&svc, "model.default", json!("auggie:sonnet4.5"));
+    set(&svc, "model.default", json!("sonnet4.5"));
 
-    set(&svc, "quickActions.defaultModel", json!("auggie:haiku"));
+    set(&svc, "quickActions.defaultModel", json!("haiku"));
 
     // Create background agent without explicit model
     let extra = intent_core::AgentCreateExtra {
@@ -149,7 +149,7 @@ async fn agent_create_background_agent_ignores_quick_action_default() {
 
     // Verify the global default won
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
+    assert_eq!(got.model.as_deref(), Some("sonnet4.5"));
 }
 
 /// Bug B: Explicit model at creation time overrides all settings.
@@ -158,14 +158,14 @@ async fn agent_create_explicit_model_wins_over_settings() {
     let (_t, svc, ws, _cfg) = setup().await;
 
     // Set global default
-    set(&svc, "model.default", json!("auggie:sonnet4.5"));
+    set(&svc, "model.default", json!("sonnet4.5"));
 
     // Create agent with explicit model
-    let id = create_agent(&svc, &ws, "TestAgent", Some("auggie:opus".into())).await;
+    let id = create_agent(&svc, &ws, "TestAgent", Some("opus".into())).await;
 
     // Verify the explicit model won
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:opus"));
+    assert_eq!(got.model.as_deref(), Some("opus"));
 }
 
 /// STAB-117 extension: providerDefaults applies when nothing more specific is set.
@@ -230,7 +230,7 @@ async fn agent_create_background_resolves_provider_defaults_over_quick_action() 
     let provider_defaults = json!({ "auggie": "fable-5" });
     set(&svc, "model.providerDefaults", provider_defaults);
 
-    set(&svc, "quickActions.defaultModel", json!("auggie:haiku"));
+    set(&svc, "quickActions.defaultModel", json!("haiku"));
 
     // Create background agent without explicit model
     let extra = intent_core::AgentCreateExtra {
@@ -263,7 +263,7 @@ async fn agent_create_provider_defaults_beats_global_default() {
     let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both global default and providerDefaults
-    set(&svc, "model.default", json!("auggie:sonnet4.5"));
+    set(&svc, "model.default", json!("sonnet4.5"));
 
     let provider_defaults = json!({ "auggie": "fable-5" });
     set(&svc, "model.providerDefaults", provider_defaults);
@@ -282,7 +282,7 @@ async fn agent_create_unknown_provider_falls_through_to_global() {
     let (_t, svc, ws, _cfg) = setup().await;
 
     // Set global default and providerDefaults with a different provider
-    set(&svc, "model.default", json!("auggie:sonnet4.5"));
+    set(&svc, "model.default", json!("sonnet4.5"));
 
     let provider_defaults = json!({ "opencode": "kimi-k3" });
     set(&svc, "model.providerDefaults", provider_defaults);
@@ -292,7 +292,7 @@ async fn agent_create_unknown_provider_falls_through_to_global() {
 
     // Verify the global default won (auggie not in providerDefaults)
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
+    assert_eq!(got.model.as_deref(), Some("sonnet4.5"));
 }
 
 /// monorepo#607 refinement: a *settings-derived* bare default whose ownership

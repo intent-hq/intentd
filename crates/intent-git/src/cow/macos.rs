@@ -28,7 +28,7 @@ extern "C" {
 
 // The `f_` prefix mirrors the C `struct statfs` field names from
 // sys/mount.h verbatim; renaming would obscure the FFI correspondence.
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 #[repr(C)]
 struct StatFs {
     f_bsize: u32,

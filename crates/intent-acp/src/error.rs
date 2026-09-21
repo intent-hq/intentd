@@ -3,6 +3,8 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::spawn::LaunchMode;
+
 /// Stable Display prefix of [`AcpError::PromptIdleTimeout`]. The service layer
 /// flattens prompt errors to strings at its wrap boundary
 /// (`session/prompt failed: …`), so downstream classification is
@@ -10,6 +12,26 @@ use std::time::Duration;
 /// the flatten (see `acp_error_prompt_idle_timeout_display_is_prefix_anchored`
 /// in `tests.rs`, which pins the Display rendering to it).
 pub const PROMPT_IDLE_TIMEOUT_PREFIX: &str = "session/prompt idle timeout";
+
+/// Stable Display prefix of [`AcpError::ProviderStall`] (intent-hq/intent#5395),
+/// pinned for the same reason as [`PROMPT_IDLE_TIMEOUT_PREFIX`]: the service
+/// layer flattens the error to `session/prompt failed: …`, so the stall is
+/// recognisable downstream (persisted `stop_reason`, `agent:failed`, logs)
+/// only through this prefix.
+pub const PROVIDER_STALL_PREFIX: &str = "provider stall";
+
+/// Display body of [`AcpError::ProviderStall`], anchored on
+/// [`PROVIDER_STALL_PREFIX`] for both shapes (tool-free and open-tool).
+fn provider_stall_display(silent: &Duration, open_tool_call: Option<&str>) -> String {
+    match open_tool_call {
+        Some(label) => format!(
+            "{PROVIDER_STALL_PREFIX}: no session/update for {silent:?} with tool call {label} still open"
+        ),
+        None => format!(
+            "{PROVIDER_STALL_PREFIX}: no session/update for {silent:?} with no tool call in flight"
+        ),
+    }
+}
 
 /// A JSON-RPC 2.0 error object returned by the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +91,23 @@ pub enum AcpError {
     #[error("failed to spawn provider: {0}")]
     Spawn(String),
 
+    /// The program `spawn_provider` launched is established to be missing:
+    /// the spawn failed with `ENOENT` and the program does not exist at its
+    /// resolved path / in any directory of the child's `PATH`. Structurally
+    /// distinct from [`AcpError::Spawn`] so a missing **bare** command —
+    /// nothing resolved a provider binary and the `PATH` lookup failed — is
+    /// told apart from a resolved binary path that vanished
+    /// (intent-hq/intent#4971). An `ENOENT` whose program exists (missing
+    /// working directory or shebang interpreter) stays [`AcpError::Spawn`].
+    /// `command` is the program as launched.
+    #[error("provider executable not found: `{command}` ({launch})")]
+    ProviderNotFound {
+        /// The program passed to the OS spawn.
+        command: String,
+        /// The launch tier that selected `command`.
+        launch: LaunchMode,
+    },
+
     /// The transport (writer/reader task or pipe) is closed or broke.
     #[error("transport closed: {0}")]
     Transport(String),
@@ -85,6 +124,24 @@ pub enum AcpError {
     /// is pinned to [`PROMPT_IDLE_TIMEOUT_PREFIX`].
     #[error("session/prompt idle timeout ({0:?} of silence)")]
     PromptIdleTimeout(Duration),
+
+    /// The provider stalled mid-turn (intent-hq/intent#5395): `session/prompt`
+    /// stayed in flight with no `session/update` traffic of any kind for
+    /// longer than the service layer's terminal stall threshold — either with
+    /// no tool call open (the provider is neither streaming nor running a
+    /// tool) or with a tool call open that emitted nothing for the whole
+    /// (longer) open-tool ceiling (the tool's completion was lost, the
+    /// opencode/grok reconnect signature). Carries the silence that elapsed
+    /// and, for the open-tool case, a label naming the hung tool call.
+    /// Terminal by design (unlike the warn-and-continue
+    /// [`AcpError::PromptIdleTimeout`]): the turn fails with this error and
+    /// attention is raised; the Display rendering is pinned to
+    /// [`PROVIDER_STALL_PREFIX`].
+    #[error("{}", provider_stall_display(silent, open_tool_call.as_deref()))]
+    ProviderStall {
+        silent: Duration,
+        open_tool_call: Option<String>,
+    },
 
     /// The agent returned a JSON-RPC error response.
     #[error("{0}")]
@@ -186,6 +243,61 @@ const TERMINAL_MESSAGE_MARKERS: &[&str] = &[
     "invalid api key",
 ];
 
+/// Usage/quota-exhaustion markers (matched case-insensitively): the phrasings
+/// providers emit when a turn was rejected because the account ran out of
+/// budget rather than because the request was malformed — HTTP 429 in its bare
+/// and prose renderings, the Anthropic/OpenAI error-type names, and the
+/// plain-English wordings the CLI bridges echo out of the upstream response
+/// body.
+///
+/// This list is a **narrowing of** [`TERMINAL_MESSAGE_MARKERS`], never a
+/// competitor to it: every phrasing here is already terminal today (several
+/// are literally the same strings), and adding it changes no retry, resume, or
+/// transient verdict anywhere. The only new thing is the OBSERVATION — the
+/// daemon can now say *why* a terminal failure was terminal, so the FE can
+/// offer "retry on another provider" instead of string-matching prose out of
+/// the rendered `error`.
+///
+/// Deliberately broad, because the cost of a wrong verdict is one unhelpful
+/// retry affordance on an already-failed turn — not a retry storm, a demoted
+/// auth verdict, or a swallowed error. Bare `"429"` in particular can collide
+/// with an unrelated number in a provider payload; that is accepted here and
+/// bounded by [`is_quota_exceeded`]'s variant filter below.
+const QUOTA_MESSAGE_MARKERS: &[&str] = &[
+    // HTTP 429, bare (status codes, JSON `"status":429`) and in prose.
+    "429",
+    "too many requests",
+    // Provider error-type names (Anthropic/OpenAI style), as they appear in
+    // the JSON body a bridge nests into its JSON-RPC `data`.
+    "rate_limit_error",
+    "insufficient_quota",
+    // Plain-English phrasings: upstream `message` strings and the wordings
+    // provider CLIs print for a spent plan allowance.
+    "rate limit",
+    "quota",
+    "usage limit",
+];
+
+/// LOCAL-resource exhaustion phrasings that must never read as a PROVIDER
+/// quota rejection, checked as a denylist ahead of [`QUOTA_MESSAGE_MARKERS`].
+///
+/// [`is_quota_exceeded`] excludes these structurally, by only considering the
+/// [`AcpError::Rpc`] / [`AcpError::Auth`] variants that can carry an upstream
+/// rejection. [`message_is_quota_exceeded`] has no variant to inspect — it
+/// runs on text already flattened through the `session/prompt failed: …` wrap
+/// boundary, and its caller cannot tell a provider rejection from a spawn or
+/// pre-turn persist failure. Without this guard, `EDQUOT` — whose standard
+/// strerror rendering is literally "Disk quota exceeded" — would match the
+/// broad `"quota"` marker and stamp a full disk as a provider allowance
+/// problem, offering the user a provider switch that cannot possibly help.
+const LOCAL_RESOURCE_QUOTA_MARKERS: &[&str] = &[
+    // EDQUOT, by name and by its strerror rendering on both platforms.
+    "disk quota",
+    "edquot",
+    // ENOSPC neighbours that some IO layers phrase with "quota".
+    "quota exceeded while writing",
+];
+
 /// Provider-fetch failure markers (matched case-insensitively) beyond the
 /// connection-class [`TRANSIENT_DISCONNECT_MARKERS`]: the shapes a provider
 /// bridge (e.g. codex-acp / auggie wrapping a Node `fetch`) renders into its
@@ -232,9 +344,10 @@ pub(crate) fn message_is_transient_upstream_disconnect(message: &str) -> bool {
 /// still surface.
 ///
 /// Structurally terminal variants ([`AcpError::Auth`], [`AcpError::Serde`],
-/// [`AcpError::Protocol`], [`AcpError::PromptIdleTimeout`]) are rejected by
-/// construction — regardless of any incidental substring in their rendered
-/// text. Everything else is classified by its rendered message via
+/// [`AcpError::Protocol`], [`AcpError::PromptIdleTimeout`],
+/// [`AcpError::ProviderStall`]) are rejected by construction — regardless of
+/// any incidental substring in their rendered text. Everything else is
+/// classified by its rendered message via
 /// [`message_is_transient_upstream_disconnect`], since connection-class drops
 /// surface as [`AcpError::Transport`]/[`AcpError::Rpc`] text (and, once
 /// flattened, as bare strings).
@@ -246,7 +359,8 @@ pub fn is_transient_upstream_disconnect(err: &AcpError) -> bool {
         AcpError::Auth(_)
         | AcpError::Serde(_)
         | AcpError::Protocol(_)
-        | AcpError::PromptIdleTimeout(_) => false,
+        | AcpError::PromptIdleTimeout(_)
+        | AcpError::ProviderStall { .. } => false,
         other => message_is_transient_upstream_disconnect(&other.to_string()),
     }
 }
@@ -292,6 +406,72 @@ pub(crate) fn message_is_transient_provider_fetch_failure(message: &str) -> bool
         .iter()
         .any(|m| msg.contains(m))
         || TRANSIENT_DISCONNECT_MARKERS.iter().any(|m| msg.contains(m))
+}
+
+/// Message-level classification backing [`is_quota_exceeded`]: the rendered
+/// text (message + bounded `data`) carries a [`QUOTA_MESSAGE_MARKERS`]
+/// phrasing.
+///
+/// `pub` (unlike the two transient message helpers, which stay `pub(crate)`)
+/// because the service layer flattens prompt errors to plain strings at its
+/// wrap boundary (`session/prompt failed: …`) and the terminal-failure
+/// publisher in `intent-services` only ever holds that flattened text — it has
+/// no [`AcpError`] left to hand to [`is_quota_exceeded`].
+///
+/// Note the ASYMMETRY with the transient classifiers: they consult
+/// [`TERMINAL_MESSAGE_MARKERS`] as a denylist because they are deciding
+/// whether to RETRY. This one must NOT consult that list — a quota failure
+/// *is* terminal, so it already contains the very phrasings being looked for,
+/// and consulting it would classify nothing.
+///
+/// It does consult [`LOCAL_RESOURCE_QUOTA_MARKERS`], which is a different
+/// question: not "should this be retried" but "is this even a PROVIDER
+/// failure". Callers on this path hold only flattened text and cannot tell a
+/// provider rejection from a local IO failure, so the disk-quota exclusion
+/// that [`is_quota_exceeded`] gets structurally from its variant filter has
+/// to be made textually here.
+#[must_use]
+pub fn message_is_quota_exceeded(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    // Denylist wins: a local-resource exhaustion never reads as a provider
+    // allowance problem, however broadly the provider markers below match.
+    if LOCAL_RESOURCE_QUOTA_MARKERS.iter().any(|m| msg.contains(m)) {
+        return false;
+    }
+    QUOTA_MESSAGE_MARKERS.iter().any(|m| msg.contains(m))
+}
+
+/// Decide whether `err` describes a provider usage/quota rejection — the turn
+/// failed because the account's allowance is spent (HTTP 429, an upstream
+/// `rate_limit_error`, an exhausted plan quota), not because the request was
+/// wrong.
+///
+/// Purely an OBSERVATION layered on top of the existing verdicts: quota
+/// failures were terminal before this classifier existed and remain terminal
+/// after it. Nothing here feeds a retry, resume, or auth decision — the sole
+/// consumer stamps a machine-readable `errorCode` on the `agent:failed` event
+/// so clients can offer "retry on another provider" without pattern-matching
+/// the rendered prose.
+///
+/// Classifies against the FULL rendered Display, so the bounded
+/// [`MAX_RENDERED_DATA_BYTES`] slice of a [`JsonRpcError`]'s `data` is covered:
+/// provider bridges nest the real upstream body there, which is exactly where
+/// the 429 / `rate_limit_error` text actually lives (the same shape as the
+/// provider-fetch classifier above). Reading only `message` — as
+/// `intent-services`' auth classifier deliberately does, to protect its
+/// expensive false-positive path — would miss every bridge-wrapped instance.
+///
+/// Restricted to [`AcpError::Rpc`] and [`AcpError::Auth`]: those are the only
+/// variants that can carry an upstream provider rejection. The exclusion that
+/// matters is [`AcpError::Fs`] / [`AcpError::Terminal`] / [`AcpError::Spawn`],
+/// whose text can legitimately say "quota" about a **disk** quota — a local IO
+/// failure that no amount of provider-switching fixes.
+#[must_use]
+pub fn is_quota_exceeded(err: &AcpError) -> bool {
+    match err {
+        AcpError::Rpc(_) | AcpError::Auth(_) => message_is_quota_exceeded(&err.to_string()),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +622,125 @@ mod classifier_tests {
                 "expected terminal: {msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn classifies_quota_messages_as_quota_exceeded() {
+        for msg in [
+            "JSON-RPC error -32603: Internal error: 429 Too Many Requests",
+            "JSON-RPC error -32603: Internal error: {\"status\":429}",
+            "JSON-RPC error -32603: Internal error: {\"type\":\"rate_limit_error\"}",
+            "JSON-RPC error -32603: Internal error: You have exceeded your rate limit",
+            "JSON-RPC error -32603: Internal error: insufficient_quota",
+            "JSON-RPC error -32603: Internal error: monthly quota exhausted",
+            "JSON-RPC error -32603: Internal error: usage limit reached — resets at 5pm",
+        ] {
+            assert!(message_is_quota_exceeded(msg), "expected quota: {msg:?}");
+        }
+    }
+
+    #[test]
+    fn quota_classifier_rejects_unrelated_messages() {
+        for msg in [
+            "JSON-RPC error -32603: Internal error: 401 Unauthorized",
+            "JSON-RPC error -32603: Internal error: model not found: claude-nope",
+            "transport closed: Connection reset by peer (os error 54)",
+            "failed to spawn provider: no such file or directory",
+            "some unrelated failure",
+        ] {
+            assert!(
+                !message_is_quota_exceeded(msg),
+                "expected non-quota: {msg:?}"
+            );
+        }
+    }
+
+    /// The payload shape that matters: the 429 rides in the JSON-RPC `data`,
+    /// not the `message`, so classification must run over the full rendered
+    /// Display (which folds in the bounded `data` slice) — the trap the
+    /// message-only auth classifier falls into.
+    #[test]
+    fn classifies_quota_nested_in_rpc_data() {
+        let err = AcpError::Rpc(JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(serde_json::Value::String(
+                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\
+                 \"message\":\"This request would exceed your organization's rate limit\"}}"
+                    .to_string(),
+            )),
+        });
+        assert!(is_quota_exceeded(&err));
+        // The rendered Display is what carries it — `message` alone does not.
+        assert!(!message_is_quota_exceeded("Internal error"));
+    }
+
+    /// Quota classification is an OBSERVATION only: it must not move any
+    /// existing transient/terminal verdict. A 429 was terminal before and
+    /// stays terminal, on both transient classifiers.
+    #[test]
+    fn quota_errors_stay_terminal_for_the_transient_classifiers() {
+        let err = AcpError::Rpc(JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(serde_json::Value::String(
+                "fetch failed: 429 Too Many Requests (rate_limit_error), connection closed"
+                    .to_string(),
+            )),
+        });
+        assert!(is_quota_exceeded(&err));
+        assert!(!is_transient_upstream_disconnect(&err));
+        assert!(!is_transient_provider_fetch_failure(&err));
+    }
+
+    /// The STRING classifier carries the same disk-quota exclusion, because
+    /// its caller (the terminal-failure publisher) holds only flattened text
+    /// and cannot fall back on the variant filter. `EDQUOT` renders as "Disk
+    /// quota exceeded", which the broad `"quota"` marker would otherwise
+    /// match — stamping a full disk as a provider allowance problem and
+    /// offering a provider switch that cannot help.
+    #[test]
+    fn message_classifier_rejects_local_resource_quota_phrasings() {
+        for msg in [
+            "spawn failed: Disk quota exceeded (os error 69)",
+            "session/prompt failed: write error: EDQUOT",
+            "persist failed: quota exceeded while writing transcript",
+        ] {
+            assert!(
+                !message_is_quota_exceeded(msg),
+                "local-resource failure misread as a provider quota: {msg}"
+            );
+        }
+        // The provider phrasings it exists to catch still classify.
+        for msg in [
+            "session/prompt failed: HTTP 429 Too Many Requests",
+            "session/prompt failed: {\"type\":\"rate_limit_error\"}",
+            "session/prompt failed: plan usage limit reached",
+        ] {
+            assert!(
+                message_is_quota_exceeded(msg),
+                "provider quota rejection missed: {msg}"
+            );
+        }
+    }
+
+    /// Only provider-rejection variants qualify. A local **disk** quota
+    /// failure names the same word and must never be reported as a provider
+    /// usage limit — switching providers cannot fix a full filesystem.
+    #[test]
+    fn quota_classifier_rejects_local_disk_quota_variants() {
+        for err in [
+            AcpError::Fs("filesystem error: disk quota exceeded".to_string()),
+            AcpError::Terminal("write failed: disk quota exceeded".to_string()),
+            AcpError::Spawn("no space left: quota exceeded".to_string()),
+            AcpError::Transport("connection reset by peer".to_string()),
+        ] {
+            assert!(!is_quota_exceeded(&err), "expected non-quota: {err}");
+        }
+        // …while the provider-rejection variants do classify.
+        assert!(is_quota_exceeded(&AcpError::Auth(
+            "usage limit reached for this plan".to_string()
+        )));
     }
 
     /// Only `Rpc`-variant errors qualify: transport-shaped failures keep

@@ -93,6 +93,16 @@ mod tests {
     use super::*;
     use crate::testutil::init_repo;
 
+    /// Hermetic stand-in for [`commit_identity_env`]: the test harness itself
+    /// may inherit the four `GIT_*` identity vars (agent-spawned shells do,
+    /// post-#4142), and the real `std::env::var_os` probe would then correctly
+    /// gap-fill nothing. Tests exercising resolution — not inheritance — go
+    /// through the seam with a fixed "nothing inherited" closure
+    /// (intent-hq/monorepo#4191).
+    fn resolved_identity_env(cwd: Option<&Path>) -> Vec<(String, String)> {
+        commit_identity_env_with(cwd, |_| false)
+    }
+
     #[test]
     fn resolves_four_pairs_from_repo_root_and_subdir() {
         let repo = init_repo("identity");
@@ -107,23 +117,23 @@ mod tests {
                 (key.to_string(), value.to_string())
             })
             .collect();
-        assert_eq!(commit_identity_env(Some(repo.path())), expected);
+        assert_eq!(resolved_identity_env(Some(repo.path())), expected);
 
         let sub = repo.path().join("nested/dir");
         std::fs::create_dir_all(&sub).unwrap();
-        assert_eq!(commit_identity_env(Some(&sub)), expected);
+        assert_eq!(resolved_identity_env(Some(&sub)), expected);
     }
 
     #[test]
     fn no_cwd_or_non_repo_cwd_exports_nothing() {
-        assert!(commit_identity_env(None).is_empty());
+        assert!(resolved_identity_env(None).is_empty());
         let dir =
             std::env::temp_dir().join(format!("intent-identity-norepo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // GIT_CEILING is irrelevant: temp dirs are never inside a repo, but
         // guard against a repo above temp on exotic hosts by asserting shape
         // only when empty.
-        let pairs = commit_identity_env(Some(&dir));
+        let pairs = resolved_identity_env(Some(&dir));
         if !pairs.is_empty() {
             assert_eq!(pairs.len(), 4, "either nothing or the full identity");
         }
@@ -171,7 +181,7 @@ mod tests {
     #[test]
     fn exported_env_carries_identity_into_unconfigured_repo_commit() {
         let source = init_repo("identity-src");
-        let pairs = commit_identity_env(Some(source.path()));
+        let pairs = resolved_identity_env(Some(source.path()));
         assert_eq!(pairs.len(), 4);
 
         let target = init_repo("identity-target");

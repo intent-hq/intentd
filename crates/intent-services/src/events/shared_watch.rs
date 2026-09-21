@@ -63,8 +63,66 @@
 //! every caller's thread, and steady-state event delivery is unaffected —
 //! only initial coverage of a newly-registered root can lag behind a slow
 //! neighbour.
+//!
+//! Roots are watched recursively by default; [`SharedWatchHub::subscribe_with`]
+//! also takes [`RecursiveMode::NonRecursive`] for the per-daemon singletons
+//! that used to own a watcher each — the `config.toml` directory watch and the
+//! ancestor watches [`super::root_watch`] parks on the nearest existing parent
+//! of a missing user-tier skills/specialists root (intent-hq/intent#4953). A
+//! non-recursive sink is narrowed to the root itself and its direct children,
+//! exactly what a dedicated non-recursive watch would have delivered, so
+//! sharing the stream changes what the OS watches but not what a subscriber
+//! sees. When the same root is wanted both ways, the OS watch is recursive —
+//! the non-recursive sinks still see only their slice — and stays recursive
+//! until the root's last subscriber drops; downgrading would mean an unwatch
+//! (which on inotify strips nested roots' descriptors) for a case that does
+//! not occur in practice. The same rule applies across roots: inotify keys its
+//! descriptors per directory, not per `watch()` call, so a non-recursive root
+//! nested under a recursive root (a missing project-tier skills root parked
+//! on `<workspace>/.agents` under the recursive workspace root) shares the
+//! ancestor's descriptors. It is registered recursively on the ancestor's
+//! behalf and is not unwatched while the ancestor survives — otherwise the
+//! shallow registration would stop the ancestor auto-watching directories
+//! created under it, and the unwatch would strip the subtree from the ancestor
+//! outright ([`covered_recursively`]).
+//!
+//! On Linux a recursive root is NOT handed to `notify` as one recursive
+//! watch: its inotify backend walks the whole tree and registers one
+//! descriptor per directory, `node_modules`/`target`/`vendor` included, which
+//! is how an installed daemon re-accumulated ~496k of the 500k
+//! `max_user_watches` within a day (intent-hq/intent#5026). The registrar
+//! instead walks the tree itself, pruning [`super::watcher::NOISE_DIRS`] at
+//! any depth, and registers one NON-recursive descriptor per surviving
+//! directory ([`PrunedWatches`]). Because those descriptors carry no
+//! recursion flag, the backend no longer auto-watches directories created
+//! later; the group's event callback feeds `Create(Folder)` / rename-to
+//! events back to the registrar, which walks the new directory the same way.
+//! Nothing is pruned beneath a [`PRUNE_EXEMPT_DIRS`] component — `.intent`,
+//! `.augment`, `.agents`, `.claude` are trees a subscriber reads through the
+//! workspace-root watch and filters itself, and a nested name colliding with
+//! the noise list (`.intent/skills/build/`) must stay watched. The residual is
+//! a root that itself lives under such a component: it is walked unpruned.
+//!
+//! A git dir is neither noise nor exempt: what its subscribers consume is
+//! known exactly (intent-hq/intent#5044). The git metadata watcher reads
+//! `HEAD`, `index` and `packed-refs` as direct children plus anything under
+//! `refs/`, and the file watcher reads `info/exclude`. So the walk keeps the
+//! git dir itself and its [`GIT_DIR_KEPT_DIRS`] children (`refs/`
+//! recursively, so `refs/heads/build` survives the noise list; `info/`) and
+//! prunes every other child — `objects/`, `logs/`, `modules/`, `worktrees/`,
+//! `hooks/` — which after intent-hq/intentd#1904 were about half of a
+//! workspace's remaining descriptors. The rule fires two ways: a `.git`
+//! child met on the way down a tree root hands its subtree to it (the
+//! regular repository, read through the recursive workspace-root watch), and
+//! a root subscribed AS a git dir ([`SharedWatchHub::subscribe_git_dir`],
+//! [`RootKind::GitDir`]) gets it from its own top — the linked worktree's
+//! resolved gitdir and common dir, which need not contain a `.git` component
+//! at all (`git init --separate-git-dir`, a bare `repo.git`), so the kind is
+//! declared by the subscriber rather than read off the pathname. macOS
+//! (`FSEvents`) is untouched — its streams cost no per-directory resource.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -75,6 +133,36 @@ use tokio::task::JoinHandle;
 
 use super::root_watch::{canonical_root, find_existing_ancestor};
 
+/// Directory names beneath which the pruned walk never prunes (see the module
+/// header): subscriber-owned trees whose contents are filtered downstream.
+#[cfg(target_os = "linux")]
+const PRUNE_EXEMPT_DIRS: &[&str] = &[".intent", ".augment", ".agents", ".claude"];
+
+/// The only children of a git dir the pruned walk descends into (module
+/// header, intent-hq/intent#5044): `refs/` for the git metadata watcher and
+/// `info/` for the file watcher's `info/exclude` invalidation. Nothing is
+/// pruned beneath them; every other child of a git dir is.
+#[cfg(target_os = "linux")]
+const GIT_DIR_KEPT_DIRS: &[&str] = &["refs", "info"];
+
+/// The `.git` directory name: a child of this name met on the way down a
+/// [`RootKind::Tree`] root hands its subtree to the git-dir rule.
+#[cfg(target_os = "linux")]
+const GIT_DIR_NAME: &str = ".git";
+
+/// What a subscribed root is, as declared by its subscriber — the property
+/// the Linux pruned walk keys its rules on (module header). Fixed by the
+/// root's first subscriber; a later subscriber joins the root as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RootKind {
+    /// An ordinary tree: noise dirs are pruned, exempt trees are walked
+    /// whole, and a `.git` child hands its subtree to the git-dir rule.
+    Tree,
+    /// The root IS a git dir — a linked worktree's resolved gitdir or common
+    /// dir — whatever its pathname: the git-dir rule applies from its top.
+    GitDir,
+}
+
 /// Event callback a group's watcher invokes with each raw result; boxed so the
 /// watcher factory below can be swapped out.
 type EventCallback = Box<dyn FnMut(notify::Result<notify::Event>) + Send>;
@@ -84,21 +172,122 @@ type EventCallback = Box<dyn FnMut(notify::Result<notify::Event>) + Send>;
 type WatcherFactory =
     dyn Fn(EventCallback) -> notify::Result<Box<dyn Watcher + Send>> + Send + Sync;
 
-/// One demux destination: raw events whose paths fall under `root` are cloned
-/// into `tx`.
+/// Test seam selecting one `watch()` call to fail: the `fail_attempt`-th
+/// (1-based) call whose path's file name is `name`. Attempts on other paths
+/// pass through untouched, so the fault can target a RE-registration — e.g.
+/// a later `watch()` of a root, after its first went live — while the
+/// surrounding registrations succeed for real. The pruned walk issues one
+/// `watch()` per directory, so a directory named `name` nested under another
+/// root counts too. Linux-only alongside the tests that use it: survivor
+/// re-registration exists only in the global inotify group.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct WatchFault {
+    name: std::ffi::OsString,
+    fail_attempt: usize,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl WatchFault {
+    pub(crate) fn nth(name: &str, fail_attempt: usize) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            fail_attempt,
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// `watch()` calls seen so far on roots named `name`.
+    pub(crate) fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
+    }
+
+    fn intercept(&self, path: &Path) -> notify::Result<()> {
+        if path.file_name() != Some(self.name.as_os_str()) {
+            return Ok(());
+        }
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt == self.fail_attempt {
+            return Err(
+                notify::Error::generic("injected watch failure").add_path(path.to_path_buf())
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Real backend wrapped by a [`WatchFault`]; see
+/// [`SharedWatchHub::with_watch_fault`].
+#[cfg(all(test, target_os = "linux"))]
+struct FaultyWatcher {
+    inner: notify::RecommendedWatcher,
+    fault: Arc<WatchFault>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Watcher for FaultyWatcher {
+    fn new<F: notify::EventHandler>(handler: F, config: notify::Config) -> notify::Result<Self> {
+        Ok(Self {
+            inner: notify::RecommendedWatcher::new(handler, config)?,
+            fault: WatchFault::nth("", 0),
+        })
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        self.fault.intercept(path)?;
+        self.inner.watch(path, mode)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.inner.unwatch(path)
+    }
+
+    fn kind() -> notify::WatcherKind {
+        notify::RecommendedWatcher::kind()
+    }
+}
+
+/// One demux destination: raw events whose paths fall under `root` — or, for
+/// a non-recursive sink, are the root or one of its direct children (see
+/// [`covers`]) — are cloned into `tx`.
 struct Sink {
     id: u64,
     root: PathBuf,
+    recursive: bool,
     tx: mpsc::UnboundedSender<notify::Event>,
 }
 
-/// Command to a group's registrar thread. Dropping the sender ends the thread,
-/// which drops the watcher and tears the stream down. `Watch` carries the
-/// [`Registration`] the registrar settles once the root is actually registered.
-enum Cmd {
-    Watch(PathBuf, Arc<Registration>),
-    Unwatch(PathBuf),
+/// The per-mode containment check: recursive means any descendant, non-
+/// recursive means the root itself or a direct child (what a dedicated
+/// non-recursive OS watch reports).
+fn covers(root: &Path, recursive: bool, path: &Path) -> bool {
+    if recursive {
+        path.starts_with(root)
+    } else {
+        path == root || path.parent() == Some(root)
+    }
 }
+
+/// Command to a group's registrar thread. Dropping every sender ends the
+/// thread, which drops the watcher and tears the stream down. `Watch` carries
+/// the [`Registration`] the registrar settles once the root is actually
+/// registered. `AddDir` / `Forget` are fed by the group's own event callback
+/// (see [`track_directories`]) to keep the pruned per-directory descriptors in
+/// step with directories created and deleted after registration.
+enum Cmd {
+    Watch(PathBuf, RecursiveMode, RootKind, Arc<Registration>),
+    Unwatch(PathBuf),
+    #[cfg(target_os = "linux")]
+    AddDir(PathBuf),
+    #[cfg(target_os = "linux")]
+    Forget(PathBuf),
+}
+
+/// Handle to a registrar's command channel. The hub holds the strong count;
+/// the watcher callback holds only a `Weak`, so retiring a group still closes
+/// the channel and ends the thread even though the watcher (and its callback)
+/// live on that thread.
+type CmdSender = Arc<std::sync::mpsc::Sender<Cmd>>;
 
 /// Outcome of one deferred `watcher.watch()`, shared between the registrar
 /// thread and everyone waiting on it.
@@ -109,10 +298,20 @@ enum Cmd {
 /// and silently receive a channel that can never deliver — with no recovery
 /// until every subscriber drops. [`SharedWatchHub::subscribe`] retries such a
 /// root instead.
+///
+/// A registration is also [`Self::reset`] and re-run while its subscribers
+/// stay attached — widening to recursive, re-registering the survivors of a
+/// recursive ancestor's unwatch. Those subscribers already saw `live` and are
+/// parked on their channels, so a failure there cannot be left as a state
+/// flag for them to notice: [`register`] closes the root's sinks instead, and
+/// `was_live` is what tells a first-time failure (the subscriber is still
+/// waiting on the registration and handles it) from a lost live watch.
 #[derive(Default)]
 struct Registration {
     /// [`REG_PENDING`] / [`REG_LIVE`] / [`REG_FAILED`].
     state: std::sync::atomic::AtomicU8,
+    /// Set once the root has been live; survives [`Self::reset`].
+    was_live: std::sync::atomic::AtomicBool,
 }
 
 const REG_PENDING: u8 = 0;
@@ -131,9 +330,29 @@ impl Registration {
         self.state.load(Ordering::Acquire) == REG_FAILED
     }
 
+    fn live(&self) -> bool {
+        self.state.load(Ordering::Acquire) == REG_LIVE
+    }
+
+    #[cfg(test)]
+    fn describe(&self) -> &'static str {
+        match self.state.load(Ordering::Acquire) {
+            REG_LIVE => "live",
+            REG_FAILED => "failed",
+            _ => "pending",
+        }
+    }
+
     fn settle(&self, live: bool) {
+        if live {
+            self.was_live.store(true, Ordering::Release);
+        }
         self.state
             .store(if live { REG_LIVE } else { REG_FAILED }, Ordering::Release);
+    }
+
+    fn was_live(&self) -> bool {
+        self.was_live.load(Ordering::Acquire)
     }
 
     fn reset(&self) {
@@ -142,16 +361,65 @@ impl Registration {
 }
 
 /// A watched root: how many subscribers reference it (two workspaces can
-/// resolve to the same root) and the state of its deferred registration.
+/// resolve to the same root), the mode the OS watch was requested in, and the
+/// state of its deferred registration.
 struct Root {
     subscribers: usize,
+    /// Recursive as soon as any subscriber wants it recursive; never
+    /// downgraded while subscribers remain (see the module header).
+    recursive: bool,
+    /// Declared by the first subscriber (see [`RootKind`]).
+    kind: RootKind,
     registration: Arc<Registration>,
+}
+
+/// Whether a recursive root in `roots` other than `path` itself is an ancestor
+/// of `path`. inotify keys its descriptor table per directory, not per
+/// `watch()` call, so a root nested under a recursive root shares the
+/// ancestor's descriptors: registering it non-recursively would flip those
+/// descriptors' recursion flag (newly created subdirectories under it stop
+/// being auto-watched for the ancestor), and unwatching it would strip them
+/// from the ancestor's coverage outright. Such a root is therefore always
+/// registered in the ancestor's mode and never unwatched while the ancestor
+/// survives. On Linux an ancestor whose pruned walk skips `path` (a root
+/// under one of its noise subtrees, see [`prunes`]) holds no descriptor there
+/// and so does NOT cover it: such a root is registered in its own mode and
+/// unwatched normally, otherwise its descriptors would outlive its
+/// subscribers until the ancestor retired. On macOS nested roots have
+/// distinct parents and so live in distinct groups; this never fires there.
+fn covered_recursively(roots: &HashMap<PathBuf, Root>, path: &Path) -> bool {
+    roots.iter().any(|(root, state)| {
+        state.recursive
+            && root.as_path() != path
+            && path.starts_with(root)
+            && !pruned_under(root, state.kind, path)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn pruned_under(root: &Path, kind: RootKind, path: &Path) -> bool {
+    prunes(root, kind, path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pruned_under(_root: &Path, _kind: RootKind, _path: &Path) -> bool {
+    false
+}
+
+/// The mode `path` must be registered in: recursive when its own subscribers
+/// asked for that OR when [`covered_recursively`] by a co-tenant of the group.
+fn os_mode(roots: &HashMap<PathBuf, Root>, path: &Path, recursive: bool) -> RecursiveMode {
+    if recursive || covered_recursively(roots, path) {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
+    }
 }
 
 /// One shared stream: the registrar handle, the roots on it, and its demux
 /// sinks.
 struct Group {
-    cmd: std::sync::mpsc::Sender<Cmd>,
+    cmd: CmdSender,
     roots: HashMap<PathBuf, Root>,
     sinks: Arc<Mutex<Vec<Sink>>>,
     /// Set by the registrar once its OS watcher is actually created. The group
@@ -166,10 +434,11 @@ struct HubState {
     next_id: u64,
 }
 
-/// Owns the shared streams and the demux table. Held by the
-/// [`super::registry::WatcherRegistry`] for the daemon's lifetime; dropping it
+/// Owns the shared streams and the demux table. Created by the composition
+/// root and shared between the [`super::registry::WatcherRegistry`] and the
+/// `config.toml` watcher for the daemon's lifetime; dropping the last handle
 /// drops every group, which ends the registrar threads and the streams.
-pub(super) struct SharedWatchHub {
+pub struct SharedWatchHub {
     state: Mutex<HubState>,
     /// Builds each group's watcher; injectable so tests can fail creation.
     factory: Arc<WatcherFactory>,
@@ -258,7 +527,7 @@ impl WatchHealth {
 
 /// A live subscription. Dropping it removes the sink and, when the root has no
 /// subscribers left, unwatches it (and retires the group once it is empty).
-pub(super) struct SubHandle {
+pub(crate) struct SubHandle {
     hub: Arc<SharedWatchHub>,
     group: PathBuf,
     root: PathBuf,
@@ -275,8 +544,104 @@ impl SubHandle {
     /// [`watch_tiers`], which reads the registration directly; the handle-level
     /// wrapper exists for the watcher tests.)
     #[cfg(test)]
-    pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
+    pub(crate) async fn wait_established(&self, timeout: std::time::Duration) {
         wait_settled(&self.registration, timeout).await;
+    }
+
+    /// Await the registration and report whether the OS watch is live. `false`
+    /// covers both a settled failure and a registrar that has not answered
+    /// within [`ESTABLISH_TIMEOUT`] — either way the subscriber cannot count on
+    /// events arriving.
+    pub(crate) async fn wait_live(&self) -> bool {
+        self.established().await
+    }
+
+    /// [`Self::wait_live`] as an owned future, for a subscriber whose event
+    /// loop runs on a spawned task while the handle itself stays with the
+    /// owner that tears the subscription down.
+    pub(crate) fn established(&self) -> impl Future<Output = bool> + Send + 'static {
+        let registration = Arc::clone(&self.registration);
+        async move {
+            wait_settled(&registration, ESTABLISH_TIMEOUT).await;
+            registration.live()
+        }
+    }
+
+    /// Detach a [`RegistrationProbe`] for this subscription, so a test can
+    /// await the watch going live without holding whatever lock guards the
+    /// handle itself.
+    #[cfg(test)]
+    pub(crate) fn probe(&self) -> RegistrationProbe {
+        let watcher_live = {
+            let state = match self.hub.state.lock() {
+                Ok(state) => state,
+                Err(e) => e.into_inner(),
+            };
+            state
+                .groups
+                .get(&self.group)
+                .map(|group| Arc::clone(&group.watcher_live))
+                .unwrap_or_default()
+        };
+        RegistrationProbe {
+            root: self.root.clone(),
+            registration: Arc::clone(&self.registration),
+            watcher_live,
+        }
+    }
+}
+
+/// Test-only view of one subscription's registration, detached from its
+/// [`SubHandle`] / [`TierWatch`].
+///
+/// [`SubHandle::wait_established`] returns as soon as the registration
+/// *settles*, failure included — the right contract for the creation-retry
+/// tests, but the wrong sync point for a test about to mutate the tree: a
+/// registration settled as failed while the group's watcher creation is being
+/// retried (inotify instance exhaustion under full-suite parallelism,
+/// intent-hq/intent#4845 / #4852) returns immediately, the test writes, and
+/// the write lands before the retry re-registers the root — so the awaited
+/// event never arrives and the test hangs into nextest's kill.
+/// [`Self::wait_live`] waits for the watch to actually be live instead.
+#[cfg(test)]
+pub(crate) struct RegistrationProbe {
+    root: PathBuf,
+    registration: Arc<Registration>,
+    watcher_live: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl RegistrationProbe {
+    /// Await the watch being live, riding out a creation-retry: a
+    /// registration the registrar settled as failed while it had no watcher
+    /// is re-registered once creation succeeds, so keep waiting through that
+    /// state. Panics — naming the root, the registration state and the OS
+    /// watch limits — when the group's watcher is live yet the root's own
+    /// `watch()` failed (nothing will retry that), or when `timeout` elapses,
+    /// so a dead watch is diagnosed here rather than as a downstream
+    /// "no event" hang.
+    pub(crate) async fn wait_live(&self, timeout: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.registration.live() {
+                return;
+            }
+            let watcher_live = self.watcher_live.load(Ordering::Acquire);
+            assert!(
+                !(watcher_live && self.registration.failed()),
+                "shared watch registration failed for {} with the group's watcher live; {}",
+                self.root.display(),
+                os_watch_limits()
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "shared watch on {} not live within {timeout:?} (registration {}, group watcher live: {watcher_live}); {}",
+                self.root.display(),
+                self.registration.describe(),
+                os_watch_limits()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -333,22 +698,45 @@ impl Drop for SubHandle {
             None => false,
         };
         if drop_root {
-            group.roots.remove(&self.root);
-            let _ = group.cmd.send(Cmd::Unwatch(self.root.clone()));
-            // `notify`'s recursive inotify unwatch removes the target AND every
-            // descendant descriptor without per-root ref-counting, so retiring
-            // this root silently strips coverage from any still-subscribed
-            // root nested under it (a Linux global-group concern; on macOS
-            // nested roots under distinct parents live in distinct groups).
-            // Re-register the survivors: reset each one's registration and
-            // re-send `Cmd::Watch`, which the registrar serves after the
-            // `Unwatch` above (the channel is ordered).
-            for (nested, root) in &group.roots {
-                if nested.starts_with(&self.root) {
-                    root.registration.reset();
-                    let _ = group
-                        .cmd
-                        .send(Cmd::Watch(nested.clone(), Arc::clone(&root.registration)));
+            let retired = group.roots.remove(&self.root);
+            // Under a surviving recursive ancestor this root's descriptors ARE
+            // the ancestor's (see `covered_recursively`): unwatching would
+            // strip them from its coverage, and the ancestor's own unwatch
+            // retires them later. Leave them in place.
+            if !covered_recursively(&group.roots, &self.root) {
+                let _ = group.cmd.send(Cmd::Unwatch(self.root.clone()));
+                // Unwatching a recursive root removes the target AND every
+                // descendant descriptor without per-root ref-counting (the
+                // registrar's pruned-walk strip, mirroring `notify`'s own
+                // recursive inotify unwatch),
+                // so retiring a RECURSIVE root silently strips coverage from
+                // any still-subscribed root nested under it (a Linux
+                // global-group concern; on macOS nested roots under distinct
+                // parents live in distinct groups). Re-register the survivors:
+                // reset each one's registration and re-send `Cmd::Watch`,
+                // which the registrar serves after the `Unwatch` above (the
+                // channel is ordered). A non-recursive root owns exactly one
+                // descriptor, so its unwatch touches no nested root and the
+                // survivors — notably a root just promoted off the ancestor
+                // watch `root_watch` parks on its parent — keep their live
+                // registrations rather than being reset behind their owner's
+                // successful `wait_live`. An ancestor watch a recursive
+                // co-subscriber once widened stays recursive, so its retirement
+                // DOES reset the promoted root; should that re-registration
+                // fail, `register` closes the survivor's channels so the owner
+                // can re-subscribe instead of parking on a dead watch.
+                if retired.is_some_and(|root| root.recursive) {
+                    for (nested, root) in &group.roots {
+                        if nested.starts_with(&self.root) {
+                            root.registration.reset();
+                            let _ = group.cmd.send(Cmd::Watch(
+                                nested.clone(),
+                                os_mode(&group.roots, nested, root.recursive),
+                                root.kind,
+                                Arc::clone(&root.registration),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -389,7 +777,8 @@ fn group_key(root: &Path) -> PathBuf {
 pub(super) const TEST_FAIL_WATCHER_CREATION_ENV: &str = "INTENTD_TEST_FAIL_WATCHER_CREATION";
 
 impl SharedWatchHub {
-    pub(super) fn new() -> Arc<Self> {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
         Self::with_factory(Arc::new(|callback: EventCallback| {
             if std::env::var(TEST_FAIL_WATCHER_CREATION_ENV).is_ok_and(|v| v != "0") {
                 return Err(notify::Error::generic(
@@ -409,14 +798,62 @@ impl SharedWatchHub {
         })
     }
 
-    /// Subscribe to raw events under `root`, joining (or starting) the shared
-    /// stream for its group. Returns the canonical root the demux matches
-    /// against, so callers can build their own path filters on the same form
-    /// the OS reports.
+    /// Hub whose watchers fail the `watch()` calls `fault` selects, so a test
+    /// can fail one specific (re-)registration deterministically while every
+    /// other call reaches the real backend.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_watch_fault(fault: &Arc<WatchFault>) -> Arc<Self> {
+        let fault = Arc::clone(fault);
+        Self::with_factory(Arc::new(move |callback: EventCallback| {
+            let inner = notify::recommended_watcher(callback)?;
+            Ok(Box::new(FaultyWatcher {
+                inner,
+                fault: Arc::clone(&fault),
+            }) as Box<dyn Watcher + Send>)
+        }))
+    }
+
+    /// Subscribe to raw events under `root` (recursively), joining (or
+    /// starting) the shared stream for its group. Returns the canonical root
+    /// the demux matches against, so callers can build their own path filters
+    /// on the same form the OS reports.
     pub(super) fn subscribe(
         self: &Arc<Self>,
         root: &Path,
     ) -> (SubHandle, mpsc::UnboundedReceiver<notify::Event>, PathBuf) {
+        self.subscribe_with(root, RecursiveMode::Recursive)
+    }
+
+    /// [`Self::subscribe`] for a root that IS a git dir — a linked worktree's
+    /// resolved gitdir or common dir ([`RootKind::GitDir`]): on Linux the
+    /// pruned walk keeps only the root and its [`GIT_DIR_KEPT_DIRS`] children,
+    /// whatever the root is named (module header, intent-hq/intent#5044).
+    pub(super) fn subscribe_git_dir(
+        self: &Arc<Self>,
+        root: &Path,
+    ) -> (SubHandle, mpsc::UnboundedReceiver<notify::Event>, PathBuf) {
+        self.subscribe_inner(root, RecursiveMode::Recursive, RootKind::GitDir)
+    }
+
+    /// [`Self::subscribe`] with an explicit mode. A non-recursive subscription
+    /// receives only events on `root` itself and its direct children; the OS
+    /// watch it rides is recursive whenever any co-subscriber of the same root
+    /// asked for that (see the module header).
+    pub(crate) fn subscribe_with(
+        self: &Arc<Self>,
+        root: &Path,
+        mode: RecursiveMode,
+    ) -> (SubHandle, mpsc::UnboundedReceiver<notify::Event>, PathBuf) {
+        self.subscribe_inner(root, mode, RootKind::Tree)
+    }
+
+    fn subscribe_inner(
+        self: &Arc<Self>,
+        root: &Path,
+        mode: RecursiveMode,
+        kind: RootKind,
+    ) -> (SubHandle, mpsc::UnboundedReceiver<notify::Event>, PathBuf) {
+        let recursive = matches!(mode, RecursiveMode::Recursive);
         let root = match std::fs::canonicalize(root) {
             Ok(canonical) => canonical,
             Err(e) => {
@@ -462,28 +899,60 @@ impl SharedWatchHub {
             sinks.push(Sink {
                 id,
                 root: root.clone(),
+                recursive,
                 tx,
             });
         }
+        let covered = covered_recursively(&group.roots, &root);
         let entry = group.roots.entry(root.clone()).or_insert_with(|| Root {
             subscribers: 0,
+            recursive,
+            kind,
             registration: Arc::new(Registration::default()),
         });
         entry.subscribers += 1;
+        if entry.kind != kind {
+            tracing::debug!(
+                root = %root.display(),
+                declared = ?kind,
+                registered = ?entry.kind,
+                "shared watch root joined under a different kind; the first subscriber's stands"
+            );
+        }
         // A root whose registration failed is dead but still refcounted, so a
         // new subscriber joining it would otherwise inherit a channel that can
         // never deliver, with no recovery until every subscriber drops. Retry
         // instead: a transient cause (the directory briefly missing) resolves,
         // and a persistent one just fails again and is logged again.
         let retry_failed = entry.subscribers > 1 && entry.registration.failed();
-        if retry_failed {
+        // A recursive subscriber joining a root watched non-recursively widens
+        // the OS watch. Replace rather than re-add: `notify` merges a repeated
+        // `watch()` per backend in ways that differ (inotify merges masks and
+        // walks the tree, `FSEvents` appends the path a second time), and an
+        // explicit unwatch first makes the outcome the same everywhere. The
+        // registrar serves the pair in order. A root already registered
+        // recursively on a recursive ancestor's behalf has nothing to widen
+        // (and its unwatch would strip the ancestor's descriptors).
+        let widen = entry.subscribers > 1 && recursive && !entry.recursive && !covered;
+        if retry_failed || widen {
             entry.registration.reset();
         }
+        entry.recursive |= recursive;
+        if widen {
+            let _ = group.cmd.send(Cmd::Unwatch(root.clone()));
+        }
         let registration = Arc::clone(&entry.registration);
-        if entry.subscribers == 1 || retry_failed {
-            let _ = group
-                .cmd
-                .send(Cmd::Watch(root.clone(), Arc::clone(&registration)));
+        let register = entry.subscribers == 1 || retry_failed || widen;
+        let root_recursive = entry.recursive;
+        let root_kind = entry.kind;
+        if register {
+            let mode = os_mode(&group.roots, &root, root_recursive);
+            let _ = group.cmd.send(Cmd::Watch(
+                root.clone(),
+                mode,
+                root_kind,
+                Arc::clone(&registration),
+            ));
         }
         drop(state);
 
@@ -510,6 +979,29 @@ impl SharedWatchHub {
         }
     }
 
+    /// Which shared stream `root` rides, as the key of the group whose root
+    /// table holds a subscription for it, or `None` when no such entry exists.
+    /// Group membership only: a root stays in the table while its registration
+    /// is pending or failed, so `Some(key)` says nothing about a live OS watch
+    /// — that is [`Self::root_established`]'s job. The per-group consolidation
+    /// invariant under test: sibling roots resolve to the same key regardless
+    /// of how many other groups the hub supervises (the count differs per OS —
+    /// see [`group_key`]). Path is canonicalized to match the form
+    /// [`Self::subscribe`] keys roots by.
+    #[cfg(test)]
+    pub(super) fn stream_for_root(&self, root: &Path) -> Option<PathBuf> {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(e) => e.into_inner(),
+        };
+        state
+            .groups
+            .iter()
+            .find(|(_, g)| g.roots.contains_key(&root))
+            .map(|(key, _)| key.clone())
+    }
+
     /// Registration state of one root: `None` when nothing watches it,
     /// `Some(false)` while the watch request is still pending, `Some(true)` once
     /// the registrar has answered (either way — a failed registration will never
@@ -527,6 +1019,22 @@ impl SharedWatchHub {
             .values()
             .find_map(|g| g.roots.get(&root))
             .map(|r| r.registration.settled())
+    }
+
+    /// Human-readable registration state of one root for test diagnostics:
+    /// `pending` / `live` / `failed`, or `unwatched` when nothing watches it.
+    #[cfg(test)]
+    pub(super) fn root_registration_state(&self, root: &Path) -> &'static str {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(e) => e.into_inner(),
+        };
+        state
+            .groups
+            .values()
+            .find_map(|g| g.roots.get(&root))
+            .map_or("unwatched", |r| r.registration.describe())
     }
 
     /// Await every currently-requested root being registered with the OS.
@@ -567,11 +1075,13 @@ impl SharedWatchHub {
 }
 
 /// First delay before retrying a failed watcher creation; doubles per failure.
-const CREATE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Shared with [`super::root_watch`]'s registration retry so both watch
+/// families recover from the same transient failure on the same schedule.
+pub(crate) const CREATE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Ceiling for the creation-retry backoff, so a persistent failure (fd
 /// exhaustion, intent-hq/intent#3708) keeps probing about once a minute.
-const CREATE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const CREATE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Start a group's registrar: a DETACHED OS thread that builds the shared
 /// watcher and then serves `watch`/`unwatch` commands. Detached rather than
@@ -585,43 +1095,354 @@ fn spawn_registrar(
     group: PathBuf,
     factory: Arc<WatcherFactory>,
     watcher_live: Arc<std::sync::atomic::AtomicBool>,
-) -> std::sync::mpsc::Sender<Cmd> {
+) -> CmdSender {
     let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+    let tx = Arc::new(tx);
+    #[cfg(target_os = "linux")]
+    let feedback = Arc::downgrade(&tx);
     std::thread::spawn(move || {
+        let demux_sinks = Arc::clone(&sinks);
         let make = move || {
-            let sinks = Arc::clone(&sinks);
+            let sinks = Arc::clone(&demux_sinks);
+            #[cfg(target_os = "linux")]
+            let feedback = feedback.clone();
             factory(Box::new(
                 move |res: notify::Result<notify::Event>| match res {
-                    Ok(event) => demux(&sinks, &event),
+                    Ok(event) => {
+                        #[cfg(target_os = "linux")]
+                        track_directories(&feedback, &event);
+                        demux(&sinks, &event);
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "shared watcher callback error; events may be missed");
                     }
                 },
             ))
         };
-        let Some(mut watcher) = build_watcher_serving(&rx, make, &group) else {
+        let Some((mut watcher, pending)) = build_watcher_serving(&rx, make, &group) else {
             // Every sender dropped: the group was retired before a watcher
             // could be built.
             return;
         };
+        let mut pruned = PrunedWatches::default();
+        for (root, mode, kind, registration) in pending {
+            register(
+                watcher.as_mut(),
+                &mut pruned,
+                &root,
+                mode,
+                kind,
+                &registration,
+                &sinks,
+            );
+        }
         // Flag the stream live only now: the group exists (and this thread
         // retries creation) before any OS watcher does, and `WatchHealth`
         // must not count a stream that is not there yet.
         watcher_live.store(true, Ordering::Release);
         while let Ok(cmd) = rx.recv() {
             match cmd {
-                Cmd::Watch(root, registration) => {
-                    register(watcher.as_mut(), &root, &registration);
+                Cmd::Watch(root, mode, kind, registration) => {
+                    register(
+                        watcher.as_mut(),
+                        &mut pruned,
+                        &root,
+                        mode,
+                        kind,
+                        &registration,
+                        &sinks,
+                    );
                 }
                 Cmd::Unwatch(root) => {
-                    if let Err(e) = watcher.unwatch(&root) {
+                    if let Err(e) = pruned.unwatch(watcher.as_mut(), &root) {
                         tracing::debug!(root = %root.display(), error = %e, "shared watch removal failed");
                     }
                 }
+                #[cfg(target_os = "linux")]
+                Cmd::AddDir(dir) => pruned.add_dir(watcher.as_mut(), &dir),
+                #[cfg(target_os = "linux")]
+                Cmd::Forget(dir) => pruned.forget(&dir),
             }
         }
     });
     tx
+}
+
+/// Registrar-side descriptor bookkeeping for the pruned recursive
+/// registration (module header, intent-hq/intent#5026). Lives on the registrar
+/// thread next to the watcher it drives; a no-op shell off Linux, where the
+/// backend's own recursive watch is used unchanged.
+#[derive(Default)]
+struct PrunedWatches {
+    /// Every directory currently holding a descriptor through a pruned walk,
+    /// across all roots. inotify keys descriptors per directory, so two
+    /// nested roots share entries here exactly as they share descriptors.
+    #[cfg(target_os = "linux")]
+    dirs: std::collections::BTreeSet<PathBuf>,
+    /// Roots registered through a pruned walk, with the [`RootKind`] their
+    /// rules follow — the ones whose unwatch strips their whole subtree, and
+    /// the ancestors a newly created directory is checked against before it
+    /// is walked.
+    #[cfg(target_os = "linux")]
+    roots: HashMap<PathBuf, RootKind>,
+}
+
+impl PrunedWatches {
+    /// One `watch()` of `root` in `mode`: on Linux a recursive root becomes
+    /// one non-recursive descriptor per directory of the pruned walk;
+    /// everything else is the backend's own watch.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(clippy::unused_self, unused_variables)
+    )]
+    fn watch(
+        &mut self,
+        watcher: &mut dyn Watcher,
+        root: &Path,
+        mode: RecursiveMode,
+        kind: RootKind,
+    ) -> notify::Result<()> {
+        #[cfg(target_os = "linux")]
+        if matches!(mode, RecursiveMode::Recursive) {
+            return self.watch_pruned(watcher, root, kind);
+        }
+        watcher.watch(root, mode)
+    }
+
+    /// Undo [`Self::watch`]. A root registered through a pruned walk releases
+    /// every descriptor under it — nested roots' included, without
+    /// ref-counting, exactly like `notify`'s recursive inotify unwatch the hub
+    /// already re-registers survivors for (`SubHandle::drop`). Any other root
+    /// releases its single descriptor.
+    #[cfg_attr(not(target_os = "linux"), expect(clippy::unused_self))]
+    fn unwatch(&mut self, watcher: &mut dyn Watcher, root: &Path) -> notify::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.roots.remove(root).is_some() {
+            self.roots.retain(|r, _| !r.starts_with(root));
+            let mut stripped = Vec::new();
+            self.dirs.retain(|dir| {
+                let under = dir.starts_with(root);
+                if under {
+                    stripped.push(dir.clone());
+                }
+                !under
+            });
+            for dir in &stripped {
+                // A directory deleted since it was walked has no descriptor
+                // left to remove; that is the expected outcome, not a fault.
+                if let Err(e) = watcher.unwatch(dir) {
+                    tracing::trace!(dir = %dir.display(), error = %e, "pruned descriptor already gone");
+                }
+            }
+            return Ok(());
+        }
+        watcher.unwatch(root)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watch_pruned(
+        &mut self,
+        watcher: &mut dyn Watcher,
+        root: &Path,
+        kind: RootKind,
+    ) -> notify::Result<()> {
+        self.roots.insert(root.to_path_buf(), kind);
+        let descriptors = self.add_tree(watcher, root, kind, root)?;
+        tracing::warn!(
+            root = %root.display(),
+            descriptors,
+            "shared watch registered; inotify descriptors held for this root after pruning noise dirs"
+        );
+        Ok(())
+    }
+
+    /// Walk `start` (which lies under `root`, whose prune rules — for its
+    /// `kind` — apply) and register one non-recursive descriptor per
+    /// surviving directory,
+    /// returning how many. `start` itself is registered first and outside the
+    /// walk, so a missing or unreadable `start` fails with the backend's own
+    /// error (the walk would merely yield nothing for it) and the caller
+    /// settles the root as failed, as `notify`'s own watch would. The walk
+    /// also aborts on `MaxFilesWatch` anywhere — coverage is genuinely lost;
+    /// the descriptors added so far stay tracked so an unwatch still releases
+    /// them. Any other per-directory failure (vanished or unreadable
+    /// directory) is skipped.
+    #[cfg(target_os = "linux")]
+    fn add_tree(
+        &mut self,
+        watcher: &mut dyn Watcher,
+        root: &Path,
+        kind: RootKind,
+        start: &Path,
+    ) -> notify::Result<usize> {
+        watcher.watch(start, RecursiveMode::NonRecursive)?;
+        self.dirs.insert(start.to_path_buf());
+        let mut count = 1;
+        for dir in pruned_dirs(root, kind, start).filter(|dir| dir != start) {
+            match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    self.dirs.insert(dir);
+                    count += 1;
+                }
+                Err(e) if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::debug!(dir = %dir.display(), error = %e, "pruned walk skipped a directory");
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// A directory appeared (created or moved in) under the group's coverage:
+    /// walk it, pruned by the rules of the first recursive root it falls
+    /// under and is not pruned by, and register its descriptors. Under no
+    /// such root — a non-recursive root's child, or a noise subtree — it is
+    /// left alone. Cheap when it lands nowhere; the callback forwards every
+    /// directory creation on the stream.
+    #[cfg(target_os = "linux")]
+    fn add_dir(&mut self, watcher: &mut dyn Watcher, dir: &Path) {
+        let Some((root, kind)) = self
+            .roots
+            .iter()
+            .find(|(root, kind)| dir.starts_with(root) && !prunes(root, **kind, dir))
+            .map(|(root, kind)| (root.clone(), *kind))
+        else {
+            return;
+        };
+        match self.add_tree(watcher, &root, kind, dir) {
+            Ok(_) => {}
+            Err(e) if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    dir = %dir.display(),
+                    error = %e,
+                    os_watch_limits = %os_watch_limits(),
+                    "new directory under a watched root could not be watched; events under it are lost"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(dir = %dir.display(), error = %e, "new directory vanished before it could be watched");
+            }
+        }
+    }
+
+    /// A tracked directory was deleted: inotify already dropped its
+    /// descriptor (and `notify` its table entry), so drop ours. Renames are
+    /// deliberately NOT forgotten — the descriptor lives on under the old
+    /// path in `notify`'s table, and only an unwatch under that path
+    /// releases it.
+    #[cfg(target_os = "linux")]
+    fn forget(&mut self, dir: &Path) {
+        self.dirs.remove(dir);
+    }
+}
+
+/// The name of a normal path component, `None` for any other kind.
+#[cfg(target_os = "linux")]
+fn component_name(component: std::path::Component<'_>) -> Option<&str> {
+    match component {
+        std::path::Component::Normal(name) => name.to_str(),
+        _ => None,
+    }
+}
+
+/// Whether the pruned walk of `root` skips `dir`. A [`RootKind::GitDir`] root
+/// is under [`git_dir_prunes`] from its top. For a [`RootKind::Tree`] root
+/// the first noise component on the path from `root` down to `dir` prunes
+/// it, unless a [`PRUNE_EXEMPT_DIRS`] component comes first — or `root`
+/// itself lies under one, in which case the whole root is walked unpruned
+/// (module header) — and a `.git` component met first hands the rest of the
+/// path to [`git_dir_prunes`].
+#[cfg(target_os = "linux")]
+fn prunes(root: &Path, kind: RootKind, dir: &Path) -> bool {
+    let is_exempt = |c| component_name(c).is_some_and(|n| PRUNE_EXEMPT_DIRS.contains(&n));
+    let is_git_dir = |c| component_name(c) == Some(GIT_DIR_NAME);
+    let Ok(rel) = dir.strip_prefix(root) else {
+        return false;
+    };
+    if kind == RootKind::GitDir {
+        return git_dir_prunes(rel.components());
+    }
+    if root.components().any(is_exempt) {
+        return false;
+    }
+    let mut components = rel.components();
+    while let Some(component) = components.next() {
+        if is_exempt(component) {
+            return false;
+        }
+        if is_git_dir(component) {
+            return git_dir_prunes(components);
+        }
+        if component_name(component).is_some_and(|n| super::watcher::NOISE_DIRS.contains(&n)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The git-dir rule (module header): given the path components below a git
+/// dir, the git dir itself and anything at or under a [`GIT_DIR_KEPT_DIRS`]
+/// child survive; every other child is pruned.
+#[cfg(target_os = "linux")]
+fn git_dir_prunes(mut below_git_dir: std::path::Components<'_>) -> bool {
+    below_git_dir
+        .next()
+        .is_some_and(|child| !component_name(child).is_some_and(|n| GIT_DIR_KEPT_DIRS.contains(&n)))
+}
+
+/// The directories of `start`'s subtree (itself included) that survive
+/// [`prunes`] under `root`'s rules for its `kind`. Symlinked directories are
+/// followed as `notify`'s own walk does; unreadable entries are skipped.
+#[cfg(target_os = "linux")]
+fn pruned_dirs(root: &Path, kind: RootKind, start: &Path) -> impl Iterator<Item = PathBuf> {
+    let root = root.to_path_buf();
+    ignore::WalkBuilder::new(start)
+        .standard_filters(false)
+        .follow_links(true)
+        .filter_entry(move |entry| {
+            !entry.file_type().is_some_and(|t| t.is_dir()) || !prunes(&root, kind, entry.path())
+        })
+        .build()
+        .flatten()
+        .filter(|entry| entry.file_type().is_some_and(|t| t.is_dir()))
+        .map(ignore::DirEntry::into_path)
+}
+
+/// Group event callback hook: forward directory creations (and moves in) as
+/// [`Cmd::AddDir`] and directory deletions as [`Cmd::Forget`] to the
+/// registrar, which owns the descriptor table. Runs on the backend's event
+/// thread, so it only enqueues; the `Weak` upgrade fails once the group is
+/// retired, which is the right time to stop.
+#[cfg(target_os = "linux")]
+fn track_directories(cmd: &std::sync::Weak<std::sync::mpsc::Sender<Cmd>>, event: &notify::Event) {
+    use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
+    let cmds: Vec<Cmd> = match event.kind {
+        EventKind::Create(CreateKind::Folder) => {
+            event.paths.iter().cloned().map(Cmd::AddDir).collect()
+        }
+        // `notify` emits a standalone `To` alongside a paired `Both`, so the
+        // destination is covered once by handling `To` alone.
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => event
+            .paths
+            .iter()
+            .filter(|p| p.is_dir())
+            .cloned()
+            .map(Cmd::AddDir)
+            .collect(),
+        EventKind::Remove(RemoveKind::Folder) => {
+            event.paths.iter().cloned().map(Cmd::Forget).collect()
+        }
+        _ => return,
+    };
+    let Some(tx) = cmd.upgrade() else {
+        return;
+    };
+    for cmd in cmds {
+        let _ = tx.send(cmd);
+    }
 }
 
 /// Obtain the group's watcher, surviving creation failure. On failure the
@@ -632,19 +1453,24 @@ fn spawn_registrar(
 /// while no watcher existed are re-registered once creation succeeds, because
 /// the hub only re-sends `Cmd::Watch` when a NEW subscriber joins a failed root
 /// ([`SharedWatchHub::subscribe`]'s retry) — without the re-registration a root
-/// whose subscribers all predate the recovery would stay dead forever. `None`
+/// whose subscribers all predate the recovery would stay dead forever; they
+/// are returned alongside the watcher for the caller to register. `None`
 /// when every sender dropped, i.e. the group was retired.
+#[expect(clippy::type_complexity)] // the pending list mirrors `Cmd::Watch`'s fields
 fn build_watcher_serving(
     rx: &std::sync::mpsc::Receiver<Cmd>,
     make: impl Fn() -> notify::Result<Box<dyn Watcher + Send>>,
     group: &Path,
-) -> Option<Box<dyn Watcher + Send>> {
+) -> Option<(
+    Box<dyn Watcher + Send>,
+    Vec<(PathBuf, RecursiveMode, RootKind, Arc<Registration>)>,
+)> {
     let mut backoff = CREATE_RETRY_INITIAL;
     let mut failures = 0u64;
-    let mut pending: Vec<(PathBuf, Arc<Registration>)> = Vec::new();
+    let mut pending: Vec<(PathBuf, RecursiveMode, RootKind, Arc<Registration>)> = Vec::new();
     loop {
         match make() {
-            Ok(mut watcher) => {
+            Ok(watcher) => {
                 if failures > 0 {
                     tracing::info!(
                         group = %group.display(),
@@ -652,10 +1478,7 @@ fn build_watcher_serving(
                         "shared watcher created after earlier failures; re-registering its roots"
                     );
                 }
-                for (root, registration) in pending {
-                    register(watcher.as_mut(), &root, &registration);
-                }
-                return Some(watcher);
+                return Some((watcher, pending));
             }
             Err(e) => {
                 failures += 1;
@@ -675,12 +1498,15 @@ fn build_watcher_serving(
                 break;
             }
             match rx.recv_timeout(remaining) {
-                Ok(Cmd::Watch(root, registration)) => {
+                Ok(Cmd::Watch(root, mode, kind, registration)) => {
                     registration.settle(false);
-                    pending.retain(|(r, _)| r != &root);
-                    pending.push((root, registration));
+                    pending.retain(|(r, ..)| r != &root);
+                    pending.push((root, mode, kind, registration));
                 }
-                Ok(Cmd::Unwatch(root)) => pending.retain(|(r, _)| r != &root),
+                Ok(Cmd::Unwatch(root)) => pending.retain(|(r, ..)| r != &root),
+                // No watcher, no descriptors to keep in step.
+                #[cfg(target_os = "linux")]
+                Ok(Cmd::AddDir(_) | Cmd::Forget(_)) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
             }
@@ -692,17 +1518,41 @@ fn build_watcher_serving(
 /// One deferred `watcher.watch()`. Settled either way, so waiters do not hang
 /// on a failure; the failed state is distinct so a later subscriber to the
 /// same root can retry it rather than inheriting a dead channel.
-fn register(watcher: &mut dyn Watcher, root: &Path, registration: &Registration) {
-    match watcher.watch(root, RecursiveMode::Recursive) {
+///
+/// A failed RE-registration of a root that has already been live (a widen, or
+/// a survivor re-registered after a recursive ancestor's unwatch stripped its
+/// descriptors) is a lost watch, not a pending one: its subscribers passed
+/// their liveness wait long ago and sit on `recv()`, where a state flag would
+/// never reach them. Their sinks are removed instead, so the channel closes
+/// and each subscriber can tear down and re-subscribe — the alternative is a
+/// live-looking watch that silently delivers nothing for the process lifetime
+/// (intent-hq/intent#4852).
+fn register(
+    watcher: &mut dyn Watcher,
+    pruned: &mut PrunedWatches,
+    root: &Path,
+    mode: RecursiveMode,
+    kind: RootKind,
+    registration: &Registration,
+    sinks: &Arc<Mutex<Vec<Sink>>>,
+) {
+    match pruned.watch(watcher, root, mode, kind) {
         Ok(()) => registration.settle(true),
         Err(e) => {
+            let lost = registration.was_live();
             tracing::warn!(
                 root = %root.display(),
                 error = %e,
                 os_watch_limits = %os_watch_limits(),
+                lost_live_watch = lost,
                 "shared watch registration failed"
             );
             registration.settle(false);
+            if lost {
+                if let Ok(mut sinks) = sinks.lock() {
+                    sinks.retain(|s| s.root != root);
+                }
+            }
         }
     }
 }
@@ -712,7 +1562,7 @@ fn register(watcher: &mut dyn Watcher, root: &Path, registration: &Registration)
 /// inotify sysctls (`max_user_instances` / `max_user_watches`); elsewhere
 /// there is no equivalent user-tunable cap to read, and unreadable procfs
 /// values degrade to `?`.
-pub(super) fn os_watch_limits() -> String {
+pub(crate) fn os_watch_limits() -> String {
     #[cfg(target_os = "linux")]
     {
         let read = |name: &str| {
@@ -746,10 +1596,14 @@ pub(super) fn os_watch_limits() -> String {
 /// The cheap `starts_with` pass runs first and is the only one needed in
 /// practice: the roots are canonicalized at subscribe time and `FSEvents` reports
 /// canonical paths. Resolution (a symlinked root, or a deleted path that cannot
-/// be canonicalized directly) is attempted only for the paths that no sink
-/// matched raw, so a busy stream costs no filesystem syscalls per event. Doing
-/// it per path rather than per event matters for multi-path events: one path
-/// matching raw must not suppress the fallback for a sibling path that needs it.
+/// be canonicalized directly) is attempted only for the paths that no sink's
+/// root contains raw, so a busy stream costs no filesystem syscalls per event.
+/// Doing it per path rather than per event matters for multi-path events: one
+/// path matching raw must not suppress the fallback for a sibling path that
+/// needs it. A non-recursive sink additionally drops paths deeper than its
+/// direct children ([`covers`]); such a path still counts as contained
+/// for the fallback's purposes, since resolving it cannot move it under a
+/// different root.
 ///
 /// The routing table is snapshotted and the lock released before any of that
 /// work happens. Resolution stats the filesystem, and holding the sinks lock
@@ -758,17 +1612,17 @@ pub(super) fn os_watch_limits() -> String {
 /// contradicting the per-group isolation this module claims. A sink that goes
 /// away mid-send just makes the send a no-op.
 fn demux(sinks: &Arc<Mutex<Vec<Sink>>>, event: &notify::Event) {
-    let routes: Vec<(PathBuf, mpsc::UnboundedSender<notify::Event>)> = match sinks.lock() {
+    let routes: Vec<(PathBuf, bool, mpsc::UnboundedSender<notify::Event>)> = match sinks.lock() {
         Ok(sinks) => sinks
             .iter()
-            .map(|s| (s.root.clone(), s.tx.clone()))
+            .map(|s| (s.root.clone(), s.recursive, s.tx.clone()))
             .collect(),
         Err(_) => return,
     };
 
     let mut unmatched: Vec<usize> = (0..event.paths.len()).collect();
-    for (root, tx) in &routes {
-        let mine = narrow(event, &event.paths, root);
+    for (root, recursive, tx) in &routes {
+        let mine = narrow(event, &event.paths, root, *recursive);
         unmatched.retain(|i| !event.paths[*i].starts_with(root));
         send_narrowed(tx, event, mine);
     }
@@ -783,22 +1637,28 @@ fn demux(sinks: &Arc<Mutex<Vec<Sink>>>, event: &notify::Event) {
         let raw = &event.paths[*i];
         resolved[*i] = canonical_root(raw, &find_existing_ancestor(raw));
     }
-    for (root, tx) in &routes {
+    for (root, recursive, tx) in &routes {
         let mine: Vec<PathBuf> = unmatched
             .iter()
-            .filter(|i| resolved[**i].starts_with(root))
+            .filter(|i| covers(root, *recursive, &resolved[**i]))
             .map(|i| event.paths[*i].clone())
             .collect();
         send_narrowed(tx, event, mine);
     }
 }
 
-/// The raw paths of `event` whose `candidates` counterpart falls under `root`.
-fn narrow(event: &notify::Event, candidates: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+/// The raw paths of `event` whose `candidates` counterpart falls within the
+/// sink's slice of `root` (see [`covers`]).
+fn narrow(
+    event: &notify::Event,
+    candidates: &[PathBuf],
+    root: &Path,
+    recursive: bool,
+) -> Vec<PathBuf> {
     candidates
         .iter()
         .zip(event.paths.iter())
-        .filter(|(candidate, _)| candidate.starts_with(root))
+        .filter(|(candidate, _)| covers(root, recursive, candidate))
         .map(|(_, raw)| raw.clone())
         .collect()
 }
@@ -847,6 +1707,17 @@ impl Drop for TierWatch {
     }
 }
 
+impl TierWatch {
+    /// Detach a [`RegistrationProbe`] for the shared watch this tier rides.
+    /// Tier watches are held behind a `std::sync::Mutex` by their owners, so
+    /// the probe is what a test awaits, not the watch itself.
+    #[cfg(test)]
+    #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
+    pub(super) fn probe(&self) -> RegistrationProbe {
+        self._sub.probe()
+    }
+}
+
 /// Watch the tier directories `subpaths` (relative to `workspace_root`) via the
 /// shared stream on the workspace root, invoking `on_change` for matching
 /// events.
@@ -878,7 +1749,7 @@ pub(super) fn watch_tiers(
         })
         .collect();
     let registration = Arc::clone(&sub.registration);
-    let task = tokio::spawn(async move {
+    let task = intent_core::spawn_daemon(async move {
         wait_settled(&registration, ESTABLISH_TIMEOUT).await;
         on_change();
         while let Some(event) = rx.recv().await {
@@ -896,6 +1767,8 @@ mod tests {
 
     use super::*;
     use crate::events::LIVENESS;
+    #[cfg(target_os = "linux")]
+    use crate::events::{inode_of, inotify_watched_inodes};
 
     /// Self-cleaning temp directory.
     struct TempDir {
@@ -946,7 +1819,7 @@ mod tests {
     /// a SINGLE stream, and the demux still keeps them isolated — each sink
     /// sees only the events under its own root.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn sibling_roots_share_one_stream_and_stay_isolated() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1025,7 +1898,6 @@ mod tests {
     /// Dropping the last subscription for a group retires the stream, so an
     /// archived/closed workspace stops consuming fseventsd capacity.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn dropping_the_last_subscription_retires_the_stream() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1093,7 +1965,7 @@ mod tests {
     /// so on Linux (one global group) the co-tenant nested root would go
     /// silently dead without the re-registration in `SubHandle::drop`.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn dropping_an_outer_root_keeps_a_nested_root_covered() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1120,6 +1992,726 @@ mod tests {
                 .is_some(),
             "the nested root must keep delivering after its outer co-tenant retires"
         );
+    }
+
+    /// Write `rel` under `root` and keep touching it until `rx` delivers an
+    /// event for it. A directory created under a recursive watch is added to
+    /// inotify only after the create event that announced it is dispatched, so
+    /// a single write racing that add can land before the descriptor exists;
+    /// every later touch is a fresh chance to be seen.
+    async fn touch_until_seen(
+        rx: &mut mpsc::UnboundedReceiver<notify::Event>,
+        root: &Path,
+        rel: &str,
+    ) -> bool {
+        let path = root.join(rel);
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while tokio::time::Instant::now() < deadline {
+            std::fs::write(&path, b"x").expect("write probe file");
+            if next_for(rx, root, rel, Duration::from_millis(250))
+                .await
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drive a recursive `outer` root with a NON-recursive co-tenant nested
+    /// under it — the shape a missing project-tier skills root parked on
+    /// `<workspace>/.agents` takes under the recursive workspace root — and
+    /// assert the outer root still auto-watches directories created under
+    /// the nested one, then keeps them after the nested subscriber retires.
+    /// Without the ancestor rule in `subscribe_with` / `SubHandle::drop`, the
+    /// shallow registration flips the shared inotify descriptor's recursion
+    /// flag off (new subdirectories are never added) and the shallow unwatch
+    /// strips the descriptor from the outer root entirely.
+    async fn recursive_outer_survives_shallow_nested(outer_first: bool, tag: &str) {
+        let base = TempDir::new(tag);
+        let outer = base.path.join("outer");
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(&nested).expect("mk nested");
+
+        let hub = SharedWatchHub::new();
+        let (sub_outer, mut rx_outer, root_outer, sub_nested, mut rx_nested, root_nested) =
+            if outer_first {
+                let (so, ro, po) = hub.subscribe(&outer);
+                let (sn, rn, pn) = hub.subscribe_with(&nested, RecursiveMode::NonRecursive);
+                (so, ro, po, sn, rn, pn)
+            } else {
+                let (sn, rn, pn) = hub.subscribe_with(&nested, RecursiveMode::NonRecursive);
+                let (so, ro, po) = hub.subscribe(&outer);
+                (so, ro, po, sn, rn, pn)
+            };
+        hub.wait_all_established(2, LIVENESS).await;
+
+        // A directory created under the shallow root must still be picked up
+        // by the recursive outer root, and its contents delivered there.
+        std::fs::create_dir(root_nested.join("created-later")).expect("mk created-later");
+        assert!(
+            touch_until_seen(
+                &mut rx_outer,
+                &root_outer,
+                "nested/created-later/expected.txt"
+            )
+            .await,
+            "outer_first={outer_first}: the recursive outer root lost coverage of a \
+             directory created under its shallow co-tenant"
+        );
+        // The shallow sink stays shallow: it sees its direct child, not the
+        // grandchild the outer root just saw.
+        std::fs::write(root_nested.join("direct.txt"), b"x").expect("write direct");
+        assert!(
+            next_for(&mut rx_nested, &root_nested, "direct.txt", LIVENESS)
+                .await
+                .is_some(),
+            "outer_first={outer_first}: the shallow sink must see its direct child"
+        );
+        while let Ok(event) = rx_nested.try_recv() {
+            assert!(
+                !event
+                    .paths
+                    .iter()
+                    .any(|p| p.starts_with(root_nested.join("created-later"))),
+                "outer_first={outer_first}: shallow sink leaked a grandchild event: {event:?}"
+            );
+        }
+
+        // Retiring the shallow root must leave the outer root's descriptors
+        // for that subtree in place.
+        drop(sub_nested);
+        sub_outer.wait_established(LIVENESS).await;
+        std::fs::create_dir(root_nested.join("after-retire")).expect("mk after-retire");
+        assert!(
+            touch_until_seen(
+                &mut rx_outer,
+                &root_outer,
+                "nested/after-retire/expected.txt"
+            )
+            .await,
+            "outer_first={outer_first}: retiring the shallow co-tenant stripped the \
+             outer root's coverage of the nested subtree"
+        );
+        drop(sub_outer);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_shallow_root_under_a_recursive_root_keeps_the_ancestor_recursive() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recursive_outer_survives_shallow_nested(true, "shallow-after-outer").await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_recursive_root_over_an_existing_shallow_root_watches_its_subtree() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recursive_outer_survives_shallow_nested(false, "outer-after-shallow").await;
+    }
+
+    /// Regression for the widened-ancestor promotion hole (PR #1876 review):
+    /// a non-recursive ancestor watch that a recursive co-subscriber once
+    /// widened stays recursive after that co-subscriber leaves, so retiring it
+    /// re-registers the roots nested under it — including a root promoted off
+    /// it whose owner already passed `wait_live`. When that re-registration
+    /// fails, the owner must find out: its channel closes (a) and the
+    /// registration reads as failed (b), instead of a live-looking watch that
+    /// never delivers again. Linux only: on macOS the two roots live in
+    /// distinct groups and no survivor re-registration happens.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_failed_re_registration_of_a_live_root_closes_its_subscribers() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("lost-live");
+        let ancestor = base.path.join("parent");
+        let desired = ancestor.join("desired");
+        std::fs::create_dir_all(&desired).expect("mk desired");
+
+        // `desired` sees one `watch()` from the ancestor's widened pruned walk
+        // and one on its own subscribe; the third is the survivor
+        // re-registration the ancestor's retirement sends.
+        let fault = WatchFault::nth("desired", 3);
+        let hub = SharedWatchHub::with_watch_fault(&fault);
+
+        let (sub_ancestor, _rx_ancestor, _) =
+            hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
+        sub_ancestor.wait_established(LIVENESS).await;
+        let (sub_wide, _rx_wide, _) = hub.subscribe(&ancestor);
+        sub_wide.wait_established(LIVENESS).await;
+        drop(sub_wide);
+
+        let (sub_desired, mut rx_desired, _) = hub.subscribe(&desired);
+        sub_desired.wait_established(LIVENESS).await;
+        assert!(
+            sub_desired.registration.live(),
+            "precondition: the promoted root goes live on its first registration"
+        );
+        assert_eq!(fault.attempts(), 2);
+
+        drop(sub_ancestor);
+
+        // (a) The subscriber's channel closes rather than parking forever.
+        let closed = tokio::time::timeout(LIVENESS, async {
+            while rx_desired.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "a failed re-registration of a live root must close its subscribers' channels"
+        );
+        // (b) The state agrees, and the failure was the targeted third call.
+        assert!(sub_desired.registration.failed());
+        assert_eq!(fault.attempts(), 3);
+    }
+
+    /// Poll until `dir` holds (or, with `expect = false`, no longer holds) an
+    /// inotify descriptor; descriptor adds for directories created after
+    /// registration ride the event path, so they land asynchronously.
+    #[cfg(target_os = "linux")]
+    async fn wait_watched(dir: &Path, expect: bool) -> bool {
+        let ino = inode_of(dir);
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while tokio::time::Instant::now() < deadline {
+            if inotify_watched_inodes().contains(&ino) == expect {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// The intent-hq/intent#5026 invariant: a recursive root's OS watch must
+    /// not descend into `NOISE_DIRS` (`node_modules`, `target`, `vendor`, …)
+    /// at any depth — those subtrees cost `max_user_watches` for events every
+    /// consumer drops — while everything else, including directories created
+    /// AFTER registration, stays covered and delivers. Subscriber-owned trees
+    /// (`.intent`, and the kept `refs/` of a git dir) are exempt from pruning
+    /// even where a nested name collides with the noise list
+    /// (`.git/refs/heads/build`), and retiring the root releases every
+    /// descriptor the pruned walk registered.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_recursive_root_does_not_watch_noise_dirs() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-noise");
+        let ws = base.path.join("ws");
+        let watched = [
+            "src",
+            "src/a",
+            "src/b/deep",
+            ".git/refs/heads/build",
+            ".intent/skills/build",
+            "docs",
+        ];
+        let noise = [
+            "node_modules/pkg-a/lib",
+            "node_modules/pkg-b/dist",
+            "target/debug/deps",
+            "target/debug/build/x",
+            "vendor/dep",
+            "src/b/node_modules/nested",
+        ];
+        for rel in watched.iter().chain(noise.iter()) {
+            std::fs::create_dir_all(ws.join(rel)).expect("mk tree");
+        }
+
+        let hub = SharedWatchHub::new();
+        let (sub, mut rx, root) = hub.subscribe(&ws);
+        sub.probe().wait_live(LIVENESS).await;
+
+        let inodes = inotify_watched_inodes();
+        assert!(
+            inodes.contains(&inode_of(&root)),
+            "the root itself is watched"
+        );
+        for rel in watched {
+            assert!(
+                inodes.contains(&inode_of(&ws.join(rel))),
+                "{rel} must hold an inotify descriptor"
+            );
+        }
+        // From the first noise component down, no directory may be watched.
+        for rel in noise {
+            let mut prefix = PathBuf::new();
+            let mut pruned = false;
+            for component in Path::new(rel).components() {
+                prefix.push(component);
+                pruned |= component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|n| super::super::watcher::NOISE_DIRS.contains(&n));
+                assert!(
+                    !pruned || !inodes.contains(&inode_of(&ws.join(&prefix))),
+                    "{} must NOT hold an inotify descriptor",
+                    prefix.display()
+                );
+            }
+            assert!(pruned, "test tree: {rel} must contain a noise component");
+        }
+
+        // Directories created after registration — a fresh top-level tree and
+        // a nested one — get descriptors and deliver, while a noise directory
+        // created later stays unwatched (also when nested under a new dir).
+        std::fs::create_dir_all(root.join("later/deeper")).expect("mk later");
+        std::fs::create_dir_all(root.join("src/a/new")).expect("mk src/a/new");
+        assert!(
+            touch_until_seen(&mut rx, &root, "later/deeper/file.txt").await,
+            "a directory created after registration must deliver events"
+        );
+        assert!(
+            touch_until_seen(&mut rx, &root, "src/a/new/file.txt").await,
+            "a nested directory created after registration must deliver events"
+        );
+        std::fs::create_dir_all(root.join("later/node_modules/pkg")).expect("mk later noise");
+        std::fs::create_dir_all(root.join("target/release")).expect("mk target/release");
+        assert!(
+            wait_watched(&root.join("later"), true).await,
+            "later/ must be watched"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let inodes = inotify_watched_inodes();
+        for rel in [
+            "later/node_modules",
+            "later/node_modules/pkg",
+            "target/release",
+        ] {
+            assert!(
+                !inodes.contains(&inode_of(&root.join(rel))),
+                "{rel} created after registration must NOT be watched"
+            );
+        }
+
+        // Retiring the root releases every descriptor the walk registered.
+        drop(sub);
+        for rel in [
+            "",
+            "src",
+            "src/b/deep",
+            "later/deeper",
+            ".git/refs/heads/build",
+        ] {
+            assert!(
+                wait_watched(&root.join(rel), false).await,
+                "unwatch must release the descriptor for {rel:?}"
+            );
+        }
+    }
+
+    /// A recursive root that does not exist must settle as FAILED, as the
+    /// backend's own recursive watch did: the pruned walk yields nothing for
+    /// a missing start, and a registration settled live with zero
+    /// descriptors would bypass the caller's failed-registration recovery.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_missing_recursive_root_settles_as_failed() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-missing");
+        let missing = base.path.join("ws");
+
+        let hub = SharedWatchHub::new();
+        let (sub, _rx, _) = hub.subscribe(&missing);
+        sub.wait_established(LIVENESS).await;
+        assert!(
+            sub.registration.settled(),
+            "registration must settle for a missing root"
+        );
+        assert!(
+            sub.registration.failed(),
+            "a missing recursive root must settle as failed, not live"
+        );
+    }
+
+    /// A root nested inside a noise subtree of a recursive co-tenant
+    /// (`ws/target/repo` under `ws`) shares no descriptors with it — the
+    /// co-tenant's walk pruned `target` — so it is not "covered": it must be
+    /// registered in its own mode and, when its last subscriber drops, be
+    /// unwatched outright rather than left holding (and growing) descriptors
+    /// until the outer root retires.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_root_under_a_pruned_subtree_is_retired_with_its_subscriber() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-nested");
+        let ws = base.path.join("ws");
+        let nested = ws.join("target").join("repo");
+        std::fs::create_dir_all(nested.join("src")).expect("mk tree");
+        std::fs::create_dir_all(ws.join("src")).expect("mk src");
+
+        let hub = SharedWatchHub::new();
+        let (sub_ws, _rx_ws, ws) = hub.subscribe(&ws);
+        sub_ws.probe().wait_live(LIVENESS).await;
+        let nested = ws.join("target").join("repo");
+        assert!(
+            !inotify_watched_inodes().contains(&inode_of(&nested)),
+            "precondition: the outer root prunes target/"
+        );
+
+        let (sub_nested, mut rx_nested, _) = hub.subscribe(&nested);
+        sub_nested.probe().wait_live(LIVENESS).await;
+        let inodes = inotify_watched_inodes();
+        assert!(inodes.contains(&inode_of(&nested)), "nested root watched");
+        assert!(
+            inodes.contains(&inode_of(&nested.join("src"))),
+            "nested root's own walk covers its subtree"
+        );
+        assert!(
+            touch_until_seen(&mut rx_nested, &nested, "src/file.txt").await,
+            "the nested root delivers while subscribed"
+        );
+
+        drop(sub_nested);
+        for rel in ["", "src"] {
+            assert!(
+                wait_watched(&nested.join(rel), false).await,
+                "dropping the nested root's last subscriber must release {rel:?}"
+            );
+        }
+        // Nor does the registrar keep growing it: a directory created under
+        // the retired root lands under the outer root's pruned subtree and
+        // stays unwatched.
+        std::fs::create_dir_all(nested.join("later")).expect("mk later");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !inotify_watched_inodes().contains(&inode_of(&nested.join("later"))),
+            "no descriptors may be added under a retired nested root"
+        );
+        assert!(
+            sub_ws.registration.live(),
+            "the outer root is untouched by the nested root's retirement"
+        );
+    }
+
+    /// A regular repository's `.git` tree as the pruned walk sees it: the
+    /// metadata the git metadata watcher and the file watcher consume, plus
+    /// the subtrees neither reads (intent-hq/intent#5044).
+    #[cfg(target_os = "linux")]
+    const GIT_DIR_KEPT: &[&str] = &[
+        ".git",
+        ".git/refs",
+        ".git/refs/heads",
+        ".git/refs/tags",
+        ".git/info",
+    ];
+    #[cfg(target_os = "linux")]
+    const GIT_DIR_PRUNED: &[&str] = &[
+        ".git/objects",
+        ".git/objects/ab",
+        ".git/objects/pack",
+        ".git/logs",
+        ".git/logs/refs/heads",
+        ".git/modules",
+        ".git/modules/sub",
+        ".git/modules/sub/objects/cd",
+        ".git/modules/sub/refs/heads",
+        ".git/worktrees",
+        ".git/worktrees/wt/logs",
+        ".git/hooks",
+    ];
+
+    /// The intent-hq/intent#5044 invariant for a regular repository: the
+    /// recursive workspace-root watch holds descriptors for `.git` itself,
+    /// `.git/refs/**` and `.git/info` — exactly what the git metadata watcher
+    /// (`HEAD`, `index`, `packed-refs`, `refs/**`) and the file watcher
+    /// (`info/exclude`) consume through it — and none for `objects/`,
+    /// `logs/`, `modules/` (submodule git dirs, which the metadata watcher
+    /// does not read), `worktrees/` or `hooks/`, which after
+    /// intent-hq/intentd#1904 were about half of a workspace's remaining
+    /// descriptors. Metadata edits, including in a ref directory created
+    /// after registration, still deliver; an object fanout directory created
+    /// later stays unwatched.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_recursive_root_watches_only_git_metadata_dirs() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-git");
+        let ws = base.path.join("ws");
+        for rel in GIT_DIR_KEPT.iter().chain(GIT_DIR_PRUNED.iter()) {
+            std::fs::create_dir_all(ws.join(rel)).expect("mk tree");
+        }
+        std::fs::create_dir_all(ws.join("src")).expect("mk src");
+        for rel in [
+            ".git/HEAD",
+            ".git/index",
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+        ] {
+            std::fs::write(ws.join(rel), b"seed").expect("seed metadata");
+        }
+
+        let hub = SharedWatchHub::new();
+        let (sub, mut rx, root) = hub.subscribe(&ws);
+        sub.probe().wait_live(LIVENESS).await;
+
+        let inodes = inotify_watched_inodes();
+        for rel in GIT_DIR_KEPT.iter().chain(["src"].iter()) {
+            assert!(
+                inodes.contains(&inode_of(&root.join(rel))),
+                "{rel} must hold an inotify descriptor"
+            );
+        }
+        for rel in GIT_DIR_PRUNED {
+            assert!(
+                !inodes.contains(&inode_of(&root.join(rel))),
+                "{rel} must NOT hold an inotify descriptor"
+            );
+        }
+
+        // Every metadata path the git metadata watcher filters for still
+        // delivers through the narrowed watch.
+        for rel in [
+            ".git/HEAD",
+            ".git/index",
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+            ".git/info/exclude",
+        ] {
+            assert!(
+                touch_until_seen(&mut rx, &root, rel).await,
+                "{rel} must deliver through the narrowed .git watch"
+            );
+        }
+        // A ref namespace created after registration (`git checkout -b
+        // feature/x`) is walked and delivers; an object fanout directory
+        // created after registration stays pruned.
+        std::fs::create_dir_all(root.join(".git/refs/heads/feature")).expect("mk feature");
+        assert!(
+            touch_until_seen(&mut rx, &root, ".git/refs/heads/feature/x").await,
+            "a ref directory created after registration must deliver"
+        );
+        std::fs::create_dir_all(root.join(".git/objects/ef")).expect("mk objects/ef");
+        assert!(
+            wait_watched(&root.join(".git/refs/heads/feature"), true).await,
+            ".git/refs/heads/feature must be watched"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !inotify_watched_inodes().contains(&inode_of(&root.join(".git/objects/ef"))),
+            ".git/objects/ef created after registration must NOT be watched"
+        );
+
+        drop(sub);
+        for rel in [
+            ".git",
+            ".git/refs/heads",
+            ".git/refs/heads/feature",
+            ".git/info",
+        ] {
+            assert!(
+                wait_watched(&root.join(rel), false).await,
+                "unwatch must release the descriptor for {rel:?}"
+            );
+        }
+    }
+
+    /// The intent-hq/intent#5044 invariant for a linked worktree, whose git
+    /// metadata watcher subscribes the resolved git dirs directly as git
+    /// dirs: the common dir (read for `refs/**` and `packed-refs`) and the
+    /// per-worktree gitdir (`<common>/worktrees/<name>`, read for `HEAD`,
+    /// `index` and its own `refs/**`). The kind is declared by the
+    /// subscriber, not read off the pathname: this repository keeps its
+    /// metadata in a separate git dir with no `.git` component anywhere
+    /// (`git init --separate-git-dir`), and the rule must still apply from
+    /// each root's own top — the common-dir root skips `objects/`, `logs/`
+    /// and `worktrees/` (the gitdir is its own root, not covered by the
+    /// common dir), the gitdir root skips its `logs/`, and both still deliver
+    /// their metadata edits. The same tree subscribed as an ordinary root
+    /// would be walked in full, which is what the kind exists to prevent.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_git_dir_root_watches_only_its_metadata_dirs() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-gitdir");
+        let metadata = base.path.join("metadata");
+        for rel in GIT_DIR_KEPT.iter().chain(GIT_DIR_PRUNED.iter()) {
+            let rel = rel.strip_prefix(".git").unwrap().trim_start_matches('/');
+            std::fs::create_dir_all(metadata.join(rel)).expect("mk tree");
+        }
+        std::fs::create_dir_all(metadata.join("worktrees/wt/refs/bisect")).expect("mk wt refs");
+        for rel in [
+            "packed-refs",
+            "refs/heads/main",
+            "worktrees/wt/HEAD",
+            "worktrees/wt/index",
+        ] {
+            std::fs::write(metadata.join(rel), b"seed").expect("seed metadata");
+        }
+        assert!(
+            !metadata
+                .components()
+                .any(|c| component_name(c) == Some(GIT_DIR_NAME)),
+            "the fixture must not carry a .git component for the rule to key on"
+        );
+
+        let hub = SharedWatchHub::new();
+        let (sub_tree, _rx_tree, tree) = hub.subscribe(&metadata);
+        sub_tree.probe().wait_live(LIVENESS).await;
+        assert!(
+            inotify_watched_inodes().contains(&inode_of(&tree.join("objects/ab"))),
+            "as an ordinary root the same tree walks objects/ in full"
+        );
+        drop(sub_tree);
+        assert!(
+            wait_watched(&tree, false).await,
+            "the ordinary subscription must release before the git-dir one"
+        );
+
+        let (sub_common, mut rx_common, common) = hub.subscribe_git_dir(&metadata);
+        sub_common.probe().wait_live(LIVENESS).await;
+        let inodes = inotify_watched_inodes();
+        for rel in ["", "refs", "refs/heads", "info"] {
+            assert!(
+                inodes.contains(&inode_of(&common.join(rel))),
+                "common dir {rel:?} must hold an inotify descriptor"
+            );
+        }
+        for rel in [
+            "objects",
+            "objects/ab",
+            "logs",
+            "modules/sub",
+            "worktrees",
+            "worktrees/wt",
+            "worktrees/wt/refs",
+            "hooks",
+        ] {
+            assert!(
+                !inodes.contains(&inode_of(&common.join(rel))),
+                "common dir {rel:?} must NOT hold an inotify descriptor"
+            );
+        }
+
+        let (sub_wt, mut rx_wt, gitdir) = hub.subscribe_git_dir(&common.join("worktrees/wt"));
+        sub_wt.probe().wait_live(LIVENESS).await;
+        let inodes = inotify_watched_inodes();
+        for rel in ["", "refs", "refs/bisect"] {
+            assert!(
+                inodes.contains(&inode_of(&gitdir.join(rel))),
+                "gitdir {rel:?} must hold an inotify descriptor"
+            );
+        }
+        assert!(
+            !inodes.contains(&inode_of(&gitdir.join("logs"))),
+            "gitdir logs/ must NOT hold an inotify descriptor"
+        );
+        assert!(
+            !inodes.contains(&inode_of(&common.join("worktrees"))),
+            "subscribing the gitdir must not pull in the common dir's worktrees/"
+        );
+
+        for rel in ["packed-refs", "refs/heads/main"] {
+            assert!(
+                touch_until_seen(&mut rx_common, &common, rel).await,
+                "common dir {rel} must deliver through the narrowed watch"
+            );
+        }
+        for rel in ["HEAD", "index", "refs/bisect/bad"] {
+            assert!(
+                touch_until_seen(&mut rx_wt, &gitdir, rel).await,
+                "gitdir {rel} must deliver through the narrowed watch"
+            );
+        }
+
+        // The gitdir is its own root (pruned under the common dir, so not
+        // covered by it): retiring its subscriber releases its descriptors
+        // while the common dir's stay.
+        drop(sub_wt);
+        for rel in ["", "refs/bisect"] {
+            assert!(
+                wait_watched(&gitdir.join(rel), false).await,
+                "dropping the gitdir subscriber must release {rel:?}"
+            );
+        }
+        assert!(
+            inotify_watched_inodes().contains(&inode_of(&common.join("refs/heads"))),
+            "the common dir's descriptors survive the gitdir's retirement"
+        );
+        drop(sub_common);
+    }
+
+    /// The prune rule's git-dir cases as a pure function, one per
+    /// module-header clause (intent-hq/intent#5044).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_dir_prune_rules() {
+        use RootKind::{GitDir, Tree};
+        let ws = Path::new("/ws");
+        // The git dir itself and its kept children survive, recursively.
+        for rel in [
+            ".git",
+            ".git/refs",
+            ".git/refs/heads/build",
+            ".git/info",
+            "sub/nested/.git/refs/tags",
+        ] {
+            assert!(!prunes(ws, Tree, &ws.join(rel)), "{rel} must survive");
+        }
+        // Every other child of a git dir is pruned, wherever the git dir is.
+        for rel in [
+            ".git/objects",
+            ".git/objects/ab",
+            ".git/logs",
+            ".git/modules",
+            ".git/modules/sub/refs",
+            ".git/worktrees/wt",
+            ".git/hooks",
+            "sub/nested/.git/objects",
+        ] {
+            assert!(prunes(ws, Tree, &ws.join(rel)), "{rel} must be pruned");
+        }
+        // Noise and exempt components met before `.git` keep their own rule.
+        assert!(prunes(ws, Tree, &ws.join("node_modules/pkg/.git/refs")));
+        assert!(!prunes(ws, Tree, &ws.join(".intent/x/.git/objects")));
+        // A root subscribed as a git dir gets the rule from its own top,
+        // whatever it is named: the usual `<main>/.git` common dir and its
+        // `worktrees/<name>` gitdir, but equally a separate git dir or a bare
+        // repository with no `.git` component anywhere in the path.
+        for common in [
+            Path::new("/main/.git"),
+            Path::new("/srv/metadata"),
+            Path::new("/srv/repo.git"),
+        ] {
+            assert!(!prunes(common, GitDir, common));
+            assert!(!prunes(common, GitDir, &common.join("refs/heads")));
+            assert!(!prunes(common, GitDir, &common.join("info")));
+            assert!(prunes(common, GitDir, &common.join("objects/ab")));
+            assert!(prunes(common, GitDir, &common.join("logs")));
+            assert!(prunes(common, GitDir, &common.join("worktrees/wt")));
+            assert!(prunes(common, GitDir, &common.join("modules/sub")));
+            let gitdir = common.join("worktrees/wt");
+            assert!(!prunes(&gitdir, GitDir, &gitdir));
+            assert!(!prunes(&gitdir, GitDir, &gitdir.join("refs/bisect")));
+            assert!(prunes(&gitdir, GitDir, &gitdir.join("logs/refs")));
+        }
+        // The kind is what carries the rule: the same paths as an ordinary
+        // root follow the noise list only (`.git` is then just a name that
+        // happens to be the root's, not a child met on the way down).
+        let metadata = Path::new("/srv/metadata");
+        assert!(!prunes(metadata, Tree, &metadata.join("objects/ab")));
+        assert!(!prunes(metadata, Tree, &metadata.join("logs")));
+        assert!(prunes(metadata, Tree, &metadata.join("hooks/node_modules")));
     }
 
     /// macOS keeps parent-directory grouping: the `FSEvents` stream rebuild on
@@ -1164,11 +2756,13 @@ mod tests {
             Sink {
                 id: 0,
                 root: a.clone(),
+                recursive: true,
                 tx: tx_a,
             },
             Sink {
                 id: 1,
                 root: b.clone(),
+                recursive: true,
                 tx: tx_b,
             },
         ]));
@@ -1200,6 +2794,7 @@ mod tests {
         let sinks = Arc::new(Mutex::new(vec![Sink {
             id: 0,
             root: a,
+            recursive: true,
             tx: tx_a,
         }]));
 
@@ -1210,9 +2805,70 @@ mod tests {
         assert!(rx_a.try_recv().is_err(), "unrelated path must not deliver");
     }
 
+    /// A non-recursive sink sees the root itself and its direct children —
+    /// what a dedicated non-recursive OS watch reports — and nothing deeper,
+    /// even though the shared stream it rides is recursive. A recursive
+    /// co-subscriber of the same root keeps the full view.
+    #[test]
+    fn a_non_recursive_sink_is_narrowed_to_direct_children() {
+        use notify::event::{CreateKind, EventKind};
+
+        let root = PathBuf::from("/home/u/.intent");
+        let (tx_shallow, mut rx_shallow) = mpsc::unbounded_channel();
+        let (tx_deep, mut rx_deep) = mpsc::unbounded_channel();
+        let sinks = Arc::new(Mutex::new(vec![
+            Sink {
+                id: 0,
+                root: root.clone(),
+                recursive: false,
+                tx: tx_shallow,
+            },
+            Sink {
+                id: 1,
+                root: root.clone(),
+                recursive: true,
+                tx: tx_deep,
+            },
+        ]));
+
+        let direct = notify::Event::new(EventKind::Create(CreateKind::File))
+            .add_path(root.join("config.toml"));
+        demux(&sinks, &direct);
+        assert_eq!(
+            rx_shallow.try_recv().expect("direct child delivers").paths,
+            vec![root.join("config.toml")]
+        );
+        assert!(rx_deep.try_recv().is_ok(), "recursive sink sees it too");
+
+        let itself =
+            notify::Event::new(EventKind::Create(CreateKind::Folder)).add_path(root.clone());
+        demux(&sinks, &itself);
+        assert!(
+            rx_shallow.try_recv().is_ok(),
+            "the root itself is a non-recursive event"
+        );
+        rx_deep.try_recv().expect("recursive sink sees it too");
+
+        let nested = notify::Event::new(EventKind::Create(CreateKind::File))
+            .add_path(root.join("specialists").join("x.md"));
+        demux(&sinks, &nested);
+        assert!(
+            rx_shallow.try_recv().is_err(),
+            "a grandchild must not reach a non-recursive sink"
+        );
+        assert_eq!(
+            rx_deep
+                .try_recv()
+                .expect("recursive sink sees the grandchild")
+                .paths,
+            vec![root.join("specialists").join("x.md")]
+        );
+    }
+
     /// The resolution fallback is per path, not per event: one path of a
     /// multi-path event matching raw must not suppress resolution for a sibling
     /// path that only reaches its sink after canonicalization.
+    #[cfg(unix)]
     #[test]
     fn a_raw_match_does_not_suppress_resolution_for_sibling_paths() {
         use notify::event::{EventKind, ModifyKind, RenameMode};
@@ -1236,11 +2892,13 @@ mod tests {
             Sink {
                 id: 0,
                 root: canonical_plain.clone(),
+                recursive: true,
                 tx: tx_plain,
             },
             Sink {
                 id: 1,
                 root: canonical_real,
+                recursive: true,
                 tx: tx_linked,
             },
         ]));
@@ -1317,7 +2975,7 @@ mod tests {
     /// command channel and retries creation with backoff, and once the factory
     /// recovers the failed roots are re-registered and deliver events.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watcher_creation_failure_settles_registrations_and_recovers() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1376,12 +3034,65 @@ mod tests {
         panic!("recovered watch never delivered events");
     }
 
+    /// Regression for intent-hq/intent#4845 / #4852: the sync point a test
+    /// uses before mutating a watched tree must wait for the watch to be
+    /// LIVE, not merely settled. A registration settled as failed during a
+    /// creation retry must keep the waiter parked (a) and release it once the
+    /// retry re-registers the root (b) — otherwise the test writes before the
+    /// OS watch exists and its event wait hangs into nextest's kill.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn probe_wait_live_rides_out_creation_retry() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parent = TempDir::new("probe-live");
+        let root = parent.path.join("ws");
+        std::fs::create_dir_all(&root).expect("mk ws");
+
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail_in_factory = Arc::clone(&fail);
+        let hub = SharedWatchHub::with_factory(Arc::new(move |callback: EventCallback| {
+            if fail_in_factory.load(Ordering::SeqCst) {
+                Err(notify::Error::generic("injected creation failure"))
+            } else {
+                notify::recommended_watcher(callback)
+                    .map(|w| Box::new(w) as Box<dyn Watcher + Send>)
+            }
+        }));
+
+        let (sub, _rx, _canonical) = hub.subscribe(&root);
+        sub.wait_established(LIVENESS).await;
+        assert!(
+            sub.registration.failed(),
+            "precondition: creation failure settles the registration as failed"
+        );
+
+        // (a) Settled-as-failed is not live: the probe keeps waiting.
+        let probe = sub.probe();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), probe.wait_live(LIVENESS))
+                .await
+                .is_err(),
+            "wait_live must not return on a registration failed during a creation retry"
+        );
+
+        // (b) Once the factory recovers the retry re-registers the root and
+        // the probe releases with the registration live.
+        fail.store(false, Ordering::SeqCst);
+        probe.wait_live(LIVENESS).await;
+        assert!(
+            sub.registration.live(),
+            "wait_live must return only once live"
+        );
+    }
+
     /// The health handle tracks the hub through its lifecycle: `None` before
     /// attachment, healthy counts while watches are live, failed-root counts
     /// when a registration settles as failed, and `None` again once the hub
     /// is dropped (the `Weak` must not extend the hub's lifetime).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watch_health_snapshot_tracks_roots_failures_and_hub_lifetime() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1436,7 +3147,7 @@ mod tests {
     /// registrar settles incoming registrations as failed while no watcher
     /// exists), and recovery drains the count back to zero.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watch_health_reflects_creation_failure_and_recovery() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()

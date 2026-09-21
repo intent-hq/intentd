@@ -78,9 +78,12 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
         display_status: None,
         waiting: false,
     }
@@ -109,14 +112,15 @@ fn gate() -> Option<String> {
 /// the ping was answered WHILE the long call was still in flight (release-file
 /// gate) AND the long call then completed successfully; any deadlock or error
 /// resolves `refusal` and fails the assertions below.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn slow_tool_call_does_not_block_concurrent_tools_list() {
     let Some(script) = gate() else { return };
 
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-bridge-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("itd-e2e-bridge-");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("mkdir ws_root");
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-bridge-{}.db", uuid::Uuid::new_v4()));
+    let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
@@ -225,10 +229,6 @@ async fn slow_tool_call_does_not_block_concurrent_tools_list() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 //
@@ -277,7 +277,7 @@ async fn read_json_line<R: tokio::io::AsyncBufRead + Unpin>(
 /// (monorepo#1530); a request sent during the gap gets the retryable `-32001`
 /// error (never silence); and once the listener is back the bridge reconnects
 /// on its own and serves requests again over the SAME stdio session.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bridge_subprocess_survives_tcp_blip_with_retryable_errors() {
     // Fake daemon listener the test controls end-to-end.
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
@@ -285,13 +285,11 @@ async fn bridge_subprocess_survives_tcp_blip_with_retryable_errors() {
 
     // Hermetic log dir so the subprocess's tracing appender never touches the
     // real data dir.
-    let data_dir =
-        std::env::temp_dir().join(format!("itd-e2e-bridge-log-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir = common::test_tempdir("itd-e2e-bridge-log-");
 
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
         .args(["mcp-bridge", "--connect", &addr.to_string()])
-        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_DATA_DIR", data_dir.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -429,8 +427,6 @@ async fn bridge_subprocess_survives_tcp_blip_with_retryable_errors() {
         .expect("bridge did not exit on stdin EOF")
         .expect("wait");
     assert!(status.success(), "bridge must exit cleanly: {status:?}");
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 //
@@ -465,17 +461,15 @@ fn spawn_bridge_subprocess(
 /// yet is buffered through the initial connect window — never answered with
 /// `-32001` — and gets the real server response once the listener is rebound
 /// inside the window.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bridge_subprocess_buffers_initialize_during_startup_race() {
     // Reserve an address, then DROP the listener so nothing is accepting.
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     drop(listener);
 
-    let data_dir =
-        std::env::temp_dir().join(format!("itd-e2e-bridge-race-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
-    let (mut child, mut stdin, mut stdout) = spawn_bridge_subprocess(&addr, &data_dir);
+    let data_dir = common::test_tempdir("itd-e2e-bridge-race-");
+    let (mut child, mut stdin, mut stdout) = spawn_bridge_subprocess(&addr, data_dir.path());
 
     // Immediately write the MCP handshake — the bridge is now inside its
     // initial connect window with nothing listening.
@@ -547,23 +541,19 @@ async fn bridge_subprocess_buffers_initialize_during_startup_race() {
         .expect("bridge did not exit on stdin EOF")
         .expect("wait");
     assert!(status.success(), "bridge must exit cleanly: {status:?}");
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Scenario 3 exhaustion (monorepo#908): against a never-rebound address the
 /// bridge exits NON-ZERO once the initial window is exhausted (~5.5s default)
 /// and writes no `-32001` response for the buffered `initialize`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bridge_subprocess_initial_window_exhaustion_exits_nonzero_without_errors() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     drop(listener);
 
-    let data_dir =
-        std::env::temp_dir().join(format!("itd-e2e-bridge-exhaust-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
-    let (mut child, mut stdin, mut stdout) = spawn_bridge_subprocess(&addr, &data_dir);
+    let data_dir = common::test_tempdir("itd-e2e-bridge-exhaust-");
+    let (mut child, mut stdin, mut stdout) = spawn_bridge_subprocess(&addr, data_dir.path());
 
     write_json_line(
         &mut stdin,
@@ -595,6 +585,4 @@ async fn bridge_subprocess_initial_window_exhaustion_exits_nonzero_without_error
         !out.contains("-32001"),
         "no -32001 may be written for buffered requests on exhaustion: {out}"
     );
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

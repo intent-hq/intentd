@@ -10,7 +10,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +25,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -44,15 +43,11 @@ impl Drop for Daemon {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-rtk-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-rtk-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -62,9 +57,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -241,15 +235,12 @@ fn gate(name: &str) -> Option<String> {
 #[tokio::test]
 async fn rtk_settings_integration() {
     //Test that rtk.enabled setting round-trips correctly over WSS
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     let mut _daemon = Daemon {
-        child: spawn_serve(
-            &data_dir,
-            "both",
-            &[("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")],
-        ),
+        child: spawn_serve(&data_dir, "both", &[("INTENTD_AUTH_TOKEN", TOKEN)]),
         data_dir: data_dir.clone(),
     };
 
@@ -340,7 +331,8 @@ async fn rtk_prompt_injection_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Fake rtk shim (outputs `ls, cat, grep, test, help`; test + help excluded)
@@ -373,7 +365,6 @@ async fn rtk_prompt_injection_over_wss() {
             "both",
             &[
                 ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("INTENTD_TCP_PORT", "0"),
                 ("MOCK_AGENT_SCRIPT_PATH", &script),
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
                 ("PATH", &augmented_path),

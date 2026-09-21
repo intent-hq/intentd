@@ -15,8 +15,8 @@ when targeting `http://daemon.localhost:8000`:
   ]
 }
 // A matching result may show the rewritten finalUrl instead of the requested alias.
-// Each tab carries its owner, sizing, and visibility info:
-// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ownerAgentId: "<your-agent-id>", mode: "emulated", width: 1280, height: 800, visibility: "visible", ... }
+// Each tab carries its owner, sizing, visibility, and display info:
+// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ownerAgentId: "<your-agent-id>", mode: "emulated", width: 1280, height: 800, visibility: "visible", displayed: true, ... }
 
 {
   "actions": [
@@ -45,7 +45,7 @@ Tabs are agent-owned: you can only manipulate tabs you own. To work in an unowne
   ]
 }
 // → tabs with ownerAgentId: null and native sizing:
-// { tabId: "tab-user1", url: "http://localhost:5173/", ownerAgentId: null, mode: "native", visibility: "visible", ... }
+// { tabId: "tab-user1", url: "http://localhost:5173/", ownerAgentId: null, mode: "native", visibility: "visible", displayed: true, ... }
 
 // Claim it — atomic, first-claim-wins; ownership transfer and viewport emulation
 // at the given size happen in one step
@@ -107,8 +107,8 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
     { "action": "screenshot", "tabId": "tab-bg1" }
   ]
 }
-// listTabs shows the tab with visibility: "hidden":
-// { tabId: "tab-bg1", url: "http://localhost:5173/", ownerAgentId: "<your-agent-id>", visibility: "hidden", ... }
+// listTabs shows the tab with visibility: "hidden" (hidden tabs are never displayed):
+// { tabId: "tab-bg1", url: "http://localhost:5173/", ownerAgentId: "<your-agent-id>", visibility: "hidden", displayed: false, ... }
 
 // Reveal it when the user should see it — activated in a visible panel without stealing focus
 {
@@ -124,17 +124,62 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
   ]
 }
 
-// Or open directly into the UI in the first place
+// Or open directly into the UI in the first place: the tab is activated in its
+// panel without stealing focus (on any position), and the result says whether it
+// ended up as its panel's active tab (`displayed`).
 {
   "actions": [
     { "action": "openTab", "url": "http://localhost:5173", "visible": true }
   ]
 }
+// → { tabId: "tab-ui1", url: "http://localhost:5173/", displayed: true, ... }
+// `displayed` is optional on openTab results: when the layout state could not be
+// confirmed (stale tab list, tab not listed) the field is omitted — absent means
+// unknown, not false. Re-check with listTabs, which carries the host's current
+// report when the daemon holds one (also absent = unknown, never false):
+// → { tabId: "tab-ui1", url: "http://localhost:5173/", ... }   (no displayed)
 ```
 
+## Visible but Not Displayed
+
+`visibility: "visible"` means the tab is in the user's panel layout; it does not mean
+the tab can paint. Only a panel's active tab renders, so a visible tab that the user
+(or another open) pushed behind a sibling is `displayed: false`. A capture op mounts
+such a tab on demand, but if its surface still does not paint (the capture times out
+at its own cap, or returns an empty image) the op fails with
+`errorCode: "not-painting"`. Check `displayed` and bring the tab to the front
+with `showTab` (no focus change) before capturing. `displayed` is a saved-layout fact
+(visible AND active in its panel), not a paint guarantee: a `displayed: true` tab
+whose panel is hidden by zoom can fail with `not-painting` too, and the field is
+absent (unknown, not `false`) whenever the daemon holds no current host report for
+it.
+
+```json
+{
+  "actions": [
+    { "action": "listTabs", "scope": "mine" }
+  ]
+}
+// → { tabId: "tab-ui1", url: "http://localhost:5173/", visibility: "visible", displayed: false, ... }
+
+{
+  "actions": [
+    { "action": "showTab", "tabId": "tab-ui1" },
+    { "action": "screenshot", "tabId": "tab-ui1" }
+  ]
+}
+```
+
+A `visible: true` open that dedupes onto an existing tab reports that tab's real
+state too: `{ reused: true, displayed: false, ... }` means the reuse handed you a
+hidden or inactive tab — `showTab` it, since a dedupe hit never changes visibility.
+As on a fresh open, `displayed` is omitted from the reuse result when the layout
+state is unknown; reuses without `visible: true` never carry it.
+
 `showTab` is owner-only (`not-owner` on a tab you do not own) and idempotent on an
-already-visible tab (`focus: true` still activates it); an unknown `tabId` fails as an
-action-result error. `focusTab` keeps its visible-tab semantics and fails on a hidden
+already-displayed tab (`focus: true` still focuses its panel); a visible-but-inactive
+tab is activated in place, not skipped. An unknown `tabId` fails as an action-result
+error. `focusTab` keeps its visible-tab semantics and fails on a hidden
 tab with an error pointing at `showTab`. Note that re-issuing
 `openTab { url, visible: true }` on a URL you already have hidden does NOT reveal it:
 a dedupe hit never changes the reused tab's visibility — use `showTab`.
@@ -143,7 +188,14 @@ All of this works even when the workspace is not currently visible in the app: t
 operations succeed and apply their effects to the persisted layout state, and
 `showTab { focus: true }` / `focusTab` / `openTab { visible: true }` skip the actual
 UI focus attempt, carrying a workspace-not-visible `warning` string in the action
-result.
+result. A capture op (`screenshot`, `getAccessibilityTree`, `evaluate`) on an unmounted
+tab of a not-in-view workspace mounts the tab on demand under the request deadline and
+succeeds with the same `warning`; when the mount, settle, or paint cannot happen it
+fails with a structured `errorCode` (`workspace-not-visible`, `deadline-exhausted`,
+`still-loading`, `navigated-away`, `not-painting`). `navigate` mounts on demand too but
+without the deadline, settle, or origin check, so of these mount/capture codes it can
+only yield `workspace-not-visible` (ownership and uncoded failures still apply) — see
+the overview topic.
 
 ## Opening Local HTML Files
 
@@ -224,6 +276,13 @@ listener, so there `openTunnel` fails with an explanatory error.)
 }
 // → { remotePort: 8000, closed: true }
 ```
+
+To recover a link for ordinary Chrome after an app or tunnel restart, do not reuse a
+remembered client port. Use `listTabs` to find the preview by its stable `requestedUrl`
+(for example `http://daemon.localhost:8000`), then call `openTunnel` with that URL's
+daemon-side port. Open `http://127.0.0.1:<localPort>` using the port returned by the
+current call. Because `openTunnel` is idempotent, this safely returns an existing live
+forward or creates its replacement.
 
 Lifecycle: forwards are persistent — a forward keeps its `localPort` for the Electron
 app's lifetime and survives transient daemon-connection drops (it lazily reconnects on

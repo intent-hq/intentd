@@ -5,13 +5,31 @@
 //! [`intent_transport::router::RPC_DISPATCH_SPAN_TARGET`]) and counts the
 //! `sqlx::query` statement events sqlx emits — one per executed statement,
 //! propagated into the span's scope by sqlx-sqlite's worker-thread span
-//! forwarding. When the span closes, the layer emits:
+//! forwarding. The one exclusion is the pool's connection-setup PRAGMA
+//! batch ([`CONNECT_PRAGMA_SUMMARY_PREFIX`] + [`CONNECT_PRAGMA_BATCH_MARKER`]):
+//! a lazy connect runs inside the acquiring dispatch's span, so under load it
+//! would otherwise be charged to whichever handler happened to trigger it.
+//! PRAGMAs a handler issues itself still count. When the span closes, the
+//! layer emits:
 //!
 //! - one WARN when the statement count exceeds the statement threshold
 //!   (default [`DEFAULT_STATEMENT_WARN_THRESHOLD`]; N+1 / hydrate-then-discard
 //!   regressions), and
 //! - one WARN when the wall-clock duration exceeds the duration threshold
-//!   for the method's tier.
+//!   for the method's tier, and
+//! - one WARN when the intended serialized response exceeds the fixed
+//!   [`RESPONSE_SIZE_WARN_THRESHOLD_BYTES`] soft limit.
+//!
+//! Every WARN includes additive response-encoding fields recorded on the same
+//! dispatch span: `response_bytes`, `encode_elapsed_ms`,
+//! `oversized_replacement`, and `encode_failed`. Notifications record zero
+//! bytes/time and false states. A hard-cap replacement records the rejected
+//! envelope's size, not the replacement frame's size. When the handler
+//! recorded a request variant on the span
+//! ([`RPC_REQUEST_SHAPE_FIELD`] — `agent.list` records `default` /
+//! `includeRetired` / `retiredOnly` / `scope=<bin>`, intent-hq/intent#5531)
+//! every WARN additionally carries it as `request_shape`; the field is
+//! omitted for dispatches that recorded none.
 //!
 //! Duration budgets are tiered: methods that fan out to a network-bound
 //! upstream ([`is_network_tier_method`] — `github.*`, `linear.*`, `sentry.*`,
@@ -28,8 +46,9 @@
 //! statement count doesn't drown out the N+1 signal, a compound op whose
 //! legitimate ceiling exceeds even that tier carries its own budget
 //! ([`PER_METHOD_STATEMENT_BUDGETS`] — `agent.sendMessage`,
-//! `agent.sendToTask`), and every other method keeps the default budget
-//! ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
+//! `agent.sendToTask`, `agent.sendQueuedMessageNow`,
+//! `agent.resolveProposal`), and every other method keeps the default
+//! budget ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
 //!
 //! All tier thresholds are overridable via [`STATEMENT_THRESHOLD_ENV`],
 //! [`COMPOUND_STATEMENT_THRESHOLD_ENV`], [`DURATION_THRESHOLD_ENV`], and
@@ -41,13 +60,15 @@
 use std::time::{Duration, Instant};
 
 use tracing::field::{Field, Visit};
-use tracing::span::{Attributes, Id};
+use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
-use intent_transport::router::{RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET};
+use intent_transport::router::{
+    RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET, RPC_REQUEST_SHAPE_FIELD,
+};
 
 /// Default statement-count threshold: a dispatch executing more than this
 /// many SQL statements draws a WARN.
@@ -58,7 +79,8 @@ pub const DEFAULT_STATEMENT_WARN_THRESHOLD: u64 = 25;
 /// [`DEFAULT_STATEMENT_WARN_THRESHOLD`] so a legitimately compound
 /// multi-entity op doesn't trip the guardrail. Sized off observed dispatch
 /// counts — `workspace.create` deterministically runs ~40 statements and
-/// `workspace.delete` scales with workspace contents (26–72 observed,
+/// `workspace.delete` ~10 regardless of workspace contents (its per-agent
+/// sweep was batched in intent-hq/monorepo#4130; 26–72 observed before that,
 /// intent-hq/monorepo#3074) — while staying an order of magnitude below the
 /// hundreds a real N+1 regression produces.
 pub const DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD: u64 = 100;
@@ -70,6 +92,10 @@ pub const DEFAULT_DURATION_WARN_MS: u64 = 1000;
 /// WARN. Higher than [`DEFAULT_DURATION_WARN_MS`] so normal upstream latency
 /// doesn't trip the guardrail.
 pub const DEFAULT_NETWORK_DURATION_WARN_MS: u64 = 10_000;
+/// Fixed soft response-size threshold. This is deliberately far below the
+/// transport's 40 MiB hard cap so unexpectedly large hot-path responses are
+/// visible before they approach frame rejection.
+pub const RESPONSE_SIZE_WARN_THRESHOLD_BYTES: u64 = 1024 * 1024;
 /// Env override for the statement-count threshold (u64).
 pub const STATEMENT_THRESHOLD_ENV: &str = "INTENTD_RPC_STATEMENT_WARN_THRESHOLD";
 /// Env override for the compound-op-tier statement-count threshold (u64).
@@ -154,9 +180,19 @@ fn is_compound_statement_method(method: &str) -> bool {
 /// routes through the same delivery path (`agent_send_to_task_op` mirrors
 /// `agent.sendMessage`'s `manager.send_message` / `interrupt_send_message`
 /// routing, DELIV-1), so it carries the same content-scaled shape plus a
-/// task lookup and gets the same budget.
-const PER_METHOD_STATEMENT_BUDGETS: &[(&str, u64)] =
-    &[("agent.sendMessage", 250), ("agent.sendToTask", 250)];
+/// task lookup and gets the same budget. `agent.sendQueuedMessageNow`
+/// drains one queued entry through that same delivery path (queue shrink,
+/// user-row persist, turn start / interrupt) and `agent.resolveProposal`
+/// persists the resolution and then delivers the proposal-resolved notice
+/// through the shared wake/delivery machinery — 27–28 statements observed
+/// on both, deterministically over the flat budget
+/// (intent-hq/monorepo#5376) — so both ride the same tier.
+const PER_METHOD_STATEMENT_BUDGETS: &[(&str, u64)] = &[
+    ("agent.sendMessage", 250),
+    ("agent.sendToTask", 250),
+    ("agent.sendQueuedMessageNow", 250),
+    ("agent.resolveProposal", 250),
+];
 
 /// The per-method statement budget for `method`, if it has one (see
 /// [`PER_METHOD_STATEMENT_BUDGETS`]). Takes precedence over the tier
@@ -170,6 +206,26 @@ fn per_method_statement_budget(method: &str) -> Option<u64> {
 
 /// Target sqlx logs each executed statement under (`sqlx-core` `QueryLogger`).
 const SQLX_QUERY_TARGET: &str = "sqlx::query";
+/// Prefix of the `summary` field on the `sqlx::query` event sqlx-sqlite
+/// emits for a connection's establishment PRAGMA batch
+/// (`SqliteConnectOptions::connect` runs `pragma_string()` as one `execute`).
+/// The pool opens connections lazily inside the acquiring caller's future,
+/// so a dispatch that finds every idle connection held by concurrent work
+/// pays that batch inside its own span; it is pool setup, not handler work,
+/// and is excluded from the statement count (intent-hq/intent#5000).
+///
+/// The prefix alone is not enough — handlers run single PRAGMAs of their
+/// own (`PRAGMA defer_foreign_keys = ON`, `PRAGMA wal_checkpoint(PASSIVE)`,
+/// …) that are real work — so the exclusion also requires the event's
+/// `db.statement` (the full SQL, which sqlx only attaches when it is longer
+/// than the four-word summary) to contain [`CONNECT_PRAGMA_BATCH_MARKER`]:
+/// every intent-store pool sets `journal_mode` at connect time
+/// (`intent_store::connect_write` / `connect_read`), and no handler sets it
+/// at runtime.
+const CONNECT_PRAGMA_SUMMARY_PREFIX: &str = "PRAGMA ";
+/// Marker that identifies a PRAGMA batch as the pool's connect batch (see
+/// [`CONNECT_PRAGMA_SUMMARY_PREFIX`]).
+const CONNECT_PRAGMA_BATCH_MARKER: &str = "PRAGMA journal_mode = ";
 /// Target the layer's own WARN events are emitted under.
 const WARN_TARGET: &str = "intentd::rpc_profile";
 
@@ -184,7 +240,7 @@ pub fn profile_filter() -> Targets {
 
 /// Tracing layer that counts SQL statements and times each RPC dispatch,
 /// warning when either exceeds its budget. See the module docs.
-#[allow(clippy::struct_field_names)] // each field is a distinct named threshold; the suffix is the meaning
+#[expect(clippy::struct_field_names)] // each field is a distinct named threshold; the suffix is the meaning
 pub struct RpcProfileLayer {
     statement_threshold: u64,
     compound_statement_threshold: u64,
@@ -265,8 +321,18 @@ impl RpcProfileLayer {
 /// Span-extension state for one in-flight dispatch.
 struct DispatchProfile {
     method: String,
+    /// The request variant the handler recorded on the span
+    /// ([`RPC_REQUEST_SHAPE_FIELD`]; `agent.list` only today) — carried on
+    /// every WARN as `request_shape` so an oversize / slow dispatch is
+    /// attributable to a read shape (intent-hq/intent#5531). `None` when
+    /// the handler recorded nothing; the field is then omitted.
+    request_shape: Option<String>,
     statements: u64,
     started: Instant,
+    response_bytes: u64,
+    encode_elapsed_ms: u64,
+    oversized_replacement: bool,
+    encode_failed: bool,
 }
 
 /// Extracts the `method` field recorded on the dispatch span.
@@ -287,6 +353,65 @@ impl Visit for MethodVisitor<'_> {
     }
 }
 
+struct ResponseFieldsVisitor<'a>(&'a mut DispatchProfile);
+
+impl Visit for ResponseFieldsVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == RPC_REQUEST_SHAPE_FIELD {
+            self.0.request_shape = Some(value.to_string());
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "response_bytes" => self.0.response_bytes = value,
+            "encode_elapsed_ms" => self.0.encode_elapsed_ms = value,
+            _ => {}
+        }
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        match field.name() {
+            "oversized_replacement" => self.0.oversized_replacement = value,
+            "encode_failed" => self.0.encode_failed = value,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
+/// Detects the pool connection-setup PRAGMA batch on a `sqlx::query` event
+/// (see [`CONNECT_PRAGMA_SUMMARY_PREFIX`]): both the summary prefix and the
+/// batch marker in `db.statement` must match.
+#[derive(Default)]
+struct ConnectPragmaVisitor {
+    pragma_summary: bool,
+    batch_marker: bool,
+}
+
+impl ConnectPragmaVisitor {
+    fn is_connect_batch(&self) -> bool {
+        self.pragma_summary && self.batch_marker
+    }
+}
+
+impl Visit for ConnectPragmaVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "summary" if value.starts_with(CONNECT_PRAGMA_SUMMARY_PREFIX) => {
+                self.pragma_summary = true;
+            }
+            "db.statement" if value.contains(CONNECT_PRAGMA_BATCH_MARKER) => {
+                self.batch_marker = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
 impl<S> Layer<S> for RpcProfileLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -301,14 +426,35 @@ where
         if let Some(span) = ctx.span(id) {
             span.extensions_mut().insert(DispatchProfile {
                 method,
+                request_shape: None,
                 statements: 0,
                 started: Instant::now(),
+                response_bytes: 0,
+                encode_elapsed_ms: 0,
+                oversized_replacement: false,
+                encode_failed: false,
             });
         }
     }
 
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else { return };
+        let mut extensions = span.extensions_mut();
+        let Some(profile) = extensions.get_mut::<DispatchProfile>() else {
+            return;
+        };
+        values.record(&mut ResponseFieldsVisitor(profile));
+    }
+
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         if event.metadata().target() != SQLX_QUERY_TARGET {
+            return;
+        }
+        // A lazy pool connect's PRAGMA batch is pool setup charged to
+        // whichever dispatch happened to trigger it, not handler work.
+        let mut connect_pragma = ConnectPragmaVisitor::default();
+        event.record(&mut connect_pragma);
+        if connect_pragma.is_connect_batch() {
             return;
         }
         // Attribute the statement to the nearest enclosing dispatch span, if
@@ -333,13 +479,19 @@ where
         let elapsed_ms =
             u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         let statement_threshold = self.statement_threshold_for(&profile.method);
+        let request_shape = profile.request_shape.as_deref();
         if profile.statements > statement_threshold {
             tracing::warn!(
                 target: WARN_TARGET,
                 method = %profile.method,
+                request_shape,
                 statements = profile.statements,
                 threshold = statement_threshold,
                 elapsed_ms,
+                response_bytes = profile.response_bytes,
+                encode_elapsed_ms = profile.encode_elapsed_ms,
+                oversized_replacement = profile.oversized_replacement,
+                encode_failed = profile.encode_failed,
                 "rpc dispatch exceeded SQL statement budget"
             );
         }
@@ -348,10 +500,44 @@ where
             tracing::warn!(
                 target: WARN_TARGET,
                 method = %profile.method,
+                request_shape,
                 statements = profile.statements,
                 threshold_ms = u64::try_from(duration_threshold.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
                 elapsed_ms,
+                response_bytes = profile.response_bytes,
+                encode_elapsed_ms = profile.encode_elapsed_ms,
+                oversized_replacement = profile.oversized_replacement,
+                encode_failed = profile.encode_failed,
                 "rpc dispatch exceeded duration budget"
+            );
+        }
+        if profile.response_bytes > RESPONSE_SIZE_WARN_THRESHOLD_BYTES {
+            tracing::warn!(
+                target: WARN_TARGET,
+                method = %profile.method,
+                request_shape,
+                statements = profile.statements,
+                threshold_bytes = RESPONSE_SIZE_WARN_THRESHOLD_BYTES,
+                elapsed_ms,
+                response_bytes = profile.response_bytes,
+                encode_elapsed_ms = profile.encode_elapsed_ms,
+                oversized_replacement = profile.oversized_replacement,
+                encode_failed = profile.encode_failed,
+                "rpc response exceeded soft size budget"
+            );
+        }
+        if profile.encode_failed {
+            tracing::warn!(
+                target: WARN_TARGET,
+                method = %profile.method,
+                request_shape,
+                statements = profile.statements,
+                elapsed_ms,
+                response_bytes = profile.response_bytes,
+                encode_elapsed_ms = profile.encode_elapsed_ms,
+                oversized_replacement = profile.oversized_replacement,
+                encode_failed = true,
+                "rpc response envelope serialization failed"
             );
         }
     }
@@ -412,8 +598,16 @@ mod tests {
             .with(layer)
             .with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
-            let span =
-                tracing::info_span!(target: RPC_DISPATCH_SPAN_TARGET, "rpc_dispatch", method);
+            let span = tracing::info_span!(
+                target: RPC_DISPATCH_SPAN_TARGET,
+                "rpc_dispatch",
+                method,
+                request_shape = tracing::field::Empty,
+                response_bytes = tracing::field::Empty,
+                encode_elapsed_ms = tracing::field::Empty,
+                oversized_replacement = tracing::field::Empty,
+                encode_failed = tracing::field::Empty,
+            );
             span.in_scope(f);
             drop(span);
         });
@@ -422,6 +616,42 @@ mod tests {
 
     fn sqlx_event() {
         tracing::event!(target: "sqlx::query", tracing::Level::DEBUG, summary = "SELECT …");
+    }
+
+    /// The `sqlx::query` event sqlx-sqlite emits for the pool's
+    /// connection-establishment PRAGMA batch (`SqliteConnectOptions::connect`
+    /// runs `pragma_string()` as one `execute`), shaped like the read pool's
+    /// real batch.
+    fn sqlx_connect_pragma_event() {
+        tracing::event!(
+            target: "sqlx::query",
+            tracing::Level::DEBUG,
+            summary = "PRAGMA journal_mode = WAL; …",
+            db.statement = "\n\nPRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; \n",
+        );
+    }
+
+    /// The write pool's connect batch (`intent_store::connect_write` also
+    /// sets `auto_vacuum`, which sqlx orders first, so the summary differs).
+    fn sqlx_write_pool_connect_pragma_event() {
+        tracing::event!(
+            target: "sqlx::query",
+            tracing::Level::DEBUG,
+            summary = "PRAGMA auto_vacuum = INCREMENTAL; …",
+            db.statement = "\n\nPRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; \n",
+        );
+    }
+
+    /// A handler-issued single PRAGMA (`note_repo::adopt_stray_spec_note`
+    /// runs `PRAGMA defer_foreign_keys = ON`): the summary is the whole
+    /// statement, so sqlx attaches an empty `db.statement`.
+    fn sqlx_handler_pragma_event() {
+        tracing::event!(
+            target: "sqlx::query",
+            tracing::Level::DEBUG,
+            summary = "PRAGMA defer_foreign_keys = ON",
+            db.statement = "",
+        );
     }
 
     #[test]
@@ -436,6 +666,203 @@ mod tests {
         assert_eq!(warns.len(), 1, "warns: {warns:?}");
         assert!(warns[0].contains("method=workspace.list"), "{warns:?}");
         assert!(warns[0].contains("statements=3"), "{warns:?}");
+    }
+
+    /// Regression test for intent-hq/intent#5000: a lazy pool connect inside
+    /// a dispatch (every idle connection held by concurrent work) runs the
+    /// connection-setup PRAGMA batch in the acquiring dispatch's span, and
+    /// the layer used to charge it as a handler statement — the
+    /// load-dependent 11th statement on `workspace.get`. Pool setup is not
+    /// handler work, so it must not count against the budget.
+    #[test]
+    fn pool_connect_pragma_batch_is_not_charged_to_the_dispatch() {
+        let layer =
+            RpcProfileLayer::new(3, 3, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "workspace.get", || {
+            sqlx_event();
+            sqlx_event();
+            sqlx_connect_pragma_event();
+            sqlx_event();
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    /// Control for the exclusion above: only the PRAGMA batch is skipped;
+    /// the handler's own statements still count.
+    #[test]
+    fn pool_connect_pragma_batch_does_not_hide_a_real_overrun() {
+        let layer =
+            RpcProfileLayer::new(3, 3, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "workspace.get", || {
+            sqlx_connect_pragma_event();
+            sqlx_event();
+            sqlx_event();
+            sqlx_event();
+            sqlx_event();
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("statements=4"), "{warns:?}");
+    }
+
+    /// The write pool's connect batch is excluded too (its summary starts
+    /// with `auto_vacuum`, but the batch still carries the marker).
+    #[test]
+    fn write_pool_connect_pragma_batch_is_not_charged_to_the_dispatch() {
+        let layer =
+            RpcProfileLayer::new(3, 3, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "note.create", || {
+            sqlx_write_pool_connect_pragma_event();
+            sqlx_event();
+            sqlx_event();
+            sqlx_event();
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    /// Only the connect batch is excluded: a PRAGMA a handler issues itself
+    /// is real work and still counts.
+    #[test]
+    fn handler_pragma_is_still_charged_to_the_dispatch() {
+        let layer =
+            RpcProfileLayer::new(3, 3, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "note.create", || {
+            sqlx_event();
+            sqlx_event();
+            sqlx_event();
+            sqlx_handler_pragma_event();
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("statements=4"), "{warns:?}");
+    }
+
+    #[test]
+    fn late_response_fields_are_added_to_the_same_dispatch_warn() {
+        let layer =
+            RpcProfileLayer::new(0, 0, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "workspace.list", || {
+            sqlx_event();
+            let span = tracing::Span::current();
+            span.record("response_bytes", 321_u64);
+            span.record("encode_elapsed_ms", 7_u64);
+            span.record("oversized_replacement", true);
+            span.record("encode_failed", false);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("response_bytes=321"), "{warns:?}");
+        assert!(warns[0].contains("encode_elapsed_ms=7"), "{warns:?}");
+        assert!(warns[0].contains("oversized_replacement=true"), "{warns:?}");
+        assert!(warns[0].contains("encode_failed=false"), "{warns:?}");
+    }
+
+    #[test]
+    fn response_size_soft_limit_warns_without_timing_sleeps() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "note.list", || {
+            let span = tracing::Span::current();
+            span.record("response_bytes", RESPONSE_SIZE_WARN_THRESHOLD_BYTES + 1);
+            span.record("encode_elapsed_ms", 3_u64);
+            span.record("oversized_replacement", false);
+            span.record("encode_failed", false);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(
+            warns[0].contains("rpc response exceeded soft size budget"),
+            "{warns:?}"
+        );
+        assert!(
+            warns[0].contains(&format!(
+                "threshold_bytes={RESPONSE_SIZE_WARN_THRESHOLD_BYTES}"
+            )),
+            "{warns:?}"
+        );
+    }
+
+    /// intent-hq/intent#5531: a handler-recorded request variant rides the
+    /// oversize WARN as `request_shape` (so the log says WHICH `agent.list`
+    /// read overflowed); a dispatch that recorded none omits the field
+    /// rather than printing an empty value.
+    #[test]
+    fn request_shape_rides_the_oversize_warn_when_recorded() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "agent.list", || {
+            let span = tracing::Span::current();
+            span.record(RPC_REQUEST_SHAPE_FIELD, "scope=delegated");
+            span.record("response_bytes", RESPONSE_SIZE_WARN_THRESHOLD_BYTES + 1);
+            span.record("encode_elapsed_ms", 3_u64);
+            span.record("oversized_replacement", false);
+            span.record("encode_failed", false);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("method=agent.list"), "{warns:?}");
+        assert!(
+            warns[0].contains("request_shape=scope=delegated"),
+            "{warns:?}"
+        );
+
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "note.list", || {
+            let span = tracing::Span::current();
+            span.record("response_bytes", RESPONSE_SIZE_WARN_THRESHOLD_BYTES + 1);
+            span.record("encode_elapsed_ms", 3_u64);
+            span.record("oversized_replacement", false);
+            span.record("encode_failed", false);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(!warns[0].contains("request_shape"), "{warns:?}");
+    }
+
+    #[test]
+    fn serialization_failure_warns_with_fallback_size_metrics() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "workspace.get", || {
+            let span = tracing::Span::current();
+            span.record("response_bytes", 77_u64);
+            span.record("encode_elapsed_ms", 1_u64);
+            span.record("oversized_replacement", false);
+            span.record("encode_failed", true);
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(
+            warns[0].contains("rpc response envelope serialization failed"),
+            "{warns:?}"
+        );
+        assert!(warns[0].contains("response_bytes=77"), "{warns:?}");
+        assert!(warns[0].contains("encode_failed=true"), "{warns:?}");
+    }
+
+    #[test]
+    fn notification_metrics_are_zero_on_dispatch_warn() {
+        let layer =
+            RpcProfileLayer::new(0, 0, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "workspace.list", sqlx_event);
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("response_bytes=0"), "{warns:?}");
+        assert!(warns[0].contains("encode_elapsed_ms=0"), "{warns:?}");
+        assert!(
+            warns[0].contains("oversized_replacement=false"),
+            "{warns:?}"
+        );
+        assert!(warns[0].contains("encode_failed=false"), "{warns:?}");
     }
 
     #[test]
@@ -700,6 +1127,14 @@ mod tests {
             per_method_statement_budget("agent.sendToTask").unwrap()
         );
         assert_eq!(
+            layer.statement_threshold_for("agent.sendQueuedMessageNow"),
+            per_method_statement_budget("agent.sendQueuedMessageNow").unwrap()
+        );
+        assert_eq!(
+            layer.statement_threshold_for("agent.resolveProposal"),
+            per_method_statement_budget("agent.resolveProposal").unwrap()
+        );
+        assert_eq!(
             layer.statement_threshold_for("workspace.list"),
             DEFAULT_STATEMENT_WARN_THRESHOLD
         );
@@ -709,7 +1144,16 @@ mod tests {
     fn per_method_budget_matches_exact_members_only() {
         assert_eq!(per_method_statement_budget("agent.sendMessage"), Some(250));
         assert_eq!(per_method_statement_budget("agent.sendToTask"), Some(250));
+        assert_eq!(
+            per_method_statement_budget("agent.sendQueuedMessageNow"),
+            Some(250)
+        );
+        assert_eq!(
+            per_method_statement_budget("agent.resolveProposal"),
+            Some(250)
+        );
         assert_eq!(per_method_statement_budget("agent.list"), None);
+        assert_eq!(per_method_statement_budget("agent.dismissQuestions"), None);
         assert_eq!(per_method_statement_budget("workspace.create"), None);
     }
 
@@ -753,6 +1197,88 @@ mod tests {
             }
         });
         assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn send_queued_message_now_at_observed_ceiling_emits_no_warn_under_defaults() {
+        // `agent.sendQueuedMessageNow` drains a queued entry through the
+        // same delivery path as `agent.sendMessage` (queue shrink + user-row
+        // persist + turn start), so the same content-scaled ceiling
+        // (intent-hq/monorepo#3492) must fit its budget; 28 observed
+        // (intent-hq/monorepo#5376) tripped the flat budget.
+        let layer = RpcProfileLayer::from_env_with(|_| None);
+        let warns = run_dispatch(layer, "agent.sendQueuedMessageNow", || {
+            for _ in 0..150 {
+                sqlx_event();
+            }
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn resolve_proposal_at_observed_ceiling_emits_no_warn_under_defaults() {
+        // `agent.resolveProposal` persists the resolution and then delivers
+        // the proposal-resolved notice through the same wake/delivery path,
+        // so the same content-scaled ceiling (intent-hq/monorepo#3492) must
+        // fit its budget; 27 observed (intent-hq/monorepo#5376) tripped the
+        // flat budget.
+        let layer = RpcProfileLayer::from_env_with(|_| None);
+        let warns = run_dispatch(layer, "agent.resolveProposal", || {
+            for _ in 0..150 {
+                sqlx_event();
+            }
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn send_queued_message_now_over_per_method_budget_still_warns() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let budget = per_method_statement_budget("agent.sendQueuedMessageNow").unwrap();
+        let warns = run_dispatch(layer, "agent.sendQueuedMessageNow", || {
+            for _ in 0..=budget {
+                sqlx_event();
+            }
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(
+            warns[0].contains("method=agent.sendQueuedMessageNow"),
+            "{warns:?}"
+        );
+        assert!(
+            warns[0].contains(&format!("threshold={budget}")),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_proposal_over_per_method_budget_still_warns() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let budget = per_method_statement_budget("agent.resolveProposal").unwrap();
+        let warns = run_dispatch(layer, "agent.resolveProposal", || {
+            for _ in 0..=budget {
+                sqlx_event();
+            }
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(
+            warns[0].contains("method=agent.resolveProposal"),
+            "{warns:?}"
+        );
+        assert!(
+            warns[0].contains(&format!("threshold={budget}")),
+            "{warns:?}"
+        );
     }
 
     #[test]

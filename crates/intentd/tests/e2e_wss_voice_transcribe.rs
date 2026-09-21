@@ -43,13 +43,6 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
 struct MemTokenStore(Mutex<Option<String>>);
@@ -191,16 +184,26 @@ struct Fixture {
     engine: Arc<RecordingEngine>,
     store: Store,
     workspaces_root: PathBuf,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry `engine`.
+///
+/// The owning `TempDir` is the first tuple element so that destructuring
+/// callers (whose locals drop in reverse binding order) drop it after the
+/// `WsApiServer`, not before.
 async fn boot_with_engine(
     engine: Arc<dyn VoiceEngine>,
-) -> (WsApiServer, u16, Arc<ClientConfig>, Store, PathBuf, TempDir) {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-voice-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+) -> (
+    tempfile::TempDir,
+    WsApiServer,
+    u16,
+    Arc<ClientConfig>,
+    Store,
+    PathBuf,
+) {
+    let dir_guard = common::test_tempdir("intentd-voice-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -225,14 +228,14 @@ async fn boot_with_engine(
     let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
-    (ws_srv, port, cfg, store, workspaces_root, TempDir(dir))
+    (dir_guard, ws_srv, port, cfg, store, workspaces_root)
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the recording
 /// stub engine.
 async fn boot() -> Fixture {
     let engine = Arc::new(RecordingEngine::default());
-    let (ws_srv, port, cfg, store, workspaces_root, dir) = boot_with_engine(engine.clone()).await;
+    let (dir, ws_srv, port, cfg, store, workspaces_root) = boot_with_engine(engine.clone()).await;
     Fixture {
         _ws: ws_srv,
         port,
@@ -293,9 +296,12 @@ async fn seed_vocab_workspace(fx: &Fixture, readme: &str) -> WorkspaceId {
         waiting: false,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     fx.store.insert_workspace(&ws).await.expect("seed ws");
     id
@@ -342,7 +348,7 @@ fn b64(bytes: &[u8]) -> String {
 /// `voice.transcribe`: the wire request reaches the engine with the decoded
 /// audio and merged context, and the response carries the documented
 /// `{ text, provider, durationMs }` result.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn transcribe_round_trips_over_wss() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -392,7 +398,7 @@ async fn transcribe_round_trips_over_wss() {
 /// `context.keyterms` carrying ElevenLabs-rejected characters reach the
 /// engine sanitized on the `keyterms` field only — the composed `OpenAI`
 /// `prompt` keeps the unsanitized spellings (PROTOCOL §5.41).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn keyterms_sanitized_for_elevenlabs_prompt_keeps_unsanitized_spellings() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -433,7 +439,7 @@ async fn keyterms_sanitized_for_elevenlabs_prompt_keeps_unsanitized_spellings() 
 
 /// Missing / empty / invalid-base64 `audio` rejects with `-32602`, and the
 /// engine is never called.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn invalid_audio_rejects_with_invalid_params() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -469,7 +475,7 @@ async fn invalid_audio_rejects_with_invalid_params() {
 /// `voice.language` setting > none (provider auto-detection). Drives
 /// `settings.update` over the same WSS connection to set the fallback and
 /// asserts what actually lands on the engine at each step.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn language_falls_back_to_voice_language_setting() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -533,7 +539,7 @@ async fn language_falls_back_to_voice_language_setting() {
 /// The injected engine is used regardless of the `provider` override (the
 /// injected handle wins, mirroring the linear/sentry test wiring), and the
 /// response `provider` reflects the engine that ran.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn provider_override_still_uses_injected_engine() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -554,9 +560,9 @@ async fn provider_override_still_uses_injected_engine() {
 /// generic `"Internal error"` message plus machine-readable
 /// `error.data = { code: "voice-no-api-key", detail }`, the detail text
 /// unchanged from the pre-structured shape (PROTOCOL §5.41, monorepo#1448).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn missing_api_key_surfaces_structured_error_data() {
-    let (_srv, port, cfg, _store, _root, _dir) = boot_with_engine(Arc::new(NoKeyEngine)).await;
+    let (_dir, _srv, port, cfg, _store, _root) = boot_with_engine(Arc::new(NoKeyEngine)).await;
     let mut ws = connect(port, cfg).await;
 
     let resp = wss_rpc_raw(
@@ -581,7 +587,7 @@ async fn missing_api_key_surfaces_structured_error_data() {
 /// workspace's auto-derived vocabulary between the user vocabulary and the
 /// request keyterms (PROTOCOL §5.41, v4.6: user `voice.vocabulary` →
 /// workspace auto-terms → `context.keyterms`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn transcribe_with_workspace_id_injects_derived_vocabulary() {
     let fx = boot().await;
     let ws_id = seed_vocab_workspace(&fx, "# Repo\nZorblatt tooling and the Quuxify pass.").await;
@@ -628,7 +634,7 @@ async fn transcribe_with_workspace_id_injects_derived_vocabulary() {
 /// call behaves exactly like a no-`workspaceId` call — while a non-string
 /// value rejects with `-32602` / `error.data.code: "invalid-params"` before
 /// the engine is reached (PROTOCOL §5.41, v4.6).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn unknown_workspace_id_tolerated_non_string_rejects() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
@@ -674,7 +680,7 @@ async fn unknown_workspace_id_tolerated_non_string_rejects() {
 /// `voice.workspaceVocabulary.maxTerms` setting (0 disables), and an unknown
 /// `workspaceId` is the standard not-found error (`-32602` with
 /// `error.data.code: "not-found"`) (PROTOCOL §5.41, v4.6).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn get_workspace_vocabulary_serves_derived_terms_and_not_found() {
     let fx = boot().await;
     let ws_id = seed_vocab_workspace(&fx, "The Zorblatt pipeline needs a Quuxify pass.").await;

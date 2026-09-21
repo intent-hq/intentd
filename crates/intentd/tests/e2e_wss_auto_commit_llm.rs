@@ -34,45 +34,35 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
-    auggie_dir: Option<PathBuf>,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        if let Some(ref dir) = self.auggie_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-aclm-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-aclm-")
 }
 
 /// Create a fake auggie binary that emits the given JSON reply verbatim.
 /// `printf '%s'` keeps the reply byte-literal, so `\n` escapes inside JSON
 /// strings survive to the parser instead of becoming real newlines.
-fn fake_auggie(reply_json: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("intentd-e2e-auggie-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("auggie");
+/// Returns the owning tempdir alongside the binary path.
+fn fake_auggie(reply_json: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = common::test_tempdir("intentd-e2e-auggie-");
+    let bin = dir.path().join("auggie");
     let script = format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{reply_json}'\n");
     std::fs::write(&bin, script).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    bin
+    (dir, bin)
 }
 
 fn run_git(args: &[&str], cwd: &Path) -> String {
@@ -109,9 +99,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -343,20 +332,23 @@ async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) ->
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("insert workspace");
     // Seed context.auggiePath via config.toml (TOML-backed setting) so the
-    // daemon's settings registry picks it up on boot. providers.active must
+    // daemon's settings registry picks it up on boot. model.defaultProvider must
     // be set too: unset provider settings resolve the completeOnce gate
     // CLOSED, which would skip LLM generation entirely.
     if let Some(bin) = auggie_bin {
         let toml = format!(
-            "[context]\nauggiePath = {:?}\n\n[providers]\nactive = \"auggie\"\n",
+            "[context]\nauggiePath = {:?}\n\n[model]\ndefaultProvider = \"auggie\"\n",
             bin.to_string_lossy()
         );
         std::fs::write(data_dir.join("config.toml"), toml).expect("write config.toml");
@@ -371,13 +363,13 @@ async fn auto_commit_uses_generated_message_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Subject + multi-line body reply: newlines inside the JSON string arrive
     // as `\n` escapes, per the commit-message.md contract.
-    let auggie_bin = fake_auggie(
+    let (_auggie_dir, auggie_bin) = fake_auggie(
         r#"{"subject": "feat: add new feature via LLM", "body": "Adds the feature via the LLM path.\n\n- covers body composition"}"#,
     );
-    let auggie_dir = auggie_bin.parent().unwrap().to_path_buf();
     let (ws_id, repo_dir) = seed_workspace_with_repo(&data_dir, Some(&auggie_bin)).await;
 
     // Mock agent behavior: write a file via the ACP fs/write_text_file client
@@ -396,19 +388,14 @@ async fn auto_commit_uses_generated_message_over_wss() {
         "response": "done",
     })
     .to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("RUST_LOG", "debug"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-        auggie_dir: Some(auggie_dir),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -573,7 +560,8 @@ async fn auto_commit_falls_back_when_auggie_missing() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, _repo_dir) = seed_workspace_with_repo(&data_dir, None).await;
 
     // Mock agent behavior: write a file via the ACP fs/write_text_file client
@@ -593,18 +581,13 @@ async fn auto_commit_falls_back_when_auggie_missing() {
     })
     .to_string();
     // NO INTENTD_AUGGIE_BIN set — auggie will not be found.
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-        auggie_dir: None,
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

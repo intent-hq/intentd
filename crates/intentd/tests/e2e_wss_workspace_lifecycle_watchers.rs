@@ -11,8 +11,8 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,15 +28,11 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-lifecycle-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-lifecycle-{prefix}-"))
 }
 
 /// Spawn `intentd serve` with a hermetic HOME so the user-tier specialists
@@ -46,13 +42,11 @@ fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("HOME", home_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
@@ -295,7 +289,8 @@ fn specialist_md(name: &str, body: &str) -> String {
 /// watch (a subsequent write stays silent).
 #[tokio::test]
 async fn workspace_created_after_serve_gains_watching_and_deletion_stops_it() {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let home_dir = data_dir.join("home");
     std::fs::create_dir_all(&home_dir).expect("mkdir hermetic home");
     // On-disk checkout whose project tier already exists at create time, so
@@ -306,7 +301,7 @@ async fn workspace_created_after_serve_gains_watching_and_deletion_stops_it() {
 
     // Single boot: the watcher registry starts with no workspaces.
     let child = spawn_serve(&data_dir, &home_dir);
-    let _guard = common::DaemonGuard::new(child, data_dir.clone(), true);
+    let _guard = common::DaemonGuard::process_only(child);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

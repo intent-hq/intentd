@@ -2,6 +2,8 @@
 //! `file.stat` against a real workspace root through the daemon over a temp
 //! UDS and assert the exact response shapes each method promises.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::Path;
@@ -64,11 +66,14 @@ fn seed_workspace(id: &WorkspaceId, worktree: &str) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -84,13 +89,12 @@ async fn send(socket: &Path, frame: &str) -> Value {
     serde_json::from_str(line.trim()).expect("valid json")
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_file_tree_returns_root_entries() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-files-{}", &short[..8]));
-    let data_dir = base.join("data");
+    let base = common::test_tempdir_in("/tmp", "intentd-files-");
+    let data_dir = base.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let repo = base.join("repo");
+    let repo = base.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     // Canonicalize so the within-workspace prefix check matches (macOS /tmp is a
     // symlink into /private/var).
@@ -120,7 +124,7 @@ async fn uds_file_tree_returns_root_entries() {
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -166,24 +170,22 @@ async fn uds_file_tree_returns_root_entries() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 async fn boot(
     repo_name: &str,
 ) -> (
-    std::path::PathBuf,
+    tempfile::TempDir,
     std::path::PathBuf,
     tokio::task::JoinHandle<()>,
     tokio::sync::oneshot::Sender<()>,
     Config,
     tempfile::TempDir,
 ) {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-{}-{}", repo_name, &short[..8]));
-    let data_dir = base.join("data");
+    let base = common::test_tempdir_in("/tmp", &format!("intentd-{repo_name}-"));
+    let data_dir = base.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let repo = base.join("repo");
+    let repo = base.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     let repo = std::fs::canonicalize(&repo).unwrap();
 
@@ -208,7 +210,7 @@ async fn boot(
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -224,9 +226,9 @@ async fn boot(
     (base, repo, server, tx, config, ws_root)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_file_exists_reports_type_and_absent() {
-    let (base, repo, server, tx, config, _ws_root) = boot("exists").await;
+    let (_base, repo, server, tx, config, _ws_root) = boot("exists").await;
     std::fs::write(repo.join("hello.txt"), "hi\n").unwrap();
     std::fs::create_dir_all(repo.join("subdir")).unwrap();
 
@@ -270,12 +272,11 @@ async fn uds_file_exists_reports_type_and_absent() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_file_stat_returns_legacy_shape() {
-    let (base, repo, server, tx, config, _ws_root) = boot("stat").await;
+    let (_base, repo, server, tx, config, _ws_root) = boot("stat").await;
     std::fs::write(repo.join("hello.txt"), "hello").unwrap();
 
     let resp = send(
@@ -312,5 +313,4 @@ async fn uds_file_stat_returns_legacy_shape() {
 
     let _ = tx.send(());
     let _ = server.await;
-    std::fs::remove_dir_all(&base).ok();
 }

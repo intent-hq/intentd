@@ -2,7 +2,9 @@
 //! scripts). Rows are written through by the hook scheduler and rehydrated at
 //! boot via [`Store::load_active_hooks`].
 
-use intent_core::{AgentId, Hook, HookId, HookState, Result, WorkspaceId};
+use intent_core::{
+    AgentId, Hook, HookId, HookListRow, HookState, HookSummary, Result, WorkspaceId,
+};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
@@ -11,6 +13,16 @@ use crate::Store;
 const COLUMNS: &str = "hook_id, workspace_id, agent_id, name, code, delay_ms, state, \
     created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, \
     expires_at, perpetual, dispatch_count, cron, run_at";
+
+/// `hook.list` projection: the heavy `code` / `last_logs` / `last_state`
+/// columns are read only for ACTIVE rows — `SQLite` evaluates the `CASE` per
+/// row, so a retired row's blobs are never hydrated (intent-hq/intent#5307).
+const LIST_COLUMNS: &str = "hook_id, workspace_id, agent_id, name, delay_ms, state, \
+    created_at, last_run_at, next_run_at, run_count, last_error, expires_at, perpetual, \
+    dispatch_count, cron, run_at, \
+    CASE WHEN state IN ('scheduled', 'running') THEN code END AS code, \
+    CASE WHEN state IN ('scheduled', 'running') THEN last_logs END AS last_logs, \
+    CASE WHEN state IN ('scheduled', 'running') THEN last_state END AS last_state";
 
 fn state_to_db(state: HookState) -> &'static str {
     match state {
@@ -75,6 +87,48 @@ fn hook_from_row(r: &SqliteRow) -> Result<Hook> {
         perpetual,
         dispatch_count: get_i64("dispatch_count")?,
     })
+}
+
+/// Map a `LIST_COLUMNS` row: active rows carry their `CASE`-selected blobs
+/// and decode as a full [`Hook`]; retired rows decode as a [`HookSummary`].
+fn hook_list_row_from_row(r: &SqliteRow) -> Result<HookListRow> {
+    let state: String = r
+        .try_get("state")
+        .map_err(|e| intent_core::Error::Internal(format!("read hook row failed: {e}")))?;
+    let state = state_from_db(&state)?;
+    if matches!(state, HookState::Scheduled | HookState::Running) {
+        return hook_from_row(r).map(HookListRow::Active);
+    }
+    let get = |col: &str| -> Result<String> {
+        r.try_get::<String, _>(col)
+            .map_err(|e| intent_core::Error::Internal(format!("read hook row failed: {e}")))
+    };
+    let get_opt = |col: &str| -> Result<Option<String>> {
+        r.try_get::<Option<String>, _>(col)
+            .map_err(|e| intent_core::Error::Internal(format!("read hook row failed: {e}")))
+    };
+    let get_i64 = |col: &str| -> Result<i64> {
+        r.try_get::<i64, _>(col)
+            .map_err(|e| intent_core::Error::Internal(format!("read hook row failed: {e}")))
+    };
+    Ok(HookListRow::Retired(HookSummary {
+        hook_id: HookId(get("hook_id")?),
+        workspace_id: WorkspaceId(get("workspace_id")?),
+        agent_id: AgentId(get("agent_id")?),
+        name: get("name")?,
+        delay_ms: get_i64("delay_ms")?,
+        cron: get_opt("cron")?,
+        run_at: get_opt("run_at")?,
+        state,
+        created_at: get("created_at")?,
+        last_run_at: get_opt("last_run_at")?,
+        next_run_at: get_opt("next_run_at")?,
+        run_count: get_i64("run_count")?,
+        last_error: get_opt("last_error")?,
+        expires_at: get_opt("expires_at")?,
+        perpetual: get_i64("perpetual")? != 0,
+        dispatch_count: get_i64("dispatch_count")?,
+    }))
 }
 
 impl Store {
@@ -152,6 +206,48 @@ impl Store {
         rows.iter().map(hook_from_row).collect()
     }
 
+    /// The `hook.list` read for a workspace (optionally one agent's rows),
+    /// oldest first, in ONE statement whose cost is O(rows returned): the
+    /// state filter is applied in SQL (`include_retired = false` selects
+    /// only `scheduled`/`running` rows), and the heavy `code` / `last_logs`
+    /// / `last_state` columns are hydrated only for active rows, so the
+    /// retired history a long-lived workspace accumulates is never read in
+    /// full (intent-hq/intent#5307).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_hook_rows(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: Option<&AgentId>,
+        include_retired: bool,
+    ) -> Result<Vec<HookListRow>> {
+        let agent_clause = if agent_id.is_some() {
+            " AND agent_id = ?"
+        } else {
+            ""
+        };
+        let state_clause = if include_retired {
+            ""
+        } else {
+            " AND state IN ('scheduled', 'running')"
+        };
+        let sql = format!(
+            "SELECT {LIST_COLUMNS} FROM hook WHERE workspace_id = ?{agent_clause}{state_clause} \
+             ORDER BY created_at"
+        );
+        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        if let Some(a) = agent_id {
+            query = query.bind(&a.0);
+        }
+        let rows = query
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("list hook rows failed: {e}")))?;
+        rows.iter().map(hook_list_row_from_row).collect()
+    }
+
     /// Number of ACTIVE (`scheduled`/`running`) hooks owned by an agent —
     /// a count-only aggregate for per-turn surfaces (the agent state
     /// snapshot): no `code`/`last_state` blob hydration and no dependence on
@@ -197,6 +293,37 @@ impl Store {
         })?
         .get::<i64, _>("n");
         Ok(n.cast_unsigned())
+    }
+
+    /// Requested workspaces that own at least one active hook, in one
+    /// aggregate statement. No hook bodies are hydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the aggregate query fails.
+    pub async fn workspaces_with_active_hooks(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<std::collections::HashSet<WorkspaceId>> {
+        if workspace_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let placeholders = vec!["?"; workspace_ids.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT workspace_id FROM hook WHERE workspace_id IN ({placeholders}) \
+             AND state IN ('scheduled', 'running')"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in workspace_ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            intent_core::Error::Internal(format!("batch active workspace hooks failed: {e}"))
+        })?;
+        Ok(rows
+            .iter()
+            .map(|row| WorkspaceId(row.get::<String, _>("workspace_id")))
+            .collect())
     }
 
     /// List all hooks owned by an agent, oldest first.
@@ -264,6 +391,11 @@ impl Store {
     /// Record a completed run: bump `run_count`, set `last_run_at`, and set
     /// (or clear) `next_run_at`; `NotFound` when the row is absent.
     ///
+    /// Idempotent per run: the `run_count` bump is keyed on `last_run_at`, so
+    /// repeating the call with the same `last_run_at` (a retry after a store
+    /// error reported on an already-committed write) does not count the run
+    /// twice.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
@@ -274,9 +406,12 @@ impl Store {
         next_run_at: Option<&str>,
     ) -> Result<()> {
         let res = sqlx::query(
-            "UPDATE hook SET run_count = run_count + 1, last_run_at = ?, next_run_at = ? \
+            "UPDATE hook SET \
+             run_count = CASE WHEN last_run_at IS ? THEN run_count ELSE run_count + 1 END, \
+             last_run_at = ?, next_run_at = ? \
              WHERE hook_id = ?",
         )
+        .bind(last_run_at)
         .bind(last_run_at)
         .bind(next_run_at)
         .bind(&hook_id.0)
@@ -292,20 +427,28 @@ impl Store {
         Ok(())
     }
 
-    /// Bump a hook's `dispatch_count`; `NotFound` when the row is absent.
+    /// Record a hook dispatch by raising `dispatch_count` to at least
+    /// `dispatch_count` (the caller's count including this fire); `NotFound`
+    /// when the row is absent.
+    ///
+    /// Idempotent: the write is a floor, not an increment, so repeating the
+    /// call for the same fire (a retry after a store error reported on an
+    /// already-committed write) leaves the count unchanged.
     ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
-    pub async fn increment_hook_dispatch_count(&self, hook_id: &HookId) -> Result<()> {
-        let res =
-            sqlx::query("UPDATE hook SET dispatch_count = dispatch_count + 1 WHERE hook_id = ?")
-                .bind(&hook_id.0)
-                .execute(self.write_pool())
-                .await
-                .map_err(|e| {
-                    intent_core::Error::Internal(format!("update hook dispatch count failed: {e}"))
-                })?;
+    pub async fn record_hook_dispatch(&self, hook_id: &HookId, dispatch_count: i64) -> Result<()> {
+        let res = sqlx::query(
+            "UPDATE hook SET dispatch_count = MAX(dispatch_count, ?) WHERE hook_id = ?",
+        )
+        .bind(dispatch_count)
+        .bind(&hook_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("update hook dispatch count failed: {e}"))
+        })?;
         if res.rows_affected() == 0 {
             return Err(intent_core::Error::NotFound(format!(
                 "hook {} not found",

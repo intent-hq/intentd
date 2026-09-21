@@ -13,7 +13,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,13 +46,6 @@ use common::TlsWs;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -146,10 +138,24 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 
 /// Stub forge: `get_pr` reports the linked PR (#42, head `feature`) as merged;
 /// when `open_pr_number` is set, `list_prs` offers that open PR on the same
-/// head ref.
+/// head ref, carrying `open_pr_mergeable_state` when set (default `clean`).
 #[derive(Default)]
 struct StubForge {
     open_pr_number: Option<u64>,
+    open_pr_mergeable_state: Option<&'static str>,
+}
+
+impl StubForge {
+    fn open_pr(&self, number: u64) -> PullRequest {
+        let mut pr = sample_pr();
+        pr.number = number;
+        pr.url = format!("https://github.com/o/r/pull/{number}");
+        pr.state = PrState::Open;
+        if let Some(state) = self.open_pr_mergeable_state {
+            pr.mergeable_state = Some(state.into());
+        }
+        pr
+    }
 }
 
 fn sample_pr() -> PullRequest {
@@ -222,23 +228,14 @@ impl SourceControl for StubForge {
         unimplemented!()
     }
     async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
-        let mut pr = sample_pr();
         if Some(number) == self.open_pr_number {
-            pr.number = number;
-            pr.url = format!("https://github.com/o/r/pull/{number}");
-            pr.state = PrState::Open;
+            return Ok(self.open_pr(number));
         }
-        Ok(pr)
+        Ok(sample_pr())
     }
     async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
         let items = match self.open_pr_number {
-            Some(n) => {
-                let mut pr = sample_pr();
-                pr.number = n;
-                pr.url = format!("https://github.com/o/r/pull/{n}");
-                pr.state = PrState::Open;
-                vec![pr]
-            }
+            Some(n) => vec![self.open_pr(n)],
             None => vec![],
         };
         Ok(Page {
@@ -340,7 +337,7 @@ struct Fixture {
     cfg: Arc<ClientConfig>,
     ws_id: WorkspaceId,
     store: Store,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener over a seeded workspace. When
@@ -349,9 +346,8 @@ struct Fixture {
 /// repo info at all (PR paths inert for the task-driven test). `pr_status`
 /// seeds only the persisted `prStatus` column (no rich PR objects).
 async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestStatus>) -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-display-status-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = common::test_tempdir("intentd-display-status-");
+    let dir = tmp.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -401,11 +397,14 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("seed workspace");
 
@@ -440,7 +439,7 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         cfg,
         ws_id,
         store,
-        _dir: TempDir(dir),
+        _dir: tmp,
     }
 }
 
@@ -532,7 +531,7 @@ async fn assert_no_display_status_event(ws: &mut TlsWs) {
 /// `task.updateNoteStatus` emits `workspace:displayStatus-changed` with the
 /// self-sufficient `{ workspaceId, displayStatus: "complete" }` payload, and a
 /// repeat no-op status write emits nothing.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_completion_transition_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
 
@@ -621,11 +620,12 @@ async fn task_completion_transition_over_wss() {
 /// `feature` discovers the stub forge's open PR (#300, mergeable) via
 /// `pr.refresh` — the linkage flips the derived rollup to `pr_ready` and emits
 /// `workspace:displayStatus-changed` alongside `pr:linked`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pr_linkage_transition_over_wss() {
     let fx = boot(
         StubForge {
             open_pr_number: Some(300),
+            open_pr_mergeable_state: None,
         },
         true,
         None,
@@ -697,11 +697,75 @@ async fn pr_linkage_transition_over_wss() {
     assert_no_display_status_event(&mut sub).await;
 }
 
+/// Merge-queue rung over the wire: the discovered open PR reports
+/// `mergeable_state: "queued"` (GitHub's merge-queue state), so the linkage
+/// flips the rollup to `pr_queued` — not `pr_ready` — on the
+/// `workspace:displayStatus-changed` event and the `workspace.get` read path.
+#[intent_test_macros::daemon_test]
+async fn pr_in_merge_queue_is_pr_queued_over_wss() {
+    let fx = boot(
+        StubForge {
+            open_pr_number: Some(300),
+            open_pr_mergeable_state: Some("queued"),
+        },
+        true,
+        None,
+    )
+    .await;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "idle");
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let refreshed = wss_rpc(
+        &mut rpc,
+        2,
+        "pr.refresh",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(refreshed["outcome"], "linked", "refresh: {refreshed}");
+
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "pr_queued" })
+    );
+
+    let after = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(after["workspace"]["displayStatus"], "pr_queued");
+}
+
 /// Persisted-column-only derivation over the wire: a workspace whose
 /// `prStatus` column is `Open` but which carries no rich PR objects
 /// (`activePullRequest` / `pullRequests` unset) reports
 /// `displayStatus: "pr_open"` on both `workspace.get` and `workspace.list`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn persisted_pr_status_only_is_pr_open_over_wss() {
     let fx = boot(StubForge::default(), false, Some(PullRequestStatus::Open)).await;
 
@@ -777,6 +841,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -784,7 +849,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
 /// `displayStatus: "failed"` on `workspace.get`; `agent.retry` clears the
 /// park and emits the `failed → idle` demotion with the self-sufficient
 /// payload.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn failed_agent_and_retry_transition_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
     let mut session = top_level_session(&fx.ws_id, "agent-e2e-err");
@@ -839,7 +904,7 @@ async fn failed_agent_and_retry_transition_over_wss() {
 /// reads as `displayStatus: "blocked"` on `workspace.get` — outranking
 /// `needs_attention` from a sibling discussion request — and `agent.delete`
 /// of the blocker-holding agent emits the demotion.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn blocked_transition_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
     let blocker = top_level_session(&fx.ws_id, "agent-e2e-blk");
@@ -908,6 +973,93 @@ async fn blocked_transition_over_wss() {
     );
 }
 
+/// Muted agents over the wire: a top-level pending blocker reads as
+/// `displayStatus: "blocked"`; `agent.update { changes: { notificationsMuted:
+/// true } }` on that agent drops it out of the attention derivation and emits
+/// the `blocked → idle` demotion, and unmuting emits the promotion back.
+#[tokio::test]
+async fn muted_agent_transition_over_wss() {
+    let fx = boot(StubForge::default(), false, None).await;
+    let blocker = top_level_session(&fx.ws_id, "agent-e2e-muted");
+    fx.store
+        .insert_agent_session(&blocker)
+        .await
+        .expect("seed blocker session");
+    fx.store
+        .set_attention_request(&fx.ws_id, &blocker.id, "blocker", "env broken", &now_iso())
+        .await
+        .expect("raise blocker");
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    // Read path serves blocked (seeds the baseline).
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "blocked");
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let muted = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.update",
+        json!({
+            "workspaceId": fx.ws_id.as_str(),
+            "agentId": blocker.id.0,
+            "changes": { "notificationsMuted": true },
+        }),
+    )
+    .await;
+    assert_eq!(muted["success"], true, "mute ok: {muted}");
+    assert_eq!(muted["agent"]["notificationsMuted"], true, "{muted}");
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "idle" })
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "idle");
+
+    let unmuted = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.update",
+        json!({
+            "workspaceId": fx.ws_id.as_str(),
+            "agentId": blocker.id.0,
+            "changes": { "notificationsMuted": false },
+        }),
+    )
+    .await;
+    assert_eq!(unmuted["success"], true, "unmute ok: {unmuted}");
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "blocked" })
+    );
+}
+
 /// Attention flags over the wire: the `unread` flag is not a displayStatus
 /// axis — `workspace.update { attention: "unread" }` and `workspace.markSeen`
 /// leave `displayStatus: "idle"` and emit no
@@ -918,7 +1070,7 @@ async fn blocked_transition_over_wss() {
 /// `workspace.dismissAttention` retires it; the ordered event stream (first
 /// event observed is the `review_required` promotion) proves the unread
 /// mutations stayed silent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn attention_flag_transitions_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
 

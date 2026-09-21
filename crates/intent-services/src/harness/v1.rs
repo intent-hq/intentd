@@ -88,6 +88,28 @@ pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message wa
 #[cfg(test)]
 pub(crate) const A2A_SENDER_NOTE_PREFIX: &str = "[MESSAGE FROM AGENT";
 
+/// Stable prefix of [`Harness::collaborator_sender_preamble`], asserted by
+/// the goldens. Like [`A2A_SENDER_NOTE_PREFIX`] it is NOT the annotation
+/// skip condition: the guard rebuilds the exact preamble from the bound
+/// caller's principal row and compares byte-for-byte.
+#[cfg(test)]
+pub(crate) const COLLABORATOR_SENDER_PREAMBLE_PREFIX: &str = "Message from ";
+
+/// Collapse control characters in a caller-visible display string to single
+/// spaces and drop a string that sanitizes to empty, so a hostile name
+/// cannot inject header-like lines into a single-line note.
+fn single_line_name(name: Option<&str>) -> Option<String> {
+    name.map(|n| {
+        n.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+    .filter(|n| !n.is_empty())
+}
+
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wakes.
 pub(crate) const HOOK_WAKE_LOGS_CAP: usize = 2048;
@@ -447,20 +469,30 @@ impl Harness for V1 {
         // it): collapse newlines/control chars in the display name to
         // single spaces so a hostile agent name cannot inject header-like
         // lines, and drop a name that sanitizes to empty.
-        let name = name
-            .map(|n| {
-                n.chars()
-                    .map(|c| if c.is_control() { ' ' } else { c })
-                    .collect::<String>()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|n| !n.is_empty());
-        match name {
+        match single_line_name(name) {
             Some(name) => format!("[MESSAGE FROM AGENT {name} ({agent_id})]"),
             None => format!("[MESSAGE FROM AGENT ({agent_id})]"),
         }
+    }
+
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String {
+        // Single-line for the same reasons as `a2a_sender_note`: the
+        // exact-match idempotency guard keys on it and a client may strip
+        // it with a single-line pattern.
+        let who = match (single_line_name(login), single_line_name(display_name)) {
+            (Some(login), Some(name)) => format!("@{login} ({name})"),
+            (Some(login), None) => format!("@{login}"),
+            (None, Some(name)) => name,
+            (None, None) => format!("principal {principal_id}"),
+        };
+        format!(
+            "Message from {who}, a collaborator (guest) of this workspace — not the workspace owner."
+        )
     }
 
     fn wait_duration(&self, secs: i64) -> String {
@@ -525,6 +557,15 @@ impl Harness for V1 {
              file is NOT inlined in this message. Call \
              ws.file.getAttachment(\"{id}\") to copy it into your working directory, \
              then read it from the returned path.]"
+        )
+    }
+
+    fn context_size_requeue_marker(&self, original_chars: usize) -> String {
+        format!(
+            "[Queued message of {original_chars} chars was dropped: the turn failed because \
+             the message was too large for the model (HTTP 413). The original content is not \
+             retained in the queue; re-obtain it from its source (e.g. ws.script.output / \
+             ws.host.exec) in bounded form.]"
         )
     }
 
@@ -760,6 +801,19 @@ impl Harness for V1 {
         )
     }
 
+    fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String {
+        format!(
+            "\n[hook message truncated: {omitted_chars} of {total_chars} chars omitted past the \
+             {cap_chars}-char cap — have the hook dispatch a summary and read the full data \
+             directly]"
+        )
+    }
+
     fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String {
         let omitted = total.saturating_sub(lines.len());
         let more = if omitted > 0 {
@@ -915,12 +969,13 @@ impl Harness for V1 {
             checks.push_str(" (required-check flags unavailable)");
         }
         lines.push(checks);
+        let count = match r.threads.unresolved {
+            Some(n) => n.to_string(),
+            None => "unknown (thread resolution state unreadable)".to_string(),
+        };
         let threads = match r.threads.resolution_required {
-            Some(true) => format!(
-                "unresolved threads: {} (resolution required to merge)",
-                r.threads.unresolved
-            ),
-            _ => format!("unresolved threads: {}", r.threads.unresolved),
+            Some(true) => format!("unresolved threads: {count} (resolution required to merge)"),
+            _ => format!("unresolved threads: {count}"),
         };
         lines.push(threads);
         if r.has_conflicts {
@@ -1018,16 +1073,26 @@ impl Harness for V1 {
                 new.review_comment_count
             ));
         }
-        if o.threads.unresolved != n.threads.unresolved {
-            let verb = if n.threads.unresolved < o.threads.unresolved {
-                "thread(s) resolved"
-            } else {
-                "thread(s) unresolved/opened"
-            };
-            changes.push(format!(
-                "{verb}: {} → {} unresolved",
-                o.threads.unresolved, n.threads.unresolved
-            ));
+        // A count delta is only meaningful when both sides are known; a
+        // readability transition is reported as such, never as a `n → 0` /
+        // `0 → n` delta.
+        match (o.threads.unresolved, n.threads.unresolved) {
+            (Some(before), Some(after)) if before != after => {
+                let verb = if after < before {
+                    "thread(s) resolved"
+                } else {
+                    "thread(s) unresolved/opened"
+                };
+                changes.push(format!("{verb}: {before} → {after} unresolved"));
+            }
+            (Some(_), None) => {
+                changes
+                    .push("review threads unreadable (resolution state unavailable)".to_string());
+            }
+            (None, Some(after)) => {
+                changes.push(format!("review threads readable again: {after} unresolved"));
+            }
+            _ => {}
         }
 
         changes.extend(diff_checks(old, new));
@@ -1183,6 +1248,16 @@ impl Harness for V1 {
         format!(
             "[PR monitor {label}] This monitor was cancelled because its workspace was \
              archived — it will not report again."
+        )
+    }
+
+    fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String {
+        format!(
+            "[PR monitor {label}] Your parent agent ({parent_id}) took over this monitor \
+             because your work had settled — it now receives the PR's wakes and this \
+             monitor will not report to you again. Do not re-register a monitor on this \
+             PR (ws.pr.monitor would be refused while your parent holds it); no other \
+             action is needed."
         )
     }
 

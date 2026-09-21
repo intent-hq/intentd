@@ -176,6 +176,7 @@ impl WorkspaceMcpServer {
             self.turn_attachments.clone(),
             effective_features.clone(),
             self.is_sub_agent,
+            self.workspace_api_timeout,
             pending.clone(),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
@@ -213,7 +214,23 @@ impl WorkspaceMcpServer {
         );
         tracing::trace!("workspace_api dispatch: eval starting");
         let eval_started = Instant::now();
-        let eval_result = js_eval(&full_code, &opts, Some(host)).await;
+        // Bind the calling agent as the request's caller for every `ws.*`
+        // call the script makes (multiplayer w1); host calls run inline on
+        // this task, so the task-local scope covers them. A bridge with no
+        // caller agent leaves whatever caller the enclosing scope bound.
+        let eval = js_eval(&full_code, &opts, Some(host));
+        let eval_result = match &self.caller_agent_id {
+            Some(agent_id) => {
+                intent_core::with_caller(
+                    intent_core::Caller::Agent {
+                        agent_id: agent_id.clone(),
+                    },
+                    eval,
+                )
+                .await
+            }
+            None => eval.await,
+        };
         let eval_ms = u64::try_from(eval_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let eval_ok = eval_result.is_ok();
         tracing::trace!(eval_ms, eval_ok, "workspace_api dispatch: eval finished");
@@ -350,7 +367,7 @@ impl WorkspaceMcpServer {
                 .filter(|n| n.is_finite() && *n >= 0.0)
                 .map_or(DEFAULT_MAX_OUTPUT_CHARS, |n| {
                     // Guarded finite + non-negative; float→int casts saturate.
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let n = n as usize;
                     n
                 }),
@@ -626,6 +643,10 @@ fn stamp_and_collect(items: &mut [Value], known: &HashSet<String>) -> Vec<TurnAt
 /// `pub` (re-exported as `intent_acp::make_workspace_host_for_bridge`) so
 /// the background hook scheduler in `intent-services` applies the same
 /// sub-agent gate to hooks owned by background/delegated sessions.
+/// `eval_budget` is the wall-clock budget of the enclosing eval (the hook
+/// runner's per-run timeout); bindings that bound a wait by the eval budget
+/// (`ws.script.run`) derive their ceiling from it, so every caller must pass
+/// its real budget.
 pub fn make_workspace_host_for_bridge(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -633,6 +654,7 @@ pub fn make_workspace_host_for_bridge(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: Duration,
 ) -> HostFn {
     make_workspace_host_with_pending(
         api,
@@ -641,6 +663,7 @@ pub fn make_workspace_host_for_bridge(
         turn_attachments,
         agent_features,
         is_sub_agent,
+        eval_budget,
         None,
     )
 }
@@ -650,7 +673,12 @@ pub fn make_workspace_host_for_bridge(
 /// result carries `__mcpContentItems` gets its resource items nonce-stamped
 /// and collected immediately, so `dispatch_workspace_api` registers them at
 /// the tool result regardless of what the agent's JS returns. Private —
-/// only the `workspace_api` dispatch wires a collector.
+/// only the `workspace_api` dispatch wires a collector. `eval_budget` is the
+/// wall-clock budget of the enclosing eval, threaded to the bindings; its
+/// clock starts HERE (both callers build the host immediately before the
+/// eval), so a binding dispatched late in the eval sees only the remaining
+/// time (intent-hq/intent#5387).
+#[expect(clippy::too_many_arguments)]
 fn make_workspace_host_with_pending(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -658,9 +686,11 @@ fn make_workspace_host_with_pending(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: Duration,
     pending: Option<PendingAttachments>,
 ) -> HostFn {
     let features = Arc::new(agent_features);
+    let eval_budget = super::bindings::EvalBudget::starting_now(eval_budget);
     Arc::new(move |arg| {
         let api = api.clone();
         let workspace_id = workspace_id.clone();
@@ -686,6 +716,7 @@ fn make_workspace_host_with_pending(
                 registry,
                 &features,
                 is_sub_agent,
+                eval_budget,
                 arg,
             )
             .await;
@@ -731,6 +762,11 @@ pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
 pub(super) const SUB_AGENT_PROPOSE_SIBLING_DENIED: &str =
     "ws.workspace.proposeSibling is only available to foreground top-level agents — report the opportunity to your parent with ws.agent.reportToParent";
 
+/// The dispatch-layer denial for a sub-agent's proposal apply: only the
+/// foreground top-level agent that proposed a sibling can apply it.
+pub(super) const SUB_AGENT_APPLY_PROPOSAL_DENIED: &str =
+    "ws.workspace.applyProposal is only available to foreground top-level agents — a proposal can only be applied by the agent that proposed it on the user's instruction";
+
 /// The dispatch-layer denial for a sub-agent's `agent.create` frame with
 /// `topLevel: true` — creating independent top-level agents is a
 /// top-level-agent capability.
@@ -742,6 +778,7 @@ pub(super) const SUB_AGENT_CREATE_TOP_LEVEL_DENIED: &str =
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
 /// trait mapping. Sub-agent `app.question.*` frames and methods gated by a
 /// disabled `[agentFeatures]` toggle are denied before dispatch.
+#[expect(clippy::too_many_arguments)]
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -749,6 +786,7 @@ async fn workspace_host_dispatch(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: &AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: super::bindings::EvalBudget,
     arg: Value,
 ) -> std::result::Result<Value, String> {
     let method = arg
@@ -764,6 +802,9 @@ async fn workspace_host_dispatch(
     }
     if is_sub_agent && method == "workspace.proposeSibling" {
         return Err(format!("host: {SUB_AGENT_PROPOSE_SIBLING_DENIED}"));
+    }
+    if is_sub_agent && method == "workspace.applyProposal" {
+        return Err(format!("host: {SUB_AGENT_APPLY_PROPOSAL_DENIED}"));
     }
     // Top-level-only rule for creating independent top-level agents (the
     // arg-conditional `agent.create` + `topLevel: true` path): like the
@@ -799,14 +840,15 @@ async fn workspace_host_dispatch(
     // boundary), so without this check the retiring turn could keep issuing
     // workspace_api calls after the mark landed. Fail closed on every
     // subsequent frame from a retired caller — the same inertness the
-    // service layer enforces for inbound interaction.
-    if let Some(caller) = caller_agent_id.as_ref() {
-        if api.agent_is_retired(caller.clone()).await {
-            return Err(
-                "host: this agent session is retired — the session is inert and no further \
-                 workspace_api calls run (only the user can restore it via agent.restore)"
-                    .to_string(),
-            );
+    // service layer enforces for inbound interaction. The send bindings run
+    // this same read INSIDE their spawned, budget-bounded delivery
+    // (`RETIRED_SEND_METHODS`): awaited here it would be one more
+    // cancellable store read on the send path (intent-hq/intent#5387).
+    if !super::bindings::RETIRED_SEND_METHODS.contains(&method) {
+        if let Some(caller) = caller_agent_id.as_ref() {
+            if api.agent_is_retired(caller.clone()).await {
+                return Err(retired_caller_error());
+            }
         }
     }
     let args = arg.get("args").cloned().unwrap_or(Value::Null);
@@ -817,6 +859,7 @@ async fn workspace_host_dispatch(
         turn_attachments.as_ref(),
         agent_features,
         is_sub_agent,
+        eval_budget,
         method,
         &args,
     )
@@ -825,6 +868,14 @@ async fn workspace_host_dispatch(
         return Ok(v);
     }
     Err(format!("host: unknown method `{method}`"))
+}
+
+/// The error every `workspace_api` frame from a retired caller fails with —
+/// shared by the dispatch guard above and the send bindings' deferred check.
+pub(crate) fn retired_caller_error() -> String {
+    "host: this agent session is retired — the session is inert and no further \
+     workspace_api calls run (only the user can restore it via agent.restore)"
+        .to_string()
 }
 
 /// Success MCP tool result for `workspace_api`: a single text content block

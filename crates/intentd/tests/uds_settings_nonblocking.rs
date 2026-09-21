@@ -29,7 +29,6 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 /// A wedged secret store: every `load` sleeps well past the wrapper's ~3s read
 /// deadline so the tokio runtime can only stay responsive if the wrapper
@@ -58,20 +57,14 @@ impl SecretStore for BlockingSecrets {
 }
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-uds-nb-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-uds-nb-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -109,7 +102,7 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>, budget: Duration) -> V
 /// starved every other RPC. Mirrors `uds_concurrent_dispatch.rs`: JSON-RPC
 /// correlates responses by `id`, so the fast reply is expected out-of-order
 /// well before the slow `settings.list` finishes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wedged_settings_list_does_not_stall_concurrent_workspace_list() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -129,7 +122,7 @@ async fn wedged_settings_list_does_not_stall_concurrent_workspace_list() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let socket = socket.clone();
         async move {
             let _ = serve_uds(services, bus, &socket, None, async {

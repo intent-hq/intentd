@@ -9,7 +9,6 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use uuid::Uuid;
 
 struct Daemon {
     child: Child,
@@ -20,7 +19,6 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -29,13 +27,11 @@ fn spawn_daemon(data_dir: &PathBuf) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    common::serve_command()
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_TCP_PORT", "0")
         .env_remove("INTENTD_AUTH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
@@ -53,9 +49,8 @@ async fn await_socket(daemon: &mut Daemon, socket: &Path) {
 
 #[tokio::test]
 async fn doctor_checks_data_dir_and_migrations() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     let child = spawn_daemon(&data_dir);
@@ -101,9 +96,8 @@ async fn doctor_checks_data_dir_and_migrations() {
 
 #[tokio::test]
 async fn status_reports_down_when_daemon_not_running() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Run status without a running daemon
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
@@ -127,15 +121,12 @@ async fn status_reports_down_when_daemon_not_running() {
         stdout.contains("not reachable"),
         "status should mention socket unreachable: {stdout}"
     );
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 #[tokio::test]
 async fn stop_succeeds_when_daemon_not_running() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Run stop without a running daemon
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
@@ -155,8 +146,6 @@ async fn stop_succeeds_when_daemon_not_running() {
         stdout.contains("not running"),
         "stop should report not running: {stdout}"
     );
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Spawn a daemon with both UDS and TCP (WSS) listeners, as `intentd pair`
@@ -165,30 +154,83 @@ async fn stop_succeeds_when_daemon_not_running() {
 /// token via `INTENTD_AUTH_TOKEN`; `None` uses the file-backed secrets store
 /// (required by rotation tests — an env-fixed token cannot rotate).
 fn spawn_daemon_both(data_dir: &PathBuf, token: Option<&str>) -> Child {
+    spawn_daemon_both_inner(data_dir, token, None)
+}
+
+/// [`spawn_daemon_both`] plus an active (fake) tailcat tunnel: pairing needs
+/// at least one dialable route, and these hermetic tests keep the loopback
+/// default bind (never advertised), so the deterministic tc address is what
+/// makes `intentd pair` succeed without real networking.
+fn spawn_daemon_both_tunneled(data_dir: &PathBuf, token: Option<&str>) -> Child {
+    let config = data_dir.join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap_or_default();
+    text.push_str("[server.tunnel]\nenabled = true\n");
+    std::fs::write(&config, text).expect("seed config.toml with server.tunnel.enabled");
+    let tailcat_bin = write_fake_tailcat(data_dir);
+    spawn_daemon_both_inner(data_dir, token, Some(&tailcat_bin))
+}
+
+fn spawn_daemon_both_inner(
+    data_dir: &PathBuf,
+    token: Option<&str>,
+    tailcat_bin: Option<&Path>,
+) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     match token {
         Some(token) => cmd.env("INTENTD_AUTH_TOKEN", token),
         None => cmd.env_remove("INTENTD_AUTH_TOKEN"),
     };
+    if let Some(bin) = tailcat_bin {
+        cmd.env("INTENTD_TAILCAT_BIN", bin);
+    }
     cmd.spawn().expect("spawn intentd serve (ws api enabled)")
 }
 
+/// Write an executable fake-tailcat script into `dir`: `genkey` creates the
+/// key file, `serve` prints the JSON address derived from the key file's
+/// content and sleeps (mirrors the seam in `e2e_wss_server_pairing.rs`).
+fn write_fake_tailcat(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-tailcat.sh");
+    let script = r#"#!/bin/sh
+key=""
+for arg in "$@"; do
+  case "$arg" in
+    --key=*) key="${arg#--key=}" ;;
+  esac
+done
+case "$1" in
+  genkey)
+    printf 'key-%s' $$ > "$key"
+    ;;
+  serve)
+    printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
+    sleep 600
+    ;;
+esac
+"#;
+    std::fs::write(&path, script).expect("write fake tailcat");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake tailcat");
+    path
+}
+
 /// Run `intentd pair` with `args`, retrying until it succeeds: the WSS
-/// listener binds asynchronously after the UDS socket accepts, so early runs
-/// can fail with listener-down (bounded by the startup budget).
+/// listener binds asynchronously after the UDS socket accepts (early runs can
+/// fail with listener-down), and the fake tailcat address registers
+/// asynchronously too (early runs can fail with no-dialable-route) — both
+/// bounded by the startup budget.
 async fn run_pair_until_success(data_dir: &Path, args: &[&str]) -> std::process::Output {
     let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
     loop {
@@ -244,13 +286,12 @@ async fn await_stored_token(data_dir: &Path) -> String {
 async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
     // Exported images embed the bearer token — must be owner-only (0600).
     use std::os::unix::fs::PermissionsExt;
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
-    let child = spawn_daemon_both(&data_dir, Some(token));
+    let child = spawn_daemon_both_tunneled(&data_dir, Some(token));
     let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -331,9 +372,8 @@ async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
 
 #[tokio::test]
 async fn pair_without_listener_non_tty_requires_yes_flag() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // UDS-only daemon: the WSS listener is down. Without --yes and with a
@@ -395,16 +435,19 @@ fn has_uncommented_enabled_true(config: &str) -> bool {
 }
 
 #[tokio::test]
-async fn pair_with_yes_enables_wss_and_prints_payload() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
-    // UDS-only daemon: the WSS listener is down. `pair --yes` must enable it
-    // via settings.update (persisting server.wsApi.enabled = true), then
-    // succeed end-to-end. INTENTD_TCP_PORT=0 makes the started listener bind
-    // an OS-assigned ephemeral port, so parallel suites cannot collide.
+    // UDS-only daemon: the WSS listener is down. `pair --yes` enables it via
+    // settings.update (persisting server.wsApi.enabled = true) on the
+    // persisted bind — a fresh config here, so the loopback default. Loopback
+    // is never advertised and no tunnel is active, so pairing has no dialable
+    // route: the command must FAIL with guidance instead of printing a
+    // payload no other device can connect through. INTENTD_TCP_PORT=0 makes
+    // the started listener bind an OS-assigned ephemeral port, so parallel
+    // suites cannot collide.
     let child = spawn_daemon(&data_dir);
     let mut daemon = Daemon {
         child,
@@ -422,8 +465,8 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "pair --yes should enable the listener and succeed: {stderr}"
+        !output.status.success(),
+        "pair --yes on a loopback-only bind must fail (no dialable route): {stderr}"
     );
     assert!(
         stderr.contains("External connections enabled"),
@@ -435,13 +478,18 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
         stderr.contains("listening on 127.0.0.1"),
         "should report the effective bind address: {stderr}"
     );
+    assert!(
+        stderr.contains("loopback only"),
+        "should carry the loopback-only guidance: {stderr}"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("intent://pair?v=1&host="),
-        "pair output should include the payload URI: {stdout}"
+        !stdout.contains("intent://pair?"),
+        "must not print a route-less pairing payload: {stdout}"
     );
 
-    // The enable must be persisted to config.toml, not just in-memory.
+    // The enable IS persisted to config.toml — the failure is about the
+    // missing route, not the listener.
     let config = std::fs::read_to_string(data_dir.join("config.toml"))
         .expect("config.toml written by settings.update");
     assert!(
@@ -449,7 +497,8 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
         "server.wsApi.enabled = true should be persisted: {config}"
     );
 
-    // A second run finds the listener already up — no prompt, no re-enable.
+    // A second run finds the listener already up — no prompt, no re-enable —
+    // and fails the same way on the missing route.
     let output2 = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
         .env("INTENTD_DATA_DIR", &data_dir)
@@ -458,20 +507,23 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
         .expect("run intentd pair (second)");
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
     assert!(
-        output2.status.success(),
-        "pair should succeed with the listener already up: {stderr2}"
+        !output2.status.success(),
+        "second run still has no dialable route: {stderr2}"
     );
     assert!(
         !stderr2.contains("External connections enabled"),
         "second run must not re-enable: {stderr2}"
     );
+    assert!(
+        stderr2.contains("loopback only"),
+        "second run carries the same guidance: {stderr2}"
+    );
 }
 
 #[tokio::test]
 async fn pair_fails_when_daemon_down() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
@@ -488,21 +540,18 @@ async fn pair_fails_when_daemon_down() {
         stderr.contains("cannot connect to daemon"),
         "should report the daemon is unreachable: {stderr}"
     );
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 #[tokio::test]
 async fn pair_rotate_mints_new_token() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // File-backed token store (no INTENTD_AUTH_TOKEN): rotation goes through
     // the daemon's `server.rotateToken`, so the subsequent `pairing.getInfo`
     // must serve the NEW token (not a stale in-process cache entry).
-    let child = spawn_daemon_both(&data_dir, None);
+    let child = spawn_daemon_both_tunneled(&data_dir, None);
     let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -536,16 +585,15 @@ async fn pair_rotate_mints_new_token() {
 
 #[tokio::test]
 async fn pair_rotate_refuses_when_daemon_token_env_fixed() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let token = "abababababababababababababababababababababababababababababababab";
 
     // The DAEMON's token is fixed by INTENTD_AUTH_TOKEN (the CLI's own env is
     // clean — the daemon is the authority): `server.rotateToken` rejects,
     // which becomes a stderr note, and the fixed token is printed unchanged.
-    let child = spawn_daemon_both(&data_dir, Some(token));
+    let child = spawn_daemon_both_tunneled(&data_dir, Some(token));
     let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -575,15 +623,14 @@ async fn pair_rotate_refuses_when_daemon_token_env_fixed() {
 
 #[tokio::test]
 async fn pair_rotate_uses_daemon_authority_not_cli_env() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Regression (PR #1074 review): INTENTD_AUTH_TOKEN set only in the CLI's
     // env, while the daemon uses its file-backed store. The CLI env must NOT
     // gate rotation — the daemon is the authority, so rotation MUST happen.
-    let child = spawn_daemon_both(&data_dir, None);
+    let child = spawn_daemon_both_tunneled(&data_dir, None);
     let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -629,9 +676,8 @@ async fn pair_rotate_uses_daemon_authority_not_cli_env() {
 
 #[tokio::test]
 async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Regression (PR #1074 review): rotation must only happen AFTER the
@@ -706,9 +752,8 @@ fn bind_address_line(config: &str) -> Option<&str> {
 
 #[tokio::test]
 async fn pair_select_endpoints_rebinds_without_repairing() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // Seed a wide bind so the picker's pre-checked set ({0.0.0.0}) differs
@@ -727,14 +772,16 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
     await_socket(&mut daemon, &socket).await;
     let before = await_stored_token(&data_dir).await;
 
-    // Selecting entry 1 (loopback) replaces the wide bind: persisted as a
-    // plain string (single entry) and the listener re-binds immediately.
+    // 'none' (no additional endpoints) replaces the wide bind with the
+    // loopback-only bind: persisted as a plain string (single entry) and the
+    // listener re-binds immediately. Loopback is no longer a selectable row,
+    // so 'none' is the deterministic way back from 0.0.0.0.
     // The e2e matrix deliberately never persists a multi-IP selection: the
-    // only universally bindable addresses are loopback and 0.0.0.0, which
-    // cannot combine (exclusive), so an array-shape e2e would be
-    // machine-dependent. The persisted array shape is unit-covered
-    // (bind_addresses_value) and the daemon's array handling by #1431.
-    let output = run_select_endpoints(&data_dir, "1\n");
+    // only universally bindable address is 0.0.0.0, exclusive by rule, so an
+    // array-shape e2e would be machine-dependent. The persisted array shape
+    // is unit-covered (bind_addresses_value) and the daemon's array handling
+    // by #1431.
+    let output = run_select_endpoints(&data_dir, "none\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -743,6 +790,19 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
     assert!(
         stderr.contains("Where should the daemon accept connections?"),
         "should show the multi-select picker: {stderr}"
+    );
+    assert!(
+        stderr.contains("Loopback (127.0.0.1) is always enabled"),
+        "the header must state the unconditional loopback bind: {stderr}"
+    );
+    assert!(
+        !stderr.contains("this machine only (loopback)"),
+        "loopback must not be a selectable row: {stderr}"
+    );
+    assert!(
+        stderr.contains("https://github.com/tailscale/tailcat"),
+        "tailcat picker entry should carry the explanatory note with the \
+         project URL: {stderr}"
     );
     assert!(
         stderr.contains("listening on 127.0.0.1"),
@@ -765,11 +825,95 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
     );
 }
 
+/// The loopback guarantee behind the picker's "always enabled" header: a
+/// daemon whose `server.bindAddress` selects only a non-`127.0.0.1` endpoint
+/// still binds `127.0.0.1` (local clients and the tailcat sidecar — which
+/// forwards tunnel traffic to the IPv4 loopback — must always reach it).
+/// `::1` needs no routable interface, keeping the e2e machine-independent
+/// wherever IPv6 exists; hosts without IPv6 skip (same signal the
+/// transport's own IPv6 test uses).
+#[tokio::test]
+async fn daemon_binds_loopback_alongside_a_specific_bind() {
+    // Probe ::1 bindability up front: IPv6-less hosts (disabled or
+    // unavailable) report Unsupported/AddrNotAvailable, which the listener
+    // itself treats as "IPv6 not supported here" — skip, don't fail.
+    match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::AddrNotAvailable
+            ) =>
+        {
+            eprintln!("skipping: ::1 not bindable on this host ({e})");
+            return;
+        }
+        Err(e) => panic!("probing ::1 bindability failed: {e}"),
+    }
+
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"::1\"\n",
+    )
+    .expect("seed config.toml with an IPv6-loopback-only bind");
+    let child = spawn_daemon_both(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    // The WSS listener binds asynchronously after the UDS socket accepts:
+    // poll `system.status` (one-shot `intentd call`) until a port shows.
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    let (port, status) = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("call")
+            .arg("system.status")
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run intentd call system.status");
+        let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+        if let Some(port) = status.as_ref().and_then(|s| s["port"].as_u64()) {
+            break (
+                u16::try_from(port).expect("valid TCP port"),
+                status.expect("status parsed"),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "WSS listener never reported a port"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    // Pin the advertised order: the unconditional loopback is APPENDED to
+    // the configured set (ensure_loopback_bind), so the configured ::1
+    // leads and 127.0.0.1 trails.
+    assert_eq!(
+        status["localIps"],
+        serde_json::json!(["::1", "127.0.0.1"]),
+        "localIps must list the configured bind first, appended loopback last"
+    );
+
+    // The configured ::1 endpoint is served, AND 127.0.0.1 answers too —
+    // the unconditional loopback bind the selector header promises.
+    for addr in ["::1", "127.0.0.1"] {
+        let target: std::net::IpAddr = addr.parse().unwrap();
+        std::net::TcpStream::connect((target, port))
+            .unwrap_or_else(|e| panic!("{addr}:{port} must accept connections: {e}"));
+    }
+}
+
 #[tokio::test]
 async fn pair_select_endpoints_unchanged_selection_writes_nothing() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     std::fs::write(
@@ -808,9 +952,8 @@ async fn pair_select_endpoints_unchanged_selection_writes_nothing() {
 
 #[tokio::test]
 async fn pair_select_endpoints_unchanged_selection_still_enables_listener() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     // UDS-only daemon (WSS listener disabled) with the default loopback bind
@@ -859,9 +1002,8 @@ async fn pair_select_endpoints_unchanged_selection_still_enables_listener() {
 
 #[tokio::test]
 async fn pair_select_endpoints_reprompts_on_invalid_input() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
     std::fs::write(
@@ -902,9 +1044,8 @@ async fn pair_select_endpoints_reprompts_on_invalid_input() {
 
 #[tokio::test]
 async fn pair_select_endpoints_fails_when_daemon_down() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // No daemon: the command must fail before showing the picker.
     let output = run_select_endpoints(&data_dir, "1\n");
@@ -917,8 +1058,6 @@ async fn pair_select_endpoints_fails_when_daemon_down() {
         !stderr.contains("Where should the daemon accept connections?"),
         "must not show the picker without a daemon: {stderr}"
     );
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 #[tokio::test]
@@ -956,9 +1095,8 @@ async fn pair_select_endpoints_conflicts_with_pairing_flags() {
 /// status 141 (128 + SIGPIPE) — never a panic backtrace.
 #[tokio::test]
 async fn status_exits_quietly_when_stdout_pipe_closes_early() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     let (pipe_read, pipe_write) = nix::unistd::pipe().expect("pipe(2)");
     drop(pipe_read);
@@ -984,8 +1122,6 @@ async fn status_exits_quietly_when_stdout_pipe_closes_early() {
         "expected quiet SIGPIPE-style exit (141) or SIGPIPE death, got {:?}; stderr: {stderr}",
         output.status
     );
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Run `intentd settings <args…>` against the daemon in `data_dir`. With
@@ -1023,9 +1159,8 @@ fn run_settings(data_dir: &Path, args: &[&str], stdin: Option<&str>) -> std::pro
 /// back in any output.
 #[tokio::test]
 async fn settings_sensitive_stdin_paths_never_echo_plaintext() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let child = spawn_daemon(&data_dir);
     let mut daemon = Daemon {

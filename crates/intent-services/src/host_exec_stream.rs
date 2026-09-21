@@ -32,6 +32,7 @@ use crate::system_actor;
 /// Grace period between SIGTERM and SIGKILL when reaping a cancelled / timed-out
 /// stream, mirroring [`host_exec`]'s constant so both surfaces settle helper
 /// subprocesses the same way.
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// Chunk size for reads off the child's stdout/stderr pipes. Small enough that
@@ -336,7 +337,7 @@ pub async fn start_stream(
     // Stdin forwarder: drain `stdin_rx` into the child. Exits on `Close` or
     // channel close; a write error also ends the task (child likely gone).
     if let Some(mut stdin_pipe) = child_stdin {
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             while let Some(msg) = stdin_rx.recv().await {
                 match msg {
                     StdinMsg::Data(bytes) => {
@@ -378,7 +379,7 @@ pub async fn start_stream(
     let ws_wait = workspace_id.clone();
     let req_wait = request_id.clone();
     let timeout_ms = common.timeout_ms;
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         run_wait_loop(
             bus_wait,
             ws_wait,
@@ -413,7 +414,7 @@ fn spawn_reader<R>(
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let mut buf = vec![0u8; READ_BUF_SIZE];
         loop {
             match reader.read(&mut buf).await {
@@ -514,6 +515,7 @@ async fn run_wait_loop(
 /// cancel/timeout. Descendants that escaped into their OWN process groups
 /// survive the group kill, so they are snapshotted before signalling and
 /// swept afterwards (`intent_acp::descendant_sweep`).
+#[cfg_attr(not(unix), expect(clippy::unused_async))] // only the unix arm awaits
 async fn reap_child_group(child: &mut tokio::process::Child, pid: Option<u32>) {
     #[cfg(unix)]
     {

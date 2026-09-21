@@ -20,18 +20,17 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    /// Swept after `Drop` reaps the child (fields drop after `drop()` runs).
+    _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -39,17 +38,15 @@ impl Drop for Daemon {
 /// `data_dir/daemon.log`, plus the given extra env vars.
 fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBuf) {
     // Keep the data dir short so `data_dir/intentd.sock` fits within SUN_LEN.
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", &format!("{prefix}-"));
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let log_path = data_dir.join("daemon.log");
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", &data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -61,7 +58,7 @@ fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBu
     (
         Daemon {
             child,
-            data_dir: data_dir.clone(),
+            _data_dir: data_dir_guard,
         },
         socket,
         log_path,
@@ -192,19 +189,13 @@ async fn default_thresholds_stay_quiet_for_normal_traffic() {
     );
 }
 
-struct TempRepo(PathBuf);
-
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 /// Create a temporary git repo (initial commit on `main`) carrying the given
 /// `.intent/config.json` contents.
 fn create_repo_with_config(config: &str) -> TempRepo {
-    let repo_path = std::env::temp_dir().join(format!("itdp-repo-{}", Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+    let repo_dir = common::test_tempdir("itdp-repo-");
+    let repo_path = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
         let out = Command::new("git")
             .args(args)
@@ -222,7 +213,7 @@ fn create_repo_with_config(config: &str) -> TempRepo {
     std::fs::write(repo_path.join("README.md"), "test").expect("write README");
     git(&["add", "."]);
     git(&["commit", "-m", "Initial commit"]);
-    TempRepo(repo_path)
+    TempRepo(repo_path, repo_dir)
 }
 
 /// Regression test for intent-hq/monorepo#1778: the first `script.list` for a
@@ -388,12 +379,15 @@ async fn get_subscriptions_stays_within_statement_budget() {
 /// now a chunked bulk statement, keeping every queue mutation at a flat
 /// statement count regardless of queue depth.
 ///
-/// Hermetic shape: an assistant message carrying a pending-question resource
-/// block arms the question hold, whose drain gate parks automatic-origin
-/// entries (no provider turn ever spawns). 40 `agent.queueMessage` calls then
-/// grow the queue to 40 entries; pre-fix the later dispatches ran 40+
-/// statements each (DELETE + one INSERT per entry), tripping the default
-/// budget of 25 — the batched shape stays at a handful per call.
+/// Hermetic shape: the workspace is archived, whose send/drain gates park
+/// AUTOMATIC-origin entries (no provider turn ever spawns). 40
+/// `agent.sendToTask` calls — the same default-origin path as A2A sends and
+/// system wakes — then grow the queue to 40 parked entries; pre-fix the
+/// later dispatches ran 40+ statements each (DELETE + one INSERT per entry),
+/// tripping the default budget of 25 — the batched shape stays at a handful
+/// per call. `agent.queueMessage` cannot serve here: its entries are
+/// user-origin (PROTOCOL §5.5), which the archived gate exempts, so each
+/// call would revive the workspace and drive a (non-hermetic) provider turn.
 #[tokio::test]
 async fn queue_mutations_stay_within_statement_budget_at_depth() {
     let (_daemon, socket, log_path) = spawn_daemon("itdp-queue", &[]);
@@ -422,44 +416,63 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
         .expect("agent id")
         .to_string();
 
-    // Arm the question hold so queued entries park instead of draining into
-    // a (non-hermetic) provider turn.
-    let question_blocks = json!([{
-        "type": "resource",
-        "resource": {
-            "uri": "intent://question/q-1",
-            "mimeType": "application/vnd.intent.question+json",
-            "text": "{\"questions\":[]}"
-        }
-    }]);
+    // A task note assigned to the agent so `agent.sendToTask` resolves it
+    // as the assignee.
     let resp = rpc_with_params(
         &socket,
-        "agent.appendMessage",
-        json!({
-            "workspaceId": workspace_id,
-            "agentId": agent_id,
-            "role": "assistant",
-            "contentBlocks": question_blocks,
-        }),
+        "note.create",
+        json!({ "workspaceId": workspace_id, "title": "Queue Task", "content": "Queue depth" }),
     )
     .await;
-    assert!(resp["error"].is_null(), "question append failed: {resp}");
+    let task_note_id = resp["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    let resp = rpc_with_params(
+        &socket,
+        "task.markAsTask",
+        json!({ "workspaceId": workspace_id, "noteId": task_note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert!(resp["error"].is_null(), "markAsTask failed: {resp}");
+    let resp = rpc_with_params(
+        &socket,
+        "task.assignAgent",
+        json!({ "workspaceId": workspace_id, "noteId": task_note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(resp["error"].is_null(), "assignAgent failed: {resp}");
+
+    // Archive the workspace so automatic sends park instead of draining
+    // into a (non-hermetic) provider turn.
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.archive",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    assert!(resp["error"].is_null(), "workspace archive failed: {resp}");
 
     for i in 0..40 {
         let resp = rpc_with_params(
             &socket,
-            "agent.queueMessage",
+            "agent.sendToTask",
             json!({
                 "workspaceId": workspace_id,
-                "agentId": agent_id,
-                "content": format!("queued message {i}"),
+                "taskNoteId": task_note_id,
+                "message": format!("queued message {i}"),
             }),
         )
         .await;
-        assert!(resp["error"].is_null(), "queueMessage {i} failed: {resp}");
+        assert!(resp["error"].is_null(), "sendToTask {i} failed: {resp}");
+        assert_eq!(
+            resp["result"]["result"]["archivedParked"],
+            json!(true),
+            "sendToTask {i} parked behind the archived gate: {resp}"
+        );
     }
 
-    // All 40 entries are parked (the hold never released).
+    // All 40 entries are parked (the workspace stays archived).
     let resp = rpc_with_params(
         &socket,
         "agent.getQueue",
@@ -478,10 +491,10 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     assert_eq!(
         count_lines(
             &log,
-            &["exceeded SQL statement budget", "method=agent.queueMessage"]
+            &["exceeded SQL statement budget", "method=agent.sendToTask"]
         ),
         0,
-        "agent.queueMessage exceeded the statement budget at queue depth, log:\n{log}"
+        "agent.sendToTask exceeded the statement budget at queue depth, log:\n{log}"
     );
 }
 
@@ -541,19 +554,24 @@ async fn transfer_plan_stays_within_statement_budget() {
 /// fold `updated_at` and count task stats, read the agent-session summaries
 /// TWICE per workspace (once for `agentSummary`/`lastActivity`, once inside
 /// the attention probe), and issued a per-session store probe for the
-/// question hold even when the summary already carried the persisted marker
+/// pending questions even when the summary already carried the persisted marker
 /// — so dispatch duration scaled with stored note bytes and session count,
 /// blowing the 1s duration budget at ~120-agent scale. The enrichment now
 /// reads the note MAX aggregate + counting query, passes its one summaries
 /// fetch through to the attention probe, and decides written markers inline.
 /// With 10 answered-question sessions the pre-fix `workspace.get` shape
 /// executed 15+ statements; the fixed shape stays at ~6. A statement
-/// threshold of 10 pins that.
+/// threshold of 10 pinned that; the first (cache-seeding) read now executes
+/// 12 statements — #1884 folds the secondary git-root PRs into
+/// `displayStatus` (10, intermittently 11 on main), and the caller's
+/// membership / role enrichment on the workspace payload adds one — so the
+/// threshold is the observed maximum, 12. Folding the membership lookup into
+/// the `workspace.get` query is a recorded follow-up.
 #[tokio::test]
 async fn workspace_get_enrichment_stays_within_statement_budget() {
     let (_daemon, socket, log_path) = spawn_daemon(
         "itdp-wsget",
-        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "10")],
+        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "12")],
     );
     assert!(await_socket(&socket).await, "daemon did not start");
 
@@ -653,5 +671,118 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
         ),
         0,
         "workspace.get enrichment exceeded the lowered statement budget, log:\n{log}"
+    );
+}
+
+/// Regression test for intent-hq/monorepo#4130: `workspace.delete` used to
+/// run 4 statements per contained agent on top of its constant sweep —
+/// `list_agent_sessions` hydrated every session's transcript (message +
+/// payload SELECTs) just to read `id`/`name`, and the per-agent teardown ran
+/// one `agent_stop_redelivery` DELETE plus one `advisory_wake_delivery` DELETE
+/// each — 128 statements / 180 ms observed for a 30-agent workspace, over the
+/// compound budget of 100. The sweep now reads session summaries and folds
+/// both clears into one batched `IN`-list statement each, so the dispatch
+/// executes a constant ~10 statements regardless of how many agents, messages
+/// or notes the workspace holds. The compound threshold is lowered to 20 so
+/// even a small N+1 regression (≥ 3 agents) fires the WARN.
+#[tokio::test]
+async fn workspace_delete_stays_within_statement_budget_at_scale() {
+    let (_daemon, socket, log_path) = spawn_daemon(
+        "itdp-wsdel",
+        &[("INTENTD_RPC_COMPOUND_STATEMENT_WARN_THRESHOLD", "20")],
+    );
+    assert!(await_socket(&socket).await, "daemon did not start");
+
+    let repo = create_repo_with_config("{}");
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.create",
+        json!({ "repositoryPath": repo.0.to_str().unwrap() }),
+    )
+    .await;
+    let workspace_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    for a in 0..30 {
+        let resp = rpc_with_params(
+            &socket,
+            "agent.create",
+            json!({ "workspaceId": workspace_id, "name": format!("Agent {a}"), "model": "sonnet4.5", "provider": "auggie" }),
+        )
+        .await;
+        let agent_id = resp["result"]["agent"]["id"]
+            .as_str()
+            .expect("agent id")
+            .to_string();
+        // A transcript per agent — the rows the pre-fix sweep hydrated.
+        for m in 0..3 {
+            let resp = rpc_with_params(
+                &socket,
+                "agent.appendMessage",
+                json!({
+                    "workspaceId": workspace_id,
+                    "agentId": agent_id,
+                    "role": "user",
+                    "contentBlocks": [{ "type": "text", "text": format!("message {m}") }],
+                }),
+            )
+            .await;
+            assert!(resp["error"].is_null(), "append failed: {resp}");
+        }
+    }
+    for n in 0..20 {
+        let resp = rpc_with_params(
+            &socket,
+            "note.create",
+            json!({ "workspaceId": workspace_id, "title": format!("Note {n}"), "content": format!("body {n}") }),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "note.create failed: {resp}");
+    }
+
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.delete",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true), "resp: {resp}");
+
+    // The cascade removed the workspace and everything under it.
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.get",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    assert!(
+        !resp["error"].is_null(),
+        "deleted workspace still readable: {resp}"
+    );
+    let resp = rpc_with_params(
+        &socket,
+        "agent.list",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    assert!(
+        resp["result"]["agents"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "deleted workspace still lists agents: {resp}"
+    );
+
+    // The WARN (were it wrongly emitted) lands on stderr before the response
+    // frame is written, so a single read after the response is sufficient.
+    let log = std::fs::read_to_string(&log_path).expect("read daemon log");
+    assert_eq!(
+        count_lines(
+            &log,
+            &["exceeded SQL statement budget", "method=workspace.delete"]
+        ),
+        0,
+        "workspace.delete exceeded the lowered compound statement budget, log:\n{log}"
     );
 }
