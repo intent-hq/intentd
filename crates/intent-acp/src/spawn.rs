@@ -5,9 +5,11 @@
 //! `-c model=…` overrides, and spawns with all three pipes captured and
 //! `kill_on_drop(true)`. The captured pipes are handed to a [`Connection`].
 //!
-//! Children start at reduced scheduling priority (nice 5 on Unix,
-//! `BELOW_NORMAL_PRIORITY_CLASS` on Windows; see [`agent_nice`]) so an agent
-//! process tree competing for CPU never starves the daemon that drives it.
+//! Children start at reduced scheduling priority relative to the daemon's own
+//! (nice `daemon + 5` on Unix, one priority class below the daemon's on
+//! Windows; see [`agent_nice`]) so an agent process tree competing for CPU
+//! never starves the daemon that drives it — and never outranks it, however
+//! the daemon itself was niced.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -210,17 +212,21 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     args
 }
 
-/// Env var tuning the nice value ACP agent children start at. `0` disables
+/// Env var tuning how much ACP agent children are niced relative to the
+/// daemon (added to the daemon's own nice value, capped at 19). `0` disables
 /// the priority reduction; other values are clamped to `0..=19`.
 pub const AGENT_NICE_ENV: &str = "INTENTD_AGENT_NICE";
 
-/// Nice value ACP agent children start at when [`AGENT_NICE_ENV`] is unset.
+/// Nice increment ACP agent children get when [`AGENT_NICE_ENV`] is unset.
 pub const DEFAULT_AGENT_NICE: i32 = 5;
 
-/// The nice value ACP agent children start at: [`AGENT_NICE_ENV`] when set
-/// (clamped to `0..=19`; an unparseable value falls back to the default), else
-/// [`DEFAULT_AGENT_NICE`]. `0` leaves the child at the daemon's priority. On
-/// Windows any non-zero value maps to `BELOW_NORMAL_PRIORITY_CLASS`.
+/// The nice increment ACP agent children start with over the daemon's own
+/// nice value: [`AGENT_NICE_ENV`] when set (clamped to `0..=19`; an
+/// unparseable value falls back to the default), else [`DEFAULT_AGENT_NICE`].
+/// The child's nice is `min(daemon + increment, 19)`, so a child never
+/// outranks the daemon even when the daemon is already niced. `0` leaves the
+/// child at the daemon's priority. On Windows any non-zero value maps to the
+/// priority class one step below the daemon's (see [`apply_reduced_priority`]).
 #[must_use]
 pub fn agent_nice() -> i32 {
     agent_nice_from(std::env::var(AGENT_NICE_ENV).ok().as_deref())
@@ -243,59 +249,130 @@ fn agent_nice_from(raw: Option<&str>) -> i32 {
     i32::try_from(n.clamp(0, 19)).unwrap_or(DEFAULT_AGENT_NICE)
 }
 
-/// Configure `cmd` so the child starts at reduced scheduling priority.
-/// `nice <= 0` leaves the command untouched.
+/// Highest (least favourable) nice value a process can have.
+#[cfg(unix)]
+const MAX_NICE: i32 = 19;
+
+/// The nice value of process `pid` (`0` = the calling process), or the raw
+/// `errno` when it cannot be read. `getpriority` legitimately returns `-1`
+/// for nice `-1`, so the error is told apart via `errno`, which is cleared
+/// first. Only plain syscall wrappers and thread-local `errno` are touched,
+/// so this is safe to call between fork and exec.
+#[cfg(unix)]
+fn nice_of(pid: libc::id_t) -> Result<i32, i32> {
+    use nix::errno::Errno;
+    Errno::clear();
+    // SAFETY: plain syscall wrapper with no pointer arguments.
+    let got = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
+    let errno = Errno::last_raw();
+    if got == -1 && errno != 0 {
+        Err(errno)
+    } else {
+        Ok(got)
+    }
+}
+
+/// The nice value a child of a process at `parent` nice should run at for
+/// increment `increment`: `parent + increment`, capped at [`MAX_NICE`]. Never
+/// below `parent`, so the child never outranks the daemon.
+#[cfg(unix)]
+fn target_nice(parent: i32, increment: i32) -> i32 {
+    parent.saturating_add(increment.max(0)).min(MAX_NICE)
+}
+
+/// Configure `cmd` so the child starts at reduced scheduling priority
+/// relative to the spawning daemon. `increment <= 0` leaves the command
+/// untouched.
+///
+/// On Unix the child reads the nice value it inherited (the daemon's) in
+/// `pre_exec` and raises it by `increment` (see [`target_nice`]); it is never
+/// lowered, so a daemon that is itself niced keeps its edge over the child.
+/// On Windows the child gets the priority class one step below the daemon's
+/// (`REALTIME`→`HIGH`, `HIGH`→`ABOVE_NORMAL`, `ABOVE_NORMAL`→`NORMAL`,
+/// `NORMAL`→`BELOW_NORMAL`, `BELOW_NORMAL`→`IDLE`); an `IDLE` daemon's child
+/// inherits `IDLE`.
 ///
 /// A failure to lower the priority must never fail the spawn, so on Unix the
-/// `setpriority` result is deliberately ignored inside `pre_exec` (logging is
-/// not async-signal-safe there); [`reduced_priority_shortfall`] reports it
-/// from the parent once the child is up.
-fn apply_reduced_priority(cmd: &mut Command, nice: i32) {
-    if nice <= 0 {
+/// `getpriority`/`setpriority` results are deliberately ignored inside
+/// `pre_exec` (logging is not async-signal-safe there);
+/// [`reduced_priority_shortfall`] reports it from the parent once the child
+/// is up.
+fn apply_reduced_priority(cmd: &mut Command, increment: i32) {
+    if increment <= 0 {
         return;
     }
     #[cfg(unix)]
     {
-        // SAFETY: `setpriority` is a plain syscall wrapper that takes no
-        // pointers and touches no locks or heap state, so it is safe to call
-        // between fork and exec.
+        // SAFETY: `getpriority`/`setpriority` are plain syscall wrappers that
+        // take no pointers and touch no locks or heap state, so they are safe
+        // to call between fork and exec.
         unsafe {
             cmd.pre_exec(move || {
-                libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+                if let Ok(inherited) = nice_of(0) {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, target_nice(inherited, increment));
+                }
                 Ok(())
             });
         }
     }
     #[cfg(windows)]
     {
-        cmd.creation_flags(windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS);
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS,
+            BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
+            NORMAL_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+        };
+        // SAFETY: both take no pointers; `GetCurrentProcess` returns a
+        // pseudo-handle that needs no closing.
+        let own = unsafe { GetPriorityClass(GetCurrentProcess()) };
+        let below = match own {
+            REALTIME_PRIORITY_CLASS => HIGH_PRIORITY_CLASS,
+            HIGH_PRIORITY_CLASS => ABOVE_NORMAL_PRIORITY_CLASS,
+            ABOVE_NORMAL_PRIORITY_CLASS => NORMAL_PRIORITY_CLASS,
+            NORMAL_PRIORITY_CLASS => BELOW_NORMAL_PRIORITY_CLASS,
+            BELOW_NORMAL_PRIORITY_CLASS | IDLE_PRIORITY_CLASS => IDLE_PRIORITY_CLASS,
+            // Unknown or unreadable: leave the default (never above the
+            // parent's class) rather than guess.
+            _ => return,
+        };
+        cmd.creation_flags(below);
     }
 }
 
-/// Why the freshly spawned child `pid` is NOT running at nice `nice` or
-/// lower priority, if it is not (`None` when it is, when `nice <= 0`, or when
-/// the child is already gone). `Command::spawn` returns only after the exec,
-/// so the `pre_exec` `setpriority` has already run when this is read.
+/// Why the freshly spawned child `pid` is NOT running at the nice value
+/// [`target_nice`] derives from this process's own nice and `increment` (or
+/// a less favourable one), if it is not — `None` when it is, when
+/// `increment <= 0`, or when the child is already gone. `Command::spawn`
+/// returns only after the exec, so the `pre_exec` `setpriority` has already
+/// run when this is read.
 #[cfg(unix)]
-fn reduced_priority_shortfall(pid: u32, nice: i32) -> Option<String> {
-    use nix::errno::Errno;
-    if nice <= 0 {
+fn reduced_priority_shortfall(pid: u32, increment: i32) -> Option<String> {
+    if increment <= 0 {
         return None;
     }
-    Errno::clear();
-    // SAFETY: plain syscall wrapper with no pointer arguments.
-    let got = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
-    let errno = Errno::last_raw();
-    if got == -1 && errno != 0 {
-        if errno == libc::ESRCH {
-            return None;
+    let parent = match nice_of(0) {
+        Ok(n) => n,
+        Err(errno) => {
+            return Some(format!(
+                "could not read the daemon's own priority: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ))
         }
-        return Some(format!(
-            "could not read the child's priority: {}",
-            std::io::Error::from_raw_os_error(errno)
-        ));
-    }
-    (got < nice).then(|| format!("child runs at nice {got}, expected at least {nice}"))
+    };
+    let expected = target_nice(parent, increment);
+    let got = match nice_of(pid as libc::id_t) {
+        Ok(n) => n,
+        Err(libc::ESRCH) => return None,
+        Err(errno) => {
+            return Some(format!(
+                "could not read the child's priority: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ))
+        }
+    };
+    (got < expected).then(|| {
+        format!("child runs at nice {got}, expected at least {expected} (daemon at {parent})")
+    })
 }
 
 /// Build the `tokio` command (args + env + enriched `PATH` + piped stdio +
@@ -333,13 +410,13 @@ fn captured_credential_env() -> &'static BTreeMap<String, String> {
 }
 
 /// [`build_command`] with an injectable captured credential-env map (the
-/// cached login-shell capture in production) and nice value ([`agent_nice`]
-/// in production). Captured vars are gap-fill only — see the precedence
-/// comment at the merge site below.
+/// cached login-shell capture in production) and nice increment
+/// ([`agent_nice`] in production). Captured vars are gap-fill only — see the
+/// precedence comment at the merge site below.
 fn build_command_with_captured_env(
     opts: &SpawnOptions,
     captured: &BTreeMap<String, String>,
-    nice: i32,
+    nice_increment: i32,
 ) -> Command {
     let args = build_args(opts);
 
@@ -410,7 +487,7 @@ fn build_command_with_captured_env(
     // only reaches the direct child, leaving grandchildren orphaned (§5.6).
     #[cfg(unix)]
     cmd.process_group(0);
-    apply_reduced_priority(&mut cmd, nice);
+    apply_reduced_priority(&mut cmd, nice_increment);
     cmd
 }
 
@@ -487,8 +564,8 @@ impl SpawnedAgent {
 /// [`AcpError::Spawn`] for every other spawn failure or when the stdio pipes
 /// cannot be taken.
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
-    let nice = agent_nice();
-    let mut cmd = build_command_with_captured_env(opts, captured_credential_env(), nice);
+    let nice_increment = agent_nice();
+    let mut cmd = build_command_with_captured_env(opts, captured_credential_env(), nice_increment);
     let (launch, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
     let mut child = cmd.spawn().map_err(|e| {
@@ -501,12 +578,12 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
     #[cfg(unix)]
     if let Some(shortfall) = child
         .id()
-        .and_then(|pid| reduced_priority_shortfall(pid, nice))
+        .and_then(|pid| reduced_priority_shortfall(pid, nice_increment))
     {
         tracing::warn!(
             command = %command_name,
             pid = child.id(),
-            nice,
+            nice_increment,
             "agent child not started at reduced priority: {shortfall}"
         );
     }
@@ -1386,15 +1463,12 @@ mod reduced_priority_tests {
     /// `getpriority` so the check needs no platform-specific `nice(1)`
     /// (macOS's prints nothing and exits 1 without a utility argument).
     fn nice_of(pid: u32) -> i32 {
-        nix::errno::Errno::clear();
-        // SAFETY: plain syscall wrapper with no pointer arguments.
-        let got = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
-        assert!(
-            got != -1 || nix::errno::Errno::last_raw() == 0,
-            "getpriority({pid}) failed: {}",
-            std::io::Error::last_os_error()
-        );
-        got
+        super::nice_of(pid as libc::id_t).unwrap_or_else(|errno| {
+            panic!(
+                "getpriority({pid}) failed: {}",
+                std::io::Error::from_raw_os_error(errno)
+            )
+        })
     }
 
     /// This test process's own nice value.
@@ -1402,36 +1476,105 @@ mod reduced_priority_tests {
         nice_of(0)
     }
 
-    /// Nice value a live child built with `nice` is running at, read from
-    /// the parent. `spawn` returns after the exec, so the `pre_exec`
+    /// Nice value a live child built with `increment` is running at, read
+    /// from the parent. `spawn` returns after the exec, so the `pre_exec`
     /// `setpriority` has already taken effect.
-    fn child_nice(nice: i32) -> i32 {
+    fn child_nice(increment: i32) -> i32 {
         let provider = sh_provider("exec sleep 30");
         let opts = SpawnOptions::new(&provider);
-        let mut cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), nice);
+        let mut cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), increment);
         let child = cmd.spawn().expect("spawn sleeper");
         let got = nice_of(child.id().expect("child pid"));
         drop(child);
         got
     }
 
+    #[test]
+    fn target_nice_is_parent_plus_increment_capped() {
+        assert_eq!(target_nice(0, DEFAULT_AGENT_NICE), DEFAULT_AGENT_NICE);
+        assert_eq!(target_nice(10, DEFAULT_AGENT_NICE), 15);
+        assert_eq!(target_nice(-10, DEFAULT_AGENT_NICE), -5);
+        assert_eq!(target_nice(15, DEFAULT_AGENT_NICE), MAX_NICE);
+        assert_eq!(target_nice(19, DEFAULT_AGENT_NICE), MAX_NICE);
+        assert_eq!(target_nice(3, 19), MAX_NICE);
+        assert_eq!(target_nice(7, i32::MAX), MAX_NICE);
+        // Never below the parent.
+        assert_eq!(target_nice(7, 0), 7);
+        assert_eq!(target_nice(7, -4), 7);
+    }
+
     #[tokio::test]
-    async fn child_starts_at_default_nice() {
-        // An unprivileged process can only RAISE nice, so a test runner
-        // already niced above the target keeps the child at its own level.
-        let expected = own_nice().max(DEFAULT_AGENT_NICE);
+    async fn child_starts_at_default_increment_over_parent() {
+        let expected = target_nice(own_nice(), DEFAULT_AGENT_NICE);
         assert_eq!(child_nice(DEFAULT_AGENT_NICE), expected);
     }
 
     #[tokio::test]
-    async fn child_starts_at_configured_nice() {
-        let expected = own_nice().max(12);
+    async fn child_starts_at_configured_increment_over_parent() {
+        let expected = target_nice(own_nice(), 12);
         assert_eq!(child_nice(12), expected);
     }
 
     #[tokio::test]
     async fn nice_zero_leaves_child_at_daemon_priority() {
         assert_eq!(child_nice(0), own_nice());
+    }
+
+    /// Nice value [`child_of_niced_parent_is_niced_relative_to_it`] re-runs
+    /// this test binary under, so the builder runs from a parent already
+    /// niced above [`DEFAULT_AGENT_NICE`].
+    const NICED_PARENT: i32 = 10;
+
+    /// Driven only via [`child_of_niced_parent_is_niced_relative_to_it`]
+    /// (hence `#[ignore]`): asserts this process is at nice ≥
+    /// [`NICED_PARENT`] and its children land at `parent + increment`,
+    /// capped at [`MAX_NICE`] — never back down at the absolute increment.
+    #[tokio::test]
+    #[ignore = "re-executed under nice(1) by child_of_niced_parent_is_niced_relative_to_it"]
+    async fn niced_parent_inner() {
+        let own = own_nice();
+        assert!(
+            own >= NICED_PARENT.min(MAX_NICE),
+            "expected to run at nice >= {NICED_PARENT}, got {own}"
+        );
+        assert_eq!(
+            child_nice(DEFAULT_AGENT_NICE),
+            target_nice(own, DEFAULT_AGENT_NICE)
+        );
+        assert!(child_nice(DEFAULT_AGENT_NICE) > DEFAULT_AGENT_NICE);
+        assert_eq!(child_nice(12), target_nice(own, 12));
+        assert_eq!(child_nice(0), own);
+    }
+
+    #[test]
+    fn child_of_niced_parent_is_niced_relative_to_it() {
+        let exe = std::env::current_exe().expect("test binary path");
+        // libtest names omit the crate segment of `module_path!()`.
+        let (_, module) = module_path!().split_once("::").expect("crate::module path");
+        let out = std::process::Command::new("nice")
+            .arg("-n")
+            .arg(NICED_PARENT.to_string())
+            .arg(&exe)
+            .args([
+                "--exact",
+                &format!("{module}::niced_parent_inner"),
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("re-exec the test binary under nice(1)");
+        assert!(
+            out.status.success(),
+            "niced re-run failed ({}):\nstdout:\n{}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("test result: ok. 1 passed"),
+            "niced re-run did not run the inner test:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     #[tokio::test]
@@ -1444,9 +1587,17 @@ mod reduced_priority_tests {
 
         assert_eq!(reduced_priority_shortfall(pid, 0), None);
         assert_eq!(reduced_priority_shortfall(pid, DEFAULT_AGENT_NICE), None);
-        if own_nice() < 19 {
-            let shortfall = reduced_priority_shortfall(pid, 19).expect("child is below nice 19");
-            assert!(shortfall.contains("expected at least 19"), "{shortfall}");
+        let own = own_nice();
+        if target_nice(own, DEFAULT_AGENT_NICE) < target_nice(own, 19) {
+            let shortfall =
+                reduced_priority_shortfall(pid, 19).expect("child is below the +19 target");
+            assert!(
+                shortfall.contains(&format!(
+                    "expected at least {} (daemon at {own})",
+                    target_nice(own, 19)
+                )),
+                "{shortfall}"
+            );
         }
         drop(child);
     }
