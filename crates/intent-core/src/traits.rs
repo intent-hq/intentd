@@ -4356,6 +4356,45 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.identityProof.create`: publish a host-issued `nonce` in a
+    /// **secret gist** created with the stored GitHub token (guest half of
+    /// the gist identity-proof join flow) → `{ gistId, login }`. Refused
+    /// with `Error::IdentityProof` (`github-not-connected` when no token is
+    /// stored or GitHub rejects it, `github-scope-missing` when the token
+    /// lacks the `gist` scope, `github-unreachable` on transport failure).
+    /// Owner-client only. Never returns the token.
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (nonce, host_label);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_identity_proof_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.identityProof.delete`: delete a proof gist created by
+    /// `github.identityProof.create` → `{ ok: true }`. Idempotent (an
+    /// already-deleted gist is `ok`); same bounded `Error::IdentityProof`
+    /// codes as create, the `gist`-scope check included. The gist is read
+    /// back before the delete and must be a proof gist (exactly one file,
+    /// `intent-join-proof.txt`); any other gist of the account is refused
+    /// with `-32602` and nothing is deleted. Owner-client only.
+    fn github_identity_proof_delete(
+        &self,
+        gist_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = gist_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_identity_proof_delete not implemented".to_string(),
+            ))
+        })
+    }
+
     // ========================================================================
     // sourceControl.* — provider-generic forge auth (PROTOCOL §5.27
     // "Provider-generic auth — `sourceControl.*`", v10.5). `provider` is
@@ -4670,13 +4709,14 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `workspace.invite.create` (multiplayer w4), service half: mint a
-    /// single-use invite for `workspace_id` → `{ invite, secret }`. The
-    /// plaintext `secret` is persisted next to its hash (migration `0128`)
-    /// so the owner can copy the link again later, but it never serialises
-    /// as a field: this result carries it exactly once, and afterwards it
-    /// reaches the wire only inside the rebuilt `url` of
-    /// `workspace_invite_list`. Owner-only.
+    /// `workspace.invite.create` (multiplayer w4), service half: mint an
+    /// invite for `workspace_id` → `{ invite, secret }`. Unpinned, the invite
+    /// is reusable until it expires or is revoked; pinned, it is single-use
+    /// (`invite.reusable` on the wire). The plaintext `secret` is persisted
+    /// next to its hash (migration `0128`) so the owner can copy the link
+    /// again later, but it never serialises as a field: this result carries
+    /// it exactly once, and afterwards it reaches the wire only inside the
+    /// rebuilt `url` of `workspace_invite_list`. Owner-only.
     /// Refused with `InviteErrorKind::GithubIdentityRequired` unless the
     /// owner's GitHub identity is linked; `pin_login` (a GitHub login) is
     /// resolved to its account id and stored as the pin
@@ -4733,51 +4773,15 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `invite.redeem` phase 1 (multiplayer w4, unauthenticated `/invite`
-    /// endpoint): validate `(invite_id, secret)` and start an identity-only
-    /// GitHub device flow → `{ flowId, userCode, verificationUri, expiresIn,
-    /// interval, workspaceId, workspaceTitle }`. The `/invite` transport
-    /// extends this with the host's `hostname` / `prettyHostname` (same
-    /// sources as `system.status`) so the guest's consent prompt can name
-    /// the machine. The access token the flow yields is used once for
-    /// `GET /user` and never persisted.
-    fn invite_redeem_start(
-        &self,
-        invite_id: String,
-        secret: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::invite_redeem_start not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `invite.redeem` phase 2 (multiplayer w4): wait for the flow started by
-    /// [`Self::invite_redeem_start`] to settle → `{ status: "authorized",
-    /// token, principalId, login, workspaceId }` exactly once (the flow is
-    /// forgotten after the result is collected), or the terminal
-    /// [`crate::InviteErrorKind`] error (denied / expired / pin mismatch /
-    /// invite closed meanwhile).
-    fn invite_redeem_wait(&self, flow_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = flow_id;
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::invite_redeem_wait not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
-    /// endpoint): validate `(invite_id, secret)` exactly as
-    /// [`Self::invite_redeem_start`] does — same [`crate::InviteErrorKind`]
-    /// refusals for an unknown / expired / revoked / redeemed link — and
-    /// answer `{ workspaceId, workspaceTitle }` **without** starting a device
-    /// flow: no flow slot is taken and GitHub is never contacted. The
-    /// `/invite` transport extends the result with the host's `hostname` /
-    /// `prettyHostname`, so a client can show the consent prompt before it
-    /// decides between `invite.accept` and `invite.redeem`.
+    /// endpoint): validate `(invite_id, secret)` — the
+    /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
+    /// revoked / (pinned and) redeemed link — and answer `{ workspaceId, workspaceTitle }`
+    /// without touching GitHub or issuing a nonce. The `/invite` transport
+    /// extends the result with the host's `hostname` / `prettyHostname`
+    /// (same sources as `system.status`), so a client can show the consent
+    /// prompt before it decides between `invite.accept` and
+    /// `invite.challenge` / `invite.prove`.
     fn invite_inspect(
         &self,
         invite_id: String,
@@ -4793,14 +4797,16 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `invite.accept` (multiplayer w4, unauthenticated `/invite` endpoint):
     /// the returning guest's join. `credential` is a per-principal bearer
-    /// credential this host minted earlier (another workspace's redeem);
+    /// credential this host minted earlier (another workspace's join);
     /// its hash resolves the principal like the `/ws` bearer gate does —
     /// unknown or revoked is [`crate::InviteErrorKind::CredentialInvalid`]
-    /// (`credential-invalid`). The invite is then validated like
-    /// [`Self::invite_redeem_start`], a pin is checked against the
+    /// (`credential-invalid`); one bound to the primary principal (the host
+    /// owner's own account) is [`crate::InviteErrorKind::OwnerSelfJoin`]
+    /// (`owner-self-join`). The invite is then validated like
+    /// [`Self::invite_inspect`], a pin is checked against the
     /// principal's stored `github_user_id` (`invite-pin-mismatch`), and the
     /// join commits with the stored identity (no GitHub call, no profile
-    /// refresh) → the [`Self::invite_redeem_wait`] shape
+    /// refresh) → the [`Self::invite_prove`] shape
     /// `{ status: "authorized", token, principalId, login, workspaceId }`
     /// with a fresh credential.
     fn invite_accept(
@@ -4813,6 +4819,62 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_accept not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.challenge` (gist identity-proof join, unauthenticated
+    /// `/invite` endpoint): validate `(invite_id, secret)` exactly like
+    /// [`Self::invite_inspect`] and issue a single-use nonce bound to the
+    /// invite → `{ workspaceId, workspaceTitle, nonce, nonceExpiresAt }`.
+    /// The nonce is 32 random bytes (base64url, unpadded), lives 10 minutes
+    /// and is consumed by the first [`Self::invite_prove`] that names it.
+    /// GitHub is never contacted. The `/invite` transport extends the result
+    /// with the host's `hostname` / `prettyHostname`.
+    fn invite_challenge(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_challenge not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.prove` (gist identity-proof join, unauthenticated `/invite`
+    /// endpoint): the guest published `nonce` in a gist under its own
+    /// account and names it. The host reads `GET /gists/{gist_id}` and
+    /// requires the owner login to equal `login` (case-insensitively), the
+    /// file `intent-join-proof.txt` to start with the nonce and the gist to
+    /// have been created no earlier than the nonce was issued; then resolves
+    /// `GET /users/{login}` and commits the join → `{ status: "authorized",
+    /// token, principalId, login, workspaceId }`. Refusals:
+    /// [`crate::InviteErrorKind::ProofInvalid`]
+    /// (any mismatch, an unknown gist, or a nonce not issued for this invite
+    /// / already consumed), [`crate::InviteErrorKind::ProofExpired`],
+    /// [`crate::InviteErrorKind::GithubUnreachable`];
+    /// [`crate::InviteErrorKind::OwnerSelfJoin`] (`owner-self-join`) when
+    /// the proven account is the primary principal's own — the host owner
+    /// cannot join its own host as a guest and no credential is minted; a
+    /// closed invite, a pin
+    /// mismatch and a full workspace answer their existing kinds. The nonce
+    /// is consumed by the first attempt that reaches the verification,
+    /// except when GitHub was unreachable (the guest may retry).
+    fn invite_prove(
+        &self,
+        invite_id: String,
+        secret: String,
+        nonce: String,
+        gist_id: String,
+        login: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret, nonce, gist_id, login);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_prove not implemented".to_string(),
             ))
         })
     }

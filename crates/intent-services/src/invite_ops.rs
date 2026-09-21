@@ -1,41 +1,52 @@
-//! Workspace invite links and the identity-only device-flow join
-//! (multiplayer w4): `workspace.invite.create` / `.list` / `.revoke` on the
-//! owner side, `invite.redeem` (start + wait), `invite.inspect` and
+//! Workspace invite links and the gist identity-proof join (multiplayer
+//! w4): `workspace.invite.create` / `.list` / `.revoke` on the owner side,
+//! `invite.inspect`, `invite.challenge` / `invite.prove` and
 //! `invite.accept` on the unauthenticated `/invite` side, plus
 //! `workspace.members.leave` / `principal.revokeSelf`.
 //!
-//! An invite is a single-use, expiring `(id, secret)` pair; redemption
-//! matches the hex SHA-256 of the secret, and the plaintext is kept only so
-//! the owner can copy the link again (`invites[].url` on `.list`, built
-//! through the transport's [`intent_core::InviteLinkBuilder`]; the secret
-//! itself never serialises). Redemption runs the same GitHub device
-//! grant as `github.connect` but with **no scopes** and through
-//! [`intent_sourcecontrol::IdentityFlow`], whose access token is spent on
-//! one `GET /user` inside the engine and never persisted — the daemon
-//! learns *who* the invitee is (stable `github_user_id`) and nothing else.
-//! The joined principal is minted (or reused, keyed by `github_user_id`),
-//! added as a `collaborator`, and issued a fresh per-principal credential
-//! that is returned exactly once.
+//! An invite is an expiring `(id, secret)` pair; a join matches the hex
+//! SHA-256 of the secret, and the plaintext is kept only so the owner can
+//! copy the link again (`invites[].url` on `.list`, built through the
+//! transport's [`intent_core::InviteLinkBuilder`]; the secret itself never
+//! serialises). An unpinned invite is **reusable**: any number of distinct
+//! GitHub accounts may redeem it until it expires or is revoked (each join
+//! is one more collaborator, a member re-joining is idempotent); a pinned
+//! invite is single-use and closes on its redemption. The daemon learns
+//! *who* the invitee is (stable `github_user_id`) and nothing else. The
+//! joined principal is minted (or reused, keyed by `github_user_id`), added
+//! as a `collaborator`, and issued a fresh per-principal credential that is
+//! returned exactly once.
+//!
+//! A first-time guest proves its identity from its **own** daemon (gist
+//! identity proof): `invite.challenge` issues a single-use nonce bound to
+//! the invite ([`NONCE_TTL`]); the guest publishes it in a secret gist with
+//! its own token and `invite.prove` reads the gist back (`GET /gists/{id}`
+//! with the host's stored token, anonymously otherwise), checks owner /
+//! content / creation time, resolves the account (`GET /users/{login}`) and
+//! commits the join. The host never issues a device code and never sees the
+//! guest's token.
 //!
 //! A guest that already holds such a credential for this host skips the
-//! device flow on later invites: `invite.inspect` previews the link (same
-//! validation, no flow) and `invite.accept` joins with the credential as
+//! proof on later invites: `invite.inspect` previews the link (same
+//! validation, no nonce) and `invite.accept` joins with the credential as
 //! proof of identity — the principal it resolves to is the one whose GitHub
-//! account was proven by its own earlier grant, so the join commits with the
-//! stored identity and GitHub is never contacted.
+//! account was proven earlier, so the join commits with the stored identity
+//! and GitHub is never contacted. The presented credential is revoked in
+//! the same transaction that mints the new one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use intent_core::{
     current_caller, iso_ms_from_now, now_iso, Caller, Error, InviteErrorKind, InviteLinkEnvelope,
     Principal, PrincipalId, Result, Workspace, WorkspaceId, WorkspaceInvite, WorkspaceRole,
 };
-use intent_sourcecontrol::{IdentityFlow, IdentityPollStatus, UserIdentity};
+use intent_sourcecontrol::identity_proof::ProofGistView;
+use intent_sourcecontrol::{SourceControl, UserIdentity};
 use intent_store::InviteJoinOutcome;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::{github_auth_ops, pr_ops, Services};
@@ -46,54 +57,91 @@ pub(crate) const DEFAULT_INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// Longest lifetime a client may request (30 days).
 pub(crate) const MAX_INVITE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
-/// Concurrent identity-only device flows the daemon keeps in flight; the
-/// `/invite` endpoint is unauthenticated, so this bounds what an anonymous
-/// peer holding one valid link can make the daemon poll for. Enforced as a
-/// semaphore whose permit is taken *before* the device-code request and
-/// lives in the flow's slot, so refused starts cost no upstream call.
-pub(crate) const MAX_INFLIGHT_INVITE_FLOWS: usize = 16;
-
-/// Consecutive poll errors tolerated before a flow is marked failed.
-const MAX_CONSECUTIVE_POLL_ERRORS: u32 = github_auth_ops::MAX_CONSECUTIVE_POLL_ERRORS;
-
-/// How long a settled flow's result stays collectable before it is dropped.
-const SETTLED_FLOW_GRACE: Duration = Duration::from_secs(120);
-
-/// How much longer a timed-out waiter stays attached once the poll task has
-/// started committing the join, so the one outcome carrying the credential
-/// is collected rather than dropped with the slot.
-const JOIN_COMMIT_GRACE: Duration = Duration::from_secs(30);
-
-/// Env override for the GitHub API base the identity flow's `GET /user`
-/// talks to — the spawned-daemon test seam (e2e points it at a local mock).
-/// Honored under the same loopback-or-https rule as the login host.
+/// Env override for the GitHub API base the identity reads (`invite.prove`'s
+/// gist / account lookups, the primary's `GET /user` refresh) talk to — the
+/// spawned-daemon test seam (e2e points it at a local mock). Honored under
+/// the same loopback-or-https rule as the login host.
 pub(crate) const API_BASE_URI_ENV: &str = "INTENTD_GITHUB_API_BASE_URI";
 
-/// Where one identity-only flow stands. `outcome` is written exactly once by
-/// the poll task; `done` flips to `true` at the same moment so a waiting
-/// `invite.redeem` wakes without polling.
-pub(crate) struct InviteFlowSlot {
+/// Lifetime of an `invite.challenge` nonce: the guest has this long to
+/// publish the gist and call `invite.prove`.
+pub(crate) const NONCE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Outstanding (issued, not yet consumed or expired) nonces one invite may
+/// have at once: a retry or two per invitee is legitimate; an anonymous
+/// peer holding one valid link cannot grow the store past this.
+pub(crate) const MAX_NONCES_PER_INVITE: usize = 8;
+
+/// Outstanding nonces daemon-wide, enforced as a semaphore whose permit
+/// lives in the nonce's slot, so the store is bounded however many links
+/// are open.
+pub(crate) const MAX_OUTSTANDING_NONCES: usize = 256;
+
+/// One issued `invite.challenge` nonce awaiting its `invite.prove`.
+pub(crate) struct NonceSlot {
     invite_id: String,
-    deadline: Instant,
-    settled_at: Option<Instant>,
-    /// Set once the grant is in hand and the join is being committed: a
-    /// waiter that times out meanwhile must not purge the slot.
-    committing: bool,
-    outcome: Option<Result<Value>>,
-    done: watch::Sender<bool>,
-    /// The [`MAX_INFLIGHT_INVITE_FLOWS`] permit; released when the slot is
-    /// collected or purged.
+    /// Wall-clock issue time — the proof gist must not predate it (GitHub
+    /// reports `created_at` at second precision, so the comparison floors).
+    issued_at: SystemTime,
+    expires_at: Instant,
+    /// The [`MAX_OUTSTANDING_NONCES`] permit; released with the slot.
     _permit: OwnedSemaphorePermit,
 }
 
-/// In-flight and recently settled identity flows keyed by flow id.
-pub(crate) type InviteFlowState = Arc<tokio::sync::Mutex<HashMap<String, InviteFlowSlot>>>;
+/// Issued nonces keyed by nonce.
+pub(crate) type InviteNonceState = Arc<tokio::sync::Mutex<HashMap<String, NonceSlot>>>;
 
-/// Admission permits for identity flows ([`MAX_INFLIGHT_INVITE_FLOWS`]).
-pub(crate) type InviteFlowPermits = Arc<Semaphore>;
+/// Admission permits for nonces ([`MAX_OUTSTANDING_NONCES`]).
+pub(crate) type InviteNoncePermits = Arc<Semaphore>;
 
-pub(crate) fn new_flow_permits() -> InviteFlowPermits {
-    Arc::new(Semaphore::new(MAX_INFLIGHT_INVITE_FLOWS))
+pub(crate) fn new_nonce_permits() -> InviteNoncePermits {
+    Arc::new(Semaphore::new(MAX_OUTSTANDING_NONCES))
+}
+
+/// 32 random bytes (two `UUIDv4`s, OS randomness) as unpadded base64url —
+/// the `invite.challenge` nonce, safe on a gist line and in a URL.
+pub(crate) fn random_nonce() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Drop nonces whose lifetime passed, returning their permits.
+fn purge_nonces(nonces: &mut HashMap<String, NonceSlot>, now: Instant) {
+    nonces.retain(|_, slot| slot.expires_at > now);
+}
+
+/// Whether a proof gist created at `created_at` (RFC 3339, as GitHub reports
+/// it) is no older than the nonce issued at `issued_at`. Unparseable input
+/// never passes.
+fn gist_created_after(created_at: &str, issued_at: SystemTime) -> bool {
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return false;
+    };
+    let Ok(issued) = issued_at.duration_since(SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    created.timestamp() >= i64::try_from(issued.as_secs()).unwrap_or(i64::MAX)
+}
+
+/// The `invite.prove` verdict on a gist: owned by the claimed `login`
+/// (case-insensitively), its proof file starts with the nonce, and it was
+/// created no earlier than the nonce was issued.
+fn proof_matches(gist: &ProofGistView, login: &str, nonce: &str, issued_at: SystemTime) -> bool {
+    // repo-slug-fold: allow — a GitHub user login (case-insensitive on GitHub), not a repo slug
+    gist.owner_login.eq_ignore_ascii_case(login)
+        && gist.proof_first_line.as_deref() == Some(nonce)
+        && gist_created_after(&gist.created_at, issued_at)
+}
+
+/// A GitHub login as `invite.prove` may claim it: 1–39 ASCII alphanumerics
+/// or hyphens (GitHub's own rule), so it is safe in a request path.
+fn valid_login(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= 39
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Live feed of principal ids whose credentials were just revoked; the
@@ -129,16 +177,19 @@ pub(crate) fn hash_secret(secret: &str) -> String {
 }
 
 /// The invite's wire shape (`secret` / `secretHash` never included), plus
-/// `url` when the row still holds its secret and a link envelope resolved.
+/// `reusable` (derived from the pin, see [`WorkspaceInvite::is_reusable`])
+/// and `url` when the row still holds its secret and a link envelope
+/// resolved.
 pub(crate) fn invite_to_wire(
     invite: &WorkspaceInvite,
     envelope: Option<&dyn InviteLinkEnvelope>,
 ) -> Value {
     let mut wire = serde_json::to_value(invite).unwrap_or_else(|_| json!({ "id": invite.id }));
-    if let (Some(env), Some(secret), Some(obj)) =
-        (envelope, invite.secret.as_deref(), wire.as_object_mut())
-    {
-        obj.insert("url".into(), env.invite_url(&invite.id, secret).into());
+    if let Some(obj) = wire.as_object_mut() {
+        obj.insert("reusable".into(), invite.is_reusable().into());
+        if let (Some(env), Some(secret)) = (envelope, invite.secret.as_deref()) {
+            obj.insert("url".into(), env.invite_url(&invite.id, secret).into());
+        }
     }
     wire
 }
@@ -169,11 +220,12 @@ fn hashes_match(a: &str, b: &str) -> bool {
 }
 
 /// The terminal [`InviteErrorKind`] for an invite that is not open at `now`
-/// (`None` when it is open).
+/// (`None` when it is open). `Redeemed` is reachable only for a pinned,
+/// single-use invite: a reusable one is never closed by its redemptions.
 fn closed_kind(invite: &WorkspaceInvite, now: &str) -> Option<InviteErrorKind> {
     if invite.revoked_at.is_some() {
         Some(InviteErrorKind::Revoked)
-    } else if invite.redeemed_at.is_some() {
+    } else if !invite.is_reusable() && invite.redeemed_at.is_some() {
         Some(InviteErrorKind::Redeemed)
     } else if invite.expires_at.as_str() <= now {
         Some(InviteErrorKind::Expired)
@@ -208,7 +260,7 @@ impl Services {
     /// on the row, so the cache alone does not qualify — `check_auth` must
     /// confirm a configured, working credential on every mint, and the
     /// profile is (re)fetched inline while the row is still unlinked. A
-    /// joined collaborator's identity was proven by its own device grant and
+    /// joined collaborator's identity was proven by its own gist proof and
     /// is accepted as cached.
     async fn inviting_principal(&self) -> Result<Principal> {
         let id = crate::principal_ops::caller_principal_id(&self.store)
@@ -243,9 +295,9 @@ impl Services {
     /// The forge used for identity lookups — the invite pin's
     /// `GET /users/{login}` and the primary's `GET /user` refresh: the
     /// injected engine when one is wired, else the active provider built
-    /// from defaults with the identity flow's API-base override applied, so
-    /// every identity read and the invitee's `GET /user` talk to the same
-    /// host (the e2e mock in tests, `api.github.com` in production).
+    /// from defaults with the API-base override applied, so every identity
+    /// read talks to the same host (the e2e mock in tests, `api.github.com`
+    /// in production).
     pub(crate) async fn identity_source_control(
         &self,
     ) -> Result<Arc<dyn intent_sourcecontrol::SourceControl>> {
@@ -257,6 +309,29 @@ impl Services {
         intent_sourcecontrol::SourceControlRegistry::from_settings(&settings)
             .await
             .map_err(pr_ops::map_sc_err)
+    }
+
+    /// The forge `invite.prove` reads the proof gist and the claimed account
+    /// with: [`Self::identity_source_control`] (the host's stored token), or
+    /// — when the host holds no GitHub token at all — an anonymous client on
+    /// the same API host. Both reads are public on GitHub (a secret gist is
+    /// unlisted, not private), so the fallback only forgoes the higher
+    /// authenticated rate limit.
+    async fn proof_source_control(&self) -> Result<Arc<dyn SourceControl>> {
+        if let Some(sc) = self.source_control.clone() {
+            return Ok(sc);
+        }
+        let api_base = resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        let mut settings = intent_sourcecontrol::SourceControlSettings::default();
+        settings.github.api_base_url.clone_from(&api_base);
+        match intent_sourcecontrol::SourceControlRegistry::from_settings(&settings).await {
+            Ok(sc) => Ok(sc),
+            Err(intent_sourcecontrol::Error::NotConfigured(_)) => Ok(Arc::new(
+                intent_sourcecontrol::GitHubSourceControl::anonymous(api_base.as_deref())
+                    .map_err(pr_ops::map_sc_err)?,
+            )),
+            Err(e) => Err(pr_ops::map_sc_err(e)),
+        }
     }
 
     /// Current `workspace_member` row count of one workspace, for the
@@ -352,6 +427,7 @@ impl Services {
             redeemed_at: None,
             redeemed_by_principal_id: None,
             revoked_at: None,
+            redemption_count: 0,
         };
         // The insert is what locks the primary identity, so it is
         // serialised with the identity transition and the creator's
@@ -505,7 +581,7 @@ impl Services {
     }
 }
 
-/// Resolve the GitHub API base for the identity flow: the builder override,
+/// Resolve the GitHub API base for the identity reads: the builder override,
 /// else the env seam, else `None` (api.github.com). Non-loopback cleartext
 /// overrides are ignored like the login host's.
 pub(crate) fn resolve_api_base_uri(override_uri: Option<&str>) -> Option<String> {
@@ -556,7 +632,7 @@ impl Services {
     }
 
     /// `invite.inspect`: see [`intent_core::WorkspaceApi::invite_inspect`].
-    /// Reads only — no flow slot, no permit, no upstream call.
+    /// Reads only — no nonce slot, no permit, no upstream call.
     pub(crate) async fn invite_inspect_op(&self, invite_id: &str, secret: &str) -> Result<Value> {
         let (invite, ws) = self.open_invite(invite_id, secret).await?;
         Ok(json!({
@@ -572,6 +648,29 @@ impl Services {
         secret: &str,
         credential: &str,
     ) -> Result<Value> {
+        let (invite, principal) = self
+            .invite_accept_resolve(invite_id, secret, credential)
+            .await?;
+        // The presented credential is validated again and rotated out inside
+        // the join transaction (exactly one active row must flip, or the
+        // join is refused `CredentialInvalid`): the guest leaves with exactly
+        // one active credential for this host, and of two concurrent accepts
+        // presenting the same credential exactly one mints.
+        self.commit_invite_join(&invite, &principal, Some(&hash_secret(credential)))
+            .await
+    }
+
+    /// The pre-transaction half of `invite.accept`: name the principal the
+    /// credential identifies and the open invite, and enforce the pin. The
+    /// active-credential check here is advisory — it gives the early, cheap
+    /// refusal and the `github_user_id` the pin needs — the authoritative
+    /// check is the rotate inside the join transaction.
+    async fn invite_accept_resolve(
+        &self,
+        invite_id: &str,
+        secret: &str,
+        credential: &str,
+    ) -> Result<(WorkspaceInvite, Principal)> {
         // The credential is the proof of identity: the same active-only
         // resolve the `/ws` bearer gate runs, so a revoked one is refused
         // here exactly as it would be at upgrade.
@@ -581,6 +680,12 @@ impl Services {
             .await?
             .ok_or(Error::Invite(InviteErrorKind::CredentialInvalid))?;
         let principal = self.store.get_principal(&principal_id).await?;
+        // The host owner's own account cannot join as a guest: a credential
+        // that resolves to the primary row (minted before this guard
+        // existed) identifies the owner, not a guest.
+        if principal.is_primary {
+            return Err(Error::Invite(InviteErrorKind::OwnerSelfJoin));
+        }
         // Only a GitHub-verified guest can join by invite (the join is keyed
         // by `github_user_id`); a credential bound to any other principal
         // does not identify one.
@@ -594,197 +699,156 @@ impl Services {
         {
             return Err(Error::Invite(InviteErrorKind::PinMismatch));
         }
-        self.commit_invite_join(&invite, &principal).await
+        Ok((invite, principal))
     }
 
-    /// `invite.redeem` phase 1: see
-    /// [`intent_core::WorkspaceApi::invite_redeem_start`].
-    pub(crate) async fn invite_redeem_start_op(
-        &self,
-        invite_id: &str,
-        secret: &str,
-    ) -> Result<Value> {
+    /// `invite.challenge`: see
+    /// [`intent_core::WorkspaceApi::invite_challenge`]. The nonce takes a
+    /// daemon-wide permit and counts against the invite's outstanding
+    /// nonces; either bound spent is [`InviteErrorKind::FlowBusy`].
+    pub(crate) async fn invite_challenge_op(&self, invite_id: &str, secret: &str) -> Result<Value> {
         let (invite, ws) = self.open_invite(invite_id, secret).await?;
-
-        // Reserve the flow's capacity before the upstream device-code
-        // request: purge collectable slots (returning their permits), then
-        // take one — a refused start never reaches GitHub. The permit is
-        // held by this frame until it moves into the slot below, so a start
-        // that fails upstream releases it on return.
-        purge_flows(&mut *self.invite_flows.lock().await);
-        let Ok(permit) = self.invite_flow_permits.clone().try_acquire_owned() else {
-            return Err(Error::Invite(InviteErrorKind::FlowBusy));
-        };
-        let client_id = self
-            .effective_settings()
-            .source_control
-            .github
-            .oauth_client_id;
-        let login_base =
-            github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref());
-        let api_base = resolve_api_base_uri(self.github_api_base_uri.as_deref());
-        let (auth, flow) = intent_sourcecontrol::device_flow::start_identity_at(
-            &login_base,
-            api_base.as_deref(),
-            &client_id,
-        )
-        .await
-        .map_err(pr_ops::map_sc_err)?;
-
-        let flow_id = uuid::Uuid::new_v4().to_string();
-        let deadline = Instant::now() + Duration::from_secs(auth.expires_in);
-        let (done, _) = watch::channel(false);
-        self.invite_flows.lock().await.insert(
-            flow_id.clone(),
-            InviteFlowSlot {
-                invite_id: invite.id.clone(),
-                deadline,
-                settled_at: None,
-                committing: false,
-                outcome: None,
-                done,
-                _permit: permit,
-            },
-        );
-        intent_core::spawn_daemon(
-            self.clone()
-                .poll_invite_flow(flow_id.clone(), flow, deadline),
-        );
+        let nonce = random_nonce();
+        let now = Instant::now();
+        let issued_at = SystemTime::now();
+        let expires_at = now + NONCE_TTL;
+        let nonce_expires_at = iso_ms_from_now(u64::try_from(NONCE_TTL.as_millis()).unwrap_or(0));
+        {
+            let mut nonces = self.invite_nonces.lock().await;
+            purge_nonces(&mut nonces, now);
+            if nonces
+                .values()
+                .filter(|slot| slot.invite_id == invite.id)
+                .count()
+                >= MAX_NONCES_PER_INVITE
+            {
+                return Err(Error::Invite(InviteErrorKind::FlowBusy));
+            }
+            let Ok(permit) = self.invite_nonce_permits.clone().try_acquire_owned() else {
+                return Err(Error::Invite(InviteErrorKind::FlowBusy));
+            };
+            nonces.insert(
+                nonce.clone(),
+                NonceSlot {
+                    invite_id: invite.id.clone(),
+                    issued_at,
+                    expires_at,
+                    _permit: permit,
+                },
+            );
+        }
         Ok(json!({
-            "flowId": flow_id,
-            "userCode": auth.user_code,
-            "verificationUri": auth.verification_uri,
-            "expiresIn": auth.expires_in,
-            "interval": auth.interval,
             "workspaceId": invite.workspace_id,
             "workspaceTitle": ws.title,
+            "nonce": nonce,
+            "nonceExpiresAt": nonce_expires_at,
         }))
     }
 
-    /// `invite.redeem` phase 2: see
-    /// [`intent_core::WorkspaceApi::invite_redeem_wait`].
-    pub(crate) async fn invite_redeem_wait_op(&self, flow_id: &str) -> Result<Value> {
-        let (mut done, deadline) = {
-            let mut flows = self.invite_flows.lock().await;
-            let Some(slot) = flows.get_mut(flow_id) else {
-                return Err(Error::Invite(InviteErrorKind::FlowNotFound));
-            };
-            if slot.outcome.is_some() {
-                let slot = flows.remove(flow_id).expect("slot present");
-                return slot.outcome.expect("settled outcome");
-            }
-            (slot.done.subscribe(), slot.deadline)
-        };
-        let budget = deadline
-            .saturating_duration_since(Instant::now())
-            .saturating_add(Duration::from_secs(5));
-        let mut settled = tokio::time::timeout(budget, done.wait_for(|d| *d))
-            .await
-            .is_ok_and(|r| r.is_ok());
-        // A timeout while the poll task is committing the join must not
-        // purge the slot: the grant is spent and the credential is (about to
-        // be) stored, and this outcome is the only copy of the token. Stay
-        // attached for the commit's grace and collect it.
-        if !settled {
-            let committing = {
-                let flows = self.invite_flows.lock().await;
-                flows
-                    .get(flow_id)
-                    .is_some_and(|slot| slot.committing && slot.outcome.is_none())
-            };
-            if committing {
-                settled = tokio::time::timeout(JOIN_COMMIT_GRACE, done.wait_for(|d| *d))
-                    .await
-                    .is_ok_and(|r| r.is_ok());
-            }
+    /// `invite.prove`: see [`intent_core::WorkspaceApi::invite_prove`].
+    pub(crate) async fn invite_prove_op(
+        &self,
+        invite_id: &str,
+        secret: &str,
+        nonce: &str,
+        gist_id: &str,
+        login: &str,
+    ) -> Result<Value> {
+        let login = login.trim();
+        if !valid_login(login) {
+            return Err(Error::InvalidParams(
+                "`login` must be a GitHub login (1-39 alphanumerics or hyphens)".to_string(),
+            ));
         }
-        let mut flows = self.invite_flows.lock().await;
-        let Some(slot) = flows.remove(flow_id) else {
-            return Err(Error::Invite(InviteErrorKind::FlowNotFound));
-        };
-        if let Some(outcome) = slot.outcome {
-            return outcome;
+        let gist_id = gist_id.trim();
+        if gist_id.is_empty() || !gist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::InvalidParams(
+                "`gistId` must be a non-empty alphanumeric gist id".to_string(),
+            ));
         }
-        debug_assert!(!settled, "done flipped without an outcome");
-        Err(Error::Invite(InviteErrorKind::FlowExpired))
+        let (invite, _) = self.open_invite(invite_id, secret).await?;
+
+        // Consume the nonce under the lock: exactly one concurrent attempt
+        // gets the slot; every other one is `ProofInvalid` right here. The
+        // slot (and its permit) is held by this frame until the verdict —
+        // put back only when GitHub could not be consulted.
+        let slot = {
+            let mut nonces = self.invite_nonces.lock().await;
+            nonces.remove(nonce.trim())
+        };
+        let Some(slot) = slot else {
+            return Err(Error::Invite(InviteErrorKind::ProofInvalid));
+        };
+        if slot.invite_id != invite.id {
+            return Err(Error::Invite(InviteErrorKind::ProofInvalid));
+        }
+        if slot.expires_at <= Instant::now() {
+            return Err(Error::Invite(InviteErrorKind::ProofExpired));
+        }
+
+        let sc = self.proof_source_control().await?;
+        let gist = match sc.get_proof_gist(gist_id).await {
+            Ok(gist) => gist,
+            // An unknown gist, or one GitHub served without an `owner.login`
+            // / `created_at` (anonymous or malformed — it can never establish
+            // the claimed identity), is an invalid proof: the nonce stays
+            // spent, no retry is owed.
+            Err(
+                intent_sourcecontrol::Error::NotFound(_) | intent_sourcecontrol::Error::Decode(_),
+            ) => {
+                return Err(Error::Invite(InviteErrorKind::ProofInvalid));
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, gist_id, "proof gist read failed");
+                self.restore_nonce(nonce, slot).await;
+                return Err(Error::Invite(InviteErrorKind::GithubUnreachable));
+            }
+        };
+        if !proof_matches(&gist, login, nonce.trim(), slot.issued_at) {
+            return Err(Error::Invite(InviteErrorKind::ProofInvalid));
+        }
+        let user = match sc.get_user_by_login(login).await {
+            Ok(user) => user,
+            Err(intent_sourcecontrol::Error::NotFound(_)) => {
+                return Err(Error::Invite(InviteErrorKind::ProofInvalid));
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, login, "proof account lookup failed");
+                self.restore_nonce(nonce, slot).await;
+                return Err(Error::Invite(InviteErrorKind::GithubUnreachable));
+            }
+        };
+        // `GET /users/{login}` is the authority on the account; the gist's
+        // owner already matched the claim case-insensitively.
+        // repo-slug-fold: allow — a GitHub user login (case-insensitive on GitHub), not a repo slug
+        if !user.login.eq_ignore_ascii_case(&gist.owner_login) {
+            return Err(Error::Invite(InviteErrorKind::ProofInvalid));
+        }
+        drop(slot);
+        self.complete_invite_join(&invite.id, &user).await
     }
 
-    /// Background poll loop of one identity flow: ticks at the engine's
-    /// interval until GitHub settles the grant or `deadline` passes, then
-    /// records the outcome on the slot (which may already have been purged —
-    /// then the result is dropped and the invite stays open).
-    async fn poll_invite_flow(self, flow_id: String, mut flow: IdentityFlow, deadline: Instant) {
-        let mut consecutive_errors = 0u32;
-        let outcome = loop {
-            tokio::time::sleep(Duration::from_secs(flow.interval_secs())).await;
-            if Instant::now() >= deadline {
-                break Err(Error::Invite(InviteErrorKind::FlowExpired));
-            }
-            if !self.invite_flows.lock().await.contains_key(&flow_id) {
-                tracing::debug!(flow_id, "invite flow abandoned; poll task exiting");
-                return;
-            }
-            match flow.poll_once().await {
-                Ok(IdentityPollStatus::Pending) => consecutive_errors = 0,
-                Ok(IdentityPollStatus::Authorized(user)) => {
-                    // Claim the slot for the commit under the lock: from
-                    // here a timed-out waiter keeps the slot (see
-                    // `invite_redeem_wait_op`) instead of dropping the
-                    // outcome that carries the credential.
-                    let invite_id = {
-                        let mut flows = self.invite_flows.lock().await;
-                        flows.get_mut(&flow_id).map(|s| {
-                            s.committing = true;
-                            s.invite_id.clone()
-                        })
-                    };
-                    let Some(invite_id) = invite_id else {
-                        return;
-                    };
-                    break self.complete_invite_join(&invite_id, &user).await;
-                }
-                Ok(IdentityPollStatus::Expired) => {
-                    break Err(Error::Invite(InviteErrorKind::FlowExpired));
-                }
-                Ok(IdentityPollStatus::Denied) => {
-                    break Err(Error::Invite(InviteErrorKind::FlowDenied));
-                }
-                Err(e) => {
-                    // A failure *after* the grant (the one `GET /user`) is
-                    // terminal: the device code is spent and must not be
-                    // polled again. Pre-grant blips keep the retry budget.
-                    if flow.is_spent() {
-                        tracing::debug!(error = %e, "invite identity lookup failed after grant");
-                        break Err(Error::Invite(InviteErrorKind::FlowError));
-                    }
-                    consecutive_errors += 1;
-                    tracing::debug!(
-                        error = %e,
-                        attempt = consecutive_errors,
-                        "invite identity flow poll failed"
-                    );
-                    if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
-                        break Err(Error::Invite(InviteErrorKind::FlowError));
-                    }
-                }
-            }
-        };
-        let mut flows = self.invite_flows.lock().await;
-        if let Some(slot) = flows.get_mut(&flow_id) {
-            slot.outcome = Some(outcome);
-            slot.settled_at = Some(Instant::now());
-            let _ = slot.done.send(true);
-        }
+    /// Put a consumed nonce back for a retry after GitHub could not be
+    /// reached (its lifetime keeps running).
+    async fn restore_nonce(&self, nonce: &str, slot: NonceSlot) {
+        let mut nonces = self.invite_nonces.lock().await;
+        nonces.entry(nonce.trim().to_string()).or_insert(slot);
     }
 
-    /// The device-flow join, once the invitee's GitHub identity is proven:
-    /// re-check the invite (pin, still open), map the resolved account onto
-    /// a fresh principal row and commit through [`Self::commit_invite_join`].
+    /// The first-time join, once the invitee's GitHub identity is proven:
+    /// refuse the host owner's own account
+    /// ([`InviteErrorKind::OwnerSelfJoin`] — the earliest point the identity
+    /// is known, so the owner never receives a guest credential), re-check
+    /// the invite (pin, still open), map the resolved account onto a fresh
+    /// principal row and commit through [`Self::commit_invite_join`].
     async fn complete_invite_join(&self, invite_id: &str, user: &UserIdentity) -> Result<Value> {
         let github_user_id = user
             .id
             .and_then(|id| i64::try_from(id).ok())
             .ok_or_else(|| Error::Internal("github identity carries no account id".to_string()))?;
+        if self.store.get_primary_principal().await?.github_user_id == Some(github_user_id) {
+            return Err(Error::Invite(InviteErrorKind::OwnerSelfJoin));
+        }
         let invite = self
             .store
             .get_workspace_invite(invite_id)
@@ -810,35 +874,51 @@ impl Services {
             updated_at: now_iso(),
         };
         apply_identity(&mut identity, user);
-        self.commit_invite_join(&invite, &identity).await
+        self.commit_invite_join(&invite, &identity, None).await
     }
 
-    /// The join shared by the device flow and `invite.accept`: in one store
-    /// transaction ([`intent_store::Store::join_workspace_by_invite`]) mint
-    /// or reuse the principal keyed by `identity.github_user_id`, redeem the
-    /// invite (the conditional UPDATE is the single-use guard), add the
-    /// `collaborator` membership and record a fresh per-principal
-    /// credential. The event is published only after the commit; the
-    /// credential is returned exactly once, in the `authorized` result.
+    /// The join shared by the gist proof and `invite.accept`: in one store
+    /// transaction
+    /// ([`intent_store::Store::join_workspace_by_invite`]) mint or reuse the
+    /// principal keyed by `identity.github_user_id`, redeem the invite (the
+    /// conditional UPDATE is the single-use guard of a pinned invite; a
+    /// reusable one stays open), add the `collaborator` membership (a
+    /// returning member's re-join is idempotent), record a fresh
+    /// per-principal credential and consume
+    /// `rotate_from_hash` (the credential an `invite.accept` presented) when
+    /// given — a hash that is not exactly one active credential of the
+    /// joining principal at that moment refuses the whole join as
+    /// [`InviteErrorKind::CredentialInvalid`] with nothing written, and an
+    /// account that resolves to the primary principal as
+    /// [`InviteErrorKind::OwnerSelfJoin`] (the transaction-level guard
+    /// behind the early checks above). The
+    /// event is published only after the commit — `members: true` +
+    /// `addedPrincipalId` when a membership was added, `invites: true` alone
+    /// for a member's re-join (only the invite's last-redemption stamp
+    /// moved); the credential is returned exactly once, in the `authorized`
+    /// result.
     async fn commit_invite_join(
         &self,
         invite: &WorkspaceInvite,
         identity: &Principal,
+        rotate_from_hash: Option<&str>,
     ) -> Result<Value> {
         let invite_id = invite.id.as_str();
         let token = random_hex_secret();
-        let principal = match self
+        let (principal, member_added) = match self
             .store
             .join_workspace_by_invite(
                 invite_id,
                 &invite.workspace_id,
                 identity,
                 &hash_secret(&token),
+                rotate_from_hash,
                 self.max_guests_per_workspace(),
             )
             .await?
         {
-            InviteJoinOutcome::Joined(principal) => principal,
+            InviteJoinOutcome::Joined(principal) => (principal, true),
+            InviteJoinOutcome::Rejoined(principal) => (principal, false),
             InviteJoinOutcome::Closed => {
                 let kind = self
                     .store
@@ -851,19 +931,27 @@ impl Services {
             InviteJoinOutcome::WorkspaceFull => {
                 return Err(Error::Invite(InviteErrorKind::WorkspaceFull));
             }
+            InviteJoinOutcome::CredentialInvalid => {
+                return Err(Error::Invite(InviteErrorKind::CredentialInvalid));
+            }
+            InviteJoinOutcome::OwnerSelfJoin => {
+                return Err(Error::Invite(InviteErrorKind::OwnerSelfJoin));
+            }
         };
         let member_count = self.member_count(&invite.workspace_id).await?;
+        let changes = if member_added {
+            json!({
+                "members": true,
+                "invites": true,
+                "addedPrincipalId": principal.id,
+                "memberCount": member_count,
+            })
+        } else {
+            json!({ "invites": true, "memberCount": member_count })
+        };
         crate::publish_event(
             self.event_bus.as_ref(),
-            crate::workspace_updated_event(
-                &invite.workspace_id,
-                &json!({
-                    "members": true,
-                    "invites": true,
-                    "addedPrincipalId": principal.id,
-                    "memberCount": member_count,
-                }),
-            ),
+            crate::workspace_updated_event(&invite.workspace_id, &changes),
         )
         .await;
         Ok(json!({
@@ -874,16 +962,6 @@ impl Services {
             "workspaceId": invite.workspace_id,
         }))
     }
-}
-
-/// Drop settled slots past their collection grace and pending slots whose
-/// codes expired long enough ago that no waiter can still be attached.
-fn purge_flows(flows: &mut HashMap<String, InviteFlowSlot>) {
-    let now = Instant::now();
-    flows.retain(|_, slot| match slot.settled_at {
-        Some(at) => now.saturating_duration_since(at) < SETTLED_FLOW_GRACE,
-        None => now.saturating_duration_since(slot.deadline) < SETTLED_FLOW_GRACE,
-    });
 }
 
 #[cfg(test)]

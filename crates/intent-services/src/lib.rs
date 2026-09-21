@@ -993,12 +993,11 @@ pub struct Services {
     /// minting (multiplayer w4): see
     /// [`principal_ops::IdentityTransitionLock`]. Shared across clones.
     identity_transition: principal_ops::IdentityTransitionLock,
-    /// In-flight identity-only device flows started by `invite.redeem`
-    /// (multiplayer w4), keyed by flow id; shared across clones.
-    invite_flows: invite_ops::InviteFlowState,
-    /// Admission permits for those flows (`MAX_INFLIGHT_INVITE_FLOWS`),
-    /// taken before the upstream device-code request.
-    invite_flow_permits: invite_ops::InviteFlowPermits,
+    /// Outstanding `invite.challenge` nonces awaiting their `invite.prove`
+    /// (gist identity proof), keyed by nonce; shared across clones.
+    invite_nonces: invite_ops::InviteNonceState,
+    /// Admission permits for those nonces (`MAX_OUTSTANDING_NONCES`).
+    invite_nonce_permits: invite_ops::InviteNoncePermits,
     /// Live feed of principals whose credentials were just revoked
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
@@ -1006,9 +1005,9 @@ pub struct Services {
     /// Ephemeral workspace / note presence table (multiplayer w5), shared
     /// with the caret coalescer's trailing-flush tasks.
     presence: Arc<presence::PresenceRegistry>,
-    /// Test-only override for the GitHub API base the identity-only flow's
-    /// `GET /user` talks to (`None` → `$INTENTD_GITHUB_API_BASE_URI` →
-    /// api.github.com).
+    /// Test-only override for the GitHub API base the invite identity reads
+    /// (`invite.prove`, the primary's `GET /user` refresh) talk to (`None` →
+    /// `$INTENTD_GITHUB_API_BASE_URI` → api.github.com).
     github_api_base_uri: Option<String>,
     /// Shared cache + offload gates for git-derived aggregates that are still
     /// computed on demand (`diffSummary` for explicit callers, `CoW` support
@@ -1379,8 +1378,8 @@ impl Services {
             gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
-            invite_flows: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            invite_flow_permits: invite_ops::new_flow_permits(),
+            invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            invite_nonce_permits: invite_ops::new_nonce_permits(),
             principal_revocations: tokio::sync::broadcast::channel(
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
@@ -1582,9 +1581,9 @@ impl Services {
         self
     }
 
-    /// Override the GitHub API base the identity-only invite flow's
-    /// `GET /user` talks to (multiplayer w4 test seam). Production wiring
-    /// keeps `None` (env override → api.github.com).
+    /// Override the GitHub API base the invite identity reads talk to
+    /// (multiplayer w4 test seam). Production wiring keeps `None` (env
+    /// override → api.github.com).
     #[must_use]
     pub fn with_github_api_base_uri(mut self, base_uri: impl Into<String>) -> Self {
         self.github_api_base_uri = Some(base_uri.into());
@@ -30535,6 +30534,60 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Guest half of the gist identity-proof join flow: the proof gist is
+        // made with the STORED device-flow token only (never the env / `gh`
+        // fallbacks), against the same API host the reconnect guard uses.
+        // 🔒 The token stays server-side; only `{ gistId, login }` crosses.
+        let secrets = self.secrets.clone();
+        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        Box::pin(async move {
+            Self::require_administrator("github.identityProof.create")?;
+            let nonce = github_auth_ops::proof_line_param("nonce", &nonce)?;
+            let host_label = github_auth_ops::proof_line_param("hostLabel", &host_label)?;
+            let token = github_auth_ops::load_stored_token(&secrets).await?;
+            let gist = intent_sourcecontrol::identity_proof::create_proof_gist(
+                &token,
+                api_base.as_deref(),
+                &nonce,
+                &host_label,
+            )
+            .await
+            .map_err(github_auth_ops::map_identity_proof_err)?;
+            Ok(serde_json::json!({ "gistId": gist.gist_id, "login": gist.login }))
+        })
+    }
+
+    fn github_identity_proof_delete(
+        &self,
+        gist_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let secrets = self.secrets.clone();
+        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        Box::pin(async move {
+            Self::require_administrator("github.identityProof.delete")?;
+            let gist_id = gist_id.trim();
+            if gist_id.is_empty() || !gist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(Error::InvalidParams(
+                    "gistId must be a non-empty alphanumeric gist id".to_string(),
+                ));
+            }
+            let token = github_auth_ops::load_stored_token(&secrets).await?;
+            intent_sourcecontrol::identity_proof::delete_proof_gist(
+                &token,
+                api_base.as_deref(),
+                gist_id,
+            )
+            .await
+            .map_err(github_auth_ops::map_identity_proof_err)?;
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
     // ========================================================================
     // sourceControl.* — provider-generic auth (§5.27, v10.5); see
     // `source_control_auth_ops`. The `github.*` quintet above is the
@@ -30858,7 +30911,7 @@ impl WorkspaceApi for Services {
         })
     }
 
-    // Invites + identity-only join (multiplayer w4) — see `invite_ops`.
+    // Invites + join (multiplayer w4) — see `invite_ops`.
 
     fn workspace_members_leave(
         &self,
@@ -30962,18 +31015,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn invite_redeem_start(
-        &self,
-        invite_id: String,
-        secret: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.invite_redeem_start_op(&invite_id, &secret).await })
-    }
-
-    fn invite_redeem_wait(&self, flow_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.invite_redeem_wait_op(&flow_id).await })
-    }
-
     fn invite_inspect(
         &self,
         invite_id: String,
@@ -30990,6 +31031,28 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.invite_accept_op(&invite_id, &secret, &credential)
+                .await
+        })
+    }
+
+    fn invite_challenge(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.invite_challenge_op(&invite_id, &secret).await })
+    }
+
+    fn invite_prove(
+        &self,
+        invite_id: String,
+        secret: String,
+        nonce: String,
+        gist_id: String,
+        login: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.invite_prove_op(&invite_id, &secret, &nonce, &gist_id, &login)
                 .await
         })
     }
