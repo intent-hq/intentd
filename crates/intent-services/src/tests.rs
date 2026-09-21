@@ -16215,6 +16215,9 @@ pub(crate) mod pr {
         >,
         /// Every gist id handed to `get_proof_gist`, in call order.
         pub(crate) seen_proof_gists: std::sync::Mutex<Vec<String>>,
+        /// How many times `get_user` was called (the primary identity
+        /// refresh tests assert exactly one spawn per interval).
+        pub(crate) get_user_calls: std::sync::atomic::AtomicU64,
     }
 
     impl StubForge {
@@ -16295,6 +16298,8 @@ pub(crate) mod pr {
             })
         }
         async fn get_user(&self) -> ScResult<UserIdentity> {
+            self.get_user_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(UserIdentity {
                 login: "octocat".into(),
                 id: Some(583_231),

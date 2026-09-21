@@ -376,6 +376,14 @@ impl Services {
 
     /// `workspace.members.list`: see
     /// [`intent_core::WorkspaceApi::workspace_members_list`].
+    ///
+    /// A list by the primary user (the owner's wire caller, or an agent /
+    /// the daemon acting for it) whose cached primary row has no GitHub
+    /// login yet spawns the same rate-limited, detached identity refresh
+    /// `principal.me` does (intent-hq/intent#5534): the rows already
+    /// loaded are served as-is, and the next list carries the attached
+    /// identity. No extra store read — the primary row comes from the
+    /// principal snapshot the rows are enriched from.
     pub(crate) async fn workspace_members_list_op(
         &self,
         workspace_id: &WorkspaceId,
@@ -391,6 +399,19 @@ impl Services {
             .into_iter()
             .map(|p| (p.id.clone(), p))
             .collect();
+        if let Some(primary) = principals
+            .values()
+            .find(|p| p.is_primary && p.login.is_none())
+        {
+            let caller_is_primary = match current_caller() {
+                Some(Caller::Wire { principal_id, .. }) => principal_id == primary.id,
+                Some(Caller::Agent { .. } | Caller::Daemon) => true,
+                None => false,
+            };
+            if caller_is_primary {
+                self.spawn_primary_identity_refresh(primary.clone()).await;
+            }
+        }
         let rows: Vec<Value> = members
             .iter()
             .map(|m| {
@@ -1330,6 +1351,74 @@ mod tests {
             .await
             .expect("visible ids")
             .is_none());
+    }
+
+    /// `workspace.members.list` by the primary user whose cached row has no
+    /// GitHub login spawns the same rate-limited background identity
+    /// refresh `principal.me` does (intent-hq/intent#5534): the triggering
+    /// response serves the cached row (it never waits on `GET /user`), a
+    /// later list carries the attached `login` / `displayName`, and a
+    /// second list inside the refresh interval spawns nothing — exactly one
+    /// `GET /user` in total.
+    #[tokio::test]
+    async fn members_list_refreshes_the_primary_identity_off_path() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let primary = store.get_primary_principal().await.expect("primary");
+        assert!(
+            primary.login.is_none(),
+            "a fresh primary row has no identity"
+        );
+        let forge = std::sync::Arc::new(crate::tests::pr::StubForge::default());
+        let services = Services::new(store.clone()).with_source_control(forge.clone());
+        let list = || {
+            with_caller(
+                Caller::Wire {
+                    principal_id: primary.id.clone(),
+                    is_administrator: true,
+                },
+                services.workspace_members_list_op(&ws),
+            )
+        };
+
+        let first = list().await.expect("first list");
+        assert_eq!(first["members"][0]["principalId"], json!(primary.id.0));
+        assert_eq!(
+            first["members"][0]["login"],
+            Value::Null,
+            "the triggering read serves the cached row"
+        );
+        list().await.expect("second list inside the interval");
+
+        let attached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let p = store.get_primary_principal().await.expect("primary");
+                if p.login.is_some() {
+                    break p;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the background refresh attaches the identity");
+        assert_eq!(attached.login.as_deref(), Some("octocat"));
+
+        let later = list().await.expect("later list");
+        assert_eq!(later["members"][0]["login"], json!("octocat"));
+        assert_eq!(later["members"][0]["displayName"], json!("The Octocat"));
+        assert_eq!(
+            later["members"][0]["avatarUrl"],
+            json!("https://avatars.example/u/1")
+        );
+        assert_eq!(
+            forge
+                .get_user_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one refresh for three lists inside the interval"
+        );
     }
 
     /// Unshare: removal by the owner drops the member's role and answers its
