@@ -1,6 +1,6 @@
 [package]
 name = "intent-transport"
-version = "0.9.89"
+version = "0.9.90"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,8 +8,8 @@ license.workspace = true
 description = "UDS/TCP/TLS listeners, JSON-RPC router, auth, heartbeat, lifecycle (§16)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.89" }
-intent-services = { path = "../intent-services", version = "0.9.89" }
+intent-core = { path = "../intent-core", version = "0.9.90" }
+intent-services = { path = "../intent-services", version = "0.9.90" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -47,7 +47,7 @@ ctor = "1.0.10"
 # `intent_store::Store`. `intent-store` depends only on `intent-core`, so this
 # dev-only edge introduces no cycle; the normal-build dependency direction
 # (transport → services only) is unchanged.
-intent-store = { path = "../intent-store", version = "0.9.89" }
+intent-store = { path = "../intent-store", version = "0.9.90" }
 
 [lints]
 workspace = true

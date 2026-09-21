@@ -1,6 +1,6 @@
 [package]
 name = "intentd"
-version = "0.9.89"
+version = "0.9.90"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -24,15 +24,15 @@ tracing-appender = { workspace = true }
 directories = { workspace = true }
 sqlx = { workspace = true }
 
-intent-core = { path = "../intent-core", version = "0.9.89" }
-intent-store = { path = "../intent-store", version = "0.9.89" }
-intent-services = { path = "../intent-services", version = "0.9.89" }
-intent-acp = { path = "../intent-acp", version = "0.9.89" }
-intent-providers = { path = "../intent-providers", version = "0.9.89" }
-intent-git = { path = "../intent-git", version = "0.9.89" }
-intent-context = { path = "../intent-context", version = "0.9.89" }
-intent-transport = { path = "../intent-transport", version = "0.9.89" }
-intent-js = { path = "../intent-js", version = "0.9.89", optional = true }
+intent-core = { path = "../intent-core", version = "0.9.90" }
+intent-store = { path = "../intent-store", version = "0.9.90" }
+intent-services = { path = "../intent-services", version = "0.9.90" }
+intent-acp = { path = "../intent-acp", version = "0.9.90" }
+intent-providers = { path = "../intent-providers", version = "0.9.90" }
+intent-git = { path = "../intent-git", version = "0.9.90" }
+intent-context = { path = "../intent-context", version = "0.9.90" }
+intent-transport = { path = "../intent-transport", version = "0.9.90" }
+intent-js = { path = "../intent-js", version = "0.9.90", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
@@ -45,17 +45,17 @@ js-engine = ["dep:intent-js"]
 
 [dev-dependencies]
 uuid = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.9.89" }
-intent-acp = { path = "../intent-acp", version = "0.9.89" }
-intent-providers = { path = "../intent-providers", version = "0.9.89" }
-intent-core = { path = "../intent-core", version = "0.9.89" }
-intent-store = { path = "../intent-store", version = "0.9.89" }
+intent-services = { path = "../intent-services", version = "0.9.90" }
+intent-acp = { path = "../intent-acp", version = "0.9.90" }
+intent-providers = { path = "../intent-providers", version = "0.9.90" }
+intent-core = { path = "../intent-core", version = "0.9.90" }
+intent-store = { path = "../intent-store", version = "0.9.90" }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
 # never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
-intent-linear = { path = "../intent-linear", version = "0.9.89" }
+intent-linear = { path = "../intent-linear", version = "0.9.90" }
 # `uds_sentry.rs` injects a stub `SentryEngine` so the `sentry.*` e2e slice
 # never touches the network (no token, no REST call).
-intent-sentry = { path = "../intent-sentry", version = "0.9.89" }
+intent-sentry = { path = "../intent-sentry", version = "0.9.90" }
 # `e2e_wss_voice_transcribe.rs` injects a stub `VoiceEngine` so the
 # `voice.transcribe` e2e slice never touches the network (no key, no HTTP).
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
@@ -77,7 +77,7 @@ chrono = "0.4"
 ctor = "1.0.10"
 tempfile = "3"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.89" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.90" }
 # `e2e_pty_job_control.rs` boots the daemon inside a real PTY session as a
 # member of a background process group (intent-hq/intent#4231 hazard class).
 portable-pty = { workspace = true }

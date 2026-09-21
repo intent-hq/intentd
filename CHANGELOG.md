@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.90] - 2026-09-21
+
+### 🐛 Bug Fixes
+
+- *(agent)* Fit agent.list rows to a response-level frame budget ([#2039](https://github.com/intent-hq/intentd/pull/2039))
+
+
 ## [0.9.89] - 2026-09-21
 
 ### 🚀 Features
