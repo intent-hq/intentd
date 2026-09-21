@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.89] - 2026-09-21
+
+### 🚀 Features
+
+- *(invite)* Invite.inspect and invite.accept for a returning guest on /invite ([#1963](https://github.com/intent-hq/intentd/pull/1963))
+- *(github)* Gist scope + github.identityProof.create/delete ([#1965](https://github.com/intent-hq/intentd/pull/1965))
+- *(invite)* Invite.challenge and invite.prove (nonce + gist identity proof) on /invite ([#1967](https://github.com/intent-hq/intentd/pull/1967))
+- *(multiplayer)* Make unpinned invite links reusable until expiry or revocation ([#1988](https://github.com/intent-hq/intentd/pull/1988))
+- *(multiplayer)* Refuse agent creation and delegation for collaborators ([#1998](https://github.com/intent-hq/intentd/pull/1998))
+- *(multiplayer)* Prepend a sender preamble to collaborator messages ([#1987](https://github.com/intent-hq/intentd/pull/1987))
+- *(principal)* Principal.list — owner-only roster of credentialed guests ([#2023](https://github.com/intent-hq/intentd/pull/2023))
+- *(workspace)* Workspace.members.add — direct member add with live guest delivery ([#2025](https://github.com/intent-hq/intentd/pull/2025))
+
+### 🐛 Bug Fixes
+
+- *(store)* Treat write-pool acquire timeouts as transient in the retry helpers ([#2030](https://github.com/intent-hq/intentd/pull/2030))
+- *(invite)* Refuse the host owner's own account joining as a guest ([#1986](https://github.com/intent-hq/intentd/pull/1986))
+
+### 🧪 Testing
+
+- *(transport)* Bound tunnel backpressure test waits by wall clock, not yield counts ([#2033](https://github.com/intent-hq/intentd/pull/2033))
+- *(services)* Presence deferred-flush test waits on the observable flush ([#2031](https://github.com/intent-hq/intentd/pull/2031))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(invite)* Remove the host-side device flow (invite.redeem) ([#1969](https://github.com/intent-hq/intentd/pull/1969))
+
+
 ## [0.9.88] - 2026-09-20
 
 ### 🚀 Features

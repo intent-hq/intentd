@@ -99,14 +99,50 @@ fn is_busy_message(msg: &str) -> bool {
         .any(|code| msg.contains(code))
 }
 
-/// Shared `SQLITE_BUSY` retry loop backing [`with_write_txn_retry`] and
+/// sqlx's `Display` for [`sqlx::Error::PoolTimedOut`] — the only text the
+/// retry helpers can classify on, since every repository flattens pool
+/// failures into `Error::Internal(String)` via `format!("… failed: {e}")`.
+/// Kept as a shared constant so the classifier and its tests cannot drift
+/// from each other.
+const POOL_TIMED_OUT_MESSAGE: &str = "pool timed out while waiting for an open connection";
+
+/// True when an error message reports a `PoolTimedOut` from `pool.acquire()`
+/// / `pool.begin()`. On the single-connection write pool this means another
+/// in-process writer held the connection for the whole acquire window
+/// (`WRITE_ACQUIRE_TIMEOUT`) — a saturation signal, not a defect in the
+/// statement being run (intent-hq/intent#5511). `PoolClosed` ("attempted to
+/// acquire a connection on a closed pool") deliberately does not match: it
+/// means the store is shutting down and a retry can never succeed.
+fn is_pool_timeout_message(msg: &str) -> bool {
+    msg.contains(POOL_TIMED_OUT_MESSAGE)
+}
+
+/// True when an error is a transient contention signal worth retrying:
+/// `SQLITE_BUSY`-family ([`is_busy_message`]) or a pool acquire timeout
+/// ([`is_pool_timeout_message`]).
+fn is_transient_message(msg: &str) -> bool {
+    is_busy_message(msg) || is_pool_timeout_message(msg)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only observer: counts the pool acquire timeouts [`with_busy_retry`]
+    /// sees on the current task, whether or not they are retried. Scoped per
+    /// task so a test can prove the exact operation it wraps really hit
+    /// `PoolTimedOut` (see `append_agent_message_survives_write_pool_acquire_timeout`)
+    /// without a global counter that other parallel tests could bump.
+    pub(crate) static POOL_TIMEOUT_OBSERVER: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
+/// Shared transient-error retry loop backing [`with_write_txn_retry`] and
 /// [`with_read_retry`]. Executes the given async closure, retrying only when
-/// the error is a transient `SQLITE_BUSY` (`Error::Internal` whose message
-/// carries a busy-family result code, see [`is_busy_message`]). Backoff is
+/// the error is transient contention (`Error::Internal` whose message
+/// carries a busy-family result code or a pool acquire timeout, see
+/// [`is_transient_message`]). Backoff is
 /// jittered exponential: ~50ms base doubling per attempt (±25% jitter), with
 /// each sleep capped at 5s and clamped to the remaining `deadline` so the
 /// loop degrades to steady polling until `deadline` is exhausted, at which
-/// point the last error is returned. Non-busy errors are returned
+/// point the last error is returned. Non-transient errors are returned
 /// immediately.
 async fn with_busy_retry<F, Fut, T>(f: F, deadline: Duration) -> Result<T>
 where
@@ -122,9 +158,15 @@ where
         match f().await {
             Ok(result) => return Ok(result),
             Err(e) => {
-                // Only retry on SQLITE_BUSY-family errors (database is locked)
-                let busy = matches!(&e, Error::Internal(msg) if is_busy_message(msg));
-                if !busy || start.elapsed() >= deadline {
+                #[cfg(test)]
+                if matches!(&e, Error::Internal(msg) if is_pool_timeout_message(msg)) {
+                    let _ = POOL_TIMEOUT_OBSERVER
+                        .try_with(|seen| seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+                }
+                // Only retry on transient contention: SQLITE_BUSY-family
+                // (database is locked) or a pool acquire timeout.
+                let transient = matches!(&e, Error::Internal(msg) if is_transient_message(msg));
+                if !transient || start.elapsed() >= deadline {
                     return Err(e);
                 }
 
@@ -146,13 +188,19 @@ where
 }
 
 /// Retry helper for write transactions that may hit `SQLITE_BUSY` during lock upgrade
-/// (STAB-7). Executes the given async transaction closure via the shared
-/// [`with_busy_retry`] loop (~30s total window, monorepo#1139). Returns the
-/// result on success or the last error after the retry window is exhausted.
+/// (STAB-7) or a write-pool acquire timeout (intent-hq/intent#5511). Executes the
+/// given async transaction closure via the shared [`with_busy_retry`] loop
+/// (~30s total window, monorepo#1139). Returns the result on success or the
+/// last error after the retry window is exhausted.
 ///
 /// Use this for any write transaction that uses .`begin()` (DEFERRED mode) to eliminate
 /// the intermittent "database is locked" (code 5) failures that occur when multiple
-/// transactions try to upgrade from shared to exclusive lock simultaneously.
+/// transactions try to upgrade from shared to exclusive lock simultaneously, and the
+/// "pool timed out while waiting for an open connection" failures that occur when
+/// another in-process writer holds the single write connection for a full acquire
+/// window (`WRITE_ACQUIRE_TIMEOUT`, 10s) — brief store saturation absorbed by the
+/// ~30s window (roughly three acquire attempts) instead of failing the caller's
+/// turn terminally.
 async fn with_write_txn_retry<F, Fut, T>(f: F) -> Result<T>
 where
     F: Fn() -> Fut,
@@ -165,8 +213,8 @@ where
 /// `SQLITE_BUSY` under heavy write load (monorepo#1139: "get note failed:
 /// ... (code: 5) database is locked" surfaced to a production client).
 /// Same shared [`with_busy_retry`] loop as [`with_write_txn_retry`]:
-/// retries only `code: 5` errors, jittered exponential backoff, ~30s total
-/// window, last error surfaced.
+/// retries only busy-family / pool-acquire-timeout errors, jittered
+/// exponential backoff, ~30s total window, last error surfaced.
 async fn with_read_retry<F, Fut, T>(f: F) -> Result<T>
 where
     F: Fn() -> Fut,
@@ -576,6 +624,20 @@ impl MigrationStatus {
 ///
 /// Returns `Error::Internal` if the pool cannot be opened (or the acquire timeout is exceeded).
 pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
+    connect_write_with_acquire_timeout(db_path, WRITE_ACQUIRE_TIMEOUT).await
+}
+
+/// How long a writer waits at `pool.acquire()` / `pool.begin()` for the
+/// single write connection before sqlx reports `PoolTimedOut`.
+const WRITE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// [`connect_write`] with an explicit acquire timeout. Production uses
+/// [`WRITE_ACQUIRE_TIMEOUT`]; tests shrink it to exercise the acquire-timeout
+/// path (intent-hq/intent#5511) without waiting out the real window.
+pub(crate) async fn connect_write_with_acquire_timeout(
+    db_path: &Path,
+    acquire_timeout: Duration,
+) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
@@ -587,7 +649,7 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
 
     SqlitePoolOptions::new()
         .max_connections(1)
-        .acquire_timeout(Duration::from_secs(10))
+        .acquire_timeout(acquire_timeout)
         .connect_with(opts)
         .await
         .map_err(|e| match e {
