@@ -546,15 +546,29 @@ impl<'a> MessageAuthorResolver<'a> {
     }
 }
 
+/// Attach the additive `identity` triple (`{ provider, host, externalUserId }`)
+/// to a principal-shaped wire row when the principal is linked; an unlinked
+/// principal carries no `identity` key at all. Shared by `principal.me`,
+/// `principal.list` rows and `workspace.members.list` Member rows.
+pub(crate) fn with_principal_identity(mut row: Value, p: &Principal) -> Value {
+    if let (Some(identity), Some(obj)) = (p.identity_key(), row.as_object_mut()) {
+        obj.insert("identity".to_string(), json!(identity));
+    }
+    row
+}
+
 /// `principal.me` wire shape.
 pub(crate) fn principal_to_wire(p: &Principal, is_administrator: bool) -> Value {
-    json!({
-        "id": p.id,
-        "login": p.login,
-        "displayName": p.display_name,
-        "avatarUrl": p.avatar_url,
-        "isAdministrator": is_administrator,
-    })
+    with_principal_identity(
+        json!({
+            "id": p.id,
+            "login": p.login,
+            "displayName": p.display_name,
+            "avatarUrl": p.avatar_url,
+            "isAdministrator": is_administrator,
+        }),
+        p,
+    )
 }
 
 impl Services {
@@ -614,14 +628,16 @@ impl Services {
             .await?
             .iter()
             .map(|p| {
-                json!({
-                    "principalId": p.id,
-                    "login": p.login,
-                    "displayName": p.display_name,
-                    "avatarUrl": p.avatar_url,
-                    "githubUserId": p.github_user_id,
-                    "identity": p.identity,
-                })
+                with_principal_identity(
+                    json!({
+                        "principalId": p.id,
+                        "login": p.login,
+                        "displayName": p.display_name,
+                        "avatarUrl": p.avatar_url,
+                        "githubUserId": p.github_user_id,
+                    }),
+                    p,
+                )
             })
             .collect();
         Ok(json!({ "principals": principals }))

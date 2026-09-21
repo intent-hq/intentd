@@ -3240,9 +3240,12 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
 /// membership summary relative to the caller: the primary user is `owner` of
 /// a workspace it created, an added collaborator sees `collaborator`, and a
 /// non-member sees no `myRole` at all. An unknown token is still refused.
+/// `principal.me` and every `workspace.members.list` row carry the additive
+/// `identity` triple when the principal is linked (here a non-GitHub
+/// provider / host, projected verbatim) and no `identity` key otherwise.
 #[intent_test_macros::daemon_test]
 async fn wss_principal_me_and_workspace_membership_by_caller() {
-    use intent_core::{Principal, PrincipalId, WorkspaceRole};
+    use intent_core::{Principal, PrincipalId, PrincipalIdentity, WorkspaceRole};
 
     let srv = start(WsOptions::default()).await;
     let primary = srv
@@ -3267,12 +3270,26 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     assert_eq!(me["result"]["id"], primary.id.0);
     assert_eq!(me["result"]["isAdministrator"], true);
     assert!(me["result"]["login"].is_null() || me["result"]["login"].is_string());
+    assert!(
+        me["result"].get("identity").is_none(),
+        "unlinked primary carries no identity: {me}"
+    );
 
-    // A second principal with its own credential (hashed at rest).
+    // A second principal with its own credential (hashed at rest), linked
+    // on a non-GitHub provider / host.
     let guest_token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    let guest_identity = serde_json::json!({
+        "provider": "gitlab",
+        "host": "gitlab.example.com",
+        "externalUserId": "4242",
+    });
     let guest = Principal {
         id: PrincipalId::new(),
-        identity: None,
+        identity: Some(PrincipalIdentity {
+            provider: "gitlab".to_string(),
+            host: "gitlab.example.com".to_string(),
+            external_user_id: "4242".to_string(),
+        }),
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: None,
@@ -3315,6 +3332,10 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     assert_eq!(me["result"]["login"], "guest");
     assert_eq!(me["result"]["isAdministrator"], false);
     assert_ne!(me["result"]["id"], primary.id.0);
+    assert_eq!(
+        me["result"]["identity"], guest_identity,
+        "linked guest identity: {me}"
+    );
 
     // An unknown token is refused at the upgrade (401).
     let unknown = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -3365,6 +3386,31 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     let collaborator_ws = &collaborator_view["result"]["workspace"];
     assert_eq!(collaborator_ws["myRole"], "collaborator");
     assert_eq!(collaborator_ws["memberCount"], 2);
+
+    // The roster projects the same additive `identity` per member row.
+    let roster = guest_ws_call(format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.members.list","params":{{"workspaceId":"{}"}}}}"#,
+        ws_id.0
+    ))
+    .await;
+    assert!(roster.get("error").is_none(), "{roster}");
+    let members = roster["result"]["members"].as_array().expect("members");
+    assert_eq!(members.len(), 2, "{roster}");
+    let member_row = |id: &str| {
+        members
+            .iter()
+            .find(|m| m["principalId"] == id)
+            .unwrap_or_else(|| panic!("member {id}: {roster}"))
+    };
+    assert_eq!(
+        member_row(&guest.id.0)["identity"],
+        guest_identity,
+        "{roster}"
+    );
+    assert!(
+        member_row(&primary.id.0).get("identity").is_none(),
+        "unlinked primary row carries no identity: {roster}"
+    );
 
     let list = guest_ws_call(
         r#"{"jsonrpc":"2.0","id":4,"method":"workspace.list","params":{}}"#.to_string(),
