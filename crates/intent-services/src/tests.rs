@@ -5121,6 +5121,298 @@ async fn update_note_expected_version_gate_hit_miss_absent() {
     }
 }
 
+/// Regression (intent-hq/intent#5589): a successful content `note.update`
+/// returns the committed row — `rev` equal to the persisted rev and
+/// `updated_at` equal to the stored timestamp — so the client can chain the
+/// returned `rev` into its next `expectedVersion`. Before the fix the
+/// pre-write in-memory Note was returned (rev 0 after the rev-1 write).
+#[intent_test_macros::daemon_test]
+async fn update_note_content_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+
+    let first = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v1".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("content write");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(first.rev, stored.rev, "response rev is the committed rev");
+    assert_eq!(first.updated_at, stored.updated_at);
+    assert_eq!(first.content, "v1");
+
+    // Chaining the returned rev as the next `expectedVersion` succeeds ...
+    let second = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v2".into()),
+                expected_version: Some(first.rev),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("chained conditional write");
+    assert_eq!(second.rev, 2);
+    assert_eq!(second.content, "v2");
+
+    // ... while the rev the first response superseded is now stale (-32005),
+    // and the rejection leaves the row untouched.
+    let stale = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v3-should-not-persist".into()),
+                expected_version: Some(first.rev),
+                ..Default::default()
+            },
+        )
+        .await;
+    match stale {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 2);
+            assert_eq!(current["content"], "v2");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(stored.content, "v2");
+}
+
+/// Same contract for a content `note.update` whose text carries an `@@@task`
+/// block: the auto-conversion rewrites the note, and the response `rev` is
+/// the rev of that final row (not of the caller's own write).
+#[intent_test_macros::daemon_test]
+async fn update_note_task_conversion_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    let updated = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("intro\n\n@@@task\n# Do it\nbody\n@@@\n".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("content write with task block");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert!(
+        stored.content.contains("intent://local/task/"),
+        "conversion rewrote the fence: {}",
+        stored.content
+    );
+    assert_eq!(updated.rev, stored.rev);
+    assert_eq!(updated.content, stored.content);
+    assert_eq!(updated.updated_at, stored.updated_at);
+    assert!(
+        updated.rev >= 1,
+        "rev advanced past the seed: {}",
+        updated.rev
+    );
+}
+
+/// The metadata arm of `note.update` (title/tags, no `content`) returns the
+/// committed row too: `rev` bumped, stored `updated_at`, and the content the
+/// row actually holds.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_arm_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    let renamed = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                title: Some("Renamed".into()),
+                tags: Some(vec!["x".into()]),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("metadata write");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(renamed.rev, stored.rev);
+    assert_eq!(renamed.updated_at, stored.updated_at);
+    assert_eq!(renamed.title, "Renamed");
+    assert_eq!(renamed.tags, vec!["x".to_string()]);
+    assert_eq!(renamed.content, "v0");
+
+    // The returned rev chains into the next conditional metadata write.
+    let again = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                title: Some("Renamed again".into()),
+                expected_version: Some(renamed.rev),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("chained metadata write");
+    assert_eq!(again.rev, 2);
+    assert_eq!(again.title, "Renamed again");
+}
+
+/// The metadata arm of `note.update` that read rev 0 while a user
+/// `setContent` lands at rev 1 (the intentd#1817 choreography) must return
+/// the row as committed — the user's content and rev 2 — never the stale
+/// pre-write copy it read.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_arm_snapshot_carries_concurrent_content() {
+    let (tmp, svc, ws, id) = setup_versioned("abc").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = svc.update_note(
+        ws.clone(),
+        id.clone(),
+        NoteUpdateInput {
+            title: Some("Renamed".into()),
+            ..Default::default()
+        },
+    );
+    let parked = poll_until(&mut fut, 20, || async {
+        svc.store.get_note(&ws, &id).await.expect("get note");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let saved = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None)
+        .await
+        .expect("user save");
+    assert_eq!(saved.rev, 1);
+    drop(held);
+
+    let returned = fut.await.expect("metadata write");
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(stored.content, "aXbc");
+    assert_eq!(
+        returned.rev, stored.rev,
+        "response rev is the committed rev"
+    );
+    assert_eq!(
+        returned.content, "aXbc",
+        "response snapshot carries the concurrently saved content, not the stale read"
+    );
+    assert_eq!(returned.title, "Renamed");
+    assert_eq!(returned.updated_at, stored.updated_at);
+}
+
+/// Regression (intent-hq/intent#5589): `note.updateMetadata` carries the
+/// committed `rev` and the stored `updated_at`, so the returned rev chains
+/// into the next conditional write; the rev it superseded is stale.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    let first = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("Renamed".into()),
+            Some(vec!["x".into()]),
+            Some(0),
+            None,
+        )
+        .await
+        .expect("metadata write");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(
+        first.rev,
+        Some(stored.rev),
+        "response rev is the committed rev"
+    );
+    assert_eq!(
+        first.updated_at.as_deref(),
+        Some(stored.updated_at.as_str())
+    );
+    assert_eq!(first.title.as_deref(), Some("Renamed"));
+    assert_eq!(first.tags, Some(vec!["x".to_string()]));
+    assert_eq!(first.skipped, None);
+
+    let second = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("Renamed again".into()),
+            None,
+            first.rev,
+            None,
+        )
+        .await
+        .expect("chained conditional metadata write");
+    assert_eq!(second.rev, Some(2));
+
+    let stale = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("stale".into()),
+            None,
+            first.rev,
+            None,
+        )
+        .await;
+    match stale {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 2);
+            assert_eq!(current["title"], "Renamed again");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+/// The `skipped` arm of `note.updateMetadata` (spec title only) writes
+/// nothing, so it carries no `rev`.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_skipped_carries_no_rev() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    store
+        .insert_note(&note(&ws, "spec", "body"))
+        .await
+        .expect("note");
+    let svc = Services::new(store);
+    let skipped = svc
+        .update_note_metadata(
+            ws,
+            NoteId::from("spec"),
+            Some("Renamed".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("skip");
+    assert_eq!(skipped.skipped, Some(true));
+    assert_eq!(skipped.rev, None);
+}
+
 #[intent_test_macros::daemon_test]
 async fn update_metadata_skips_spec_title_but_applies_tags() {
     let tmp = TempDb::new();

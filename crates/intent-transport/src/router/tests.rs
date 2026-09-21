@@ -605,6 +605,7 @@ impl WorkspaceApi for FakeApi {
                 updated_at: Some("t1".to_string()),
                 skipped: None,
                 reason: None,
+                rev: Some(1),
             })
         })
     }
