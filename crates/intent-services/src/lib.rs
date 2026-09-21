@@ -3250,7 +3250,7 @@ impl Services {
         }
 
         ws.updated_at = now_iso();
-        self.store.update_workspace(&ws).await?;
+        ws.branch = self.store.update_workspace(&ws).await?;
 
         publish_event(
             self.event_bus.as_ref(),
@@ -20546,6 +20546,7 @@ impl WorkspaceApi for Services {
                     .await?;
             }
             // Captured before the `if let` arms below move the fields out.
+            let branch_update = update.branch.clone();
             let pr_fields_changed = update.pr_number.is_some()
                 || update.pr_url.is_some()
                 || update.pr_status.is_some()
@@ -20670,7 +20671,9 @@ impl WorkspaceApi for Services {
                 // not the stale default `idle` from the synthesized row.
                 ws.activity = this.workspace_activity(&ws.id);
             } else {
-                store.update_workspace(&ws).await?;
+                ws.branch = store
+                    .update_workspace_with_branch(&ws, branch_update.as_deref())
+                    .await?;
                 // Derive `lastActivity` (§9.1) on the returned record so
                 // `workspace.update` callers get the authoritative wire shape
                 // without a follow-up `workspace.get`, and persist it through
@@ -21380,7 +21383,7 @@ impl WorkspaceApi for Services {
             ws.archived = true;
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
-            store.update_workspace(&ws).await?;
+            ws.branch = store.update_workspace(&ws).await?;
             // Everything below the persist runs on a DETACHED task
             // (intent-hq/monorepo#1577): the sweeps can cancel this very
             // caller. A background hook whose script calls
@@ -32919,7 +32922,7 @@ impl Services {
         ws.pr_status = Some(info.status);
         ws.active_pull_request = Some(info);
         ws.updated_at = now_iso();
-        self.store.update_workspace(&ws).await?;
+        ws.branch = self.store.update_workspace(&ws).await?;
         publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
         self.maybe_emit_display_status_changed(workspace_id).await;
 
@@ -32960,7 +32963,9 @@ impl Services {
                     pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
                 }
                 ws.updated_at = now_iso();
-                let _ = self.store.update_workspace(&ws).await;
+                if let Ok(branch) = self.store.update_workspace(&ws).await {
+                    ws.branch = branch;
+                }
                 publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
                 self.maybe_emit_display_status_changed(&workspace_id).await;
                 self.ac_move_stage(&workspace_id, "pull_request", "merged")

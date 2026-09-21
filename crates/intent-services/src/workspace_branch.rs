@@ -150,7 +150,10 @@ mod tests {
         let (_db, svc, mut ws) = setup(&path).await;
         ws.branch = "linked".into();
         ws.repository_path = Some(dir.path().join("repo").to_string_lossy().into_owned());
-        svc.store.update_workspace(&ws).await.unwrap();
+        svc.store
+            .update_workspace_with_branch(&ws, Some(&ws.branch))
+            .await
+            .unwrap();
         let bus = svc.event_bus.as_ref().unwrap().clone();
         let mut sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![WORKSPACE_UPDATED.into()],
@@ -236,6 +239,12 @@ mod tests {
         assert_eq!(current.title, edited.title);
         assert_eq!(current.status_message, edited.status_message);
         assert_eq!(current.updated_at, ws.updated_at);
+        edited.title = "Edit saved after reconciliation".into();
+        let branch = svc.store.update_workspace(&edited).await.unwrap();
+        assert_eq!(branch, "renamed");
+        let saved = svc.store.get_workspace(&ws.id).await.unwrap();
+        assert_eq!(saved.branch, "renamed");
+        assert_eq!(saved.title, edited.title);
         assert!(!svc
             .store
             .reconcile_workspace_branch(&ws, "stale")
@@ -249,5 +258,20 @@ mod tests {
             .reconcile_workspace_branch(&current, "wrong-repo")
             .await
             .unwrap());
+        let explicit = svc
+            .update_workspace(
+                ws.id.clone(),
+                intent_core::WorkspaceUpdate {
+                    branch: Some("explicit-branch-edit".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit.branch, "explicit-branch-edit");
+        assert_eq!(
+            svc.store.get_workspace(&ws.id).await.unwrap().branch,
+            "explicit-branch-edit"
+        );
     }
 }

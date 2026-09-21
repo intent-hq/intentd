@@ -124,11 +124,12 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace (full row replace, except `id` and the
-    /// guarded `last_activity`, see below), or `NotFound`. `activity` is
-    /// derived and never persisted (§9.9).
+    /// Update an existing workspace, preserving `branch`, `id` and the
+    /// guarded `last_activity`, or return `NotFound`. Returns the stored branch.
+    /// `activity` is derived and never persisted (§9.9).
     ///
-    /// `last_activity` is the one exception to the full-row replace
+    /// Explicit branch changes use [`Self::update_workspace_with_branch`].
+    /// `last_activity` is another exception to the full-row replace
     /// (monorepo#1585): it goes through the same monotonic guard as
     /// [`Self::bump_workspace_last_activity`] — the candidate writes only when
     /// it parses AND the stored value is NULL, unparseable, or strictly older.
@@ -139,9 +140,22 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
-    pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
-        let res = sqlx::query(
-            "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
+    pub async fn update_workspace(&self, ws: &Workspace) -> Result<String> {
+        self.update_workspace_with_branch(ws, None).await
+    }
+
+    /// Update workspace fields and optionally apply an explicit branch edit.
+    /// Returns the stored branch so responses cannot echo a stale snapshot.
+    ///
+    /// # Errors
+    /// Returns `Error::NotFound` for a missing workspace or an error on database failure.
+    pub async fn update_workspace_with_branch(
+        &self,
+        ws: &Workspace,
+        branch: Option<&str>,
+    ) -> Result<String> {
+        let row = sqlx::query(
+            "UPDATE workspace SET title=?, branch=COALESCE(?, branch), base_ref=?, base_commit_sha=?, status=?, \
              status_message=?, status_image_asset_id=?, attention=?, path=?, repository_path=?, \
              repository_owner=?, repository_name=?, worktree_path=?, scope=?, skip_worktree=?, \
              is_remote=?, default_model=?, pr_number=?, pr_url=?, pr_status=?, \
@@ -150,10 +164,10 @@ impl Store {
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, checkout_mode=? WHERE id=?",
+             token_usage=?, setup_script=?, checkout_mode=? WHERE id=? RETURNING branch",
         )
         .bind(&ws.title)
-        .bind(&ws.branch)
+        .bind(branch)
         .bind(&ws.base_ref)
         .bind(&ws.base_commit_sha)
         .bind(enum_to_db(&ws.status)?)
@@ -187,13 +201,13 @@ impl Store {
         .bind(setup_script_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
         .bind(&ws.id.0)
-        .execute(self.write_pool())
+        .fetch_optional(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update workspace failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("workspace {}", ws.id)));
+        match row {
+            Some(row) => col(&row, "branch"),
+            None => Err(Error::NotFound(format!("workspace {}", ws.id))),
         }
-        Ok(())
     }
 
     /// Reconcile an observed branch without overwriting concurrent workspace edits.
