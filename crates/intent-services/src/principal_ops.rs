@@ -656,7 +656,11 @@ impl Services {
     /// `GET /user` that names a **different** `github_user_id` (the user
     /// reconnected GitHub as another account) leaves the cached identity
     /// untouched and fails with [`InviteErrorKind::IdentityLocked`]. While
-    /// the daemon is still single-user the switch is applied as before.
+    /// the daemon is still single-user the switch is applied as before —
+    /// unless a `github.connect` switch landed while this `GET /user` was
+    /// in flight, in which case the fetched profile describes the old
+    /// account and is dropped in favour of the current row
+    /// ([`Self::apply_primary_identity`]).
     pub(crate) async fn refresh_primary_identity(&self, principal: Principal) -> Result<Principal> {
         let fetched = tokio::time::timeout(IDENTITY_REFRESH_TIMEOUT, async {
             let sc = self.identity_source_control().await?;
@@ -758,8 +762,14 @@ impl Services {
     /// [`IdentityTransitionLock`], so no invite is minted in between, and
     /// the cached identity is re-read under that lock: `principal` is the
     /// caller's snapshot, which a switch that landed while `GET /user` was
-    /// in flight may have outdated, and a stale snapshot must not decide
-    /// the same-account check or be written back over the current row.
+    /// in flight may have outdated, and a stale snapshot never decides the
+    /// same-account check. Past the lock check, when the re-read row names
+    /// an account that matches neither the snapshot nor the fetched
+    /// profile, the row moved to another account while `GET /user` was in
+    /// flight and the profile describes the old one: nothing is written
+    /// and the current row is returned unchanged (intent-hq/intent#5551).
+    /// A stale snapshot whose fetched profile *is* the current account
+    /// still refreshes it.
     /// A persisted change is pushed into the presence profile cache
     /// ([`Self::presence_profile_changed`]) so a roster that already lists
     /// the principal is renamed without a reconnect.
@@ -775,12 +785,15 @@ impl Services {
     /// [`Self::apply_primary_identity`] for a caller that already holds the
     /// [`IdentityTransitionLock`] (the connect guard, which keeps it across
     /// the token write). Re-reads the current row under that lock exactly
-    /// as the locking variant does.
+    /// as the locking variant does. The connect guard reads its snapshot
+    /// under the same lock immediately before `GET /user`, so the moved-row
+    /// check below is a no-op for it.
     pub(crate) async fn apply_primary_identity_locked(
         &self,
         principal: Principal,
         user: &intent_sourcecontrol::UserIdentity,
     ) -> Result<Principal> {
+        let snapshot_id = principal.github_user_id;
         let principal = self.store.get_principal(&principal.id).await?;
         let fetched_id = user.id.and_then(|id| i64::try_from(id).ok());
         let same_account =
@@ -793,6 +806,16 @@ impl Services {
                  principals or open invites exist; keeping the cached identity"
             );
             return Err(Error::Invite(InviteErrorKind::IdentityLocked));
+        }
+        if principal.github_user_id != snapshot_id && principal.github_user_id != fetched_id {
+            tracing::info!(
+                snapshot_github_user_id = snapshot_id,
+                current_github_user_id = principal.github_user_id,
+                fetched_github_user_id = fetched_id,
+                "primary GitHub identity changed while GET /user was in flight; \
+                 keeping the current identity"
+            );
+            return Ok(principal);
         }
         let mut updated = principal.clone();
         updated.github_user_id = fetched_id;
