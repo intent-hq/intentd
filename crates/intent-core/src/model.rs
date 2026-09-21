@@ -3188,8 +3188,8 @@ fn agent_list_rows_bytes(rows: &[AgentLite]) -> usize {
 /// ([`AgentLite::cap_list_previews_to`] is monotone, so re-capping an
 /// already-capped row only shortens it) until the array fits or the budget
 /// reaches [`AGENT_LIST_PREVIEW_FLOOR_BYTES`], whichever comes first. Row
-/// shape is unchanged and no new key is introduced: the one presence effect
-/// stays inside the documented `lastToolUse` contract
+/// shape is unchanged and no key outside the documented row contract is
+/// introduced: the one presence effect stays inside the `lastToolUse` contract
 /// `{ name, input?, inputTruncated?, inputBytes? }` — an `input` that passed
 /// the 400-byte list cap unflagged and is truncated by a tighter re-cap gains
 /// `inputTruncated: true` + `inputBytes` (original serialized size), exactly
