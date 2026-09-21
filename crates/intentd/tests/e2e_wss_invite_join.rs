@@ -1687,3 +1687,107 @@ async fn unpinned_invite_link_is_reusable_until_revoked_over_wss() {
         "no join started a device flow"
     );
 }
+
+/// `workspace.members.list` by the owner attaches the primary GitHub
+/// identity off the read path (intent-hq/intent#5534): on a fresh daemon
+/// whose only prior call is `workspace.create` — no `principal.me`, no
+/// invite — the first list answers at once with the cached, login-less
+/// owner row, and a later list carries the `login` / `displayName` /
+/// `avatarUrl` resolved through the (mock) API host from the `GITHUB_TOKEN`
+/// the daemon was handed. The refresh is detached, so the list is polled.
+#[tokio::test]
+async fn members_list_attaches_the_owner_identity_over_wss() {
+    let mock = spawn_mock_github().await;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let secrets_s = data_dir.join("secrets.json").to_string_lossy().to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SECRETS_FILE", &secrets_s),
+        ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
+        ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
+        ("GITHUB_TOKEN", OWNER_TOKEN),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut owner = connect_ws(port, cfg, TOKEN).await;
+    let v = wss_rpc(
+        &mut owner,
+        1,
+        "workspace.create",
+        json!({ "title": "Members E2E" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "workspace.create: {v}");
+    let ws_id = v["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let v = wss_rpc(
+        &mut owner,
+        2,
+        "workspace.members.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(v["jsonrpc"], json!("2.0"));
+    assert_eq!(v["id"], json!(2));
+    assert!(v.get("error").is_none(), "workspace.members.list: {v}");
+    let members = v["result"]["members"].as_array().expect("members");
+    assert_eq!(members.len(), 1, "{v}");
+    assert_eq!(members[0]["role"], json!("owner"), "{v}");
+    assert_eq!(v["result"]["guestCount"], json!(0), "{v}");
+    let owner_id = members[0]["principalId"]
+        .as_str()
+        .expect("owner principal id")
+        .to_string();
+
+    let attached = timeout(Duration::from_secs(30), async {
+        let mut id = 3;
+        loop {
+            let v = wss_rpc(
+                &mut owner,
+                id,
+                "workspace.members.list",
+                json!({ "workspaceId": ws_id }),
+            )
+            .await;
+            assert!(v.get("error").is_none(), "workspace.members.list: {v}");
+            if v["result"]["members"][0]["login"] == json!("owner") {
+                break v;
+            }
+            id += 1;
+            // timing-guard: poll interval (the identity is attached off the read path)
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("members.list attached the owner identity");
+    let member = &attached["result"]["members"][0];
+    assert_eq!(member["principalId"], json!(owner_id));
+    assert_eq!(member["role"], json!("owner"));
+    assert_eq!(member["displayName"], json!("owner name"));
+    assert_eq!(
+        member["avatarUrl"],
+        json!(format!("https://avatars.example/u/{OWNER_ID}"))
+    );
+    assert_eq!(
+        mock.flows.load(Ordering::SeqCst),
+        0,
+        "the refresh used the stored token, not a device flow"
+    );
+}

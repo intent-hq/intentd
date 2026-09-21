@@ -8,10 +8,11 @@
 //!
 //! The GitHub identity of the primary principal is attached lazily and off
 //! the read path (stale-while-revalidate): a `principal.me` read for the
-//! primary user serves the cached `principal` row and, at most once per
-//! [`IDENTITY_REFRESH_INTERVAL`] per process, spawns a bounded background
-//! refresh from `GET /user` when the source-control auth is configured. An
-//! offline daemon keeps serving the cache.
+//! primary user (or a `workspace.members.list` by the primary user whose
+//! row has no login yet) serves the cached `principal` row and, at most
+//! once per [`IDENTITY_REFRESH_INTERVAL`] per process, spawns a bounded
+//! background refresh from `GET /user` when the source-control auth is
+//! configured. An offline daemon keeps serving the cache.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -630,7 +631,7 @@ impl Services {
     /// principal's GitHub identity from `GET /user`. Detached: the read that
     /// triggered it never waits, and any failure (not configured, offline,
     /// timeout) leaves the cached row untouched.
-    async fn spawn_primary_identity_refresh(&self, principal: Principal) {
+    pub(crate) async fn spawn_primary_identity_refresh(&self, principal: Principal) {
         {
             let mut last = self.principal_identity_refreshed_at.lock().await;
             if last.is_some_and(|at| at.elapsed() < IDENTITY_REFRESH_INTERVAL) {
@@ -641,7 +642,7 @@ impl Services {
         let this = self.clone();
         intent_core::spawn_daemon(async move {
             if let Err(e) = this.refresh_primary_identity(principal).await {
-                tracing::debug!(error = %e, "principal.me: github identity refresh skipped");
+                tracing::debug!(error = %e, "primary github identity refresh skipped");
             }
         });
     }

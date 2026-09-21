@@ -16215,6 +16215,15 @@ pub(crate) mod pr {
         >,
         /// Every gist id handed to `get_proof_gist`, in call order.
         pub(crate) seen_proof_gists: std::sync::Mutex<Vec<String>>,
+        /// How many times `get_user` was called (the primary identity
+        /// refresh tests assert exactly one spawn per interval). Counted
+        /// before [`Self::get_user_gate`] is awaited, so a held call is
+        /// still visible.
+        pub(crate) get_user_calls: std::sync::atomic::AtomicU64,
+        /// When set, `get_user` holds until the test releases a permit
+        /// (`add_permits(1)`): the caller proves the read it triggered from
+        /// returned while `GET /user` was still in flight.
+        pub(crate) get_user_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     }
 
     impl StubForge {
@@ -16222,6 +16231,14 @@ pub(crate) mod pr {
         pub(crate) fn unauthenticated() -> Self {
             Self {
                 unauthenticated: true,
+                ..Default::default()
+            }
+        }
+
+        /// A forge whose `get_user` holds until `gate` has a permit.
+        pub(crate) fn with_get_user_gate(gate: std::sync::Arc<tokio::sync::Semaphore>) -> Self {
+            Self {
+                get_user_gate: Some(gate),
                 ..Default::default()
             }
         }
@@ -16295,6 +16312,11 @@ pub(crate) mod pr {
             })
         }
         async fn get_user(&self) -> ScResult<UserIdentity> {
+            self.get_user_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &self.get_user_gate {
+                gate.acquire().await.expect("gate open").forget();
+            }
             Ok(UserIdentity {
                 login: "octocat".into(),
                 id: Some(583_231),
