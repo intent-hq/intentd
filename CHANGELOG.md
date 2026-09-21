@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.92] - 2026-09-21
+
+### 🚀 Features
+
+- *(agent)* Serve delegatedCounts on agent.list ([#2051](https://github.com/intent-hq/intentd/pull/2051))
+
+### 🐛 Bug Fixes
+
+- *(identity)* Keep a concurrent account switch over a stale background refresh ([#2050](https://github.com/intent-hq/intentd/pull/2050))
+- *(principal)* Refresh primary GitHub identity from principal.list and at startup ([#2047](https://github.com/intent-hq/intentd/pull/2047))
+
+
 ## [0.9.91] - 2026-09-21
 
 ### 🐛 Bug Fixes
