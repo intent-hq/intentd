@@ -19,7 +19,8 @@ on:
   # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
   # merged tree before it lands on main. CI is tiered by event: pull_request
   # runs the fast feedback jobs (check / build / pr-title / conflict-markers /
-  # deb-packaging / release-scripts) plus coverage-changed, which runs only
+  # monorepo-consumer-checks / deb-packaging / release-scripts) plus
+  # coverage-changed, which runs only
   # the PR's own changed tests under llvm-cov (pull_request-ONLY; see its
   # comment); merge_group additionally runs the full instrumented coverage
   # jobs (coverage-e2e / coverage-all), which are merge_group-ONLY — they no
@@ -1480,6 +1481,31 @@ jobs:
           fi
           echo "No conflict markers in ${#files[@]} changed file(s)."
 
+  # Monorepo consumer checks: runs intent-hq/intent's `make consumer-checks`
+  # list (method catalog, event catalog, protocol→FE field parity, docs-check,
+  # check-makefile-targets) with this PR head in place of packages/intentd, so
+  # a change that would break a monorepo consumer check is red here before it
+  # merges instead of turning monorepo `main` red or stalling the rolling
+  # `auto/submodule-bump` PR after the fact (intent-hq/intent#4558, #5479,
+  # #5489, #5497). Fix order when red: the checks compare this head against
+  # monorepo `main` and every checker tolerates docs that lead the pin, so land
+  # the monorepo docs PR first (the job summary names the file to update), then
+  # re-run this job; the later submodule bump then lands green.
+  # check-mcp-bindings is advisory here (its generated index must match the
+  # pinned help text line for line, so the docs cannot lead an intentd change
+  # to a binding's help line); it stays a hard error in the monorepo.
+  # Runs on merge_group and same-repo pull_request (fork PRs get no CI — see
+  # the `pull_request` trigger comment); skipped on push to main, where the
+  # tree was already checked by its PR run. Seconds-long on ubuntu-latest.
+  monorepo-consumer-checks:
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      contents: read
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@main
+    with:
+      component: intentd
+      head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+
   # Packaging assets guard: asserts the systemd user unit keeps the exact
   # semantics the daemon's `service install` used to generate (Type=simple,
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
@@ -1629,12 +1655,15 @@ jobs:
   # both carry `if: github.event_name == 'pull_request'` and are legitimately
   # skipped on push and merge_group runs (PR-metadata checks, already
   # validated on the PR) — requiring strict success there would fail the
-  # gate outside pull_request events. Net per event: pull_request requires
-  # check / build / coverage-changed / deb-packaging / release-scripts /
-  # install-ps1 / pr-title / conflict-markers; merge_group requires check /
-  # build / deb-packaging / release-scripts / install-ps1 / coverage-e2e /
-  # coverage-all against the queue's merged tree; push requires build /
-  # deb-packaging / release-scripts / install-ps1.
+  # gate outside pull_request events. monorepo-consumer-checks follows the
+  # check pattern: success on pull_request and merge_group, success or
+  # skipped on push (see its comment). Net per event: pull_request requires
+  # check / build / coverage-changed / monorepo-consumer-checks /
+  # deb-packaging / release-scripts / install-ps1 / pr-title /
+  # conflict-markers; merge_group requires check / build /
+  # monorepo-consumer-checks / deb-packaging / release-scripts / install-ps1 /
+  # coverage-e2e / coverage-all against the queue's merged tree; push
+  # requires build / deb-packaging / release-scripts / install-ps1.
   gate:
     name: CI Gate
     # Seconds-long job: pinned to ubuntu-latest (see pr-title).
@@ -1645,7 +1674,7 @@ jobs:
     # would run the gate against all-skipped needs and report a spurious
     # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, deb-packaging, release-scripts, install-ps1]
+    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1]
     steps:
       - name: Check results
         run: |
@@ -1669,6 +1698,21 @@ jobs:
             esac
           elif [ "${{ needs.check.result }}" != "success" ]; then
             echo "One or more required jobs failed"
+            exit 1
+          fi
+          # Event-aware on purpose: monorepo-consumer-checks must succeed
+          # outright on pull_request and merge_group; only push runs (where it
+          # is job-skipped as already checked by the PR run) accept skipped.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            case "${{ needs.monorepo-consumer-checks.result }}" in
+              success|skipped) ;;
+              *)
+                echo "monorepo-consumer-checks did not succeed or skip"
+                exit 1
+                ;;
+            esac
+          elif [ "${{ needs.monorepo-consumer-checks.result }}" != "success" ]; then
+            echo "monorepo-consumer-checks must succeed outright on pull_request / merge_group"
             exit 1
           fi
           # Event-aware on purpose: coverage-changed is pull_request-only, so

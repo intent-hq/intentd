@@ -682,17 +682,53 @@ async fn inbound_byte_budget_is_shared_and_released() {
     streams.remove(&1).unwrap().abort.abort();
 }
 
-/// Poll `ready` between scheduler yields until it holds or `attempts` runs
-/// out. Returns whether it held, so callers can wait for progress that the
-/// fixed code makes without hanging on code that never makes it.
-async fn yield_until(attempts: usize, ready: impl Fn() -> bool) -> bool {
-    for _ in 0..attempts {
-        if ready() {
-            return true;
+/// Deadline for one step of progress by the code under test, scaled for slow
+/// environments (coverage runs export `INTENTD_TEST_TIMEOUT_MULTIPLIER`);
+/// the multiplier is never below 1.0, non-finite values are ignored, and an
+/// out-of-range product saturates instead of panicking.
+fn deadline() -> Duration {
+    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|m| m.is_finite())
+        .unwrap_or(1.0)
+        .max(1.0);
+    Duration::try_from_secs_f64(5.0 * multiplier).unwrap_or(Duration::MAX)
+}
+
+/// Poll `ready` on a short interval until it holds or `deadline()` passes;
+/// returns whether it held. A wall-clock bound on observable progress rather
+/// than a count of scheduler yields (intent-hq/intent#5513): slow
+/// interleaving under llvm-cov or host load spends more of the budget instead
+/// of exhausting it, while code that never makes the progress still fails.
+async fn wait_until(ready: impl Fn() -> bool) -> bool {
+    tokio::time::timeout(deadline(), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        tokio::task::yield_now().await;
-    }
-    ready()
+    })
+    .await
+    .is_ok()
+}
+
+/// Wait until the producer's `written` counter has not moved for a quiet
+/// window (wall-clock, scaled) and return where it stalled. Reading a stall
+/// early only yields a smaller figure, which every caller's
+/// `stalled_at < reply` bound tolerates; the counter is monotone and capped,
+/// so the wait ends well inside the enclosing `deadline()`.
+async fn producer_stall(written: &AtomicUsize) -> usize {
+    let quiet = deadline() / 50;
+    tokio::time::timeout(deadline(), async {
+        loop {
+            let before = written.load(Ordering::Relaxed);
+            tokio::time::sleep(quiet).await;
+            if written.load(Ordering::Relaxed) == before {
+                return before;
+            }
+        }
+    })
+    .await
+    .expect("producer stalls within the deadline")
 }
 
 /// Regression for intent-hq/intent#5461, at the relay level. A loopback
@@ -705,7 +741,7 @@ async fn yield_until(attempts: usize, ready: impl Fn() -> bool) -> bool {
 /// exercise `forward_to_stream` and the sink directly, so they only show the
 /// parked relay holds no lock those paths need; the connection loop is driven
 /// by `slow_client_keeps_stream_and_heartbeats_alive_behind_large_response`.
-/// Fails on the pre-fix relay at request `STREAM_QUEUE_FRAMES`.
+/// Fails on the pre-fix relay at the first request, whose queue never drains.
 #[tokio::test]
 async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
     const RESPONSE_BYTES: usize = 2 * OUTBOUND_QUEUE_FRAMES * READ_CHUNK_BYTES;
@@ -762,7 +798,7 @@ async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
         )
         .await
     );
-    let opened = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+    let opened = tokio::time::timeout(deadline(), out_rx.recv())
         .await
         .expect("OPEN_OK within the deadline")
         .expect("relay alive");
@@ -787,13 +823,13 @@ async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
     // Client pauses: the relay fills the shared queue and is left holding a
     // chunk it cannot admit.
     assert!(
-        yield_until(100_000, || out_tx.capacity() == 0).await,
+        wait_until(|| out_tx.capacity() == 0).await,
         "response must saturate the outbound queue"
     );
     let relay_queue = streams[&1].msg_tx.clone();
     for request in 0..REQUESTS {
         assert!(tokio::time::timeout(
-            Duration::from_secs(1),
+            deadline(),
             handle_frame(
                 Frame::Data {
                     stream_id: 1,
@@ -812,8 +848,12 @@ async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
             streams.contains_key(&1),
             "request {request} closed the stream behind the lagging response"
         );
-        // A relay that keeps draining empties its queue between requests.
-        yield_until(64, || relay_queue.capacity() == relay_queue.max_capacity()).await;
+        // A relay that keeps draining empties its queue between requests; a
+        // parked one leaves the request queued, and the queue fills up.
+        assert!(
+            wait_until(|| relay_queue.capacity() == relay_queue.max_capacity()).await,
+            "request {request} stayed queued behind the lagging response"
+        );
     }
     assert!(client.next().now_or_never().is_none(), "no stream CLOSE");
     // Siblings and heartbeats are unaffected by the parked relay.
@@ -823,7 +863,7 @@ async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
     );
     assert!(sink.send(Message::Ping(Bytes::new())).await.is_ok());
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), client.next())
+        tokio::time::timeout(deadline(), client.next())
             .await
             .expect("ping reaches the client promptly"),
         Some(Ok(Message::Ping(_)))
@@ -832,7 +872,7 @@ async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
     // every request the relay wrote through while the client lagged.
     let mut received = 0;
     while received < RESPONSE_BYTES {
-        let outbound = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        let outbound = tokio::time::timeout(deadline(), out_rx.recv())
             .await
             .expect("response keeps flowing once the client resumes")
             .expect("relay alive");
@@ -845,7 +885,7 @@ async fn lagging_client_does_not_fill_inbound_queue_behind_large_response() {
         }
     }
     assert_eq!(received, RESPONSE_BYTES);
-    let requests = tokio::time::timeout(Duration::from_secs(5), consumer)
+    let requests = tokio::time::timeout(deadline(), consumer)
         .await
         .expect("consumer reads the queued requests")
         .unwrap();
@@ -897,13 +937,13 @@ async fn blocked_loopback_write_does_not_hold_back_admitted_output() {
         out_tx.clone(),
         TunnelLimits::default(),
     ));
-    let opened = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+    let opened = tokio::time::timeout(deadline(), out_rx.recv())
         .await
         .expect("OPEN_OK within the deadline")
         .expect("relay alive");
     assert_eq!(opened.frame, Frame::OpenOk { stream_id: 1 });
     assert!(
-        yield_until(100_000, || out_tx.capacity() == 0).await,
+        wait_until(|| out_tx.capacity() == 0).await,
         "response must saturate the outbound queue"
     );
     // The relay takes the frame (queued bytes drop to zero) and starts a write
@@ -912,18 +952,18 @@ async fn blocked_loopback_write_does_not_hold_back_admitted_output() {
     queued_bytes.fetch_add(request.len(), Ordering::Relaxed);
     msg_tx.try_send(data(request)).ok().unwrap();
     assert!(
-        yield_until(100_000, || queued_bytes.load(Ordering::Relaxed) == 0).await,
+        wait_until(|| queued_bytes.load(Ordering::Relaxed) == 0).await,
         "relay must take the client frame while its output is held"
     );
     // Client resumes: the queue drains, and the held chunk must follow.
     for _ in 0..OUTBOUND_QUEUE_FRAMES {
-        let outbound = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        let outbound = tokio::time::timeout(deadline(), out_rx.recv())
             .await
             .expect("queued response chunks")
             .expect("relay alive");
         assert!(matches!(outbound.frame, Frame::Data { stream_id: 1, .. }));
     }
-    let held = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+    let held = tokio::time::timeout(deadline(), out_rx.recv())
         .await
         .expect("held chunk is admitted once a slot frees, despite the blocked loopback write")
         .expect("relay alive");
@@ -960,22 +1000,6 @@ async fn recv_data_bytes(
     }
     assert_eq!(received, expected, "relay overshot the granted window");
     chunks
-}
-
-/// Wait until the producer's `written` counter stops moving for a while and
-/// return where it stalled.
-async fn producer_stall(written: &AtomicUsize) -> usize {
-    let (mut stalled_at, mut stable) = (0, 0);
-    while stable < 1_000 {
-        let now = written.load(Ordering::Relaxed);
-        if now == stalled_at {
-            stable += 1;
-        } else {
-            (stalled_at, stable) = (now, 0);
-        }
-        tokio::task::yield_now().await;
-    }
-    stalled_at
 }
 
 /// Per-stream daemon→client flow control at the relay level
@@ -1263,7 +1287,7 @@ async fn client_send(sink: &mut SplitSink<ClientWs, Message>, frame: Frame) {
 
 /// Next client-side message, failing loudly if the connection stops progressing.
 async fn client_next(stream: &mut futures_util::stream::SplitStream<ClientWs>) -> Message {
-    tokio::time::timeout(Duration::from_secs(5), stream.next())
+    tokio::time::timeout(deadline(), stream.next())
         .await
         .expect("the connection keeps making progress")
         .expect("connection alive")
@@ -1272,8 +1296,9 @@ async fn client_next(stream: &mut futures_util::stream::SplitStream<ClientWs>) -
 
 /// Companion to the relay-level tests above, through `run_tunnel_connection`
 /// on an in-process WebSocket. The client first withholds reads until the
-/// response (twice the shared outbound queue) has visibly saturated that queue
-/// — the consumer's own write backs up behind the parked relay — and only then
+/// response (far larger than the shared outbound queue) has visibly saturated
+/// that queue — the consumer's own write backs up behind the parked relay —
+/// and only then
 /// pipelines its requests, a sibling-stream echo, and a heartbeat ping, all
 /// while the reply is still queued. It then reads slowly but keeps progressing
 /// (a 4 KiB duplex buffer means every 16 KiB `DATA` frame blocks the sink
@@ -1291,13 +1316,18 @@ async fn client_next(stream: &mut futures_util::stream::SplitStream<ClientWs>) -
 /// `blocked_sink_client_stalls_only_its_own_stream_at_the_credit_window`.
 #[tokio::test]
 async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
-    const RESPONSE_BYTES: usize = 2 * OUTBOUND_QUEUE_FRAMES * READ_CHUNK_BYTES;
+    // Far larger than what the loopback socket pair can absorb once the relay
+    // stops reading: the relay side's receive buffer autotunes up to
+    // `net.ipv4.tcp_rmem` max (6 MiB on stock Linux, and the consumer's own
+    // write was seen completing a 2 MiB reply under load,
+    // intent-hq/intent#5513), so the stall assertion below cannot be defeated
+    // by kernel buffering.
+    const RESPONSE_BYTES: usize = 16 * 1024 * 1024;
     const REQUESTS: usize = STREAM_QUEUE_FRAMES + 1;
     let (requests_tx, requests_rx) = tokio::sync::oneshot::channel();
     // A one-chunk send buffer keeps the consumer's write from running ahead
-    // into the kernel once the relay stops reading (the relay's receive window
-    // cannot grow while it is not reading), so queue saturation shows up as
-    // the consumer stalling short of the full response.
+    // into the kernel once the relay stops reading, so queue saturation shows
+    // up as the consumer stalling short of the full response.
     let response_socket = tokio::net::TcpSocket::new_v4().unwrap();
     response_socket
         .set_send_buffer_size(u32::try_from(READ_CHUNK_BYTES).unwrap())
@@ -1408,19 +1438,10 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
     // nothing downstream is taking more.
     let saturated = (OUTBOUND_QUEUE_FRAMES + 2) * READ_CHUNK_BYTES;
     assert!(
-        yield_until(100_000, || written.load(Ordering::Relaxed) >= saturated).await,
+        wait_until(|| written.load(Ordering::Relaxed) >= saturated).await,
         "response must fill the outbound queue while the client pauses"
     );
-    let (mut stalled_at, mut stable) = (0, 0);
-    while stable < 1_000 {
-        let now = written.load(Ordering::Relaxed);
-        if now == stalled_at {
-            stable += 1;
-        } else {
-            (stalled_at, stable) = (now, 0);
-        }
-        tokio::task::yield_now().await;
-    }
+    let stalled_at = producer_stall(&written).await;
     assert!(
         stalled_at < RESPONSE_BYTES,
         "consumer wrote the whole {RESPONSE_BYTES}-byte reply without the client reading: \
@@ -1486,7 +1507,7 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
         ping_at < RESPONSE_BYTES,
         "heartbeat ping arrived only after the {RESPONSE_BYTES}-byte reply fully drained"
     );
-    let requests = tokio::time::timeout(Duration::from_secs(5), requests_rx)
+    let requests = tokio::time::timeout(deadline(), requests_rx)
         .await
         .expect("consumer reads the queued requests")
         .unwrap();
@@ -1499,7 +1520,7 @@ async fn slow_client_keeps_stream_and_heartbeats_alive_behind_large_response() {
     drop(cmd_tx);
     drop(client_sink);
     drop(client_stream);
-    tokio::time::timeout(Duration::from_secs(5), connection)
+    tokio::time::timeout(deadline(), connection)
         .await
         .expect("connection loop ends once its command channel closes")
         .unwrap();
@@ -1618,7 +1639,7 @@ async fn blocked_sink_client_stalls_only_its_own_stream_at_the_credit_window() {
     .await;
     cmd_tx.send(ConnCmd::Ping).await.unwrap();
     assert!(
-        yield_until(100_000, || cmd_tx.capacity() == 1).await,
+        wait_until(|| cmd_tx.capacity() == 1).await,
         "heartbeat ping stalled behind the WebSocket write for stream A: the daemon kept \
          sending A's reply past the client's {window}-byte window"
     );
