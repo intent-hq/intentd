@@ -537,6 +537,29 @@ async fn agent_list_scopes_partition_the_non_retired_rows() {
             .expect("retired count"),
         3
     );
+    // delegatedCounts: per direct parent over the same non-retired delegated
+    // rows (the retired child under top-b is excluded), so Σ total equals
+    // scopeCounts.delegated.
+    let delegated_counts = svc
+        .agent_delegated_counts_op(ws.clone())
+        .await
+        .expect("delegated counts");
+    assert_eq!(delegated_counts.by_parent.keys().collect::<Vec<_>>(), {
+        let mut parents = vec![&top_a, &top_b];
+        parents.sort();
+        parents
+    });
+    assert_eq!(delegated_counts.by_parent[&top_a].total, 2);
+    assert_eq!(delegated_counts.by_parent[&top_b].total, 1);
+    assert_eq!(
+        delegated_counts
+            .by_parent
+            .values()
+            .map(|c| c.total)
+            .sum::<u64>(),
+        3,
+        "Σ byParent[*].total == scopeCounts.delegated"
+    );
 
     // parentAgentId narrows delegated to that parent's direct sub-agents.
     let under_a = svc
@@ -599,13 +622,20 @@ async fn agent_list_scopes_partition_the_non_retired_rows() {
 /// An empty workspace answers zero counts and empty bins (no rows, no error).
 #[tokio::test]
 async fn agent_list_scopes_on_empty_workspace() {
-    use intent_core::{AgentListRowScope, AgentScopeCounts};
+    use intent_core::{AgentDelegatedCounts, AgentListRowScope, AgentScopeCounts};
     let (_t, svc, ws) = setup().await;
     assert_eq!(
         svc.agent_scope_counts_op(ws.clone())
             .await
             .expect("scope counts"),
         AgentScopeCounts::default()
+    );
+    assert_eq!(
+        svc.agent_delegated_counts_op(ws.clone())
+            .await
+            .expect("delegated counts"),
+        AgentDelegatedCounts::default(),
+        "an empty workspace serves {{ running: 0, byParent: {{}} }}"
     );
     for scope in [
         AgentListRowScope::TopLevel,

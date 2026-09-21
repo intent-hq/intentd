@@ -16,12 +16,12 @@ use intent_core::events::{
     AGENT_QUEUE_UPDATED, AGENT_UPDATED,
 };
 use intent_core::{
-    now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentListRowScope, AgentLite,
-    AgentMessage, AgentScopeCounts, AgentSession, AgentStatus, AgentWakeCreateOptions,
-    AgentWakeOrCreateInput, ConversationProjection, Error, Event, EventActor, MessageOrigin,
-    NoteId, PullRequestInfo, PullRequestStatus, Result, SessionStats, TaskStatus, WorkspaceApi,
-    WorkspaceId, MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED,
-    SLIM_PAGE_BUDGET_BYTES,
+    now_iso, parse_iso, ActorType, AgentCreateExtra, AgentDelegatedCounts, AgentId,
+    AgentListRowScope, AgentLite, AgentMessage, AgentScopeCounts, AgentSession, AgentStatus,
+    AgentWakeCreateOptions, AgentWakeOrCreateInput, ConversationProjection, Error, Event,
+    EventActor, MessageOrigin, NoteId, PullRequestInfo, PullRequestStatus, Result, SessionStats,
+    TaskStatus, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED,
+    PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
 };
 use intent_sourcecontrol::RepoRef;
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
@@ -2744,6 +2744,20 @@ impl Services {
     ) -> Result<AgentScopeCounts> {
         self.store
             .count_agent_sessions_by_scope(&workspace_id)
+            .await
+    }
+
+    /// `delegatedCounts` (PROTOCOL §5.5): per-parent counts of the
+    /// workspace's non-retired delegated sessions (total and running, the
+    /// [`is_running_turn`] rule on the persisted status) — one grouped SQL
+    /// aggregate attached to every `agent.list` response variant by the
+    /// router, next to `scopeCounts`.
+    pub(crate) async fn agent_delegated_counts_op(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<AgentDelegatedCounts> {
+        self.store
+            .count_delegated_agent_sessions_by_parent(&workspace_id)
             .await
     }
 

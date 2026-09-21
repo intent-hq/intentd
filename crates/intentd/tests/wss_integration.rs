@@ -1504,9 +1504,11 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
 /// `"delegated"` / `"background"` each return exactly their bin, the bins
 /// partition the default read, `parentAgentId` narrows `delegated` to one
 /// parent's direct sub-agents, every variant carries `scopeCounts`
-/// (workspace-wide, non-retired) next to `retiredCount`, the default
-/// response is otherwise byte-identical to `scope: "all"`, and the invalid
-/// combinations are `-32602` with the documented messages.
+/// (workspace-wide, non-retired) and `delegatedCounts` (per direct parent,
+/// with the persisted-status running rule and `Σ total ==
+/// scopeCounts.delegated`) next to `retiredCount`, the default response is
+/// otherwise byte-identical to `scope: "all"`, and the invalid combinations
+/// are `-32602` with the documented messages.
 #[intent_test_macros::daemon_test]
 async fn wss_agent_list_scope_bins_and_counts() {
     let srv = start(WsOptions::default()).await;
@@ -1566,6 +1568,36 @@ async fn wss_agent_list_scope_bins_and_counts() {
         )
         .await
         .expect("retire");
+    // A retired child under top-b: excluded from every count.
+    let retired_child = create_agent("retired-under-b", false, 9).await;
+    {
+        let child_id = intent_core::AgentId::from(retired_child.as_str());
+        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        session.parent_agent_id = Some(intent_core::AgentId::from(top_b.as_str()));
+        srv.store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("link retired child");
+        srv.api
+            .agent_retire(child_id, Some(workspace_id.clone()), None)
+            .await
+            .expect("retire child");
+    }
+    // Persisted statuses drive the `running` rule: `active` counts, the
+    // legacy capitalized `Processing` counts, `idle` does not.
+    for (child, status) in [
+        (&alpha_child, intent_core::AgentStatus::Active),
+        (&alpha_bg_child, intent_core::AgentStatus::RuntimeIdle),
+        (&beta_child, intent_core::AgentStatus::Processing),
+    ] {
+        let child_id = intent_core::AgentId::from(child.as_str());
+        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        session.status = status;
+        srv.store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("set child status");
+    }
 
     let list = |params: String, id: i64| {
         let frame = format!(
@@ -1598,8 +1630,22 @@ async fn wss_agent_list_scope_bins_and_counts() {
     )
     .await;
 
-    // Envelope: every variant is `{ agents, retiredCount, scopeCounts }`.
+    let including_retired = list(r#","includeRetired":true"#.to_string(), 16).await;
+    let retired_only = list(r#","retiredOnly":true"#.to_string(), 17).await;
+
+    // Envelope: every variant is
+    // `{ agents, retiredCount, scopeCounts, delegatedCounts }`.
     let expected_counts = serde_json::json!({ "topLevel": 2, "delegated": 3, "background": 1 });
+    // Per direct parent, non-retired only: top-a has an `active` (running)
+    // and an `idle` background child, top-b a legacy `Processing` (running)
+    // child; its retired child is excluded, and Σ total == scopeCounts.delegated.
+    let expected_delegated = serde_json::json!({
+        "running": 2,
+        "byParent": {
+            top_a.as_str(): { "total": 2, "running": 1 },
+            top_b.as_str(): { "total": 1, "running": 1 },
+        }
+    });
     for (label, v) in [
         ("default", &default),
         ("all", &all),
@@ -1607,6 +1653,8 @@ async fn wss_agent_list_scope_bins_and_counts() {
         ("delegated", &delegated),
         ("background", &background),
         ("delegated/parent", &under_a),
+        ("includeRetired", &including_retired),
+        ("retiredOnly", &retired_only),
     ] {
         assert_eq!(v["jsonrpc"], "2.0", "{label}: {v}");
         assert!(v.get("error").is_none(), "{label}: {v}");
@@ -1618,13 +1666,36 @@ async fn wss_agent_list_scope_bins_and_counts() {
             .collect();
         assert_eq!(
             keys,
-            ["agents", "retiredCount", "scopeCounts"],
+            ["agents", "retiredCount", "scopeCounts", "delegatedCounts"],
             "{label}: envelope keys: {v}"
         );
-        assert_eq!(v["result"]["retiredCount"], 1, "{label}: {v}");
+        assert_eq!(v["result"]["retiredCount"], 2, "{label}: {v}");
         assert_eq!(
             v["result"]["scopeCounts"], expected_counts,
             "{label}: scopeCounts are workspace-wide and non-retired: {v}"
+        );
+        assert_eq!(
+            v["result"]["delegatedCounts"], expected_delegated,
+            "{label}: delegatedCounts are workspace-wide, per parent, non-retired: {v}"
+        );
+        let by_parent = v["result"]["delegatedCounts"]["byParent"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: byParent object: {v}"));
+        assert_eq!(
+            by_parent
+                .values()
+                .map(|c| c["total"].as_u64().unwrap())
+                .sum::<u64>(),
+            v["result"]["scopeCounts"]["delegated"].as_u64().unwrap(),
+            "{label}: Σ byParent[*].total == scopeCounts.delegated: {v}"
+        );
+        assert_eq!(
+            by_parent
+                .values()
+                .map(|c| c["running"].as_u64().unwrap())
+                .sum::<u64>(),
+            v["result"]["delegatedCounts"]["running"].as_u64().unwrap(),
+            "{label}: running == Σ byParent[*].running: {v}"
         );
     }
     // `scope: "all"` IS the default read.
@@ -1652,6 +1723,7 @@ async fn wss_agent_list_scope_bins_and_counts() {
         ids(&default).len()
     );
     assert!(!union.contains(&retired_top));
+    assert!(!union.contains(&retired_child));
     // Scoped rows are the default read's rows, unchanged.
     for v in [&top, &delegated, &background, &under_a] {
         for row in v["result"]["agents"].as_array().unwrap() {

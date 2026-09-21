@@ -218,6 +218,67 @@ async fn stale_snapshot_cannot_bypass_the_reconnect_guard() {
     assert_eq!(refreshed.login.as_deref(), Some("second-renamed"));
 }
 
+/// Single-user daemon, the race from intent-hq/intent#5551: a background
+/// refresh snapshots the row (account 10, then the unlinked `None` row),
+/// `github.connect` switches the primary to account 20 while `GET /user`
+/// is in flight, and the refresh completes with account 10's profile. The
+/// row has moved to an account the fetched profile does not describe, so
+/// the write is skipped and the current row is returned unchanged.
+#[tokio::test]
+async fn stale_refresh_keeps_a_concurrent_account_switch() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store.clone());
+    let mut primary = store.get_primary_principal().await.expect("primary");
+    primary.github_user_id = Some(10);
+    primary.login = Some("first".into());
+    store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed identity");
+    let stale = primary.clone();
+
+    let switched = services
+        .apply_primary_identity(primary, &identity("second", 20))
+        .await
+        .expect("connect switch");
+    assert_eq!(switched.github_user_id, Some(20));
+
+    let kept = services
+        .apply_primary_identity(stale, &identity("first", 10))
+        .await
+        .expect("stale refresh is skipped, not an error");
+    assert_eq!(kept.github_user_id, Some(20));
+    assert_eq!(kept.login.as_deref(), Some("second"));
+    let stored = store.get_primary_principal().await.expect("primary");
+    assert_eq!(stored.github_user_id, Some(20));
+    assert_eq!(stored.login.as_deref(), Some("second"));
+
+    // The same race from a still-unlinked snapshot (`github_user_id` None).
+    let mut unlinked = stored.clone();
+    unlinked.github_user_id = None;
+    unlinked.login = None;
+    store
+        .upsert_principal(&unlinked)
+        .await
+        .expect("reset to unlinked");
+    let stale = unlinked.clone();
+    services
+        .apply_primary_identity(unlinked, &identity("second", 20))
+        .await
+        .expect("connect links account 20");
+
+    let kept = services
+        .apply_primary_identity(stale, &identity("first", 10))
+        .await
+        .expect("stale refresh is skipped, not an error");
+    assert_eq!(kept.github_user_id, Some(20));
+    assert_eq!(kept.login.as_deref(), Some("second"));
+    let stored = store.get_primary_principal().await.expect("primary");
+    assert_eq!(stored.github_user_id, Some(20));
+    assert_eq!(stored.login.as_deref(), Some("second"));
+}
+
 /// While locked, a profile without a stable account id is unverifiable and
 /// refused: the cached identity stays.
 #[tokio::test]
