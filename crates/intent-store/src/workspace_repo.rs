@@ -196,6 +196,33 @@ impl Store {
         Ok(())
     }
 
+    /// Reconcile an observed branch without overwriting concurrent workspace edits.
+    /// A renamed or switched branch is no longer eligible for automatic deletion.
+    ///
+    /// # Errors
+    /// Returns an error if the database write fails.
+    pub async fn reconcile_workspace_branch(
+        &self,
+        expected: &Workspace,
+        branch: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workspace SET branch = ?, branch_auto_generated = 0 \
+             WHERE id = ? AND branch = ? AND branch <> ? \
+             AND worktree_path IS ? AND repository_path IS ? AND is_remote = 0",
+        )
+        .bind(branch)
+        .bind(&expected.id.0)
+        .bind(&expected.branch)
+        .bind(branch)
+        .bind(&expected.worktree_path)
+        .bind(&expected.repository_path)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("reconcile workspace branch failed: {e}")))?;
+        Ok(result.rows_affected() != 0)
+    }
+
     /// Scoped PR-linkage write: set ONLY the PR columns (`pr_number`,
     /// `pr_url`, `pr_status`, `active_pull_request`, `pull_requests`) plus
     /// `updated_at` — never a full-row replace, so a PR refresh whose

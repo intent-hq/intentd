@@ -146,6 +146,7 @@ mod transfer_submodules;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
+mod workspace_branch;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
