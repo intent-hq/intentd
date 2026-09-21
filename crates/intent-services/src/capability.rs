@@ -1355,13 +1355,18 @@ mod tests {
 
     /// `workspace.members.list` by the primary user whose cached row has no
     /// GitHub login spawns the same rate-limited background identity
-    /// refresh `principal.me` does (intent-hq/intent#5534): the triggering
-    /// response serves the cached row (it never waits on `GET /user`), a
-    /// later list carries the attached `login` / `displayName`, and a
-    /// second list inside the refresh interval spawns nothing — exactly one
-    /// `GET /user` in total.
+    /// refresh `principal.me` does (intent-hq/intent#5534). The stub's
+    /// `GET /user` is held by a test-controlled gate so the assertions are
+    /// deterministic: the triggering list AND a second list inside the
+    /// refresh interval both return while the fetch is still in flight
+    /// (serving the cached, login-less row), exactly one fetch was started,
+    /// and only once the gate opens does a later list carry the attached
+    /// `login` / `displayName` / `avatarUrl` — still one `GET /user`.
     #[tokio::test]
     async fn members_list_refreshes_the_primary_identity_off_path() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
@@ -1371,41 +1376,81 @@ mod tests {
             primary.login.is_none(),
             "a fresh primary row has no identity"
         );
-        let forge = std::sync::Arc::new(crate::tests::pr::StubForge::default());
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let forge = std::sync::Arc::new(crate::tests::pr::StubForge::with_get_user_gate(
+            gate.clone(),
+        ));
         let services = Services::new(store.clone()).with_source_control(forge.clone());
-        let list = || {
-            with_caller(
-                Caller::Wire {
-                    principal_id: primary.id.clone(),
-                    is_administrator: true,
-                },
-                services.workspace_members_list_op(&ws),
+        let (services, primary, ws) = (&services, &primary, &ws);
+        let list = |what: &'static str| async move {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                with_caller(
+                    Caller::Wire {
+                        principal_id: primary.id.clone(),
+                        is_administrator: true,
+                    },
+                    services.workspace_members_list_op(ws),
+                ),
             )
+            .await
+            .unwrap_or_else(|_| panic!("{what}: blocked on the refresh"))
+            .expect(what)
         };
+        let fetches = || forge.get_user_calls.load(Ordering::SeqCst);
 
-        let first = list().await.expect("first list");
+        // The triggering list returns while `GET /user` is held: it never
+        // waits on the refresh and serves the cached row.
+        let first = list("first list").await;
         assert_eq!(first["members"][0]["principalId"], json!(primary.id.0));
-        assert_eq!(
-            first["members"][0]["login"],
-            Value::Null,
-            "the triggering read serves the cached row"
-        );
-        list().await.expect("second list inside the interval");
+        assert_eq!(first["members"][0]["login"], Value::Null);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fetches() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refresh was spawned");
 
-        let attached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // A second list while the fetch is still held: served from the
+        // cache, and the interval gate spawns no second refresh.
+        let second = list("second list").await;
+        assert_eq!(second["members"][0]["login"], Value::Null);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fetches(),
+            1,
+            "the second list inside the interval spawns nothing"
+        );
+        assert!(
+            store
+                .get_primary_principal()
+                .await
+                .expect("primary")
+                .login
+                .is_none(),
+            "nothing is persisted while the fetch is held"
+        );
+
+        // Open the gate: the detached refresh completes and persists the
+        // identity; a later list carries it.
+        gate.add_permits(1);
+        let attached = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let p = store.get_primary_principal().await.expect("primary");
                 if p.login.is_some() {
                     break p;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
         .expect("the background refresh attaches the identity");
         assert_eq!(attached.login.as_deref(), Some("octocat"));
 
-        let later = list().await.expect("later list");
+        let later = list("later list").await;
         assert_eq!(later["members"][0]["login"], json!("octocat"));
         assert_eq!(later["members"][0]["displayName"], json!("The Octocat"));
         assert_eq!(
@@ -1413,9 +1458,7 @@ mod tests {
             json!("https://avatars.example/u/1")
         );
         assert_eq!(
-            forge
-                .get_user_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
+            fetches(),
             1,
             "one refresh for three lists inside the interval"
         );
