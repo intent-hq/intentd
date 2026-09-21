@@ -249,7 +249,10 @@ fn agent_nice_from(raw: Option<&str>) -> i32 {
     i32::try_from(n.clamp(0, 19)).unwrap_or(DEFAULT_AGENT_NICE)
 }
 
-/// Highest (least favourable) nice value a process can have.
+/// Cap on the nice value the demotion targets — the portable
+/// least-favourable value (Linux's `PRIO_MAX`). Not every OS stops there
+/// (macOS's `PRIO_MAX` is 20), so a parent already at or above it is left
+/// where it is rather than pulled down to the cap.
 #[cfg(unix)]
 const MAX_NICE: i32 = 19;
 
@@ -273,11 +276,16 @@ fn nice_of(pid: libc::id_t) -> Result<i32, i32> {
 }
 
 /// The nice value a child of a process at `parent` nice should run at for
-/// increment `increment`: `parent + increment`, capped at [`MAX_NICE`]. Never
-/// below `parent`, so the child never outranks the daemon.
+/// increment `increment`: `parent + increment`, capped at [`MAX_NICE`], but
+/// never below `parent` — a parent already at or past the cap (possible on
+/// macOS, whose range reaches 20) keeps its value — so the child never
+/// outranks the daemon.
 #[cfg(unix)]
 fn target_nice(parent: i32, increment: i32) -> i32 {
-    parent.saturating_add(increment.max(0)).min(MAX_NICE)
+    parent
+        .saturating_add(increment.max(0))
+        .min(MAX_NICE)
+        .max(parent)
 }
 
 /// Configure `cmd` so the child starts at reduced scheduling priority
@@ -309,7 +317,10 @@ fn apply_reduced_priority(cmd: &mut Command, increment: i32) {
         unsafe {
             cmd.pre_exec(move || {
                 if let Ok(inherited) = nice_of(0) {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, target_nice(inherited, increment));
+                    let target = target_nice(inherited, increment);
+                    if target > inherited {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, target);
+                    }
                 }
                 Ok(())
             });
@@ -1501,6 +1512,11 @@ mod reduced_priority_tests {
         // Never below the parent.
         assert_eq!(target_nice(7, 0), 7);
         assert_eq!(target_nice(7, -4), 7);
+        // A parent past the portable cap (macOS PRIO_MAX is 20) stays put
+        // rather than being pulled down to the cap.
+        assert_eq!(target_nice(20, DEFAULT_AGENT_NICE), 20);
+        assert_eq!(target_nice(20, 0), 20);
+        assert_eq!(target_nice(i32::MAX, DEFAULT_AGENT_NICE), i32::MAX);
     }
 
     #[tokio::test]
