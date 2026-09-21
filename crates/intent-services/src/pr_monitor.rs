@@ -6693,7 +6693,10 @@ mod tests {
         row.pr_number = Some(42);
         row.pr_url = Some("https://github.com/o/r/pull/42".into());
         row.pr_status = Some(intent_core::PullRequestStatus::Open);
-        svc.store().update_workspace(&row).await.unwrap();
+        svc.store()
+            .update_workspace_with_branch(&row, Some(&row.branch))
+            .await
+            .unwrap();
         register(&svc, &ws, &owner).await;
 
         forge.edit(|s| s.pr_state = PrState::Merged);
@@ -8758,7 +8761,10 @@ mod tests {
         linked.branch = "feature".into();
         linked.pr_number = Some(42);
         linked.pr_url = Some("https://github.com/o/r/pull/42".into());
-        svc.store().update_workspace(&linked).await.unwrap();
+        svc.store()
+            .update_workspace_with_branch(&linked, Some(&linked.branch))
+            .await
+            .unwrap();
         forge.edit(|s| s.rate_limit_get_pr = true);
         svc.refresh_all_workspace_prs(0).await;
         assert!(

@@ -91,7 +91,7 @@ mod tests {
         (db, Services::new(store).with_event_bus(bus), ws)
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn refresh_repairs_external_rename_and_publishes_once() {
         let dir = test_tempdir("branch-read-");
         let repo = init_repo(dir.path());
@@ -140,7 +140,7 @@ mod tests {
         assert!(sub.try_recv_delivery().is_none());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn metadata_refresh_repairs_linked_worktree_branch() {
         let dir = test_tempdir("branch-worktree-");
         let repo = init_repo(&dir.path().join("repo"));
@@ -183,7 +183,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn detached_missing_and_remote_repositories_preserve_metadata() {
         let dir = test_tempdir("branch-fallback-");
         let repo = init_repo(dir.path());
@@ -222,7 +222,7 @@ mod tests {
             .unwrap());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn reconciliation_preserves_concurrent_edits_and_rejects_stale_branch_or_path() {
         let dir = test_tempdir("branch-concurrency-");
         let (_db, svc, ws) = setup(dir.path()).await;
