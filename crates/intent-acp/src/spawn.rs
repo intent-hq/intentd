@@ -1382,29 +1382,37 @@ mod reduced_priority_tests {
         }
     }
 
-    /// This test process's own nice value.
-    fn own_nice() -> i32 {
+    /// The nice value of process `pid` (`0` = this test process), read with
+    /// `getpriority` so the check needs no platform-specific `nice(1)`
+    /// (macOS's prints nothing and exits 1 without a utility argument).
+    fn nice_of(pid: u32) -> i32 {
         nix::errno::Errno::clear();
         // SAFETY: plain syscall wrapper with no pointer arguments.
-        let got = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let got = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
         assert!(
             got != -1 || nix::errno::Errno::last_raw() == 0,
-            "getpriority(self) failed"
+            "getpriority({pid}) failed: {}",
+            std::io::Error::last_os_error()
         );
         got
     }
 
-    /// Nice value the child reports via `nice(1)` when built with `nice`.
-    async fn child_nice(nice: i32) -> i32 {
-        let provider = sh_provider("nice");
+    /// This test process's own nice value.
+    fn own_nice() -> i32 {
+        nice_of(0)
+    }
+
+    /// Nice value a live child built with `nice` is running at, read from
+    /// the parent. `spawn` returns after the exec, so the `pre_exec`
+    /// `setpriority` has already taken effect.
+    fn child_nice(nice: i32) -> i32 {
+        let provider = sh_provider("exec sleep 30");
         let opts = SpawnOptions::new(&provider);
         let mut cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), nice);
-        let out = cmd.output().await.expect("spawn `sh -c nice`");
-        assert!(out.status.success(), "nice(1) failed: {out:?}");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .expect("nice(1) prints an integer")
+        let child = cmd.spawn().expect("spawn sleeper");
+        let got = nice_of(child.id().expect("child pid"));
+        drop(child);
+        got
     }
 
     #[tokio::test]
@@ -1412,18 +1420,18 @@ mod reduced_priority_tests {
         // An unprivileged process can only RAISE nice, so a test runner
         // already niced above the target keeps the child at its own level.
         let expected = own_nice().max(DEFAULT_AGENT_NICE);
-        assert_eq!(child_nice(DEFAULT_AGENT_NICE).await, expected);
+        assert_eq!(child_nice(DEFAULT_AGENT_NICE), expected);
     }
 
     #[tokio::test]
     async fn child_starts_at_configured_nice() {
         let expected = own_nice().max(12);
-        assert_eq!(child_nice(12).await, expected);
+        assert_eq!(child_nice(12), expected);
     }
 
     #[tokio::test]
     async fn nice_zero_leaves_child_at_daemon_priority() {
-        assert_eq!(child_nice(0).await, own_nice());
+        assert_eq!(child_nice(0), own_nice());
     }
 
     #[tokio::test]
