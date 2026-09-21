@@ -228,6 +228,14 @@ impl Lexer<'_> {
                     self.boundary(2);
                     self.stack.push(Ctx::Subshell);
                 }
+                '>' | '<' => {
+                    let fd_prefix = self.word.chars().all(|c| c.is_ascii_digit());
+                    if !self.word.is_empty() && !fd_prefix {
+                        self.flush();
+                    }
+                    self.push_char(c);
+                    self.i += 1;
+                }
                 '(' | ';' => self.boundary(1),
                 ')' => {
                     self.boundary(1);
@@ -399,6 +407,10 @@ mod fixture {
             r"          printf x | grep -q x # comment",
             r"          printf x | grep -q x 2>/dev/null; echo done",
             r"          printf x | grep -q -- -x",
+            r"          printf x | grep x -q>/dev/null",
+            r"          printf x | grep x -q;",
+            r"          printf x | grep x -q 2>&1",
+            r"          printf x | grep x -q&& echo yes",
             r"          (printf x | grep -q x)",
             r#"        run: "printf x | grep -q x""#,
             r"        run: 'printf x | grep -q x'",
@@ -450,6 +462,8 @@ mod fixture {
             r"          printf x | grep x -- -q",
             r"          printf x | grep -E pat >/dev/null; x=$(grep -q y file)",
             r"          printf x | grep x >'/dev/null' -- -q",
+            r"          printf x | grep x>/dev/null",
+            r"          printf x | grep x 2>/dev/null",
             r#"          echo "a | grep -q b""#,
             r"          echo 'a | grep -q b'",
             r"          # comment \",
