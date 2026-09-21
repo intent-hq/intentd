@@ -271,13 +271,14 @@ API:
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
   ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
   ws.script.remove(scriptId) → { ok, scriptId }  // Stops and removes a saved script definition.
-  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script.
+  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
   ws.script.stop(scriptId) → { ok, scriptId }  // Stops a running script.
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
-  ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings.
+  ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings. `status` is `idle` | `starting` | `running` | `restarting` | `exited`. The settled condition is exactly `status === "exited"`; `starting` / `running` / `restarting` are live (a poll mid-launch or mid-restart must keep waiting), and `idle` after a start means a `ws.script.stop` aborted the launch. Every `exited` carries an `exitCode`: the real code when a process ran (0 success, non-zero failure; `error` absent), or the sentinel `-1` when no code could be observed. A startup failure (PTY allocation, a cwd escaping the workspace root, a spawn error) never ran a process, so it settles as `exited` with `exitCode: -1`, `error` = the original failure text (kept verbatim — no success code is invented) and `stoppedAt`. Never gate completion on `exitCode` alone and never read `-1` as a real code: check `status`, then `error`.
+    Canonical completion hook — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\n" + out };' })`.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
-    `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with a self-checking background hook that polls `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
+    `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with the completion hook documented under `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
   ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root, and an omitted `cwd` defaults to the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
@@ -525,13 +526,14 @@ API:
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
   ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
   ws.script.remove(scriptId) → { ok, scriptId }  // Stops and removes a saved script definition.
-  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script.
+  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
   ws.script.stop(scriptId) → { ok, scriptId }  // Stops a running script.
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
-  ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings.
+  ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings. `status` is `idle` | `starting` | `running` | `restarting` | `exited`. The settled condition is exactly `status === "exited"`; `starting` / `running` / `restarting` are live (a poll mid-launch or mid-restart must keep waiting), and `idle` after a start means a `ws.script.stop` aborted the launch. Every `exited` carries an `exitCode`: the real code when a process ran (0 success, non-zero failure; `error` absent), or the sentinel `-1` when no code could be observed. A startup failure (PTY allocation, a cwd escaping the workspace root, a spawn error) never ran a process, so it settles as `exited` with `exitCode: -1`, `error` = the original failure text (kept verbatim — no success code is invented) and `stoppedAt`. Never gate completion on `exitCode` alone and never read `-1` as a real code: check `status`, then `error`.
+    Canonical completion hook — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\n" + out };' })`.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
-    `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with a self-checking background hook that polls `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
+    `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with the completion hook documented under `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
   ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
@@ -707,6 +709,14 @@ const PR_MONITOR_SNAPSHOT_XREF_LINE: &str = "    This is the SAME enriched objec
 const PR_MONITOR_ONLY_METHODS: &str = "These are the only `ws.pr.*` methods.";
 const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
 
+/// The `ws.script.status` continuation line carrying the canonical
+/// completion-hook recipe (intent-hq/intent#5577): a `ws.hook.schedule` call
+/// outside the `ws.hook.*` doc lines, scrubbed whole when
+/// `agentFeatures.backgroundHooks` is off so the surviving script docs never
+/// advertise a pruned method (a unit test guards the needle verbatim in both
+/// variants).
+const SCRIPT_COMPLETION_HOOK_LINE: &str = "    Canonical completion hook — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: \"script <id> done\", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status(\"<id>\"); if (s.status !== \"exited\") return { dispatch: false }; const out = await ws.script.output(\"<id>\", 200); const outcome = s.error ? \"failed: \" + s.error : s.exitCode === 0 ? \"succeeded\" : \"exited with code \" + s.exitCode; return { dispatch: true, message: \"script <id> \" + outcome + \"\\n\" + out };' })`.\n";
+
 /// Task-graph teaching scrubbed from the assembled description when
 /// `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). Docs only —
 /// `delegate({ tasks })` is never dispatch-denied, so this never joins
@@ -816,6 +826,12 @@ pub fn workspace_api_description(
         out =
             out.replacen(HOOK_HOST_EXEC_INDEX_XREF, "", 1)
                 .replacen(HOOK_HOST_EXEC_DOC_XREF, "", 1);
+    }
+    // Cross-reference scrub for `backgroundHooks`: the `ws.script.status`
+    // completion recipe is a `ws.hook.schedule` call on its own continuation
+    // line, which method-line pruning cannot reach.
+    if !features.background_hooks {
+        out = out.replacen(SCRIPT_COMPLETION_HOOK_LINE, "", 1);
     }
     // Cross-reference scrub for `prMonitor`: the three monitor doc lines are
     // pruned above, but the surviving `ws.pr.*` index entry, hook steer and
@@ -1245,9 +1261,10 @@ mod tests {
         HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT,
         PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF,
         PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
-        TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS,
-        TASK_GRAPH_SETCONTENT_XREF, TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION,
-        WORKSPACE_API_DESCRIPTION_CHIEF, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+        SCRIPT_COMPLETION_HOOK_LINE, TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR,
+        TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF, TASK_GRAPH_UNBLOCKED_WAKE_XREF,
+        WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
+        WORKSPACE_API_SYSTEM_PROMPT_HEADING,
     };
     use std::collections::HashSet;
 
@@ -2598,6 +2615,37 @@ mod tests {
                     "chief={is_chief}: `{kept}` was wrongly pruned"
                 );
             }
+        }
+    }
+
+    // Guard: the `ws.script.status` completion recipe (the one
+    // `ws.hook.schedule` mention outside the hook docs, intent-hq/intent#5577)
+    // matches both variants verbatim, so the `backgroundHooks` scrub cannot
+    // silently become a no-op; with hooks off the recipe is gone while the
+    // settled-condition contract on the same method line survives.
+    #[test]
+    fn script_completion_recipe_matches_both_variants_and_follows_hook_gate() {
+        for base in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert!(base.contains(SCRIPT_COMPLETION_HOOK_LINE));
+            assert!(base.contains("The settled condition is exactly `status === \"exited\"`"));
+            assert!(base.contains(
+                "settles as `exited` with `exitCode: -1`, `error` = the original failure text"
+            ));
+        }
+        let features = AgentFeaturesSettings {
+            background_hooks: false,
+            ..AgentFeaturesSettings::default()
+        };
+        for is_chief in [false, true] {
+            let pruned = workspace_api_description(is_chief, &features);
+            assert!(
+                !pruned.contains("Canonical completion hook"),
+                "chief={is_chief}: the hook recipe survived disabling backgroundHooks"
+            );
+            assert!(
+                pruned.contains("The settled condition is exactly `status === \"exited\"`"),
+                "chief={is_chief}: the settled-condition contract was wrongly pruned"
+            );
         }
     }
 
