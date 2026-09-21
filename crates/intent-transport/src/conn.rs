@@ -9,7 +9,9 @@
 //! transports handle by draining the two-lane outbound queue
 //! ([`OutboundSender`] / [`OutboundReceiver`], priority lane first).
 
-use intent_core::events::{AGENT_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED};
+use intent_core::events::{
+    AGENT_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED,
+};
 use intent_core::{AgentId, ClientId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
