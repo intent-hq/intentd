@@ -9,10 +9,10 @@
 //! (<https://github.com/intent-hq/cloudlands-fe/pull/2709#discussion_r4057405412>).
 //!
 //! This test scans every `.github/workflows/*.yml` / `*.yaml` and fails,
-//! naming `file:line: text` and the accepted rewrites, on any non-comment
-//! line where a `|` (not `||`; `|&` counts) is followed by `grep` whose
-//! flags include a quiet spelling — `-q`, a short-flag cluster containing
-//! `q` (`-Eq`, `-qE`, `-Fxq`, …), `--quiet`, or `--silent`. The accepted
+//! naming `file:line: text` and the accepted rewrites, wherever a `|` (not
+//! `||`; `|&` counts) is followed by the command `grep` whose arguments
+//! include a quiet spelling — `-q`, a short-flag cluster containing `q`
+//! (`-Eq`, `-qE`, `-Fxq`, …), `--quiet`, or `--silent`. The accepted
 //! rewrites are:
 //!
 //! - variable input: drop the pipe — `grep -qE pattern <<<"$VAR"` (no
@@ -21,10 +21,20 @@
 //!   `producer | grep -E pattern >/dev/null`;
 //! - file input: `grep -q pattern file`.
 //!
-//! Limits: this is a bounded textual check (no shell parser). A quiet grep
-//! reading a file or here-string on a line with no `|` is not a hit; a
-//! pipeline whose `|` ends one line and whose `grep` starts the next is not
-//! detected; a pipe inside a quoted string is treated like any other pipe.
+//! The scan is a small quote-aware shell lexer, not a parser: single and
+//! double quotes group words (so `-e 'x|y' -q` is a hit and `-E 'has -q
+//! word'` is not), an unquoted `#` at a word start drops the comment tail,
+//! redirections (`2>/dev/null`, `2>&1`) are ordinary non-option words, `--`
+//! ends option scanning, and only an unquoted `|`, `;`, `&`, `&&`, `||`,
+//! `(` or `)` ends grep's argument list. `$(…)` opens a fresh command
+//! context even inside double quotes. Physical lines ending in `\` are
+//! joined with the next before lexing; a hit is reported on the physical
+//! line holding the `grep` word.
+//!
+//! Limits: a quiet grep reading a file or here-string with no `|` is not a
+//! hit; only the bare word `grep` is recognised (not `command grep`,
+//! `/usr/bin/grep`, an env-prefixed `LC_ALL=C grep`, or `xargs grep`);
+//! here-docs and backtick substitutions are lexed as ordinary text.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,43 +73,262 @@ fn is_quiet_flag(token: &str) -> bool {
     }
 }
 
-/// Whether `segment` (the text after a pipe) starts with a `grep` command
-/// carrying a quiet flag before the segment's own command boundary.
-fn segment_is_quiet_grep(segment: &str) -> bool {
-    let segment = segment.trim_start_matches('&').trim_start();
-    let Some(rest) = segment.strip_prefix("grep") else {
-        return false;
+/// One shell logical line: physical lines joined at `\`-newline, with the
+/// 0-based physical line index of every character.
+struct Logical {
+    chars: Vec<char>,
+    lines: Vec<usize>,
+}
+
+/// A one-line YAML `run: "…"` / `run: '…'` scalar, unwrapped to its body so
+/// the shell inside is lexed instead of being one quoted word.
+fn unwrap_quoted_run(line: &str) -> &str {
+    let t = line.trim_start();
+    let t = t.strip_prefix("- ").unwrap_or(t);
+    let Some(rest) = t.strip_prefix("run:") else {
+        return line;
     };
-    if !rest.starts_with(char::is_whitespace) {
-        return false;
+    let rest = rest.trim();
+    rest.strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .or_else(|| rest.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+        .unwrap_or(line)
+}
+
+fn logical_lines(text: &str) -> Vec<Logical> {
+    let mut out = Vec::new();
+    let mut cur: Option<Logical> = None;
+    for (i, line) in text.lines().enumerate() {
+        let line = unwrap_quoted_run(line);
+        let trailing = line.chars().rev().take_while(|&c| c == '\\').count();
+        let continued = trailing % 2 == 1;
+        let body = if continued {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+        let l = cur.get_or_insert_with(|| Logical {
+            chars: Vec::new(),
+            lines: Vec::new(),
+        });
+        l.chars.extend(body.chars());
+        l.lines.resize(l.chars.len(), i);
+        if !continued {
+            out.extend(cur.take());
+        }
     }
-    let end = rest
-        .find(['|', ';', '&', ')', '>', '<'])
-        .unwrap_or(rest.len());
-    rest[..end].split_whitespace().any(is_quiet_flag)
+    out.extend(cur);
+    out
+}
+
+#[derive(Debug, PartialEq)]
+enum Tok {
+    /// A shell word with quotes removed, and the physical line it starts on.
+    Word { text: String, line: usize },
+    /// `|` or `|&`.
+    Pipe,
+    /// `;`, `&`, `&&`, `||`, `(`, `)`, `$(` — ends a command's argument list.
+    Boundary,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Ctx {
+    DoubleQuote,
+    Subshell,
+}
+
+struct Lexer<'a> {
+    l: &'a Logical,
+    i: usize,
+    stack: Vec<Ctx>,
+    word: String,
+    word_line: Option<usize>,
+    toks: Vec<Tok>,
+}
+
+impl Lexer<'_> {
+    fn at(&self, off: usize) -> Option<char> {
+        self.l.chars.get(self.i + off).copied()
+    }
+
+    fn push_char(&mut self, c: char) {
+        self.word_line.get_or_insert(self.l.lines[self.i]);
+        self.word.push(c);
+    }
+
+    fn flush(&mut self) {
+        if let Some(line) = self.word_line.take() {
+            let text = std::mem::take(&mut self.word);
+            self.toks.push(Tok::Word { text, line });
+        }
+    }
+
+    fn boundary(&mut self, width: usize) {
+        self.flush();
+        self.toks.push(Tok::Boundary);
+        self.i += width;
+    }
+
+    fn run(mut self) -> Vec<Tok> {
+        let n = self.l.chars.len();
+        while self.i < n {
+            let c = self.l.chars[self.i];
+            if self.stack.last() == Some(&Ctx::DoubleQuote) {
+                match c {
+                    '"' => {
+                        self.word_line.get_or_insert(self.l.lines[self.i]);
+                        self.stack.pop();
+                        self.i += 1;
+                    }
+                    '\\' if self.i + 1 < n => {
+                        self.push_char(self.l.chars[self.i + 1]);
+                        self.i += 2;
+                    }
+                    '$' if self.at(1) == Some('(') => {
+                        self.boundary(2);
+                        self.stack.push(Ctx::Subshell);
+                    }
+                    _ => {
+                        self.push_char(c);
+                        self.i += 1;
+                    }
+                }
+                continue;
+            }
+            match c {
+                ' ' | '\t' => {
+                    self.flush();
+                    self.i += 1;
+                }
+                '#' if self.word_line.is_none() => {
+                    let line = self.l.lines[self.i];
+                    while self.i < n && self.l.lines[self.i] == line {
+                        self.i += 1;
+                    }
+                }
+                '\'' => {
+                    self.word_line.get_or_insert(self.l.lines[self.i]);
+                    self.i += 1;
+                    while self.i < n && self.l.chars[self.i] != '\'' {
+                        self.word.push(self.l.chars[self.i]);
+                        self.i += 1;
+                    }
+                    self.i += 1;
+                }
+                '"' => {
+                    self.word_line.get_or_insert(self.l.lines[self.i]);
+                    self.stack.push(Ctx::DoubleQuote);
+                    self.i += 1;
+                }
+                '\\' if self.i + 1 < n => {
+                    self.push_char(self.l.chars[self.i + 1]);
+                    self.i += 2;
+                }
+                '$' if self.at(1) == Some('(') => {
+                    self.boundary(2);
+                    self.stack.push(Ctx::Subshell);
+                }
+                '(' | ';' => self.boundary(1),
+                ')' => {
+                    self.boundary(1);
+                    if self.stack.last() == Some(&Ctx::Subshell) {
+                        self.stack.pop();
+                    }
+                }
+                '|' => {
+                    self.flush();
+                    match self.at(1) {
+                        Some('|') => {
+                            self.toks.push(Tok::Boundary);
+                            self.i += 2;
+                        }
+                        Some('&') => {
+                            self.toks.push(Tok::Pipe);
+                            self.i += 2;
+                        }
+                        _ => {
+                            self.toks.push(Tok::Pipe);
+                            self.i += 1;
+                        }
+                    }
+                }
+                '&' => {
+                    let redirection = self.word.ends_with(['>', '<']) || self.at(1) == Some('>');
+                    if redirection {
+                        self.push_char(c);
+                        self.i += 1;
+                    } else if self.at(1) == Some('&') {
+                        self.boundary(2);
+                    } else {
+                        self.boundary(1);
+                    }
+                }
+                _ => {
+                    self.push_char(c);
+                    self.i += 1;
+                }
+            }
+        }
+        self.flush();
+        self.toks
+    }
+}
+
+fn tokenize(l: &Logical) -> Vec<Tok> {
+    Lexer {
+        l,
+        i: 0,
+        stack: Vec::new(),
+        word: String::new(),
+        word_line: None,
+        toks: Vec::new(),
+    }
+    .run()
+}
+
+/// Physical line indices (0-based) of every `grep` word that follows a pipe
+/// and carries a quiet flag among its arguments.
+fn quiet_grep_lines(toks: &[Tok]) -> Vec<usize> {
+    let mut lines = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        if *tok != Tok::Pipe {
+            continue;
+        }
+        let Some(Tok::Word { text, line }) = toks.get(i + 1) else {
+            continue;
+        };
+        if text != "grep" {
+            continue;
+        }
+        let quiet = toks[i + 2..]
+            .iter()
+            .map_while(|t| match t {
+                Tok::Word { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .take_while(|arg| *arg != "--")
+            .any(is_quiet_flag);
+        if quiet {
+            lines.push(*line);
+        }
+    }
+    lines
+}
+
+/// Every hit in `text`, as `<name>:<line>: <trimmed text>`; the line is the
+/// physical line holding the `grep` word.
+fn hits_in(name: &str, text: &str) -> Vec<String> {
+    let physical: Vec<&str> = text.lines().collect();
+    logical_lines(text)
+        .iter()
+        .flat_map(|l| quiet_grep_lines(&tokenize(l)))
+        .map(|line| format!("{name}:{}: {}", line + 1, physical[line].trim()))
+        .collect()
 }
 
 /// Whether one line of workflow text pipes into a quiet grep.
 fn line_is_quiet_grep_pipeline(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return false;
-    }
-    let bytes = line.as_bytes();
-    line.match_indices('|').any(|(i, _)| {
-        let prev_is_pipe = i > 0 && bytes[i - 1] == b'|';
-        let next_is_pipe = bytes.get(i + 1) == Some(&b'|');
-        !prev_is_pipe && !next_is_pipe && segment_is_quiet_grep(&line[i + 1..])
-    })
-}
-
-/// Every hit in `text`, as `<name>:<line>: <trimmed text>`.
-fn hits_in(name: &str, text: &str) -> Vec<String> {
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| line_is_quiet_grep_pipeline(line))
-        .map(|(i, line)| format!("{name}:{}: {}", i + 1, line.trim()))
-        .collect()
+    !hits_in("", line).is_empty()
 }
 
 fn scan(root: &Path) -> Vec<String> {
@@ -161,9 +390,33 @@ mod fixture {
             r"          cmd |& grep -q err",
             r"            | grep -q err",
             r"          x=$(cat f | grep -q beta.json)",
+            r#"          x="$(cat f | grep -q beta.json)""#,
+            r"          printf x | grep -e 'x|y' -q",
+            r#"          printf x | grep -e "x|y" -q"#,
+            r"          printf x | grep 2>/dev/null -q x",
+            r"          printf x | grep >/dev/null -q x",
+            r"          printf x | grep 2>&1 -q x",
+            r"          printf x | grep -q x # comment",
+            r"          printf x | grep -q x 2>/dev/null; echo done",
+            r"          printf x | grep -q -- -x",
+            r"          (printf x | grep -q x)",
+            r#"        run: "printf x | grep -q x""#,
+            r"        run: 'printf x | grep -q x'",
         ] {
             assert!(line_is_quiet_grep_pipeline(line), "expected hit: {line}");
         }
+    }
+
+    #[test]
+    fn backslash_continued_pipeline_is_a_hit_on_the_grep_line() {
+        let text = "      - run: |\n          producer \\\n            | grep -q x\n          producer | \\\n            grep -q y\n          producer | grep -E z \\\n            >/dev/null\n";
+        assert_eq!(
+            hits_in("x.yml", text),
+            vec![
+                "x.yml:3: | grep -q x".to_string(),
+                "x.yml:5: grep -q y".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -186,6 +439,21 @@ mod fixture {
             r"          producer | egrep -q x",
             r"          producer | grep pat -1",
             r"          producer | grep -E pat >/dev/null || grep -q pat file",
+            r"          printf x | grep -E 'has -q word' >/dev/null",
+            r#"          printf x | grep -E "has -q word" >/dev/null"#,
+            r"          printf x | grep -E has\ -q\ word >/dev/null",
+            r"          printf x | grep x # no -q here",
+            r"          printf x | grep x >/dev/null # was: | grep -q x",
+            r"          printf x | grep x; grep -q y file",
+            r"          printf x | grep x && grep -q y file",
+            r"          printf x | grep x & grep -q y file",
+            r"          printf x | grep x -- -q",
+            r"          printf x | grep -E pat >/dev/null; x=$(grep -q y file)",
+            r"          printf x | grep x >'/dev/null' -- -q",
+            r#"          echo "a | grep -q b""#,
+            r"          echo 'a | grep -q b'",
+            r"          # comment \",
+            r"          printf '%s#%s' a b | grep -E pat >/dev/null",
         ] {
             assert!(!line_is_quiet_grep_pipeline(line), "unexpected hit: {line}");
         }
