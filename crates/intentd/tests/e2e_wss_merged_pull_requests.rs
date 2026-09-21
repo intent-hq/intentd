@@ -172,11 +172,13 @@ fn workspace(id: &WorkspaceId, title: &str) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -225,6 +227,7 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -503,7 +506,13 @@ fn assert_merged_rows(rows: &[Value], ws_merge: &WorkspaceId, ws_plain: &Workspa
     // Snapshot-backed monitor entry: fields synthesized off the snapshot.
     assert_eq!(prs[1]["title"], json!("Monitored PR"), "{path}");
     assert_eq!(prs[1]["number"], json!(2), "{path}");
-    assert_eq!(prs[1]["headSha"], json!("abc123"), "{path}");
+    // The snapshot's headSha fed the merge, but list rows strip the per-PR
+    // detail fields as a final pass (`Workspace::slim_for_list`).
+    assert!(
+        prs[1].get("headSha").is_none(),
+        "{path}: headSha slimmed off list rows: {}",
+        prs[1]
+    );
     assert_eq!(prs[1]["isDraft"], json!(false), "{path}");
     // Snapshotless completed monitor: synthesized identity; terminal
     // without a verdict reads closed, never merged.
@@ -523,7 +532,7 @@ fn assert_merged_rows(rows: &[Value], ws_merge: &WorkspaceId, ws_plain: &Workspa
 /// `workspace.list` rows over WSS carry the emit-path merged `pullRequests`
 /// (git-root + monitor sources, URL-deduped, cancelled excluded), while the
 /// nothing-to-merge row omits the field entirely.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_list_merges_external_prs_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
@@ -536,7 +545,7 @@ async fn workspace_list_merges_external_prs_over_wss() {
 /// The `workspace.subscribe` seq-0 snapshot rides the same lite list path
 /// and must carry the identical merged `pullRequests` a `workspace.list`
 /// would (docs/protocol/06-events.md).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_subscribe_snapshot_merges_external_prs_over_wss() {
     let fx = boot().await;
     let mut sub = connect(fx.port, fx.cfg.clone()).await;

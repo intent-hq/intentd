@@ -122,11 +122,13 @@ fn workspace(id: &WorkspaceId, worktree: &str, branch: &str) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -163,7 +165,7 @@ async fn serve(
         Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let handle = tokio::spawn(async move {
+    let handle = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -183,7 +185,7 @@ fn tmp_base(tag: &str) -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", &format!("intentd-ac-{tag}-"))
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn undo_commit_soft_resets_and_restores_staging() {
     let base_guard = tmp_base("undo-commit");
     let base = base_guard.path().to_path_buf();
@@ -234,7 +236,7 @@ async fn undo_commit_soft_resets_and_restores_staging() {
     let _ = handle.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn reset_to_trunk_guards_dirty_then_hard_resets() {
     let base_guard = tmp_base("reset");
     let base = base_guard.path().to_path_buf();
@@ -278,7 +280,7 @@ async fn reset_to_trunk_guards_dirty_then_hard_resets() {
     let _ = handle.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn rebase_onto_trunk_replays_branch() {
     let base_guard = tmp_base("rebase");
     let base = base_guard.path().to_path_buf();
@@ -314,7 +316,7 @@ async fn rebase_onto_trunk_replays_branch() {
     let _ = handle.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn merge_local_fast_forwards_trunk() {
     let base_guard = tmp_base("merge");
     let base = base_guard.path().to_path_buf();
@@ -346,7 +348,7 @@ async fn merge_local_fast_forwards_trunk() {
     let _ = handle.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn merge_squash_creates_single_commit_on_trunk() {
     let base_guard = tmp_base("squash");
     let base = base_guard.path().to_path_buf();
@@ -381,8 +383,7 @@ async fn merge_squash_creates_single_commit_on_trunk() {
     let _ = handle.await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn undo_push_rewinds_remote_branch() {
     let base_guard = tmp_base("undo-push");
     let base = base_guard.path().to_path_buf();

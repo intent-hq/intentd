@@ -350,7 +350,7 @@ const MARKER: &str = "MCP_TOOL_MARKER_wss_e2e";
 /// + client.hello → agent.create → agent.sendMessage → the mock agent calls
 /// `ws.note.saveAsset` and `ws.note.add` through MCP → note.readAsset proves the
 /// returned URL is readable → agent.list reports an assistant message persisted.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mock_agent_full_turn_saves_readable_asset_over_wss() {
     let Some(script) = gate("WSS full-turn E2E") else {
         return;
@@ -634,7 +634,7 @@ async fn mock_agent_full_turn_saves_readable_asset_over_wss() {
 /// the same `finishReason` live. The turn stays a completion: `agent:idle`
 /// fires (carrying its existing `finishReason` lifecycle field) and
 /// `agent:failed` never does.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
     let Some(script) = gate("WSS abnormal finishReason E2E") else {
         return;
@@ -773,7 +773,7 @@ async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
 /// the hot `agent.get` / `agent.list` payloads (diagnostics-only by design).
 /// The suspect threshold is lowered via `INTENTD_SILENT_TAIL_SUSPECT_MS` so
 /// the mock's parked tail crosses it without a minutes-long test.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn silent_tail_annotation_and_diagnostics_over_wss() {
     let Some(script) = gate("WSS silent-tail annotation E2E") else {
         return;
@@ -981,7 +981,7 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
 /// response, so the stall window is deterministic. Margins: the stall fires
 /// ~1s into a 3s park (checker cadence ~166ms at the 1s threshold), leaving
 /// ~2s of slack each way for saturated CI runners.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mid_turn_stall_and_resume_status_over_wss() {
     let Some(script) = gate("WSS mid-turn stall status E2E") else {
         return;
@@ -1145,7 +1145,7 @@ async fn mid_turn_stall_and_resume_status_over_wss() {
 /// turn MUST NOT. Margins match [`mid_turn_stall_and_resume_status_over_wss`]:
 /// the checker fires ~1s into a 3s park (~166ms cadence at the 1s
 /// threshold), leaving ~2s of slack for saturated CI runners.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn open_tool_call_suppresses_stall_status_over_wss() {
     let Some(script) = gate("WSS tool-aware stall suppression E2E") else {
         return;
@@ -1316,6 +1316,209 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
     );
 }
 
+/// Terminal provider stall under a hung tool call over the real WSS wire
+/// (intent-hq/intent#5395 — the opencode/grok signature): the mock's
+/// `parkMidToolCall` mode streams ONE `tool_call` (`in_progress`) and then
+/// goes completely silent — no terminal `tool_call_update`, no prompt
+/// resolution, pipes held open — so the daemon's open-tool ceilings are the
+/// only thing that can end the turn. With the thresholds lowered to seconds
+/// (stall 1s, open-tool advisory 1.5s, tool-free terminal 2s, open-tool
+/// terminal 4s), an `events.subscribe` subscriber MUST observe, in order:
+/// the routed `agent:tool:call`, the `agent:stream:status` `phase: "stalled"`
+/// advisory (open-tool ceiling — the FE leaves "Thinking"), the blocker
+/// `agent:attention-requested`, and `agent:failed` whose `error` is the
+/// `PROVIDER_STALL_PREFIX`-anchored text naming the hung call
+/// (`tc_park_mid_tool`). `agent.getSession` then reports the persisted
+/// `status: "error"` plus the blocker attention. Exactly one terminal
+/// `agent:stream:end` rides the wire (§7: error and complete both map to it),
+/// after the stalled advisory and before `agent:failed` (the deferred
+/// mid-turn raise is flushed just ahead of `agent:failed`). Margins: the
+/// terminal fires ~4s into the park (checker cadence ~166ms), well inside
+/// the 30s collection window on saturated CI runners.
+#[tokio::test]
+async fn open_tool_call_provider_stall_fails_turn_over_wss() {
+    let Some(script) = gate("WSS open-tool provider stall terminal E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // parkMidToolCall: emit tool_call (in_progress) then hold the prompt
+    // open forever (only session/cancel would release it).
+    let behavior = json!({ "parkMidToolCall": true, "response": "never streamed" }).to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_STREAM_STALL_MS", "1000"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "1500"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "2000"),
+        ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "4000"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — events.subscribe BEFORE the turn so we miss nothing.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Hung", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hang on a tool call" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect this agent's frames until agent:failed rides the wire.
+    let events = timeout(Duration::from_secs(30), async {
+        let mut events: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+                continue;
+            }
+            let done = ev["type"] == json!("agent:failed");
+            events.push(ev.clone());
+            if done {
+                return events;
+            }
+        }
+    })
+    .await
+    .expect("hung open tool call fails the turn within the lowered terminal threshold");
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["type"].as_str().unwrap_or_default())
+        .collect();
+
+    let tool_call_idx = types
+        .iter()
+        .position(|t| *t == "agent:tool:call")
+        .unwrap_or_else(|| panic!("tool call routed over the wire: {types:?}"));
+    let stalled_idx = events
+        .iter()
+        .position(|e| {
+            e["type"] == json!("agent:stream:status") && e["data"]["phase"] == json!("stalled")
+        })
+        .unwrap_or_else(|| panic!("stalled advisory precedes the terminal stall: {types:?}"));
+    let attention_idx = types
+        .iter()
+        .position(|t| *t == "agent:attention-requested")
+        .unwrap_or_else(|| panic!("blocker attention raised over the wire: {types:?}"));
+    let failed_idx = types.len() - 1;
+    assert!(
+        tool_call_idx < stalled_idx && stalled_idx < attention_idx && attention_idx < failed_idx,
+        "tool call → stalled → attention-requested → failed: {types:?}"
+    );
+    let ends: Vec<usize> = types
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == "agent:stream:end")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(ends.len(), 1, "one terminal stream:end: {types:?}");
+    assert!(
+        stalled_idx < ends[0] && ends[0] < failed_idx,
+        "stream:end lands after the stalled advisory and before agent:failed: {types:?}"
+    );
+
+    // Payload contract. The stalled advisory fired at the open-tool ceiling
+    // (1.5s), not the tool-free threshold (1s).
+    let stalled = &events[stalled_idx]["data"];
+    assert_eq!(
+        stalled["level"],
+        json!("warn"),
+        "stalled is warn: {stalled}"
+    );
+    assert!(
+        stalled["silentMs"].as_u64().expect("silentMs") >= 1500,
+        "stalled fires at the open-tool ceiling: {stalled}"
+    );
+    let attention = &events[attention_idx]["data"];
+    assert_eq!(
+        attention["kind"],
+        json!("blocker"),
+        "attention kind: {attention}"
+    );
+    let reason = attention["reason"].as_str().expect("attention reason");
+    assert!(
+        reason.contains("provider stall") && reason.contains("tc_park_mid_tool"),
+        "attention reason names the stall and the hung call: {reason}"
+    );
+    let failed = &events[failed_idx]["data"];
+    let error = failed["error"]
+        .as_str()
+        .expect("agent:failed carries error");
+    assert!(
+        error.starts_with(intent_acp::PROVIDER_STALL_PREFIX),
+        "agent:failed error is ProviderStall-prefixed: {error}"
+    );
+    assert!(
+        error.contains("tc_park_mid_tool") && error.contains("still open"),
+        "agent:failed error names the hung tool call: {error}"
+    );
+
+    // Persisted state: the agent is in Error with the blocker attention.
+    let got = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["status"], "error",
+        "provider stall persists Error status: {session}"
+    );
+    assert_eq!(
+        session["attentionRequestKind"], "blocker",
+        "blocker attention persisted: {session}"
+    );
+    assert!(
+        session["attentionRequestReason"]
+            .as_str()
+            .is_some_and(|r| r.contains("tc_park_mid_tool")),
+        "persisted attention reason names the hung call: {session}"
+    );
+}
+
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
 /// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
 /// turn as
@@ -1326,7 +1529,7 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
 /// spawns the bridge command from that entry and mutates a note through it, so
 /// a successful marker assertion proves the field rode the real WSS→daemon→
 /// ACP wire and the bridge endpoint it carried actually works.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
     let Some(script) = gate("WSS session-mcpServers E2E") else {
         return;
@@ -1445,7 +1648,6 @@ async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
     );
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Session-status lifecycle persistence (P0 — chat-spinner clear). A normal
 /// `agent.sendMessage` turn must drive the persisted `agent_session.status`
 /// through `Idle → active → idle` and emit the matching
@@ -1458,7 +1660,7 @@ async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
 /// carries `isBackground` from the session row: `false` for this normal
 /// (foreground) agent, and `true` for a second agent created with
 /// `isBackground: true`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_session_status_persists_idle_active_idle_over_wss() {
     let Some(script) = gate("WSS status-lifecycle E2E") else {
         return;
@@ -1577,6 +1779,12 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         json!(false),
         "agent:idle carries isBackground=false for a foreground agent: {idle}"
     );
+    // The mute stamp is present only when the session is muted — absent
+    // (never `false`) for this unmuted agent.
+    assert!(
+        idle.get("notificationsMuted").is_none(),
+        "agent:idle omits notificationsMuted for an unmuted agent: {idle}"
+    );
     // The emit-time waiting flag: this agent parents no pending completion
     // watches, so the idle payload reports `false`.
     assert_eq!(
@@ -1674,12 +1882,232 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
     );
 }
 
+/// Per-agent `notificationsMuted` (PROTOCOL §5.5 / §6): `agent.update
+/// { changes: { notificationsMuted } }` persists the daemon-owned mute flag,
+/// returns it on the `AgentLite`, emits `agent:updated` carrying the change,
+/// and rejects a non-boolean with `-32602`; `agent.get` / `agent.list` /
+/// `agent.getSession` serve the persisted value; the terminal `agent:idle`
+/// of a muted agent is stamped `notificationsMuted: true` (omitted when
+/// unmuted — see the status-lifecycle test above); `false` clears it.
+#[tokio::test]
+async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
+    let Some(script) = gate("WSS notificationsMuted E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "muted turn ok" }).to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-Muted", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    // Fresh sessions are unmuted; the field is always present on AgentLite.
+    assert_eq!(
+        created["agent"]["notificationsMuted"],
+        json!(false),
+        "fresh agent is unmuted: {created}"
+    );
+
+    // Non-boolean → -32602, no state change.
+    let rejected = wss_rpc_envelope(
+        &mut rpc,
+        11,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "notificationsMuted": "yes" } }),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"],
+        json!(-32602),
+        "non-boolean notificationsMuted is -32602: {rejected}"
+    );
+    let still = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        still["agent"]["notificationsMuted"],
+        json!(false),
+        "{still}"
+    );
+    // The session wire form serves the flag always — `false` included.
+    let fresh_session = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        fresh_session["session"]["notificationsMuted"],
+        json!(false),
+        "agent.getSession serves notificationsMuted=false explicitly: {fresh_session}"
+    );
+
+    // Mute: persisted, returned on the AgentLite, and `agent:updated` carries
+    // the change so subscribed clients invalidate their projection.
+    let muted = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "notificationsMuted": true } }),
+    )
+    .await;
+    assert_eq!(muted["success"], true, "{muted}");
+    assert_eq!(
+        muted["agent"]["notificationsMuted"],
+        json!(true),
+        "agent.update returns notificationsMuted=true: {muted}"
+    );
+    let mut updated_payload: Option<Value> = None;
+    for _ in 0..40 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:updated"
+            && ev["data"]["agentId"].as_str() == Some(agent_id.as_str())
+            && ev["data"].get("notificationsMuted").is_some()
+        {
+            updated_payload = Some(ev["data"].clone());
+            break;
+        }
+    }
+    let updated = updated_payload.expect("agent:updated emitted for the mute change");
+    assert_eq!(updated["notificationsMuted"], json!(true), "{updated}");
+
+    // Every read projection serves the persisted value.
+    let got = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(got["agent"]["notificationsMuted"], json!(true), "{got}");
+    let list = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let listed = list["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == json!(agent_id))
+        .expect("muted agent listed")
+        .clone();
+    assert_eq!(listed["notificationsMuted"], json!(true), "{listed}");
+    let session = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        session["session"]["notificationsMuted"],
+        json!(true),
+        "agent.getSession serves the persisted flag: {session}"
+    );
+
+    // A muted agent's terminal agent:idle is stamped `notificationsMuted: true`
+    // so notification clients can suppress the alert without a follow-up read.
+    let sent = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "drive a turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut idle_payload: Option<Value> = None;
+    for _ in 0..160 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"].as_str() == Some(agent_id.as_str()) {
+            idle_payload = Some(ev["data"].clone());
+            break;
+        }
+    }
+    let idle = idle_payload.expect("muted agent emitted terminal agent:idle");
+    assert_eq!(
+        idle["notificationsMuted"],
+        json!(true),
+        "agent:idle carries notificationsMuted=true for a muted agent: {idle}"
+    );
+    assert_eq!(idle["isBackground"], json!(false), "{idle}");
+
+    // `false` clears the flag.
+    let unmuted = wss_rpc(
+        &mut rpc,
+        18,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "notificationsMuted": false } }),
+    )
+    .await;
+    assert_eq!(
+        unmuted["agent"]["notificationsMuted"],
+        json!(false),
+        "{unmuted}"
+    );
+    let cleared = wss_rpc(
+        &mut rpc,
+        19,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        cleared["agent"]["notificationsMuted"],
+        json!(false),
+        "{cleared}"
+    );
+}
+
 /// `agent.stop` keep-alive + resume over WSS (step 10). The first turn streams
 /// "streaming-before-cancel" and parks at `session/cancel`; `agent.stop`
 /// interrupts (terminal stream:end emitted, child kept alive); a follow-up
 /// `agent.sendMessage` resumes the SAME child and the mock reports `turn=2`
 /// (per-process counter), proving interrupt-not-kill keep-alive semantics.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_stop_keep_alive_resume_over_wss() {
     let Some(script) = gate("WSS agent.stop keep-alive E2E") else {
         return;
@@ -1986,7 +2414,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
 /// turn, so a non-null `lastAgentResponse` mid-turn can only come from the
 /// overlay. After the interrupted flush + a resumed turn completes, the
 /// projection falls back to the newest persisted preview.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_lite_live_turn_preview_overlay_over_wss() {
     let Some(script) = gate("WSS live-turn preview overlay E2E") else {
         return;
@@ -2212,7 +2640,7 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
 /// report `turn=1`). A follow-up interrupt-priority send to the then-idle
 /// agent falls through to the plain send path (`turn=3`), proving the agent
 /// keeps processing across interrupts without failing or restarting.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
     let Some(script) = gate("WSS interrupt-priority sendMessage E2E") else {
         return;
@@ -2390,6 +2818,29 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
          agent:idle (reason: interrupted) on the wire"
     );
 
+    // The turn-2 `stream:end` lands BEFORE the worker releases the in-flight
+    // slot (`end_turn`); an interrupt-priority send in that teardown window
+    // is busy-with-no-live-turn and queues behind the finishing turn rather
+    // than preempting a turn that already completed (intent-hq/intent#5380).
+    // Wait for the idle status flip — published only after the slot release
+    // — so the send below meets a genuinely idle agent.
+    let mut saw_idle_status = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:status-changed"
+            && ev["data"]["agentId"].as_str() == Some(agent_id.as_str())
+            && ev["data"]["isActive"] == json!(false)
+        {
+            saw_idle_status = true;
+            break;
+        }
+    }
+    assert!(
+        saw_idle_status,
+        "the interrupt turn's end_turn published the idle status flip"
+    );
+
     // Idle fall-through + liveness: another interrupt-priority send now behaves
     // like a plain send and the SAME child answers turn=3 — the agent survived
     // both interrupts (never killed, never failed, never restarted).
@@ -2444,7 +2895,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
 /// assignee's mid-turn stream keep-alive and delivers immediately — the same
 /// never-kill semantics as `agent.sendMessage`, resolved through the task
 /// assignment (`task.markAsTask` + `task.assignAgent`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn interrupt_priority_send_to_task_over_wss() {
     let Some(script) = gate("WSS interrupt-priority sendToTask E2E") else {
         return;
@@ -2609,7 +3060,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
 /// the follow-up send runs `turn=3` on the SAME child (a double delivery
 /// would have burned a turn and reported `turn=4`; a killed/restarted child
 /// would report `turn=1`) and `agent.get` never shows an `error` status.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
     let Some(script) = gate("WSS duplicate interrupt-priority E2E") else {
         return;
@@ -2832,7 +3283,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
 /// worker over the WSS wire. A `blockUntilCancel` agent parks mid-turn (a live
 /// worker draining a turn) so its `AgentLite` + chat snapshot report
 /// `isResponding: true`; a freshly-created idle agent reports every flag `false`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_activity_flags_active_vs_idle_over_wss() {
     let Some(script) = gate("WSS agent activity flags E2E") else {
         return;
@@ -3027,7 +3478,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
 /// Timing: the sampler publishes a full attribution sweep at boot and then on
 /// its ~5s baseline cadence, so the parked agent's bucket lands within one
 /// baseline period of the spawn — the poll loop below bounds that wait.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_diagnostics_reports_subtree_memory_over_wss() {
     let Some(script) = gate("WSS diagnostics subtreeMemoryBytes E2E") else {
         return;
@@ -3185,7 +3636,7 @@ async fn agent_diagnostics_reports_subtree_memory_over_wss() {
 /// genuine parent→child watch registered by the MCP `delegate_task` tool.
 /// Drives the full MCP loop (mock ACP fires `delegate_task`)
 /// and parks the child so the watch persists for observation.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
     // Parent fires `delegate_task` with instructions carrying a marker; the
     // delegated child sees the marker in its first prompt and parks. The
@@ -3349,7 +3800,7 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
 /// the generic `Agent xxxxxx` fallback), ≥1 `agent:stream:activity` + exactly one
 /// terminal `agent:stream:end` + an `agent:idle` all carrying the child id, and
 /// the child transcript carrying the delivered instructions + an assistant reply.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
     let Some(script) = gate("WSS delegate child-turn E2E") else {
         return;
@@ -3491,7 +3942,6 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
     );
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// WAKE-1: `after_all` delegation fan-in over WSS, end to end. A parent fires
 /// TWO MCP `delegate_task` calls with `waitMode: "after_all"`; each child
 /// reports via `report_to_parent` (suppressed — no immediate parent message)
@@ -3503,7 +3953,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
 /// - `isWaitingForOtherAgents` is true (with both child ids) while waiting and
 ///   false after delivery, with `agent:subscriptions-changed` watch-change
 ///   events observed on the wire for both transitions.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
     const CHILD_A: &str = "WAKE1_CHILD_ALPHA";
     const CHILD_B: &str = "WAKE1_CHILD_BETA";
@@ -3822,7 +4272,7 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
 /// second `agent:idle` and the child's terminal `agent:idle` can arrive on
 /// the wire in EITHER order. The event loop below must therefore track each
 /// milestone independently and never gate one on the other.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss() {
     const CHILD_TAG: &str = "SUB2_WSS_CHILD";
     const REPORT: &str = "SUB2_WSS_REPORT shipped the thing";
@@ -4110,7 +4560,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
 ///    and the presence-detected `advisory` string;
 ///  - no `task:status-changed` is emitted for the blocked write;
 ///  - `task.get` still reads `complete` after the agent's turn.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn linked_agent_cannot_reopen_terminal_task_over_wss() {
     const GO: &str = "GUARD_WSS_GO";
     const RESULT_TAG: &str = "GUARD_WSS_RESULT ";
@@ -4324,7 +4774,7 @@ async fn linked_agent_cannot_reopen_terminal_task_over_wss() {
 ///    (Top-level foreground agents keep the user-only dismissal — covered by
 ///    the `attention_request_clear_gates` unit tests and, over the wire, by
 ///    `attention_request_foreground_automatic_delivery_negative_over_wss`.)
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn attention_request_discussion_over_wss() {
     const CHILD_MARKER: &str = "ATTN_DISCUSS_CHILD";
     const REASON: &str = "ATTN_WSS need a decision on the migration approach";
@@ -4719,7 +5169,7 @@ async fn attention_request_discussion_over_wss() {
 /// afterwards. Complements the child/background clear path in
 /// `attention_request_discussion_over_wss` and the unit-level
 /// `attention_request_clear_gates` suite.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
     const RAISE_MARKER: &str = "ATTN_FG_RAISE";
     const REASON: &str = "ATTN_WSS foreground needs the user's decision";
@@ -4937,7 +5387,7 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
 /// serves the `attentionRequest*` fields. Regression for
 /// intent-hq/intentd#1790 (the entry used to park as system-origin, so the
 /// banner survived the reply).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn attention_request_cleared_by_drained_queue_message_over_wss() {
     const RAISE_MARKER: &str = "ATTN_QM_RAISE";
     const SLOW_MARKER: &str = "ATTN_QM_SLOW";
@@ -5216,7 +5666,7 @@ async fn attention_request_cleared_by_drained_queue_message_over_wss() {
 /// no linked task) calls `ws.agent.requestDiscussion(reason)` — the call
 /// succeeds, the session fields persist, and NO `task:status-changed` fires
 /// (no linked task = the transition is skipped).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn attention_request_blocker_and_taskless_caller_over_wss() {
     const BLOCKER_MARKER: &str = "ATTN_BLOCKER_CHILD";
     const TASKLESS_MARKER: &str = "ATTN_TASKLESS_AGENT";
@@ -5492,7 +5942,7 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
 /// The parentless-omission halves are covered by
 /// `attention_request_discussion_over_wss` (attention) and the MIDTURN-1
 /// suite in `e2e_wss_agent_midturn_failure.rs` (failed).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() {
     const PARENT_GO: &str = "PARENTID_PARENT_GO";
     const CHILD_ATTN: &str = "PARENTID_CHILD_ATTN";
@@ -5662,6 +6112,229 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
     );
 }
 
+/// Multiplayer w3 (decided: an agent steered by a collaborator acts with the
+/// owner's capabilities), end to end through the real agent runtime. The
+/// collaborator's own `host.exec` over WSS is refused before dispatch
+/// (`-32003`); its `agent.sendMessage` steer succeeds, is stamped with the
+/// collaborator, and drives a real mock-ACP turn in which the agent calls
+/// `ws.host.exec` through the production `workspace_api` bridge the daemon
+/// bound to it. The turn's persisted `tool_result` carries the process
+/// output, run in the workspace checkout. Nothing here is constructed by the
+/// test: if the runtime never binds the bridge or never executes the
+/// collaborator's turn, no `tool_result` lands and the test fails.
+#[intent_test_macros::daemon_test]
+async fn collaborator_steer_runs_host_exec_through_bound_bridge_over_wss() {
+    use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId, WorkspaceRole};
+    use intent_store::Store;
+
+    let Some(script) = gate("WSS collaborator steer host.exec E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    // The workspace checkout lives under the daemon's hermetic workspaces
+    // dir; `ws.host.exec` runs there.
+    let checkout = data_dir.join("workspaces").join("collab-steer");
+    std::fs::create_dir_all(&checkout).expect("mkdir checkout");
+    let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    let ws = WorkspaceId::new();
+    {
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open store");
+        let mut seed = workspace_seed(&ws);
+        seed.path = Some(checkout.to_string_lossy().into_owned());
+        seed.worktree_path = Some(checkout.to_string_lossy().into_owned());
+        store.insert_workspace(&seed).await.expect("insert ws");
+        store
+            .upsert_principal(&guest)
+            .await
+            .expect("guest principal");
+        let token_hash =
+            Sha256::digest(guest_token.as_bytes())
+                .iter()
+                .fold(String::new(), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+        store
+            .insert_principal_credential(&guest.id, &token_hash)
+            .await
+            .expect("guest credential");
+        store
+            .add_workspace_member(&ws, &guest.id, WorkspaceRole::Collaborator)
+            .await
+            .expect("guest membership");
+    }
+    let ws_id = ws.0.clone();
+
+    // Only the collaborator's steer drives the tool call; the mock agent
+    // reaches the bridge through whatever the daemon delivered for it.
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": "run echo steered",
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": {
+                    "code": "return JSON.stringify(await ws.host.exec({ command: 'sh', args: ['-c', 'echo steered && pwd && touch steered.txt'] }));",
+                    "summary": "collaborator-steered host.exec"
+                }
+            },
+            "response": "ran host.exec",
+            "emitToolBlocks": true,
+        }],
+        "response": "idle",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Owner: subscribe before the turn, then create the workspace's agent.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "{sub_resp}");
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Steered", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Collaborator: direct `host.exec` is refused before dispatch …
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
+    let refused = wss_rpc_envelope(
+        &mut guest_rpc,
+        20,
+        "host.exec",
+        json!({ "workspaceId": ws_id, "command": "echo", "args": ["steered"] }),
+    )
+    .await;
+    assert_eq!(refused["jsonrpc"], "2.0", "{refused}");
+    assert_eq!(refused["error"]["code"], -32003, "{refused}");
+    assert_eq!(refused["error"]["message"], "Forbidden", "{refused}");
+    assert!(refused.get("result").is_none(), "{refused}");
+
+    // … while its steer of the owner's agent runs a real turn.
+    let steered = wss_rpc(
+        &mut guest_rpc,
+        21,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "run echo steered" }),
+    )
+    .await;
+    assert_eq!(steered["success"], true, "steer: {steered}");
+    let message_id = steered["messageId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("messageId: {steered}"))
+        .to_string();
+
+    timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = wss_event(&mut sub, 60).await;
+            let ev = &frame["params"]["event"];
+            if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id.as_str() {
+                return;
+            }
+            assert_ne!(
+                ev["type"], "agent:failed",
+                "the steered turn must not fail: {frame}"
+            );
+        }
+    })
+    .await
+    .expect("steered turn reached stream:end");
+
+    // The transcript: the steer row stamped with the collaborator, followed
+    // in the same turn by the bridge's `tool_result` carrying the process
+    // output from the workspace checkout.
+    let conv = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages");
+    let steer_at = messages
+        .iter()
+        .position(|m| m["id"] == message_id.as_str())
+        .unwrap_or_else(|| panic!("steer row: {conv}"));
+    assert_eq!(
+        messages[steer_at]["metadata"]["fromPrincipalId"], guest.id.0,
+        "{conv}"
+    );
+    let tool_result = messages[steer_at..]
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_result")
+        .unwrap_or_else(|| panic!("tool_result after the steer row: {conv}"));
+    assert_eq!(tool_result["is_error"], false, "{tool_result}");
+    let text = tool_result["output"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool text: {tool_result}"));
+    let mut body: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"));
+    if let Some(inner) = body.as_str() {
+        body = serde_json::from_str(inner).unwrap_or_else(|e| panic!("{e}: {inner}"));
+    }
+    assert_eq!(body["exitCode"], 0, "{body}");
+    let stdout = body["stdout"].as_str().expect("stdout");
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("steered"), "{body}");
+    let printed = lines.next().expect("pwd line");
+    let canonical = std::fs::canonicalize(&checkout).unwrap_or_else(|_| checkout.clone());
+    assert!(
+        Path::new(printed) == checkout || Path::new(printed) == canonical,
+        "host.exec must run in the workspace checkout ({}), got {printed}",
+        checkout.display()
+    );
+    assert!(
+        checkout.join("steered.txt").is_file(),
+        "the steered process ran in the checkout"
+    );
+}
+
 /// Pre-seed the daemon's `SQLite` store with a workspace + target note for the
 /// MCP tool call (the daemon opens the same data dir on launch).
 async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
@@ -5750,11 +6423,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -5859,7 +6534,7 @@ async fn boot_daemon_with_seeded_note() -> (tempfile::TempDir, Daemon, String, S
 /// arm in `intent-transport::router::dispatch` is exercised through
 /// `conn::process_frame` (which is uncounted over WSS in the COV-1 baseline).
 /// No agent turn → no `node` dependency.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn router_read_lifecycle_arms_over_wss() {
     let (_data_dir, _daemon, ws_id, note_id, port, fingerprint) =
         boot_daemon_with_seeded_note().await;
@@ -6166,7 +6841,7 @@ async fn router_read_lifecycle_arms_over_wss() {
 /// variable is visible to the spawned child. Runs the `env` binary as the
 /// terminal command, subscribes to `terminal:data`, and asserts the decoded
 /// output carries `MY_TEST_VAR=PROT_MARKER_env_wss`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn terminal_create_env_over_wss() {
     use base64::Engine as _;
 
@@ -6354,7 +7029,7 @@ async fn terminal_create_env_over_wss() {
 /// `terminal:data` rows behind for `event.query` — while `terminal:exit`
 /// stays durable. Before the fix each chunk awaited a durable `SQLite` commit,
 /// serializing paste echo behind the writer batch window.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn terminal_data_many_chunks_transient_over_wss() {
     // 200 fixed-width markers; the command echo carries the literal
     // `CHUNK-%03d-END` template, which never collides with an expanded marker.
@@ -6502,7 +7177,7 @@ async fn terminal_data_many_chunks_transient_over_wss() {
 /// events (it previously compiled to an exact `event_type = 'note:*'` match
 /// and silently returned `[]`), exact types are unchanged, and bare `*`
 /// behaves like no type filter.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_query_event_type_glob_over_wss() {
     let (_data_dir, _daemon, ws_id, note_id, port, fingerprint) =
         boot_daemon_with_seeded_note().await;
@@ -6592,7 +7267,7 @@ async fn event_query_event_type_glob_over_wss() {
 /// titles (~1.5 MiB of raw event data), then asserts the queried row set is
 /// bounded with additive `truncated` / `originalBytes` markers, row identity
 /// preserved, and no rows dropped.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn event_query_response_bounded_over_wss() {
     const ONE_MIB: usize = 1024 * 1024;
     const SEEDED: usize = 50;
@@ -6668,7 +7343,7 @@ async fn event_query_response_bounded_over_wss() {
 /// `["note:*"]`, one to `["agent:*"]` — observe a single mock agent turn and
 /// each receive ONLY their category. Exercises the filter+forward arms in
 /// `subscriptions.rs` / `forward.rs` over WSS.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn subscription_filter_branches_over_wss() {
     let Some(script) = gate("WSS subscription filter branches") else {
         return;
@@ -6809,7 +7484,7 @@ async fn subscription_filter_branches_over_wss() {
 /// down its forwarder cleanly without poisoning the daemon. After the drop:
 /// (a) an existing RPC conn still answers `system.status` / `agent.list`, and
 /// (b) a FRESH subscriber observes a subsequent turn's terminal `stream:end`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mid_stream_subscriber_disconnect_over_wss() {
     let Some(script) = gate("WSS mid-stream subscriber disconnect") else {
         return;
@@ -6938,7 +7613,7 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
 /// (`read_request_head` returns `InvalidData`), so the client sees an EOF —
 /// not a 4xx. We assert that no upgrade response arrives by reading until
 /// EOF or timeout. No node required.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn oversized_request_head_rejected_over_wss() {
     let (_data_dir, _daemon, _ws_id, _note_id, port, fingerprint) =
         boot_daemon_with_seeded_note().await;
@@ -6983,7 +7658,7 @@ async fn oversized_request_head_rejected_over_wss() {
 // queue mutation carrying `{ agentId, queue }` (PROTOCOL §5.5/§6).
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn queue_message_self_drains_on_idle_agent_over_wss() {
     let Some(script) = gate("WSS queue self-drain E2E") else {
         return;
@@ -7110,7 +7785,7 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
 // event was published for the dequeued user message.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn dequeued_message_publishes_agent_message_event_over_wss() {
     let Some(script) = gate("WSS dequeued message event E2E") else {
         return;
@@ -7288,7 +7963,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
 // §5.5 dequeue-wait annotation) alongside the caller's fields.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn queued_message_metadata_survives_drain_over_wss() {
     let Some(script) = gate("WSS queued messageMetadata E2E") else {
         return;
@@ -7374,9 +8049,13 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     .await;
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second send should queue: {send2}");
-    // (a) The queued entry wire shape carries messageMetadata verbatim.
+    // (a) The queued entry wire shape carries messageMetadata verbatim, plus
+    // the daemon's `fromPrincipalId` stamp for the wire caller.
+    let me = wss_rpc(&mut rpc, 15, "principal.me", json!({})).await;
+    let mut stamped = metadata.clone();
+    stamped["fromPrincipalId"] = me["id"].clone();
     assert_eq!(
-        send2["queuedMessage"]["messageMetadata"], metadata,
+        send2["queuedMessage"]["messageMetadata"], stamped,
         "queued entry must carry messageMetadata: {send2}"
     );
 
@@ -7390,7 +8069,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     .await;
     let queue = q["queue"].as_array().expect("queue array");
     assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0]["messageMetadata"], metadata);
+    assert_eq!(queue[0]["messageMetadata"], stamped);
 
     // Wait for both turns to finish (first send + drained queued send).
     let mut stream_end_count = 0;
@@ -7425,7 +8104,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
                     .is_some_and(|t| t.starts_with("tagged queued message"))
         })
         .expect("drained user message row present");
-    for (key, want) in metadata.as_object().unwrap() {
+    for (key, want) in stamped.as_object().unwrap() {
         assert_eq!(
             &tagged["metadata"][key], want,
             "drained user row must persist messageMetadata field {key}: {tagged}"
@@ -7444,9 +8123,12 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     );
     // Both direct-delivery placements are covered: the row-level `metadata`
     // column (direct `agent.sendMessage` parity) and the in-block fold
-    // (`deliver_wake_message` parity) — the fold carries queueInfo too.
+    // (`deliver_wake_message` parity) — the fold carries queueInfo too, but
+    // the `fromPrincipalId` stamp stays row-level only.
+    let mut folded = tagged["metadata"].clone();
+    folded.as_object_mut().unwrap().remove("fromPrincipalId");
     assert_eq!(
-        tagged["contentBlocks"][0]["messageMetadata"], tagged["metadata"],
+        tagged["contentBlocks"][0]["messageMetadata"], folded,
         "drained user block must fold the same messageMetadata: {tagged}"
     );
 }
@@ -7477,7 +8159,7 @@ const PROD_DEQUEUE_WAIT_MIN_MS: u128 = 5_000;
 /// `queuedAt` mint and its dequeue reading).
 const WALL_CLOCK_SLACK_MS: u128 = 1_000;
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
     let Some(script) = gate("WSS sub-threshold dequeue-wait E2E") else {
         return;
@@ -7692,7 +8374,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
 // event carry the same id.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn user_app_message_id_round_trips_over_wss() {
     let Some(script) = gate("WSS userAppMessageId E2E") else {
         return;
@@ -7842,7 +8524,7 @@ async fn user_app_message_id_round_trips_over_wss() {
     assert_eq!(row2["metadata"]["userAppMessageId"], "app-msg-queued-2");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn remove_queued_message_is_idempotent_over_wss() {
     // No mock-agent needed — `agent.removeQueuedMessage` is a pure router arm
     // when the message id is unknown. The FE's seeded mirror diverges from the
@@ -7894,7 +8576,7 @@ async fn remove_queued_message_is_idempotent_over_wss() {
 /// the SAME child), and the response mirrors sendMessage:
 /// `{ success, queued: false, messageId: <entry id> }`. An unknown entry id
 /// is `-32602` with no side effects (deliberately NOT idempotent).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn send_queued_message_now_over_wss() {
     let Some(script) = gate("WSS sendQueuedMessageNow E2E") else {
         return;
@@ -8111,7 +8793,7 @@ async fn send_queued_message_now_over_wss() {
 // emit `agent:idle` until the under-edit entry is the only thing left.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     let Some(script) = gate("WSS mixed-case queue drain E2E") else {
         return;
@@ -8349,7 +9031,7 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
 /// subscriber sees `workspace:created` → `agent:created` → stream frames keyed
 /// to the agent. A replay with the same `idempotencyKey` returns the stored
 /// result without re-sending (still exactly one user message).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_orchestrates_initial_agent_over_wss() {
     let Some(script) = gate("WSS workspace.create initial-agent E2E") else {
         return;
@@ -8599,14 +9281,147 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
     assert_eq!(user_count, 1, "replay delivered no second prompt: {conv}");
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+/// Multiplayer w2 — `workspace.create`'s `initialAgent.prompt` is the
+/// creator's first user row, stamped with the bound caller in
+/// `WorkspaceApi::create_workspace` (the transport catalog ledger lists it as
+/// a user-origin chat entry point). Under the default-deny
+/// `COLLABORATOR_METHODS` allowlist `workspace.create` is administrator-only,
+/// so a collaborator's attempt over WSS is `Forbidden` before anything is
+/// provisioned: no workspace, no kickoff agent, no `agent:*` traffic for the
+/// owner's subscriber.
+#[tokio::test]
+async fn workspace_create_by_collaborator_is_forbidden_over_wss() {
+    use intent_core::{now_iso, Principal, PrincipalId};
+    use intent_store::Store;
+
+    let Some(script) = gate("WSS workspace.create creator attribution E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let behavior = json!({ "response": "initial agent ran" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // A collaborator with its own credential, seeded into the daemon's store.
+    let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    {
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open daemon store");
+        store
+            .upsert_principal(&guest)
+            .await
+            .expect("guest principal");
+        let token_hash =
+            Sha256::digest(guest_token.as_bytes())
+                .iter()
+                .fold(String::new(), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+        store
+            .insert_principal_credential(&guest.id, &token_hash)
+            .await
+            .expect("guest credential");
+    }
+
+    // SUBSCRIBER conn (owner) — unfiltered `agent:*`, so a kickoff agent
+    // spawned behind a leaked create would show up here.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // The GUEST attempts to create a workspace with an initialAgent prompt.
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
+    let refused = wss_rpc_envelope(
+        &mut guest_rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Guest WS",
+            "branch": "feat/guest-initial-agent-e2e",
+            "initialAgent": {
+                "prompt": "guest kickoff",
+                "model": "default", "provider": "mock",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"],
+        json!(-32003),
+        "a collaborator's workspace.create is Forbidden: {refused}"
+    );
+    assert!(
+        refused.get("result").is_none(),
+        "no workspace / initialAgent in a refused create: {refused}"
+    );
+
+    // Nothing was provisioned: the owner's listing carries no such workspace
+    // and the subscriber sees no agent traffic in the quiet window.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let listed = wss_rpc(&mut rpc, 11, "workspace.list", json!({})).await;
+    assert!(
+        listed["workspaces"]
+            .as_array()
+            .expect("workspaces array")
+            .iter()
+            .all(|w| w["title"] != "Guest WS"),
+        "refused create provisioned nothing: {listed}"
+    );
+    let quiet = wss_event_opt(&mut sub, 2).await;
+    assert!(
+        quiet.is_none(),
+        "no agent:* event follows a refused create: {quiet:?}"
+    );
+}
+
 /// Regression for the composite `(id, workspace_id)` note PK (migration 0030
 /// + `feat(services): workspace-scope note lookups + seed spec per workspace`):
 /// two `workspace.create` calls each seed their own `spec` note. Over the
 /// real WSS transport the client can call `note.get {noteId: "spec"}` against
 /// either workspace and receive a distinct row scoped to that workspace, with
 /// no cross-workspace bleed of body, title, or `workspaceId`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_seeds_per_workspace_spec_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
@@ -8712,7 +9527,7 @@ fn seed_local_repo(prefix: &str) -> Option<tempfile::TempDir> {
 /// and streams `git:clone:progress` + `git:clone:done` under the new workspace
 /// id before `workspace:created` publishes. The result's `workspace` carries
 /// the clone target as `repositoryPath`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_clones_github_url_over_wss() {
     let Some(source) = seed_local_repo("itd-wss-clone-src") else {
         eprintln!("skipping WSS clone E2E: git not available");
@@ -8827,7 +9642,7 @@ async fn workspace_create_clones_github_url_over_wss() {
 ///      `AgentManager::send_message`), producing a second `agent:idle`.
 ///   3. The persisted transcript shows BOTH user prompts AND both matching
 ///      assistant responses — no lost messages across the cycle.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
     let Some(script) = gate("WSS DELIV-1 no-lost-messages E2E") else {
         return;
@@ -9015,7 +9830,7 @@ async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
 /// completion delivery worker wakes the SENDER. Asserts the widened response
 /// (`subscriptionId` + notification text, PROTOCOL §5.5) and the delivered
 /// `[WORKSPACE EVENTS]` completion wake in the coordinator's transcript.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
     let Some(script) = gate("WSS SUB-1 sender completion wake E2E") else {
         return;
@@ -9188,7 +10003,6 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
     .await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// STAB-118 (SUB-1 `after_all` duplicate wake): when a coordinator delegates
 /// two `after_all` children, sends follow-up messages to both via
 /// `agent.sendMessage` (which triggers SUB-1 auto-watch), and both children
@@ -9199,7 +10013,7 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
 /// (the Services-level regression test in `agent_ops/tests.rs` validates the
 /// internal completion-delivery logic; this test proves it over the full WSS
 /// stack including JSON-RPC routing and client-visible transcript reads).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
     const CHILD_A_TAG: &str = "SUB1_WSS_CHILD_A";
     const CHILD_B_TAG: &str = "SUB1_WSS_CHILD_B";
@@ -9474,7 +10288,7 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
 /// `<data_dir>/agent-configs` (monorepo#1302) and keeps it alive for the
 /// lifetime of the agent handle, so we scan that directory after the first
 /// turn kicks off spawning.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
     let Some(script) = gate("WSS SP-1 rules-file E2E") else {
         return;
@@ -9609,7 +10423,7 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
 /// `AgentLite` — the subscriber sees `workspace:created` → `agent:created`,
 /// but never a `stream:*` frame because no first turn was started. The
 /// transcript stays empty until the FE sends its first message.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_no_prompt_creates_agent_over_wss() {
     let Some(script) = gate("WSS workspace.create no-prompt initial-agent E2E") else {
         return;
@@ -9722,7 +10536,7 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
 /// (frontmatter `name` — "Coordinator" for the embedded `spec-writer`) and
 /// marks it explicitly set, so the opening-turn `setAgentName`
 /// (`skipIfExplicitlySet: true`) cannot rename it away.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_wss() {
     let Some(script) = gate("WSS workspace.create specialist-derived initial-agent name E2E")
     else {
@@ -9789,7 +10603,7 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
 /// true`. A subsequent `agent.get` shows no completion report in metadata. The
 /// original `agent:idle` wake that delivered the report is unaffected (it
 /// fires at turn-end before the next turn begins).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     const CHILD_TAG: &str = "CLEAR_REPORT_CHILD";
     const REPORT: &str = "CLEAR_REPORT shipped the thing";
@@ -10007,7 +10821,7 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
 ///   never re-reports, so no duplicate wake).
 /// Fresh messages keep today's clear-on-new-turn behavior (covered by
 /// `completion_report_cleared_when_new_turn_begins_over_wss` above).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     const CHILD_TAG: &str = "STALE576_CHILD";
     const REPORT: &str = "STALE576_REPORT shipped the thing";
@@ -10300,7 +11114,7 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
 /// `agent.editAndRegenerate` regenerated user message invisible until reload).
 /// This test covers: (1) direct send to an idle agent, (2) dequeued message
 /// after a busy turn, (3) wake delivery to an idle agent.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     // Dequeue-wait note: the drained entry's delivered content (persisted
     // user row == provider prompt) carries the enqueue-time annotation;
@@ -10592,7 +11406,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
 /// agent:stream:status phase="prompt" to ensure the ACP session is established
 /// (making the turn cancellable) before sending the interrupt. The combined
 /// outbound prompt is asserted via the fixture's `MOCK_AGENT_PROMPT_LOG` seam.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
     let Some(script) = gate("STAB-114 zero-output combined delivery E2E") else {
         eprintln!("[STAB114-TEST] Gate returned None, test skipped");
@@ -10801,7 +11615,7 @@ async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
 
 /// STAB-114 regression: When an interrupt lands AFTER streaming started, the
 /// message is NOT re-queued (turn has progressed past zero output).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
     let Some(script) = gate("STAB-114 after-streaming no requeue E2E") else {
         return;
@@ -10912,7 +11726,7 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
 /// terminal `agent:stream:end` carries `stopReason: "interrupted"` plus the
 /// synthetic row's `messageId` so clients can render the Stopped indicator
 /// live.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss() {
     let Some(script) = gate("pre-first-token agent.stop E2E") else {
         return;
@@ -11061,7 +11875,7 @@ async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss()
 /// Uses `parkBeforeFirstChunk` (zero output) + a deterministic wait for
 /// phase="prompt" before the stop; the follow-up outbound prompt is asserted
 /// via the fixture's `MOCK_AGENT_PROMPT_LOG` seam (`text` + `blockTypes`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_wss() {
     let Some(script) = gate("zero-output stop redelivery E2E") else {
         return;
@@ -11270,7 +12084,7 @@ async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_w
 /// the bytes had been sent inline, while the persisted transcript row keeps
 /// only the reference. Asserted via the fixture's `MOCK_AGENT_PROMPT_LOG`
 /// seam (`blockTypes`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn image_reference_block_resolves_to_acp_image_over_wss() {
     use base64::Engine as _;
 
@@ -11432,7 +12246,7 @@ async fn image_reference_block_resolves_to_acp_image_over_wss() {
 /// `tool_use` + errored `tool_result` pair that broke FE conversation loading.
 /// After the interrupt turn completes, every persisted `tool_use` block must
 /// carry a non-empty name.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
     let Some(script) = gate("STAB-124 anonymous tool_use E2E") else {
         return;
@@ -11583,7 +12397,7 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
 /// transcript row (after the text block) so `agent.getConversation` — the
 /// conversation view's read — returns them. Pre-fix, only the text block was
 /// persisted and reloading the conversation dropped the attachments.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
     let Some(script) = gate("STAB-133 attachment persistence E2E") else {
         return;
@@ -11759,7 +12573,7 @@ fn assert_no_file_data(v: &Value, surface: &str) {
 /// block on the same row is untouched. The row is seeded directly in the
 /// store before the daemon boots (the input seams reject the shape now, so
 /// no wire call can create it), and nothing is rewritten on disk.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn legacy_inline_file_blocks_served_as_text_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
@@ -11922,7 +12736,7 @@ async fn legacy_inline_file_blocks_served_as_text_over_wss() {
 /// daemon-prepended A2A sender header (monorepo#3721). A human
 /// `agent.sendMessage` (FE/RPC front door, no caller agent) must stay
 /// untagged AND header-free (byte-identical content).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
     let Some(script) = gate("WSS agent-to-agent sender metadata E2E") else {
         return;
@@ -12136,7 +12950,7 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
 /// Drives all three through the full daemon stack: a real mock-ACP sender
 /// turn invokes the MCP `workspace_api` bindings, and the assertions read
 /// the persisted transcripts back over WSS `agent.getConversation`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     let Some(script) = gate("WSS sendToTask/create sender metadata E2E") else {
         return;
@@ -12409,7 +13223,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
 ///   entity (§7.1), while a human `agent.sendMessage` row carries no
 ///   attribution metadata (lean metadata-free shape, or at most the drain-time
 ///   `queueInfo` stamp if the send raced the parent's busy window).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_wss() {
     let Some(script) = gate("WSS child→parent watch suppression + delta metadata E2E") else {
         return;
@@ -12742,23 +13556,24 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     })
     .await
     .expect("human row reached the chat channel");
-    match lean.get("metadata") {
-        None => {} // direct delivery: the lean metadata-free entity shape
-        Some(md) => {
-            // Queued delivery race: only the drain-time queueInfo stamp is
-            // allowed — human sends never gain A2A attribution metadata.
-            let keys: Vec<&String> = md
-                .as_object()
-                .unwrap_or_else(|| panic!("metadata is an object: {lean}"))
-                .keys()
-                .collect();
-            assert_eq!(
-                keys,
-                vec!["queueInfo"],
-                "a human row carries at most the queueInfo stamp: {lean}"
-            );
-        }
-    }
+    // A human row carries the daemon's `fromPrincipalId` stamp for the wire
+    // caller and, on the queued-delivery race, the drain-time queueInfo stamp
+    // — never A2A attribution metadata.
+    let md = lean["metadata"]
+        .as_object()
+        .unwrap_or_else(|| panic!("metadata is an object: {lean}"));
+    assert!(
+        md["fromPrincipalId"].is_string(),
+        "a human row carries the principal stamp: {lean}"
+    );
+    let extra: Vec<&String> = md
+        .keys()
+        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo")
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "a human row carries at most the principal + queueInfo stamps: {lean}"
+    );
 
     // Contrast: a parentless BYSTANDER sending to the CHILD — a created
     // worker target (parent linkage), not an independent top-level peer —
@@ -12860,7 +13675,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
 /// the regenerated turn's outbound prompt replays the kept prefix as
 /// `<supervisor>` XML with the edited text — WITHOUT the truncated content
 /// (asserted via the mock fixture's `MOCK_AGENT_PROMPT_LOG` seam).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
     let Some(script) = gate("WSS editAndRegenerate happy-path E2E") else {
         return;
@@ -13138,7 +13953,7 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
 /// (hard-stop semantics), then truncates and regenerates — no wedged
 /// state. The first turn parks mid-flight (`parkIfPromptContains`); the edit
 /// lands while it is in flight.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
     let Some(script) = gate("WSS editAndRegenerate busy-agent E2E") else {
         return;
@@ -13313,7 +14128,7 @@ async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
 
 /// Invalid and non-user `messageId` → `-32602` with NO transcript mutation
 /// (PROTOCOL §5.5: validation precedes any state change).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
     let Some(script) = gate("WSS editAndRegenerate bad-id E2E") else {
         return;
@@ -13470,7 +14285,7 @@ async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
 /// `agent.getConversation` serves), while the live pre-terminal entity carried
 /// none — so a subscribe-only client renders the interrupted state without a
 /// refetch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
     let Some(script) = gate("WSS interrupt partial-flush E2E") else {
         return;
@@ -13701,7 +14516,7 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
 /// channel — in addition to the `tool_result` that still carries the item in
 /// its `output` array — and the terminal reconcile KEEPS that block (its id
 /// matches the persisted transcript, so `removedIds` stays empty for it).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn proposal_resource_standalone_block_over_chat_subscribe() {
     let Some(script) = gate("WSS proposal-resource chat.subscribe E2E") else {
         return;
@@ -13896,7 +14711,7 @@ async fn proposal_resource_standalone_block_over_chat_subscribe() {
 /// still surfaces the standalone proposal `resource` block over the live
 /// `chat.subscribe` channel, and the terminal reconcile keeps it (its id
 /// matches the persisted transcript).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
     let Some(script) = gate("WSS collapsed-proposal chat.subscribe E2E") else {
         return;
@@ -14094,7 +14909,7 @@ async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
 /// `cacheReadTokens`/`cacheCreationTokens`. A second turn's larger cumulative
 /// snapshot REPLACES the first (never summed), and `workspace.getTokenUsage`
 /// returns the same tally over the wire.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn token_usage_captured_at_turn_end_over_wss() {
     let Some(script) = gate("WSS token-usage E2E") else {
         return;
@@ -14245,7 +15060,7 @@ async fn token_usage_captured_at_turn_end_over_wss() {
 /// `cost: { amount, currency }` on `totals`, `byAgentId`, and `byModel`.
 /// Cost is cumulative per ACP session, so a second turn's report REPLACES the
 /// first.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn usage_update_cost_captured_over_wss() {
     let Some(script) = gate("WSS usage-cost E2E") else {
         return;
@@ -14421,7 +15236,7 @@ fn seed_grok_path_override(data_dir: &Path, script: &str) {
 /// disjoint buckets, and emit `workspace:tokenUsage-changed` with tokens AND
 /// cost; a second turn's bill SUMS (tokens and cost) — never REPLACEs — and
 /// `workspace.getTokenUsage` returns the same tally over the wire.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn grok_meta_usage_bill_captured_over_wss() {
     let Some(script) = gate("WSS grok _meta.usage E2E") else {
         return;
@@ -14594,7 +15409,7 @@ async fn grok_meta_usage_bill_captured_over_wss() {
 ///     `input._acpTitle` equal to the richest title seen;
 ///  3. the persisted block (`agent.getConversation`) is byte-identical to the
 ///     live one (§7.1 parity), richer title included.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn status_only_tool_update_preserves_richer_title_over_wss() {
     const SPARSE_TITLE: &str = "Run";
     const RICH_TITLE: &str = "Run: cargo test --workspace";
@@ -14872,7 +15687,7 @@ where
 /// first turn completes and the queue drains, client B's `chat.subscribe`
 /// receives the dequeued user row as a delta (role `user`, terminal fields)
 /// BEFORE the second turn's assistant chunks — no refetch needed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn queue_drain_user_row_delta_over_chat_subscribe() {
     let Some(script) = gate("WSS queue-drain user-row chat delta E2E") else {
         return;
@@ -15048,7 +15863,7 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
 /// `chat.subscribe` afterwards must serve a seq-0 snapshot whose user row
 /// carries the same `appMessageId` (snapshot/delta parity, the intentd#780
 /// review note).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn direct_send_user_row_delta_over_chat_subscribe() {
     let Some(script) = gate("WSS direct-send user-row chat delta E2E") else {
         return;
@@ -15234,7 +16049,7 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
 /// response, so the leading-edge ping of the turn necessarily comes from the
 /// tool arm: it names the first tool (`bash`, derived from the ACP title) and
 /// carries no `lastAgentResponse` (nothing had streamed yet).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
     let Some(script) = gate("WSS tool-call activity E2E") else {
         return;
@@ -15370,7 +16185,7 @@ async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
 /// channel, the assistant text that follows opens a separate `text` block,
 /// and both persist in stream order under the same ids `agent.getConversation`
 /// returns.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn thinking_blocks_stream_and_persist_over_wss() {
     let Some(script) = gate("WSS thinking-block E2E") else {
         return;
@@ -15568,7 +16383,7 @@ async fn thinking_blocks_stream_and_persist_over_wss() {
 /// reaped agent and assert the RPC succeeds and the turn streams to a normal
 /// `agent:stream:end` (lazy respawn), with both user rows persisted — the
 /// send was restored, not silently dropped.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
     let Some(script) = gate("WSS TTL-reap eviction E2E") else {
         return;
@@ -15732,10 +16547,12 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
 /// A second `resumed` — the timeout/wakeup double-emit this pins against —
 /// would land before that `stream:end`, so draining to it is the check.
 ///
-/// The slot is freed with `agent.stop` (interrupt): the interrupt releases
-/// the holder's busy slot BEFORE marking its process idle, so the woken
-/// waiter's claim on the idle holder succeeds and it admits in one pass. The
-/// natural-turn-end route is pinned separately by
+/// The slot is freed with `agent.stop` (interrupt): the interrupt first marks
+/// the holder's process idle WITHOUT waking (`mark_idle_slot_held`), then its
+/// `end_turn` releases the busy slot and only then wakes the waiter
+/// (`release_slot_sync` → `wake_waiter_if_idle`, intent-hq/intent#5253), so
+/// the woken waiter's claim on the idle holder succeeds and it admits in one
+/// pass. The natural-turn-end route is pinned separately by
 /// `natural_turn_end_admits_queued_spawn_in_one_pass_over_wss`.
 #[tokio::test]
 async fn queued_spawn_resumes_exactly_once_over_wss() {
@@ -15886,9 +16703,9 @@ async fn queued_spawn_resumes_exactly_once_over_wss() {
         queued_frames[0]
     );
 
-    // Interrupt the holder mid-turn: its busy slot is released, its process
-    // marked idle, and that wakeup admits the waiter (evicting the idle
-    // holder for the slot).
+    // Interrupt the holder mid-turn: its process is marked idle without a
+    // wake, then its busy slot is released and that release wakes the waiter,
+    // which admits (evicting the idle holder for the slot).
     let stopped = wss_rpc(&mut rpc, 14, "agent.stop", json!({ "agentId": holder })).await;
     assert_eq!(stopped["success"], true, "holder stop ok: {stopped}");
 
@@ -16183,7 +17000,7 @@ async fn natural_turn_end_admits_queued_spawn_in_one_pass_over_wss() {
 /// - the daemon log carries the wedged-cancel WARN, proving the timeout arm
 ///   (not a plain wire error) produced the teardown;
 /// - `agent.getSession` settles to `status: "idle"`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
     let Some(script) = gate("WSS wedged-transport stop E2E") else {
         return;
@@ -16365,7 +17182,7 @@ async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
 ///   resumable;
 /// - no post-interrupt `chat:stream:delta` and no persisted assistant message
 ///   carries the zombie marker.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
     const ZOMBIE_MARKER: &str = "ZOMBIE-CHUNK-2763";
     const PARK_MARKER: &str = "PARK-FIRST-TURN-2763";

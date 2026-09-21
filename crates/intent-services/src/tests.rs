@@ -171,11 +171,13 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -214,7 +216,136 @@ pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, Note
     (tmp, services, ws, id)
 }
 
+/// The transport bearer seam resolves an active credential to its principal
+/// and records the use, and rejects a revoked one — through the single
+/// atomic store statement, so no lookup-then-touch window exists in which a
+/// concurrent revoke is still admitted (intent-hq/intentd#1868).
 #[tokio::test]
+async fn resolve_principal_credential_admits_active_and_rejects_revoked() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "e".repeat(64);
+    store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+    let services = Services::new(store.clone());
+
+    assert_eq!(
+        services
+            .resolve_principal_credential("f".repeat(64))
+            .await
+            .expect("resolve unknown"),
+        None
+    );
+    assert_eq!(
+        services
+            .resolve_principal_credential(hash.clone())
+            .await
+            .expect("resolve active"),
+        Some(primary.id.clone())
+    );
+    assert!(
+        store
+            .lookup_principal_credential(&hash)
+            .await
+            .expect("lookup")
+            .expect("present")
+            .last_used_at
+            .is_some(),
+        "an admitted credential records last_used_at"
+    );
+
+    assert!(store
+        .revoke_principal_credential(&hash)
+        .await
+        .expect("revoke"));
+    assert_eq!(
+        services
+            .resolve_principal_credential(hash)
+            .await
+            .expect("resolve revoked"),
+        None,
+        "a revoked credential is never admitted"
+    );
+}
+
+/// Regression (intent-hq/intentd#1868 review): a credential revoked while a
+/// resolution is already in flight is NOT admitted. The pre-fix seam read the
+/// row on the read pool, saw it active, then parked on the write pool to
+/// `touch`; a revoke landing in that window flipped the touch to `false`,
+/// which was ignored, and the stale principal was returned. Holding the sole
+/// write-pool connection reproduces that interleaving deterministically: the
+/// resolve is driven until it parks on the write pool, the revoke lands via
+/// the held connection, and only then is the resolve released.
+///
+/// Negative control: with only the service body restored to e8083cbd
+/// (lookup → `is_active` → touch ignoring `false`) this test fails at the
+/// `None` assertion with `Some(<primary id>)`; with the atomic body from
+/// 80585837 it passes.
+#[tokio::test]
+async fn resolve_principal_credential_rejects_revoke_landing_mid_resolution() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "a".repeat(64);
+    store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+    let services = Services::new(store.clone());
+
+    // The sole write-pool connection: any resolve parks on its touch/UPDATE.
+    let mut held = store.write_pool().acquire().await.expect("hold write conn");
+
+    // Drive the resolve past its (read-pool) lookup up to the write gate. Each
+    // poll is separated by a real read-pool round trip, so the pre-fix body has
+    // observed the active row and is waiting to touch by the time we revoke.
+    let mut fut = services.resolve_principal_credential(hash.clone());
+    let parked = poll_until(&mut fut, 20, || async {
+        assert!(store
+            .lookup_principal_credential(&hash)
+            .await
+            .expect("lookup")
+            .expect("present")
+            .is_active());
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    // Revoke through the held connection while the resolve is still gated.
+    let revoked = sqlx::query(
+        "UPDATE principal_credential SET revoked_at = ? \
+         WHERE token_hash = ? AND revoked_at IS NULL",
+    )
+    .bind(now_iso())
+    .bind(&hash)
+    .execute(&mut *held)
+    .await
+    .expect("revoke via held conn");
+    assert_eq!(revoked.rows_affected(), 1);
+    drop(held);
+
+    assert_eq!(
+        fut.await.expect("resolve"),
+        None,
+        "a credential revoked mid-resolution must not be admitted"
+    );
+    let after = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("row kept after revoke");
+    assert!(!after.is_active());
+    assert!(
+        after.last_used_at.is_none(),
+        "a rejected resolve does not record a use"
+    );
+}
+
+#[intent_test_macros::daemon_test]
 async fn settings_revision_gate_orders_mutation_before_snapshot() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -223,7 +354,7 @@ async fn settings_revision_gate_orders_mutation_before_snapshot() {
     let held = gate.write().await;
 
     let update_services = services.clone();
-    let update = tokio::spawn(async move {
+    let update = intent_core::spawn_daemon(async move {
         update_services
             .settings_update(serde_json::json!([
                 { "path": "git.autoCommit", "value": false }
@@ -234,8 +365,9 @@ async fn settings_revision_gate_orders_mutation_before_snapshot() {
     tokio::task::yield_now().await;
 
     let list_services = services.clone();
-    let list =
-        tokio::spawn(async move { list_services.settings_list().await.expect("settings.list") });
+    let list = intent_core::spawn_daemon(async move {
+        list_services.settings_list().await.expect("settings.list")
+    });
     assert!(!update.is_finished());
     assert!(!list.is_finished());
 
@@ -256,7 +388,7 @@ async fn settings_revision_gate_orders_mutation_before_snapshot() {
 /// `workspace.list` / `workspace.get` populate the iOS card aggregates
 /// (`taskStats` / `agentSummary` / `diffSummary`) computed from the workspace's
 /// real notes, agents, and git state, with the nested wire shape iOS decodes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_list_and_get_populate_card_aggregates() {
     use intent_core::{AgentId, AgentSession, AgentStatus, TaskMetadata, TaskStatus};
 
@@ -355,6 +487,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
     store
         .insert_agent_session(&mk_agent(
@@ -432,20 +565,61 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(v.get("diskUsage").is_none());
 }
 
-/// List-frame slimming (monorepo#3041): `workspace.list` rows never carry
-/// `tokenUsage` (detail-only — clients read it via `workspace.getTokenUsage`
-/// and the tokenUsage-changed event), and ARCHIVED rows additionally omit
-/// `agentSummary` (no HUD/coverflow agent card renders for an archived
-/// workspace). Active rows keep the full `agentSummary`, and `workspace.get`
-/// keeps serving both fields for detail reads.
-#[tokio::test]
+/// List-frame slimming (monorepo#3041, `Workspace::slim_for_list`):
+/// `workspace.list` rows never carry `tokenUsage` (detail-only — clients read
+/// it via `workspace.getTokenUsage` and the tokenUsage-changed event),
+/// `setupScript` (`workspace.getSetupScript`), `contextLinks` (read once on
+/// open via `workspace.get`), nor the per-PR `headSha` / `author` on
+/// `activePullRequest` / `pullRequests[]` (`mergeable` / `mergeableState`
+/// stay: the FE derives the PR lifecycle display status from them);
+/// ARCHIVED rows additionally omit `agentSummary` (no HUD/coverflow agent
+/// card renders for an archived workspace). Active rows keep the full
+/// `agentSummary`, and `workspace.get` keeps serving every field.
+#[intent_test_macros::daemon_test]
 async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     use std::collections::BTreeMap;
 
-    use intent_core::{AgentId, AgentSession, AgentStatus, TokenUsage, TokenUsageTotals};
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, ContextLink, ContextLinkKind, PullRequestInfo,
+        PullRequestStatus, SetupScript, TokenUsage, TokenUsageTotals,
+    };
 
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
+
+    let detail_pr = PullRequestInfo {
+        id: "pr-1".to_string(),
+        number: 1,
+        url: "https://github.com/intent-hq/intentd/pull/1".to_string(),
+        title: "feat: slim list rows".to_string(),
+        status: PullRequestStatus::Open,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        base_ref: Some("main".to_string()),
+        head_ref: Some("feat/slim".to_string()),
+        head_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()),
+        author: Some("dev".to_string()),
+        mergeable: Some(true),
+        mergeable_state: Some("clean".to_string()),
+        is_draft: Some(false),
+    };
+    let with_detail_fields = |ws: &mut Workspace| {
+        ws.setup_script = Some(SetupScript {
+            script: "#!/bin/bash\nnpm ci\n".to_string(),
+            project_type: None,
+            updated_at: 1,
+            generated_by: None,
+        });
+        ws.context_links = Some(vec![ContextLink {
+            kind: ContextLinkKind::Issue,
+            url: "https://github.com/intent-hq/intent/issues/3041".to_string(),
+            owner: "intent-hq".to_string(),
+            repo: "intent".to_string(),
+            number: 3041,
+        }]);
+        ws.active_pull_request = Some(detail_pr.clone());
+        ws.pull_requests = Some(vec![detail_pr.clone()]);
+    };
 
     let usage = TokenUsage {
         by_agent_id: BTreeMap::from([(
@@ -474,6 +648,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     let ws_active = WorkspaceId::new();
     let mut active = workspace(&ws_active);
     active.token_usage = Some(usage.clone());
+    with_detail_fields(&mut active);
     store.insert_workspace(&active).await.expect("active ws");
 
     let ws_archived = WorkspaceId::new();
@@ -481,6 +656,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     archived.archived = true;
     archived.archived_at = Some(now_iso());
     archived.token_usage = Some(usage);
+    with_detail_fields(&mut archived);
     store
         .insert_workspace(&archived)
         .await
@@ -532,6 +708,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store
         .insert_agent_session(&mk_session("agent-1", &ws_active))
@@ -571,14 +748,63 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert!(v.get("tokenUsage").is_none());
     assert!(v.get("agentSummary").is_none());
 
-    // Lite list (workspace.subscribe seq-0): tokenUsage stripped the same way.
+    // The other detail-only fields are stripped on every list row, active
+    // and archived alike; the PR entries keep their list-context keys.
+    let assert_detail_stripped = |row: &Workspace, path: &str| {
+        assert!(row.setup_script.is_none(), "{path}: setupScript omitted");
+        assert!(row.context_links.is_none(), "{path}: contextLinks omitted");
+        let active_pr = row
+            .active_pull_request
+            .as_ref()
+            .expect("activePullRequest kept");
+        let pool_pr = &row.pull_requests.as_ref().expect("pullRequests kept")[0];
+        for pr in [active_pr, pool_pr] {
+            assert_eq!(pr.number, 1);
+            assert_eq!(pr.status, PullRequestStatus::Open);
+            assert_eq!(pr.is_draft, Some(false));
+            assert_eq!(pr.head_ref.as_deref(), Some("feat/slim"));
+            assert!(pr.head_sha.is_none(), "{path}: PR headSha omitted");
+            assert!(pr.author.is_none(), "{path}: PR author omitted");
+            assert_eq!(pr.mergeable, Some(true), "{path}: PR mergeable kept");
+            assert_eq!(
+                pr.mergeable_state.as_deref(),
+                Some("clean"),
+                "{path}: PR mergeableState kept"
+            );
+        }
+    };
+    assert_detail_stripped(row_active, "list/active");
+    assert_detail_stripped(row_archived, "list/archived");
+    assert!(v.get("setupScript").is_none());
+    assert!(v.get("contextLinks").is_none());
+    assert!(v["activePullRequest"].get("headSha").is_none());
+    assert_eq!(v["activePullRequest"]["mergeableState"], "clean");
+
+    // Lite list (workspace.subscribe seq-0): slimmed the same way.
     let lite = svc.list_workspaces_lite(true).await.expect("lite list");
     assert!(lite.iter().all(|w| w.token_usage.is_none()));
+    for row in &lite {
+        assert_detail_stripped(row, "lite");
+    }
 
-    // workspace.get keeps both fields for detail reads — archived included.
+    // workspace.get keeps every field for detail reads — archived included.
     let got_active = svc.get_workspace(ws_active).await.expect("get active");
     assert!(got_active.token_usage.is_some(), "get keeps tokenUsage");
     assert!(got_active.agent_summary.is_some());
+    assert!(got_active.setup_script.is_some(), "get keeps setupScript");
+    assert!(got_active.context_links.is_some(), "get keeps contextLinks");
+    assert_eq!(
+        got_active
+            .active_pull_request
+            .as_ref()
+            .and_then(|pr| pr.mergeable_state.as_deref()),
+        Some("clean"),
+        "get keeps the per-PR detail fields"
+    );
+    assert_eq!(
+        got_active.pull_requests.as_ref().unwrap()[0].head_sha,
+        detail_pr.head_sha
+    );
     let got_archived = svc.get_workspace(ws_archived).await.expect("get archived");
     assert!(got_archived.token_usage.is_some());
     assert!(
@@ -587,12 +813,558 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     );
 }
 
+/// Build the worst-case-realistic ACTIVE `workspace.list` row the row-budget
+/// golden measures: every small optional scalar present, a long title /
+/// status message, eight PRs in the pool (so the
+/// `WORKSPACE_LIST_PR_CAP` truncation is exercised and `pullRequestsTotal`
+/// is present) plus a linked `activePullRequest` (all detail fields
+/// populated so the slimming has something to strip), a saved setup script,
+/// context links, a fat `tokenUsage`, and ten live agent sessions
+/// (coordinator + nine sub-agents) so the enrichment builds a ten-agent
+/// `agentSummary`. Returns the row as served by `list_workspaces`.
+async fn worst_case_workspace_list_row() -> Workspace {
+    use std::collections::BTreeMap;
+
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, CheckoutMode, ClientId, ContextLink, ContextLinkKind,
+        PullRequestInfo, PullRequestStatus, SetupScript, TokenUsage, TokenUsageTotals,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let totals = |n: u64| TokenUsageTotals {
+        input_tokens: 1_000_000 + n,
+        output_tokens: 500_000 + n,
+        cache_read_tokens: 2_000_000 + n,
+        cache_creation_tokens: 300_000 + n,
+        thought_tokens: 0,
+        cost: None,
+    };
+    let pr = |n: u64, status: PullRequestStatus| PullRequestInfo {
+        id: format!("PR_kwDOLxyz{n:08}"),
+        number: 1_000 + n,
+        url: format!("https://github.com/intent-hq/intentd/pull/{}", 1_000 + n),
+        title: format!("feat(workspace): slim list rows and add the row-budget golden ({n})"),
+        status,
+        created_at: now_iso(),
+        // Entry `n` was updated `n` minutes into the hour: a higher `n` is
+        // more recent, so the list cap keeps the highest-numbered entries.
+        updated_at: format!("2026-01-01T00:{n:02}:00Z"),
+        base_ref: Some("main".to_string()),
+        head_ref: Some(format!("feat/slim-list-rows-{n}")),
+        head_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()),
+        author: Some("octocat-developer".to_string()),
+        mergeable: Some(true),
+        mergeable_state: Some("blocked".to_string()),
+        is_draft: Some(false),
+    };
+
+    let ws = WorkspaceId::new();
+    let mut row = workspace(&ws);
+    row.title = "Fix the workspace panel focus regression after the modal closes".to_string();
+    row.branch = "feat/fix-workspace-panel-focus-regression-after-modal-close".to_string();
+    row.base_ref = Some("origin/main".to_string());
+    row.base_commit_sha = Some("f759124bdeadbeefdeadbeefdeadbeefdeadbeef".to_string());
+    row.status_message = Some(
+        "PR #1234 for the panel focus fix is open and waiting for review after \
+         addressing every reviewer thread."
+            .to_string(),
+    );
+    row.status_image_asset_id = Some(format!("asset-{}", uuid::Uuid::new_v4()));
+    row.last_activity = Some(now_iso());
+    row.tags = vec!["frontend".to_string(), "regression".to_string()];
+    row.path = Some(format!(
+        "/home/user/intent/workspaces/{}/monorepo",
+        ws.as_str()
+    ));
+    row.repository_path = Some("/home/user/src/intent/monorepo".to_string());
+    row.repository_owner = Some("intent-hq".to_string());
+    row.repository_name = Some("intent".to_string());
+    row.worktree_path = row.path.clone();
+    row.scope = Some("intent-hq/intent".to_string());
+    row.default_model = Some("anthropic:claude-opus-4-1-20250805".to_string());
+    row.pr_number = Some(1_000);
+    row.pr_url = Some("https://github.com/intent-hq/intentd/pull/1000".to_string());
+    row.pr_status = Some(PullRequestStatus::Open);
+    row.active_pull_request = Some(pr(0, PullRequestStatus::Open));
+    row.pull_requests = Some(vec![
+        pr(0, PullRequestStatus::Open),
+        pr(1, PullRequestStatus::Merged),
+        pr(2, PullRequestStatus::Closed),
+        pr(3, PullRequestStatus::Draft),
+        pr(4, PullRequestStatus::Merged),
+        pr(5, PullRequestStatus::Closed),
+        pr(6, PullRequestStatus::Open),
+        pr(7, PullRequestStatus::Merged),
+    ]);
+    row.setup_script = Some(SetupScript {
+        script: "#!/usr/bin/env bash\nset -euo pipefail\n".repeat(40),
+        project_type: None,
+        updated_at: 1_700_000_000_000,
+        generated_by: None,
+    });
+    row.context_links = Some(
+        (0..3)
+            .map(|n| ContextLink {
+                kind: ContextLinkKind::Issue,
+                url: format!("https://github.com/intent-hq/intent/issues/{}", 3_000 + n),
+                owner: "intent-hq".to_string(),
+                repo: "intent".to_string(),
+                number: 3_000 + n,
+            })
+            .collect(),
+    );
+    row.token_usage = Some(TokenUsage {
+        by_agent_id: (0..10)
+            .map(|n| (format!("agent-{}", uuid::Uuid::new_v4()), totals(n)))
+            .collect(),
+        totals: totals(9),
+        by_model: BTreeMap::from([("claude-opus-4-1".to_string(), totals(1))]),
+        last_scan_at: Some(now_iso()),
+    });
+    row.cow_supported = Some(true);
+    row.browser_client_id = Some(ClientId::from(
+        format!("client-{}", uuid::Uuid::new_v4()).as_str(),
+    ));
+    row.checkout_mode = Some(CheckoutMode::Worktree);
+    store.insert_workspace(&row).await.expect("ws");
+
+    let coordinator = AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str());
+    for n in 0..10u64 {
+        let id = if n == 0 {
+            coordinator.clone()
+        } else {
+            AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str())
+        };
+        store
+            .insert_agent_session(&AgentSession {
+                harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+                harness_features: None,
+                id,
+                workspace_id: ws.clone(),
+                parent_agent_id: (n > 0).then(|| coordinator.clone()),
+                backend_session_id: None,
+                acp_session_id: None,
+                name: format!("Implement the sidebar dropdown ({n})"),
+                name_explicitly_set: true,
+                model: None,
+                reasoning_effort: None,
+                effort_levels: None,
+                provider: None,
+                system_prompt: None,
+                specialist: Some("implementor".to_string()),
+                status: AgentStatus::Idle,
+                is_active: false,
+                messages: vec![],
+                stats: None,
+                task_note_id: None,
+                skip_auto_commit: false,
+                completion_report: None,
+                completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                file_blocks: None,
+                is_background: n > 0,
+                metadata: None,
+                created_at: now_iso(),
+                updated_at: now_iso(),
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+                stop_reason: None,
+                stop_reason_timestamp: None,
+                session_corrupted: false,
+                pending_delete_at: None,
+                retired_at: None,
+                notifications_muted: false,
+            })
+            .await
+            .expect("session");
+    }
+
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    // Bind the primary principal as the wire caller so the row carries the
+    // full flattened membership shape (`myRole` is omitted without one).
+    let primary = store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let caller = intent_core::Caller::Wire {
+        principal_id: primary.id,
+        is_administrator: true,
+    };
+    let list = intent_core::with_caller(caller, svc.list_workspaces(true))
+        .await
+        .expect("list");
+    let mut served = list
+        .into_iter()
+        .find(|w| w.id == ws)
+        .expect("worst-case row listed");
+    // The list path never populates `diffSummary` today, but it is part of
+    // the wire shape; charge its totals so the budget covers it if a future
+    // rung-1/2 rollup lands (`files` stays empty on list rows by contract).
+    served.diff_summary = Some(intent_core::WorkspaceDiffSummary {
+        schema_version: 1,
+        updated_at: now_iso(),
+        total_files: 12,
+        total_additions: 1_234,
+        total_deletions: 567,
+        files: vec![],
+    });
+    served
+}
+
+/// Row-budget golden: the worst-case-realistic ACTIVE `workspace.list` row
+/// serializes at or under [`intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES`] —
+/// the failure message is the per-field byte table so the offending field
+/// is named, not guessed.
+#[tokio::test]
+async fn workspace_list_row_stays_within_row_budget() {
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, WORKSPACE_LIST_ROW_BUDGET_BYTES,
+    };
+
+    let row = worst_case_workspace_list_row().await;
+    let summary = row
+        .agent_summary
+        .as_ref()
+        .expect("active row keeps agentSummary");
+    assert_eq!(summary.count, 10, "worst case carries ten agents");
+    // The eight-entry pool is capped to the five most recently updated with
+    // the linked PR (the oldest, `pr(0)`) retained and moved to the front.
+    assert_eq!(
+        row.pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>(),
+        vec![1_000, 1_007, 1_006, 1_005, 1_004]
+    );
+    assert_eq!(row.pull_requests_total, Some(8));
+    assert!(row.active_pull_request.is_some());
+    assert!(row.task_stats.is_some(), "list rows carry taskStats");
+    assert!(
+        row.display_status.is_some(),
+        "list rows carry displayStatus"
+    );
+
+    let measured = serde_json::to_value(&row).unwrap();
+    let (total, per_key) = serialized_key_bytes(&measured);
+    let (summary_total, summary_per_key) = serialized_key_bytes(&measured["agentSummary"]);
+    let table = format!(
+        "{}\nagentSummary breakdown:\n{}",
+        format_key_bytes_table(total, &per_key),
+        format_key_bytes_table(summary_total, &summary_per_key)
+    );
+    assert!(
+        total <= WORKSPACE_LIST_ROW_BUDGET_BYTES,
+        "worst-case workspace.list row is {total} B, over WORKSPACE_LIST_ROW_BUDGET_BYTES \
+         ({WORKSPACE_LIST_ROW_BUDGET_BYTES} B). Shrink or drop the largest fields below \
+         (detail-only data belongs on workspace.get / a dedicated RPC), or justify a new \
+         budget in intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES's arithmetic.\n{table}"
+    );
+}
+
+/// Key-allowlist golden: every top-level key of the worst-case
+/// `workspace.list` row is in [`intent_core::WORKSPACE_LIST_ROW_KEYS`], every
+/// key of its `activePullRequest` / `pullRequests[]` entries is in
+/// [`intent_core::WORKSPACE_LIST_PR_KEYS`], and — since the worst case
+/// populates every allowlisted field — each allowlisted key is present, so
+/// a stale allowlist entry fails too. The only allowlisted keys an active,
+/// idle row legitimately lacks are the state-conditional ones:
+/// `archivedAt` (archived rows), `pendingDeleteAt` (a running delete grace
+/// window) and `waiting` (omitted when `false`).
+#[tokio::test]
+async fn workspace_list_row_keys_match_allowlist_golden() {
+    use std::collections::BTreeSet;
+
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, WORKSPACE_LIST_PR_KEYS,
+        WORKSPACE_LIST_ROW_KEYS,
+    };
+
+    const STATE_CONDITIONAL_KEYS: &[&str] = &["archivedAt", "pendingDeleteAt", "waiting"];
+
+    let row = worst_case_workspace_list_row().await;
+    let measured = serde_json::to_value(&row).unwrap();
+
+    let check = |object: &serde_json::Value, allowlist: &[&str], what: &str| {
+        let keys: BTreeSet<&str> = object
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let allowed: BTreeSet<&str> = allowlist.iter().copied().collect();
+        let (total, per_key) = serialized_key_bytes(object);
+        let table = format_key_bytes_table(total, &per_key);
+        let unlisted: Vec<&str> = keys.difference(&allowed).copied().collect();
+        assert!(
+            unlisted.is_empty(),
+            "{what} carries keys outside the list-row allowlist: {unlisted:?}. Either add \
+             each to intent_core::WORKSPACE_LIST_ROW_KEYS / WORKSPACE_LIST_PR_KEYS (only if \
+             list-context UI renders it AND it is small; update \
+             docs/protocol/methods/workspace.md in the same commit) or strip it in \
+             Workspace::slim_for_list so it is served on workspace.get only.\n{table}"
+        );
+        let missing: Vec<&str> = allowed
+            .difference(&keys)
+            .copied()
+            .filter(|key| !STATE_CONDITIONAL_KEYS.contains(key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{what} allowlist names keys the worst-case row does not carry: {missing:?}. \
+             Populate them in worst_case_workspace_list_row or drop them from the \
+             allowlist.\n{table}"
+        );
+    };
+
+    check(&measured, WORKSPACE_LIST_ROW_KEYS, "workspace.list row");
+    check(
+        &measured["activePullRequest"],
+        WORKSPACE_LIST_PR_KEYS,
+        "workspace.list row activePullRequest",
+    );
+    for (i, entry) in measured["pullRequests"]
+        .as_array()
+        .expect("pullRequests array")
+        .iter()
+        .enumerate()
+    {
+        check(
+            entry,
+            WORKSPACE_LIST_PR_KEYS,
+            &format!("workspace.list row pullRequests[{i}]"),
+        );
+    }
+}
+
+/// `pullRequests` cap (`intent_core::WORKSPACE_LIST_PR_CAP`): both list
+/// surfaces (`workspace.list`, lite `workspace.subscribe` seq-0) serve the
+/// five most recently updated entries of an eight-entry pool plus
+/// `pullRequestsTotal: 8`, while `workspace.get` keeps the full pool in
+/// stored order with `pullRequestsTotal` absent — the cap is applied only by
+/// the final list-row slimming pass, never on the detail read. The same
+/// holds whatever the pool's source: a pool held entirely on a registered
+/// git root, or entirely on PR monitors, is merged onto `workspace.get`
+/// exactly as onto the list rows (batch-1b verification defect: the
+/// documented `workspace.get` recovery read served `0` entries for an
+/// eight-PR git root the list capped to five).
+#[intent_test_macros::daemon_test]
+async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
+    use intent_core::{
+        PrMonitor, PrMonitorId, PrMonitorState, PullRequestInfo, PullRequestStatus,
+        WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource, WORKSPACE_LIST_PR_CAP,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let pr = |n: u64| PullRequestInfo {
+        id: format!("PR_{n}"),
+        number: 500 + n,
+        url: format!("https://github.com/intent-hq/intentd/pull/{}", 500 + n),
+        title: format!("PR {n}"),
+        status: PullRequestStatus::Open,
+        created_at: now_iso(),
+        updated_at: format!("2026-01-01T00:{n:02}:00Z"),
+        base_ref: None,
+        head_ref: None,
+        head_sha: None,
+        author: None,
+        mergeable: None,
+        mergeable_state: None,
+        is_draft: None,
+    };
+    let numbers = |ws: &Workspace| -> Vec<u64> {
+        ws.pull_requests
+            .as_ref()
+            .expect("pullRequests")
+            .iter()
+            .map(|pr| pr.number)
+            .collect()
+    };
+
+    // own_ws: the eight-entry pool is the workspace's own.
+    let own_ws = WorkspaceId::new();
+    let mut row = workspace(&own_ws);
+    row.pull_requests = Some((0..8).map(pr).collect());
+    store.insert_workspace(&row).await.expect("own ws");
+
+    // root_ws: no own PRs; the eight-entry pool lives on one git root.
+    let root_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&root_ws))
+        .await
+        .expect("root ws");
+    let ts = now_iso();
+    store
+        .upsert_workspace_git_root(&WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: root_ws.clone(),
+            path: "/tmp/root-pool".into(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("intent-hq".into()),
+            repo_name: Some("intentd".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some((0..8).map(pr).collect()),
+            created_at: ts.clone(),
+            updated_at: ts,
+        })
+        .await
+        .expect("git root");
+
+    // monitor_ws: no own PRs; eight completed, snapshotless monitors (one
+    // per PR number — the synthesized URL is the merge identity).
+    let monitor_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&monitor_ws))
+        .await
+        .expect("monitor ws");
+    // Monitor rows FK onto agent_session; one session covers every monitor.
+    let owner = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from("agent-pool-mon"),
+        workspace_id: monitor_ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Monitor Owner".into(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+        retired_at: None,
+        notifications_muted: false,
+    };
+    store.insert_agent_session(&owner).await.expect("owner");
+    for n in 0..8_i64 {
+        store
+            .insert_pr_monitor(&PrMonitor {
+                monitor_id: PrMonitorId::new(),
+                workspace_id: monitor_ws.clone(),
+                agent_id: owner.id.clone(),
+                repo_owner: "intent-hq".into(),
+                repo_name: "intentd".into(),
+                pr_number: 500 + n,
+                state: PrMonitorState::Completed,
+                last_snapshot: None,
+                baseline_snapshot: None,
+                pending_changes: vec![],
+                pending_since: None,
+                last_change_at: None,
+                last_polled_at: None,
+                last_error: None,
+                created_at: format!("2026-01-02T00:{n:02}:00Z"),
+                updated_at: format!("2026-01-02T00:{n:02}:01Z"),
+            })
+            .await
+            .expect("monitor");
+    }
+
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+
+    let list = svc.list_workspaces(true).await.expect("list");
+    let lite = svc.list_workspaces_lite(true).await.expect("lite list");
+    // Entry `n` was updated `n` minutes into the hour on every source (a
+    // snapshotless monitor's entry carries the monitor row's `updated_at`),
+    // so the cap keeps the five newest on each; `get` serves the source's
+    // own order (stored / git-root / monitor creation order).
+    for (label, ws) in [
+        ("own", &own_ws),
+        ("git-root", &root_ws),
+        ("monitor", &monitor_ws),
+    ] {
+        let listed = list.iter().find(|w| &w.id == ws).expect("listed");
+        assert_eq!(
+            numbers(listed),
+            vec![507, 506, 505, 504, 503],
+            "{label}: workspace.list caps the pool"
+        );
+        assert_eq!(
+            listed.pull_requests.as_ref().unwrap().len(),
+            WORKSPACE_LIST_PR_CAP
+        );
+        assert_eq!(listed.pull_requests_total, Some(8), "{label}: list total");
+        let lite_row = lite.iter().find(|w| &w.id == ws).expect("lite row");
+        assert_eq!(
+            numbers(lite_row),
+            vec![507, 506, 505, 504, 503],
+            "{label}: lite list caps the pool"
+        );
+        assert_eq!(lite_row.pull_requests_total, Some(8), "{label}: lite total");
+
+        let got = svc.get_workspace(ws.clone()).await.expect("get");
+        assert_eq!(
+            numbers(&got),
+            (500..508).collect::<Vec<_>>(),
+            "{label}: workspace.get serves the full merged pool"
+        );
+        assert_eq!(got.pull_requests_total, None, "{label}");
+        let detail = serde_json::to_value(&got).unwrap();
+        assert!(detail.get("pullRequestsTotal").is_none(), "{label}");
+        // Every capped list entry is recoverable from the detail read.
+        let served: Vec<u64> = numbers(&got);
+        for n in numbers(listed) {
+            assert!(
+                served.contains(&n),
+                "{label}: list entry {n} missing on get"
+            );
+        }
+    }
+}
+
 /// Frame-size regression guard for monorepo#3041: ~130 realistic rows —
 /// dogfooding-shaped (mostly archived, each with agent sessions, a fat
 /// persisted tokenUsage rollup, PR linkage, and a status message) — must
 /// serialize under the 1 MiB transport warn threshold once the list paths
 /// slim `tokenUsage` (all rows) and `agentSummary` (archived rows).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
     // Dogfooding shape (issue math: ~10 KB/row at 130 workspaces): the vast
     // majority archived, each with the agent sessions a coordinator +
@@ -664,6 +1436,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
 
     for i in 0..WORKSPACES {
@@ -928,7 +1701,7 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
 /// healthy rows' aggregates when list-shaped reads fall back from the bulk
 /// query. The failed workspace alone retains the single-workspace omission
 /// behavior, for both `workspace.list` and the lite subscription snapshot.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
     use intent_core::{TaskMetadata, TaskStatus};
 
@@ -1009,6 +1782,7 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store
         .insert_agent_session(&session(&healthy, "agent-healthy-projection"))
@@ -1096,7 +1870,7 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
 /// `cowSupported` probe result,
 /// while continuing to omit `agentSummary`/`diffSummary`. The lite read also
 /// seeds the `last_display_statuses` baseline (a seed never emits).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn lite_list_is_self_sufficient_for_status_rendering() {
     use intent_core::{TaskMetadata, TaskStatus, WorkspaceDisplayStatus};
 
@@ -1168,7 +1942,7 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
 
 /// The bulk list projection is byte-for-byte identical to the former
 /// per-workspace enrichment path, including row order and omitted optionals.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     let db = test_tempdir("intentd-bulk-list-shape-");
     let store = Store::open(&db.path().join("shape.db")).await.unwrap();
@@ -1195,12 +1969,14 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
         row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
-        svc.enrich_workspace_aggregates_with_unread(row, Some(unread.contains(row.id.as_str())))
-            .await;
-        row.token_usage = None;
-        if row.archived {
-            row.agent_summary = None;
-        }
+        svc.enrich_workspace_aggregates_with_unread(
+            row,
+            Some(unread.contains(row.id.as_str())),
+            None,
+        )
+        .await;
+        row.slim_for_list();
+        svc.attach_workspace_membership(row).await;
     }
 
     let actual = svc.list_workspaces(true).await.unwrap();
@@ -1212,13 +1988,16 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
 }
 
 /// Both list emit paths (`workspace.list` and the lite path behind
-/// `workspace.subscribe` seq-0) merge externally known PRs into each row's
-/// `pullRequests`: git-root PRs (`workspace_git_root.pull_requests`) and
-/// monitor-derived PRs (active + completed; cancelled excluded), deduped by
-/// URL with workspace > git-root > monitor priority. Purely an emit-path
-/// merge — nothing is persisted, and a row with no external sources keeps
-/// its stored value untouched.
-#[tokio::test]
+/// `workspace.subscribe` seq-0) AND the `workspace.get` detail read merge
+/// externally known PRs into the row's `pullRequests`: git-root PRs
+/// (`workspace_git_root.pull_requests`) and monitor-derived PRs (active +
+/// completed; cancelled excluded), deduped by URL with workspace > git-root
+/// > monitor priority — the same pool on every surface, so a capped list
+/// row's `pullRequestsTotal` is always recoverable from `get` (which alone
+/// keeps the per-PR detail fields the list slimming strips). Purely an
+/// emit-path merge — nothing is persisted, and a row with no external
+/// sources keeps its stored value untouched.
+#[intent_test_macros::daemon_test]
 async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     use intent_core::{
         PrMonitor, PrMonitorId, PrMonitorState, PullRequestInfo, PullRequestStatus,
@@ -1340,6 +2119,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -1442,6 +2222,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
     let assert_merged = |list: &[Workspace], path: &str| {
+        let detail = path == "workspace.get";
         let r1 = list.iter().find(|w| w.id == ws1).expect("ws1 row");
         let prs = r1.pull_requests.as_ref().expect("ws1 pullRequests");
         let urls: Vec<_> = prs.iter().map(|p| p.url.as_str()).collect();
@@ -1464,7 +2245,15 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
             intent_core::PullRequestStatus::Open,
             "{path}"
         );
-        assert_eq!(prs[1].head_sha.as_deref(), Some("abc123"), "{path}");
+        // The merged entry carried the snapshot's headSha: the final
+        // list-row slimming (`Workspace::slim_for_list`) strips the per-PR
+        // detail fields from externally merged entries too, while the
+        // detail read keeps them.
+        assert_eq!(
+            prs[1].head_sha.as_deref(),
+            if detail { Some("abc123") } else { None },
+            "{path}: headSha slimmed off list rows only"
+        );
         assert_eq!(prs[1].is_draft, Some(false), "{path}");
         // Snapshotless completed monitor: URL/title synthesized from the
         // repo identity; terminal without a verdict reads closed, not merged.
@@ -1507,13 +2296,26 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     assert_merged(&full, "workspace.list");
     let lite = svc.list_workspaces_lite(false).await.expect("lite list");
     assert_merged(&lite, "lite list");
+    // The detail read merges the same pool per workspace (scoped reads).
+    let mut gets = Vec::new();
+    for ws in [&ws1, &ws2, &ws3, &ws4] {
+        gets.push(svc.get_workspace(ws.clone()).await.expect("get"));
+    }
+    assert_merged(&gets, "workspace.get");
 
-    // Archived-inclusive list: the archived row's git-root PR merges in.
+    // Archived-inclusive list: the archived row's git-root PR merges in —
+    // and `get`, which serves archived workspaces regardless, merges it too.
     let all = svc.list_workspaces_lite(true).await.expect("archived list");
     let r5 = all.iter().find(|w| w.id == ws5).expect("ws5 row");
     let prs5 = r5.pull_requests.as_ref().expect("ws5 pullRequests");
     assert_eq!(prs5.len(), 1);
     assert_eq!(prs5[0].title, "Archived root PR");
+    let got5 = svc.get_workspace(ws5.clone()).await.expect("get ws5");
+    assert_eq!(
+        got5.pull_requests.as_ref().map(|p| p[0].title.as_str()),
+        Some("Archived root PR"),
+        "workspace.get merges the archived workspace's git-root PR"
+    );
 
     // Archived-excluding bulk reads filter archived-workspace rows in SQL.
     let roots = store
@@ -1538,7 +2340,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
 /// scoped per-workspace read — while a workspace with no roots keeps the
 /// exact row it produced before (same bytes across all three surfaces, no
 /// `pullRequests` materialized).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn display_status_folds_git_root_prs_on_every_read_surface() {
     use intent_core::{
         PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceGitRoot,
@@ -1695,7 +2497,7 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
 /// (repro C) and a linked `open(blocked)` + pooled `open(clean)` at one
 /// instant beside an older root copy (repro D) both serve the clean
 /// snapshot next to `pr_ready` in either root order.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
     use intent_core::{
         PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceGitRoot,
@@ -1763,6 +2565,10 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
             p.mergeable_state.clone(),
         )
     };
+    // `Workspace::slim_for_list` runs AFTER the derivation on the list
+    // surfaces and keeps the whole lifecycle tuple (`mergeable` /
+    // `mergeableState` included — the FE derives the PR display status from
+    // them off list rows), so every surface serves the canonical copy.
 
     // Repro A, both root orders: linked + pooled stale `open` copy of the
     // URL; one root still `open` (newer than the workspace copy), one root
@@ -1956,12 +2762,8 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
                 "{ctx}"
             );
             assert!(ws.active_pull_request.is_none(), "{ctx}");
-            // Root-only URLs are appended by the list paths' external merge
-            // only; `workspace.get` has no workspace-owned copy to serve.
-            if surface == "workspace.get" {
-                assert!(ws.pull_requests.is_none(), "{ctx}");
-                continue;
-            }
+            // Root-only URLs are appended by the external merge on every
+            // surface — the list paths and `workspace.get` alike.
             let prs = ws.pull_requests.as_ref().expect("pullRequests");
             assert_eq!(prs.len(), 1, "{ctx}: root copies dedupe into one entry");
             assert_eq!(lifecycle(&prs[0]), tied_canonical, "{ctx}: pullRequests");
@@ -2021,7 +2823,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
 /// `isDraft: true`), while a git-root entry already `merged` is never
 /// downgraded by the snapshotless completed-monitor `closed` fallback
 /// (intent-hq/monorepo#3127).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
     use intent_core::{
         PrMonitor, PrMonitorId, PrMonitorState, PullRequestInfo, PullRequestStatus,
@@ -2117,6 +2919,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -2291,7 +3094,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
 /// `crossWorkspace.listSiblings` returns only same-repository peers — here
 /// matched by `repositoryPath` (self filtered out, other-repo filtered out)
 /// — with the `PascalCase` status.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_list_siblings_scopes_to_repository() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -2344,7 +3147,7 @@ async fn cross_workspace_list_siblings_scopes_to_repository() {
 /// and tolerate a `.git` suffix on the name (in any case, so `INTENT.GIT`
 /// matches `intent`); a different GitHub repo at a different path is not a
 /// sibling.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -2459,7 +3262,7 @@ async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
 /// Rows without a GitHub identity (local-only repos, or rows the
 /// owner/name backfill has not reached yet) still resolve siblings by an
 /// identical `repositoryPath` — even when only one side carries owner/name.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -2543,7 +3346,7 @@ async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
 /// A caller with neither a GitHub identity nor a `repositoryPath` cannot list
 /// siblings or read notes (mirrors the TS "not associated with a repository"
 /// error). An identity alone (no path) is sufficient.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_list_siblings_requires_repository() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -2582,7 +3385,7 @@ async fn cross_workspace_list_siblings_requires_repository() {
 
 /// Cross-repo `readNote`/`listNotes` are access-denied; a same-repo sibling
 /// note reads back with numbered content and source metadata.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_read_note_enforces_access_and_shape() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -2655,7 +3458,7 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn add_persists_and_reports_position() {
     let (_tmp, svc, ws, id) = setup("# A\nbody").await;
     let r = svc
@@ -2677,7 +3480,7 @@ async fn add_persists_and_reports_position() {
     assert_eq!(persisted.content, "# A\nbody\n\nmore");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_no_match_maps_to_internal() {
     let (_tmp, svc, ws, id) = setup("hello").await;
     let err = svc
@@ -2695,7 +3498,7 @@ async fn edit_no_match_maps_to_internal() {
     assert!(matches!(err, Error::Internal(_)));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_lines_deletes_range() {
     let (_tmp, svc, ws, id) = setup("a\nb\nc").await;
     let r = svc
@@ -2715,7 +3518,7 @@ async fn edit_lines_deletes_range() {
     assert_eq!(r.total_lines_after, 2);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_reduction_guard_requires_confirmation() {
     let (_tmp, svc, ws, id) = setup("0123456789ABCDEFGHIJ").await;
     let denied = svc
@@ -2745,7 +3548,7 @@ pub(super) async fn setup_versioned(content: &str) -> (TempDb, Services, Workspa
 /// against base rev 0) is merged onto the current text (rev 1, which appended
 /// `delta`), the write succeeds, and `rev` bumps to `current + 1` both in the
 /// result and in the store.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_stale_expected_version_merges_and_bumps_rev() {
     let (_tmp, svc, ws, id) = setup_versioned("alpha\nbeta\ngamma").await;
 
@@ -2786,7 +3589,7 @@ async fn set_content_stale_expected_version_merges_and_bumps_rev() {
 /// Same-span conflict (AC 3): both writers replaced the same base word; the
 /// result keeps the current variant immediately followed by the incoming one
 /// (`WaWb`), dropping nothing.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_same_word_conflict_keeps_both_variants() {
     let (_tmp, svc, ws, id) = setup_versioned("one cat three").await;
 
@@ -2821,7 +3624,7 @@ async fn set_content_same_word_conflict_keeps_both_variants() {
 /// tiny against base (accepted) even though it is ~70 % shorter than current;
 /// a 60 % removal relative to the base is still rejected with the existing
 /// message unless confirmed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_reduction_guard_measures_against_base() {
     let lines: Vec<String> = (0..10).map(|i| format!("line-{i}-0123456789")).collect();
     let base = lines.join("\n");
@@ -2870,7 +3673,7 @@ async fn set_content_reduction_guard_measures_against_base() {
 /// No recoverable base (AC 5): a note whose `expectedVersion` predates every
 /// retained snapshot degrades to honest last-writer-wins — the incoming text
 /// lands verbatim and `rev` still bumps by one.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_stale_expected_version_without_base_is_lww() {
     // `setup` inserts the row directly: no snapshot exists at rev 0.
     let (_tmp, svc, ws, id) = setup("v0 body").await;
@@ -2916,7 +3719,7 @@ async fn set_content_stale_expected_version_without_base_is_lww() {
 /// optimistic-concurrency mismatch (`Conflict`, `-32005` carrying the current
 /// row) — not a stale base that resolves to the newest snapshot and lets the
 /// incoming text land as an exact write.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_future_expected_version_conflicts_without_writing() {
     let (_tmp, svc, ws, id) = setup_versioned("body").await;
     svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
@@ -2961,7 +3764,7 @@ async fn set_content_future_expected_version_conflicts_without_writing() {
 /// so `expectedVersion` above the stored rev is `-32005` even when the
 /// payload is an empty quoted string or a short `...` fragment. Nothing is
 /// written either way.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_future_expected_version_conflicts_before_content_guards() {
     let (_tmp, svc, ws, id) = setup_versioned("body").await;
     svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
@@ -3004,7 +3807,7 @@ async fn set_content_future_expected_version_conflicts_before_content_guards() {
 /// `Conflict` — same shape as the future-rev case — with no content write
 /// and no snapshot appended. Once the trigger is gone the same write lands,
 /// so exhaustion leaves the write pool usable.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_retry_exhaustion_conflicts_without_writing() {
     let (_tmp, svc, ws, id) = setup_versioned("body").await;
     sqlx::raw_sql(
@@ -3083,7 +3886,7 @@ async fn set_content_retry_exhaustion_conflicts_without_writing() {
 /// writer's rev exists, a stale `expectedVersion` is the documented
 /// last-writer-wins replace, and each such write records a snapshot at its
 /// new rev — so the first rev a writer reads *after* the transition merges.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_null_history_transitions_to_recoverable_revs() {
     let (_tmp, svc, ws, id) = setup_versioned("legacy body").await;
     sqlx::query("UPDATE note_version SET rev = NULL")
@@ -3152,7 +3955,7 @@ async fn set_content_null_history_transitions_to_recoverable_revs() {
 /// Conflict stays where it belongs (AC 6): the non-merging conditional writes
 /// — `note.update` (metadata arm), `note.updateMetadata`, `note.delete` —
 /// still surface a stale `expectedVersion` as `Conflict` (`-32005`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_merge_leaves_other_conditional_writes_conflicting() {
     let (_tmp, svc, ws, id) = setup_versioned("body").await;
     svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
@@ -3240,7 +4043,7 @@ where
 /// connection) is sampled between polls; the invariant is asserted on every
 /// sample that shows rev 1 and once more after the write completes, so the
 /// test never depends on catching a particular window under load.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn content_write_snapshot_is_visible_with_its_rev() {
     let (tmp, svc, ws, id) = setup_versioned("abc").await;
     let other = Store::open(&tmp.path).await.expect("open second store");
@@ -3376,7 +4179,7 @@ async fn surgical_write_races_user_save_in<T>(
 /// no longer overwrites a user `setContent` that landed at rev 1 — its write
 /// is gated on the rev it read, and the retry three-way-merges the appended
 /// chunk onto the user's text (`TYPED` survives, `AGENT` lands on top).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_add_merges_onto_completed_user_save() {
     let (result, stored) = surgical_write_races_user_save(
         "alpha\nbeta\ngamma",
@@ -3401,7 +4204,7 @@ async fn note_add_merges_onto_completed_user_save() {
 }
 
 /// Same race for `note.edit`: the replacement merges onto the user's save.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_edit_merges_onto_completed_user_save() {
     let (result, stored) = surgical_write_races_user_save(
         "alpha\nbeta\ngamma",
@@ -3425,7 +4228,7 @@ async fn note_edit_merges_onto_completed_user_save() {
 
 /// Same race for `note.editLines`: the line replacement merges onto the
 /// user's save.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_edit_lines_merges_onto_completed_user_save() {
     let (result, stored) = surgical_write_races_user_save(
         "alpha\nbeta\ngamma",
@@ -3455,7 +4258,7 @@ async fn note_edit_lines_merges_onto_completed_user_save() {
 /// that landed at rev 1 — the rewrite is gated on the rev it read, and the
 /// retry re-anchors on the user's text (`TYPED` survives, the markers wrap
 /// `gamma`, the comment row exists and `noteRev` is the rev that landed).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_reanchors_onto_completed_user_save() {
     let (result, stored) = surgical_write_races_user_save(
         "alpha\nbeta\ngamma",
@@ -3487,7 +4290,7 @@ async fn comment_add_reanchors_onto_completed_user_save() {
 
 /// Same race for `primitive.addCli`: the appended block merges onto the
 /// user's save.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn primitive_append_merges_onto_completed_user_save() {
     let (result, stored) = surgical_write_races_user_save(
         "alpha\nbeta\ngamma",
@@ -3503,7 +4306,7 @@ async fn primitive_append_merges_onto_completed_user_save() {
 
 /// Same race for `task.updateStatus` on a plain (unlinked) checkbox line:
 /// the status flip merges onto the user's save.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_update_status_merges_onto_completed_user_save() {
     let (result, stored) = surgical_write_races_user_save(
         "- [ ] alpha\nbeta\ngamma",
@@ -3521,7 +4324,7 @@ async fn task_update_status_merges_onto_completed_user_save() {
 /// persisted `- [/x] alpha`, which `match_task_line` no longer recognizes.
 /// The persisted marker is one valid character — the current (user) side's —
 /// and `note.listTasks` still parses the line.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_update_status_conflicting_marker_persists_a_valid_checkbox() {
     let (tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
     let (result, stored) = surgical_write_races_user_save_in(
@@ -3553,7 +4356,7 @@ async fn task_update_status_conflicting_marker_persists_a_valid_checkbox() {
 /// `note.edit` that flips the marker to `[x]` while the user's save flipped
 /// it to `[/]`. The repaired line keeps its link (`note.listTasks` row carries
 /// `taskNoteId`) and the next `task.updateNoteStatus` materializes onto it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn linked_checkbox_conflicting_marker_stays_linked_and_materializes() {
     use intent_core::{TaskMetadata, TaskStatus};
 
@@ -3625,7 +4428,7 @@ async fn linked_checkbox_conflicting_marker_stays_linked_and_materializes() {
 /// appended `delta`), the current text has `[/]`. The non-conflicting append
 /// merges in, and the conflicting marker collapses to the current side's
 /// character instead of persisting `- [/x] alpha`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_stale_expected_version_repairs_conflicting_marker() {
     let (_tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
 
@@ -3671,7 +4474,7 @@ async fn set_content_stale_expected_version_repairs_conflicting_marker() {
 /// quotes the set-content cleaner strips. The cleaner runs before the merge,
 /// so the bullet is visible to the conflict-scoped repair and the persisted
 /// line is `- [/] alpha`, not `- [/x] alpha`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_quoted_stale_expected_version_repairs_conflicting_marker() {
     let (_tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
 
@@ -3717,7 +4520,7 @@ async fn set_content_quoted_stale_expected_version_repairs_conflicting_marker() 
 /// persists the unquoted text byte-for-byte, and a non-conflicting stale
 /// merge onto current text that legitimately starts with a quote keeps that
 /// quote — only the writer's own payload is cleaned.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_cleaner_runs_once_on_the_incoming_text() {
     let (_tmp, svc, ws, id) = setup_versioned("alpha\nbeta\ngamma").await;
 
@@ -3773,7 +4576,7 @@ async fn set_content_cleaner_runs_once_on_the_incoming_text() {
 /// two zero-conflict partial deletions (`ab` → `a` and `ab` → `b`, each
 /// exactly 50 % so the unconfirmed reduction guard passes) merge to the empty
 /// string, which is rejected with the existing message and persists nothing.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_stale_merge_that_empties_the_note_is_rejected() {
     let (_tmp, svc, ws, id) = setup_versioned("ab").await;
 
@@ -3797,7 +4600,7 @@ async fn set_content_stale_merge_that_empties_the_note_is_rejected() {
 
 /// Same race for `task.update` on a plain checkbox line: the line edit
 /// merges onto the user's save.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_update_merges_onto_completed_user_save() {
     let (result, stored) = surgical_write_races_user_save(
         "- [ ] alpha\nbeta\ngamma",
@@ -3823,7 +4626,7 @@ async fn task_update_merges_onto_completed_user_save() {
 /// reads rev 0 and a store-level versioned save lands at rev 1 in between.
 /// The conversion re-derives from the fresh content (the fence is still
 /// there) and lands at rev 2 with `TYPED` intact and exactly one child.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_rederives_onto_completed_user_save() {
     let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
     let (tmp, svc, ws, id) = setup_versioned(base).await;
@@ -3900,7 +4703,7 @@ async fn convert_blocks_rederives_onto_completed_user_save() {
 /// no fence remains, nothing to convert — and no child is ever persisted for
 /// the failed attempt: one child, the parent text clean, `TYPED` intact, and
 /// the newest snapshot matches the row.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_racing_real_user_save_converts_once() {
     let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
     let (tmp, svc, ws, id) = setup_versioned(base).await;
@@ -3985,7 +4788,7 @@ async fn convert_blocks_racing_real_user_save_converts_once() {
 /// sample that sees the note, the two writes are issued right there while
 /// creation is still in flight, and the outcome is asserted once more after
 /// it completes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_create_snapshot_is_visible_with_the_row() {
     let (tmp, svc, ws, _seed) = setup("seed").await;
     let other = Store::open(&tmp.path).await.expect("open second store");
@@ -4137,7 +4940,7 @@ async fn metadata_write_races_user_save(
 /// the fix the write was a full-row `UPDATE` carrying the stale `abc`, so the
 /// acknowledged insertion vanished and rev 2 resolved to a base (`aXbc`) that
 /// no longer matched the row — a false base for every later merge.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_update_metadata_preserves_completed_user_save() {
     let stored = metadata_write_races_user_save(|svc, ws, id| {
         Box::pin(async move {
@@ -4152,7 +4955,7 @@ async fn note_update_metadata_preserves_completed_user_save() {
 
 /// Same race for the metadata arm of `note.update` (title/tags without
 /// `content`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_update_metadata_arm_preserves_completed_user_save() {
     let stored = metadata_write_races_user_save(|svc, ws, id| {
         Box::pin(async move {
@@ -4174,7 +4977,7 @@ async fn note_update_metadata_arm_preserves_completed_user_save() {
 
 /// Same race for a task-metadata write (`task.markAsTask`): the `task_json`
 /// column lands, the content does not move.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_metadata_write_preserves_completed_user_save() {
     use intent_core::TaskStatus;
     let stored = metadata_write_races_user_save(|svc, ws, id| {
@@ -4205,7 +5008,7 @@ async fn task_metadata_write_preserves_completed_user_save() {
 /// concurrently; whichever lands first makes the others stale, and each
 /// stale writer re-fetches, re-merges and retries until its versioned write
 /// lands — every line survives and `rev` advances once per writer.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_content_retry_loop_converges_under_concurrent_versioned_writes() {
     let base = "l1\nl2\nl3\nl4\nl5";
     let (_tmp, svc, ws, id) = setup_versioned(base).await;
@@ -4216,7 +5019,7 @@ async fn set_content_retry_loop_converges_under_concurrent_versioned_writes() {
         let ws = ws.clone();
         let id = id.clone();
         let incoming = base.replace(&format!("l{i}\n"), &format!("l{i}\nw{i}\n"));
-        handles.push(tokio::spawn(async move {
+        handles.push(intent_core::spawn_daemon(async move {
             svc.set_note_content(ws, id, incoming, false, Some(0), None)
                 .await
         }));
@@ -4238,7 +5041,7 @@ async fn set_content_retry_loop_converges_under_concurrent_versioned_writes() {
     assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent concurrent").await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn update_note_expected_version_gate_hit_miss_absent() {
     let (_tmp, svc, ws, id) = setup("v0").await;
 
@@ -4318,7 +5121,7 @@ async fn update_note_expected_version_gate_hit_miss_absent() {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn update_metadata_skips_spec_title_but_applies_tags() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -4371,7 +5174,7 @@ async fn update_metadata_skips_spec_title_but_applies_tags() {
 /// (no-caller) writes record nothing; a transition back out of `complete`
 /// removes the pair regardless of caller. `task.markAsTask` boundary
 /// crossings behave the same.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn flipped_completion_recorded_on_agent_complete_boundary() {
     use intent_core::{TaskMetadata, TaskStatus};
 
@@ -4434,6 +5237,7 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .expect("session");
@@ -4541,7 +5345,7 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
         .is_empty());
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_tasks_and_delete_and_scoping() {
     let (_tmp, svc, ws, id) = setup("- [ ] one\n- [x] two").await;
     let tasks = svc
@@ -4579,7 +5383,7 @@ async fn list_tasks_and_delete_and_scoping() {
 /// deleted, (a) its comments are removed, (b) its children (e.g. linked task
 /// notes) survive with `parent_id = NULL`, and (c) an unrelated note in the
 /// same workspace is untouched.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delete_note_cascades_comments_and_unlinks_children() {
     use intent_core::{
         AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType,
@@ -4702,7 +5506,7 @@ async fn delete_note_cascades_comments_and_unlinks_children() {
     assert_eq!(other_after.content, "other body");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn update_metadata_expected_version_gate_hit_and_miss() {
     let (_tmp, svc, ws, id) = setup("body").await;
 
@@ -4743,7 +5547,7 @@ async fn update_metadata_expected_version_gate_hit_and_miss() {
     assert_eq!(svc.get_note(ws, id).await.unwrap().title, "Renamed");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delete_expected_version_gate_miss_then_hit_and_absent() {
     let (_tmp, svc, ws, id) = setup("body").await;
 
@@ -4777,7 +5581,7 @@ async fn delete_expected_version_gate_miss_then_hit_and_absent() {
     ));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn read_asset_reads_base64_from_assets_root() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -4801,7 +5605,7 @@ async fn read_asset_reads_base64_from_assets_root() {
 // task.* tests
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_update_atomic_and_conflict() {
     let (_tmp, svc, ws, id) = setup("intro\n- [ ] do the thing\ntail").await;
     // Atomic status-only update on line 2.
@@ -4839,7 +5643,7 @@ async fn task_update_atomic_and_conflict() {
     assert!(matches!(err, Error::Internal(ref m) if m.contains("Conflict detected")));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_update_status_and_not_found() {
     let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
     let r = svc
@@ -4863,7 +5667,7 @@ async fn task_update_status_and_not_found() {
         .is_err());
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mark_as_task_then_update_note_status_and_get_my_task() {
     let (_tmp, svc, ws, id) = setup("# Parent task").await;
     let marked = svc
@@ -4935,7 +5739,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
 /// returns a single task note in the same shape (with `specLinked` computed
 /// from the spec body); unknown / cross-workspace ids surface `NotFound` and
 /// non-task notes surface an `Internal` error.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_list_and_get_project_workspace_tasks() {
     use intent_core::{TaskMetadata, TaskStatus};
 
@@ -5075,7 +5879,7 @@ async fn task_list_and_get_project_workspace_tasks() {
 
 /// When the spec body has no task links, `task.list` still returns every task
 /// note in the workspace — all flagged `specLinked: false`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_list_no_spec_links_returns_all_tasks_unlinked() {
     use intent_core::{TaskMetadata, TaskStatus};
 
@@ -5116,7 +5920,7 @@ async fn task_list_no_spec_links_returns_all_tasks_unlinked() {
 /// the cycle path named, and the computed `unmetDependsOn` surfaces in
 /// `task.list` / `task.get` / `task.getMyTask`. `task.markAsTask` accepts the
 /// same relation params with identical validation.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
     use intent_core::{TaskMetadata, TaskStatus};
 
@@ -5389,7 +6193,7 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
 /// child on the parent via the edge) — can no longer be written, in either
 /// direction, through `task.setRelations` or `task.markAsTask`. Ancestry
 /// chains crossing non-task notes are caught too; sibling edges stay valid.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_relations_reject_tree_ancestor_and_descendant_edges() {
     use intent_core::{TaskMetadata, TaskStatus};
 
@@ -5529,7 +6333,7 @@ async fn task_relations_reject_tree_ancestor_and_descendant_edges() {
 /// subset as the `task.list` projection, the field tracks dependency status
 /// changes, is omitted when empty (additive wire shape), and is never
 /// persisted into `task_json`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_reads_project_unmet_depends_on() {
     use intent_core::{TaskMetadata, TaskStatus};
 
@@ -5659,7 +6463,7 @@ async fn note_reads_project_unmet_depends_on() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn assign_agent_validates_and_starts_task() {
     let (_tmp, svc, ws, id) = setup("# Task").await;
     svc.mark_as_task(
@@ -5692,7 +6496,7 @@ async fn assign_agent_validates_and_starts_task() {
     assert_eq!(task.assigned_agent_ids[0].0, agent);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn remove_agent_from_all_tasks_strips_id_only_from_matching_tasks() {
     use intent_core::{AgentId, TaskMetadata, TaskStatus};
 
@@ -5773,7 +6577,7 @@ async fn remove_agent_from_all_tasks_strips_id_only_from_matching_tasks() {
     assert_eq!(r2.updated_count, 0);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_creates_children_idempotently() {
     let content = "intro\n@@@task\n# Build API\nBuild the thing.\n@@@\ntail";
     let (_tmp, svc, ws, id) = setup(content).await;
@@ -5869,7 +6673,7 @@ async fn child_id_by_title(
     panic!("no created child titled {title:?}");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_seeds_relations_by_key_and_title_and_effort() {
     // `key=` reference, exact-title reference, `conflictsWith`, and `effort=`
     // all seed in one conversion pass with zero warnings. Header values are
@@ -5922,7 +6726,7 @@ async fn convert_blocks_seeds_relations_by_key_and_title_and_effort() {
     assert_eq!(unmet, vec![api_id.as_str()]);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_key_takes_precedence_over_title() {
     // A sibling declares key=Target while another sibling is TITLED "Target".
     // The reference "Target" must resolve to the key owner, not the title.
@@ -5946,7 +6750,7 @@ async fn convert_blocks_key_takes_precedence_over_title() {
     assert_eq!(deps, vec![key_owner.as_str()]);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_resolves_existing_task_note_ids() {
     // A value matching no sibling key/title resolves against an existing
     // task-note id in the workspace; a same-shaped id on a NON-task note
@@ -5988,7 +6792,7 @@ async fn convert_blocks_resolves_existing_task_note_ids() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_warns_on_unknown_reference_and_still_converts() {
     let content = "@@@task key=a dependsOn=nope\n# Alpha\nbody\n@@@\n\
                    @@@task dependsOn=a\n# Beta\nbody\n@@@";
@@ -6021,7 +6825,7 @@ async fn convert_blocks_warns_on_unknown_reference_and_still_converts() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_warns_on_ambiguous_duplicate_key() {
     // Two distinct blocks declare the same key → a reference to it is
     // ambiguous: warn and skip.
@@ -6045,7 +6849,7 @@ async fn convert_blocks_warns_on_ambiguous_duplicate_key() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_warns_on_ambiguous_duplicate_title() {
     // Two sibling blocks share a title. The reuse map collapses them onto one
     // child note, but the duplicated declaration still makes a title
@@ -6070,7 +6874,7 @@ async fn convert_blocks_warns_on_ambiguous_duplicate_title() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_warns_on_tree_ancestor_rejected_edge() {
     // The converting note is itself a task note; a block's dependsOn names it
     // by id. The reference resolves via the existing-task-note-id step, then
@@ -6103,7 +6907,7 @@ async fn convert_blocks_warns_on_tree_ancestor_rejected_edge() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_warns_on_effort_dropped_for_reused_child() {
     // Idempotent-reuse path: a same-titled child already exists, so the
     // block's `effort=` never overwrites the existing note's estimate — but
@@ -6139,7 +6943,7 @@ async fn convert_blocks_warns_on_effort_dropped_for_reused_child() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_warns_on_validator_rejected_edges() {
     // Self-edge (block depends on its own key) and a cycle (A→B after B→A)
     // are rejected by the validators with distinct warnings; the blocks
@@ -6181,7 +6985,7 @@ async fn convert_blocks_warns_on_validator_rejected_edges() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_surfaces_header_parse_issues_as_warnings() {
     // T1 header parse issues (unknown attribute) ride the conversion result
     // as warnings; the block still converts.
@@ -6201,7 +7005,7 @@ async fn convert_blocks_surfaces_header_parse_issues_as_warnings() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn convert_blocks_auto_convert_surfaces_relations_via_note_write() {
     // The post-write auto-conversion path (note.setContent) shares the op:
     // relations seed there too, and the write itself still succeeds.
@@ -6242,7 +7046,7 @@ async fn convert_blocks_auto_convert_surfaces_relations_via_note_write() {
 // stamp.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_add_stamps_user_author_when_caller_is_none() {
     let (_tmp, svc, ws, id) = setup("body").await;
     svc.add_to_note(
@@ -6309,7 +7113,7 @@ async fn assert_snapshot_at_current_rev(svc: &Services, ws: &WorkspaceId, id: &N
 /// writes (`updateStatus`, `update`, `createPrerequisite`, and linked-checkbox
 /// materialization from `updateNoteStatus`), the `comment.add` anchor rewrite
 /// and the `primitive.*` append.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_writes_record_post_write_rev_on_version_snapshot() {
     let (_tmp, svc, ws, id) = setup("body\n- [ ] alpha\n- [ ] beta").await;
 
@@ -6506,7 +7310,7 @@ async fn note_writes_record_post_write_rev_on_version_snapshot() {
     assert_snapshot_at_current_rev(&svc, &ws, &id, "linked-checkbox materialization").await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_add_stamps_agent_author_with_session_name() {
     use intent_core::{AgentId, AgentSession, AgentStatus};
     let (_tmp, svc, ws, id) = setup("body").await;
@@ -6555,6 +7359,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     svc.store
         .insert_agent_session(&session)
@@ -6583,7 +7388,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
     assert_eq!(last.author.author_type, "agent");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_add_falls_back_to_agent_id_when_session_missing() {
     use intent_core::AgentId;
     let (_tmp, svc, ws, id) = setup("body").await;
@@ -6623,7 +7428,7 @@ async fn note_add_falls_back_to_agent_id_when_session_missing() {
 // count fields.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn create_note_with_task_block_auto_converts() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -6670,7 +7475,7 @@ async fn create_note_with_task_block_auto_converts() {
     assert_eq!(created.content, persisted.content);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn update_note_full_content_with_task_block_auto_converts() {
     let (_tmp, svc, ws, id) = setup("original").await;
     let updated = svc
@@ -6698,7 +7503,7 @@ async fn update_note_full_content_with_task_block_auto_converts() {
     assert_eq!(updated.content, persisted.content);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn add_to_note_task_block_auto_converts() {
     let (_tmp, svc, ws, id) = setup("# Head\nintro").await;
     let r = svc
@@ -6724,7 +7529,7 @@ async fn add_to_note_task_block_auto_converts() {
     assert_eq!(persisted.content, r.new_content);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_note_replacing_text_with_task_block_auto_converts() {
     let (_tmp, svc, ws, id) = setup("intro PLACEHOLDER tail").await;
     let r = svc
@@ -6749,7 +7554,7 @@ async fn edit_note_replacing_text_with_task_block_auto_converts() {
     assert_eq!(persisted.content, r.new_content);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_note_lines_inserting_task_block_auto_converts() {
     let (_tmp, svc, ws, id) = setup("line1\nOLD\nline3").await;
     let r = svc
@@ -6778,7 +7583,7 @@ async fn edit_note_lines_inserting_task_block_auto_converts() {
     assert_eq!(persisted.content, r.new_content);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_note_content_with_task_block_auto_converts() {
     let (_tmp, svc, ws, id) = setup("original body content that is long enough").await;
     let r = svc
@@ -6821,7 +7626,7 @@ fn numbered_read_presentation(content: &str) -> String {
         .join("\n")
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_note_content_rejects_numbered_read_presentation() {
     let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
     let numbered = numbered_read_presentation(SPEC_MARKDOWN);
@@ -6842,7 +7647,7 @@ async fn set_note_content_rejects_numbered_read_presentation() {
     assert_eq!(persisted.content, SPEC_MARKDOWN, "spec must be preserved");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_note_content_rejects_numbered_task_note_read_presentation() {
     // A task note's `note.read` content carries a metadata trailer after the
     // numbered body; writing that shape back must be rejected too.
@@ -6858,7 +7663,7 @@ async fn set_note_content_rejects_numbered_task_note_read_presentation() {
     assert_eq!(persisted.content, SPEC_MARKDOWN);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_note_content_raw_round_trip_preserves_markdown() {
     // The documented remediation — writing `rawContent` back — must remain a
     // no-op round trip, and legitimate numbered text inside a fence must pass.
@@ -6893,7 +7698,7 @@ async fn set_note_content_raw_round_trip_preserves_markdown() {
     assert_eq!(r.new_content, indented);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn content_edit_ops_reject_numbered_read_presentation() {
     let (_tmp, svc, ws, id) = setup(SPEC_MARKDOWN).await;
     let numbered = numbered_read_presentation(SPEC_MARKDOWN);
@@ -6970,7 +7775,7 @@ async fn content_edit_ops_reject_numbered_read_presentation() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn set_note_content_rejects_numbered_read_presentation_with_appended_lines() {
     // The reported incident shape: an agent appends raw Markdown to the
     // numbered `content` of a read and writes the whole thing back. The
@@ -7001,7 +7806,7 @@ async fn set_note_content_rejects_numbered_read_presentation_with_appended_lines
     assert_eq!(persisted.content, SPEC_MARKDOWN, "spec must be preserved");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn create_prerequisite_rejects_numbered_read_presentation() {
     // `task.createPrerequisite` materializes note content outside the
     // `note.*` surface; its `content` must hit the same guard and a rejected
@@ -7057,7 +7862,7 @@ async fn create_prerequisite_rejects_numbered_read_presentation() {
         .expect("absent content is accepted");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn write_without_task_block_reports_zero_conversions() {
     let (_tmp, svc, ws, id) = setup("body").await;
     let r = svc
@@ -7081,7 +7886,7 @@ async fn write_without_task_block_reports_zero_conversions() {
 // comment.* tests
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_unique_match_anchors_and_persists() {
     let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
     let r = svc
@@ -7117,7 +7922,7 @@ async fn comment_add_unique_match_anchors_and_persists() {
     assert_eq!(list.threads[0].comments.as_ref().unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_persists_anchor_context() {
     // M1: `comment.add` must persist `anchor_before` / `anchor_after` (the
     // ~50 chars of surrounding text) so a later note edit can relocate a
@@ -7179,7 +7984,7 @@ async fn fetch_comment_by_id(
 /// Round 14 root cause A (monorepo optimistic-vs-canonical id split): a
 /// client-supplied `commentId` must be used for the comment row, the thread
 /// id, the anchor ids, AND the embedded markers — not a daemon-minted UUID.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_supplied_comment_id_used_for_row_thread_anchor_and_markers() {
     let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
     let supplied = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
@@ -7215,7 +8020,7 @@ async fn comment_add_supplied_comment_id_used_for_row_thread_anchor_and_markers(
     assert_eq!(anchor.end_id.as_deref(), Some(supplied));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_invalid_supplied_comment_id_is_invalid_params() {
     let (_tmp, svc, ws, id) = setup("some note content").await;
     let err = svc
@@ -7242,7 +8047,7 @@ async fn comment_add_invalid_supplied_comment_id_is_invalid_params() {
     assert!(!note.content.contains("<!--anchor:"));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_duplicate_supplied_comment_id_is_invalid_params() {
     let (_tmp, svc, ws, id) = setup("alpha target-a and target-b omega").await;
     let supplied = "11111111-2222-4333-8444-555555555555";
@@ -7287,7 +8092,7 @@ async fn comment_add_duplicate_supplied_comment_id_is_invalid_params() {
 /// An `idempotencyKey` replay carrying the same supplied `commentId` returns
 /// the cached result — the duplicate-id rejection must not fire because the
 /// replay short-circuits before the mutation body runs.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_idempotent_replay_with_same_supplied_comment_id_returns_cached() {
     let (_tmp, svc, ws, id) = setup("alpha target-a omega").await;
     let supplied = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -7331,7 +8136,7 @@ async fn comment_add_idempotent_replay_with_same_supplied_comment_id_returns_cac
 }
 
 /// Backward compatibility: omitting `commentId` keeps minting a fresh UUID.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_omitted_comment_id_mints_fresh_uuid() {
     let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
     let r = svc
@@ -7360,7 +8165,7 @@ async fn comment_add_omitted_comment_id_mints_fresh_uuid() {
         .contains(&format!("<!--anchor:{}:start-->", r.comment_id)));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_above_anchor_preserves_healthy_state() {
     // H1: an edit that touches text BEFORE the anchored range must leave both
     // markers intact and must not orphan the comment.
@@ -7401,7 +8206,7 @@ async fn edit_above_anchor_preserves_healthy_state() {
     assert_ne!(comment.is_orphaned, Some(true));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_that_destroys_start_marker_recovers_via_context() {
     // H1: an edit that clobbers just the start marker (but leaves the
     // anchored text + neighbor intact) must be re-anchored using the
@@ -7450,7 +8255,7 @@ async fn edit_that_destroys_start_marker_recovers_via_context() {
     assert_ne!(comment.is_orphaned, Some(true));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn edit_that_destroys_both_markers_marks_orphaned() {
     // H1: an edit that wipes both anchor markers cannot be recovered — the
     // comment must be flipped to `is_orphaned = true` per reference
@@ -7489,7 +8294,7 @@ async fn edit_that_destroys_both_markers_marks_orphaned() {
     assert_eq!(comment.is_orphaned, Some(true));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_ambiguous_context_errors() {
     let (_tmp, svc, ws, id) = setup("repeat repeat").await;
     let err = svc
@@ -7512,7 +8317,7 @@ async fn comment_add_ambiguous_context_errors() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_plaintext_context_over_formatted_markdown() {
     // Regression: the FE builds searchContext/commentTarget from the tiptap
     // document's *plain text* — markdown syntax is stripped and blocks are
@@ -7544,7 +8349,7 @@ async fn comment_add_plaintext_context_over_formatted_markdown() {
     )));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_context_not_found_is_invalid_params() {
     let (_tmp, svc, ws, id) = setup("some note content").await;
     let err = svc
@@ -7583,7 +8388,7 @@ fn bounded_needle_snippet_bounds_long_needles() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_mention_at_prefixed_needle_anchors() {
     // Round-4 repro: the FE needle carries `@KNOWN_ISSUES.md` (mention chip
     // canonical text) where the markdown has the bare filename.
@@ -7608,7 +8413,7 @@ async fn comment_add_mention_at_prefixed_needle_anchors() {
     assert_eq!(res.location.anchored_text, "KNOWN_ISSUES.md was retired");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_empty_target_is_invalid_params() {
     // Caret-only selections send an empty commentTarget.
     let (_tmp, svc, ws, id) = setup("some note content").await;
@@ -7681,7 +8486,7 @@ fn anchored_root_comment(
 /// Round 15: phantom markers in the note must not block `comment.add` — the
 /// pre-add self-heal scrubs them so the search context matches, and the
 /// persisted rewrite drops the debris for good.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_scrubs_phantom_markers_before_anchoring() {
     let (_tmp, svc, ws, id) = setup(&format!(
         "alpha <!--anchor:{PHANTOM_UUID}:start-->beta<!--anchor:{PHANTOM_UUID}:end--> gamma"
@@ -7719,7 +8524,7 @@ async fn comment_add_scrubs_phantom_markers_before_anchoring() {
 /// whose target spans an existing comment's markers succeeds, the marker
 /// pairs interleave, both comments stay healthy across a note round-trip, and
 /// the stored anchorText/context never contain raw marker text.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_overlapping_ranges_interleave_and_survive_roundtrip() {
     let (_tmp, svc, ws, id) = setup("alpha beta gamma delta").await;
     let c1 = svc
@@ -7828,7 +8633,7 @@ async fn comment_add_overlapping_ranges_interleave_and_survive_roundtrip() {
 
 /// Round 15: documentation-literal marker text (non-UUID id) is ordinary user
 /// content — commentable, never scrubbed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_add_doc_literal_marker_is_commentable_and_survives() {
     let (_tmp, svc, ws, id) = setup("see `<!--anchor:{id}:start-->` example gamma tail here").await;
     let r = svc
@@ -7870,7 +8675,7 @@ async fn comment_add_doc_literal_marker_is_commentable_and_survives() {
 
 /// Round 15: `note.edit` scrubs phantom markers and stale-orphan markers
 /// while leaving live comments' markers and doc-literals untouched.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_edit_scrubs_phantom_and_orphan_markers_keeps_live() {
     const LIVE: &str = "11111111-1111-4111-8111-111111111111";
     const ORPHAN: &str = "22222222-2222-4222-8222-222222222222";
@@ -7916,7 +8721,7 @@ async fn note_edit_scrubs_phantom_and_orphan_markers_keeps_live() {
 
 /// Round 15: `note.update` (full-content write) also runs the phantom scrub
 /// on the incoming markdown.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn note_update_scrubs_phantom_markers_from_incoming_content() {
     let (_tmp, svc, ws, id) = setup("v0").await;
     svc.update_note(
@@ -7936,7 +8741,7 @@ async fn note_update_scrubs_phantom_markers_from_incoming_content() {
     assert_eq!(note.content, "keep beta tail");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_respond_suggestion_nests_diff_and_threads() {
     let (_tmp, svc, ws, id) = setup("alpha unique-target omega").await;
     let added = svc
@@ -8020,7 +8825,7 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
 /// `comment.respond` persists the optional `authorType` (defaulting `author`
 /// to `"User"` / `"Agent"` when absent) and rejects invalid values with
 /// `InvalidParams`, mirroring `comment.add`'s validation.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_respond_author_type_persists_and_validates() {
     use intent_core::AuthorType;
 
@@ -8099,7 +8904,7 @@ async fn comment_respond_author_type_persists_and_validates() {
 /// `threadId`/`commentId`, empty `comment`, and a missing
 /// `suggestionOriginal`/`suggestionProposed` pair — return `InvalidParams`
 /// (-32602) like `comment.add`, not `Internal` (-32603) (monorepo#632).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_respond_caller_input_errors_are_invalid_params() {
     let (_tmp, svc, ws, id) = setup("alpha reply-target omega").await;
     let added = svc
@@ -8182,7 +8987,7 @@ async fn comment_respond_caller_input_errors_are_invalid_params() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_resolve_thread_marks_and_reopens() {
     let (_tmp, svc, ws, id) = setup("alpha resolve-target omega").await;
     let added = svc
@@ -8269,7 +9074,7 @@ async fn comment_resolve_thread_marks_and_reopens() {
     assert_eq!(list.threads[0].status, "open");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_resolve_thread_requires_thread_or_comment_id() {
     let (_tmp, svc, ws, id) = setup("nothing here").await;
     let err = svc
@@ -8288,7 +9093,7 @@ async fn comment_resolve_thread_requires_thread_or_comment_id() {
 /// `InvalidParams` (-32602) like `comment.add`/`comment.respond`, not
 /// `Internal` (-32603) (monorepo#649). Lookup failures (unknown
 /// commentId/threadId) keep their existing `Internal` semantics.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_get_thread_and_resolve_caller_input_errors_are_invalid_params() {
     let (_tmp, svc, ws, id) = setup("alpha lookup-target omega").await;
 
@@ -8396,7 +9201,7 @@ async fn comment_get_thread_and_resolve_caller_input_errors_are_invalid_params()
 /// so a caller declaring workspace B cannot remove a row owned by workspace A
 /// (the store's `set_thread_status` UPDATE is scoped the same way, so
 /// `comment_resolve_thread` becomes a no-op across workspaces).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_ops_reject_cross_workspace_bare_id_writes() {
     let (_tmp, svc, ws_a, id_a) = setup("Hello world, this is a test sentence.").await;
     // Provision a second workspace on the same store/services handle.
@@ -8479,7 +9284,7 @@ async fn comment_ops_reject_cross_workspace_bare_id_writes() {
 /// workspace-scoped `list_comments_in_workspace` lookup, the parent lookup
 /// would leak a match from the other workspace and attach a reply whose
 /// `parent_id` chains cross-workspace.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_respond_rejects_cross_workspace_comment_id_probe() {
     use intent_core::{
         AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType,
@@ -8632,7 +9437,7 @@ async fn event_setup() -> (TempDb, Services, WorkspaceId) {
     (tmp, Services::new(store), ws)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_activity_files_branch_vs_aggregate_branch() {
     let (_tmp, svc, ws) = event_setup().await;
     let ts = intent_core::now_iso();
@@ -8663,7 +9468,7 @@ async fn agent_activity_files_branch_vs_aggregate_branch() {
     assert!(ids.contains(&"a1") && ids.contains(&"a2"));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_summary_aggregates_recent_window() {
     let (_tmp, svc, ws) = event_setup().await;
     let ts = intent_core::now_iso();
@@ -8683,7 +9488,7 @@ async fn workspace_summary_aggregates_recent_window() {
     assert_eq!(summary.top_changed_files[0].change_count, 2);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn query_filters_and_defaults_limit_50() {
     let (_tmp, svc, ws) = event_setup().await;
     insert_file_event(
@@ -8740,7 +9545,7 @@ async fn query_filters_and_defaults_limit_50() {
 /// means no type filter, and anything else — including `note*` without a
 /// colon — stays an exact match. Both the legacy-array and paginated paths
 /// honor the glob.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn query_event_type_glob_matches_subscribe_semantics() {
     let (_tmp, svc, ws) = event_setup().await;
     for (i, t) in ["note:updated", "note:deleted", "workspace:updated"]
@@ -8824,7 +9629,7 @@ async fn query_event_type_glob_matches_subscribe_semantics() {
 /// it returns the legacy bare array; with it, it returns the `{ items, nextToken }`
 /// envelope (newest→oldest, clamped limit) and an opaque token that walks
 /// backward to exhaustion.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn query_opt_in_pagination_envelope_and_token() {
     let (_tmp, svc, ws) = event_setup().await;
     for i in 0..3 {
@@ -8921,7 +9726,7 @@ async fn insert_big_event(svc: &Services, ws: &WorkspaceId, i: usize, data_bytes
 /// per-row payload trimming with observable `truncated` / `originalBytes`
 /// markers, row count is preserved, and the caller-supplied legacy `limit`
 /// is clamped (a negative value previously meant "no limit" in SQL).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn query_response_size_is_bounded_below_frame_advisory() {
     const ONE_MIB: usize = 1024 * 1024;
     let (_tmp, svc, ws) = event_setup().await;
@@ -9019,7 +9824,7 @@ async fn query_response_size_is_bounded_below_frame_advisory() {
 /// The legacy `event.query` limit's UPPER bound (monorepo#3347): a limit past
 /// 500 is clamped to exactly 500 rows — the second half of the [1, 500]
 /// contract (the lower bound is covered by the regression test above).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn query_legacy_limit_upper_clamp() {
     let (_tmp, svc, ws) = event_setup().await;
     for i in 0..510 {
@@ -9042,7 +9847,7 @@ async fn query_legacy_limit_upper_clamp() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
     let (_tmp, svc, ws) = event_setup().await;
     // Empty eventTypes → error (TS resolveSubscriptionEventTypes guard).
@@ -9090,7 +9895,7 @@ async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
 /// subscriptions keep the full stream — the `*` expansion in
 /// [`subscribe_resolves_star_and_unsubscribe_roundtrips`] still contains
 /// `agent:*`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
     let (_tmp, svc, ws) = event_setup().await;
     // A live subscriber session: the phantom-subscriber guard (monorepo#568)
@@ -9141,6 +9946,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .expect("insert agent session");
@@ -9310,7 +10116,7 @@ mod change_event_parity {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_created_payload() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -9341,7 +10147,7 @@ mod change_event_parity {
     /// Idempotency replay (design note TB-0 §5.3): a second `note.create` with the
     /// same `(workspaceId, idempotencyKey)` returns the ORIGINAL note without
     /// re-executing — so no second `note:created` event is published.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn idempotent_create_note_replay_returns_original_no_reexec() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -9392,7 +10198,7 @@ mod change_event_parity {
 
     /// Soft-launch (R5): a missing `idempotencyKey` is accepted (never rejected)
     /// and each call executes normally, producing distinct notes.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn missing_idempotency_key_executes_normally() {
         let h = harness().await;
         let mk = || NoteCreate {
@@ -9419,7 +10225,7 @@ mod change_event_parity {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_status_changed_payload() {
         let h = harness().await;
         // Pre-insert a task note directly (no event) so the only published event
@@ -9452,7 +10258,7 @@ mod change_event_parity {
         assert!(ev["data"].get("agentId").is_none());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_status_changed_carries_agent_id_when_agent_attributed() {
         let h = harness().await;
         let mut tn = note(&h.ws, "task-agent", "Agent Task");
@@ -9506,6 +10312,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -9542,7 +10349,7 @@ mod change_event_parity {
     /// `task:status-changed`. Every other caller (unlinked agent, the
     /// caller-less router/FE path) and every non-terminal starting status
     /// transition exactly as before, with no `advisory`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_note_status_terminal_guard_blocks_only_linked_agent() {
         let h = harness().await;
         let mk_session = |id: &str, task_note_id: Option<intent_core::NoteId>| AgentSession {
@@ -9589,6 +10396,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         let task_id = intent_core::NoteId::from("task-guard");
         // `linked-session` is linked via its session row; `linked-assigned`
@@ -9723,7 +10531,7 @@ mod change_event_parity {
             .collect::<Vec<_>>()
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_as_task_emits_task_created_and_note_updated() {
         let h = harness().await;
         let n = note(&h.ws, "plain-1", "body");
@@ -9759,7 +10567,7 @@ mod change_event_parity {
         assert!(ev["data"].get("agentId").is_none());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_as_task_on_existing_task_emits_status_changed_not_created() {
         let h = harness().await;
         let mut n = note(&h.ws, "already-task", "body");
@@ -9801,7 +10609,7 @@ mod change_event_parity {
         assert_eq!(ready[0]["data"]["triggeredBy"]["noteId"], "already-task");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_as_task_on_existing_task_same_status_emits_no_task_event() {
         let h = harness().await;
         let mut n = note(&h.ws, "same-status", "body");
@@ -9830,7 +10638,7 @@ mod change_event_parity {
         assert_eq!(of_type(&events, "note:updated").len(), 1);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn convert_blocks_emits_task_created_per_child() {
         let h = harness().await;
         let n = note(
@@ -9857,7 +10665,7 @@ mod change_event_parity {
         assert!(ev["data"]["createdAt"].is_string());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn convert_blocks_task_created_carries_agent_id() {
         let h = harness().await;
         let n = note(
@@ -9910,6 +10718,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -9939,7 +10748,7 @@ mod change_event_parity {
     /// `dependsOn` edge emits the §6.5 pair: `note:updated` for the child
     /// whose metadata changed, then `task:ready-tasks-changed` with the
     /// `relations-changed` trigger naming that child.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn convert_blocks_relation_seeding_emits_ready_tasks_changed() {
         let h = harness().await;
         let n = note(
@@ -9985,7 +10794,7 @@ mod change_event_parity {
         assert!(!ready_ids.iter().any(|v| v == beta_id.as_str()));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_prerequisite_emits_task_created() {
         let h = harness().await;
         let n = note(&h.ws, "dependent-1", "body");
@@ -10015,7 +10824,7 @@ mod change_event_parity {
     /// LC-1 parity for the two `task.*` paths that now thread the caller:
     /// `markAsTask` and `createPrerequisite` attribute their emissions to the
     /// invoking agent when the MCP front door supplies one.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_as_task_and_create_prerequisite_carry_agent_id() {
         let h = harness().await;
         let plain = note(&h.ws, "plain-agent", "body");
@@ -10064,6 +10873,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -10134,7 +10944,7 @@ mod change_event_parity {
         assert_eq!(created[0]["actor"], agent_actor);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn ready_tasks_changed_payload() {
         let h = harness().await;
         // Parent task with one child; both start not_started. The parent is
@@ -10188,7 +10998,7 @@ mod change_event_parity {
     /// Cross-subtree regression: a task depending on two sibling-subtree
     /// tasks is not ready until BOTH complete; a cancelled dep never
     /// satisfies its edge.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn ready_tasks_respect_depends_on_edges() {
         let h = harness().await;
         // Two sibling subtrees: parent-a → dep-a, parent-b → dep-b, plus a
@@ -10352,7 +11162,7 @@ mod change_event_parity {
     /// `triggeredBy: { noteId, reason: "relations-changed" }` variant (no
     /// status fields). Adding an edge un-readies a task; clearing it readies
     /// the task again; a conflictsWith-only write does not emit.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn set_relations_recomputes_ready_set() {
         let h = harness().await;
         let mk = |id: &str, seq: usize| {
@@ -10427,7 +11237,7 @@ mod change_event_parity {
     /// `dependsOn` takes the same `relations-changed` recompute as
     /// `task.setRelations` (no status-shaped emission runs on that arm). A
     /// same-status re-mark with omitted relation params emits no recompute.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn same_status_remark_recomputes_ready_set() {
         let h = harness().await;
         let mk = |id: &str, seq: usize| {
@@ -10499,7 +11309,7 @@ mod change_event_parity {
     /// dependents. Deleting a **ready** task itself also moves the set
     /// (monorepo#2006), while a delete that provably cannot move it (a
     /// terminal task nobody depends on) still emits no recompute.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn deleting_depended_on_note_recomputes_ready_set() {
         let h = harness().await;
         let mk = |id: &str, status: TaskStatus, deps: Vec<&str>, seq: usize| {
@@ -10572,7 +11382,7 @@ mod change_event_parity {
     /// recompute EVEN WHEN the ready set is unchanged — here `gated` is held
     /// back by a second incomplete dep both before and after, so the set is
     /// `[other]` throughout, yet the dangling-edge announcement still fires.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn deleting_depended_on_note_emits_even_when_set_unchanged() {
         let h = harness().await;
         let mk = |id: &str, status: TaskStatus, deps: Vec<&str>, seq: usize| {
@@ -10617,7 +11427,7 @@ mod change_event_parity {
     /// ENTERS the ready set — announced with the `note-deleted` trigger and
     /// the parent present in `readyTaskIds`. Deleting a plain (non-task) note
     /// never emits a recompute.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn deleting_last_incomplete_child_readies_parent() {
         let h = harness().await;
         let mk = |id: &str, status: TaskStatus, parent: Option<&str>, seq: usize| {
@@ -10678,7 +11488,7 @@ mod change_event_parity {
     /// `parent_id`, so reconstructing the pre-delete tree from post-delete
     /// rows made the parent look childless/ready and fired a spurious emit;
     /// the pre-delete snapshot comparison avoids that.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn deleting_non_ready_parent_with_ready_child_emits_no_recompute() {
         let h = harness().await;
         let mk = |id: &str, status: TaskStatus, parent: Option<&str>, seq: usize| {
@@ -10708,7 +11518,7 @@ mod change_event_parity {
         assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn comment_added_payload() {
         let h = harness().await;
         let tn = note(&h.ws, "n-1", "hello world");
@@ -10752,7 +11562,7 @@ mod change_event_parity {
     /// `comment.add` with the same `(workspaceId, idempotencyKey)` returns the
     /// ORIGINAL result without re-executing — no duplicate comment row, no
     /// second anchor in the note, and no second `comment:added` event.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn idempotent_comment_add_replay_returns_original_no_reexec() {
         let h = harness().await;
         let tn = note(&h.ws, "n-1", "hello world");
@@ -10813,7 +11623,7 @@ mod change_event_parity {
     /// Reference parity: `comment.respond` publishes a single `comment:added`
     /// event carrying `{ noteId, commentId }` for the reply so subscribers see
     /// the new thread comment without a re-read (Audit D C2).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn comment_respond_emits_comment_added_once() {
         let h = harness().await;
         let tn = note(&h.ws, "n-1", "hello world");
@@ -10866,7 +11676,7 @@ mod change_event_parity {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn comment_resolved_payload() {
         let h = harness().await;
         let tn = note(&h.ws, "n-1", "hello world");
@@ -10907,7 +11717,7 @@ mod change_event_parity {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn attention_changed_payload() {
         let h = harness().await;
         // Raise attention directly (no event), then dismiss it via the service.
@@ -10932,7 +11742,7 @@ mod change_event_parity {
     /// (`archived`/`status`/`archivedAt`). Verify `archive_workspace` fires
     /// exactly one such event whose `archivedAt` equals the persisted
     /// timestamp (Audit D C3).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn archive_workspace_emits_workspace_updated_once() {
         use intent_core::WorkspaceApi;
         let h = harness().await;
@@ -10966,7 +11776,7 @@ mod change_event_parity {
     /// Symmetric to archive: `unarchive_workspace` emits one `workspace:updated`
     /// carrying the full applied delta with an explicit `archivedAt: null` so
     /// clients clear the field (Audit D C3).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unarchive_workspace_emits_workspace_updated_once() {
         use intent_core::{WorkspaceApi, WorkspaceStatus};
         let h = harness().await;
@@ -11047,6 +11857,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -11187,7 +11998,7 @@ mod change_event_parity {
     /// The manual RPC stays idempotent: `unarchive_workspace` on an
     /// already-Active workspace still succeeds and still emits the delta
     /// (no stamp) — the flipped-only short-circuit is auto-path-only.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn manual_unarchive_on_active_workspace_stays_idempotent() {
         use intent_core::WorkspaceApi;
         let h = harness().await;
@@ -11248,7 +12059,7 @@ mod change_event_parity {
     /// folds to the empty-string clear signal (preserving the "clear" vs
     /// "no change" distinction, which a `None` snapshot would erase via
     /// `skip_serializing_if`).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn update_workspace_event_delta_matches_persisted_normalisation() {
         use intent_core::{WorkspaceApi, WorkspaceUpdate};
         let h = harness().await;
@@ -11283,7 +12094,7 @@ mod change_event_parity {
     /// Derived `activity` flips `Idle → AgentRunning → Idle` across in-flight
     /// session begin/end, reflected by `get_workspace`, and emits
     /// `workspace:activity-changed` ONLY on the zero/non-zero edges (§9.9/§10.1).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn activity_changed_only_on_change_and_derived() {
         use intent_core::{WorkspaceActivity, WorkspaceApi};
         let _guard = DebounceEnvGuard::new("100");
@@ -11445,7 +12256,7 @@ mod change_event_parity {
     /// When a workspace has agents in-flight, mutations that return a `Workspace`
     /// must set `ws.activity = workspace_activity(&id)` so the FE receives
     /// `agent_running`, not the stale/default `idle` from the persisted row.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn update_workspace_derives_activity_from_live_agent_state() {
         use intent_core::{WorkspaceActivity, WorkspaceApi, WorkspaceUpdate};
         let h = harness().await;
@@ -11532,7 +12343,7 @@ mod change_event_parity {
     }
 
     /// Regression for STAB-N: `dismiss_attention` must derive activity.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn dismiss_attention_derives_activity_from_live_agent_state() {
         use intent_core::{WorkspaceActivity, WorkspaceAttention};
         let h = harness().await;
@@ -11562,7 +12373,7 @@ mod change_event_parity {
     }
 
     /// Regression for STAB-N: `archive_workspace` must derive activity.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn archive_workspace_derives_activity_from_live_agent_state() {
         use intent_core::WorkspaceActivity;
         let h = harness().await;
@@ -11586,7 +12397,7 @@ mod change_event_parity {
     }
 
     /// Regression for STAB-N: `unarchive_workspace` must derive activity.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unarchive_workspace_derives_activity_from_live_agent_state() {
         use intent_core::WorkspaceActivity;
         let h = harness().await;
@@ -11616,7 +12427,7 @@ mod change_event_parity {
     }
 
     /// Regression for STAB-N: `mark_seen` must derive activity.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_seen_derives_activity_from_live_agent_state() {
         use intent_core::{WorkspaceActivity, WorkspaceAttention};
         let h = harness().await;
@@ -11644,7 +12455,7 @@ mod change_event_parity {
     /// The BE raises `attention`, it persists across a store reload, the raise is
     /// idempotent (no duplicate event), and dismissal clears it + emits
     /// `attention-changed` and is itself idempotent (§9.9).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn attention_raise_dismiss_persists_and_idempotent() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         let h = harness().await;
@@ -11697,7 +12508,7 @@ mod change_event_parity {
 
     /// `markSeen` clears an `unread` flag (emitting attention-changed) and is a
     /// no-op when there is nothing unread (§9.9).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_seen_clears_unread_and_is_idempotent() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         let h = harness().await;
@@ -11732,7 +12543,7 @@ mod change_event_parity {
     /// "activity". `markSeen` clears the unread flag WITHOUT bumping
     /// `updated_at`, so the derived `lastActivity` (sidebar label/sort) stays
     /// put.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_seen_does_not_bump_updated_at() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         let h = harness().await;
@@ -11767,7 +12578,7 @@ mod change_event_parity {
     /// Regression (intent-hq/monorepo#1466): `dismissAttention` never bumps
     /// `updated_at` — neither when attention is already `none` (a pure no-op:
     /// the row is not rewritten) nor when it actually clears attention.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn dismiss_attention_does_not_bump_updated_at() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         let h = harness().await;
@@ -11824,7 +12635,7 @@ mod change_event_parity {
     /// survives. Parks `mark_seen` immediately before its scoped write,
     /// mutates `title`/`updated_at` concurrently, and asserts the mutation
     /// is not clobbered.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_seen_race_preserves_concurrent_row_mutation() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         use std::sync::Arc;
@@ -11839,7 +12650,7 @@ mod change_event_parity {
 
         let services = h.services.clone();
         let ws_id = h.ws.clone();
-        let task = tokio::spawn(async move { services.mark_seen(ws_id).await });
+        let task = intent_core::spawn_daemon(async move { services.mark_seen(ws_id).await });
         tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
             .await
             .expect("mark_seen reaches the attention write window");
@@ -11870,7 +12681,7 @@ mod change_event_parity {
 
     /// Regression (intent-hq/monorepo#1481): same race window as above, for
     /// `dismissAttention`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn dismiss_attention_race_preserves_concurrent_row_mutation() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         use std::sync::Arc;
@@ -11883,7 +12694,8 @@ mod change_event_parity {
 
         let services = h.services.clone();
         let ws_id = h.ws.clone();
-        let task = tokio::spawn(async move { services.dismiss_attention(ws_id).await });
+        let task =
+            intent_core::spawn_daemon(async move { services.dismiss_attention(ws_id).await });
         tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
             .await
             .expect("dismiss_attention reaches the attention write window");
@@ -11958,7 +12770,7 @@ mod change_event_parity {
     /// `workspace.create` emits `workspace:created` after the row is inserted
     /// (§6.5), with the self-sufficient `{ workspaceId, workspace }` payload
     /// (§6.7). The new workspace mints its own id, so subscribe unfiltered.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_created_payload() {
         use intent_core::WorkspaceCreate;
         let h = harness().await;
@@ -11989,7 +12801,7 @@ mod change_event_parity {
     /// returned workspace carries it, the row round-trips it through the
     /// store, and its JSON wire shape matches the documented camelCase +
     /// lowercase-kind contract.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_create_persists_context_links() {
         use intent_core::{ContextLink, ContextLinkKind, WorkspaceCreate};
         let h = harness().await;
@@ -12032,7 +12844,7 @@ mod change_event_parity {
     /// `workspace.create` `contextLinks` validation (§5.1): empty string
     /// fields, a zero `number`, or an over-bound list reject `-32602` before
     /// any state change; an empty list persists as absent (wire omits it).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_create_context_links_validation() {
         use intent_core::{ContextLink, ContextLinkKind, WorkspaceCreate};
         let h = harness().await;
@@ -12101,7 +12913,7 @@ mod change_event_parity {
     /// per-workspace auto-commit override from the global `git.autoCommit` in
     /// force at create time, so `workspace.getAutoCommit` reports
     /// `source: "workspace"` and later global flips don't affect the row.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_create_mirrors_global_auto_commit() {
         use intent_core::WorkspaceCreate;
         let h = harness().await;
@@ -12138,7 +12950,7 @@ mod change_event_parity {
     /// the source's effective value (source override → global fallback), so
     /// a source toggled OFF produces an OFF duplicate while the source's own
     /// override is untouched.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_duplicate_seeds_auto_commit_from_source() {
         use intent_core::WorkspaceCreate;
         let h = harness().await;
@@ -12185,7 +12997,7 @@ mod change_event_parity {
     /// Every note `workspace.duplicate` copies is snapshotted at its
     /// post-insert `rev`, so the rev a client loads from the duplicate is a
     /// recoverable merge base.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_duplicate_copied_notes_record_post_write_rev_on_version_snapshot() {
         use intent_core::WorkspaceCreate;
         let h = harness().await;
@@ -12246,7 +13058,7 @@ mod change_event_parity {
     /// NULL fallback: a pre-migration row (no persisted override) resolves
     /// `workspace.getAutoCommit` against the global setting with
     /// `source: "global"`, and `effective_auto_commit` follows the global.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_auto_commit_null_falls_back_to_global() {
         let h = harness().await;
         // The harness workspace is inserted directly (no create-time seed),
@@ -12270,7 +13082,7 @@ mod change_event_parity {
     /// `workspace.setAutoCommit` persists the override, emits a
     /// `workspace:updated` delta carrying `autoCommitEnabled`, and the
     /// effective resolution honors the override over the global default.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_set_auto_commit_persists_and_emits() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -12302,7 +13114,7 @@ mod change_event_parity {
     /// with the same key returns the ORIGINAL workspace without re-executing —
     /// so no second row, and neither the `workspace:created` nor the seeded
     /// spec's `note:created` is republished on the replay.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn idempotent_create_workspace_replay_no_second_event() {
         use intent_core::WorkspaceCreate;
         let h = harness().await;
@@ -12363,7 +13175,7 @@ mod change_event_parity {
     /// with `notes.service.ts ensureSpecExists`): default Spec — empty
     /// markdown, `spec` tag, pinned, default, workspace visibility — with a
     /// v1 version snapshot and a `note:created` event carrying `noteId=spec`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_create_seeds_spec_note() {
         use intent_core::{NoteId, NoteVisibility, WorkspaceCreate};
         let h = harness().await;
@@ -12418,7 +13230,7 @@ mod change_event_parity {
 
     /// Spec seeding is idempotent inside the create scope: a replay with the
     /// same `idempotencyKey` short-circuits and does not attempt to reinsert.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_create_spec_seed_replay_no_duplicate() {
         use intent_core::{NoteId, WorkspaceCreate};
         let h = harness().await;
@@ -12466,7 +13278,7 @@ mod change_event_parity {
     /// workspace owns its own `spec` note. Two separate `workspace.create`
     /// calls each seed a fresh spec scoped to their workspace; there is no
     /// cross-workspace collision on the well-known `spec` id.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_seed_is_workspace_scoped_no_cross_workspace_collision() {
         use intent_core::{NoteId, WorkspaceCreate};
         let h = harness().await;
@@ -12516,7 +13328,7 @@ mod change_event_parity {
     /// markdown, `Spec` title, `spec` tag, pinned, default, workspace
     /// visibility), returns it in the response, and emits `note:created`
     /// exactly once. Heals workspaces that predate the composite-PK spec seed.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_reseeds_missing_spec_note() {
         use intent_core::{NoteId, NoteVisibility};
         let h = harness().await;
@@ -12568,7 +13380,7 @@ mod change_event_parity {
     /// Concurrent `note.list` callers may both observe a missing spec before
     /// either creates it. Both calls still succeed with the same seeded row,
     /// while the insert winner alone captures a version and emits the event.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn concurrent_note_lists_reseed_missing_spec_once() {
         use intent_core::NoteId;
         let h = harness().await;
@@ -12602,7 +13414,7 @@ mod change_event_parity {
 
     /// A workspace that already has a `spec` note is untouched by `note.list`:
     /// no spurious `note:created`, no extra version snapshot, no rev bump.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_leaves_existing_spec_untouched() {
         use intent_core::{NoteId, WorkspaceCreate};
         let h = harness().await;
@@ -12659,7 +13471,7 @@ mod change_event_parity {
     /// After a client deletes the `spec` note (§5 `note.delete`), the next
     /// `note.list` reseeds it and emits `note:created`. Regression guard for
     /// the self-healing behaviour the reference relies on.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_reseeds_after_spec_deletion() {
         use intent_core::{NoteId, WorkspaceCreate};
         let h = harness().await;
@@ -12701,7 +13513,7 @@ mod change_event_parity {
     /// the spec reseed verifies the workspace exists before any INSERT, so no
     /// raw `note.workspace_id → workspace.id` FK violation occurs and no
     /// `note:created` fires.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_returns_workspace_not_found_for_unknown_workspace() {
         let h = harness().await;
         let mut sub = h.bus.subscribe(SubscriptionFilter::default());
@@ -12733,7 +13545,7 @@ mod change_event_parity {
     /// row is deleted, `note.list` with the stale id returns
     /// `NotFound("workspace …")` instead of attempting the spec reseed INSERT
     /// against the gone FK target. No `note:created` fires.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_returns_workspace_not_found_after_workspace_deletion() {
         use intent_core::{NoteId, WorkspaceCreate};
         let h = harness().await;
@@ -12788,7 +13600,7 @@ mod change_event_parity {
     /// `chief_workspace()`), so `note.list` must not attempt to reseed a spec
     /// against a nonexistent FK target. Reseed is skipped; the list returns
     /// empty and no `note:created` fires.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_skips_reseed_for_chief_virtual_workspace() {
         let h = harness().await;
         let mut sub = h.bus.subscribe(SubscriptionFilter::default());
@@ -12801,14 +13613,13 @@ mod change_event_parity {
         assert!(none.is_err(), "chief list must not publish a reseed event");
     }
 
-    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
     /// bug: on `note.list` with no `id='spec'` note but exactly one top-level,
     /// non-task note titled "Spec", the stray is *adopted* — its `note.id` is
     /// rewritten to `'spec'`, children are re-parented, version history / line
     /// attribution / comments follow, `is_pinned` / `is_default` / the `spec`
     /// tag are set, and delete+create events fire so live FE clients converge.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_adopts_stray_spec_note() {
         use intent_core::{
             now_iso, AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus,
@@ -13048,7 +13859,7 @@ mod change_event_parity {
     /// Ambiguity (≥2 top-level "Spec" notes): the adoption bails out and
     /// falls through to the existing empty-seed path. Both strays stay put;
     /// the new `spec` is a fresh empty row.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_falls_back_to_empty_seed_when_multiple_spec_candidates() {
         use intent_core::{now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility};
         let h = harness().await;
@@ -13098,7 +13909,7 @@ mod change_event_parity {
     /// Candidates must be top-level and non-task: a task-note titled "Spec"
     /// or a child note titled "Spec" is *not* adopted. With no other stray
     /// present the caller falls through to the empty-seed path.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_ignores_task_or_child_spec_candidates() {
         use intent_core::{
             now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata,
@@ -13147,7 +13958,7 @@ mod change_event_parity {
     /// A workspace that already has `id='spec'` is untouched even if a stray
     /// "Spec" UUID note sits beside it: `ensure_spec_note` returns early on
     /// the healthy path, no adoption runs, no adoption events fire.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn note_list_does_not_adopt_when_spec_already_exists() {
         use intent_core::{
             now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, WorkspaceCreate,
@@ -13264,7 +14075,7 @@ mod change_event_parity {
         format!("- {marker} [{label}](intent://local/task/{id})")
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn update_note_status_materializes_linked_checkbox() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13303,7 +14114,7 @@ mod change_event_parity {
         assert_eq!(rows[1].status, "todo");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn update_note_status_reverse_transitions_and_cancelled() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::Complete).await;
@@ -13322,7 +14133,7 @@ mod change_event_parity {
         assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn materialization_covers_every_linked_line_and_skips_unlinked_notes() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13368,7 +14179,7 @@ mod change_event_parity {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn same_char_status_write_does_not_rewrite_parent() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13396,7 +14207,7 @@ mod change_event_parity {
     /// read. A snapshot that predates another task's materialized `[x]` and an
     /// editor save must not revert either (lost-update race from the #1696
     /// review).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn materialization_writes_from_a_fresh_read_not_the_stale_snapshot() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13437,7 +14248,7 @@ mod change_event_parity {
 
     /// Two linked tasks in one parent completing concurrently (the
     /// `after_all` delegation-group case) both end up materialized.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn concurrent_status_writes_in_one_parent_both_materialize() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13467,7 +14278,7 @@ mod change_event_parity {
     /// not stamp its stale `[x]` over the `[/]` the later one already
     /// projected — the marker is derived from the task's status at write
     /// time, not from the status the caller captured (#1696 review).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delayed_materialization_projects_the_current_task_status_not_the_stale_one() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13501,7 +14312,7 @@ mod change_event_parity {
         assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn mark_as_task_materializes_linked_checkbox() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13560,7 +14371,7 @@ mod change_event_parity {
         assert_eq!(note_content(&h, "spec2").await.0, linked("[/]", "F", FRESH));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn assign_agent_materializes_linked_checkbox() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13619,7 +14430,7 @@ mod change_event_parity {
         intent_core::NoteId::from("spec")
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn update_status_on_linked_line_redirects_to_task_note() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13680,7 +14491,7 @@ mod change_event_parity {
     /// hex/dash shape (`task-a`) passes the materialization prefilter
     /// (`extract_spec_task_ids`) and must be rewritten and redirected like
     /// a UUID-shaped one — not left with a stale marker / raw fallback.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn non_hex_linked_task_ids_materialize_and_redirect() {
         const ID: &str = "task-a";
         let h = harness().await;
@@ -13725,7 +14536,7 @@ mod change_event_parity {
         assert_eq!(row.linked_task_note_id.as_deref(), Some(ID));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_update_on_linked_line_redirects_status_to_task_note() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13784,7 +14595,7 @@ mod change_event_parity {
         assert_eq!(note_content(&h, "spec").await.0, linked("[/]", "T", T1));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_update_text_and_status_on_linked_line_writes_parent_once() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13834,7 +14645,7 @@ mod change_event_parity {
     /// redirect resolves against the post-edit line, so the status write
     /// lands on B, the line carries B's marker, and A is untouched (#1696
     /// review).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_update_retargeting_the_link_redirects_status_to_the_new_task() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13883,7 +14694,7 @@ mod change_event_parity {
 
     /// A text-only retarget to a task in a different status renders that
     /// task's marker: the char is a projection of the (new) linked task.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_update_text_only_retarget_renders_the_new_tasks_marker() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -13925,7 +14736,7 @@ mod change_event_parity {
         assert_eq!(spec_updates(&events), 1, "{events:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn todo_on_linked_line_preserves_detailed_task_status() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::Blocked).await;
@@ -14003,7 +14814,7 @@ mod change_event_parity {
         assert_eq!(note_content(&h, "spec").await.0, linked("[ ]", "T", T1));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn linked_line_write_heals_a_diverged_char() {
         // The task is already complete but the line still reads `[ ]`: `done`
         // is a no-op on the task and rewrites the char via materialization.
@@ -14032,7 +14843,7 @@ mod change_event_parity {
         assert_eq!(spec_updates(&events), 1, "{events:?}");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn dangling_task_link_keeps_the_raw_checkbox_write() {
         let h = harness().await;
         // FRESH exists but is not a task; `d4d4` does not exist at all.
@@ -14091,7 +14902,7 @@ mod change_event_parity {
     /// A materialized parent write is a surgical content mutation like
     /// `note.edit`: it schedules the parent's line-attribution recompute.
     /// Parents left untouched — and the task note itself — schedule nothing.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn materialization_schedules_parent_attribution_recompute() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -14121,7 +14932,7 @@ mod change_event_parity {
     /// Redirected writes through `task.updateStatus` / `task.update` behave as
     /// on every other materializing path: the redirect target's parent (here
     /// the note the call addressed) schedules its recompute too.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn redirected_write_schedules_parent_attribution_recompute() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
@@ -14153,7 +14964,7 @@ mod change_event_parity {
     /// agent (payload `agentId` + agent actor) and a complete-boundary crossing
     /// records / removes the agent's flipped-completion pair. A caller-less
     /// write (FE/RPC front door) carries neither.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn redirected_writes_carry_agent_provenance_and_flipped_completion() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::InProgress).await;
@@ -14267,7 +15078,7 @@ mod change_event_parity {
     /// write, so a same-text write never persists the refused marker; a real
     /// text edit still lands in exactly one parent write carrying the
     /// terminal marker, and the result's `status` echoes that marker.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn linked_line_redirects_by_linked_agent_are_no_ops_on_terminal_task() {
         for start in [TaskStatus::Complete, TaskStatus::Cancelled] {
             let h = harness().await;
@@ -14467,7 +15278,7 @@ mod change_event_parity {
     /// text (`[/]` → `[x]` vs `[/]` → `[ ]` char-interleave into `[x ]`, no
     /// longer a checkbox): the gate miss re-derives from the fresh parent,
     /// where the guard now refuses `todo` and the line projects `[x]`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn linked_line_write_re_derives_after_concurrent_completion() {
         let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
         let h = harness_with_task_update_park(park.clone()).await;
@@ -14501,7 +15312,7 @@ mod change_event_parity {
             let ws = h.ws.clone();
             let new_text = new_text.clone();
             let agent = agent.clone();
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 services
                     .task_update(
                         ws,
@@ -14562,7 +15373,7 @@ mod mcp_callback {
     use super::{note, workspace, TempDb};
     use crate::{EventBus, Services, SubscriptionFilter};
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_note_add_through_mcp_changes_state_and_fires_event() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -14677,6 +15488,7 @@ mod mcp_callback {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -15259,7 +16071,7 @@ mod drafts_events {
 // status/reviews/check-run shapes and the review-thread filtering/fallback.
 // ============================================================================
 
-mod pr {
+pub(crate) mod pr {
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -15271,7 +16083,7 @@ mod pr {
         MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
         PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Result as ScResult, Review,
         ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
-        RollupCheck, ScCapabilities, SourceControl, UserIdentity,
+        RollupCheck, RollupCheckKind, ScCapabilities, SourceControl, UserIdentity,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -15282,7 +16094,7 @@ mod pr {
     // Test stub: one independent bool per scripted scenario.
     #[expect(clippy::struct_excessive_bools)]
     #[derive(Default)]
-    struct StubForge {
+    pub(crate) struct StubForge {
         fail_threads: bool,
         /// When set, `get_review_threads` fails with `RateLimited` (the
         /// GraphQL quota is exhausted), exercising the checklist's
@@ -15380,6 +16192,20 @@ mod pr {
         /// Runs at the start of every `list_comments` (the last forge read
         /// of `pr_state`), so a test can move daemon state mid-snapshot.
         on_list_comments: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// When true, `check_auth` reports no working credential (a revoked
+        /// or missing token), exercising the invite-create live auth gate
+        /// (multiplayer w4).
+        unauthenticated: bool,
+    }
+
+    impl StubForge {
+        /// A forge whose `check_auth` reports `authenticated: false`.
+        pub(crate) fn unauthenticated() -> Self {
+            Self {
+                unauthenticated: true,
+                ..Default::default()
+            }
+        }
     }
 
     /// The blended multi-repo page a forge answers for a search whose
@@ -15436,6 +16262,13 @@ mod pr {
             })
         }
         async fn check_auth(&self) -> ScResult<AuthStatus> {
+            if self.unauthenticated {
+                return Ok(AuthStatus {
+                    authenticated: false,
+                    login: None,
+                    scopes: vec![],
+                });
+            }
             Ok(AuthStatus {
                 authenticated: true,
                 login: Some("octocat".into()),
@@ -15883,16 +16716,19 @@ mod pr {
                     name: "build".into(),
                     state: CheckState::Success,
                     url: None,
+                    started_at: None,
                 },
                 CheckRun {
                     name: "test".into(),
                     state: CheckState::Failure,
                     url: None,
+                    started_at: None,
                 },
                 CheckRun {
                     name: "lint".into(),
                     state: CheckState::Pending,
                     url: None,
+                    started_at: None,
                 },
             ])
         }
@@ -16000,21 +16836,27 @@ mod pr {
                 checks: vec![
                     RollupCheck {
                         name: "build".into(),
+                        kind: RollupCheckKind::CheckRun,
                         state: CheckState::Success,
                         is_required: true,
                         url: None,
+                        started_at: None,
                     },
                     RollupCheck {
                         name: "test".into(),
+                        kind: RollupCheckKind::CheckRun,
                         state: CheckState::Failure,
                         is_required: true,
                         url: None,
+                        started_at: None,
                     },
                     RollupCheck {
                         name: "flaky".into(),
+                        kind: RollupCheckKind::CheckRun,
                         state: CheckState::Failure,
                         is_required: false,
                         url: None,
+                        started_at: None,
                     },
                 ],
                 checks_known: true,
@@ -16147,7 +16989,7 @@ mod pr {
         (tmp, svc)
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_repos_list_projects_html_url_and_null_next_token() {
         let (_t, svc) = github_svc().await;
         let v = svc.github_repos_list(None, None).await.expect("list");
@@ -16161,7 +17003,7 @@ mod pr {
         assert!(repo.get("url").is_none());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_repos_search_shapes_like_list() {
         let (_t, svc) = github_svc().await;
         let v = svc
@@ -16172,7 +17014,7 @@ mod pr {
         assert_eq!(v["nextToken"], serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_repos_list_paginates_via_opaque_next_token() {
         // §5.5: the first page returns a non-null opaque `nextToken`; echoing it
         // back fetches the next (last) page, which ends with a null `nextToken`.
@@ -16202,7 +17044,7 @@ mod pr {
         assert_eq!(page2["nextToken"], serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_repos_get_returns_repo_or_null_when_missing() {
         let (_t, svc) = github_svc().await;
         let found = svc
@@ -16219,7 +17061,7 @@ mod pr {
         assert_eq!(missing["repo"], serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_branches_list_returns_names_and_null_next_token() {
         let (_t, svc) = github_svc().await;
         let v = svc
@@ -16230,7 +17072,7 @@ mod pr {
         assert_eq!(v["nextToken"], serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_branches_list_threads_prefix_and_drops_blank() {
         let (_t, svc) = github_svc().await;
         // A non-empty prefix reaches the engine and narrows the listing.
@@ -16260,7 +17102,7 @@ mod pr {
         assert_eq!(v["branches"], serde_json::json!(["main", "dev"]));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_repo_config_get_parses_remote_config() {
         let forge = StubForge {
             file_content: Some(r#"{ "branchPrefix": "feat/", "customKey": "kept" }"#.to_string()),
@@ -16277,7 +17119,7 @@ mod pr {
         assert_eq!(v["exists"], true);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_repo_config_get_missing_file_yields_null_config() {
         let (_t, svc) = github_svc().await;
         let v = svc
@@ -16288,7 +17130,7 @@ mod pr {
         assert_eq!(v["exists"], false);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_repo_config_get_invalid_json_yields_empty_config() {
         let forge = StubForge {
             file_content: Some("{ not json".to_string()),
@@ -16303,7 +17145,7 @@ mod pr {
         assert_eq!(v["exists"], true);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_repo_config_get_decode_error_folds_to_empty_config() {
         // A mis-shaped contents payload (directory / non-base64 / non-UTF-8)
         // is "present but invalid": tolerant fold, never an RPC error.
@@ -16320,7 +17162,7 @@ mod pr {
         assert_eq!(v["exists"], true);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_related_repos_list_normalizes_dedupes_and_excludes_parent() {
         // Every accepted URL form, a duplicate (different casing + form), the
         // parent itself, a non-GitHub host, and a relative URL — only the
@@ -16357,7 +17199,7 @@ mod pr {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_related_repos_list_caps_at_five() {
         let content = (0..7).fold(String::new(), |mut acc, i| {
             use std::fmt::Write as _;
@@ -16381,7 +17223,7 @@ mod pr {
         assert_eq!(repos[4]["path"], "libs/s4");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_related_repos_list_missing_file_yields_empty() {
         let (_t, svc) = github_svc().await;
         let v = svc
@@ -16391,7 +17233,7 @@ mod pr {
         assert_eq!(v, serde_json::json!({ "repos": [] }));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_related_repos_list_unparsable_or_decode_error_yields_empty() {
         let forge = StubForge {
             file_content: Some("not a gitmodules file\n= =\n".to_string()),
@@ -16418,7 +17260,7 @@ mod pr {
         assert_eq!(v, serde_json::json!({ "repos": [] }));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_get_user_drops_id_name_and_never_leaks_token() {
         let (_t, svc) = github_svc().await;
         let v = svc.github_get_user().await.expect("user");
@@ -16430,7 +17272,7 @@ mod pr {
         assert!(user.get("name").is_none());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_auth_status_reports_configured_with_valid_token() {
         let (_t, svc) = github_svc().await;
         let v = svc.github_auth_status().await.expect("auth");
@@ -16441,7 +17283,7 @@ mod pr {
         assert_eq!(v["deviceFlow"], serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_connect_against_unreachable_login_host_is_a_graceful_error() {
         // Port 0 is never a valid destination: the device-flow start must
         // deterministically fail with a domain error
@@ -16455,7 +17297,7 @@ mod pr {
         assert_eq!(v["deviceFlow"], serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_connect_returns_the_same_codes_while_a_flow_is_pending() {
         // Pre-populate a live pending slot: a second connect must return the
         // SAME codes without restarting the flow (no network touched — the
@@ -16482,7 +17324,7 @@ mod pr {
         assert_eq!(v["oauthUrl"], "https://github.com/login/device");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_cancel_auth_clears_the_pending_flow() {
         let (_t, svc) = github_svc().await;
         {
@@ -16507,7 +17349,7 @@ mod pr {
         assert_eq!(c["cancelled"], false);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_cancel_auth_preserves_a_terminal_flow_outcome() {
         // Only a PENDING flow is cancellable: cancel after a terminal
         // transition (denied here) must leave the slot intact so authStatus
@@ -16531,7 +17373,7 @@ mod pr {
         assert_eq!(v["deviceFlow"]["status"], "denied");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_revoke_deletes_the_stored_token_and_clears_the_flow() {
         let (_t, svc) = github_svc().await;
         let mem = Arc::new(crate::settings::InMemorySecretStore::default());
@@ -16566,7 +17408,7 @@ mod pr {
         assert_eq!(r["ok"], true);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn status_shape_is_parity_exact() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc.pr_status(ws).await.expect("status");
@@ -16580,7 +17422,7 @@ mod pr {
         assert_eq!(v["summary"], "✅ PR is mergeable with no conflicts.");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_active_pr_is_internal_error() {
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_status(ws).await.unwrap_err();
@@ -16589,7 +17431,7 @@ mod pr {
 
     // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
@@ -16626,7 +17468,7 @@ mod pr {
         assert_eq!(v["requirements"]["threads"]["unresolved"], 1);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_counts_via_rest_fallback() {
         // GraphQL threads unavailable: inline comments are counted from the
         // flat REST list (replies included); resolution is unavailable there,
@@ -16650,7 +17492,7 @@ mod pr {
         assert!(v["requirements"]["threads"].get("unresolved").is_none());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_dirty_pr_reports_blocked_reason() {
         let (_t, svc, ws) = setup_with(
             StubForge {
@@ -16666,7 +17508,7 @@ mod pr {
         assert_eq!(v["mergeBlockedReason"], "merge conflicts");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_merged_pr_has_no_blocked_reason() {
         let (_t, svc, ws) = setup_with(
             StubForge {
@@ -16686,7 +17528,7 @@ mod pr {
         assert_eq!(v["mergeBlockedReason"], serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_blocked_state_without_reviews_is_none_decision() {
         // Regression (intent-hq/monorepo#1524): REST `mergeable_state:
         // "blocked"` conflates required checks / merge queue / token access
@@ -16709,7 +17551,7 @@ mod pr {
         assert_eq!(v["reviews"]["changesRequested"], 0);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_provider_review_required_maps_directly() {
         // A protected base reporting `REVIEW_REQUIRED` yields
         // `review_required` even with a clean mergeable state — the decision
@@ -16728,7 +17570,7 @@ mod pr {
         assert_eq!(v["reviews"]["decision"], "review_required");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_decision_fetch_error_degrades_to_aggregate() {
         // A failed `reviewDecision` fetch never fails the snapshot: the
         // decision degrades to the aggregated actionable reviews (the stub's
@@ -16746,7 +17588,7 @@ mod pr {
         assert_eq!(v["reviews"]["approvals"], 1);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_missing_pr_is_clear_error() {
         let (_t, svc, ws) = setup_with(
             StubForge {
@@ -16760,7 +17602,7 @@ mod pr {
         assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_requires_workspace_repo() {
         // No repository on the workspace: same "No active PR" guard as the
         // other pr.* methods (the required prNumber does not bypass it).
@@ -16769,7 +17611,7 @@ mod pr {
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_cross_repo_arg_overrides_workspace_repo() {
         // Workspace has no repository at all: the explicit `repo` slug alone
         // scopes the lookup (no "No active PR" guard), and the resolved repo
@@ -16788,7 +17630,7 @@ mod pr {
     /// the awaited forge reads, so a pause opened while they were in flight
     /// is carried (RFC 3339, the gate's deadline) and a pause lifted while
     /// they were in flight is omitted — never a stale value either way.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_paused_until_reflects_the_gate_after_the_forge_reads() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, ws) = setup_with_shared(forge.clone(), true).await;
@@ -16829,7 +17671,7 @@ mod pr {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn state_snapshot_rejects_malformed_repo_arg() {
         let (_t, svc, ws) = setup(false, true).await;
         for bad in ["acme", "acme/", "/widgets", "a/b/c", " "] {
@@ -17191,7 +18033,7 @@ mod pr {
     // `pr:*` events flow through the existing refresh path only.
     // ------------------------------------------------------------------------
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pr_refresh_reports_linked_state_after_discovery() {
         // Unlinked ws; discovery links PR #42 → outcome "linked" plus the
         // post-refresh linkage fields.
@@ -17216,7 +18058,7 @@ mod pr {
         assert_eq!(evs.len(), 1);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pr_refresh_reports_unlinked_state_after_stale_link_cleared() {
         // Linked PR #42 but ws branch "main" differs from PR head "feature" →
         // the stale link is cleared and the RPC reports the cleared state.
@@ -17237,7 +18079,7 @@ mod pr {
         assert_eq!(evs.len(), 1);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pr_refresh_skips_ineligible_workspace_without_error() {
         // Remote workspace: outcome "skipped", no forge call, no event.
         let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "feature", Some(42), true).await;
@@ -17553,7 +18395,7 @@ mod pr {
         (tmp, work_dir, bare_dir, svc, ws_id, work)
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn execute_runs_commit_push_create_pr_pipeline() {
         let (_t, _w, bare, svc, ws, work) = ac_setup(StubForge::default()).await;
         // An unstaged change for the commit step to capture.
@@ -17634,7 +18476,7 @@ mod pr {
     /// display status collapses under the new path only, but attribution is
     /// per path and the old path's deletion must be attributable too so the
     /// next agent checkpoint lands it.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn undo_commit_restores_attribution_for_both_sides_of_a_rename() {
         let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
         let repo = git2::Repository::open(&work).unwrap();
@@ -17675,7 +18517,7 @@ mod pr {
         assert_eq!(new.agent_id.as_deref(), Some("agent-a"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn execute_create_pr_without_remote_fails_step() {
         // A workspace with no git repo at all → push/create-pr cannot proceed.
         let tmp = TempDb::new();
@@ -17696,7 +18538,7 @@ mod pr {
         assert_eq!(res["steps"][0]["status"], "failed");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn execute_rejects_unknown_action() {
         let (_t, _w, _b, svc, ws, _work) = ac_setup(StubForge::default()).await;
         let err = svc
@@ -17706,7 +18548,7 @@ mod pr {
         assert!(matches!(err, Error::InvalidParams(_)));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn prepare_lists_files_and_suggests_message() {
         let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
         std::fs::write(work.join("feature.txt"), "a\nb\n").unwrap();
@@ -17725,7 +18567,7 @@ mod pr {
         assert!(p["additions"].as_i64().unwrap() >= 2);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn add_remote_initializes_and_returns_status() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("store");
@@ -17756,7 +18598,7 @@ mod pr {
     // directly, so no workspace/PR linkage is needed (`setup_with(.., false)`).
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_pulls_create_preserves_head_verbatim_and_shapes_dto() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
         let v = svc
@@ -17781,7 +18623,7 @@ mod pr {
         assert_eq!(pull["user"]["login"], "octocat");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_pulls_get_list_search_shapes() {
         let (_t, svc, _ws) = setup_with(
             StubForge {
@@ -17851,7 +18693,7 @@ mod pr {
     /// `owner` / `repo` of ITS OWN hit (caller casing echoed for scoped
     /// repos), the blended page keeps the engine's updated-desc order, and
     /// the continuation cursor round-trips as `nextToken`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_pulls_search_multi_repo_attributes_each_hit() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
@@ -17923,7 +18765,7 @@ mod pr {
     /// ONE engine call carrying `IssueQuery.extra_repos`, each issue's
     /// `owner` / `repo` derived from its own hit (not echoed from the request
     /// params), updated-desc order preserved, cursor round-tripped.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_issues_search_multi_repo_attributes_each_hit() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
@@ -17974,7 +18816,7 @@ mod pr {
     /// `repos` absent/empty leaves both searches on the pre-existing path:
     /// the engine sees an empty `extra_repos`, the single-repo item shapes
     /// echo the request params.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_search_without_repos_is_unchanged() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
@@ -18013,7 +18855,7 @@ mod pr {
     /// The `repos` extras are capped so the whole search spans at most 6
     /// repositories: a seventh distinct repo is `-32602`, and the engine is
     /// never called.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_search_rejects_more_than_six_repos() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
@@ -18087,7 +18929,7 @@ mod pr {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_pulls_merge_and_update_branch() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
         let m = svc
@@ -18112,7 +18954,7 @@ mod pr {
         assert!(u["url"].is_null());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_issues_get_shape() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
         let g = svc
@@ -18133,7 +18975,7 @@ mod pr {
         assert_eq!(issue["comments"], 0);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_issues_list_and_search_shapes() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
         let l = svc
@@ -18192,7 +19034,7 @@ mod pr {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_review_comments_threads_and_resolution() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
         let c = svc
@@ -18738,7 +19580,7 @@ mod pr {
     /// status delta and emits exactly one
     /// `workspace:displayStatus-changed { displayStatus: "pr_merged" }`; an
     /// identical re-sweep persists nothing and emits nothing.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn root_refresh_merged_pr_emits_display_status_changed() {
         let primary = SweepRepo::init("main", None);
         let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
@@ -18798,7 +19640,7 @@ mod pr {
     /// rollup (`complete` → `pr_merged`) and unregistering the PR-bearing
     /// root lapses it back (`pr_merged` → `complete`); each transition emits
     /// exactly once.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_root_register_unregister_recompute_display_status() {
         let primary = SweepRepo::init("main", None);
         let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
@@ -19225,7 +20067,7 @@ mod pr {
     /// `activePullRequest`, and the pool entry to Merged, emits one
     /// `pr:updated` and one `displayStatus-changed` to `pr_merged`, keeps
     /// the link (no discovery/unlink), and an identical re-fetch is a no-op.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_folds_merged_status_into_linked_workspace() {
         let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
@@ -19297,7 +20139,7 @@ mod pr {
     /// holds #43 (Open) — the fetch upserts the pool entry to Merged, leaves
     /// the (absent) link alone, and emits `pr:updated` plus the transition
     /// to `pr_merged`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_folds_merged_status_into_pool_only_workspace() {
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
             ws.pull_requests = Some(vec![pool_entry(
@@ -19342,7 +20184,7 @@ mod pr {
     /// upserts the root's pool entry to Merged, persists via the scoped
     /// git-root PR write, and emits `gitRoot:updated` plus the owning
     /// workspace's transition to `pr_merged`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_folds_merged_status_into_git_root_pool_entry() {
         let (_t, _root, svc, ws_id) = fold_setup(|_| {}).await;
         let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
@@ -19392,7 +20234,7 @@ mod pr {
 
     /// A PR nobody references: the response is served as before and the
     /// fold writes nothing — no row touched, no event of any kind.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_for_unreferenced_pr_writes_nothing() {
         let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
@@ -19434,7 +20276,7 @@ mod pr {
     /// A store failure inside the fold (the scoped PR-linkage write aborted
     /// by an injected trigger) never fails the RPC: the hover card still gets
     /// its `{ pull }`, the persisted state is untouched, and no event fires.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_fold_persist_failure_never_fails_the_rpc() {
         let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
@@ -19473,7 +20315,7 @@ mod pr {
     /// A store failure in the fold's lookup itself (a referencing row whose
     /// persisted pool no longer decodes) surfaces as the fold's `Err` and is
     /// equally fail-soft at the RPC boundary.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_fold_lookup_failure_never_fails_the_rpc() {
         let (_t, _root, svc, ws_id) = fold_setup(|_| {}).await;
         sqlx::query("UPDATE workspace SET pull_requests = ? WHERE id = ?")
@@ -19503,7 +20345,7 @@ mod pr {
     /// the single fetched snapshot — never `[Merged, Open]` with the stale
     /// duplicate holding the rollup at `pr_ready` — and the collapsed pool
     /// is stable under an identical re-fetch.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_fold_collapses_duplicate_pool_entries() {
         let open = pool_entry(43, intent_core::PullRequestStatus::Open, "");
         let (_t, _root, svc, ws_id) = fold_setup(|ws| {
@@ -19540,7 +20382,7 @@ mod pr {
     /// the forge answers with its canonical `o/r` URL — the store lookups
     /// compare `COLLATE NOCASE`, the pool upsert replaces (not appends), and
     /// the persisted copies adopt the forge casing.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pulls_get_folds_case_variant_persisted_urls() {
         let mut open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
         open.url = "https://github.com/O/R/pull/42".into();
@@ -19928,7 +20770,7 @@ mod pr {
     /// A pr-kind contextLink on `workspace.create` links the workspace from
     /// birth: branch defaults to the PR head branch, `baseRef` to the PR base
     /// branch, and `pr_number`/`pr_url`/status/snapshot are seeded.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_pr_context_link_derives_branch_and_base_ref() {
         let (_t, _r, svc) = create_services(StubForge::default()).await;
         let created = svc
@@ -19961,7 +20803,7 @@ mod pr {
 
     /// Explicit `branch`/`baseRef` params win over PR-derived values; the PR
     /// linkage (number/url) still seeds from the link.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_pr_context_link_explicit_params_win() {
         let (_t, _r, svc) = create_services(StubForge::default()).await;
         let created = svc
@@ -19989,7 +20831,7 @@ mod pr {
 
     /// A failed forge lookup is non-fatal: the create succeeds without the
     /// PR-derived git setup, keeping the number/url linkage from the link.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_pr_context_link_forge_failure_is_non_fatal() {
         let (_t, _r, svc) = create_services(StubForge {
             missing_pr: Some(42),
@@ -20021,7 +20863,7 @@ mod pr {
 
     /// An issue-kind contextLink (no pr-kind entry) leaves the create
     /// unchanged: no forge lookup, no PR linkage.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_issue_context_link_stays_unlinked() {
         let (_t, _r, svc) = create_services(StubForge::default()).await;
         let created = svc
@@ -20050,7 +20892,7 @@ mod pr {
     /// A hung forge connection degrades like a lookup error instead of
     /// stalling the interactive create: the bounded `get_pr` times out, the
     /// create succeeds, and the linkage from the link itself survives.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_pr_context_link_hung_forge_times_out() {
         let (_t, _r, svc) = create_services(StubForge {
             hang_get_pr: Some(42),
@@ -20082,7 +20924,7 @@ mod pr {
     /// A pr-kind link whose owner/repo mismatch the workspace's known
     /// repository identity is ignored entirely: no forge lookup, no PR
     /// linkage, no derived branches.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_cross_repo_pr_context_link_is_ignored() {
         let (_t, _r, svc) = create_services(StubForge::default()).await;
         let created = svc
@@ -20109,7 +20951,7 @@ mod pr {
     /// from the link so the persisted PR linkage stays functional (the §7.6
     /// background refresh keys the forge repo off the row's owner/name) —
     /// including on the degraded forge-failure path.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_pr_context_link_seeds_repository_identity() {
         let (_t, _r, svc) = create_services(StubForge {
             missing_pr: Some(42),
@@ -20241,7 +21083,7 @@ mod file_tracking {
         (tmp, Services::new(store), ws)
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn get_changes_returns_tracked_changes_with_attribution() {
         let (_t, svc, ws) = ft_setup().await;
         svc.store()
@@ -20281,7 +21123,7 @@ mod file_tracking {
         assert!(b["attribution"].get("agent").is_none());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn get_changes_filters_by_stage_and_agent() {
         let (_t, svc, ws) = ft_setup().await;
         svc.store()
@@ -20314,7 +21156,7 @@ mod file_tracking {
         assert_eq!(arr[0]["relativePath"], serde_json::json!("a.ts"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn get_line_stats_sums_additions_and_deletions() {
         let (_t, svc, ws) = ft_setup().await;
         svc.store()
@@ -20330,7 +21172,7 @@ mod file_tracking {
         assert_eq!(stats["deletions"], serde_json::json!(4));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn get_changes_empty_for_unknown_workspace() {
         let (_t, svc, _ws) = ft_setup().await;
         let missing = WorkspaceId::new();
@@ -20339,7 +21181,7 @@ mod file_tracking {
         assert_eq!(result["changes"], serde_json::json!([]));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn stage_then_unstage_preserves_attribution() {
         let repo = init_git_repo();
         let tmp = TempDb::new();
@@ -20402,7 +21244,7 @@ mod file_tracking {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn stage_rejects_empty_paths() {
         let (_t, svc, ws) = ft_setup().await;
         let err = svc
@@ -20412,7 +21254,7 @@ mod file_tracking {
         assert!(format!("{err}").contains("No file paths provided"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn load_commits_returns_history_with_attribution() {
         let repo = init_git_repo();
         commit_file(
@@ -20448,7 +21290,7 @@ mod file_tracking {
     /// `git.stage` → `git.unstage` round-trip over the git.* RPC surface: a
     /// staged modification is reflected in the index, then dropped back to an
     /// unstaged modification, both calls echoing the validated path list.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_unstage_round_trips_a_staged_modification() {
         let repo = init_git_repo();
         let tmp = TempDb::new();
@@ -20480,7 +21322,7 @@ mod file_tracking {
 
     /// `git.unstage` is idempotent: unstaging an already-unstaged path is a
     /// no-op that returns the path list rather than erroring.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_unstage_is_idempotent_on_already_unstaged_paths() {
         let repo = init_git_repo();
         let tmp = TempDb::new();
@@ -20511,7 +21353,7 @@ mod file_tracking {
 
     /// `git.discard` over the git.* RPC surface: an unstaged worktree change
     /// is restored from the index, echoing the validated path list.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_discard_reverts_an_unstaged_modification() {
         let repo = init_git_repo();
         let tmp = TempDb::new();
@@ -20537,7 +21379,7 @@ mod file_tracking {
 
     /// `git.discard` on an untracked file deletes it from disk (mirrors the
     /// reference's `fs.unlink` after `git ls-files --error-unmatch` fails).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_discard_deletes_an_untracked_file() {
         let repo = init_git_repo();
         let tmp = TempDb::new();
@@ -20561,7 +21403,7 @@ mod file_tracking {
 
     /// `git.discard` is idempotent: discarding a clean tracked path or a
     /// missing untracked path returns the list rather than erroring.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_discard_is_idempotent() {
         let repo = init_git_repo();
         let tmp = TempDb::new();
@@ -20592,7 +21434,7 @@ mod file_tracking {
     /// only inspected the top-level string, letting `["*"]` / `["--all"]`
     /// fall through to a silent no-op and `["."]` to the worktree-escape
     /// guard's `-32602`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_discard_refuses_discard_all_in_every_shape() {
         let repo = init_git_repo();
         let tmp = TempDb::new();
@@ -20648,7 +21490,7 @@ mod file_tracking {
     /// (monorepo#939): another agent's and unattributed worktree changes stay
     /// uncommitted, and the committed paths' attribution rows move to
     /// `committed` (the `ac_commit` mirror).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_no_files_commits_only_attributed_paths() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -20705,7 +21547,7 @@ mod file_tracking {
     /// attribution-filtered commit — the commit tree is built from exactly
     /// the attributed paths (`git commit -- <paths>` semantics), and the
     /// pre-staged entry survives in the index afterwards.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_does_not_sweep_prestaged_unattributed_paths() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -20754,7 +21596,7 @@ mod file_tracking {
     /// surfacing the "No uncommitted changes found for this agent" error the
     /// auto-commit subscriber treats as a silent skip. The unattributed dirty
     /// file is not swept either.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_stale_attribution_commits_nothing() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -20807,7 +21649,7 @@ mod file_tracking {
 
     /// An explicit `files` list is committed as-is — attribution is not
     /// consulted (unchanged behavior).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_explicit_files_bypasses_attribution() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -20837,7 +21679,7 @@ mod file_tracking {
     /// only attributed change the call degenerates to the benign "no
     /// uncommitted changes" skip (auto-commit treats this as silent). The
     /// parent's gitlink entry for the submodule survives unchanged.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_drops_submodule_internal_attributed_path() {
         let repo = init_git_repo();
         let child = init_git_repo();
@@ -20885,7 +21727,7 @@ mod file_tracking {
     /// strictly inside a registered submodule fails with a clear error naming
     /// the offending path and its containing submodule, advising the caller
     /// to commit from within the submodule repo instead — no commit lands.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_explicit_files_rejects_submodule_internal_path() {
         let repo = init_git_repo();
         let child = init_git_repo();
@@ -20947,7 +21789,7 @@ mod file_tracking {
     /// tools feed the same attribution pipeline as ACP `fs/write_text_file`
     /// (monorepo#939), so the attribution-filtered `git.agentCommit` fallback
     /// sees the edit.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_write_with_agent_context_records_attribution() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -20989,7 +21831,7 @@ mod file_tracking {
 
     /// A `file.write` without an agent caller context (FE/user write) records
     /// no attribution row.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_write_without_agent_context_records_no_attribution() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -21013,7 +21855,7 @@ mod file_tracking {
 
     /// An agent-context `file.delete` records a `deleted` attribution row for
     /// the caller (monorepo#939); a no-agent-context delete records none.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_delete_agent_context_attribution() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -21049,7 +21891,7 @@ mod file_tracking {
     /// new path `added` — attributed to the caller (monorepo#939), and the
     /// attribution-filtered fallback commits the rename. A no-agent-context
     /// rename records none.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_rename_agent_context_attribution() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -21100,7 +21942,7 @@ mod file_tracking {
     }
 
     /// A `file.rename` without an agent caller context records no attribution.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_rename_without_agent_context_records_no_attribution() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -21171,7 +22013,7 @@ mod file_tracking {
     /// includes x.txt (A's attribution row survives B's touch), and the
     /// commit — which captures the file's full working-tree content, i.e.
     /// both agents' edits — advances BOTH agents' rows to `committed`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_shared_path_includes_first_agents_edit() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -21214,7 +22056,7 @@ mod file_tracking {
     /// B's fallback commit does NOT spuriously re-commit it (B's satisfied row
     /// was advanced with A's), but a fresh edit by B re-attributes the path
     /// and B's next fallback commit includes it.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_shared_path_cleared_rows_not_recommitted() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -21283,7 +22125,7 @@ mod file_tracking {
     /// `file.rename` of a DIRECTORY records per-file attribution rows for
     /// every moved path (old side `deleted`, new side `added`), so the
     /// attribution-filtered fallback commit includes the whole move.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_rename_directory_records_attribution_for_all_moved_files() {
         let repo = init_git_repo();
         let (_t, svc, ws) = svc_with_repo(&repo).await;
@@ -21378,7 +22220,7 @@ mod file_tracking {
     /// trailers), leaves the primary worktree untouched, and the emitted
     /// `git:commit` / `changes:git-status` events carry the additive
     /// `gitRootId` (with status read from the target root).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_targets_registered_root_with_explicit_files() {
         let repo = init_git_repo();
         let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
@@ -21433,7 +22275,7 @@ mod file_tracking {
     /// A `userRequested` `git.agentCommit` with a `gitRootId` and no `files`
     /// commits the target root's staged index as-is (plain `git commit`
     /// semantics against the secondary root).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_root_user_requested_commits_staged_index() {
         let repo = init_git_repo();
         let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
@@ -21467,7 +22309,7 @@ mod file_tracking {
     /// `gitRootId` but no explicit `files` is refused: the attribution
     /// pipeline only observes the primary worktree, so a secondary-root
     /// commit set cannot be attribution-filtered.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_root_without_files_is_rejected() {
         let repo = init_git_repo();
         let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
@@ -21501,7 +22343,7 @@ mod file_tracking {
     /// fails with the identical `Unknown git root: {id}` `InvalidParams`
     /// (`resolve_git_read_root` parity; a foreign root is indistinguishable
     /// from a nonexistent one).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_rejects_unknown_and_foreign_root_ids() {
         let repo = init_git_repo();
         let (_t, svc, ws, _secondary, _root_id) = svc_with_registered_root(&repo).await;
@@ -21582,7 +22424,7 @@ mod file_tracking {
     /// disabled and `userRequested: false`, an unknown `gitRootId` still
     /// fails with the documented `Unknown git root: {id}` `InvalidParams`
     /// (`-32602`) rather than the auto-commit `-32603` rejection.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_unknown_root_precedes_auto_commit_gate() {
         let repo = init_git_repo();
         let (_t, svc, ws, _secondary, _root_id) = svc_with_registered_root(&repo).await;
@@ -21617,7 +22459,7 @@ mod file_tracking {
     /// explicit `files` match nothing, where the paths exist under a
     /// registered secondary root, errors with the root's path/id and suggests
     /// passing `gitRootId`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_primary_miss_hints_at_registered_root() {
         let repo = init_git_repo();
         let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
@@ -21656,7 +22498,7 @@ mod file_tracking {
     /// discards the base, so an absolute path existing anywhere used to
     /// "match" every registered root. An absolute path OUTSIDE the root must
     /// suppress the hint; one INSIDE the root still triggers it.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_primary_miss_hint_handles_absolute_paths() {
         let repo = init_git_repo();
         let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&repo).await;
@@ -21713,7 +22555,7 @@ mod file_tracking {
     /// Primary-path regression: with `git_root_id: None` an explicit-files
     /// miss that matches NO registered root keeps the bare pathspec error —
     /// no hint is appended.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_commit_primary_miss_without_matching_root_keeps_bare_error() {
         let repo = init_git_repo();
         let (_t, svc, ws, _secondary, _root_id) = svc_with_registered_root(&repo).await;
@@ -21740,7 +22582,7 @@ mod file_tracking {
     /// token; attribution trailers populate `agentId`/`linkedNoteId`. The
     /// list payload is metadata-only — `files` is omitted (fetched on demand
     /// via `git.commitDetails`).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_commits_returns_commit_summary_page() {
         let repo = init_git_repo();
         commit_file(
@@ -21785,7 +22627,7 @@ mod file_tracking {
 
     /// `git.changes` returns the working-tree `FileStatus[]` (`path`/`status`/
     /// `staged`), including untracked files.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_changes_returns_working_tree_files() {
         let repo = init_git_repo();
         std::fs::write(repo.dir.join("seed.txt"), "seed\nmore\n").unwrap();
@@ -21804,7 +22646,7 @@ mod file_tracking {
     /// `git.diffs` (unstaged) returns `[{ path, hunks }]` with the FE hunk shape
     /// (`oldStart`/`oldLines`/`newStart`/`newLines`/`lines`) and `DiffLine`s
     /// tagged `Context`/`Addition`/`Deletion` with 1-based line numbers.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_unstaged_returns_path_and_hunks() {
         let repo = init_git_repo();
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
@@ -21829,7 +22671,7 @@ mod file_tracking {
 
     /// `git.diffs` (staged) hydrates hunks from blob SHAs and honors the `path`
     /// filter, returning only the requested file.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_staged_filters_to_path() {
         let repo = init_git_repo();
         std::fs::write(repo.dir.join("seed.txt"), "seed\nstaged change\n").unwrap();
@@ -21856,7 +22698,7 @@ mod file_tracking {
     /// `git.diffs` (staged) on a submodule pin bump synthesizes the
     /// `Subproject commit <sha>` pseudo-hunk instead of failing to hydrate the
     /// pin SHAs as blobs (monorepo#1739).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_staged_gitlink_synthesizes_subproject_hunk() {
         let repo = init_git_repo();
         let child = init_git_repo();
@@ -21911,7 +22753,7 @@ mod file_tracking {
     /// the result. The probe parks the leader's walk on the blocking pool
     /// until the second call has provably joined as a follower, so the
     /// overlap is deterministic.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_concurrent_identical_calls_coalesce_into_one_walk() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -21933,7 +22775,7 @@ mod file_tracking {
             })
         });
 
-        let first = tokio::spawn({
+        let first = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_diffs(ws, None, false, None, None).await }
@@ -21944,7 +22786,7 @@ mod file_tracking {
         })
         .await;
 
-        let second = tokio::spawn({
+        let second = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_diffs(ws, None, false, None, None).await }
@@ -21972,7 +22814,7 @@ mod file_tracking {
 
     /// Concurrent `git.diffs` calls with different identities (here: `staged`)
     /// never coalesce — each runs its own walk.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_concurrent_distinct_calls_run_their_own_walks() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -21994,13 +22836,13 @@ mod file_tracking {
             })
         });
 
-        let unstaged = tokio::spawn({
+        let unstaged = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         wait_until("first walk", || walks.load(Ordering::SeqCst) == 1).await;
-        let staged = tokio::spawn({
+        let staged = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_diffs(ws, None, true, None, None).await }
@@ -22023,7 +22865,7 @@ mod file_tracking {
     /// that result. The probe parks the leader's scan on the blocking pool
     /// until the followers have provably joined, so the overlap is
     /// deterministic.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_status_concurrent_calls_coalesce_into_one_scan() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22045,7 +22887,7 @@ mod file_tracking {
             })
         });
 
-        let leader = tokio::spawn({
+        let leader = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22060,7 +22902,7 @@ mod file_tracking {
             .map(|_| {
                 let svc = svc.clone();
                 let ws = ws_id.clone();
-                tokio::spawn(async move { svc.git_status(ws, None).await })
+                intent_core::spawn_daemon(async move { svc.git_status(ws, None).await })
             })
             .collect();
         wait_until("followers to join the in-flight scan", || {
@@ -22084,7 +22926,7 @@ mod file_tracking {
     /// concurrent `git.status` for the same worktree (monorepo#1648): its
     /// extra history/remote work still runs per call, but the common scan
     /// happens once.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn accept_changes_get_status_shares_the_scan_with_git_status() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22106,7 +22948,7 @@ mod file_tracking {
             })
         });
 
-        let status = tokio::spawn({
+        let status = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22116,7 +22958,7 @@ mod file_tracking {
         })
         .await;
 
-        let accept = tokio::spawn({
+        let accept = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.accept_changes_get_status(ws).await }
@@ -22142,7 +22984,7 @@ mod file_tracking {
     /// parked, three more calls join and must register as followers of the
     /// *ac-status* flight (not merely as independent followers of the scan), so
     /// each of them skips the scan entirely and shares the leader's full result.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn accept_changes_get_status_concurrent_calls_coalesce_into_one_build() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22164,7 +23006,7 @@ mod file_tracking {
             })
         });
 
-        let leader = tokio::spawn({
+        let leader = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.accept_changes_get_status(ws).await }
@@ -22178,7 +23020,7 @@ mod file_tracking {
             .map(|_| {
                 let svc = svc.clone();
                 let ws = ws_id.clone();
-                tokio::spawn(async move { svc.accept_changes_get_status(ws).await })
+                intent_core::spawn_daemon(async move { svc.accept_changes_get_status(ws).await })
             })
             .collect();
         wait_until("followers to join the in-flight ac-status build", || {
@@ -22201,7 +23043,7 @@ mod file_tracking {
 
     /// Concurrent status scans for *different* worktrees never coalesce — they
     /// must not serialize against each other.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_status_distinct_worktrees_run_their_own_scans() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22227,12 +23069,12 @@ mod file_tracking {
             })
         });
 
-        let first = tokio::spawn({
+        let first = intent_core::spawn_daemon({
             let svc = svc.clone();
             async move { svc.git_status(ws_a, None).await }
         });
         wait_until("first scan", || scans.load(Ordering::SeqCst) == 1).await;
-        let second = tokio::spawn({
+        let second = intent_core::spawn_daemon({
             let svc = svc.clone();
             async move { svc.git_status(ws_b, None).await }
         });
@@ -22250,7 +23092,7 @@ mod file_tracking {
 
     /// A failed scan is never cached: after the flight settles, the next call
     /// runs a fresh scan.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_status_failed_scan_is_not_cached() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22277,7 +23119,7 @@ mod file_tracking {
     /// `git.changes` runs the same working-tree scan, so it shares the flight
     /// with a concurrent `git.status` for the same worktree (monorepo#1648)
     /// while still projecting only the file list.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_changes_shares_the_scan_with_git_status() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22299,7 +23141,7 @@ mod file_tracking {
             })
         });
 
-        let status = tokio::spawn({
+        let status = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22308,7 +23150,7 @@ mod file_tracking {
             scans.load(Ordering::SeqCst) == 1
         })
         .await;
-        let changes = tokio::spawn({
+        let changes = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_changes(ws, None).await }
@@ -22334,7 +23176,7 @@ mod file_tracking {
     /// A leader that vanishes before publishing (cancelled RPC) wakes its
     /// followers to elect a new leader rather than hanging them — the
     /// service-level counterpart of the module's dropped-leader test.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_status_aborted_leader_lets_a_follower_retry() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22356,7 +23198,7 @@ mod file_tracking {
             })
         });
 
-        let leader = tokio::spawn({
+        let leader = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22365,7 +23207,7 @@ mod file_tracking {
             scans.load(Ordering::SeqCst) == 1
         })
         .await;
-        let follower = tokio::spawn({
+        let follower = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22394,7 +23236,7 @@ mod file_tracking {
     /// A coalesced follower surfaces the *same* error as the leader: the shared
     /// failure travels as the inner message, so the follower's re-wrap does not
     /// produce a doubled `internal error:` prefix.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_status_failed_scan_reports_the_same_error_to_followers() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22416,7 +23258,7 @@ mod file_tracking {
             })
         });
 
-        let leader = tokio::spawn({
+        let leader = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22425,7 +23267,7 @@ mod file_tracking {
             scans.load(Ordering::SeqCst) == 1
         })
         .await;
-        let follower = tokio::spawn({
+        let follower = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22450,7 +23292,7 @@ mod file_tracking {
     /// Regression (monorepo#1648, ladder rung 2): steady-state sequential
     /// reads cost no working-tree scan at all — the first read scans, the
     /// rest serve the cached status.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_status_repeat_reads_serve_the_cached_scan() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22486,7 +23328,7 @@ mod file_tracking {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_status_force_refresh_bypasses_cached_scan() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22525,7 +23367,7 @@ mod file_tracking {
         assert!(fresh.files.iter().any(|file| file.path == "seed.txt"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
     async fn git_status_force_refresh_waits_for_published_old_flight_to_retire() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22567,7 +23409,7 @@ mod file_tracking {
                 })
             });
 
-        let old = tokio::spawn({
+        let old = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws_id = ws_id.clone();
             async move { svc.git_status(ws_id, None).await }
@@ -22577,7 +23419,7 @@ mod file_tracking {
         })
         .await;
 
-        let forced = tokio::spawn({
+        let forced = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws_id = ws_id.clone();
             async move { svc.git_status_with_options(ws_id, None, true).await }
@@ -22614,7 +23456,7 @@ mod file_tracking {
 
     /// A daemon-owned git mutation invalidates the cache inline, so the next
     /// read reflects it rather than serving the pre-mutation snapshot.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_mutation_invalidates_the_cached_status() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22658,7 +23500,7 @@ mod file_tracking {
     /// runtime clock (intent-hq/intent#4880): with a millisecond TTL measured
     /// against the wall clock, a scheduling stall between the two "inside the
     /// TTL" reads expired the entry early under package load.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_status_cache_expires_after_its_ttl() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22717,7 +23559,7 @@ mod file_tracking {
     /// Invalidation landing *during* a scan wins: that scan cannot be trusted
     /// to describe the post-change tree, so its result must not be cached —
     /// the next read rescans instead of serving it.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn invalidation_during_a_scan_is_not_overwritten_by_it() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22738,7 +23580,7 @@ mod file_tracking {
             })
         });
 
-        let leader = tokio::spawn({
+        let leader = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22769,7 +23611,7 @@ mod file_tracking {
     /// A reader that joins an in-flight scan *after* an invalidation must not
     /// publish that scan's (pre-change) result: only the leader caches, and
     /// only against the generation it snapshotted when it was elected.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn follower_joining_after_invalidation_does_not_cache_the_leaders_scan() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -22790,7 +23632,7 @@ mod file_tracking {
             })
         });
 
-        let leader = tokio::spawn({
+        let leader = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22805,7 +23647,7 @@ mod file_tracking {
 
         // Joins after the invalidation, so its generation is the new one — but
         // the result it receives is the leader's pre-change scan.
-        let follower = tokio::spawn({
+        let follower = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_status(ws, None).await }
@@ -22833,7 +23675,7 @@ mod file_tracking {
 
     /// The git reads degrade to empty results for a workspace with no worktree
     /// (mirrors the `git.status` empty fallbacks).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_reads_empty_for_non_repo_workspace() {
         let (_t, svc, ws) = ft_setup().await;
         assert_eq!(
@@ -22862,7 +23704,7 @@ mod file_tracking {
 
     /// `git.commitDetails` returns the commit's metadata + per-file additions/
     /// deletions for a real repo (PROTOCOL §5.6).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_commit_details_returns_metadata_and_file_stats() {
         let repo = init_git_repo();
         // Land a second commit so HEAD has a non-empty parent diff.
@@ -22917,7 +23759,7 @@ mod file_tracking {
 
     /// An unresolvable `commitHash` degrades to the empty envelope (graceful)
     /// rather than surfacing as a `-32603` so the FE can render an empty state.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_commit_details_unknown_hash_is_empty_envelope() {
         let repo = init_git_repo();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
@@ -22962,7 +23804,7 @@ mod file_tracking {
     /// `gitRoot.list` returns every registered root for the workspace with a
     /// live-read `branch` grafted on, and an empty list when none are
     /// registered (monorepo#2053).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_root_list_returns_registered_roots_with_branch() {
         let primary = init_git_repo();
         let secondary = init_git_repo();
@@ -23011,7 +23853,7 @@ mod file_tracking {
     }
 
     /// `gitRoot.list` on an unknown workspace is `NotFound` (router → -32602).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_root_list_unknown_workspace_is_not_found() {
         let repo = init_git_repo();
         let (_t, svc, _ws) = svc_with_repo(&repo).await;
@@ -23021,7 +23863,7 @@ mod file_tracking {
 
     /// A `gitRootId` on the workspace-scoped reads targets the registered
     /// root's path instead of the workspace worktree (monorepo#2053).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_reads_scoped_to_registered_root() {
         let primary = init_git_repo();
         let secondary = init_git_repo();
@@ -23135,7 +23977,7 @@ mod file_tracking {
 
     /// An unknown `gitRootId` — or one registered to a different workspace —
     /// is `InvalidParams` (-32602), not an empty fallback (monorepo#2053).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_reads_unknown_or_foreign_git_root_id_is_invalid_params() {
         let repo = init_git_repo();
         let other_repo = init_git_repo();
@@ -23179,7 +24021,7 @@ mod file_tracking {
     /// the remote early-return: an unknown id is `InvalidParams` (-32602),
     /// while a valid id degrades to the same empty result the primary gets
     /// (monorepo#2053 review).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_reads_remote_workspace_still_validates_git_root_id() {
         let repo = init_git_repo();
         let secondary = init_git_repo();
@@ -23298,7 +24140,7 @@ mod file_tracking {
     /// and the returned wire row carries the live-read `branch`.
     /// Re-registration is idempotent and appends the new caller
     /// (monorepo#2053).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_root_register_registers_secondary_root() {
         let primary = init_git_repo();
         let secondary = init_git_repo();
@@ -23368,7 +24210,7 @@ mod file_tracking {
     /// worktree — not the daemon's cwd — so an agent whose cwd is the
     /// worktree can register `vendor/lib` directly; the same relative
     /// spelling unregisters it (monorepo#2053).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_root_register_resolves_relative_path_against_worktree() {
         let primary = init_git_repo();
         let (_t, svc, ws_id) = svc_with_repo(&primary).await;
@@ -23409,7 +24251,7 @@ mod file_tracking {
     /// `ws.git.registerRoot` validation: a missing path, a non-repo
     /// directory, and the workspace's own primary root are all
     /// `InvalidParams`; an unknown workspace is `NotFound` (monorepo#2053).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_root_register_rejects_invalid_paths() {
         let primary = init_git_repo();
         let (_t, svc, ws_id) = svc_with_repo(&primary).await;
@@ -23469,7 +24311,7 @@ mod file_tracking {
     /// (canonicalized, so the registering spelling resolves) and returns
     /// `{ ok, gitRootId, path }`; an unregistered path is `NotFound`
     /// (monorepo#2053).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_root_unregister_removes_by_path() {
         let primary = init_git_repo();
         let secondary = init_git_repo();
@@ -23503,7 +24345,7 @@ mod file_tracking {
 
     /// `git.diffs` with `commitHash` returns the commit's per-file hunks vs
     /// its first parent (PROTOCOL §5.6 extension).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_with_commit_hash_returns_per_file_hunks() {
         let repo = init_git_repo();
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
@@ -23621,7 +24463,7 @@ mod file_tracking {
     /// emits exactly the wire payload the two-pass implementation produced
     /// (same entries, same order, same hunk/line fields) on a worktree with
     /// staged + unstaged + untracked + binary files.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_unstaged_matches_two_pass_reference() {
         let repo = seed_mixed_worktree();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
@@ -23662,7 +24504,7 @@ mod file_tracking {
 
     /// `git.diffs` (unstaged) with `path` narrows to the requested file and
     /// its entry equals the corresponding one from the unfiltered payload.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_unstaged_path_filter_returns_only_requested_file() {
         let repo = seed_mixed_worktree();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
@@ -23690,7 +24532,7 @@ mod file_tracking {
     /// `git.diffs` (unstaged) with a multi-entry `paths` set returns exactly
     /// the requested files that have pending changes (others excluded), each
     /// entry byte-identical to the full-tree payload's.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_unstaged_paths_narrows_to_subset() {
         let repo = seed_mixed_worktree();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
@@ -23726,7 +24568,7 @@ mod file_tracking {
 
     /// `git.diffs` (unstaged) with an empty `paths` vec behaves like `None`
     /// (full tree), and a `paths` entry with no pending change yields no entry.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_unstaged_empty_paths_is_full_tree() {
         let repo = seed_mixed_worktree();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
@@ -23756,7 +24598,7 @@ mod file_tracking {
 
     /// `git.diffs` (staged) with a multi-entry `paths` set filters the
     /// HEAD→index walk to exactly the requested files.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_staged_paths_filters_to_subset() {
         let repo = init_git_repo();
         std::fs::write(repo.dir.join("seed.txt"), "seed\nstaged change\n").unwrap();
@@ -23792,7 +24634,7 @@ mod file_tracking {
     /// Regression (monorepo#1078): `git.diffs` (unstaged) treats `paths`
     /// entries as literal paths, not globs — requesting `a[1].txt` returns
     /// exactly that file and never the sibling `a1.txt` the glob would match.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_unstaged_paths_are_literal_not_globs() {
         let repo = init_git_repo();
         std::fs::write(repo.dir.join("a[1].txt"), "meta\nchange\n").unwrap();
@@ -23812,7 +24654,7 @@ mod file_tracking {
     /// Regression (monorepo#1078): the staged (HEAD→index) walk applies the
     /// same strict path equality — `a[1].txt` in `paths` never matches the
     /// staged sibling `a1.txt`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_staged_paths_are_literal_not_globs() {
         let repo = init_git_repo();
         std::fs::write(repo.dir.join("a[1].txt"), "meta\nchange\n").unwrap();
@@ -23840,7 +24682,7 @@ mod file_tracking {
     /// normalized to its worktree-relative form, so it narrows exactly like
     /// the relative request (unstaged and staged) and the wire result keeps
     /// worktree-relative `path` values.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_absolute_paths_under_worktree_narrow_like_relative() {
         let repo = seed_mixed_worktree();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
@@ -23887,7 +24729,7 @@ mod file_tracking {
 
     /// An absolute `paths` entry outside the worktree root passes through
     /// verbatim and matches nothing, exactly as before the normalization.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_absolute_path_outside_worktree_matches_nothing() {
         let repo = seed_mixed_worktree();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
@@ -23908,7 +24750,7 @@ mod file_tracking {
     /// Normalization happens BEFORE the single-flight key is computed:
     /// concurrent `git.diffs` calls naming the same file in relative and
     /// absolute form coalesce onto one walk.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_absolute_and_relative_requests_coalesce() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -23930,7 +24772,7 @@ mod file_tracking {
             })
         });
 
-        let first = tokio::spawn({
+        let first = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move {
@@ -23944,7 +24786,7 @@ mod file_tracking {
         .await;
 
         let abs = repo.dir.join("seed.txt").to_string_lossy().into_owned();
-        let second = tokio::spawn({
+        let second = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move { svc.git_diffs(ws, Some(vec![abs]), false, None, None).await }
@@ -23974,7 +24816,7 @@ mod file_tracking {
     /// The single-flight identity is order-insensitive and duplicate-free:
     /// concurrent `git.diffs` calls naming the same path set in a different
     /// order (one with a duplicate entry) coalesce onto one walk.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn git_diffs_reordered_and_duplicated_paths_coalesce() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -23996,7 +24838,7 @@ mod file_tracking {
             })
         });
 
-        let first = tokio::spawn({
+        let first = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move {
@@ -24015,7 +24857,7 @@ mod file_tracking {
         })
         .await;
 
-        let second = tokio::spawn({
+        let second = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move {
@@ -24209,7 +25051,7 @@ mod metrics {
         }
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn recompute_aggregates_by_workspace_and_agent() {
         let (_t, svc, ws) = setup().await;
         let store = svc.store();
@@ -24251,7 +25093,7 @@ mod metrics {
     /// the file's **full** diff counters, so the workspace totals count a
     /// `(path, stage)` once (max per counter across its rows), not once per
     /// agent. The per-agent breakdown still reflects each agent's own rows.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn recompute_counts_shared_path_once_in_workspace_totals() {
         let (_t, svc, ws) = setup().await;
         let store = svc.store();
@@ -24290,7 +25132,7 @@ mod metrics {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_stats_null_when_unknown() {
         let (_t, svc, _ws) = setup().await;
         let missing = WorkspaceId::new();
@@ -24298,7 +25140,7 @@ mod metrics {
         assert_eq!(m, serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_stats_sum_across_workspaces_and_clear() {
         let (_t, svc, ws1) = setup().await;
         let store = svc.store();
@@ -24343,7 +25185,7 @@ mod metrics {
         assert_eq!(after, serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn recompute_drops_metrics_when_no_changes() {
         let (_t, svc, ws) = setup().await;
         let store = svc.store();
@@ -24610,7 +25452,7 @@ mod usage_stats_recording {
     /// agent's normalized model, keeps accruing across recordings, and is
     /// untouched by clearing the workspace/agent metrics aggregates
     /// (`metrics.clearAgentStats` independence).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn lines_changed_accrue_by_model_and_survive_metrics_clear() {
         let (_t, svc, ws) = setup().await;
         let store = svc.store();
@@ -24698,7 +25540,7 @@ mod search {
         (tmp, Services::new(store), ws_id)
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn in_files_echoes_request_id_and_returns_matches() {
         let tree = worktree();
         let (_tmp, svc, ws) = services_with_worktree(tree.path()).await;
@@ -24711,7 +25553,7 @@ mod search {
         assert_eq!(r["matches"].as_array().unwrap().len(), 2);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn in_files_mints_request_id_when_absent() {
         let tree = worktree();
         let (_tmp, svc, ws) = services_with_worktree(tree.path()).await;
@@ -24722,7 +25564,7 @@ mod search {
         assert!(r["requestId"].as_str().unwrap().starts_with("srch-"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_names_glob_returns_relative_paths() {
         let tree = worktree();
         let (_tmp, svc, ws) = services_with_worktree(tree.path()).await;
@@ -24736,7 +25578,7 @@ mod search {
         assert_eq!(files[0], "src/main.rs");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_worktree_path_returns_empty() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
@@ -24751,7 +25593,7 @@ mod search {
         assert_eq!(r["truncated"], false);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn cancel_unknown_is_noop_success() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
@@ -24834,6 +25676,7 @@ mod search_adapters {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -24845,7 +25688,7 @@ mod search_adapters {
         id
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn messages_search_matches_and_previews() {
         let (_tmp, store, ws) = store_with_ws().await;
         insert_session(
@@ -24882,7 +25725,7 @@ mod search_adapters {
         assert!(matches[0]["preview"].as_str().unwrap().contains("needle"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn messages_search_filters_by_role() {
         let (_tmp, store, ws) = store_with_ws().await;
         insert_session(
@@ -24912,7 +25755,7 @@ mod search_adapters {
         assert_eq!(matches.len(), 1);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn events_search_matches_data() {
         let (_tmp, store, ws) = store_with_ws().await;
         let ev = store
@@ -24942,7 +25785,7 @@ mod search_adapters {
         assert_eq!(matches[0]["eventId"], ev.id);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn notes_search_is_global_across_workspaces() {
         let (_tmp, store, ws1) = store_with_ws().await;
         let ws2 = WorkspaceId::new();
@@ -24998,7 +25841,7 @@ mod search_adapters {
     /// (a) When the context engine is available it backs `search.codebase`: the
     /// returned matches are the engine's hits (carrying their `score`), not the
     /// ripgrep/symbol output (§5.15, §8).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn codebase_search_uses_context_engine_when_available() {
         let dir = crate::tests::test_tempdir("intentd-search-eng-");
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -25045,7 +25888,7 @@ mod search_adapters {
     /// (b) When the engine is `Unavailable`, `search.codebase` degrades to the
     /// ripgrep/symbol path without erroring (§8.3). An injected `Unavailable`
     /// engine makes this deterministic regardless of the host PATH.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn codebase_search_returns_symbol_matches() {
         let dir = crate::tests::test_tempdir("intentd-search-cb-");
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -25084,7 +25927,7 @@ mod search_adapters {
     /// (M10 CE-3): auggie exposes no structured codebase-retrieval CLI, so its
     /// `retrieve()` is always `Unavailable` even while `availability()` is
     /// `Available` for `intentd doctor` (§8.3).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn codebase_search_degrades_when_available_engine_cannot_retrieve() {
         let dir = crate::tests::test_tempdir("intentd-search-deg-");
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -25159,7 +26002,7 @@ mod search_adapters {
         serde_json::to_value(&batch[0]).expect("serialize")
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn streaming_emits_result_batches_and_done() {
         let h = stream_harness().await;
         // 60 matching messages → above the inline threshold → streamed.
@@ -25204,7 +26047,7 @@ mod search_adapters {
         assert_eq!(streamed, 60);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn cancel_mid_stream_stops_further_batches() {
         let h = stream_harness().await;
         let msgs: Vec<(&str, Value)> = (0..60)
@@ -25337,7 +26180,7 @@ mod terminal {
 
     /// create → write echoes back as `terminal:data`; two subscribers see the
     /// same output; kill emits `terminal:exit`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_streams_data_to_all_subscribers_then_exit() {
         let h = harness().await;
         let mut a = subscribe(&h);
@@ -25372,7 +26215,7 @@ mod terminal {
 
     /// `terminal.getBuffer` back-fills scrollback for a late attach (the echoed
     /// input survives in the server-side buffer), then `terminal.list` reports it.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn get_buffer_backfills_and_list_reports() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -25430,7 +26273,7 @@ mod terminal {
     /// one `Services` instance (one daemon boot) and a fresh id for a new
     /// instance (a restart) — the authoritative-lifetime signal clients use to
     /// tell a same-boot empty list from a post-restart one (monorepo#1334).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn list_boot_id_stable_within_boot_and_fresh_across_boots() {
         let h1 = harness().await;
         let first = h1
@@ -25467,7 +26310,7 @@ mod terminal {
     /// `terminal.readOutput` returns a formatted, ANSI-stripped string: a header
     /// (`Terminal {id} (cwd: ...)`), a `─`×40 separator, then the trailing lines.
     /// A freshly created terminal with no output returns the empty sentinel.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn read_output_formats_scrollback_and_empty_sentinel() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -25524,7 +26367,7 @@ mod terminal {
     }
 
     /// A process that exits on its own surfaces its exit code on `terminal:exit`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn natural_exit_reports_exit_code() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -25543,7 +26386,7 @@ mod terminal {
 
     /// Unknown terminal ids map to `NotFound`; bad base64 input maps to
     /// `InvalidParams`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unknown_id_and_bad_base64_error() {
         let h = harness().await;
         let err = h
@@ -25690,7 +26533,7 @@ mod script {
     }
 
     /// `script.run` runs a command-mode script once and captures its output.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn command_runs_once_and_captures_output() {
         let h = harness().await;
         let id = create(&h, "echo", "echo run-once-output", ScriptMode::Command).await;
@@ -25715,7 +26558,7 @@ mod script {
 
     /// `script.output` returns the buffer as a plaintext string (a `[... lines]`
     /// header + text), not an object — the ancestor/§5.8 parity contract.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn output_returns_plaintext_buffer_with_header() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -25768,7 +26611,7 @@ mod script {
     /// persisted to the event table — while `script:state` transitions stay
     /// durable. Replay comes from `script.output` (the PTY buffer), not
     /// events.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn output_is_transient_state_is_durable() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -25827,7 +26670,7 @@ mod script {
 
     /// `script.output` on a script that never produced output returns the bare
     /// `"No output yet."` string (ancestor empty-buffer case).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn output_empty_buffer_returns_placeholder() {
         let h = harness().await;
         let id = create(&h, "idle", "echo never-started", ScriptMode::Command).await;
@@ -25853,7 +26696,7 @@ mod script {
     /// stall (monorepo#623). A spurious restart still fails fast: the restart
     /// separator or a `running` state with `restartCount` >= 1 would arrive
     /// before the too-fast separator ever could.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn service_too_fast_exit_does_not_restart() {
         let mut h = harness().await;
         h.services = h.services.with_script_too_fast_ms(u128::MAX);
@@ -25891,7 +26734,7 @@ mod script {
 
     /// A service that runs past the 2s floor before exiting auto-restarts once,
     /// surfacing `restartCount: 1` on the next `running` `script:state`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn service_auto_restarts_after_long_enough_run() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -25927,7 +26770,7 @@ mod script {
 
     /// A service whose output prints a local dev-server URL surfaces it on
     /// `script:state` as `detectedUrl` (the `forward.*` hook).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn service_url_detection_emits_state() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -25959,7 +26802,7 @@ mod script {
 
     /// A running script's PTY stays hidden from `terminal.list` while its
     /// scrollback remains readable through `script.output` (§12.2).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn running_script_is_hidden_but_output_remains_available() {
         let h = harness().await;
         let mut sub = subscribe(&h);
@@ -26051,7 +26894,7 @@ mod rules {
             .find(|e| e["ruleType"] == rule_type && e["source"] == "user-override")
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn update_then_get_roundtrips() {
         let tree = worktree();
         let (_tmp, _store, svc, ws) = setup(&tree.0).await;
@@ -26083,7 +26926,7 @@ mod rules {
         assert_eq!(got["updatedAt"], 0);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn list_returns_editable_override_and_readonly_file() {
         let tree = worktree();
         let (_tmp, _store, svc, ws) = setup(&tree.0).await;
@@ -26116,7 +26959,7 @@ mod rules {
         assert!(file["path"].as_str().unwrap().ends_with("CLAUDE.md"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn over_long_content_rejected() {
         let tree = worktree();
         let (_tmp, _store, svc, ws) = setup(&tree.0).await;
@@ -26128,7 +26971,7 @@ mod rules {
         assert!(matches!(err, Error::InvalidParams(_)));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn assembly_layers_all_sources_in_precedence() {
         let tree = worktree();
         let (_tmp, store, svc, ws) = setup(&tree.0).await;
@@ -26184,7 +27027,7 @@ mod rules {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn disabled_override_excluded_from_assembly() {
         let tree = worktree();
         let (_tmp, store, svc, ws) = setup(&tree.0).await;
@@ -26250,7 +27093,7 @@ mod rules {
         assert_eq!(rules, "WORKSPACE_FILE_RULES");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn specialization_tier1_override_wins_over_file() {
         let tree = worktree();
         let (_tmp, store, svc, ws) = setup(&tree.0).await;
@@ -26323,7 +27166,7 @@ mod rules {
         assert!(!prompt.contains("## Role Reminder"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn assembly_injects_specialist_role_section_and_footer() {
         let tree = worktree();
         let (_tmp, store, svc, ws) = setup(&tree.0).await;
@@ -26546,7 +27389,7 @@ mod rules {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn update_emits_settings_changed() {
         let tree = worktree();
         let tmp = TempDb::new();
@@ -26664,11 +27507,13 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -26712,6 +27557,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -26811,11 +27657,13 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -26859,6 +27707,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -26949,11 +27798,13 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -26996,6 +27847,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27082,11 +27934,13 @@ mod rules {
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -27129,6 +27983,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27214,11 +28069,13 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -27262,6 +28119,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27351,11 +28209,13 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -27399,6 +28259,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27678,7 +28539,7 @@ mod known_repo {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_workspace_registers_repo_visible_in_repo_list() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -27715,7 +28576,7 @@ mod known_repo {
     /// daemon-owned `<parent>/<wsId>/<slug>` layout is user-owned and DOES
     /// register (intent-hq/monorepo#2611 — ownership is layout-gated, not
     /// bare path equality).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_workspace_skips_registry_for_workspace_owned_paths() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -27780,7 +28641,7 @@ mod known_repo {
     /// roots: a `repositoryPath` under the **boot root** (e.g. a stale
     /// checkout created before the setting changed) is skipped too, not just
     /// paths under the create-time resolved parent (intent-hq/monorepo#2227).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_workspace_skips_registry_for_boot_root_paths_with_custom_location() {
         use crate::SettingsRegistry;
         use std::sync::Arc;
@@ -27825,7 +28686,7 @@ mod known_repo {
     /// `workspace.create` derives `repository_name` from the local
     /// `repositoryPath` basename when the caller omits it; an explicit name
     /// always wins, and a create without a path leaves the name NULL.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_workspace_derives_repository_name_from_path_basename() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -27887,7 +28748,7 @@ mod known_repo {
     /// supplied values always win; non-github remotes leave owner unset; missing
     /// remotes fall back to basename for name. Strict host check rejects
     /// github.com.evil.com and similar substring attacks.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_workspace_derives_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
@@ -28139,7 +29000,7 @@ mod known_repo {
     /// derive from the `origin` remote URL (same helper as `workspace.create`),
     /// persist, and emit `workspace:updated` with the changed fields (STAB-64
     /// backfill).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn startup_prewarm_backfills_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
@@ -28211,11 +29072,13 @@ mod known_repo {
             diff_summary: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
@@ -28469,7 +29332,7 @@ mod worktree_provisioning {
     /// local git repo must provision a linked worktree at
     /// `<root>/<workspaceId>/<repo-slug>` on the workspace branch and record
     /// the base commit SHA.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_provisions_worktree_from_local_repo() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -28524,7 +29387,7 @@ mod worktree_provisioning {
     /// + seeded `.gitignore`/`README.md` + initial commit). The workspace then
     /// works directly in the repository folder — checkoutMode `direct`, no
     /// worktree provisioned, workspace branch checked out in place.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_is_new_repo_initializes_repo_then_provisions() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -28587,7 +29450,7 @@ mod worktree_provisioning {
     /// intent-hq/monorepo#962: an `isNewRepo` initialization failure fails the
     /// whole create with a typed `-32603` carrying the detail — and persists
     /// no row (no silent row-only workspace).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_is_new_repo_init_failure_is_typed_with_no_row() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -28622,7 +29485,7 @@ mod worktree_provisioning {
     /// repo is a no-op for the init — no re-init, no extra commit. The
     /// workspace works directly in the repository folder (checkoutMode
     /// `direct`) on its workspace branch.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_is_new_repo_on_existing_repo_is_a_noop() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -28680,7 +29543,7 @@ mod worktree_provisioning {
     /// repository folder — not a daemon-provisioned checkout under the
     /// workspaces root — so `workspace.delete` must remove only the row and
     /// never the directory.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_is_new_repo_workspace_keeps_user_repository_dir() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -28746,7 +29609,7 @@ mod worktree_provisioning {
     /// caller-reachable) must survive `workspace.delete` — both the
     /// trash-rename of the checkout and the recursive
     /// `workspace_dir_candidates` sweep of its parent directory.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_direct_workspace_outside_roots_keeps_spoofed_id_layout() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -28795,7 +29658,7 @@ mod worktree_provisioning {
     /// An `isNewRepo` create on an already-initialized repo honors a
     /// caller-supplied non-HEAD `baseRef`: the in-place workspace branch (and
     /// `baseCommitSha`) start at the requested base, not at HEAD.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_is_new_repo_honors_base_ref_on_existing_repo() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -28850,7 +29713,7 @@ mod worktree_provisioning {
     /// intent-hq/monorepo#962 guard: without `isNewRepo`, a non-git
     /// `repositoryPath` keeps the documented legacy behavior — the create
     /// succeeds row-only (no worktree, no init) and the dir stays non-git.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_without_is_new_repo_keeps_row_only_skip_for_non_git_paths() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -28883,7 +29746,7 @@ mod worktree_provisioning {
     /// intent-hq/monorepo#962 review hardening: `isNewRepo: true` without a
     /// usable `repositoryPath` is a client bug — reject with `-32602` instead
     /// of minting a silent row-only workspace.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_is_new_repo_missing_repository_path_is_invalid_params() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -28916,7 +29779,7 @@ mod worktree_provisioning {
     /// `.git` without a resolvable HEAD; a retried `isNewRepo` create must
     /// finish the initialization instead of treating the dir as an existing
     /// repo and failing provisioning downstream on the base ref.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_with_is_new_repo_recovers_half_initialized_dir() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29147,7 +30010,7 @@ mod worktree_provisioning {
     /// back to a linked worktree (`checkoutMode: "worktree"`) instead of
     /// failing — the setting is a preference, not a guarantee. Runs only
     /// where the probe reports Unsupported (the inverse of the test above).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_falls_back_to_worktree_when_cow_unsupported() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29197,7 +30060,7 @@ mod worktree_provisioning {
 
     /// cowIsolation off keeps worktree behavior even on CoW-capable
     /// filesystems, persisting `checkoutMode: "worktree"`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_provisions_worktree_when_isolation_disabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29237,7 +30100,7 @@ mod worktree_provisioning {
     /// branches). The `CoW` workspace's branch lives only inside the clone.
     /// CI-safe: the standalone checkout is a plain `git clone`, so no `CoW`
     /// filesystem support is needed to exercise the delete path.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_cow_checkout_removes_dir_without_touching_source_repo() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29385,7 +30248,7 @@ mod worktree_provisioning {
     /// cowIsolation on + CoW-incapable filesystem: `workspace.duplicate`
     /// mirrors the create fallback — the duplicate gets a linked worktree
     /// (`checkoutMode: "worktree"`) instead of failing.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_falls_back_to_worktree_when_cow_unsupported() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29552,7 +30415,7 @@ mod worktree_provisioning {
 
     /// cowIsolation off keeps `workspace.duplicate` on the linked-worktree
     /// path, persisting `checkoutMode: "worktree"`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_provisions_worktree_when_isolation_disabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29605,7 +30468,7 @@ mod worktree_provisioning {
     /// linked worktree, even with `workspace.cowIsolation` OFF — the
     /// duplicate is a self-contained clone whose `repositoryPath` is its own
     /// checkout, and the source checkout gains no branch.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_of_standalone_source_stays_standalone_with_isolation_off() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29657,7 +30520,7 @@ mod worktree_provisioning {
     /// fails, the worktree-less row must not keep the `repositoryPath` copied
     /// from the source — for a standalone source that is the SOURCE's checkout
     /// directory, which dangles once the source workspace is deleted.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_of_standalone_source_clears_repository_path_when_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29699,7 +30562,7 @@ mod worktree_provisioning {
     /// monorepo#1560 regression: the duplicate of a standalone source keeps
     /// working after the source workspace's checkout directory is deleted —
     /// no live filesystem reference back into it.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_of_standalone_source_survives_source_deletion() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29746,7 +30609,7 @@ mod worktree_provisioning {
     /// user's own folder IS the repository) is duplicated into a standalone
     /// checkout under the workspaces root, leaving the user's repo free of
     /// workspace branches and worktree registrations.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_of_new_repo_direct_source_leaves_user_repo_clean() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29788,7 +30651,7 @@ mod worktree_provisioning {
     /// monorepo#1560: with a self-contained `repositoryPath`, duplicating a
     /// duplicate provisions its own checkout instead of silently producing a
     /// checkout-less row.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_of_a_standalone_duplicate_provisions_its_own_checkout() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29821,7 +30684,7 @@ mod worktree_provisioning {
 
     /// `skipWorktree` keeps `checkoutMode` unset even with cowIsolation on —
     /// no checkout is provisioned, so there is no mode to record.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_skip_worktree_leaves_checkout_mode_unset_with_isolation_on() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29870,7 +30733,7 @@ mod worktree_provisioning {
     /// The initial-agent prompt seeds the branch slug, the
     /// `workspace.branchPrefix` setting is prepended, and a second workspace
     /// with the same prompt gets a `-2` collision suffix.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_names_branch_from_prompt_with_prefix_and_suffix() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29924,7 +30787,7 @@ mod worktree_provisioning {
     }
 
     /// An explicit `branch` wins untouched — no slug, prefix, or suffix.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_keeps_explicit_branch_untouched() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -29961,7 +30824,7 @@ mod worktree_provisioning {
 
     /// `baseRef` selects the starting commit, and an explicit `branch` names
     /// the checked-out branch.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_provisions_worktree_at_requested_base_ref() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30002,7 +30865,7 @@ mod worktree_provisioning {
 
     /// An unresolvable `baseRef` on a valid repo fails creation loudly instead
     /// of silently persisting a workspace without a checkout.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_fails_on_unresolvable_base_ref() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30028,7 +30891,7 @@ mod worktree_provisioning {
 
     /// `skipWorktree`, non-git `repositoryPath`, and a caller-supplied
     /// `worktreePath` all skip provisioning (prior row-only behavior).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_skips_provisioning_when_opted_out_or_not_a_repo() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30087,7 +30950,7 @@ mod worktree_provisioning {
     /// `removeGitWorktree` parity): the worktree directory and its
     /// `<root>/<workspaceId>` parent are removed, the registration is pruned,
     /// and the auto-generated workspace branch is deleted from the source repo.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_removes_worktree_and_auto_generated_branch() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30151,7 +31014,7 @@ mod worktree_provisioning {
     /// The branch-deletion guard: a caller-supplied (explicit) branch is never
     /// deleted on `workspace.delete`, even though the worktree itself is
     /// cleaned up — mirroring the reference's "pre-existing branch" skip.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_preserves_explicit_branch() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30200,7 +31063,7 @@ mod worktree_provisioning {
 
     /// A workspace without a provisioned checkout (`skipWorktree`) deletes its
     /// row without touching the repository.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_without_worktree_only_removes_row() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30236,7 +31099,7 @@ mod worktree_provisioning {
     /// on-disk directory is human-readable (e.g. `auth-fix`) instead of an
     /// opaque UUID. A second create with the same prompt collides and yields
     /// `<slug>-2`, mirroring the branch collision suffix.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_derives_slug_id_from_prompt_and_uniquifies() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30274,7 +31137,7 @@ mod worktree_provisioning {
     /// prompt yields a *different* (suffixed) id — reusing the id would
     /// collide the old workspace's agent streams and file paths with the new
     /// one's (FE `recentlyDeletedWorkspaces` parity).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_never_recycles_deleted_workspace_id() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30326,7 +31189,7 @@ mod worktree_provisioning {
 
     /// A leftover `<workspaces_root>/<id>` directory (orphaned/pre-tombstone
     /// state) also blocks id reuse: `workspace.create` uniquifies past it.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_skips_workspace_id_with_leftover_directory() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30358,7 +31221,7 @@ mod worktree_provisioning {
     /// When no initial-agent prompt is supplied, `workspace.create` falls back
     /// to a random adjective-animal slug (never a raw UUID). The resulting id
     /// must satisfy the FE `word-word` shape (`isValidWorkspaceId`).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_falls_back_to_random_slug_id_without_prompt() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30394,7 +31257,7 @@ mod worktree_provisioning {
     /// (FE `FileSystemWorkspaceRepository.findById`) find it without ENOENT.
     /// The file matches the FE `WorkspaceSchema`: id/title/branch/status plus
     /// the empty `changesets`/`timeline`/`conversationInfo` arrays it requires.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_writes_workspace_json_metadata_file() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30448,7 +31311,7 @@ mod worktree_provisioning {
     /// `workspace.service` (`title: request.title || ''`) so the FE renders
     /// "Untitled" until the initial agent's first-turn naming instruction
     /// calls `workspace.setTitle`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_stores_empty_title_when_title_is_empty_string() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30496,7 +31359,7 @@ mod worktree_provisioning {
     /// absent), `workspace.create` stores `""` (matching the empty-string
     /// case): the reference contract collapses missing and blank titles to
     /// the same Untitled shape.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_stores_empty_title_when_title_is_none() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30527,7 +31390,7 @@ mod worktree_provisioning {
     }
 
     /// A whitespace-only title is normalized to `""` (same Untitled shape).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_stores_empty_title_when_title_is_whitespace() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30558,7 +31421,7 @@ mod worktree_provisioning {
 
     /// An explicit non-empty title from the caller wins over the slug
     /// fallback (the reference-app path still allows explicit titles).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_preserves_explicit_title_over_slug_fallback() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30674,7 +31537,7 @@ mod setup_lifecycle_events {
     /// Script runs to a zero exit: `started` then `completed` with
     /// `ranScript: true` and `exitCode: 0`.
     #[cfg(unix)]
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_success_emits_started_then_completed_exit_zero() {
         let (repo_dir, head_branch) = seed_repo("intentd-setupev-ok-repo");
         let root = unique_dir("intentd-setupev-ok-root");
@@ -30714,7 +31577,7 @@ mod setup_lifecycle_events {
     /// script's real exit code — a failing setup script never fails the
     /// create and never suppresses the lifecycle terminal event.
     #[cfg(unix)]
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn script_failure_emits_completed_with_nonzero_exit_code() {
         let (repo_dir, head_branch) = seed_repo("intentd-setupev-fail-repo");
         let root = unique_dir("intentd-setupev-fail-root");
@@ -30750,7 +31613,7 @@ mod setup_lifecycle_events {
     /// Worktree provisioned but no effective script anywhere (no explicit
     /// param, no repo config, no legacy row): no `started`, exactly one
     /// `completed` with `ranScript: false` and no `exitCode` key.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_script_emits_completed_only() {
         let (repo_dir, head_branch) = seed_repo("intentd-setupev-noscript-repo");
         let root = unique_dir("intentd-setupev-noscript-root");
@@ -30785,7 +31648,7 @@ mod setup_lifecycle_events {
     /// `skipIsolation` opts out of the setup stage entirely — even with an
     /// explicit `setupScript` in the request, no `started` fires and the
     /// lifecycle completes immediately with `ranScript: false`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn skip_isolation_emits_completed_without_running_script() {
         let root = unique_dir("intentd-setupev-skip-root");
         let (svc, bus, _tmp) = services(root.0.clone()).await;
@@ -30818,7 +31681,7 @@ mod setup_lifecycle_events {
 
     /// `workspace.duplicate` runs no setup script: exactly one immediate
     /// `completed { ranScript: false }` under the duplicate's id, no `started`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_emits_immediate_completed() {
         let root = unique_dir("intentd-setupev-dup-root");
         let (svc, bus, _tmp) = services(root.0.clone()).await;
@@ -30857,7 +31720,7 @@ mod setup_lifecycle_events {
     /// the legacy importer) pairs its `workspace:created` with an immediate
     /// `completed { ranScript: false }` — imports run no setup stage, so the
     /// watcher registry must not hold their watcher start until the backstop.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn publish_workspace_created_emits_immediate_completed() {
         let root = unique_dir("intentd-setupev-legacy-root");
         let (svc, bus, _tmp) = services(root.0.clone()).await;
@@ -30906,7 +31769,7 @@ mod file_ops_service {
     /// `file.*` wired through `WorkspaceApi`: the workspace root resolves from
     /// `worktreePath`, writes/reads round-trip, and an out-of-workspace path
     /// surfaces as `Error::Internal` (→ `-32603`).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_methods_resolve_root_and_enforce_workspace() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30959,7 +31822,7 @@ mod file_ops_service {
     /// the `.intent/.gitignore` exclusion is ensured on the way, param
     /// validation surfaces as `Error::InvalidParams` (→ `-32602`), and the
     /// placed file is invisible to `git status` (monorepo#1948).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_place_attachment_places_excluded_from_git() {
         use base64::Engine as _;
 
@@ -31084,7 +31947,7 @@ mod file_ops_service {
     /// `file.getAttachmentInfo` (PROTOCOL §5.9): serves the registry row with
     /// `exists` reflecting the file on disk; unknown ids are `NotFound`; a
     /// deleted stored file flips `exists` to false without erroring.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_get_attachment_info_found_missing_deleted() {
         use base64::Engine as _;
 
@@ -31144,7 +32007,7 @@ mod file_ops_service {
     /// 7-day retention is swept lazily and the retry places afresh; the
     /// `sourcePath` arm fingerprints on `(fileName, size)` only; and an
     /// absent key is byte-identical to today (no `replayed` marker).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_place_attachment_idempotency_key_replay_conflict_restart_expiry() {
         use base64::Engine as _;
 
@@ -31454,7 +32317,7 @@ mod file_ops_service {
     /// Concurrent same-key placements (intent-hq/intent#4691) yield exactly
     /// one registry row and one file: the per-`(workspace, key)` in-flight
     /// guard serializes the callers, so one places and the rest replay.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
     async fn file_place_attachment_idempotency_key_concurrent_callers_yield_one_row() {
         use base64::Engine as _;
 
@@ -31474,7 +32337,7 @@ mod file_ops_service {
             let svc = svc.clone();
             let ws = ws.clone();
             let b64 = b64.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(intent_core::spawn_daemon(async move {
                 svc.file_place_attachment(
                     ws,
                     "race.bin".to_string(),
@@ -31533,7 +32396,7 @@ mod file_ops_service {
     /// registry row whose stored file was deleted from disk (the latter names
     /// the fileName + uploadedAt and instructs the model to proceed without
     /// the file).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_get_attachment_copies_and_distinguishes_errors() {
         use base64::Engine as _;
 
@@ -31631,7 +32494,7 @@ mod file_ops_service {
     /// never reads outside the canonical store or writes outside the caller
     /// root, and the `getAttachmentInfo` exists-probe never leaks existence
     /// of host paths. Cross-workspace ids read as unknown.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn file_get_attachment_rejects_tampered_rows_and_cross_workspace() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -31827,6 +32690,7 @@ mod file_ops_service {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store
             .insert_agent_session(&agent)
@@ -32069,7 +32933,7 @@ mod primitive_ops_service {
 
     /// All four `primitive.*` methods append a parseable `ws-block:<type>` block
     /// and return `{ ok, primitiveId, noteId, content }` with the TS field shapes.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn primitive_methods_append_blocks_and_match_response_shape() {
         let (_tmp, svc, ws, note_id) = setup("# Note").await;
 
@@ -32145,7 +33009,7 @@ mod primitive_ops_service {
 
     /// A missing note surfaces as `Error::Internal` (→ `-32603`), matching the TS
     /// builder throwing `Note <id> not found`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn primitive_on_missing_note_is_internal_error() {
         let (_tmp, svc, ws, _id) = setup("# Note").await;
         let res = svc
@@ -32349,7 +33213,7 @@ mod linear {
         (tmp, services)
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn not_configured_maps_to_internal() {
         let (_tmp, s) = svc(true).await;
         assert!(matches!(
@@ -32393,7 +33257,7 @@ mod linear {
         ));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn success_serializes_as_bare_object_and_arrays() {
         let (_tmp, s) = svc(false).await;
 
@@ -32432,7 +33296,7 @@ mod linear {
         assert!(updated.get("items").is_none(), "no envelope");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn list_and_search_serialize_paginated_envelope() {
         use crate::github_ops::encode_next_token;
 
@@ -32475,7 +33339,7 @@ mod linear {
         assert_eq!(page["nextToken"], serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_and_update_reject_invalid_params() {
         let (_tmp, s) = svc(false).await;
 
@@ -32661,7 +33525,7 @@ mod sentry {
         (tmp, services)
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn not_configured_maps_to_internal() {
         let (_tmp, s) = svc(true).await;
         assert!(matches!(
@@ -32699,7 +33563,7 @@ mod sentry {
         ));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn invalid_status_is_invalid_params() {
         let (_tmp, s) = svc(false).await;
         assert!(matches!(
@@ -32709,7 +33573,7 @@ mod sentry {
         ));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn success_serializes_as_bare_object_and_arrays() {
         let (_tmp, s) = svc(false).await;
 
@@ -32719,7 +33583,7 @@ mod sentry {
         assert_eq!(status["organization"], "acme");
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn list_and_search_serialize_paginated_envelope() {
         use crate::github_ops::encode_next_token;
 
@@ -32771,7 +33635,7 @@ mod sentry {
         assert_eq!(page["nextToken"], wire_token);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn list_projects_returns_bare_array() {
         let (_tmp, s) = svc(false).await;
         let v = s.sentry_list_projects(None).await.unwrap();
@@ -32781,7 +33645,7 @@ mod sentry {
         assert_eq!(v[0]["isMember"], true);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn p1_get_and_p2_writes_return_bare_object() {
         let (_tmp, s) = svc(false).await;
         for v in [
@@ -32859,6 +33723,7 @@ mod heal_stale_agent_sessions {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -32997,7 +33862,7 @@ mod initial_agent_orchestration {
         types
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn creates_agent_and_delivers_prompt_once() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -33084,7 +33949,7 @@ mod initial_agent_orchestration {
 
     /// Idempotency replay: the stored result is returned without re-running
     /// the op — no duplicate agent row and no second prompt delivery.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn idempotent_replay_no_duplicate_agent_or_message() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -33139,7 +34004,7 @@ mod initial_agent_orchestration {
     /// the stored result, produces no duplicate session row, and never
     /// persists a message even though the replayed request also carried no
     /// prompt.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_prompt_idempotent_replay_no_duplicate_agent() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -33198,7 +34063,7 @@ mod initial_agent_orchestration {
     /// turn). The result carries the `AgentLite`, the row is non-background
     /// with the requested specialist/model, `metadata.initialMessage` is
     /// absent, and no messages are persisted.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_prompt_creates_agent_row_without_message() {
         for prompt in [None, Some("   ".to_string())] {
             let tmp = TempDb::new();
@@ -33284,7 +34149,7 @@ mod initial_agent_orchestration {
     /// initial-agent metadata. Otherwise `agent_create_op`'s metadata
     /// harvest would silently promote the caller value into
     /// `AgentSession.initial_message`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_prompt_drops_caller_supplied_initial_message_in_metadata() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -33429,7 +34294,7 @@ mod clone_orchestration {
     /// + `git:clone:done` under the new workspace id before the row insert
     /// and `workspace:created`. Owner/name derivation from a real GitHub URL
     /// is covered by `intent_core::git_remote_url` goldens.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_clones_github_url_before_worktree() {
         let source = seed_repo("intentd-clone-src");
         let root = unique_dir("intentd-clone-root");
@@ -33490,7 +34355,7 @@ mod clone_orchestration {
     /// distinct path must not become a sibling of `github.com/acme/widget`.
     /// Exercised on both create paths — explicit `clonePath` and the
     /// self-contained repo-cache hydration.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn non_github_url_clone_is_not_sibling_of_github_identity() {
         let parent = unique_dir("intentd-nongh-src");
         let source = parent.0.join("acme").join("widget.git");
@@ -33598,7 +34463,7 @@ mod clone_orchestration {
 
     /// A clone that cannot succeed (unreachable target under `file://`) fails
     /// the whole `workspace.create` — no workspace row is persisted.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn clone_failure_fails_create_no_row_persisted() {
         let root = unique_dir("intentd-clone-fail-root");
         let tmp = TempDb::new();
@@ -33635,7 +34500,7 @@ mod clone_orchestration {
     /// A `githubUrl` alongside an existing local `repositoryPath` (a real git
     /// repo on disk) is a no-op for clone: the daemon uses the local repo as
     /// the workspace's `repositoryPath` and does not re-clone.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn github_url_skipped_when_local_repo_is_present() {
         let repo = seed_repo("intentd-clone-skip-src");
         let root = unique_dir("intentd-clone-skip-root");
@@ -33724,7 +34589,7 @@ mod clone_orchestration {
     /// cache, hydrates a standalone checkout, streams `git:clone:*` frames
     /// before `workspace:created`. A non-`github.com` URL keys the cache but
     /// does not seed `repositoryOwner` (basename fallback still names the row).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_hydrates_from_cache_on_miss() {
         let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate-src");
         let root = unique_dir("intentd-hydrate-root");
@@ -33790,7 +34655,7 @@ mod clone_orchestration {
     /// Cache hit: a second create for the same URL refreshes the existing
     /// cache (a marker planted in the cache's `.git` survives — no re-clone)
     /// and hydrates a second, independent checkout.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn second_create_hydrates_from_refreshed_cache_without_reclone() {
         let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate2-src");
         let root = unique_dir("intentd-hydrate2-root");
@@ -33840,7 +34705,7 @@ mod clone_orchestration {
 
     /// `baseRef` checkout: the hydrated checkout's workspace branch starts at
     /// the requested base ref, not the cache's default-branch tip.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn hydration_checks_out_requested_base_ref() {
         let source = seed_repo("intentd-hydrate-base-src");
         // Pin `base` at the first commit, then advance the default branch.
@@ -33902,7 +34767,7 @@ mod clone_orchestration {
 
     /// Concurrent `githubUrl`-only creates for the same repo serialize on the
     /// per-repo cache lock and all succeed with independent checkouts.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_hydrating_creates_same_repo_all_succeed() {
         let source = seed_repo("intentd-hydrate-conc-src");
         let root = unique_dir("intentd-hydrate-conc-root");
@@ -33918,7 +34783,7 @@ mod clone_orchestration {
         for _ in 0..3 {
             let svc = svc.clone();
             let url = url.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(intent_core::spawn_daemon(async move {
                 svc.create_workspace(
                     WorkspaceCreate {
                         github_url: Some(url),
@@ -33943,7 +34808,7 @@ mod clone_orchestration {
     /// A hydration whose cache clone cannot succeed (unreachable `file://`
     /// source, no `clonePath`) fails the whole create — no row persisted, no
     /// partial state.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn hydration_cache_failure_fails_create_no_row_persisted() {
         let root = unique_dir("intentd-hydrate-fail-root");
         let tmp = TempDb::new();
@@ -33976,7 +34841,7 @@ mod clone_orchestration {
     /// `githubUrl` keeps the legacy network-clone path exactly — repo cloned
     /// at `clonePath`, a linked worktree provisioned off it (`checkoutMode:
     /// "worktree"`), and **no** `.repo-cache` directory created.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn explicit_clone_path_keeps_legacy_clone_no_cache() {
         let source = seed_repo("intentd-legacy-clone-src");
         let root = unique_dir("intentd-legacy-clone-root");
@@ -34028,7 +34893,7 @@ mod clone_orchestration {
     /// `workspace.delete` of a hydrated workspace removes the standalone
     /// checkout (and its `<root>/<wsId>` parent) while the repo cache stays
     /// untouched for future creates.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_hydrated_workspace_removes_checkout_keeps_cache() {
         let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate-del-src");
         let root = unique_dir("intentd-hydrate-del-root");
@@ -34146,7 +35011,7 @@ mod clone_orchestration {
     /// Worktree mode (local repo, isolation on): milestones stream with the
     /// echoed `progressId` — worktree provisioning, finalizing, complete —
     /// and one terminal done, on a path that emitted nothing before.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_worktree_create_streams_milestones() {
         let repo = seed_repo("intentd-prog-wt-src");
         let root = unique_dir("intentd-prog-wt-root");
@@ -34193,7 +35058,7 @@ mod clone_orchestration {
 
     /// Direct mode (`isNewRepo`): the daemon-initialized repo path streams
     /// checkout + finalizing milestones and one terminal done.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_new_repo_direct_streams_milestones() {
         let root = unique_dir("intentd-prog-direct-root");
         let repo_dir = unique_dir("intentd-prog-direct-repo");
@@ -34237,7 +35102,7 @@ mod clone_orchestration {
     /// route through the reporter — normalized into the 0–85 clone segment,
     /// echoing `progressId` — and the provisioning tail + terminal done come
     /// from the create (not the clone), still exactly once.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_network_clone_normalizes_and_defers_done() {
         let source = seed_repo("intentd-prog-clone-src");
         let root = unique_dir("intentd-prog-clone-root");
@@ -34285,7 +35150,7 @@ mod clone_orchestration {
 
     /// Cache hydration (`githubUrl` without `clonePath`): the cache + copy
     /// milestones stream through the reporter with one terminal done.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_cache_hydration_streams_milestones() {
         let source = seed_repo("intentd-prog-hydrate-src");
         let root = unique_dir("intentd-prog-hydrate-root");
@@ -34328,7 +35193,7 @@ mod clone_orchestration {
 
     /// A failed create with a `progressId` still ends the stream with exactly
     /// one terminal done (`ok:false` + sanitized error), echoing the id.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_failed_clone_emits_one_done_err() {
         let root = unique_dir("intentd-prog-fail-root");
         let target = unique_dir("intentd-prog-fail-target");
@@ -34372,7 +35237,7 @@ mod clone_orchestration {
     /// `workspace.create` with the same `idempotency_key` + `progressId`
     /// returns the cached result without re-running provisioning, so no
     /// `git:clone:*` frames (progress OR done) are re-emitted.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_idempotent_replay_emits_nothing() {
         let repo = seed_repo("intentd-prog-idem-src");
         let root = unique_dir("intentd-prog-idem-root");
@@ -34411,6 +35276,58 @@ mod clone_orchestration {
         assert!(
             frames.is_empty(),
             "idempotent replay emits no git:clone frames: {frames:?}"
+        );
+    }
+
+    /// Two concurrent first-use `workspace.create` calls carrying the same
+    /// `idempotencyKey` are exactly-once: `with_idempotency` serializes
+    /// same-key callers, so one provisions and the other replays the stored
+    /// result — identical ids, one workspace row, one `workspace:created`.
+    #[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_creates_yield_one_workspace() {
+        let repo = seed_repo("intentd-idem-race-src");
+        let root = unique_dir("intentd-idem-race-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let input = WorkspaceCreate {
+            repository_path: Some(repo.0.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let key = Some("idem-key-race-1".to_string());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let (first, second) = tokio::join!(
+            svc.create_workspace(input.clone(), key.clone()),
+            svc.create_workspace(input, key)
+        );
+        let first = first.expect("first create");
+        let second = second.expect("second create");
+        assert_eq!(
+            first.workspace.id, second.workspace.id,
+            "both callers observe the same workspace"
+        );
+
+        let rows = store.list_workspaces(true).await.expect("list workspaces");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one workspace row: {:?}",
+            rows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>()
+        );
+        let created = drain_event_types(&mut sub)
+            .await
+            .into_iter()
+            .filter(|t| t == intent_core::events::WORKSPACE_CREATED)
+            .count();
+        assert_eq!(created, 1, "exactly one workspace:created");
+        assert!(
+            svc.idempotency_inflight.is_empty(),
+            "in-flight key entry is dropped after both callers finish"
         );
     }
 
@@ -34482,7 +35399,7 @@ mod clone_orchestration {
     /// failures: an invalid `workspace.worktreesLocation` (relative path)
     /// errors the create before a workspace id exists, yet a supplied
     /// `progressId` still gets exactly one `git:clone:done { ok:false }`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_early_config_error_emits_done_err() {
         let root = unique_dir("intentd-prog-cfg-root");
         let repo = seed_repo("intentd-prog-cfg-src");
@@ -34537,7 +35454,7 @@ mod clone_orchestration {
     /// Rollback safety: without a `progressId`, a local-repo create emits no
     /// `git:clone:*` frames at all (legacy behavior), and legacy clone paths
     /// carry no `progressId` key.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_progress_id_keeps_legacy_event_behavior() {
         let repo = seed_repo("intentd-prog-legacy-src");
         let root = unique_dir("intentd-prog-legacy-root");
@@ -34678,7 +35595,7 @@ mod repo_warm_cache {
     /// Happy path: the warm is accepted, returns `{ started, owner, repo }`
     /// immediately, populates the cache in the background, and clears the
     /// in-flight flag so a later warm is accepted again.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn warm_starts_populates_cache_and_clears_flag() {
         let source = seed_repo("Intentd-Warm-Src");
         let root = unique_dir("intentd-warm-root");
@@ -34707,7 +35624,7 @@ mod repo_warm_cache {
     /// rejected with `WarmInFlight` naming the repo being warmed.
     /// Multi-thread flavor: the test thread blocks on the held-signal recv
     /// while the lock holder runs on the blocking pool.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 2)]
     async fn second_warm_rejected_while_in_flight() {
         let source = seed_repo("Intentd-Warm-Busy-Src");
         let root = unique_dir("intentd-warm-busy-root");
@@ -34758,7 +35675,7 @@ mod repo_warm_cache {
     /// A URL whose owner/repo segments would be rejected by the cache ensure
     /// (path escapes like `..`) is `-32602` up front and never claims the
     /// single-flight slot — a malformed request cannot block valid warms.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn traversal_segments_rejected_before_claiming_slot() {
         let source = seed_repo("intentd-warm-trav-src");
         let root = unique_dir("intentd-warm-trav-root");
@@ -34783,7 +35700,7 @@ mod repo_warm_cache {
 
     /// A URL with no owner/repo pair is rejected with `-32602` and never
     /// claims the single-flight slot.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn invalid_url_is_invalid_params() {
         let source = seed_repo("intentd-warm-inv-src");
         let root = unique_dir("intentd-warm-inv-root");
@@ -34822,7 +35739,7 @@ mod line_attribution_hooks {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_update_status_schedules_recompute() {
         let (_tmp, svc, ws, id) = setup("- [ ] alpha\n- [ ] beta").await;
         svc.task_update_status(
@@ -34837,7 +35754,7 @@ mod line_attribution_hooks {
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_update_schedules_recompute() {
         let (_tmp, svc, ws, id) = setup("- [ ] alpha").await;
         svc.task_update(
@@ -34854,7 +35771,7 @@ mod line_attribution_hooks {
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn convert_task_blocks_schedules_recompute() {
         let content = "intro\n@@@task\n# Build API\nBuild the thing.\n@@@\ntail";
         let (_tmp, svc, ws, id) = setup(content).await;
@@ -34864,7 +35781,7 @@ mod line_attribution_hooks {
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn comment_add_schedules_recompute() {
         let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
         svc.comment_add(
@@ -35458,7 +36375,7 @@ mod browser_client_pin {
         assert!(svc.client_list().await.expect("list").is_empty());
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unpinned_workspace_reports_default_and_dispatches_default() {
         let reg = FakeRegistry::new(&[
             ("desktop-a", Some("Desktop A"), true),
@@ -35482,7 +36399,7 @@ mod browser_client_pin {
         assert_eq!(reg.calls.lock().unwrap()[0].2, ReverseTarget::Default);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_eligible_client_resolves_null_and_dispatch_says_no_client() {
         let reg = FakeRegistry::new(&[("aux", None, false)]);
         let (_t, _r, svc, _bus, ws) = setup(reg).await;
@@ -35495,7 +36412,7 @@ mod browser_client_pin {
         assert!(matches!(err, Error::Internal(m) if m == "browser.exec: no client connected"));
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pinned_live_client_is_reported_and_dispatched_to() {
         let reg = FakeRegistry::new(&[
             ("desktop-a", Some("Desktop A"), true),
@@ -35580,7 +36497,7 @@ mod browser_client_pin {
     /// The last delta a subscriber sees always equals what the store holds,
     /// and each reply echoes the pin *that call* committed — never a value a
     /// racing setter committed between this call's publish and its read-back.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_setters_publish_deltas_in_commit_order() {
         const ROUNDS: usize = 24;
         let reg = FakeRegistry::new(&[
@@ -35603,14 +36520,17 @@ mod browser_client_pin {
                 1 => Some(ClientId::from_string("desktop-b")),
                 _ => None,
             };
-            tasks.spawn(async move {
-                let requested = target.as_ref().map_or(Value::Null, |c| c.as_str().into());
-                let reply = svc
-                    .set_workspace_browser_client(ws, target)
-                    .await
-                    .expect("set");
-                (requested, reply)
-            });
+            tasks.spawn(intent_core::with_caller(
+                intent_core::Caller::Daemon,
+                async move {
+                    let requested = target.as_ref().map_or(Value::Null, |c| c.as_str().into());
+                    let reply = svc
+                        .set_workspace_browser_client(ws, target)
+                        .await
+                        .expect("set");
+                    (requested, reply)
+                },
+            ));
         }
         while let Some(joined) = tasks.join_next().await {
             let (requested, reply) = joined.expect("join");
@@ -35648,7 +36568,7 @@ mod browser_client_pin {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pinned_offline_client_is_a_hard_error_not_a_fallback() {
         // desktop-b hello'd before (client row exists) but is not live now.
         let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
@@ -35680,7 +36600,7 @@ mod browser_client_pin {
         );
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn set_rejects_never_seen_client_chief_and_unknown_workspace() {
         let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
         let (_t, _r, svc, _bus, ws) = setup(reg).await;
@@ -35749,7 +36669,7 @@ mod browser_client_pin {
     /// pinnable after upgrade while a pre-upgrade draft-only placeholder is
     /// rejected until it hellos. Pre-upgrade rows are shaped by nulling the
     /// stamp directly, and the backfill statement is re-run from 0117.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn pre_upgrade_named_row_is_pinnable_and_nameless_row_is_not() {
         let reg = FakeRegistry::new(&[]);
         let (_t, _r, svc, _bus, ws) = setup(reg).await;
@@ -35909,7 +36829,7 @@ mod browser_routing {
     /// Model 10: without a pin, the host of the workspace's claimed tabs is
     /// the driving client — even when another eligible client connected
     /// first — and `workspace.getBrowserClient` reports it as `resolved`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn claimed_tab_host_is_the_driving_client_when_unpinned() {
         let reg = two_clients();
         let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
@@ -35943,7 +36863,7 @@ mod browser_routing {
     /// Model 5: an agent `listTabs` is answered from the registry — every
     /// host aggregated, no reverse call — with the FE field names plus the
     /// host fields, filtered by `scope`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn list_tabs_is_answered_from_the_registry_across_hosts() {
         let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
         let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
@@ -36133,7 +37053,7 @@ mod browser_routing {
     /// the previous host's `displayed` fact (`changes.displayed: null`, absent
     /// on the event `tab` and the next list) until the new host reports it;
     /// a same-host owner-only claim keeps it (intent-hq/intent#4835).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn successful_claim_migrates_the_tab_to_the_driving_client() {
         let reg = two_clients();
         let (_t, _r, svc, bus, ws) = setup(reg.clone()).await;
@@ -36263,7 +37183,7 @@ mod browser_routing {
     /// Model 5 (end to end through `browser_exec`): the FE's real success
     /// envelope for `claimTab` carries `result.tabId`, which is what triggers
     /// the migration.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn claim_reply_with_tab_id_migrates_through_browser_exec() {
         use std::sync::{Arc, Mutex};
 
@@ -36375,7 +37295,7 @@ mod browser_routing {
     /// switches the pin commits against the driving client *at commit
     /// time* — the claimed rows land on the new pin, never on the client
     /// that executed the claim — and the tab events stay gated.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client() {
         use std::sync::{Arc, Mutex};
 
@@ -36467,7 +37387,7 @@ mod browser_routing {
             .await
             .expect("pin a");
 
-        let events = tokio::spawn({
+        let events = intent_core::spawn_daemon({
             let bus = bus.clone();
             let ws = ws.clone();
             async move { tab_events(&bus, &ws, 2).await }
@@ -36475,7 +37395,7 @@ mod browser_routing {
         tokio::task::yield_now().await;
 
         // The claim dispatches to the pinned client and its reply is held.
-        let claim = tokio::spawn({
+        let claim = intent_core::spawn_daemon({
             let svc = svc.clone();
             let ws = ws.clone();
             async move {
@@ -36561,7 +37481,7 @@ mod browser_routing {
     /// old host's `displayed` fact: `changes.displayed: null`); unclaimed
     /// tabs and other workspaces stay put (fact retained); clearing the pin
     /// moves nothing.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn set_browser_client_migrates_claimed_tabs() {
         let reg = two_clients();
         let (_t, _r, svc, bus, ws) = setup(reg).await;
@@ -36638,7 +37558,7 @@ mod browser_routing {
     /// Model 4: `browser.navigateTab` goes to the driving client for a
     /// claimed tab and to the physical host for an unclaimed one; an unknown
     /// tab is `-32602`, an offline target `-32603`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn navigate_tab_routes_by_claim_state() {
         let reg = two_clients();
         let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
@@ -36779,7 +37699,7 @@ mod browser_routing {
 /// `scan_workspace_token_usage` tallies agent-session token counters into the
 /// workspace's durable `tokenUsage` field, returning `true` when the materialized
 /// tally changed and `false` when it matched the existing snapshot.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn scan_workspace_token_usage_tallies_and_detects_change() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -36832,6 +37752,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         is_background: false,
         metadata: None,
     };
@@ -36878,6 +37799,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         is_background: false,
         metadata: None,
     };
@@ -36947,7 +37869,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
 
 /// `scan_all_token_usage` sweeps all non-archived workspaces and tallies each
 /// one's token usage, logging errors per workspace and continuing the sweep.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn scan_all_token_usage_sweeps_multiple_workspaces() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -37003,6 +37925,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         is_background: false,
         metadata: None,
     };
@@ -37041,7 +37964,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
 /// several workspaces. `tokio::time::sleep` guarantees at least the requested
 /// duration, so the wall-clock lower bound proves the pause is wired. (Paused
 /// time is unusable here: auto-advance trips sqlx's pool-acquire timeout.)
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn scan_all_token_usage_pauses_between_workspaces() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -37254,7 +38177,7 @@ mod last_activity_events {
     /// debounced lastActivity derivation. Without the cancel the timer
     /// outlives the workspace, fires against the deleted row, and logs a
     /// spurious `get_workspace failed ... not found` WARN.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_workspace_cancels_pending_last_activity_schedule() {
         use intent_core::WorkspaceApi;
         // Debounce window far longer than the test: the delete must land
@@ -37338,7 +38261,7 @@ mod last_activity_events {
     /// idle debouncer. Without the sweep the timer outlives the workspace,
     /// emits a spurious `workspace:activity-changed { idle }` ~3s after
     /// deletion, and its `(gen, AbortHandle)` map entry lingers.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_workspace_cancels_pending_idle_debounce() {
         use intent_core::WorkspaceApi;
         // Debounce window far longer than the test: the delete must land
@@ -37550,7 +38473,7 @@ mod last_activity_events {
     /// since acknowledging attention is not "activity"
     /// (intent-hq/monorepo#1466) — never a `workspace:updated
     /// { lastActivity }`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn dismiss_attention_idempotent() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
@@ -37693,7 +38616,7 @@ mod last_activity_events {
     /// value straight off the column (the post-restart shape). Reverting the
     /// `bump_workspace_last_activity` call in `schedule_last_activity_event`
     /// leaves the column NULL and fails this test.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn debounced_last_activity_is_persisted_for_lite_reads() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
@@ -37750,7 +38673,7 @@ mod last_activity_events {
     /// `derive_last_activity` folds the stored value into its max so an
     /// ordinary derivation short-circuits before it can emit an older value.
     /// Both are asserted here against a live services store.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn persisted_last_activity_is_monotonic() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
@@ -37819,7 +38742,7 @@ mod last_activity_events {
     /// derive (`list_workspaces_lite`, the `workspace.subscribe` seq-0
     /// snapshot) and a daemon restart serve the same fresh value instead of
     /// a stale one that waits on the next debounce.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn update_workspace_persists_derived_last_activity() {
         use intent_core::{WorkspaceApi, WorkspaceUpdate};
         let h = harness().await;
@@ -37882,7 +38805,7 @@ mod last_activity_events {
     /// through the same full-row `store.update_workspace` call every
     /// `workspace.*` mutation path (update/archive/unarchive) uses — pre-fix
     /// this silently reverted the bump.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn update_workspace_does_not_clobber_concurrent_bump() {
         use intent_core::{WorkspaceApi, WorkspaceUpdate};
         let h = harness().await;
@@ -37940,7 +38863,7 @@ mod last_activity_events {
     /// Regression (monorepo#1585 review): archive and unarchive persist the
     /// `lastActivity` they derive for the response, so the lite list / seq-0
     /// snapshot serves the same value without deriving.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn archive_unarchive_persist_derived_last_activity() {
         use intent_core::WorkspaceApi;
         let h = harness().await;
@@ -38330,6 +39253,7 @@ mod last_activity_events {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -38591,6 +39515,7 @@ mod turn_end_unread_gate {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -38685,6 +39610,32 @@ mod turn_end_unread_gate {
         assert!(
             should_raise_turn_end_unread(&h.services, &agent_id).await,
             "a restored top-level foreground agent raises again"
+        );
+    }
+
+    /// A muted top-level foreground session (`notifications_muted`) must NOT
+    /// raise the blue dot at drain end. Unmuting brings the raise back.
+    #[tokio::test]
+    async fn muted_agent_skips_raise_until_unmuted() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.notifications_muted = true;
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a muted agent must not raise the turn-end blue dot"
+        );
+        h.store
+            .set_agent_notifications_muted(&h.ws, &agent_id, false, &now_iso())
+            .await
+            .expect("unmute session");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "an unmuted top-level foreground agent raises again"
         );
     }
 
@@ -39031,6 +39982,7 @@ mod turn_token_usage {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -40747,7 +41699,7 @@ mod default_provider_self_heal {
 
     /// Unset settings + installed provider with a cached `isDefault` row ⇒
     /// both keys healed; a second sweep is a no-op (idempotent).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unset_settings_heal_provider_and_catalog_default_model() {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
@@ -40786,7 +41738,7 @@ mod default_provider_self_heal {
     }
 
     /// No `isDefault` row in the cached catalog ⇒ the FIRST row is used.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn catalog_without_default_row_heals_first_model() {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
@@ -40810,7 +41762,7 @@ mod default_provider_self_heal {
     /// the auggie catalog) is not an ownership claim (monorepo#607) — the
     /// provider is healed alone; a self-prefixed row is stripped to its bare
     /// model half (persisted values are always bare ids).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn foreign_prefixed_catalog_row_heals_provider_only() {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
@@ -40848,7 +41800,7 @@ mod default_provider_self_heal {
 
     /// Cold catalog cache (no models known) ⇒ the provider is persisted
     /// alone; `model.default` stays unset.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_cached_models_heals_provider_only() {
         let (_tmp, svc) = setup().await;
 
@@ -40892,7 +41844,7 @@ mod default_provider_self_heal {
     /// A `model.default` alone no longer derives a default provider (the
     /// provider is its own key): the heal writes `model.defaultProvider` and
     /// leaves the configured model untouched (per-key no-overwrite).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn default_model_alone_no_longer_blocks_heal() {
         let (_tmp, svc) = setup().await;
         svc.settings_registry()
@@ -40970,7 +41922,7 @@ mod default_provider_self_heal {
     /// the same `settings_update` path: with no derivable provider
     /// beforehand this is first-time setup, not a switch, so `model.default`
     /// keeps its raw value per heal's per-key no-overwrite guard.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn single_key_heal_does_not_rewrite_legacy_model() {
         let (_tmp, svc) = setup().await;
         svc.settings_registry()
@@ -41034,7 +41986,7 @@ mod default_provider_self_heal {
 
     /// The first INSTALLED provider wins in the order discovery reported,
     /// skipping ids the registry doesn't know.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn first_registered_installed_provider_wins() {
         let (_tmp, svc) = setup().await;
 
@@ -41105,7 +42057,7 @@ mod provider_switch_reresolves_default_model {
     /// Warm cache with a marked default ⇒ the switch batch applies the new
     /// provider AND its catalog-default model atomically; the response
     /// `applied` list carries both keys.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn switch_reresolves_catalog_default_model() {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
@@ -41132,7 +42084,7 @@ mod provider_switch_reresolves_default_model {
 
     /// No `isDefault` row in the new provider's cached catalog ⇒ the FIRST
     /// row is used.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn switch_falls_back_to_first_catalog_model() {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
@@ -41154,7 +42106,7 @@ mod provider_switch_reresolves_default_model {
     /// Cold cache for the new provider ⇒ the stale `model.default` is
     /// CLEARED (blank), never left shadowing the switched provider
     /// (monorepo#3044 fail-loudly behavior applies downstream).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn switch_with_cold_cache_clears_stale_model() {
         let (_tmp, svc) = setup().await;
 
@@ -41170,7 +42122,7 @@ mod provider_switch_reresolves_default_model {
     /// catalog) is not an ownership claim (monorepo#607) — it is not
     /// persisted; with a model currently stored the stale value is cleared
     /// instead.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn foreign_prefixed_catalog_row_clears_instead() {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
@@ -41199,7 +42151,7 @@ mod provider_switch_reresolves_default_model {
 
     /// An explicit `model.default` anywhere in the same batch wins — the
     /// side effect never overrides the caller's pick.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn explicit_model_in_batch_wins() {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
@@ -41223,7 +42175,7 @@ mod provider_switch_reresolves_default_model {
     /// A same-provider rewrite of `model.defaultProvider` is NOT a switch —
     /// the configured model is left alone and the no-op neither reports an
     /// applied change nor advances the settings revision.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn same_provider_rewrite_is_a_noop() {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
@@ -41245,7 +42197,7 @@ mod provider_switch_reresolves_default_model {
     /// An unregistered provider value gets no side effect: the string is
     /// persisted as-is (plain string setting) but `model.default` is
     /// untouched.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unregistered_provider_value_is_ignored() {
         let (_tmp, svc) = setup().await;
 
@@ -41258,7 +42210,7 @@ mod provider_switch_reresolves_default_model {
 
     /// Nothing configured yet (no stored model) + cold cache ⇒ nothing to
     /// clear, nothing appended; the provider applies alone.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_stored_model_and_cold_cache_appends_nothing() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -41278,7 +42230,7 @@ mod provider_switch_reresolves_default_model {
     /// nothing even on a warm cache — the raw model value is preserved
     /// (heal's no-overwrite guard relies on this, since heal persists
     /// through the same `settings_update` path).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn first_time_setup_is_not_a_switch() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -41442,7 +42394,7 @@ mod worktrees_location {
     /// workspace lands under the configured location (metadata file proves
     /// the resolved parent); cleared back to empty, the next create falls
     /// back to the boot root.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_workspace_honors_worktrees_location_setting() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -41519,7 +42471,7 @@ mod worktrees_location {
     /// `workspace.duplicate` resolves the same parent precedence as
     /// `workspace.create`: with the setting present the duplicate lands under
     /// the configured location, not the boot root.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_workspace_honors_worktrees_location_setting() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -41575,7 +42527,7 @@ mod worktrees_location {
     /// `workspace.delete` sweeps the workspace's directory under the custom
     /// `workspace.worktreesLocation` too — deleting a workspace created there
     /// must not leak `<location>/<id>/` (metadata, cache, residual content).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delete_workspace_sweeps_custom_worktrees_location_dir() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -41693,7 +42645,7 @@ mod delete_grace_window {
     /// The projections are asserted under a comfortably long window (then
     /// cancelled), and the deadline commit is exercised by a separate short
     /// re-schedule — so no assertion ever races a sub-second timer.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn schedule_commits_on_deadline_and_projects_pending_delete_at() {
         let h = harness().await;
         let delete_at = h
@@ -41728,7 +42680,7 @@ mod delete_grace_window {
 
     /// Schedule → cancel restores the entity: the timer never commits and
     /// `pendingDeleteAt` disappears from the projection.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn cancel_within_window_keeps_workspace() {
         let h = harness().await;
         h.services
@@ -41756,7 +42708,7 @@ mod delete_grace_window {
 
     /// Cancel-after-commit race: once the timer fired and the delete
     /// committed, cancel reports `false` (non-error) — never an error.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn cancel_after_commit_is_false_not_error() {
         let h = harness().await;
         h.services
@@ -41774,7 +42726,7 @@ mod delete_grace_window {
 
     /// Re-scheduling while pending is idempotent: the original deadline is
     /// returned, not a new one.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn reschedule_while_pending_returns_existing_deadline() {
         let h = harness().await;
         let first = h
@@ -41807,7 +42759,7 @@ mod delete_grace_window {
     }
 
     /// An immediate delete while pending cancels the timer and commits now.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn immediate_delete_while_pending_commits_now() {
         let h = harness().await;
         h.services
@@ -41839,7 +42791,7 @@ mod delete_grace_window {
     /// Restart semantics: pending deletions are in-memory only — a fresh
     /// `Services` over the same store sees no pending deletion and the
     /// workspace survives.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn restart_drops_pending_deletion() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -41866,7 +42818,7 @@ mod delete_grace_window {
     }
 
     /// Scheduling for an unknown workspace is the standard `NotFound`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn schedule_unknown_workspace_is_not_found() {
         let h = harness().await;
         let missing = WorkspaceId::new();
@@ -41879,7 +42831,7 @@ mod delete_grace_window {
     /// The grace-window events: `workspace:delete-scheduled` carries
     /// `{ workspaceId, deleteAt }`, `workspace:delete-cancelled` carries
     /// `{ workspaceId }` (§6.5 self-sufficient payloads).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn schedule_and_cancel_emit_events() {
         let h = harness().await;
         let mut sub = h.bus.subscribe(crate::SubscriptionFilter {
@@ -41918,7 +42870,7 @@ mod delete_grace_window {
 
     /// The caller-supplied delay is clamped to the 60s cap: the returned
     /// deadline is at most ~60s out, never hours.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn undo_delay_is_clamped_to_cap() {
         let h = harness().await;
         let delete_at = h
@@ -41967,6 +42919,244 @@ mod delete_grace_window {
             "original entry untouched"
         );
         assert!(reg.cancel("k"), "single pending entry");
+    }
+}
+
+/// Bulk `workspace.delete` vs. the event bus (intent-hq/intent#5337): a burst
+/// of deletes — some checkouts still on disk, some already gone — must not
+/// make the bus drop a batch, and an already-absent repository must not WARN
+/// from the detach step.
+mod bulk_delete_pool_pressure {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{now_iso, WorkspaceApi, WorkspaceId};
+    use intent_store::{NewEvent, Store};
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{cleanup_workspace_worktree_locked, system_actor, EventBus, Services};
+
+    /// Thread-local `tracing` capture of `(level, message + fields)`.
+    #[derive(Clone, Default)]
+    struct LevelCapture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl LevelCapture {
+        fn at_or_above(&self, level: tracing::Level) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(l, _)| *l <= level)
+                .map(|(_, line)| line.clone())
+                .collect()
+        }
+    }
+
+    impl tracing::Subscriber for LevelCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{}={value:?} ", field.name());
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The observed log signature: the repository behind the worktree was
+    /// already gone (`Repository::open` → "failed to resolve path … No such
+    /// file or directory"), so there is nothing to detach. That is an
+    /// expected state on a retried/orphaned delete, not a WARN-worthy failure.
+    #[test]
+    fn absent_repository_detach_does_not_warn() {
+        let root = WorkspacesRoot::new();
+        let repo = root.path().join("gone-repo");
+        let worktree = root.path().join("ws-1").join("gone-repo");
+        assert!(!repo.exists() && !worktree.exists());
+
+        let capture = LevelCapture::default();
+        let guard = crate::test_tracing::set_capture_default(capture.clone());
+        let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
+        drop(guard);
+
+        assert!(trash.is_none(), "nothing to detach");
+        let loud = capture.at_or_above(tracing::Level::WARN);
+        assert!(
+            loud.is_empty(),
+            "absent repository must not log at WARN or above: {loud:?}"
+        );
+    }
+
+    /// Only a confirmed absence is quiet. A repository that is present but
+    /// unreadable (`try_exists` → `PermissionDenied`, standing in for EIO on
+    /// a flaky mount) must still reach the detach attempt and keep its WARN,
+    /// or a real failure would be silently swallowed.
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_repository_detach_still_warns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Restores the guard dir's permissions on drop — including during
+        /// unwinding — so the tempdir sweep can traverse it after a failed
+        /// assertion.
+        struct RestorePerms(std::path::PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        if unsafe { libc::geteuid() } == 0 {
+            // Root bypasses permission checks, so the PermissionDenied seam
+            // cannot be produced; skip.
+            return;
+        }
+
+        let root = WorkspacesRoot::new();
+        let guard_dir = root.path().join("guard");
+        let repo = guard_dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("present repo");
+        let worktree = root.path().join("ws-1").join("repo");
+        std::fs::set_permissions(&guard_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod guard");
+        let _restore = RestorePerms(guard_dir.clone());
+        assert_eq!(
+            repo.try_exists().unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "seam must produce a non-NotFound stat error"
+        );
+
+        let capture = LevelCapture::default();
+        let guard = crate::test_tracing::set_capture_default(capture.clone());
+        let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
+        drop(guard);
+
+        assert!(trash.is_none(), "nothing detached");
+        let loud = capture.at_or_above(tracing::Level::WARN);
+        assert!(
+            loud.iter()
+                .any(|line| line.contains("failed to detach git worktree")),
+            "inaccessible repository must keep the detach WARN: {loud:?}"
+        );
+    }
+
+    /// Concurrent deletes (checkouts present and absent) while the bus keeps
+    /// publishing: every delete succeeds, every publish resolves `Ok` (no
+    /// dropped batch), and the writer never logs a drop.
+    #[intent_test_macros::daemon_test]
+    async fn concurrent_deletes_do_not_drop_event_batches() {
+        const DELETES: usize = 12;
+        const PUBLISHES: usize = 200;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = WorkspacesRoot::new();
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+
+        let missing_repo = root.path().join("missing-repo");
+        let mut ids = Vec::new();
+        for i in 0..DELETES {
+            let id = WorkspaceId::new();
+            let checkout = root.path().join(id.as_str()).join("missing-repo");
+            if i % 2 == 0 {
+                std::fs::create_dir_all(&checkout).expect("present checkout");
+            }
+            let mut ws = workspace(&id);
+            ws.repository_path = Some(missing_repo.to_string_lossy().into_owned());
+            ws.worktree_path = Some(checkout.to_string_lossy().into_owned());
+            store.insert_workspace(&ws).await.expect("insert");
+            ids.push(id);
+        }
+        let live = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&live))
+            .await
+            .expect("live workspace");
+
+        let capture = LevelCapture::default();
+        let guard = crate::test_tracing::set_capture_default(capture.clone());
+
+        let publisher = {
+            let bus = bus.clone();
+            let live = live.clone();
+            tokio::spawn(async move {
+                let mut failures = Vec::new();
+                for i in 0..PUBLISHES {
+                    let ev = NewEvent {
+                        workspace_id: live.clone(),
+                        timestamp: now_iso(),
+                        event_type: "note:updated".to_string(),
+                        actor: system_actor(),
+                        session_id: None,
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: serde_json::json!({ "i": i }),
+                    };
+                    if let Err(e) = bus.publish(&ev).await {
+                        failures.push(e.to_string());
+                    }
+                    tokio::task::yield_now().await;
+                }
+                failures
+            })
+        };
+        let mut deletes = tokio::task::JoinSet::new();
+        for id in &ids {
+            let svc = svc.clone();
+            let id = id.clone();
+            deletes.spawn(intent_core::with_caller(
+                intent_core::Caller::Daemon,
+                async move { (id.clone(), svc.delete_workspace(id).await) },
+            ));
+        }
+        let mut done = 0;
+        while let Some(joined) = deletes.join_next().await {
+            let (id, res) = joined.expect("delete task");
+            res.unwrap_or_else(|e| panic!("delete {id} failed: {e}"));
+            done += 1;
+        }
+        assert_eq!(done, DELETES);
+        let failures = publisher.await.expect("publisher task");
+        assert!(failures.is_empty(), "publishes failed: {failures:?}");
+        drop(guard);
+
+        let errors = capture.at_or_above(tracing::Level::ERROR);
+        assert!(
+            !errors.iter().any(|l| l.contains("dropping batch")),
+            "bus dropped a batch under bulk delete: {errors:?}"
+        );
+        for id in &ids {
+            assert!(
+                matches!(
+                    svc.get_workspace(id.clone()).await,
+                    Err(intent_core::Error::NotFound(_))
+                ),
+                "{id} deleted"
+            );
+        }
     }
 }
 
@@ -42038,6 +43228,7 @@ mod agent_delete_grace_window {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             created_at: ts.clone(),
             updated_at: ts,
         }
@@ -42369,7 +43560,7 @@ mod agent_delete_grace_window {
     /// agent deletion. The session dies with the workspace cascade
     /// (`agent:deleted`), the agent timer never fires on its own, and no
     /// `agent:delete-cancelled` is emitted.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_delete_supersedes_pending_agent_deletes() {
         let h = harness().await;
         let mut sub = h.bus.subscribe(crate::SubscriptionFilter {
@@ -43007,6 +44198,7 @@ mod derived_workspace_unread {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -43124,7 +44316,7 @@ mod derived_workspace_unread {
     /// Read paths serve the derivation: an unseen assistant last message
     /// reads `unread` even when the stored flag is `none`, and a stale
     /// stored `unread` reads `none` once every marker is caught up.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn reads_serve_derived_attention_over_stored_flag() {
         let h = harness().await;
         // Derived unread, stored none.
@@ -43153,7 +44345,7 @@ mod derived_workspace_unread {
 
     /// Stored `review_required` always wins over the derivation — in both
     /// directions (derived unread and derived none).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn review_required_wins_over_derivation() {
         let h = harness().await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -43179,7 +44371,7 @@ mod derived_workspace_unread {
     /// `agent.markSeen` partial vs final clear: reading one of two unread
     /// agents stays silent; reading the last one clears the stored flag and
     /// emits exactly one `workspace:attention-changed { none }`.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_mark_seen_partial_then_final_clear() {
         let h = harness().await;
         let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -43235,7 +44427,7 @@ mod derived_workspace_unread {
     /// The final `agent.markSeen` clears the derived state even when the
     /// stored flag was never raised (e.g. the turn-end raise was skipped):
     /// clients tracking the derived value still get the clear.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_mark_seen_emits_clear_without_stored_flag() {
         let h = harness().await;
         let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -43257,7 +44449,7 @@ mod derived_workspace_unread {
     /// `workspace.markSeen` advances every top-level session's marker to its
     /// `last_message_id` (background/child sessions untouched), clears the
     /// derived + stored unread, and emits exactly one attention-changed.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_mark_seen_marks_all_top_level_sessions() {
         let h = harness().await;
         let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -43338,7 +44530,7 @@ mod derived_workspace_unread {
     /// bumping that session's `updated_at`, so the derived workspace
     /// `lastActivity` (max over session `updated_at`) stays put and the
     /// workspace is not re-sorted to the top merely for being opened.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_mark_seen_does_not_bump_session_updated_at() {
         let h = harness().await;
         let last = seed_pinned_unseen_session(&h, "agent-a").await;
@@ -43401,7 +44593,7 @@ mod derived_workspace_unread {
 
     /// The turn-end raise still only emits on the none→unread transition
     /// (guarded write), and the derivation agrees with the raise.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn turn_end_raise_transition_only() {
         let h = harness().await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -43432,7 +44624,7 @@ mod derived_workspace_unread {
     /// unread session while parked, and asserts the atomic clear declines —
     /// stored flag still `unread`, no `{ none }` emit — so subscribers never
     /// believe the workspace is caught up while the derivation reads unread.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn settle_race_new_message_in_gap_never_clears() {
         use std::sync::Arc;
         let park = Arc::new(crate::script_ops::SupervisePark::default());
@@ -43564,7 +44756,7 @@ mod derived_workspace_unread {
     /// exactly one `workspace:attention-changed { none }`, reads serve
     /// `none`. `agent.restore` is SILENT: no stored-flag change and no
     /// attention event — reads re-derive `unread` for the restored session.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_retire_settles_unread_and_restore_is_silent() {
         let h = harness().await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -43611,7 +44803,7 @@ mod derived_workspace_unread {
 
     /// Retiring one of two unread top-level sessions is a partial read:
     /// nothing is emitted at the workspace level and the stored flag stays.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_retire_partial_stays_silent() {
         let h = harness().await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -43661,7 +44853,7 @@ mod derived_workspace_unread {
     /// window — under load that starved the second window wait about
     /// 1 in 8 runs. Only once both writes have landed are the settles
     /// released into the attention-write park.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_retire_concurrent_unread_sessions_settle_exactly_once() {
         use std::sync::Arc;
         let entry = Arc::new(crate::script_ops::SupervisePark::default());
@@ -43726,7 +44918,7 @@ mod derived_workspace_unread {
     /// was never raised (e.g. the turn-end raise was skipped): the guarded
     /// clear has nothing to write, so the fallback emits the one `{ none }`
     /// clients tracking the derived value still need.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_retire_emits_clear_without_stored_flag() {
         let h = harness().await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -43759,7 +44951,7 @@ mod derived_workspace_unread {
     /// own re-probes fail too and it stays silent either way; the retire
     /// assertions confirm the write still lands and the stored flag is
     /// untouched.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_retire_probe_failure_fails_closed() {
         let h = harness().await;
         let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -43806,7 +44998,7 @@ mod derived_workspace_unread {
 
     /// A stored `review_required` is never touched by retire or restore:
     /// no attention event, stored and served value unchanged.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn agent_retire_and_restore_leave_review_required_untouched() {
         let h = harness().await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
@@ -44153,5 +45345,321 @@ mod local_changes {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+}
+
+/// `with_idempotency` under concurrency: same-key first-use callers are
+/// serialized per `(workspace_id, key)` so `op` runs exactly once and every
+/// caller observes the stored result; errors stay uncached; unrelated keys
+/// never wait on each other.
+mod idempotency_serialization {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use intent_core::{Error, Result};
+    use intent_store::Store;
+
+    use super::TempDb;
+    use crate::{with_idempotency, IdempotencyInflight};
+
+    /// A racing caller's observable checkpoints: `entered` fires
+    /// synchronously right before `with_idempotency` is called, `started`
+    /// fires from inside `op`, and `op` then parks until `release` opens.
+    struct Race {
+        store: Store,
+        inflight: Arc<IdempotencyInflight>,
+        calls: Arc<AtomicUsize>,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    struct Checkpoints {
+        entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+        started: tokio::sync::mpsc::UnboundedReceiver<()>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    fn race(store: Store) -> (Arc<Race>, Checkpoints) {
+        let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        (
+            Arc::new(Race {
+                store,
+                inflight: Arc::new(IdempotencyInflight::default()),
+                calls: Arc::new(AtomicUsize::new(0)),
+                entered: entered_tx,
+                started: started_tx,
+                release: release_rx,
+            }),
+            Checkpoints {
+                entered: entered_rx,
+                started: started_rx,
+                release: release_tx,
+            },
+        )
+    }
+
+    async fn wait_open(mut release: tokio::sync::watch::Receiver<bool>) {
+        while !*release.borrow_and_update() {
+            release.changed().await.expect("release gate dropped");
+        }
+    }
+
+    impl Race {
+        /// Spawn a caller on `key` whose `op` (call number `n`, 1-based)
+        /// yields `outcome(n)` once the gate opens.
+        fn spawn(
+            self: &Arc<Self>,
+            key: &str,
+            outcome: fn(usize) -> Result<serde_json::Value>,
+        ) -> tokio::task::JoinHandle<Result<serde_json::Value>> {
+            let race = self.clone();
+            let key = key.to_string();
+            tokio::spawn(async move {
+                let op_race = race.clone();
+                race.entered.send(()).expect("entered checkpoint");
+                with_idempotency(
+                    &race.inflight,
+                    &race.store,
+                    "",
+                    Some(key),
+                    "test.op",
+                    move || async move {
+                        let n = op_race.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        op_race.started.send(()).expect("started checkpoint");
+                        wait_open(op_race.release.clone()).await;
+                        outcome(n)
+                    },
+                )
+                .await
+            })
+        }
+
+        /// Yield until `n` callers hold or await `key`'s lock — i.e. a
+        /// second caller is provably parked behind the first.
+        async fn wait_holders(&self, key: &str, n: usize) {
+            while self.holders(key) < n {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        fn holders(&self, key: &str) -> usize {
+            self.inflight.holders(&(String::new(), key.to_string()))
+        }
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the `outcome` fn-pointer shape"
+    )]
+    fn winner(n: usize) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({ "call": n }))
+    }
+
+    /// Two callers racing one fresh key while the first `op` is provably in
+    /// flight: the second must wait on the key and then observe the stored
+    /// result, never run `op` a second time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_first_use_runs_op_once() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store.clone());
+
+        let first = race.spawn("race-key", winner);
+        cp.entered.recv().await.expect("first entered");
+        cp.started.recv().await.expect("first op in flight");
+        let second = race.spawn("race-key", winner);
+        cp.entered
+            .recv()
+            .await
+            .expect("second caller entered while the first op is parked");
+        race.wait_holders("race-key", 2).await;
+        cp.release.send(true).expect("open gate");
+
+        let first = first.await.expect("join").expect("first result");
+        let second = second.await.expect("join").expect("second result");
+        assert_eq!(
+            race.calls.load(Ordering::SeqCst),
+            1,
+            "op ran more than once for one key"
+        );
+        assert_eq!(first, second, "both callers observe the stored result");
+        assert_eq!(first["call"], 1);
+        assert_eq!(
+            store.get_idempotent("", "race-key").await.expect("lookup"),
+            Some(serde_json::to_string(&first).unwrap()),
+            "the single result is what was persisted"
+        );
+        assert!(
+            race.inflight.is_empty(),
+            "in-flight entry is dropped once every caller is done"
+        );
+    }
+
+    /// Errors are not cached: when the first caller's `op` fails, a same-key
+    /// caller that was waiting runs `op` itself and its success is stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_first_op_does_not_poison_waiting_caller() {
+        fn fail_first(n: usize) -> Result<serde_json::Value> {
+            if n == 1 {
+                Err(Error::Internal("first attempt failed".to_string()))
+            } else {
+                Ok(serde_json::json!({ "call": n }))
+            }
+        }
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store.clone());
+
+        let first = race.spawn("fail-key", fail_first);
+        cp.entered.recv().await.expect("first entered");
+        cp.started.recv().await.expect("first op in flight");
+        let second = race.spawn("fail-key", fail_first);
+        cp.entered.recv().await.expect("second entered");
+        race.wait_holders("fail-key", 2).await;
+        cp.release.send(true).expect("open gate");
+
+        let first = first.await.expect("join");
+        let second = second.await.expect("join");
+        assert!(
+            matches!(first, Err(Error::Internal(_))),
+            "first caller surfaces its op error: {first:?}"
+        );
+        let second = second.expect("waiting caller runs op itself");
+        assert_eq!(second["call"], 2);
+        assert_eq!(race.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store.get_idempotent("", "fail-key").await.expect("lookup"),
+            Some(serde_json::to_string(&second).unwrap()),
+            "only the success is persisted"
+        );
+        assert!(race.inflight.is_empty());
+    }
+
+    /// The lock is per key: a caller on an unrelated key completes while
+    /// another key's first `op` is still parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unrelated_keys_do_not_serialize() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store.clone());
+
+        let held = race.spawn("held-key", winner);
+        cp.entered.recv().await.expect("held entered");
+        cp.started.recv().await.expect("held op in flight");
+
+        let other = tokio::time::timeout(
+            Duration::from_secs(30),
+            with_idempotency(
+                &race.inflight,
+                &store,
+                "",
+                Some("other-key".to_string()),
+                "test.op",
+                || async { Ok::<_, Error>(serde_json::json!({ "other": true })) },
+            ),
+        )
+        .await
+        .expect("unrelated key must not wait on the held key")
+        .expect("other result");
+        assert_eq!(other["other"], true);
+
+        assert_eq!(
+            race.holders("held-key"),
+            1,
+            "the unrelated call never touched the held key"
+        );
+
+        cp.release.send(true).expect("open gate");
+        let held = held.await.expect("join").expect("held result");
+        assert_eq!(held["call"], 1);
+        assert!(race.inflight.is_empty());
+    }
+
+    /// A waiter cancelled while parked on the key's lock releases its hold
+    /// at once (the holder's count drops back to 1), and the entry is pruned
+    /// when the holder itself finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_waiter_releases_hold_and_entry_is_pruned() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (race, mut cp) = race(store);
+
+        let holder = race.spawn("k", winner);
+        cp.entered.recv().await.expect("holder entered");
+        cp.started.recv().await.expect("holder op in flight");
+
+        let waiter = race.spawn("k", winner);
+        cp.entered.recv().await.expect("waiter entered");
+        race.wait_holders("k", 2).await;
+
+        waiter.abort();
+        assert!(
+            waiter.await.expect_err("aborted").is_cancelled(),
+            "waiter was cancelled while parked"
+        );
+        assert_eq!(
+            race.holders("k"),
+            1,
+            "the cancelled waiter no longer holds the key"
+        );
+
+        cp.release.send(true).expect("open gate");
+        let held = holder.await.expect("join").expect("holder result");
+        assert_eq!(held["call"], 1);
+        assert_eq!(race.calls.load(Ordering::SeqCst), 1, "op ran once");
+        assert!(
+            race.inflight.is_empty(),
+            "entry pruned once the last holder released"
+        );
+    }
+
+    /// Same-key slots dropped at the same instant must leave the registry
+    /// empty. Pruning has to release the dropping slot's ref under the
+    /// registry mutex: checking the count first and letting the ref drop
+    /// after `Drop::drop` returned lets two concurrent drops each see the
+    /// other's ref, both skip removal, and leak the entry for good.
+    #[test]
+    fn concurrent_slot_drops_prune_the_entry() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 2_000;
+
+        let inflight = IdempotencyInflight::default();
+        let key = (String::new(), "k".to_string());
+        // Three phases per round: all entered → all dropped → checked.
+        let barrier = std::sync::Barrier::new(THREADS + 1);
+
+        // Recorded rather than asserted inside the scope so a failure does
+        // not leave the workers parked on the barrier.
+        let mut leaked_round = None;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        let slot = inflight.enter(key.clone());
+                        barrier.wait();
+                        drop(slot);
+                        barrier.wait();
+                        barrier.wait();
+                    }
+                });
+            }
+            for round in 0..ROUNDS {
+                barrier.wait();
+                barrier.wait();
+                if leaked_round.is_none() && !inflight.is_empty() {
+                    leaked_round = Some((round, inflight.holders(&key)));
+                }
+                barrier.wait();
+            }
+        });
+        assert_eq!(
+            leaked_round, None,
+            "(round, holders): entry leaked after every slot dropped"
+        );
     }
 }

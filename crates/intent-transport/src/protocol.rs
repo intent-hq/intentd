@@ -475,12 +475,42 @@
 //! update check (SIGUSR2, rate-limited, only while no turn is in flight) and
 //! exits for a staged update only once idle; `system.requestUpdate`
 //! (SIGUSR1) still restarts immediately. No method-catalog change.
+//!
+//! Version 10.3 adds multiplayer (additive; staged as 9.14 / 9.15 while
+//! main moved to 10.x). Principals (multiplayer w1): every connection
+//! is bound to a principal at admission (UDS and the legacy bearer token →
+//! the primary user; a hashed per-principal credential → its principal) and
+//! `principal.me` returns that binding
+//! (`{ id, login?, displayName?, avatarUrl?, isAdministrator }`).
+//! `workspace.get` / `workspace.list` rows carry the flattened membership
+//! summary `ownerPrincipalId?`, `myRole?` (`owner` | `collaborator`, relative
+//! to the caller), `memberCount`, `openInviteCount`.
+//!
+//! Also within 10.3, invite links and the identity-only join
+//! (multiplayer w4): `workspace.invite.create` (fast path; returns the
+//! `intent://invite?…` link — the pair envelope minus the bearer token plus
+//! `inviteId` / `secret`, the secret exactly once), `workspace.invite.list` /
+//! `workspace.invite.revoke`, `workspace.members.leave`, `principal.revokeSelf`
+//! (closes the caller's own connections), and the unauthenticated `/invite`
+//! WSS endpoint serving only `invite.redeem` (`{ inviteId, secret }` → device
+//! codes; `{ flowId }` → the collaborator credential once). Invite refusals
+//! carry `error.data.code` (`invite-expired`, `invite-revoked`,
+//! `invite-redeemed`, `invite-pin-mismatch`, `invite-flow-denied`, …). Also
+//! within 10.3, ephemeral presence (multiplayer w5): `presence.update` /
+//! `note.presence.update` (fast path), `presence.snapshot`, and the
+//! `note.presence.subscribe` / `note.presence.unsubscribe` channel pair. The
+//! catalog contains 323 router methods, 53 fast-path methods, and two
+//! aliases: 378 client-callable names.
+
+//! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
+//! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release
+//! installs are asynchronous and never fall back to channel updates.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.2";
+pub const PROTOCOL_VERSION: &str = "10.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

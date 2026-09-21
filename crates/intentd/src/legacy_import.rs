@@ -632,7 +632,9 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
                 let seen = seen.clone();
                 let dir = dir.clone();
                 let manifest = manifest.clone();
-                tokio::spawn(async move { import_one(&store, &dir, &manifest, &opts, &seen).await })
+                intent_core::spawn_daemon(async move {
+                    import_one(&store, &dir, &manifest, &opts, &seen).await
+                })
             };
             match task.await {
                 Ok((claimed, entry)) => {
@@ -1727,6 +1729,7 @@ fn session_from_legacy_json(
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         created_at,
         updated_at,
     };

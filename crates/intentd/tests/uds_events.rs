@@ -98,7 +98,7 @@ async fn wait_for_subscriber_count(bus: &EventBus, target: usize) {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn subscribe_push_filter_unsubscribe_and_disconnect_cleanup() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -112,7 +112,7 @@ async fn subscribe_push_filter_unsubscribe_and_disconnect_cleanup() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -215,11 +215,29 @@ async fn rpc(
     resp["result"].clone()
 }
 
+/// The actor the daemon stamps on the UDS caller's own actions: UDS binds the
+/// primary principal, and every bound wire principal's event carries
+/// `{ type: user, id: principalId, name }` (multiplayer w4) — the name is
+/// the GitHub login, else the display name, else the id.
+async fn primary_actor(bus: &EventBus) -> Value {
+    let p = bus
+        .store()
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+    let name = p
+        .login
+        .clone()
+        .or(p.display_name.clone())
+        .unwrap_or_else(|| p.id.0.clone());
+    json!({ "type": "user", "id": p.id, "name": name })
+}
+
 /// End-to-end change-event proof (M2.6): one connection subscribes; another runs
 /// CRUD across workspace/note/task/comment over JSON-RPC; the subscriber receives
 /// the matching `events.event` notifications with the camelCase envelope + payload
 /// shapes the iOS client expects (PROTOCOL §6.5).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn crud_mutations_emit_change_events_over_uds() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -237,7 +255,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -305,10 +323,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(e["workspaceId"], ws_id.as_str());
     assert!(e["id"].is_string());
     assert!(e["timestamp"].is_string());
-    assert_eq!(
-        e["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(e["actor"], primary_actor(&bus).await);
     assert_eq!(
         e["data"],
         json!({ "noteId": note_id, "title": "Note", "action": "create" })
@@ -350,10 +365,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
     let ev = read_json(&mut sub_reader).await;
     let e = &ev["params"]["event"];
     assert_eq!(e["type"], "task:created");
-    assert_eq!(
-        e["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(e["actor"], primary_actor(&bus).await);
     assert_eq!(e["data"]["noteId"], note_id.as_str());
     assert_eq!(e["data"]["noteTitle"], "Note");
     assert_eq!(e["data"]["status"], "not_started");
@@ -469,7 +481,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
 /// on the `workspace:*` family (no workspace filter — the id is minted by the
 /// create) receives the event with the self-sufficient `{ workspaceId,
 /// workspace }` payload (§6.7) matching the RPC result.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_emits_workspace_created() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -486,7 +498,7 @@ async fn workspace_create_emits_workspace_created() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -529,10 +541,7 @@ async fn workspace_create_emits_workspace_created() {
     assert_eq!(e["workspaceId"], ws_id.as_str());
     assert!(e["id"].is_string());
     assert!(e["timestamp"].is_string());
-    assert_eq!(
-        e["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(e["actor"], primary_actor(&bus).await);
     // Self-sufficient payload: the event carries the same Workspace the RPC
     // result returned, so clients render it without a follow-up read.
     assert_eq!(e["data"]["workspaceId"], ws_id.as_str());
@@ -546,7 +555,7 @@ async fn workspace_create_emits_workspace_created() {
 /// carries the applied `WorkspaceUpdate` delta as `changes` (reference-parity
 /// FE emitter), so a subscriber can mirror the mutation without a follow-up
 /// `workspace.get` read.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_update_emits_workspace_updated_with_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -563,7 +572,7 @@ async fn workspace_update_emits_workspace_updated_with_delta() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -621,10 +630,7 @@ async fn workspace_update_emits_workspace_updated_with_delta() {
     assert_eq!(e["workspaceId"], ws_id.as_str());
     assert!(e["id"].is_string());
     assert!(e["timestamp"].is_string());
-    assert_eq!(
-        e["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(e["actor"], primary_actor(&bus).await);
     // `changes` is the applied WorkspaceUpdate delta only (Option::is_none
     // fields are skipped in serialization), so absent fields do not leak.
     assert_eq!(
@@ -642,7 +648,7 @@ async fn workspace_update_emits_workspace_updated_with_delta() {
 /// `workspace.delete` emits `workspace:deleted` (PROTOCOL §6.5): minimal
 /// `{ workspaceId }` payload (reference-parity FE emitter). The event fires
 /// only after the store row is actually removed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_delete_emits_workspace_deleted() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -659,7 +665,7 @@ async fn workspace_delete_emits_workspace_deleted() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {

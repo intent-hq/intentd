@@ -20,7 +20,7 @@ pub mod token;
 
 use async_trait::async_trait;
 
-pub use device_flow::{DeviceFlow, PollStatus};
+pub use device_flow::{DeviceFlow, IdentityFlow, IdentityPollStatus, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use model::{
@@ -29,7 +29,7 @@ pub use model::{
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
     PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
     ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
-    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
 pub use token::TokenSource;
@@ -66,6 +66,15 @@ pub trait SourceControl: Send + Sync {
 
     /// Authenticated user identity (`GET /user`). Backs `github.getUser`.
     async fn get_user(&self) -> Result<UserIdentity>;
+
+    /// Public profile of another account by login (`GET /users/{login}`),
+    /// used to resolve an invite pin to a stable account id (multiplayer w4).
+    /// [`Error::NotFound`] when no account has that login.
+    async fn get_user_by_login(&self, login: &str) -> Result<UserIdentity> {
+        Err(Error::Unsupported(format!(
+            "user lookup by login is not supported by this provider (login {login:?})"
+        )))
+    }
 
     // --- Repositories ---
 
@@ -171,9 +180,11 @@ pub trait SourceControl: Send + Sync {
     ///
     /// Sub-reads degrade individually — unreadable branch rules yield
     /// `branch_rules: None`, a missing rollup yields `checks_known: false` —
-    /// so a partially-visible forge still produces a usable probe. Hosts
-    /// without the signals return [`Error::Unsupported`] (the default
-    /// implementation).
+    /// so a partially-visible forge still produces a usable probe. Quota
+    /// exhaustion is the one non-degrading failure: [`Error::RateLimited`]
+    /// from any sub-read propagates so callers pause instead of persisting
+    /// a degraded probe as a successful read. Hosts without the signals
+    /// return [`Error::Unsupported`] (the default implementation).
     async fn merge_requirements(
         &self,
         _repo: &RepoRef,

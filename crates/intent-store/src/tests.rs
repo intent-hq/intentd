@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use intent_core::{
     events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientHostInfo,
     ClientId, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType,
-    Error, EventActor, Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor,
-    NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    Error, EventActor, Hook, HookId, HookListRow, HookState, Note, NoteId, NoteMetadata,
+    NoteVersionAuthor, NoteVisibility, Principal, PrincipalId, TaskMetadata, TaskStatus, Workspace,
+    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceRole, WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -83,11 +83,13 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -4121,6 +4123,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,
@@ -6358,11 +6361,13 @@ async fn concurrent_writes_no_sqlite_busy() {
                     token_usage: None,
                     cow_supported: None,
                     browser_client_id: None,
+                    pull_requests_total: None,
                     display_status: None,
                     waiting: false,
                     checkout_mode: None,
                     disk_usage: None,
                     pending_delete_at: None,
+                    membership: None,
                 };
                 store.insert_workspace(&workspace).await
             })
@@ -7276,6 +7281,87 @@ async fn hook_list_filters_by_workspace_and_agent() {
     assert!(empty.is_empty());
 }
 
+/// `list_hook_rows` (the `hook.list` read) filters by state in SQL — active
+/// rows only by default — and hydrates the heavy `code` / `last_logs` /
+/// `last_state` columns only for active rows: with `include_retired` the
+/// terminal rows come back as the light `HookSummary`, oldest first among
+/// the full rows, scoped to the workspace and optionally one agent.
+#[tokio::test]
+async fn hook_list_rows_filters_state_in_sql_and_lightens_retired() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+    let (ws_other, agent_other) = seed_hook_owner(&store).await;
+
+    let mut done = sample_hook(&HookId("hook-done".into()), &ws, &agent, "done");
+    done.state = HookState::Dispatched;
+    done.created_at = "2026-01-01T00:00:00Z".to_string();
+    done.last_logs = Some("fired".to_string());
+    done.last_state = Some("{\"n\":1}".to_string());
+    done.last_error = Some("boom".to_string());
+    done.run_count = 3;
+    done.dispatch_count = 1;
+    let mut sched = sample_hook(&HookId("hook-sched".into()), &ws, &agent, "sched");
+    sched.created_at = "2026-01-01T00:00:01Z".to_string();
+    sched.last_state = Some("{\"n\":2}".to_string());
+    let mut other_agent = sample_hook(&HookId("hook-other".into()), &ws, &agent_other, "peer");
+    other_agent.created_at = "2026-01-01T00:00:02Z".to_string();
+    let other_ws = sample_hook(&HookId("hook-ws-b".into()), &ws_other, &agent_other, "b");
+    for h in [&done, &sched, &other_agent, &other_ws] {
+        store.insert_hook(h).await.expect("insert hook");
+    }
+
+    let active = store
+        .list_hook_rows(&ws, None, false)
+        .await
+        .expect("active rows");
+    assert_eq!(
+        active,
+        vec![
+            HookListRow::Active(sched.clone()),
+            HookListRow::Active(other_agent.clone())
+        ]
+    );
+
+    let active_mine = store
+        .list_hook_rows(&ws, Some(&agent), false)
+        .await
+        .expect("active rows for agent");
+    assert_eq!(active_mine, vec![HookListRow::Active(sched.clone())]);
+
+    let all_mine = store
+        .list_hook_rows(&ws, Some(&agent), true)
+        .await
+        .expect("all rows for agent");
+    assert_eq!(all_mine.len(), 2, "{all_mine:?}");
+    match &all_mine[0] {
+        HookListRow::Retired(light) => {
+            assert_eq!(light.hook_id, done.hook_id);
+            assert_eq!(light.state, HookState::Dispatched);
+            assert_eq!(light.name, "done");
+            assert_eq!(light.last_error.as_deref(), Some("boom"));
+            assert_eq!(light.run_count, 3);
+            assert_eq!(light.dispatch_count, 1);
+            assert_eq!(light.created_at, done.created_at);
+            let wire = json!(light);
+            for heavy in ["code", "lastLogs", "lastState"] {
+                assert!(
+                    wire.get(heavy).is_none(),
+                    "light row carries {heavy}: {wire}"
+                );
+            }
+        }
+        other @ HookListRow::Active(_) => panic!("retired row expected first, got {other:?}"),
+    }
+    assert_eq!(all_mine[1], HookListRow::Active(sched.clone()));
+
+    let none = store
+        .list_hook_rows(&ws, Some(&AgentId("agent-none".to_string())), true)
+        .await
+        .expect("no rows");
+    assert!(none.is_empty());
+}
+
 /// `count_active_hooks_by_agent` counts only `scheduled`/`running` rows for
 /// the given agent — terminal rows and other agents' hooks are excluded, and
 /// an unknown agent counts zero.
@@ -7763,4 +7849,913 @@ async fn clear_advisory_wake_deliveries_for_children_matches_child_side_only() {
         "a marker where the listed id is only the parent survives"
     );
     assert!(has(&other, &parent).await, "unrelated pair survives");
+}
+
+// ─── principals / membership / credentials (migration 0125) ────────────────
+
+/// A fresh database has exactly one primary principal (GitHub identity
+/// unlinked), and reopening the store neither re-mints nor rotates it.
+#[tokio::test]
+async fn primary_principal_is_minted_once() {
+    let tmp = TempDb::new();
+    let first = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let p = store.get_primary_principal().await.expect("primary");
+        assert!(p.is_primary);
+        assert_eq!(p.github_user_id, None);
+        assert_eq!(p.login, None);
+        assert_eq!(store.list_principals().await.expect("list").len(), 1);
+        store.close().await;
+        p
+    };
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let again = store.get_primary_principal().await.expect("primary");
+    assert_eq!(again, first, "reopen keeps the same primary principal");
+    assert_eq!(store.list_principals().await.expect("list").len(), 1);
+
+    // A second primary is rejected by the partial unique index.
+    let dup = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: None,
+        display_name: None,
+        avatar_url: None,
+        is_primary: true,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    assert!(store.upsert_principal(&dup).await.is_err());
+    assert_eq!(store.list_principals().await.expect("list").len(), 1);
+}
+
+/// Migration 0125 applies cleanly on an existing, populated database: after
+/// rewinding to the 0124 schema with two workspaces present, reopening the
+/// store mints the primary principal and makes it owner (and legacy author)
+/// of every existing workspace.
+#[tokio::test]
+async fn principals_migration_backfills_existing_workspaces() {
+    let tmp = TempDb::new();
+    let ws_a = WorkspaceId::from("ws-mig-a");
+    let ws_b = WorkspaceId::from("ws-mig-b");
+    {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        for sql in [
+            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126)",
+            "DROP TRIGGER workspace_owner_default_ai",
+            "DROP TABLE principal_credential",
+            "DROP TABLE workspace_member",
+            "DROP TABLE principal",
+            "ALTER TABLE workspace DROP COLUMN owner_principal_id",
+            "ALTER TABLE workspace DROP COLUMN legacy_author_principal_id",
+        ] {
+            sqlx::query(sql)
+                .execute(store.write_pool())
+                .await
+                .unwrap_or_else(|e| panic!("rewind `{sql}`: {e}"));
+        }
+        store
+            .insert_workspace(&sample_workspace(&ws_a, "A", false))
+            .await
+            .expect("insert a");
+        store
+            .insert_workspace(&sample_workspace(&ws_b, "B", true))
+            .await
+            .expect("insert b");
+        store.close().await;
+    }
+
+    let store = Store::open(&tmp.path).await.expect("reopen applies 0125");
+    let status = store.migration_status().await.expect("status");
+    assert!(status.is_current(), "all migrations applied: {status:?}");
+    let primary = store.get_primary_principal().await.expect("primary");
+    for ws in [&ws_a, &ws_b] {
+        assert_eq!(
+            store
+                .get_workspace_owner_principal_id(ws)
+                .await
+                .expect("owner"),
+            Some(primary.id.clone()),
+            "{ws} owner column backfilled"
+        );
+        let legacy: Option<String> =
+            sqlx::query("SELECT legacy_author_principal_id FROM workspace WHERE id = ?")
+                .bind(&ws.0)
+                .fetch_one(store.read_pool())
+                .await
+                .expect("legacy author")
+                .get(0);
+        assert_eq!(legacy.as_deref(), Some(primary.id.as_str()));
+        let members = store.list_workspace_members(ws).await.expect("members");
+        assert_eq!(members.len(), 1, "{ws} has exactly the owner membership");
+        assert_eq!(members[0].principal_id, primary.id);
+        assert_eq!(members[0].role, WorkspaceRole::Owner);
+    }
+}
+
+/// A workspace created after the migration gets the primary principal as
+/// owner via the insert trigger, but no legacy author; deleting the
+/// workspace cascades its memberships away.
+#[tokio::test]
+async fn new_workspace_defaults_owner_to_primary_principal() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let ws_id = WorkspaceId::from("ws-owner-default");
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "Owned", false))
+        .await
+        .expect("insert");
+
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(primary.id.clone())
+    );
+    let legacy: Option<String> =
+        sqlx::query("SELECT legacy_author_principal_id FROM workspace WHERE id = ?")
+            .bind(&ws_id.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("legacy author")
+            .get(0);
+    assert_eq!(
+        legacy, None,
+        "post-migration workspaces have no legacy author"
+    );
+    let members = store.list_workspace_members(&ws_id).await.expect("members");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].role, WorkspaceRole::Owner);
+    assert_eq!(members[0].principal_id, primary.id);
+
+    store.delete_workspace(&ws_id).await.expect("delete");
+    assert!(store
+        .list_workspace_members(&ws_id)
+        .await
+        .expect("members")
+        .is_empty());
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        None
+    );
+}
+
+/// Principal upsert links a GitHub identity and refreshes the cached profile
+/// without touching `is_primary`; lookup by GitHub id and by unknown id.
+#[tokio::test]
+async fn principal_upsert_links_github_identity() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let mut primary = store.get_primary_principal().await.expect("primary");
+    assert!(store
+        .find_principal_by_github_user_id(42)
+        .await
+        .expect("find")
+        .is_none());
+
+    primary.github_user_id = Some(42);
+    primary.login = Some("octocat".to_string());
+    primary.display_name = Some("The Octocat".to_string());
+    primary.avatar_url = Some("https://avatars.example/42".to_string());
+    primary.updated_at = "2026-02-02T00:00:00Z".to_string();
+    store.upsert_principal(&primary).await.expect("upsert");
+
+    let linked = store.get_principal(&primary.id).await.expect("get");
+    assert_eq!(linked, primary);
+    assert!(linked.is_primary, "upsert never clears the primary flag");
+    assert_eq!(
+        store
+            .find_principal_by_github_user_id(42)
+            .await
+            .expect("find")
+            .map(|p| p.id),
+        Some(primary.id.clone())
+    );
+
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(7),
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&guest).await.expect("insert guest");
+    let listed = store.list_principals().await.expect("list");
+    assert_eq!(listed.len(), 2);
+    assert!(listed[0].is_primary, "primary sorts first");
+
+    // A GitHub id already linked to another principal is rejected.
+    let clash = Principal {
+        github_user_id: Some(42),
+        ..guest.clone()
+    };
+    assert!(store.upsert_principal(&clash).await.is_err());
+
+    assert!(matches!(
+        store.get_principal(&PrincipalId::from("missing")).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+/// Membership add is idempotent, role changes are scoped to the pair,
+/// removal reports whether a row went away, unknown pairs surface as
+/// `NotFound` on role change, and a workspace has exactly one owner
+/// (migration `0126`): promoting a second member or adding a second owner
+/// is `InvalidInput` while the primary remains owner.
+#[tokio::test]
+async fn workspace_membership_add_set_role_remove() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let ws_id = WorkspaceId::from("ws-members");
+    let other_ws = WorkspaceId::from("ws-members-other");
+    for ws in [&ws_id, &other_ws] {
+        store
+            .insert_workspace(&sample_workspace(ws, "M", false))
+            .await
+            .expect("insert ws");
+    }
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(7),
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&guest).await.expect("insert guest");
+
+    assert!(store
+        .add_workspace_member(&ws_id, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add"));
+    assert!(
+        !store
+            .add_workspace_member(&ws_id, &guest.id, WorkspaceRole::Owner)
+            .await
+            .expect("re-add"),
+        "re-adding an existing member is a no-op"
+    );
+    let members = store.list_workspace_members(&ws_id).await.expect("members");
+    assert_eq!(
+        members
+            .iter()
+            .map(|m| (m.principal_id.clone(), m.role))
+            .collect::<Vec<_>>(),
+        vec![
+            (primary.id.clone(), WorkspaceRole::Owner),
+            (guest.id.clone(), WorkspaceRole::Collaborator),
+        ],
+        "owner first; re-add did not change the role"
+    );
+    assert_eq!(
+        store
+            .list_principal_memberships(&guest.id)
+            .await
+            .expect("memberships")
+            .iter()
+            .map(|m| m.workspace_id.clone())
+            .collect::<Vec<_>>(),
+        vec![ws_id.clone()]
+    );
+
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws_id, &guest.id)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&other_ws, &guest.id)
+            .await
+            .expect("role"),
+        None
+    );
+
+    // Exactly one owner per workspace: the primary already owns it.
+    assert!(matches!(
+        store
+            .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        store
+            .add_workspace_member(&other_ws, &guest.id, WorkspaceRole::Owner)
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+    let members = store.list_workspace_members(&ws_id).await.expect("members");
+    assert_eq!(
+        members
+            .iter()
+            .map(|m| (m.principal_id.clone(), m.role))
+            .collect::<Vec<_>>(),
+        vec![
+            (primary.id.clone(), WorkspaceRole::Owner),
+            (guest.id.clone(), WorkspaceRole::Collaborator),
+        ],
+        "rejected promotion left the roles untouched"
+    );
+    // A same-role update (collaborator → collaborator) is scoped to the pair.
+    store
+        .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("no-op role update");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(primary.id.clone()),
+        "the current owner stays mirrored while it still holds the owner role"
+    );
+    store
+        .set_workspace_member_role(&ws_id, &primary.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("demote primary");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        None,
+        "demoting the only owner clears the mirrored column"
+    );
+    // With the owner seat free the earlier refusal no longer applies.
+    store
+        .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
+        .await
+        .expect("promote guest");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(guest.id.clone()),
+        "promoting a member into the free owner seat re-derives the column"
+    );
+    assert_eq!(
+        store
+            .list_workspace_members(&other_ws)
+            .await
+            .expect("other")
+            .len(),
+        1,
+        "role change is scoped to the workspace"
+    );
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&other_ws)
+            .await
+            .expect("other owner"),
+        Some(primary.id.clone()),
+        "owner mirror is scoped to the workspace"
+    );
+    assert!(matches!(
+        store
+            .set_workspace_member_role(&other_ws, &guest.id, WorkspaceRole::Collaborator)
+            .await,
+        Err(Error::NotFound(_))
+    ));
+
+    // Unknown principal / workspace are rejected by the FKs.
+    assert!(store
+        .add_workspace_member(
+            &ws_id,
+            &PrincipalId::from("nobody"),
+            WorkspaceRole::Collaborator
+        )
+        .await
+        .is_err());
+    assert!(store
+        .add_workspace_member(
+            &WorkspaceId::from("nowhere"),
+            &guest.id,
+            WorkspaceRole::Collaborator
+        )
+        .await
+        .is_err());
+
+    assert!(store
+        .remove_workspace_member(&ws_id, &guest.id)
+        .await
+        .expect("remove"));
+    assert!(!store
+        .remove_workspace_member(&ws_id, &guest.id)
+        .await
+        .expect("remove again"));
+    let members = store.list_workspace_members(&ws_id).await.expect("members");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].principal_id, primary.id);
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        None,
+        "removing the only owner clears the mirrored column"
+    );
+    store
+        .set_workspace_member_role(&ws_id, &primary.id, WorkspaceRole::Owner)
+        .await
+        .expect("re-promote primary");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(primary.id.clone()),
+        "promoting a member sets the mirrored column"
+    );
+    let outsider = Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(8),
+        login: Some("outsider".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store
+        .upsert_principal(&outsider)
+        .await
+        .expect("insert outsider");
+    store
+        .remove_workspace_member(&ws_id, &primary.id)
+        .await
+        .expect("remove primary");
+    assert!(store
+        .add_workspace_member(&ws_id, &outsider.id, WorkspaceRole::Owner)
+        .await
+        .expect("add owner"));
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(outsider.id.clone()),
+        "adding an owner member sets the mirrored column"
+    );
+}
+
+/// Promoting a second member to `owner` never flips the mirrored
+/// `workspace.owner_principal_id` away from the current owner, even when the
+/// newcomer's `added_at` sorts before the current owner's. `added_at` mixes
+/// the migration trigger's millisecond stamps with `now_iso()`'s nanosecond
+/// ones, so two rows written in the same millisecond order arbitrarily; the
+/// mirror must therefore prefer the current owner and only fall back to the
+/// earliest-added row once the current owner loses the role
+/// (intent-hq/intentd#1868). Under the one-owner index (migration `0126`)
+/// the second promotion is refused outright, so the mirror stays on the
+/// current owner and only moves once the seat is vacated and re-filled.
+#[tokio::test]
+async fn workspace_owner_mirror_keeps_current_owner_on_promotion() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let ws_id = WorkspaceId::from("ws-owner-tie");
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "T", false))
+        .await
+        .expect("insert ws");
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(9),
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&guest).await.expect("insert guest");
+    assert!(store
+        .add_workspace_member(&ws_id, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add"));
+    // Force the tie the wrong way: the guest's row now sorts before the
+    // primary's regardless of how the two timestamps were formatted.
+    sqlx::query(
+        "UPDATE workspace_member SET added_at = '2000-01-01T00:00:00Z' \
+         WHERE workspace_id = ? AND principal_id = ?",
+    )
+    .bind(&ws_id.0)
+    .bind(&guest.id.0)
+    .execute(store.write_pool())
+    .await
+    .expect("backdate guest");
+
+    assert!(matches!(
+        store
+            .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(primary.id.clone()),
+        "a refused second-owner promotion keeps the current owner mirrored"
+    );
+
+    store
+        .set_workspace_member_role(&ws_id, &primary.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("demote primary");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        None,
+        "once the current owner loses the role nothing is mirrored"
+    );
+    store
+        .set_workspace_member_role(&ws_id, &guest.id, WorkspaceRole::Owner)
+        .await
+        .expect("promote guest");
+    assert_eq!(
+        store
+            .get_workspace_owner_principal_id(&ws_id)
+            .await
+            .expect("owner"),
+        Some(guest.id.clone()),
+        "the backdated row is mirrored once it is the only owner"
+    );
+}
+
+/// Migration `0126` applies on a database that already holds several owner
+/// rows per workspace (the pre-index membership APIs allowed it): instead of
+/// aborting on the unique index it keeps one owner — the primary principal
+/// when present, else the earliest-added — demotes the rest to collaborator
+/// (nobody loses membership), and then installs the index.
+#[tokio::test]
+async fn one_owner_migration_repairs_duplicate_owners_before_indexing() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let with_primary = WorkspaceId::from("ws-dup-primary");
+    let without_primary = WorkspaceId::from("ws-dup-guests");
+    for ws in [&with_primary, &without_primary] {
+        store
+            .insert_workspace(&sample_workspace(ws, "D", false))
+            .await
+            .expect("insert ws");
+    }
+    let guest = |login: &str| Principal {
+        id: PrincipalId::from(format!("p-{login}")),
+        github_user_id: None,
+        login: Some(login.to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    let (early, late) = (guest("early"), guest("late"));
+    for p in [&early, &late] {
+        store.upsert_principal(p).await.expect("principal");
+    }
+
+    // Rewind to the pre-0126 shape and seed the duplicates the index forbids.
+    sqlx::query("DROP INDEX workspace_member_owner_uq")
+        .execute(store.write_pool())
+        .await
+        .expect("drop index");
+    for (ws, principal, added_at) in [
+        (&with_primary, &early.id, "2026-01-01T00:00:00Z"),
+        (&with_primary, &late.id, "2026-01-03T00:00:00Z"),
+        (&without_primary, &late.id, "2026-01-02T00:00:00Z"),
+        (&without_primary, &early.id, "2026-01-01T00:00:00Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO workspace_member (workspace_id, principal_id, role, added_at) \
+             VALUES (?, ?, 'owner', ?)",
+        )
+        .bind(&ws.0)
+        .bind(&principal.0)
+        .bind(added_at)
+        .execute(store.write_pool())
+        .await
+        .expect("seed duplicate owner");
+    }
+    // The trigger made the primary owner of `without_primary` too; take that
+    // row away so the workspace has only guest owners.
+    sqlx::query("DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?")
+        .bind(&without_primary.0)
+        .bind(&primary.id.0)
+        .execute(store.write_pool())
+        .await
+        .expect("remove primary membership");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/0126_one_owner_per_workspace.sql"
+    ))
+    .execute(store.write_pool())
+    .await
+    .expect("0126 repairs the duplicates instead of aborting");
+
+    let roles = |ws: &WorkspaceId| {
+        let store = store.clone();
+        let ws = ws.clone();
+        async move {
+            let mut members = store
+                .list_workspace_members(&ws)
+                .await
+                .expect("members")
+                .into_iter()
+                .map(|m| (m.principal_id.0, m.role))
+                .collect::<Vec<_>>();
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            members
+        }
+    };
+    let mut expected = vec![
+        ("p-early".to_string(), WorkspaceRole::Collaborator),
+        ("p-late".to_string(), WorkspaceRole::Collaborator),
+        (primary.id.0.clone(), WorkspaceRole::Owner),
+    ];
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        roles(&with_primary).await,
+        expected,
+        "the primary principal keeps ownership; the others are demoted"
+    );
+    assert_eq!(
+        roles(&without_primary).await,
+        vec![
+            ("p-early".to_string(), WorkspaceRole::Owner),
+            ("p-late".to_string(), WorkspaceRole::Collaborator),
+        ],
+        "without the primary, the earliest-added owner is kept"
+    );
+    // The index is in place again: a second owner is refused.
+    assert!(matches!(
+        store
+            .set_workspace_member_role(&without_primary, &late.id, WorkspaceRole::Owner)
+            .await,
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+/// `workspace_membership_summaries` is scoped to exactly the requested ids:
+/// workspaces outside the selection (e.g. archived rows `workspace.list`
+/// filters out) never appear, an empty selection issues no query, and the
+/// viewer's role / member count are computed per selected row
+/// (intent-hq/intentd#1868).
+#[tokio::test]
+async fn workspace_membership_summaries_scoped_to_requested_ids() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let selected = WorkspaceId::from("ws-summary-selected");
+    let shared = WorkspaceId::from("ws-summary-shared");
+    let archived = WorkspaceId::from("ws-summary-archived");
+    for (ws, is_archived) in [(&selected, false), (&shared, false), (&archived, true)] {
+        store
+            .insert_workspace(&sample_workspace(ws, "S", is_archived))
+            .await
+            .expect("insert ws");
+    }
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(9),
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store.upsert_principal(&guest).await.expect("insert guest");
+    assert!(store
+        .add_workspace_member(&shared, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("add"));
+
+    assert!(
+        store
+            .workspace_membership_summaries(Some(&primary.id), &[])
+            .await
+            .expect("empty selection")
+            .is_empty(),
+        "an empty selection yields no summaries"
+    );
+
+    let map = store
+        .workspace_membership_summaries(Some(&guest.id), &[selected.clone(), shared.clone()])
+        .await
+        .expect("summaries");
+    let mut keys: Vec<&str> = map.keys().map(|id| id.0.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![selected.0.as_str(), shared.0.as_str()],
+        "only the requested workspaces are summarised; the archived row is absent"
+    );
+    let selected_summary = &map[&selected];
+    assert_eq!(
+        selected_summary.owner_principal_id,
+        Some(primary.id.clone())
+    );
+    assert_eq!(selected_summary.member_count, 1);
+    assert_eq!(selected_summary.my_role, None, "guest is not a member");
+    let shared_summary = &map[&shared];
+    assert_eq!(shared_summary.member_count, 2);
+    assert_eq!(shared_summary.my_role, Some(WorkspaceRole::Collaborator));
+
+    let one = store
+        .workspace_membership_summaries(None, std::slice::from_ref(&archived))
+        .await
+        .expect("single");
+    assert_eq!(
+        one.len(),
+        1,
+        "an explicitly selected archived row is summarised"
+    );
+    assert_eq!(one[&archived].my_role, None, "no viewer, no role");
+    assert!(
+        store
+            .workspace_membership_summaries(None, &[WorkspaceId::from("nowhere")])
+            .await
+            .expect("unknown")
+            .is_empty(),
+        "unknown ids produce no rows"
+    );
+}
+
+/// Credentials are found by hash only, `touch` bumps `last_used_at` on
+/// active rows, and revoke flips exactly once while keeping the row so a
+/// replayed token reads as revoked rather than unknown.
+#[tokio::test]
+async fn principal_credential_insert_lookup_touch_revoke() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "a".repeat(64);
+    let other_hash = "b".repeat(64);
+
+    assert!(store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .is_none());
+    let created = store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+    assert_eq!(created.principal_id, primary.id);
+    assert!(created.is_active());
+    assert!(
+        store
+            .insert_principal_credential(&primary.id, &hash)
+            .await
+            .is_err(),
+        "duplicate hash rejected"
+    );
+    store
+        .insert_principal_credential(&primary.id, &other_hash)
+        .await
+        .expect("insert second");
+
+    let found = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("present");
+    assert_eq!(found, created);
+    assert!(store
+        .lookup_principal_credential("not-a-hash")
+        .await
+        .expect("lookup")
+        .is_none());
+
+    assert!(store
+        .touch_principal_credential(&hash)
+        .await
+        .expect("touch"));
+    let touched = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("present");
+    assert!(touched.last_used_at.is_some());
+
+    assert!(store
+        .revoke_principal_credential(&hash)
+        .await
+        .expect("revoke"));
+    assert!(
+        !store
+            .revoke_principal_credential(&hash)
+            .await
+            .expect("revoke again"),
+        "revoke is idempotent"
+    );
+    assert!(!store
+        .revoke_principal_credential("unknown")
+        .await
+        .expect("revoke unknown"));
+    let revoked = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("row kept after revoke");
+    assert!(!revoked.is_active());
+    assert!(revoked.revoked_at.is_some());
+    assert!(
+        !store
+            .touch_principal_credential(&hash)
+            .await
+            .expect("touch revoked"),
+        "revoked credentials are not touched"
+    );
+
+    let listed = store
+        .list_principal_credentials(&primary.id)
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.iter().filter(|c| c.is_active()).count(), 1);
+    assert_eq!(
+        listed
+            .iter()
+            .find(|c| c.is_active())
+            .map(|c| c.token_hash.as_str()),
+        Some(other_hash.as_str())
+    );
+}
+
+/// `resolve_active_principal_credential` is the single-statement
+/// resolve+touch behind the WSS bearer seam: an active hash resolves to its
+/// principal and records the use; an unknown or revoked hash resolves to
+/// `None` and leaves `last_used_at` untouched (intent-hq/intentd#1868).
+#[tokio::test]
+async fn resolve_active_principal_credential_touches_active_and_rejects_revoked() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    let hash = "d".repeat(64);
+    store
+        .insert_principal_credential(&primary.id, &hash)
+        .await
+        .expect("insert");
+
+    assert_eq!(
+        store
+            .resolve_active_principal_credential("unknown")
+            .await
+            .expect("resolve unknown"),
+        None
+    );
+    assert_eq!(
+        store
+            .resolve_active_principal_credential(&hash)
+            .await
+            .expect("resolve active"),
+        Some(primary.id.clone())
+    );
+    let touched = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("present");
+    assert!(touched.last_used_at.is_some(), "resolve records the use");
+
+    assert!(store
+        .revoke_principal_credential(&hash)
+        .await
+        .expect("revoke"));
+    assert_eq!(
+        store
+            .resolve_active_principal_credential(&hash)
+            .await
+            .expect("resolve revoked"),
+        None,
+        "a revoked credential never resolves"
+    );
+    let after = store
+        .lookup_principal_credential(&hash)
+        .await
+        .expect("lookup")
+        .expect("row kept after revoke");
+    assert_eq!(
+        after.last_used_at, touched.last_used_at,
+        "a rejected resolve does not touch the row"
+    );
 }

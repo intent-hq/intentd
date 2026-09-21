@@ -108,7 +108,7 @@ fn boot(
     );
     let api: Arc<dyn intent_core::WorkspaceApi> = services.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -291,7 +291,7 @@ fn is_terminal_delta(delta: &Value) -> bool {
     })
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_snapshot_matches_conversation_then_unsubscribe() {
     let (socket, server, shutdown_tx, _tmp, _services, _ws_root, _sock_dir) = setup().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
@@ -376,7 +376,7 @@ async fn chat_subscribe_snapshot_matches_conversation_then_unsubscribe() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_missing_agent_id_is_invalid_params() {
     let (socket, server, shutdown_tx, _tmp, _services, _ws_root, _sock_dir) = setup().await;
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
@@ -401,7 +401,7 @@ async fn chat_subscribe_missing_agent_id_is_invalid_params() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_isolates_snapshot_per_agent() {
     let (socket, server, shutdown_tx, _tmp, _services, _ws_root, _sock_dir) = setup().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
@@ -463,7 +463,7 @@ async fn chat_subscribe_isolates_snapshot_per_agent() {
 /// coalesce onto one block (added → updated), a tool call (`tool_use` → `tool_use`
 /// updated + `tool_result` added), then trailing text — persists the assistant
 /// message exactly as `run_prompt_turn` would, and finally emits `stream:end`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -704,7 +704,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
 /// the live-turn slot. Its first continuing chunk carries the FULL accumulated
 /// text (proving the delta state was seeded from the snapshot), and the
 /// snapshot + deltas reconcile to a fresh `agent.getConversation` snapshot.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -924,7 +924,6 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let _ = server.await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2104 — the end-to-end shape of the orphan-slot rule, deliberately
 /// superseding the Iter#1c heal-gate assertion this test used to make (that a
 /// live-turn slot with no busy claim is not merged AT ALL). The objection Iter#1c
@@ -934,7 +933,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
 /// is merged and `agent_is_busy` only decides the flag — over the wire, the
 /// orphan arrives as a NON-streaming message, and the STAB-125 turn-liveness
 /// fields stay gated on the busy claim, so nothing claims a turn is in flight.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_snapshot_serves_an_orphan_live_turn_as_a_non_streaming_message() {
     let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1065,12 +1064,11 @@ async fn chat_snapshot_serves_an_orphan_live_turn_as_a_non_streaming_message() {
     let _ = server.await;
 }
 
-#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// CS-4 cross-agent isolation: a `chat.subscribe` for agent A must NOT receive
 /// agent B's `agent:stream:*` events — the forwarder filters on
 /// `sessionId == agentId`. B's chunk is published first (and dropped); the next
 /// (and only) delta A's subscription sees is A's own chunk.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscription_isolates_stream_across_agents() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1163,7 +1161,7 @@ async fn chat_subscription_isolates_stream_across_agents() {
 /// `chat.subscribe` receives the block delta mapped from `chat:stream:delta`
 /// for the SAME turn — both fire for one chunk (the emit path publishes the
 /// delta plus, on the throttle's leading edge, the activity signal).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscription_coexists_with_events_firehose() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1283,7 +1281,7 @@ async fn chat_subscription_coexists_with_events_firehose() {
 /// and clobbering the interleaved text block for the rest of the turn. This
 /// test asserts that too — `{mid}:2` must never be emitted as a `tool_result` —
 /// while still exercising the genuine-orphan self-heal path via `{mid}:4`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1511,7 +1509,7 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
 /// newest 50 (the server default page), `truncated: true`,
 /// `totalMessages: 120`, and a non-null `nextToken` so older pages stay
 /// client-pulled via `agent.getConversation { nextToken }`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1629,7 +1627,7 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
 /// non-yielding `publish_transient` loop starves the delivery task, so the ring
 /// (capacity 1024) drops the oldest undelivered events — the tail published
 /// first — before the task ever runs.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;

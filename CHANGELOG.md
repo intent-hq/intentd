@@ -2,6 +2,129 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.85] - 2026-09-20
+
+### 🐛 Bug Fixes
+
+- *(services)* Bound auto-commit generation and cool down after timeouts ([#2009](https://github.com/intent-hq/intentd/pull/2009))
+- *(agent)* Surface and end mid-turn provider stalls (intent#5395) ([#2007](https://github.com/intent-hq/intentd/pull/2007))
+- Raise tokio worker stack size to 8 MiB for the daemon runtime ([#2011](https://github.com/intent-hq/intentd/pull/2011))
+
+
+## [0.9.84] - 2026-09-19
+
+### 🧪 Testing
+
+- *(events)* Drain FSEvents replay before the negative git-metadata assertion on macOS ([#2008](https://github.com/intent-hq/intentd/pull/2008))
+
+
+## [0.9.83] - 2026-09-19
+
+### 🚀 Features
+
+- *(rpc)* Slim agent.list / workspace.list rows, scope filter, push-side projection ([#2001](https://github.com/intent-hq/intentd/pull/2001))
+
+### 🐛 Bug Fixes
+
+- *(agent_session)* Raise blocker attention on post-output transient fetch failure ([#2004](https://github.com/intent-hq/intentd/pull/2004))
+
+
+## [0.9.82] - 2026-09-19
+
+### 🐛 Bug Fixes
+
+- *(services)* Serialize same-key first-use in with_idempotency ([#2000](https://github.com/intent-hq/intentd/pull/2000))
+
+
+## [0.9.81] - 2026-09-19
+
+### 🚀 Features
+
+- Support exact-version remote daemon updates ([#1941](https://github.com/intent-hq/intentd/pull/1941))
+
+
+## [0.9.80] - 2026-09-19
+
+### 🚀 Features
+
+- *(acp)* Add ws.workspace.applyProposal binding for agent-applied sibling proposals ([#1995](https://github.com/intent-hq/intentd/pull/1995))
+
+### 🐛 Bug Fixes
+
+- *(acp)* Make queued ws.agent.send durable past the eval budget ([#1994](https://github.com/intent-hq/intentd/pull/1994))
+- *(rpc_profile)* Budget agent.sendQueuedMessageNow / agent.resolveProposal on the compound tier ([#1993](https://github.com/intent-hq/intentd/pull/1993))
+
+### 🧪 Testing
+
+- *(acp)* Egress registry + contract test for AGENT_HIDDEN_FIELDS ([#1996](https://github.com/intent-hq/intentd/pull/1996))
+
+
+## [0.9.79] - 2026-09-18
+
+### 🚀 Features
+
+- *(agent)* Per-agent notificationsMuted flag with workspace rollup exclusion ([#1984](https://github.com/intent-hq/intentd/pull/1984))
+
+
+## [0.9.78] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(transport)* Drop Chief workspace from workspace subscription deltas ([#1989](https://github.com/intent-hq/intentd/pull/1989))
+- *(agent)* Skip preemption when no live turn is registered ([#1991](https://github.com/intent-hq/intentd/pull/1991))
+- *(pr-monitor)* Dedupe same-name check runs so a cancelled duplicate cannot flap the checklist ([#1985](https://github.com/intent-hq/intentd/pull/1985))
+
+
+## [0.9.77] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(events)* Give the bus writer a wall-clock retry budget so bulk workspace.delete never drops a batch ([#1980](https://github.com/intent-hq/intentd/pull/1980))
+
+### ⚙️ Miscellaneous Tasks
+
+- Isolate pwsh startup cache in install.ps1 guard tests ([#1982](https://github.com/intent-hq/intentd/pull/1982))
+
+
+## [0.9.76] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(acp)* Classify missing bare-command launches and harden Antigravity e2es under load ([#1978](https://github.com/intent-hq/intentd/pull/1978))
+
+
+## [0.9.75] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(git)* Remove origin and overlay-fetch safely under a global remote.origin.prune ([#1975](https://github.com/intent-hq/intentd/pull/1975))
+
+
+## [0.9.74] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- Make agent questions and blockers plain and self-contained ([#1798](https://github.com/intent-hq/intentd/pull/1798))
+
+
+## [0.9.73] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(hooks)* Default hook.list to active hooks and lighten retired rows ([#1971](https://github.com/intent-hq/intentd/pull/1971))
+
+
+## [0.9.72] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(sourcecontrol)* Propagate RateLimited from the nested branch_rules read ([#1966](https://github.com/intent-hq/intentd/pull/1966))
+
+### 📚 Documentation
+
+- *(tests)* Describe the merged interrupt slot-release ordering in the WSS queued-spawn e2e ([#1961](https://github.com/intent-hq/intentd/pull/1961))
+
+
 ## [0.9.71] - 2026-09-17
 
 ### 🚀 Features

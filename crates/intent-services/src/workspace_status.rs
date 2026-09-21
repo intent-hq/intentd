@@ -179,13 +179,19 @@ impl Services {
     /// hot RPC's statement count stays independent of the workspace count —
     /// AGENTS.md RPC cost contract). `None` (single-row paths: get, mutation
     /// responses, event emits) runs the bounded per-workspace EXISTS probe.
+    ///
+    /// `external_prs` — the workspace's git-root PRs and displayStatus
+    /// monitor rows when the caller already read them (`workspace.get` reads
+    /// them ONCE and reuses them for its PR merge, so the detail read issues
+    /// no duplicate scoped statement). `None` runs the two scoped reads.
     pub(crate) async fn enrich_display_status(
         &self,
         ws: &mut Workspace,
         sessions: Option<&[intent_core::AgentSession]>,
         unread: Option<bool>,
+        external_prs: Option<WorkspaceExternalPrs<'_>>,
     ) {
-        self.enrich_display_status_with_snapshot(ws, sessions, unread, None)
+        self.enrich_display_status_inner(ws, sessions, unread, external_prs, None)
             .await;
     }
 
@@ -197,6 +203,24 @@ impl Services {
         ws: &mut Workspace,
         sessions: Option<&[intent_core::AgentSession]>,
         unread: Option<bool>,
+        snapshot: Option<WorkspaceStatusSnapshot<'_>>,
+    ) {
+        self.enrich_display_status_inner(
+            ws,
+            sessions,
+            unread,
+            snapshot.map(|snapshot| snapshot.external_prs()),
+            snapshot,
+        )
+        .await;
+    }
+
+    async fn enrich_display_status_inner(
+        &self,
+        ws: &mut Workspace,
+        sessions: Option<&[intent_core::AgentSession]>,
+        unread: Option<bool>,
+        external_prs: Option<WorkspaceExternalPrs<'_>>,
         snapshot: Option<WorkspaceStatusSnapshot<'_>>,
     ) {
         // Served `attention` is DERIVED on this same emit path (§5.1):
@@ -261,12 +285,12 @@ impl Services {
         // the awaits below must not have this seed resurrect the baseline.
         let generation = self.last_display_statuses.generation();
         // Git-root PRs feed the PR rungs alongside the workspace's own
-        // linkage: the list snapshot carries them from its one bulk read;
-        // single-row callers do one scoped read (same class as the monitor
-        // probe below).
+        // linkage: the list snapshot carries them from its one bulk read and
+        // `workspace.get` from its one pre-read; other single-row callers do
+        // one scoped read (same class as the monitor probe below).
         let fetched_git_root_prs;
-        let git_root_prs: &[PullRequestInfo] = if let Some(snapshot) = snapshot {
-            snapshot.git_root_prs
+        let git_root_prs: &[PullRequestInfo] = if let Some(external) = external_prs {
+            external.git_root_prs
         } else {
             fetched_git_root_prs = self.workspace_git_root_prs(&ws.id).await;
             &fetched_git_root_prs
@@ -301,9 +325,9 @@ impl Services {
             ws.pull_requests.as_deref().unwrap_or_default(),
             git_root_prs,
         );
-        let monitor_prs = match snapshot {
-            Some(snapshot) => {
-                crate::pr_monitor::fold_monitor_pr_signals(snapshot.monitor_rows, &terminal_prs)
+        let monitor_prs = match external_prs {
+            Some(external) => {
+                crate::pr_monitor::fold_monitor_pr_signals(external.monitor_rows, &terminal_prs)
             }
             None => {
                 self.workspace_monitor_pr_signals(&ws.id, &terminal_prs)
@@ -357,6 +381,40 @@ impl Services {
                 );
                 Vec::new()
             }
+        }
+    }
+
+    /// The `workspace.get` external-PR reads: the git-root PRs
+    /// ([`Self::workspace_git_root_prs`]) plus the one-statement monitor
+    /// read serving both the displayStatus rows and the PR-merge projection
+    /// (`Store::load_workspace_pr_monitor_reads`) — two scoped statements,
+    /// the same count the derivation alone paid before the merge existed.
+    /// Best-effort like its parts: a monitor read failure is logged and
+    /// reads as no monitors (no signals, nothing merged) so the detail read
+    /// is never wedged.
+    pub(crate) async fn workspace_external_pr_reads(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> WorkspaceExternalPrReads {
+        let git_root_prs = self.workspace_git_root_prs(workspace_id).await;
+        let monitors = match self
+            .store
+            .load_workspace_pr_monitor_reads(workspace_id)
+            .await
+        {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "workspace.get: pr monitor read failed; reads as no monitors"
+                );
+                intent_store::WorkspacePrMonitorReads::default()
+            }
+        };
+        WorkspaceExternalPrReads {
+            git_root_prs,
+            monitors,
         }
     }
 
@@ -550,7 +608,8 @@ impl Services {
     /// The `unread` workspace attention flag never feeds the signals — it
     /// is the flag's own contract (§9.9), not a displayStatus axis.
     /// Child/background sessions never count — their attention surface is
-    /// the parent/subscriber (attention-retire taxonomy). A pending request
+    /// the parent/subscriber (attention-retire taxonomy) — and neither do
+    /// soft-retired or muted (`notificationsMuted`) sessions. A pending request
     /// raised MID-TURN whose surfacing is still parked on the
     /// deferred-attention registry does not count either: the workspace
     /// stays `in_progress` until the raising agent's turn-end flush
@@ -604,6 +663,7 @@ impl Services {
                     && !s.is_background
                     && s.status != intent_core::AgentStatus::Deleted
                     && s.retired_at.is_none()
+                    && !s.notifications_muted
             })
             .collect();
         for s in &top_level {
@@ -666,6 +726,51 @@ pub(crate) struct WorkspaceStatusSnapshot<'a> {
     /// call's one bulk read (`list_workspace_git_roots_with_prs`).
     pub(crate) git_root_prs: &'a [PullRequestInfo],
     pub(crate) legacy_question_holds: &'a HashSet<AgentId>,
+}
+
+impl<'a> WorkspaceStatusSnapshot<'a> {
+    fn external_prs(&self) -> WorkspaceExternalPrs<'a> {
+        WorkspaceExternalPrs {
+            monitor_rows: self.monitor_rows,
+            git_root_prs: self.git_root_prs,
+        }
+    }
+}
+
+/// The externally known PR inputs to the displayStatus derivation a caller
+/// already read: the subset of [`WorkspaceStatusSnapshot`] every path can
+/// supply without the list-only `waiting` / legacy-hold batches.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkspaceExternalPrs<'a> {
+    /// See [`WorkspaceStatusSnapshot::monitor_rows`].
+    pub(crate) monitor_rows: &'a [intent_core::PrMonitor],
+    /// See [`WorkspaceStatusSnapshot::git_root_prs`].
+    pub(crate) git_root_prs: &'a [PullRequestInfo],
+}
+
+/// The `workspace.get` external-PR reads, issued ONCE per call
+/// ([`Services::workspace_external_pr_reads`]) and consumed twice: the
+/// displayStatus derivation ([`WorkspaceExternalPrReads::status_inputs`])
+/// and, after enrichment, the PR merge
+/// (`Services::merge_workspace_external_pull_requests`) — so the detail read
+/// serves the merged pool with no extra statement over the enrichment it
+/// already paid for (`workspace_get_enrichment_stays_within_statement_budget`).
+pub(crate) struct WorkspaceExternalPrReads {
+    /// PRs persisted on the workspace's secondary git roots
+    /// ([`Services::workspace_git_root_prs`]).
+    pub(crate) git_root_prs: Vec<PullRequestInfo>,
+    /// The one-statement monitor read: displayStatus rows plus the PR-merge
+    /// projection of every non-cancelled row.
+    pub(crate) monitors: intent_store::WorkspacePrMonitorReads,
+}
+
+impl WorkspaceExternalPrReads {
+    pub(crate) fn status_inputs(&self) -> WorkspaceExternalPrs<'_> {
+        WorkspaceExternalPrs {
+            monitor_rows: &self.monitors.display_rows,
+            git_root_prs: &self.git_root_prs,
+        }
+    }
 }
 
 /// The workspace-owned PR copies (linked `activePullRequest`, pooled
@@ -3387,6 +3492,7 @@ mod workspace_needs_attention {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -3570,6 +3676,66 @@ mod workspace_needs_attention {
         }
     }
 
+    /// A muted top-level session (`notifications_muted`) feeds none of the
+    /// axes: its `error` status, pending blocker/discussion request, and
+    /// pending questions marker are all silenced. Unmuting brings each
+    /// signal back.
+    #[tokio::test]
+    async fn muted_top_level_sessions_never_count_until_unmuted() {
+        let (svc, ws, _tmp) = setup().await;
+
+        let mut failed = mk_session(&ws, "agent-muted-error");
+        failed.status = AgentStatus::Error;
+        failed.notifications_muted = true;
+        svc.store.insert_agent_session(&failed).await.unwrap();
+
+        let mut blocker = mk_session(&ws, "agent-muted-blocker");
+        blocker.attention_request_kind = Some("blocker".to_string());
+        blocker.notifications_muted = true;
+        svc.store.insert_agent_session(&blocker).await.unwrap();
+
+        let mut discuss = mk_session(&ws, "agent-muted-discussion");
+        discuss.attention_request_kind = Some("discussion".to_string());
+        discuss.notifications_muted = true;
+        svc.store.insert_agent_session(&discuss).await.unwrap();
+
+        let mut questions = mk_session(&ws, "agent-muted-questions");
+        questions.metadata = Some(json!({
+            (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY): "msg-pending"
+        }));
+        questions.notifications_muted = true;
+        svc.store.insert_agent_session(&questions).await.unwrap();
+
+        assert_eq!(
+            signals(&svc, &ws).await,
+            AttentionSignals::default(),
+            "muted sessions feed no attention axis"
+        );
+
+        let cases: [(&AgentSession, Axis); 4] = [
+            (&failed, |s| s.failed),
+            (&blocker, |s| s.blocked),
+            (&discuss, |s| s.needs_attention),
+            (&questions, |s| s.needs_attention),
+        ];
+        for (session, expect) in cases {
+            let ts = intent_core::now_iso();
+            svc.store
+                .set_agent_notifications_muted(&ws, &session.id, false, &ts)
+                .await
+                .unwrap();
+            assert!(
+                expect(&signals(&svc, &ws).await),
+                "unmuting {} surfaces its signal again",
+                session.id.0
+            );
+            svc.store
+                .set_agent_notifications_muted(&ws, &session.id, true, &ts)
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn pending_questions_on_top_level_session_is_needs_attention() {
         let (svc, ws, _tmp) = setup().await;
@@ -3582,7 +3748,7 @@ mod workspace_needs_attention {
         assert!(signals(&svc, &ws).await.needs_attention);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn question_marker_shapes_match_across_get_list_and_lite_snapshot() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -3648,7 +3814,7 @@ mod workspace_needs_attention {
         }
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn batch_tail_failure_falls_back_without_hiding_pending_questions() {
         let (svc, ws, _tmp) = setup().await;
         let pending = mk_session(&ws, "agent-pending-batch-fallback");
@@ -3927,7 +4093,7 @@ mod display_status_events {
     /// A task-completion transition (`in_progress` → complete over
     /// `task.updateNoteStatus`) emits the event with the self-sufficient
     /// `{ workspaceId, displayStatus }` payload.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_completion_transition_emits() {
         let h = harness().await;
         h.store
@@ -4028,7 +4194,7 @@ mod display_status_events {
     /// A task-status change that does not move the derived rollup (a second
     /// task flipping `not_started` → `in_progress` while the rollup is already
     /// `in_progress`) publishes no displayStatus event.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn no_op_recompute_stays_silent() {
         let h = harness().await;
         h.store
@@ -4078,7 +4244,7 @@ mod display_status_events {
     /// last-observed baseline the same way the enriched path does — a seed
     /// never emits — so the first post-boot mutation emits the transition
     /// against that baseline.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn lite_list_seeds_baseline_then_first_mutation_emits() {
         let h = harness().await;
         // Hermetic root: the lite path probes the workspaces root for
@@ -4122,7 +4288,7 @@ mod display_status_events {
     /// (complete → idle once the only completed task is gone) emits the
     /// transition event: `note.delete` goes through the same
     /// recompute+maybe-emit hook as the task-status mutations.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn task_note_delete_transition_emits() {
         let h = harness().await;
         h.store
@@ -4333,6 +4499,130 @@ mod display_status_events {
         );
     }
 
+    /// `agent.update { notificationsMuted: true }` on the only
+    /// attention-raising agent removes it from the derivation and emits the
+    /// `needs_attention` → idle demotion; unmuting emits the promotion back.
+    #[tokio::test]
+    async fn agent_update_notifications_muted_transition_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-muted");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .set_attention_request(&h.ws, &session.id, "discussion", "input", &now_iso())
+            .await
+            .expect("set attention");
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": true }))
+            .await
+            .expect("mute agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": false }))
+            .await
+            .expect("unmute agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "needs_attention" })
+        );
+    }
+
+    /// Muting the LAST unread top-level agent settles the derived workspace
+    /// `unread` like the last seen-marker advance: the stored flag clears and
+    /// exactly one `workspace:attention-changed { none }` fires. A no-op
+    /// re-mute and the later unmute write nothing at the workspace level (an
+    /// unmuted unseen tail re-derives `unread` on the next read).
+    #[tokio::test]
+    async fn muting_last_unread_agent_settles_workspace_unread() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-unread-muted");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .append_agent_message(
+                &session.id,
+                "assistant",
+                &json!([{ "type": "text", "text": "done" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append assistant tail");
+        h.services
+            .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
+            .await
+            .expect("raise unread");
+        assert!(
+            h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .expect("probe"),
+            "unmuted unseen tail derives unread"
+        );
+
+        let mut attn_sub = h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:attention-changed".to_string()],
+            ..Default::default()
+        });
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": true }))
+            .await
+            .expect("mute agent");
+        let ev = recv_one(&mut attn_sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_silent(&mut attn_sub).await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(ws.attention, intent_core::WorkspaceAttention::None);
+        assert!(
+            !h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .expect("probe"),
+            "a muted session never derives unread"
+        );
+
+        // Idempotent re-mute: no transition, no event.
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": true }))
+            .await
+            .expect("re-mute agent");
+        assert_silent(&mut attn_sub).await;
+
+        // Unmute: silent at the workspace level; the derivation reads unread
+        // again on the next probe.
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": false }))
+            .await
+            .expect("unmute agent");
+        assert_silent(&mut attn_sub).await;
+        assert!(
+            h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .expect("probe"),
+            "unmuting re-derives unread"
+        );
+    }
+
     /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
     /// persisting the dismissal marker retires the pending set and emits the
     /// `needs_attention` → idle demotion.
@@ -4398,7 +4688,7 @@ mod display_status_events {
 
     /// G3: a spec-body write over `note.update` that changes the linked task
     /// set moves the link-gated `taskStats` rollup and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_body_update_transition_emits() {
         let h = harness().await;
         h.store
@@ -4438,7 +4728,7 @@ mod display_status_events {
 
     /// G4: `note.restoreVersion` on the spec re-gates `taskStats` from the
     /// restored body and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_restore_version_transition_emits() {
         let h = harness().await;
         h.store
@@ -4494,7 +4784,7 @@ mod display_status_events {
 
     /// G5: a spec checkbox-line rewrite over `task.update` that strips a
     /// task link re-gates `taskStats` and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn spec_task_line_update_transition_emits() {
         let h = harness().await;
         h.store
@@ -4535,7 +4825,7 @@ mod display_status_events {
 
     /// G6: `task.createPrerequisite` with the spec as dependent adds a fresh
     /// open spec-child task and emits the transition.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_prerequisite_on_spec_transition_emits() {
         let h = harness().await;
         h.store
@@ -4571,7 +4861,7 @@ mod display_status_events {
 
     /// G7: `workspace.delete` evicts the last-observed baseline so the
     /// in-memory cache does not leak deleted-workspace entries.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_delete_evicts_baseline() {
         let h = harness().await;
         // Hermetic root: the delete path sweeps the workspaces root, and
@@ -4645,7 +4935,7 @@ mod display_status_events {
 
     /// G8: `workspace.update` carrying a PR field recomputes — a `prStatus`
     /// flip to open moves the derived rollup to `pr_open` and emits.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_update_pr_status_transition_emits() {
         let h = harness().await;
         // Baseline: no tasks, no PR → not_started → idle.
@@ -5012,7 +5302,7 @@ mod display_status_events {
     /// `workspace.markSeen` both leave the derived rollup at `idle` — no
     /// `workspace:displayStatus-changed` — while the flag's own
     /// `workspace:attention-changed` events still fire on raise and clear.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unread_raise_and_mark_seen_never_move_display_status() {
         let h = harness().await;
         // Seed: idle baseline (no agents, no PR, no tasks).
@@ -5066,7 +5356,7 @@ mod display_status_events {
     /// Regression: a terminal `complete` base with the unread flag raised
     /// serves `displayStatus: complete` — the turn-end blue dot never masks
     /// the real terminal state (raise and markSeen both stay silent).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unread_flag_never_masks_complete() {
         let h = harness().await;
         h.store
@@ -5084,7 +5374,9 @@ mod display_status_events {
         assert_silent(&mut sub).await;
         let mut ws = h.store.get_workspace(&h.ws).await.expect("reload");
         ws.task_stats = Some(h.services.cheap_task_stats(&h.ws).await.expect("stats"));
-        h.services.enrich_display_status(&mut ws, None, None).await;
+        h.services
+            .enrich_display_status(&mut ws, None, None, None)
+            .await;
         assert_eq!(ws.display_status, Some(WorkspaceDisplayStatus::Complete));
 
         h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
@@ -5096,7 +5388,7 @@ mod display_status_events {
     /// guarded no-op (no `attention-changed`), and a later
     /// `workspace.markSeen` (guarded on `unread`) leaves the review-required
     /// attention in place.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn unread_raise_never_downgrades_review_required() {
         let h = harness().await;
         h.services
@@ -5139,7 +5431,7 @@ mod display_status_events {
     /// carrying `attention: review_required` promotes the derived rollup to
     /// `needs_attention` and emits; `workspace.dismissAttention` retires it
     /// and emits the demotion.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn review_required_flag_transitions_emit() {
         let h = harness().await;
         // Seed: idle baseline.

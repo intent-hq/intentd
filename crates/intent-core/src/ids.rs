@@ -103,6 +103,19 @@ id_newtype!(
     /// Identifier for an agent.
     AgentId
 );
+
+impl AgentId {
+    /// Whether this id has the canonical daemon-minted `agent-{uuid}` shape
+    /// (hyphenated 8-4-4-4-12 UUID). Wire params that name another agent
+    /// (`agent.list` `parentAgentId`, §5.5) are validated against this before
+    /// they reach a store predicate.
+    #[must_use]
+    pub fn is_canonical(&self) -> bool {
+        self.0
+            .strip_prefix("agent-")
+            .is_some_and(|rest| rest.len() == 36 && Uuid::parse_str(rest).is_ok())
+    }
+}
 id_newtype!(
     /// Identifier for a logical client (stable, client-supplied identity; §16).
     /// Distinct from the ephemeral per-connection id used for transport
@@ -121,4 +134,10 @@ id_newtype!(
     /// Identifier for a registered workspace git root (a secondary local git
     /// repository tracked for a workspace).
     WorkspaceGitRootId
+);
+id_newtype!(
+    /// Identifier for a principal (a person, keyed locally; stable across
+    /// GitHub identity linking). The daemon's primary user is minted by
+    /// migration `0125_principals`.
+    PrincipalId
 );

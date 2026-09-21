@@ -349,11 +349,13 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         })
         .await
         .expect("insert ws");
@@ -513,7 +515,12 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let fetched = wss_rpc(&mut rpc, "workspace.get", json!({ "workspaceId": ws_id })).await;
     assert_eq!(fetched["workspace"]["archived"], json!(true));
     assert_eq!(fetched["workspace"]["status"], json!("Archived"));
-    let listed = wss_rpc(&mut rpc, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        "hook.list",
+        json!({ "workspaceId": ws_id, "includeRetired": true }),
+    )
+    .await;
     let row = listed["hooks"]
         .as_array()
         .expect("hooks array")

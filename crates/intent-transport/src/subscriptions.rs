@@ -20,14 +20,15 @@ use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
     AGENT_RENAMED, AGENT_RESTORED, AGENT_RETIRED, AGENT_STARTED, AGENT_STATUS_CHANGED,
     AGENT_STREAM_END, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED,
-    NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
+    NOTE_CREATED, NOTE_DELETED, NOTE_PRESENCE, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
     TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
     WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
-    extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, ConversationProjection, Event,
-    Note, NoteId, NoteListProjection, WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
+    extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, AgentLite, ConversationProjection,
+    Error, Event, Note, NoteId, NoteListProjection, Workspace, WorkspaceApi, WorkspaceId,
+    SLIM_PAGE_BUDGET_BYTES,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -51,6 +52,12 @@ pub(crate) enum Channel {
     /// `agent:stream:*` family for one agent (snapshot = newest conversation
     /// page; live deltas land in CS-3).
     Chat,
+    /// Per-note presence (multiplayer w5). Scoped by `workspaceId` +
+    /// `noteId`; the seq-0 snapshot is the note's current viewers and the
+    /// deltas are the transient `note:presence` joined / updated / left
+    /// frames. Subscribing is itself the "I am viewing" signal (the
+    /// subscription holds a viewer lease released on unsubscribe / close).
+    NotePresence,
 }
 
 /// A classified subscription fast-path request awaiting handling by the
@@ -185,6 +192,11 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
             channel: Channel::Chat,
             params,
         }),
+        "note.presence.subscribe" => Some(SubFastPath::Subscribe {
+            id,
+            channel: Channel::NotePresence,
+            params,
+        }),
         // The collection `agent` channel shares the `agent.subscribe` method
         // name with the pre-existing deprecated service-style alias (router,
         // §5.5). Disambiguate by params: the alias always carries `eventTypes`,
@@ -201,7 +213,8 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
         | "task.unsubscribe"
         | "workspace.unsubscribe"
         | "comment.unsubscribe"
-        | "chat.unsubscribe" => Some(SubFastPath::Unsubscribe { id, params }),
+        | "chat.unsubscribe"
+        | "note.presence.unsubscribe" => Some(SubFastPath::Unsubscribe { id, params }),
         "agent.unsubscribe" if !params.contains_key("workspaceId") => {
             Some(SubFastPath::Unsubscribe { id, params })
         }
@@ -435,6 +448,7 @@ pub(crate) fn channel_name(channel: Channel) -> &'static str {
         Channel::Workspace => "workspace",
         Channel::Comment => "comment",
         Channel::Chat => "chat",
+        Channel::NotePresence => "note.presence",
     }
 }
 
@@ -608,7 +622,8 @@ pub(crate) fn trace_chat_snapshot(scope: &str, subscription_id: &str, snapshot: 
 }
 
 /// Record a chat forwarder loop exiting. `reason` is a fixed vocabulary:
-/// `client_closed` (the outbound lane is gone) or `bus_closed`.
+/// `client_closed` (the outbound lane is gone), `bus_closed`, or
+/// `membership_revoked` (the subscriber lost the agent's workspace).
 pub(crate) fn trace_chat_forwarder_exit(scope: &str, subscription_id: &str, reason: &'static str) {
     tracing::info!(
         target: LIFECYCLE_TARGET,
@@ -689,6 +704,9 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_MESSAGE,
             AGENT_UPDATED,
         ],
+        // Transient only: the forwarder narrows the workspace-wide stream to
+        // one note by `data.noteId` ([`note_presence_delta`]).
+        Channel::NotePresence => &[NOTE_PRESENCE],
     };
     types.iter().map(std::string::ToString::to_string).collect()
 }
@@ -746,8 +764,10 @@ pub(crate) async fn channel_snapshot(
         },
         // The chat channel uses the dedicated `chat_snapshot` /
         // `forward_chat_subscription` path (a per-agent `messages[]` object
-        // snapshot, CS-0 D3), so this generic arm is unreachable.
-        Channel::Chat => empty(),
+        // snapshot, CS-0 D3), so this generic arm is unreachable. The
+        // note-presence channel's snapshot is the join's return value
+        // (`note_presence_join`, served by `forward_note_presence_subscription`).
+        Channel::Chat | Channel::NotePresence => empty(),
     }
 }
 
@@ -790,7 +810,7 @@ pub(crate) async fn chat_snapshot(
     since_message_id: Option<&str>,
     projection: Option<ConversationProjection>,
 ) -> Value {
-    let mut snapshot = match api
+    let (mut snapshot, overlay) = match api
         .agent_get_conversation(
             agent_id.clone(),
             None,
@@ -803,19 +823,35 @@ pub(crate) async fn chat_snapshot(
         )
         .await
     {
-        Ok(v) => v,
-        Err(_) => json!({
-            "agentId": agent_id.as_str(),
-            "messages": [],
-            "truncated": false,
-            "totalMessages": 0,
-            "nextToken": Value::Null,
-        }),
+        Ok(v) => (v, true),
+        // A refused read (a non-member's guarded page, multiplayer w3 — or an
+        // unknown agent) serves the empty page WITHOUT the live overlay: the
+        // in-flight turn and activity flags are not membership-gated, so
+        // overlaying them would leak the live turn the persisted page just
+        // refused. A transient read error keeps the overlay only for an
+        // administrator: for a collaborator the guarded read is the ONLY
+        // membership check on this path, and a failure inside the guard
+        // itself (store error) has verified nothing.
+        Err(err) => {
+            let refused = matches!(err, Error::Forbidden(_) | Error::NotFound(_));
+            (
+                json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [],
+                    "truncated": false,
+                    "totalMessages": 0,
+                    "nextToken": Value::Null,
+                }),
+                !refused && !crate::context::is_non_administrator_caller(),
+            )
+        }
     };
     if let Some(since) = since_message_id {
         apply_resume_filter(&mut snapshot, since);
     }
-    overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+    if overlay {
+        overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+    }
     snapshot
 }
 
@@ -1291,6 +1327,10 @@ impl ChatDeltaState {
         // `appMessageId` (`AgentMessage` skips the field when `None`), but a
         // hand-built row (tests, future callers) shouldn't leak `null`.
         let app_message_id = msg.get("appMessageId").filter(|v| !v.is_null());
+        // Lift the re-read's resolved `author` (user rows only) onto each
+        // entity so subscribers render the human author live, mirroring the
+        // `agent.getConversation` row shape. Omitted when absent.
+        let author = msg.get("author").filter(|v| !v.is_null());
         let blocks = msg.get("contentBlocks").and_then(Value::as_array)?;
         let mut added = Vec::new();
         let mut updated = Vec::new();
@@ -1324,6 +1364,9 @@ impl ChatDeltaState {
                 }
                 if let Some(app_id) = app_message_id {
                     obj.insert("appMessageId".to_string(), app_id.clone());
+                }
+                if let Some(author) = author {
+                    obj.insert("author".to_string(), author.clone());
                 }
             }
             push_entity(&mut added, &mut updated, is_added, entity);
@@ -1821,19 +1864,42 @@ pub(crate) async fn channel_delta(
         // generic arm is unreachable for `Note`; full rows keep it faithful.
         Channel::Note => note_delta(api, workspace_id, event, None).await,
         Channel::Agent => agent_delta(api, event).await,
-        Channel::Workspace => workspace_delta(api, event).await,
+        // The workspace channel's tombstone scoping is stateful (the
+        // forwarder threads the subscriber's visible-id set); this generic
+        // arm is the unscoped administrator form.
+        Channel::Workspace => workspace_delta(api, event, None).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
         // The task channel uses the stateful [`task_delta`] mapper directly in
         // the forwarder: it tracks the spec's task-link set across deltas so a
         // spec-body edit can refresh flipped `specLinked` flags
         // (monorepo#2407) — so this generic stateless arm is unreachable for
         // `Task`.
-        Channel::Task | Channel::Chat => None,
+        Channel::Task | Channel::Chat | Channel::NotePresence => None,
         // The chat channel uses the dedicated, stateful [`ChatDeltaState`] mapper
         // on the `forward_chat_subscription` path (CS-3) — its deltas are
         // event-payload-driven, not re-read — so this generic re-read arm is
-        // unreachable for `Chat`.
+        // unreachable for `Chat`. Likewise the note-presence channel maps its
+        // transient events payload-only through [`note_presence_delta`].
     }
+}
+
+/// Map one `note:presence` bus event to a note-presence channel delta
+/// `{ kind: "joined" | "updated" | "left", viewer: { principalId, login?,
+/// displayName?, avatarUrl?, cursor? } }`. Payload-only (nothing to re-read:
+/// presence is never persisted); events for a different note are ignored.
+pub(crate) fn note_presence_delta(note_id: &NoteId, event: &Event) -> Option<Value> {
+    if event.event_type != NOTE_PRESENCE {
+        return None;
+    }
+    if event.data.get("noteId").and_then(Value::as_str)? != note_id.as_str() {
+        return None;
+    }
+    let kind = event.data.get("kind").and_then(Value::as_str)?;
+    let mut viewer = event.data.as_object()?.clone();
+    viewer.remove("workspaceId");
+    viewer.remove("noteId");
+    viewer.remove("kind");
+    Some(json!({ "kind": kind, "viewer": Value::Object(viewer) }))
 }
 
 /// Materialize the task channel's seq-0 snapshot AND the spec's
@@ -2011,6 +2077,12 @@ pub(crate) async fn task_delta(
 /// retired rows — deltas must converge on the same state a fresh snapshot
 /// would serve. The agent id is read from `data.agentId` (falling back to
 /// the agent-scoped `sessionId`).
+///
+/// The re-read goes through `agent.get` (a detail read), so the row is
+/// projected onto the list shape here ([`agent_list_row`]): a pushed delta
+/// row carries exactly the keys and byte budget an `agent.list` row does
+/// (intent-hq/intent#5383), rather than re-hydrating detail-only fields
+/// the seq-0 snapshot stripped.
 pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
     let agent_id = event
         .data
@@ -2021,35 +2093,111 @@ pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option
         AGENT_DELETED | AGENT_RETIRED => Some(json!({ "removedIds": [agent_id] })),
         AGENT_CREATED | AGENT_RESTORED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
-            Some(json!({ "added": [serde_json::to_value(agent).ok()?] }))
+            Some(json!({ "added": [agent_list_row(agent)?] }))
         }
         AGENT_STARTED | AGENT_COMPLETED | AGENT_FAILED | AGENT_IDLE | AGENT_STATUS_CHANGED
         | AGENT_RENAMED | AGENT_UPDATED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
-            Some(json!({ "updated": [serde_json::to_value(agent).ok()?] }))
+            Some(json!({ "updated": [agent_list_row(agent)?] }))
         }
         _ => None,
     }
+}
+
+/// Project an `agent.get` re-read onto the `agent.list` row shape — the same
+/// [`AgentLite::strip_detail_only_fields`] + [`AgentLite::cap_list_previews`]
+/// pass `agent.list` applies to every row — so an `agent` channel delta row
+/// satisfies the [`intent_core::AGENT_LIST_ROW_KEYS`] allowlist and the
+/// [`intent_core::AGENT_LIST_ROW_BUDGET_BYTES`] budget like the seq-0
+/// snapshot rows it upserts into.
+fn agent_list_row(mut agent: AgentLite) -> Option<Value> {
+    agent.strip_detail_only_fields();
+    agent.cap_list_previews();
+    serde_json::to_value(agent).ok()
+}
+
+/// The workspace ids a `workspace` channel subscriber has been shown so far,
+/// seeded from the snapshot rows — `id` of each — and maintained by
+/// [`workspace_delta`]. Only a non-administrator forwarder tracks one
+/// (multiplayer w3): the channel is global, so without it a
+/// `workspace:deleted` tombstone would disclose the id of a workspace the
+/// subscriber was never a member of.
+pub(crate) fn visible_workspace_ids(snapshot: &Value) -> HashSet<String> {
+    snapshot
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Map a `workspace` channel event by re-reading the [`Workspace`]. The channel
 /// is global, so the id comes from `data.workspaceId` (falling back to the
 /// event's `workspaceId`). `workspace:created` → `added`, `workspace:deleted` →
 /// `removedIds`, every other status/PR event → `updated`.
-pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
-    let workspace_id = event
-        .data
-        .get("workspaceId")
-        .and_then(Value::as_str)
-        .map_or_else(|| event.workspace_id.as_str().to_string(), str::to_string);
+///
+/// The virtual Chief of Staff workspace (`__chief__`) never rides a delta:
+/// `workspace.list` and the seq-0 snapshot filter it at the store, and
+/// `workspace.get` synthesizes it, so without this guard a Chief-scoped status
+/// event would upsert Chief into subscribed clients' lists.
+///
+/// The re-read goes through `workspace.get` (a detail read), so the row is
+/// projected onto the `workspace.list` row shape with the same
+/// [`Workspace::slim_for_list`] pass `workspace.list` and the seq-0 snapshot
+/// (`list_workspaces_lite`) apply as their final step: a pushed delta row
+/// carries the [`intent_core::WORKSPACE_LIST_ROW_KEYS`] allowlist keys within
+/// [`intent_core::WORKSPACE_LIST_ROW_BUDGET_BYTES`], `pullRequests` capped at
+/// [`intent_core::WORKSPACE_LIST_PR_CAP`], `agentSummary` kept on active rows
+/// and dropped on archived ones, and never the detail-only `tokenUsage` /
+/// `setupScript` / `contextLinks` / uncapped PR pool.
+///
+/// The seq-0 snapshot rows are lighter than that on purpose: the lite path
+/// never computes `agentSummary` at all (intentd#743 — no sessions
+/// enrichment on the snapshot, on active rows too), and the documented
+/// contract (`docs/protocol/06-events.md`, `workspace.subscribe`) is that the
+/// omitted aggregate arrives via the enriched delta re-read. A delta row
+/// upserting `agentSummary` into an active snapshot row is therefore the
+/// intended rehydration, not a leak past the list shape — the FE HUD reads it
+/// from workspace-channel updates — and `agentSummary` is allowlisted and
+/// counted inside the row budget (the budget golden's worst case carries a
+/// ten-agent summary).
+///
+/// With `visible` (a non-administrator subscriber), a `workspace:deleted`
+/// tombstone is emitted only for a workspace previously shown to this
+/// subscriber, and every successful re-read records the id as shown; the
+/// subscriber's own unshare removes it. Without it (administrator) every
+/// tombstone is emitted as before.
+pub(crate) async fn workspace_delta(
+    api: &dyn WorkspaceApi,
+    event: &Event,
+    visible: Option<&mut HashSet<String>>,
+) -> Option<Value> {
+    let workspace_id = WorkspaceId::from(
+        event
+            .data
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map_or_else(|| event.workspace_id.as_str().to_string(), str::to_string),
+    );
+    if workspace_id.is_chief() {
+        return None;
+    }
     match event.event_type.as_str() {
-        WORKSPACE_DELETED => Some(json!({ "removedIds": [workspace_id] })),
+        WORKSPACE_DELETED => {
+            if let Some(visible) = visible {
+                if !visible.remove(workspace_id.as_str()) {
+                    return None;
+                }
+            }
+            Some(json!({ "removedIds": [workspace_id.as_str()] }))
+        }
         WORKSPACE_CREATED => {
-            let ws = api
-                .get_workspace(WorkspaceId::from(workspace_id))
-                .await
-                .ok()?;
-            Some(json!({ "added": [serde_json::to_value(ws).ok()?] }))
+            let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if let Some(visible) = visible {
+                visible.insert(workspace_id.as_str().to_string());
+            }
+            Some(json!({ "added": [workspace_list_row(ws)?] }))
         }
         WORKSPACE_UPDATED
         | WORKSPACE_ACTIVITY_CHANGED
@@ -2059,14 +2207,56 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         | PR_LINKED
         | PR_UPDATED
         | PR_UNLINKED => {
-            let ws = api
-                .get_workspace(WorkspaceId::from(workspace_id))
-                .await
-                .ok()?;
-            Some(json!({ "updated": [serde_json::to_value(ws).ok()?] }))
+            // Unshare (multiplayer w3): the forwarder runs under the
+            // subscriber's caller, so the member named by
+            // `changes.removedPrincipalId` sees its own removal as a
+            // `removedIds` delta. Any other subscriber falls through to the
+            // re-read, which is `NotFound` for non-members (no delta) — a
+            // non-member workspace id is never disclosed.
+            if is_unshare_of_current_caller(event) {
+                if let Some(visible) = visible {
+                    visible.remove(workspace_id.as_str());
+                }
+                return Some(json!({ "removedIds": [workspace_id.as_str()] }));
+            }
+            let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if let Some(visible) = visible {
+                visible.insert(workspace_id.as_str().to_string());
+            }
+            Some(json!({ "updated": [workspace_list_row(ws)?] }))
         }
         _ => None,
     }
+}
+
+/// Project a `workspace.get` re-read onto the `workspace.list` row shape
+/// ([`Workspace::slim_for_list`]: allowlist keys, row budget, PR cap, active-row
+/// `agentSummary` kept / archived dropped) so a `workspace` channel delta row
+/// is a `workspace.list` row. The lite seq-0 snapshot rows it upserts into
+/// additionally omit `agentSummary` on every row (`list_workspaces_lite`,
+/// intentd#743) — see [`workspace_delta`]: the delta is the documented path
+/// by which that aggregate reaches the client, so it is deliberately not
+/// stripped here.
+fn workspace_list_row(mut ws: Workspace) -> Option<Value> {
+    ws.slim_for_list();
+    serde_json::to_value(ws).ok()
+}
+
+/// Whether `event` is a `workspace:updated` unshare whose
+/// `changes.removedPrincipalId` is the current request's wire principal.
+fn is_unshare_of_current_caller(event: &Event) -> bool {
+    let Some(removed) = event
+        .data
+        .get("changes")
+        .and_then(|c| c.get("removedPrincipalId"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    matches!(
+        intent_core::current_caller(),
+        Some(intent_core::Caller::Wire { principal_id, .. }) if principal_id.as_str() == removed
+    )
 }
 
 /// Map a `comment` channel event by re-reading the affected thread summary. A

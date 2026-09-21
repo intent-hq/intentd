@@ -128,7 +128,7 @@ impl DiskUsageCache {
         // duplicate walks.
         if let Some(guard) = try_begin(&self.in_flight, workspace_dir.clone()) {
             let cache = Arc::clone(self);
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 let _in_flight = guard;
                 let walk_permit = Arc::clone(&cache.walk_permits)
                     .acquire_owned()

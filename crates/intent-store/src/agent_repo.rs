@@ -8,8 +8,8 @@
 //! a derived snapshot and is never persisted — sessions load with `stats: None`.
 
 use intent_core::{
-    AgentId, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result, TokenUsageTotals,
-    UsageCost, WorkspaceId, PENDING_QUESTIONS_MESSAGE_ID_KEY,
+    AgentId, AgentListRowScope, AgentMessage, AgentScopeCounts, AgentSession, AgentStatus, Error,
+    NoteId, Result, TokenUsageTotals, UsageCost, WorkspaceId, PENDING_QUESTIONS_MESSAGE_ID_KEY,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -24,7 +24,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features, retired_at";
+    harness_features, retired_at, notifications_muted";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
@@ -37,7 +37,7 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features, retired_at";
+    effort_levels, harness_version, harness_features, retired_at, notifications_muted";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
@@ -115,20 +115,79 @@ pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
     )
 }
 
+/// SQL predicate fragment (leading ` AND`, unqualified column names so it
+/// applies to both the summary read and the `agent_session s` projection
+/// read) selecting one `agent.list { scope }` bin (§5.5), plus the extra
+/// bind it needs (`parent_agent_id = ?` for a parent-narrowed `delegated`
+/// read). The three bins partition the non-retired rows:
+/// `parent_agent_id IS NULL` splits on `is_background` (`= 0` / `<> 0`,
+/// always written as 0/1), `parent_agent_id IS NOT NULL` is `delegated`.
+/// Every fragment carries `retired_at IS NULL` — retired sessions are their
+/// own bin. Compile-time fragments only, never caller input.
+pub(crate) fn scope_predicate(scope: &AgentListRowScope) -> (&'static str, Option<&str>) {
+    match scope {
+        AgentListRowScope::TopLevel => (
+            " AND parent_agent_id IS NULL AND is_background = 0 AND retired_at IS NULL",
+            None,
+        ),
+        AgentListRowScope::Delegated {
+            parent_agent_id: None,
+        } => (
+            " AND parent_agent_id IS NOT NULL AND retired_at IS NULL",
+            None,
+        ),
+        AgentListRowScope::Delegated {
+            parent_agent_id: Some(parent),
+        } => (
+            " AND parent_agent_id = ? AND retired_at IS NULL",
+            Some(parent.as_str()),
+        ),
+        AgentListRowScope::Background => (
+            " AND parent_agent_id IS NULL AND is_background <> 0 AND retired_at IS NULL",
+            None,
+        ),
+    }
+}
+
+/// SQL behind [`Store::list_scoped_agent_session_summaries`], extracted so
+/// the plan-shape test runs `EXPLAIN` on the exact production statement.
+pub(crate) fn scoped_session_summaries_sql(scope: &AgentListRowScope) -> String {
+    let (predicate, _) = scope_predicate(scope);
+    format!(
+        "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+         WHERE workspace_id = ?{predicate} ORDER BY created_at"
+    )
+}
+
+/// SQL behind [`Store::count_agent_sessions_by_scope`] — ONE statement over
+/// the workspace's non-retired rows yielding all three `scopeCounts` (§5.5).
+/// The three conditional sums use the same predicates as
+/// [`scope_predicate`], so `topLevel + delegated + background` always equals
+/// the row count of the default `agent.list` read.
+pub(crate) fn scope_counts_sql() -> &'static str {
+    "SELECT \
+        COALESCE(SUM(parent_agent_id IS NULL AND is_background = 0), 0) AS top_level, \
+        COALESCE(SUM(parent_agent_id IS NOT NULL), 0) AS delegated, \
+        COALESCE(SUM(parent_agent_id IS NULL AND is_background <> 0), 0) AS background \
+     FROM agent_session WHERE workspace_id = ? AND retired_at IS NULL"
+}
+
 /// SQL predicate selecting an **unread top-level session** row (§5.1): a
-/// non-deleted, non-background, non-retired `agent_session` with no parent
-/// whose newest user/assistant message is an assistant message the
+/// non-deleted, non-background, non-retired, non-muted `agent_session` with
+/// no parent whose newest user/assistant message is an assistant message the
 /// per-agent seen marker (`metadata.lastSeenMessageId`, v4.5) has not caught
 /// up with. Shared by the single-workspace EXISTS probe, the batch list-path
 /// derivation, and the guarded workspace-attention clear so the three can
 /// never drift. Soft-retired sessions (`retired_at` set) are excluded: they
 /// are hidden from `agent.list`, so an unread one could never be focused to
 /// clear the flag; clearing `retired_at` (restore) makes the session count
-/// again.
+/// again. Muted sessions (`notifications_muted`, 0123) are excluded too: the
+/// mute silences every workspace-level surface the derivation feeds, and
+/// unmuting makes the row count again on the next read.
 ///
 /// The seen marker is read with `->>` (NOT `json_extract()`) and the three
 /// consumers force [`UNREAD_TOP_LEVEL_SESSION_INDEX`] via `INDEXED BY`, so
-/// each statement is answered entirely from the 0114/0122 partial covering
+/// each statement is answered entirely from the 0114/0122/0124 partial covering
 /// index instead of fetching every candidate row's metadata JSON from the
 /// main table B-tree — on a ~1GB dogfood DB that difference is ~5.6MB of
 /// scattered page reads vs ~86KB, and cold-cache it pushed the
@@ -146,11 +205,12 @@ pub(crate) const UNREAD_TOP_LEVEL_SESSION_PREDICATE: &str = "parent_agent_id IS 
     AND last_message_id IS NOT NULL \
     AND last_message_role = 'assistant' \
     AND retired_at IS NULL \
+    AND notifications_muted = 0 \
     AND (metadata ->> '$.lastSeenMessageId' IS NULL \
          OR metadata ->> '$.lastSeenMessageId' <> last_message_id)";
 
 /// The 0114 partial covering index (recreated by 0122 with `retired_at IS
-/// NULL` in its WHERE clause) answering
+/// NULL` and by 0124 with `notifications_muted = 0` in its WHERE clause) answering
 /// [`UNREAD_TOP_LEVEL_SESSION_PREDICATE`] statements. Named explicitly (via
 /// `INDEXED BY`) by all three consumers because the planner's stat1
 /// estimates otherwise prefer `idx_agent_parent` (`parent_agent_id IS NULL`
@@ -641,7 +701,8 @@ fn bind_session_insert<'q>(
         .bind(i64::from(task_graph_enabled))
         .bind(&s.harness_version)
         .bind(json_col_to_db(s.harness_features.as_ref())?)
-        .bind(&s.retired_at))
+        .bind(&s.retired_at)
+        .bind(i64::from(s.notifications_muted)))
 }
 
 impl Store {
@@ -668,7 +729,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?
             .execute(self.write_pool())
@@ -735,7 +796,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s, false)?
                 .execute(&mut *tx)
@@ -1167,6 +1228,61 @@ impl Store {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    /// [`Store::list_agent_session_summaries`] restricted to ONE
+    /// `agent.list { scope }` bin of the non-retired sessions (§5.5) — see
+    /// [`scope_predicate`]. The filter runs in SQL over the same summary
+    /// projection as the retired reads, so the handler cost stays O(rows
+    /// returned) per the RPC cost contract; the row visit is an
+    /// `idx_agent_workspace` (or, parent-narrowed, `idx_agent_parent`) index
+    /// search, never a table scan (plan-shape test below).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_scoped_agent_session_summaries(
+        &self,
+        workspace_id: &WorkspaceId,
+        scope: &AgentListRowScope,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = scoped_session_summaries_sql(scope);
+        let (_, extra_bind) = scope_predicate(scope);
+        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        if let Some(bind) = extra_bind {
+            query = query.bind(bind);
+        }
+        let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+            Error::Internal(format!("list scoped agent session summaries failed: {e}"))
+        })?;
+        rows.iter().map(map_session_summary_row).collect()
+    }
+
+    /// Per-bin counts of the workspace's non-retired sessions — the
+    /// `scopeCounts` field served on every `agent.list` response variant
+    /// (§5.5). One grouped statement ([`scope_counts_sql`]) over the
+    /// workspace's `idx_agent_workspace` entries — O(workspace sessions),
+    /// the same order as the default rows read it accompanies. No rows are
+    /// hydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_agent_sessions_by_scope(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<AgentScopeCounts> {
+        let row = sqlx::query(scope_counts_sql())
+            .bind(&workspace_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("count agent sessions by scope failed: {e}")))?;
+        let count = |col: &str| -> u64 { u64::try_from(row.get::<i64, _>(col)).unwrap_or(0) };
+        Ok(AgentScopeCounts {
+            top_level: count("top_level"),
+            delegated: count("delegated"),
+            background: count("background"),
+        })
+    }
+
     /// Get message count, whether any assistant message exists, and the total
     /// persisted conversation size in bytes for each session in a workspace,
     /// without hydrating message bodies (finding F1/F3: lightweight
@@ -1231,7 +1347,8 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, "").await
+        self.session_message_projections(workspace_id, "", None)
+            .await
     }
 
     /// [`Store::get_agent_session_message_projections`] restricted to ACTIVE
@@ -1247,7 +1364,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, " AND s.retired_at IS NULL")
+        self.session_message_projections(workspace_id, " AND s.retired_at IS NULL", None)
             .await
     }
 
@@ -1266,20 +1383,44 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        self.session_message_projections(workspace_id, " AND s.retired_at IS NOT NULL")
+        self.session_message_projections(workspace_id, " AND s.retired_at IS NOT NULL", None)
             .await
     }
 
-    /// Shared body of the workspace projection reads; `retired_filter` is
-    /// one of the compile-time SQL fragments above (never caller input).
+    /// [`Store::get_agent_session_message_projections`] restricted to ONE
+    /// `agent.list { scope }` bin (§5.5) — the variant the scoped read
+    /// loads, so its aggregate cost scales with the rows that read returns
+    /// rather than with every active session in the workspace (RPC cost
+    /// contract). The filter is [`scope_predicate`], run in SQL.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_scoped_agent_session_message_projections(
+        &self,
+        workspace_id: &WorkspaceId,
+        scope: &AgentListRowScope,
+    ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
+        let (predicate, extra_bind) = scope_predicate(scope);
+        self.session_message_projections(workspace_id, predicate, extra_bind)
+            .await
+    }
+
+    /// Shared body of the workspace projection reads; `filter` is one of the
+    /// compile-time SQL fragments above (never caller input) and
+    /// `extra_bind` its optional second positional bind.
     async fn session_message_projections(
         &self,
         workspace_id: &WorkspaceId,
-        retired_filter: &str,
+        filter: &str,
+        extra_bind: Option<&str>,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        let sql = session_message_projections_sql(retired_filter);
-        let rows = sqlx::query(&sql)
-            .bind(&workspace_id.0)
+        let sql = session_message_projections_sql(filter);
+        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        if let Some(bind) = extra_bind {
+            query = query.bind(bind);
+        }
+        let rows = query
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("session message projections failed: {e}")))?;
@@ -1448,8 +1589,9 @@ impl Store {
     /// written, paired with their newest non-system message. List enrichment
     /// uses this one-statement projection to preserve the pre-upgrade question
     /// hold fallback without issuing a tail query per session. Soft-retired
-    /// sessions are excluded (a retired agent's stale question must not hold
-    /// the workspace at `needs_attention`).
+    /// and muted sessions are excluded (a retired agent's stale question must
+    /// not hold the workspace at `needs_attention`, and a muted agent feeds no
+    /// workspace-level attention rung).
     ///
     /// # Errors
     ///
@@ -1473,6 +1615,7 @@ impl Store {
              WHERE s.workspace_id IN ({placeholders}) \
                AND s.parent_agent_id IS NULL AND s.is_background = 0 \
                AND s.status != 'deleted' AND s.retired_at IS NULL \
+               AND s.notifications_muted = 0 \
                AND (json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL \
                     OR json_type(s.metadata, '$.pendingQuestionsMessageId') != 'text')"
         );
@@ -1915,6 +2058,10 @@ impl Store {
         // persisted here cannot wipe freshly discovered levels.
         // Those two attention writers are
         // the only post-insert mutators of the attention columns.
+        // `notifications_muted` (0123) is excluded for the same reason: it is
+        // a user toggle whose only post-insert mutator is
+        // `set_agent_notifications_muted`, so a concurrent or long-lived
+        // in-memory session persisted here can never revert the user's mute.
         let rows = sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
@@ -1964,6 +2111,57 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
         Ok(())
+    }
+
+    /// Set the session's `notifications_muted` flag (0123) — the store side
+    /// of `agent.update { notificationsMuted }`. Returns `true` when the
+    /// stored value actually changed; an already-matching flag is a no-op
+    /// (no write, no `updated_at` bump). The ONLY post-insert mutator of the
+    /// column: the full-row [`Store::update_agent_session`] deliberately
+    /// excludes it so a concurrent `agent.update` on unrelated fields, or a
+    /// long-lived in-memory session persisted at turn end, can never revert
+    /// the user's toggle. Scoped to `workspace_id` (defense-in-depth).
+    /// `NotFound` if the session is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_notifications_muted(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        muted: bool,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET notifications_muted=?, updated_at=? \
+             WHERE id=? AND workspace_id=? AND notifications_muted != ?",
+        )
+        .bind(i64::from(muted))
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(i64::from(muted))
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            let exists = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
+            )
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("verify agent session failed: {e}")))?;
+            if exists.is_none() {
+                return Err(Error::NotFound(format!("agent session {id}")));
+            }
+            // Session exists with the identical flag — the common case.
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Persist a model switch (`agent.setModel`): a narrow write of `model`,
@@ -3047,6 +3245,7 @@ fn map_session_row_with_heavy_cols(
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: col(row, "retired_at")?,
+        notifications_muted: col::<i64>(row, "notifications_muted")? != 0,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -3858,6 +4057,7 @@ impl Store {
             role: role.to_string(),
             content: content.clone(),
             app_message_id: intent_core::lift_app_message_id(metadata),
+            author: None,
             metadata: metadata.cloned(),
             created_at: created_at.to_string(),
         })
@@ -4853,6 +5053,7 @@ impl Store {
                     role: role.clone(),
                     content: content.clone(),
                     app_message_id: intent_core::lift_app_message_id(metadata.as_ref()),
+                    author: None,
                     metadata: metadata.clone(),
                     created_at: created_at.clone(),
                 });
@@ -5191,6 +5392,7 @@ fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
         role: col(row, "role")?,
         content,
         app_message_id: intent_core::lift_app_message_id(metadata.as_ref()),
+        author: None,
         metadata,
         created_at: col(row, "created_at")?,
     })
@@ -5292,6 +5494,72 @@ mod tests {
         }
     }
 
+    /// The `agent.list { scope }` reads and the grouped `scopeCounts`
+    /// aggregate (§5.5) must be answered by an index SEARCH on the workspace
+    /// (or, parent-narrowed, on `idx_agent_parent`) — never a full
+    /// `agent_session` SCAN — so their cost is bounded by the workspace's own
+    /// sessions like the default read they replace. No dedicated covering
+    /// index: the three bins split the same `idx_agent_workspace` entries
+    /// the default read visits, and a covering index over
+    /// `(workspace_id, retired_at, parent_agent_id, is_background)` would
+    /// only trade a row fetch per session for write amplification on every
+    /// session mutation.
+    #[tokio::test]
+    async fn scoped_reads_use_an_index_search_not_a_scan() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let parent = AgentId::from("agent-00000000-0000-4000-8000-000000000001");
+        let scopes = [
+            AgentListRowScope::TopLevel,
+            AgentListRowScope::Delegated {
+                parent_agent_id: None,
+            },
+            AgentListRowScope::Delegated {
+                parent_agent_id: Some(parent),
+            },
+            AgentListRowScope::Background,
+        ];
+        let mut statements: Vec<(String, String, Option<String>)> =
+            vec![("counts".to_string(), scope_counts_sql().to_string(), None)];
+        for scope in &scopes {
+            let (predicate, bind) = scope_predicate(scope);
+            statements.push((
+                format!("rows/{}", scope.wire_name()),
+                scoped_session_summaries_sql(scope),
+                bind.map(str::to_string),
+            ));
+            statements.push((
+                format!("projections/{}", scope.wire_name()),
+                session_message_projections_sql(predicate),
+                bind.map(str::to_string),
+            ));
+        }
+        for (label, sql, bind) in statements {
+            let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut plan = sqlx::query(&plan_sql).bind("ws-plan");
+            if let Some(bind) = &bind {
+                plan = plan.bind(bind);
+            }
+            let details: Vec<String> = plan
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.contains("SEARCH") && d.contains("INDEX idx_agent_")),
+                "{label} must be an index search on agent_session, plan: {details:?}"
+            );
+            assert!(
+                !details.iter().any(|d| d.contains("SCAN")),
+                "{label} must not scan agent_session, plan: {details:?}"
+            );
+        }
+    }
+
     /// The three unread-derivation statements (single-workspace EXISTS
     /// probe, workspace.list batch derivation, guarded settle-clear) must be
     /// answered entirely from the 0114/0122 partial covering index
@@ -5304,7 +5572,7 @@ mod tests {
     /// being fetched from the main table B-tree again — and no `Column`
     /// read from the `agent_session` table cursor: every predicate term
     /// outside the index columns (`parent_agent_id`, `is_background`,
-    /// `status`, `retired_at`) is satisfied by the partial index's WHERE
+    /// `status`, `retired_at`, `notifications_muted`) is satisfied by the partial index's WHERE
     /// clause only while it is spelled identically there, so a term added to
     /// the predicate but not the index (or vice versa) shows up as a
     /// per-row main-table fetch.
@@ -5385,7 +5653,8 @@ mod tests {
                 "{label} must be answered from the partial unread index alone: a \
                  `Column` read on the agent_session table cursor means a predicate \
                  term is not satisfied by the index WHERE clause (0122 added \
-                 `retired_at IS NULL` to both — keep them spelled identically), \
+                 `retired_at IS NULL` and 0124 `notifications_muted = 0` to both — \
+                 keep them spelled identically), \
                  opcodes: {opcodes:?}"
             );
         }
@@ -5604,6 +5873,216 @@ mod tests {
         );
     }
 
+    /// Flip the persisted `notifications_muted` flag on an existing session
+    /// row (the store-level equivalent of `agent.update { notificationsMuted }`).
+    async fn set_notifications_muted(
+        store: &Store,
+        ws: &WorkspaceId,
+        agent: &AgentId,
+        muted: bool,
+    ) {
+        store
+            .set_agent_notifications_muted(ws, agent, muted, &intent_core::now_iso())
+            .await
+            .expect("persist notifications_muted");
+    }
+
+    /// `set_agent_notifications_muted` is the only writer of the column: it
+    /// reports whether the flag changed (a same-value write is a no-op), and a
+    /// stale full-row `update_agent_session` carrying the pre-toggle flag
+    /// leaves the persisted mute untouched.
+    #[tokio::test]
+    async fn notifications_muted_survives_stale_full_row_update() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-muted-race".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-muted-race".to_string());
+        seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
+
+        let stale = store.get_agent_session(&agent).await.expect("load session");
+        assert!(!stale.notifications_muted);
+
+        assert!(store
+            .set_agent_notifications_muted(&ws, &agent, true, &ts)
+            .await
+            .expect("mute"));
+        assert!(
+            !store
+                .set_agent_notifications_muted(&ws, &agent, true, &ts)
+                .await
+                .expect("mute again"),
+            "same-value write is a no-op"
+        );
+
+        // A concurrent writer persisting the session it loaded BEFORE the
+        // toggle (still `notifications_muted: false`) must not revert it.
+        store
+            .update_agent_session(&ws, &stale)
+            .await
+            .expect("stale full-row update");
+        let after = store.get_agent_session(&agent).await.expect("reload");
+        assert!(
+            after.notifications_muted,
+            "full-row update must not clobber notifications_muted"
+        );
+
+        assert!(store
+            .set_agent_notifications_muted(&ws, &agent, false, &ts)
+            .await
+            .expect("unmute"));
+        assert!(
+            !store
+                .get_agent_session(&agent)
+                .await
+                .expect("reload")
+                .notifications_muted
+        );
+        assert!(matches!(
+            store
+                .set_agent_notifications_muted(
+                    &ws,
+                    &AgentId("agent-missing".to_string()),
+                    true,
+                    &ts
+                )
+                .await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// A muted session (`notifications_muted = 1`) never counts as unread:
+    /// the single-workspace probe, both batch derivations, and the guarded
+    /// settle-clear all ignore it. Unmuting makes the same row unread again —
+    /// the derivation is purely a read over the column.
+    #[tokio::test]
+    async fn unread_derivation_excludes_muted_sessions_until_unmuted() {
+        use intent_core::{now_iso, WorkspaceAttention};
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-unread-muted".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-unread-muted".to_string());
+        seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
+
+        let assert_unread = |expected: bool, label: &'static str| {
+            let store = &store;
+            let ws = &ws;
+            async move {
+                assert_eq!(
+                    store
+                        .workspace_has_unread_top_level_session(ws)
+                        .await
+                        .expect("probe"),
+                    expected,
+                    "{label}: single-workspace probe"
+                );
+                assert_eq!(
+                    store
+                        .workspaces_with_unread_top_level_sessions()
+                        .await
+                        .expect("batch")
+                        .contains(&ws.0),
+                    expected,
+                    "{label}: batch derivation"
+                );
+                assert_eq!(
+                    store
+                        .workspaces_with_unread_top_level_sessions_by_workspace(
+                            std::slice::from_ref(ws)
+                        )
+                        .await
+                        .expect("scoped batch")
+                        .contains(ws),
+                    expected,
+                    "{label}: scoped batch derivation"
+                );
+            }
+        };
+
+        assert_unread(true, "unmuted session").await;
+        assert!(store
+            .set_workspace_attention(&ws, WorkspaceAttention::Unread, None, None)
+            .await
+            .expect("raise unread"));
+        assert!(
+            !store
+                .clear_workspace_unread_if_all_seen(&ws)
+                .await
+                .expect("settle-clear while unmuted"),
+            "settle-clear must decline while the unmuted session is unread"
+        );
+
+        set_notifications_muted(&store, &ws, &agent, true).await;
+        assert_unread(false, "muted session").await;
+        assert!(
+            store
+                .clear_workspace_unread_if_all_seen(&ws)
+                .await
+                .expect("settle-clear after mute"),
+            "settle-clear must clear the flag when the only unread session is muted"
+        );
+        assert_eq!(
+            store.get_workspace(&ws).await.expect("workspace").attention,
+            WorkspaceAttention::None
+        );
+
+        set_notifications_muted(&store, &ws, &agent, false).await;
+        assert_unread(true, "unmuted again").await;
+    }
+
+    /// The legacy question-tail fallback (list path) skips muted sessions —
+    /// a muted agent's trailing question must not hold its workspace at
+    /// `needs_attention` — and picks them up again once unmuted.
+    #[tokio::test]
+    async fn legacy_question_tail_candidates_exclude_muted_sessions_until_unmuted() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-legacy-muted".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-legacy-muted".to_string());
+        seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
+
+        let candidates = |label: &'static str| {
+            let store = &store;
+            let ws = &ws;
+            async move {
+                store
+                    .list_legacy_question_tail_candidates_by_workspace(std::slice::from_ref(ws))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: legacy candidates: {e}"))
+                    .into_iter()
+                    .map(|(id, _, role, _)| (id, role))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(
+            candidates("unmuted session").await,
+            vec![(agent.clone(), "assistant".to_string())]
+        );
+
+        set_notifications_muted(&store, &ws, &agent, true).await;
+        assert!(
+            candidates("muted session").await.is_empty(),
+            "a muted session is not a legacy question-tail candidate"
+        );
+
+        set_notifications_muted(&store, &ws, &agent, false).await;
+        assert_eq!(
+            candidates("unmuted again").await,
+            vec![(agent.clone(), "assistant".to_string())]
+        );
+    }
+
     /// A UNIQUE violation on the session id maps to `Internal` naming the
     /// colliding id. Agent ids are server-minted (`agent-{uuid}`), so a
     /// duplicate insert is a server-side anomaly — never a client params
@@ -5658,11 +6137,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -5712,6 +6193,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -5780,11 +6262,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -5835,6 +6319,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -5940,11 +6425,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -5999,6 +6486,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -9452,11 +9940,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -9584,11 +10074,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -9668,11 +10160,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)
@@ -9729,6 +10223,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store
             .insert_agent_session(&session)
@@ -9865,11 +10360,13 @@ mod tests {
                 token_usage: None,
                 cow_supported: None,
                 browser_client_id: None,
+                pull_requests_total: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
+                membership: None,
             };
             store.insert_workspace(&workspace).await.expect("insert");
         }
@@ -9920,6 +10417,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -10159,11 +10657,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store.insert_workspace(&workspace).await.expect("insert");
 
@@ -10216,6 +10716,7 @@ mod tests {
                 session_corrupted: false,
                 pending_delete_at: None,
                 retired_at: None,
+                notifications_muted: false,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }
@@ -14267,6 +14768,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: ts.clone(),
@@ -14487,11 +14989,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store
             .insert_workspace(&workspace)

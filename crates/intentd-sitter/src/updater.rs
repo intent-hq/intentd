@@ -101,6 +101,8 @@ pub enum UpdateError {
     Io(#[from] io::Error),
     #[error("no manifest base URLs configured")]
     NoBaseUrls,
+    #[error("invalid exact update: {0}")]
+    ExactVersion(String),
 }
 
 /// The update engine. Holds the resolved sitter paths and an HTTP client
@@ -114,6 +116,92 @@ pub struct Updater {
 }
 
 impl Updater {
+    /// Install a fixed release, retaining the configured channel. Both the
+    /// running and installed versions are downgrade floors. No channel
+    /// manifest or caller-supplied URL participates in this operation.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid target, downgrade, or failed verification/install.
+    pub fn install_exact(&self, target: &str, running: &str) -> Result<UpdateOutcome, UpdateError> {
+        let version = validate_exact_version(target)?;
+        let running = semver::Version::parse(running)
+            .map_err(|e| UpdateError::ExactVersion(format!("invalid running version: {e}")))?;
+        if version.cmp_precedence(&running).is_lt() {
+            return Err(UpdateError::ExactVersion(
+                "downgrades are not allowed".into(),
+            ));
+        }
+        let installed = state::load(&self.paths.state_path);
+        if let Some(current) = installed.current_version.as_deref() {
+            let current_version = semver::Version::parse(current).map_err(|e| {
+                UpdateError::ExactVersion(format!("invalid installed version: {e}"))
+            })?;
+            if version.cmp_precedence(&current_version).is_lt() {
+                return Err(UpdateError::ExactVersion(
+                    "a newer version is already installed".into(),
+                ));
+            }
+            if current == target && self.paths.daemon_binary(current).exists() {
+                return Ok(UpdateOutcome::AlreadyCurrent {
+                    version: current.into(),
+                });
+            }
+        }
+        let entry = self.fetch_exact_entry(target)?;
+        let tmp_dir = self
+            .paths
+            .tmp_dir
+            .join(format!("exact-{}-{}", std::process::id(), target));
+        fs::create_dir_all(&tmp_dir)?;
+        let result =
+            self.download_and_install(target, installed.channel, &entry, &tmp_dir, false, true);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        match result? {
+            UpdateOutcome::AlreadyCurrent { version } if version != target => Err(
+                UpdateError::ExactVersion("a concurrent update installed a newer version".into()),
+            ),
+            outcome => Ok(outcome),
+        }
+    }
+
+    fn fetch_exact_entry(&self, target: &str) -> Result<PlatformEntry, UpdateError> {
+        let extensions: &[&str] = if cfg!(windows) {
+            &["zip"]
+        } else {
+            &["tar.xz", "tar.gz"]
+        };
+        let mut last_error = None;
+        for base in &self.base_urls {
+            for extension in extensions {
+                let asset = format!("intentd-{TARGET_TRIPLE}.{extension}");
+                let url = format!("{}/v{target}/{asset}", base.trim_end_matches('/'));
+                let bytes = match self.fetch(&format!("{url}.sha256"), MANIFEST_TIMEOUT) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+                let checksum = String::from_utf8_lossy(&bytes);
+                let fields: Vec<_> = checksum.split_whitespace().collect();
+                if fields.len() != 2
+                    || fields[0].len() != 64
+                    || !fields[0].bytes().all(|b| b.is_ascii_hexdigit())
+                    || fields[1].trim_start_matches('*') != asset
+                {
+                    return Err(UpdateError::ExactVersion(
+                        "invalid release checksum sidecar".into(),
+                    ));
+                }
+                return Ok(PlatformEntry {
+                    asset,
+                    url,
+                    sha256: fields[0].into(),
+                });
+            }
+        }
+        Err(last_error.unwrap_or(UpdateError::NoBaseUrls))
+    }
     /// Updater against the real GitHub release manifests, trying each of
     /// [`manifest::DEFAULT_MANIFEST_BASE_URLS`] in order.
     ///
@@ -271,7 +359,8 @@ impl Updater {
                 .unwrap_or_default()
         ));
         fs::create_dir_all(&tmp_dir)?;
-        let result = self.download_and_install(&manifest.version, channel, entry, &tmp_dir, force);
+        let result =
+            self.download_and_install(&manifest.version, channel, entry, &tmp_dir, force, false);
         let _ = fs::remove_dir_all(&tmp_dir);
         result
     }
@@ -283,6 +372,7 @@ impl Updater {
         entry: &PlatformEntry,
         tmp_dir: &Path,
         force: bool,
+        exact: bool,
     ) -> Result<UpdateOutcome, UpdateError> {
         let archive_path = tmp_dir.join(&entry.asset);
         self.download_verified(entry, &archive_path)?;
@@ -296,36 +386,44 @@ impl Updater {
                 reason: format!("archive does not contain a {DAEMON_BIN_NAME} binary"),
             })?;
 
-        self.install_version(version, &extracted_bin)?;
-
-        // state.json is written only after the binary is fully installed.
-        // Reload it here instead of trusting the pre-download snapshot:
-        // another updater (e.g. a serve-mode sitter's periodic check running
-        // next to a CLI `intentd update`) may have installed an equal or
-        // newer version while we were downloading, and overwriting its state
-        // entry would activate a downgrade on the next (re)spawn. `force`
-        // skips the guard — it is the explicit downgrade path.
-        let mut new_state = state::load(&self.paths.state_path);
+        let _lock = state::lock(&self.paths.state_path)?;
+        // Check again under the cross-process lock, before replacing a binary
+        // or pruning a concurrent install. Older sitters lack this lock and
+        // must not advertise exact update support to their child.
+        let latest = state::load(&self.paths.state_path);
         if !force {
-            if let Some(current) = new_state.current_version.as_deref() {
-                // Strictly newer only: an equal version is our own reinstall
-                // (or an identical concurrent install) and must still commit;
-                // `install_version` above already made `version`'s binary
-                // exist, so an "is current installed?" check can't be used
-                // here. Unparseable `current` never wins.
-                if self.paths.daemon_binary(current).exists()
-                    && manifest_is_newer(current, version).unwrap_or(false)
-                {
-                    // Lost the race: keep the winner's state. Our orphaned
-                    // `versions/<version>/` dir is swept by a later prune.
+            if let Some(current) = latest.current_version.as_deref() {
+                // Channel checks recover a missing binary even when the channel
+                // trails recorded state. Exact requests retain the state version
+                // as a downgrade floor regardless of whether its binary exists.
+                let newer = if exact {
+                    let current = semver::Version::parse(current).map_err(|e| {
+                        UpdateError::ExactVersion(format!("invalid installed version: {e}"))
+                    })?;
+                    current
+                        .cmp_precedence(&validate_exact_version(version)?)
+                        .is_gt()
+                } else {
+                    self.paths.daemon_binary(current).exists()
+                        && manifest_is_newer(current, version).unwrap_or(false)
+                };
+                if newer {
                     return Ok(UpdateOutcome::AlreadyCurrent {
-                        version: current.to_string(),
+                        version: current.into(),
                     });
                 }
             }
         }
+        self.install_version(version, &extracted_bin)?;
+
+        // Keep the lock through activation and prune, and preserve the fresh
+        // scheduling fields loaded under it. No concurrent writer can win
+        // between the comparison and this commit.
+        let mut new_state = latest;
         let previous = new_state.current_version.take();
-        new_state.channel = channel;
+        if !exact {
+            new_state.channel = channel;
+        }
         new_state.current_version = Some(version.to_string());
         state::save(&self.paths.state_path, &new_state)?;
 
@@ -491,6 +589,24 @@ impl Updater {
             }
         }
     }
+}
+
+/// Strict release identifier, safe as one URL/path component.
+///
+/// # Errors
+/// Rejects prefixes, whitespace, build metadata, oversized and malformed semver.
+pub fn validate_exact_version(value: &str) -> Result<semver::Version, UpdateError> {
+    if value.len() > 128 {
+        return Err(UpdateError::ExactVersion("version is too long".into()));
+    }
+    let version =
+        semver::Version::parse(value).map_err(|e| UpdateError::ExactVersion(e.to_string()))?;
+    if !version.build.is_empty() {
+        return Err(UpdateError::ExactVersion(
+            "build metadata is not a release target".into(),
+        ));
+    }
+    Ok(version)
 }
 
 /// True when the manifest's version is strictly newer than `current`.

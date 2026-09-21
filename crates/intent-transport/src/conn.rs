@@ -9,8 +9,8 @@
 //! transports handle by draining the two-lane outbound queue
 //! ([`OutboundSender`] / [`OutboundReceiver`], priority lane first).
 
-use intent_core::events::{AGENT_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
-use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
+use intent_core::events::{AGENT_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED};
+use intent_core::{AgentId, ClientId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::browser;
+use crate::catalog;
 use crate::client;
 use crate::conflate::{self, ChatItem, ConflationBuffer, Enqueue, EventItem};
 use crate::control::{self, SystemControl};
@@ -29,6 +30,7 @@ use crate::events::{self, FastPath};
 use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::panic_guard;
+use crate::presence;
 use crate::reverse::{PrimaryReverseGuard, ReverseChannel};
 use crate::router::{
     check_envelope, handle_message, EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET,
@@ -101,6 +103,14 @@ impl OutboundSender {
     /// checking one suffices).
     pub(crate) fn is_closed(&self) -> bool {
         self.priority.is_closed()
+    }
+
+    /// Whether the priority lane holds neither a queued frame nor a reserved
+    /// slot. A slow-path RPC reserves its slot on the read loop before it is
+    /// spawned (see [`finish_slow_path_rpc`]), so `true` means no RPC response
+    /// is queued or still in flight for this connection.
+    pub(crate) fn priority_idle(&self) -> bool {
+        self.priority.capacity() == self.priority.max_capacity()
     }
 
     /// The priority-lane sender for collaborators that only ever send
@@ -200,11 +210,14 @@ struct ChatLifecycle {
 
 /// Per-connection record for one active subscription: the forwarder task (its
 /// `Drop` aborts delivery and releases the bus subscription), the optional
-/// `replaceGroup` it belongs to, and (chat only) its lifecycle identity.
+/// `replaceGroup` it belongs to, (chat only) its lifecycle identity, and
+/// whether it holds a `note.presence` viewer lease (released with the service
+/// layer by [`ConnSubs::remove`] before the removal is acknowledged).
 struct ConnSub {
     handle: JoinHandle<()>,
     replace_group: Option<String>,
     lifecycle: Option<ChatLifecycle>,
+    note_lease: bool,
 }
 
 impl Drop for ConnSub {
@@ -222,6 +235,11 @@ impl Drop for ConnSub {
 pub(crate) struct ConnSubs {
     subs: HashMap<String, ConnSub>,
     setup: crate::provider_setup::Connection,
+    /// The connection's presence identity (multiplayer w5); dropping it with
+    /// the registry publishes the offline transition and releases every
+    /// `note.presence` lease — declared after `subs` so the forwarders'
+    /// lease guards drop first.
+    presence: presence::PresenceConn,
 }
 
 impl ConnSubs {
@@ -238,17 +256,59 @@ impl ConnSubs {
                 handle,
                 replace_group,
                 lifecycle,
+                note_lease: false,
+            },
+        );
+    }
+
+    /// Register a `note.presence` channel subscription whose forwarder holds
+    /// the viewer lease `id`.
+    fn insert_note_lease(
+        &mut self,
+        id: String,
+        handle: JoinHandle<()>,
+        replace_group: Option<String>,
+    ) {
+        self.subs.insert(
+            id,
+            ConnSub {
+                handle,
+                replace_group,
+                lifecycle: None,
+                note_lease: true,
             },
         );
     }
 
     /// Remove one subscription; `true` if it existed (TS `handleUnsubscribe`).
-    fn remove(&mut self, id: &str) -> bool {
-        self.subs.remove(id).is_some()
+    /// A `note.presence` lease is released with the service layer *before*
+    /// returning, so the connection's next frame (a pipelined
+    /// `note.presence.update`) can no longer find it: the forwarder's own
+    /// [`presence::NoteLease`] drop only schedules the same idempotent leave
+    /// and would otherwise race the unsubscribe acknowledgement.
+    async fn remove(&mut self, api: &Arc<dyn WorkspaceApi>, id: &str) -> bool {
+        let Some(sub) = self.subs.remove(id) else {
+            return false;
+        };
+        let note_lease = sub.note_lease;
+        drop(sub);
+        if note_lease {
+            api.note_presence_leave(self.presence.id().to_string(), id.to_string())
+                .await;
+        }
+        true
     }
 
-    /// Drop every subscription sharing `group` (`replaceGroup` semantics).
-    fn remove_group(&mut self, group: &str) {
+    /// Whether a registered forwarder has exited on its own (`None` for an
+    /// unknown id). Test probe for the membership teardown paths.
+    #[cfg(test)]
+    pub(crate) fn forwarder_finished(&self, id: &str) -> Option<bool> {
+        self.subs.get(id).map(|s| s.handle.is_finished())
+    }
+
+    /// Drop every subscription sharing `group` (`replaceGroup` semantics),
+    /// releasing their `note.presence` leases like [`Self::remove`].
+    async fn remove_group(&mut self, api: &Arc<dyn WorkspaceApi>, group: &str) {
         let ids: Vec<String> = self
             .subs
             .iter()
@@ -256,7 +316,7 @@ impl ConnSubs {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
-            self.subs.remove(&id);
+            self.remove(api, &id).await;
         }
     }
 }
@@ -351,6 +411,19 @@ pub(crate) async fn process_frame(
             &method,
             raw.len(),
         );
+        // Multiplayer w3 — default-deny allowlist for non-administrator
+        // connections. Runs before every classify and dispatch path (control,
+        // server/pairing, provider setup, host, browser, forward, client,
+        // drafts, subscription channels, events, router) so no fast path can
+        // be reached by a method outside `COLLABORATOR_METHODS`; aliases are
+        // canonicalised inside the lookup. Only a frame that already carries
+        // a method is gated — a malformed envelope keeps its `-32600`.
+        if !method.is_empty()
+            && crate::context::is_non_administrator_caller()
+            && !catalog::collaborator_may_call(&method)
+        {
+            return refuse_forbidden(&method, rpc_id, out_tx).await;
+        }
         if let Some(control) = control {
             if let Some(req) = control::classify(value) {
                 let is_uds = !crate::context::is_tcp_connection();
@@ -398,6 +471,26 @@ pub(crate) async fn process_frame(
                 };
             }
         }
+        // `workspace.invite.create` (multiplayer w4): wraps the minted invite
+        // into the `intent://invite` link with this listener's own pairing
+        // envelope (hosts / port / fingerprint, never the bearer token), so it
+        // runs here where the pairing provider is in reach. Not local-only:
+        // a remote owner mints links too. `invite.redeem` is NOT served on
+        // authenticated connections — only on the `/invite` endpoint.
+        if let Some(req) = crate::invite::classify(value) {
+            if req.method == crate::invite::InviteMethod::Create {
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::invite::handle_create(req, api, server_pairing_info),
+                )
+                .await;
+                return match frame {
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                    None => true,
+                };
+            }
+        }
         if let Some(req) = crate::provider_setup::classify(value) {
             let frame = panic_guard::guard_frame(
                 &method,
@@ -435,9 +528,10 @@ pub(crate) async fn process_frame(
             let bus = bus.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
+            let caller = crate::context::current_caller();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_connection_context(is_tcp, async {
+                crate::context::with_request_context(is_tcp, caller, async {
                     finish_slow_path_rpc(
                         permit,
                         panic_guard::guard_frame(
@@ -491,9 +585,10 @@ pub(crate) async fn process_frame(
                 .flatten();
             let registry = reverse_guard.registry();
             let is_tcp = crate::context::is_tcp_connection();
+            let caller = crate::context::current_caller();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_connection_context(is_tcp, async {
+                crate::context::with_request_context(is_tcp, caller, async {
                     let tabs = browser::TabContext {
                         api: api.as_ref(),
                         client_id: host_client_id.as_ref(),
@@ -545,8 +640,18 @@ pub(crate) async fn process_frame(
             .await;
             // REV-2: bind the hello'd identity onto the registry entry; the
             // registry queues and publishes any `client:*` transition.
+            let hello_ok = bound.is_some();
             if let Some(identity) = bound {
                 reverse_guard.bind(identity);
+            }
+            // Multiplayer w5: a hello'd connection is online for its
+            // principal. Best-effort — a refusal (no wire caller) only
+            // means this connection never counts as present.
+            if hello_ok {
+                subs.presence.attach(api);
+                if let Err(e) = api.presence_connect(subs.presence.id().to_string()).await {
+                    tracing::debug!(error = %e, "presence: connect skipped");
+                }
             }
             subs.setup.authorized = setup_requested
                 && !crate::context::is_tcp_connection()
@@ -564,6 +669,18 @@ pub(crate) async fn process_frame(
                 &method,
                 rpc_id.clone(),
                 drafts::handle(req, api.as_ref(), client_id),
+            )
+            .await;
+            return match frame {
+                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                None => true,
+            };
+        }
+        if let Some(req) = presence::classify(value) {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                presence::handle(req, api, &mut subs.presence),
             )
             .await;
             return match frame {
@@ -591,7 +708,7 @@ pub(crate) async fn process_frame(
                 &method,
                 rpc_id.clone(),
                 out_tx,
-                handle_fast_path(fast_path, bus, out_tx, subs),
+                handle_fast_path(fast_path, api, bus, out_tx, subs),
             )
             .await;
         }
@@ -635,8 +752,9 @@ pub(crate) async fn process_frame(
     let api = api.clone();
     let raw = raw.to_string();
     let is_tcp = crate::context::is_tcp_connection();
+    let caller = crate::context::current_caller();
     tokio::spawn(async move {
-        crate::context::with_connection_context(is_tcp, async {
+        crate::context::with_request_context(is_tcp, caller, async {
             finish_slow_path_rpc(
                 permit,
                 panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)),
@@ -740,11 +858,36 @@ async fn reject_overloaded(
     }
 }
 
+/// Refuse one frame from a non-administrator connection whose method is
+/// outside [`catalog::COLLABORATOR_METHODS`]: a request echoes
+/// `-32003 "Forbidden"` with its `id`, a notification (no `id`) is dropped
+/// without a response per PROTOCOL §9. Returns `false` only when the outbound
+/// channel is closed.
+async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &OutboundSender) -> bool {
+    tracing::debug!(
+        method,
+        "refusing RPC: method is not on the collaborator allowlist"
+    );
+    match rpc_id {
+        Some(id) => out_tx
+            .send_priority(events::error_frame(
+                &id,
+                catalog::FORBIDDEN_ERROR_CODE,
+                catalog::FORBIDDEN_ERROR_MESSAGE,
+            ))
+            .await
+            .is_ok(),
+        None => !out_tx.is_closed(),
+    }
+}
+
 /// Handle a classified `events.subscribe` / `events.unsubscribe` request,
 /// mirroring `handleSubscribe` / `handleUnsubscribe`. Returns `false` when the
-/// outbound channel is closed.
-async fn handle_fast_path(
+/// outbound channel is closed. `pub(crate)` for the conn-level collaborator
+/// fan-out test in `events::tests`.
+pub(crate) async fn handle_fast_path(
     fast_path: FastPath,
+    api: &Arc<dyn WorkspaceApi>,
     bus: &EventBus,
     out_tx: &OutboundSender,
     subs: &mut ConnSubs,
@@ -758,14 +901,38 @@ async fn handle_fast_path(
                     replace_group,
                 } = p;
                 if let Some(group) = replace_group.as_deref() {
-                    subs.remove_group(group);
+                    subs.remove_group(api, group).await;
                 }
                 // Canonical WS bridge: each accepted event is delivered
-                // individually (no server-side coalescing, §6.6).
+                // individually (no server-side coalescing, §6.6). A
+                // non-administrator connection keeps whatever patterns it
+                // asked for (and its subscription id) but only allowlisted
+                // types ever match (multiplayer w3), and every matched event
+                // is then checked against the subscriber's membership of its
+                // workspace at delivery (`MembershipGate`); a side
+                // subscription on `workspace:updated` feeds unshares to the
+                // gate so a removal tears delivery down at once — and, for
+                // a subscription scoped to one `workspaceId`, ends it.
+                // Channel-only types (`note:presence`, multiplayer w5) never
+                // travel on this firehose for anyone: they reach only the
+                // note's `note.presence.subscribe` lease holders.
+                let gate = events::MembershipGate::for_current_caller(api);
+                let scoped_workspace = gate.as_ref().and(workspace_id.clone());
+                let membership_events = gate.as_ref().map(|_| {
+                    bus.subscribe(SubscriptionFilter {
+                        event_types: vec![WORKSPACE_UPDATED.to_string()],
+                        workspace_id: workspace_id.clone(),
+                        batch_window: None,
+                        collaborator_only: true,
+                        ..Default::default()
+                    })
+                });
                 let subscription = bus.subscribe(SubscriptionFilter {
                     event_types,
                     workspace_id,
                     batch_window: None,
+                    collaborator_only: gate.is_some(),
+                    exclude_channel_only: true,
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -781,8 +948,12 @@ async fn handle_fast_path(
                         return false;
                     }
                 }
-                let handle = tokio::spawn(forward_subscription(
+                // Spawned with the request context re-established: the gate's
+                // membership re-reads run under the subscriber's caller.
+                let handle = spawn_forwarder(forward_subscription(
                     subscription,
+                    gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
+                    scoped_workspace,
                     subscription_id.clone(),
                     out_tx.clone(),
                 ));
@@ -793,7 +964,7 @@ async fn handle_fast_path(
         },
         FastPath::Unsubscribe { id, params } => match events::parse_unsubscribe_id(&params) {
             Ok(subscription_id) => {
-                let success = subs.remove(&subscription_id);
+                let success = subs.remove(api, &subscription_id).await;
                 if id.present {
                     let frame = events::success_frame(&id.echo, &json!({ "success": success }));
                     return out_tx.send_priority(frame).await.is_ok();
@@ -826,8 +997,15 @@ async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &Outbou
 /// flushed first (a conflated frame always lands before its stream's terminal
 /// event, e.g. `terminal:exit`), then the barrier blocks as before. With no
 /// congestion the buffer stays empty and every frame passes straight through.
+///
+/// A guarded subscriber's own unshare from `scoped_workspace` (the
+/// subscription's `workspaceId`, when one was given) ends the forwarder,
+/// like the scoped collection channels; a global stream stays alive for the
+/// subscriber's other member workspaces, the gate suppressing the rest.
 async fn forward_subscription(
     mut subscription: Subscription,
+    membership: Option<(events::MembershipGate, Subscription)>,
+    scoped_workspace: Option<String>,
     subscription_id: String,
     out_tx: OutboundSender,
 ) {
@@ -835,6 +1013,10 @@ async fn forward_subscription(
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
     let out_tx = out_tx.bulk_sender();
     let mut buffer: ConflationBuffer<EventItem> = ConflationBuffer::new();
+    let (mut gate, mut membership_events) = match membership {
+        Some((gate, sub)) => (Some(gate), Some(sub)),
+        None => (None, None),
+    };
     loop {
         tokio::select! {
             biased;
@@ -847,6 +1029,25 @@ async fn forward_subscription(
                 }
                 Err(_) => return,
             },
+            // Membership changes invalidate the gate's cached verdicts
+            // before the next matched event is considered.
+            maybe = async { membership_events.as_mut().expect("guarded").recv().await },
+                if membership_events.is_some() =>
+            {
+                match (maybe, gate.as_mut()) {
+                    (Some(batch), Some(gate)) => {
+                        for event in &batch {
+                            gate.observe_membership_event(event);
+                            if gate.is_own_unshare(event)
+                                && scoped_workspace.as_deref() == Some(event.workspace_id.as_str())
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    _ => membership_events = None,
+                }
+            },
             maybe = subscription.recv() => {
                 let Some(batch) = maybe else {
                     // Bus closed: flush anything still pending, then stop.
@@ -856,6 +1057,11 @@ async fn forward_subscription(
                     return;
                 };
                 for event in batch {
+                    if let Some(gate) = gate.as_mut() {
+                        if !gate.allows(&event).await {
+                            continue;
+                        }
+                    }
                     if let Some(key) = conflate::event_key(&event) {
                         let item = EventItem::new(&key, event);
                         let sid = &subscription_id;
@@ -931,7 +1137,7 @@ pub(crate) async fn handle_sub_fast_path(
                 // in the measured interval.
                 let timer = subscriptions::SnapshotTimer::start(Channel::Note, &workspace_id);
                 if let Some(group) = replace_group.as_deref() {
-                    subs.remove_group(group);
+                    subs.remove_group(api, group).await;
                 }
                 // Subscribe before the snapshot so a mutation racing the read is
                 // captured and re-emitted as a delta (idempotent over-delivery,
@@ -945,6 +1151,7 @@ pub(crate) async fn handle_sub_fast_path(
                     ],
                     workspace_id: Some(workspace_id.clone()),
                     batch_window: None,
+                    collaborator_only: crate::context::is_non_administrator_caller(),
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -960,16 +1167,97 @@ pub(crate) async fn handle_sub_fast_path(
                         return false;
                     }
                 }
-                let handle = tokio::spawn(forward_note_subscription(
+                let membership = ChannelMembership::for_current_caller(api, bus, &workspace_id);
+                let handle = spawn_forwarder(forward_note_subscription(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
                     projection,
                     subscription,
+                    membership,
                     subscription_id.clone(),
                     out_tx.clone(),
                     timer,
                 ));
                 subs.insert(subscription_id, handle, replace_group, None);
+                true
+            }
+            Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
+        },
+        // The per-note `note.presence` channel (multiplayer w5): subscribing
+        // IS the "I am viewing" signal, so the join runs first — it is
+        // member-gated and returns the seq-0 snapshot (`{ viewers }`, the
+        // subscriber included) — and a refusal is the request's error reply
+        // (`-32602 not-found` for a non-member), never a subscription. The
+        // forwarder owns the viewer lease: dropping it (unsubscribe,
+        // `replaceGroup`, close, own unshare) publishes the `left`.
+        SubFastPath::Subscribe {
+            id,
+            channel: Channel::NotePresence,
+            params,
+        } => match subscriptions::parse_comment_subscribe_params(&params) {
+            Ok(p) => {
+                let subscriptions::CommentSubscribeParams {
+                    workspace_id,
+                    note_id,
+                    replace_group,
+                } = p;
+                let timer =
+                    subscriptions::SnapshotTimer::start(Channel::NotePresence, &workspace_id);
+                if let Some(group) = replace_group.as_deref() {
+                    subs.remove_group(api, group).await;
+                }
+                // Subscribe before the join so the join's own `joined` (and
+                // any racing viewer) is delivered as a delta after the
+                // snapshot (idempotent over-delivery, §1.3).
+                let subscription = bus.subscribe(SubscriptionFilter {
+                    event_types: subscriptions::channel_event_types(Channel::NotePresence),
+                    workspace_id: Some(workspace_id.clone()),
+                    batch_window: None,
+                    collaborator_only: crate::context::is_non_administrator_caller(),
+                    ..Default::default()
+                });
+                let subscription_id = events::next_subscription_id();
+                subs.presence.attach(api);
+                let joined = api
+                    .note_presence_join(
+                        subs.presence.id().to_string(),
+                        subscription_id.clone(),
+                        WorkspaceId::from(workspace_id.clone()),
+                        NoteId::from(note_id.clone()),
+                    )
+                    .await;
+                let snapshot = match joined {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        return match presence::respond(id.present, &id.echo, Err(e)) {
+                            Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                            None => true,
+                        };
+                    }
+                };
+                let lease =
+                    presence::NoteLease::new(api.clone(), subs.presence.id(), &subscription_id);
+                if id.present {
+                    let frame = events::success_frame(
+                        &id.echo,
+                        &json!({ "subscriptionId": subscription_id }),
+                    );
+                    if out_tx.send_priority(frame).await.is_err() {
+                        return false;
+                    }
+                }
+                let membership = ChannelMembership::for_current_caller(api, bus, &workspace_id);
+                let handle = spawn_forwarder(forward_note_presence_subscription(
+                    NoteId::from(note_id),
+                    snapshot,
+                    subscription,
+                    membership,
+                    subscription_id.clone(),
+                    out_tx.clone(),
+                    timer,
+                    lease,
+                ));
+                subs.insert_note_lease(subscription_id, handle, replace_group);
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -999,15 +1287,32 @@ pub(crate) async fn handle_sub_fast_path(
                 // scan is included in the measured interval.
                 let timer = subscriptions::SnapshotTimer::start(Channel::Chat, &agent_id);
                 if let Some(group) = replace_group.as_deref() {
-                    subs.remove_group(group);
+                    subs.remove_group(api, group).await;
                 }
                 // The chat channel is per-agent, not workspace-scoped, so the
                 // bus filter carries no `workspaceId`; the forwarder narrows the
-                // stream family to this agent (cross-agent isolation).
+                // stream family to this agent (cross-agent isolation). A
+                // non-administrator's live chunk/tool deltas are mapped from
+                // the event payload, not re-read, so the same delivery-time
+                // `MembershipGate` as `events.subscribe` decides whether the
+                // subscriber may see the agent's workspace; its side
+                // subscription on `workspace:updated` tears the stream down
+                // on the subscriber's own removal (multiplayer w3).
+                let gate = events::MembershipGate::for_current_caller(api);
+                let membership_events = gate.as_ref().map(|_| {
+                    bus.subscribe(SubscriptionFilter {
+                        event_types: vec![WORKSPACE_UPDATED.to_string()],
+                        workspace_id: None,
+                        batch_window: None,
+                        collaborator_only: true,
+                        ..Default::default()
+                    })
+                });
                 let subscription = bus.subscribe(SubscriptionFilter {
                     event_types: subscriptions::channel_event_types(Channel::Chat),
                     workspace_id: None,
                     batch_window: None,
+                    collaborator_only: gate.is_some(),
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -1035,13 +1340,14 @@ pub(crate) async fn handle_sub_fast_path(
                     scope: agent_id.clone(),
                     subscription_id: subscription_id.clone(),
                 };
-                let handle = tokio::spawn(forward_chat_subscription(
+                let handle = spawn_forwarder(forward_chat_subscription(
                     api.clone(),
                     AgentId::from(agent_id),
                     since_message_id,
                     delta_encoding,
                     projection,
                     subscription,
+                    gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
                     subscription_id.clone(),
                     out_tx.clone(),
                     timer,
@@ -1074,7 +1380,7 @@ pub(crate) async fn handle_sub_fast_path(
                         workspace_id.as_deref().unwrap_or("global"),
                     );
                     if let Some(group) = replace_group.as_deref() {
-                        subs.remove_group(group);
+                        subs.remove_group(api, group).await;
                     }
                     let filter_ws = if subscriptions::channel_is_global(channel) {
                         None
@@ -1085,8 +1391,15 @@ pub(crate) async fn handle_sub_fast_path(
                         event_types: subscriptions::channel_event_types(channel),
                         workspace_id: filter_ws,
                         batch_window: None,
+                        collaborator_only: crate::context::is_non_administrator_caller(),
                         ..Default::default()
                     });
+                    // The global `workspace` channel re-reads its rows and
+                    // scopes its tombstones itself (see the forwarder); the
+                    // workspace-scoped channels take the membership boundary.
+                    let membership = workspace_id
+                        .as_deref()
+                        .and_then(|ws| ChannelMembership::for_current_caller(api, bus, ws));
                     let subscription_id = events::next_subscription_id();
                     if id.present {
                         let frame = events::success_frame(
@@ -1097,13 +1410,14 @@ pub(crate) async fn handle_sub_fast_path(
                             return false;
                         }
                     }
-                    let handle = tokio::spawn(forward_channel_subscription(
+                    let handle = spawn_forwarder(forward_channel_subscription(
                         api.clone(),
                         channel,
                         workspace_id
                             .map_or_else(|| WorkspaceId::from(String::new()), WorkspaceId::from),
                         note_id.map(NoteId::from),
                         subscription,
+                        membership,
                         subscription_id.clone(),
                         out_tx.clone(),
                         timer,
@@ -1116,7 +1430,7 @@ pub(crate) async fn handle_sub_fast_path(
         }
         SubFastPath::Unsubscribe { id, params } => match events::parse_unsubscribe_id(&params) {
             Ok(subscription_id) => {
-                let success = subs.remove(&subscription_id);
+                let success = subs.remove(api, &subscription_id).await;
                 if id.present {
                     let frame = events::success_frame(&id.echo, &json!({ "success": success }));
                     return out_tx.send_priority(frame).await.is_ok();
@@ -1125,6 +1439,111 @@ pub(crate) async fn handle_sub_fast_path(
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
         },
+    }
+}
+
+/// Spawn a subscription forwarder with the subscribing connection's request
+/// context re-established for the task's whole lifetime: the seq-0 snapshot
+/// and every later delta re-read run through `api`, so they need the same
+/// transport origin and [`Caller`](crate::context::Caller) the inline
+/// request had (multiplayer w1 — without it `workspace.subscribe` rows
+/// carried no `myRole`, intent-hq/intentd#1868).
+fn spawn_forwarder<F>(forwarder: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let is_tcp = crate::context::is_tcp_connection();
+    let caller = crate::context::current_caller();
+    tokio::spawn(crate::context::with_request_context(
+        is_tcp, caller, forwarder,
+    ))
+}
+
+/// A non-administrator subscriber's delivery-time membership boundary on a
+/// workspace-scoped collection channel (`note` / `task` / `agent` /
+/// `comment`, multiplayer w3). The channels' `added` / `updated` rows come
+/// from guarded re-reads, but their `removedIds` tombstones are mapped from
+/// the event alone, so every event is checked against the
+/// [`events::MembershipGate`] before mapping; the side subscription on the
+/// workspace's `workspace:updated` feeds membership changes to the gate, and
+/// the subscriber's own unshare ends the forwarder.
+struct ChannelMembership {
+    gate: events::MembershipGate,
+    events: Option<Subscription>,
+    workspace_id: String,
+}
+
+impl ChannelMembership {
+    /// The boundary for the current request's caller on `workspace_id`, or
+    /// `None` for an administrator (or unbound) caller.
+    fn for_current_caller(
+        api: &Arc<dyn WorkspaceApi>,
+        bus: &EventBus,
+        workspace_id: &str,
+    ) -> Option<Self> {
+        let gate = events::MembershipGate::for_current_caller(api)?;
+        let events = bus.subscribe(SubscriptionFilter {
+            event_types: vec![WORKSPACE_UPDATED.to_string()],
+            workspace_id: Some(workspace_id.to_string()),
+            batch_window: None,
+            collaborator_only: true,
+            ..Default::default()
+        });
+        Some(Self {
+            gate,
+            events: Some(events),
+            workspace_id: workspace_id.to_string(),
+        })
+    }
+}
+
+/// The next batch of `subscription` a channel forwarder may map, with the
+/// events `membership` refuses removed (every event when the subscriber is
+/// no member). `None` once the bus closes or the subscriber's own unshare of
+/// the channel's workspace arrives — the forwarder ends.
+async fn recv_visible(
+    subscription: &mut Subscription,
+    membership: &mut Option<ChannelMembership>,
+) -> Option<Vec<Event>> {
+    let Some(ChannelMembership {
+        gate,
+        events,
+        workspace_id,
+    }) = membership.as_mut()
+    else {
+        return subscription.recv().await;
+    };
+    loop {
+        tokio::select! {
+            biased;
+            maybe = async { events.as_mut().expect("guarded").recv().await },
+                if events.is_some() =>
+            {
+                match maybe {
+                    Some(batch) => {
+                        for event in &batch {
+                            gate.observe_membership_event(event);
+                            if gate.is_own_unshare(event)
+                                && event.workspace_id.as_str() == workspace_id
+                            {
+                                return None;
+                            }
+                        }
+                    }
+                    None => *events = None,
+                }
+            },
+            maybe = subscription.recv() => {
+                let batch = maybe?;
+                let mut visible = Vec::with_capacity(batch.len());
+                for event in batch {
+                    if gate.allows(&event).await {
+                        visible.push(event);
+                    }
+                }
+                return Some(visible);
+            }
+        }
     }
 }
 
@@ -1137,11 +1556,13 @@ pub(crate) async fn handle_sub_fast_path(
 /// at subscribe time: slim serves bounded `note_list_slim_row`s on the seq-0
 /// snapshot AND every `added`/`updated` delta, so no note-channel frame class
 /// escapes the bound; full (`None`) keeps the rows byte-identical to before.
+#[expect(clippy::too_many_arguments)]
 async fn forward_note_subscription(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     projection: Option<intent_core::NoteListProjection>,
     mut subscription: Subscription,
+    mut membership: Option<ChannelMembership>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
@@ -1164,7 +1585,7 @@ async fn forward_note_subscription(
     }
     timer.snapshot_emitted();
     let mut seq: u64 = 1;
-    while let Some(batch) = subscription.recv().await {
+    while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
             if let Some(delta) =
                 subscriptions::note_delta(api.as_ref(), &workspace_id, &event, projection).await
@@ -1241,6 +1662,7 @@ async fn forward_chat_subscription(
     delta_encoding: subscriptions::DeltaEncoding,
     projection: Option<intent_core::ConversationProjection>,
     subscription: Subscription,
+    membership: Option<(events::MembershipGate, Subscription)>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
@@ -1253,6 +1675,7 @@ async fn forward_chat_subscription(
         delta_encoding,
         projection,
         subscription,
+        membership,
         subscription_id.clone(),
         out_tx,
         timer,
@@ -1263,7 +1686,9 @@ async fn forward_chat_subscription(
 
 /// The snapshot-then-tail loop behind [`forward_chat_subscription`], returning
 /// the fixed-vocabulary reason it exited for the lifecycle record:
-/// `client_closed` (the outbound lane is gone) or `bus_closed`.
+/// `client_closed` (the outbound lane is gone), `bus_closed`, or
+/// `membership_revoked` (the subscriber was removed from the agent's
+/// workspace, multiplayer w3).
 #[expect(clippy::too_many_arguments)]
 async fn chat_subscription_loop(
     api: Arc<dyn WorkspaceApi>,
@@ -1272,6 +1697,7 @@ async fn chat_subscription_loop(
     delta_encoding: subscriptions::DeltaEncoding,
     projection: Option<intent_core::ConversationProjection>,
     mut subscription: Subscription,
+    membership: Option<(events::MembershipGate, Subscription)>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
@@ -1279,6 +1705,24 @@ async fn chat_subscription_loop(
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
     let out_tx = out_tx.bulk_sender();
+    let (mut gate, mut membership_events) = match membership {
+        Some((gate, sub)) => (Some(gate), Some(sub)),
+        None => (None, None),
+    };
+    // The agent's workspace (the chat channel is keyed by agent, not
+    // workspace): the subscriber's own unshare of THAT workspace ends the
+    // forwarder. Resolved at subscribe time through the guarded `agent.get`
+    // so a member removed BEFORE the agent's first stream event is still
+    // torn down; a refused read (non-member) leaves it unknown until a
+    // stream event names the workspace, by which point the gate admits it.
+    let mut agent_workspace: Option<String> = match gate {
+        Some(_) => api
+            .agent_get(agent_id.clone(), None)
+            .await
+            .ok()
+            .map(|agent| agent.workspace_id.as_str().to_string()),
+        None => None,
+    };
     let mut snapshot = subscriptions::chat_snapshot(
         api.as_ref(),
         &agent_id,
@@ -1329,6 +1773,26 @@ async fn chat_subscription_loop(
                     }
                 }
                 Err(_) => return "client_closed",
+            },
+            // Membership changes invalidate the gate's cached verdicts
+            // before the next matched event is considered; the subscriber's
+            // own removal from the agent's workspace tears the stream down.
+            maybe = async { membership_events.as_mut().expect("guarded").recv().await },
+                if membership_events.is_some() =>
+            {
+                match (maybe, gate.as_mut()) {
+                    (Some(batch), Some(gate)) => {
+                        for event in &batch {
+                            gate.observe_membership_event(event);
+                            if gate.is_own_unshare(event)
+                                && agent_workspace.as_deref() == Some(event.workspace_id.as_str())
+                            {
+                                return "membership_revoked";
+                            }
+                        }
+                    }
+                    _ => membership_events = None,
+                }
             },
             // A pending recovery with a quiet bus: retry on a timer so the
             // client is not left stale until the next event happens to arrive.
@@ -1428,6 +1892,18 @@ async fn chat_subscription_loop(
                     // belong to this subscription.
                     if event.session_id.as_deref() != Some(agent_id.as_str()) {
                         continue;
+                    }
+                    if agent_workspace.is_none() && !event.workspace_id.as_str().is_empty() {
+                        agent_workspace = Some(event.workspace_id.as_str().to_string());
+                    }
+                    // Delivery-time membership (multiplayer w3): chunk and
+                    // tool deltas are payload-mapped, so a non-member of the
+                    // agent's workspace must be refused HERE, before the
+                    // mapper sees the event.
+                    if let Some(gate) = gate.as_mut() {
+                        if !gate.allows(&event).await {
+                            continue;
+                        }
                     }
                     let conflatable = conflate::chat_event_conflatable(&event);
                     let Some(delta) = state.delta(api.as_ref(), &event).await else {
@@ -1580,6 +2056,45 @@ fn parse_channel_params(
     }
 }
 
+/// Per-subscription forwarder for the `note.presence` channel (multiplayer
+/// w5). The seq-0 snapshot is the join's `{ viewers }` result; every later
+/// `note:presence` event for the note is mapped payload-only through
+/// [`subscriptions::note_presence_delta`]. Holds the viewer `lease` for its
+/// whole lifetime so every exit path — unsubscribe / `replaceGroup` /
+/// connection close (abort) and the subscriber's own unshare (membership
+/// ends the loop) — releases it and publishes the `left`.
+#[expect(clippy::too_many_arguments)]
+async fn forward_note_presence_subscription(
+    note_id: NoteId,
+    snapshot: Value,
+    mut subscription: Subscription,
+    mut membership: Option<ChannelMembership>,
+    subscription_id: String,
+    out_tx: OutboundSender,
+    timer: subscriptions::SnapshotTimer,
+    lease: presence::NoteLease,
+) {
+    let _lease = lease;
+    let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    if out_tx.send_bulk(frame).await.is_err() {
+        return;
+    }
+    timer.snapshot_emitted();
+    let mut seq: u64 = 1;
+    while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
+        for event in batch {
+            let Some(delta) = subscriptions::note_presence_delta(&note_id, &event) else {
+                continue;
+            };
+            let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
+            if out_tx.send_bulk(frame).await.is_err() {
+                return;
+            }
+            seq += 1;
+        }
+    }
+}
+
 /// Per-subscription forwarder for the TB-5 channels. Mirrors
 /// [`forward_note_subscription`] but dispatches snapshot + delta through the
 /// channel-generic [`subscriptions::channel_snapshot`] /
@@ -1595,6 +2110,7 @@ async fn forward_channel_subscription(
     workspace_id: WorkspaceId,
     note_id: Option<NoteId>,
     mut subscription: Subscription,
+    mut membership: Option<ChannelMembership>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
@@ -1630,17 +2146,26 @@ async fn forward_channel_subscription(
         subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
             .await
     };
+    // The global workspace channel discloses ids through `workspace:deleted`
+    // tombstones, so a non-administrator subscriber only receives them for
+    // workspaces it has been shown (multiplayer w3); seeded from its own
+    // membership-scoped snapshot, no extra query.
+    let mut visible_workspaces = (channel == Channel::Workspace
+        && crate::context::is_non_administrator_caller())
+    .then(|| subscriptions::visible_workspace_ids(&snapshot));
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
     if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
     timer.snapshot_emitted();
     let mut seq: u64 = 1;
-    while let Some(batch) = subscription.recv().await {
+    while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
             let delta = if channel == Channel::Task {
                 subscriptions::task_delta(api.as_ref(), &workspace_id, &event, &mut spec_links)
                     .await
+            } else if let Some(visible) = visible_workspaces.as_mut() {
+                subscriptions::workspace_delta(api.as_ref(), &event, Some(visible)).await
             } else {
                 subscriptions::channel_delta(
                     api.as_ref(),

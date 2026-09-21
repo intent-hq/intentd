@@ -65,11 +65,13 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -100,7 +102,7 @@ fn gate() -> Option<String> {
 /// `repositoryPath` reports it as `path` through the full mock-agent loop
 /// (agent → MCP bridge → binding → Services), not just at the binding unit.
 /// Adopted from PR intent-hq/intentd#1564.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_info_uses_repository_path() {
     let Some(script) = gate() else { return };
 
@@ -237,7 +239,7 @@ async fn workspace_info_uses_repository_path() {
 // Task bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_bindings_update_status_and_get() {
     let Some(script) = gate() else { return };
 
@@ -377,7 +379,7 @@ async fn task_bindings_update_status_and_get() {
 // Comment bindings coverage
 //
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn comment_bindings_add_and_list() {
     let Some(script) = gate() else { return };
 

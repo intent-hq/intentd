@@ -21,7 +21,7 @@ use crate::model::{
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
     PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
     ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
-    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+    ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
 
@@ -583,6 +583,7 @@ pub(crate) fn map_check_run(value: Value) -> Result<CheckRun> {
             c.conclusion.as_deref(),
         ),
         url: c.html_url.or(c.details_url),
+        started_at: c.started_at,
     })
 }
 
@@ -816,6 +817,7 @@ mod dto {
         pub conclusion: Option<String>,
         pub html_url: Option<String>,
         pub details_url: Option<String>,
+        pub started_at: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -901,6 +903,7 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
                     name
                     status
                     conclusion
+                    startedAt
                     detailsUrl
                     isRequired(pullRequestNumber: $prNumber)
                   }
@@ -1010,6 +1013,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!) {
                     name
                     status
                     conclusion
+                    startedAt
                     detailsUrl
                     isRequired(pullRequestNumber: $prNumber)
                   }
@@ -1248,7 +1252,7 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
         .get("isRequired")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let url = |key: &str| value.get(key).and_then(Value::as_str).map(String::from);
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(String::from);
     match value.get("__typename").and_then(Value::as_str) {
         Some("StatusContext") => Some(RollupCheck {
             name: value
@@ -1256,6 +1260,7 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            kind: RollupCheckKind::StatusContext,
             state: derive_status_context_state(
                 value
                     .get("state")
@@ -1263,7 +1268,8 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                     .unwrap_or_default(),
             ),
             is_required,
-            url: url("targetUrl"),
+            url: text("targetUrl"),
+            started_at: None,
         }),
         Some("CheckRun") => {
             let status = value
@@ -1281,9 +1287,11 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                kind: RollupCheckKind::CheckRun,
                 state: derive_check_state(&status, conclusion.as_deref()),
                 is_required,
-                url: url("detailsUrl"),
+                url: text("detailsUrl"),
+                started_at: text("startedAt"),
             })
         }
         _ => None,
@@ -1403,6 +1411,18 @@ impl SourceControl for GitHubSourceControl {
 
     async fn get_user(&self) -> Result<UserIdentity> {
         let v: Value = self.client.get("/user", None::<&()>).await?;
+        map_user_identity(v)
+    }
+
+    async fn get_user_by_login(&self, login: &str) -> Result<UserIdentity> {
+        let login = login.trim();
+        if login.is_empty() || login.contains('/') {
+            return Err(Error::NotFound(format!("github user {login:?}")));
+        }
+        let v: Value = self
+            .client
+            .get(format!("/users/{login}"), None::<&()>)
+            .await?;
         map_user_identity(v)
     }
 
@@ -1748,7 +1768,9 @@ impl SourceControl for GitHubSourceControl {
 
         // The base branch's rules are a separate REST read whose endpoint may
         // be unreadable (older GHES, a token without the scope); that degrades
-        // to `None` instead of failing the probe.
+        // to `None` instead of failing the probe. Quota exhaustion is the one
+        // exception: it propagates so the caller pauses instead of persisting
+        // a degraded checklist as a successful poll (intent-hq/intent#5281).
         let base = data
             .pointer("/repository/pullRequest/baseRefName")
             .and_then(Value::as_str)
@@ -1756,6 +1778,7 @@ impl SourceControl for GitHubSourceControl {
         if let Some(base) = base {
             signals.branch_rules = match self.branch_rules(repo, base).await {
                 Ok(rules) => Some(rules),
+                Err(e @ Error::RateLimited(_)) => return Err(e),
                 Err(e) => {
                     tracing::debug!(
                         error = %e,
@@ -2217,12 +2240,19 @@ mod tests {
             "name": "build",
             "status": "completed",
             "conclusion": "failure",
+            "started_at": "2026-09-18T11:08:02Z",
             "details_url": "https://ci/run/1"
         }))
         .unwrap();
         assert_eq!(cr.name, "build");
         assert_eq!(cr.state, CheckState::Failure);
         assert_eq!(cr.url.as_deref(), Some("https://ci/run/1"));
+        assert_eq!(cr.started_at.as_deref(), Some("2026-09-18T11:08:02Z"));
+        // Internal tie-break signal only: the wire shape stays `{ name, state, url? }`.
+        assert!(serde_json::to_value(&cr)
+            .unwrap()
+            .get("startedAt")
+            .is_none());
     }
 
     #[test]
@@ -2524,6 +2554,7 @@ mod tests {
             "name": "build",
             "status": "COMPLETED",
             "conclusion": "SUCCESS",
+            "startedAt": "2026-09-18T11:32:04Z",
             "detailsUrl": "https://ci/run/1",
             "isRequired": true
         }))
@@ -2532,6 +2563,8 @@ mod tests {
         assert_eq!(check.state, CheckState::Success);
         assert!(check.is_required);
         assert_eq!(check.url.as_deref(), Some("https://ci/run/1"));
+        assert_eq!(check.started_at.as_deref(), Some("2026-09-18T11:32:04Z"));
+        assert_eq!(check.kind, RollupCheckKind::CheckRun);
 
         // An in-flight check-run is pending regardless of conclusion.
         let pending = map_rollup_context(&json!({
@@ -2544,6 +2577,7 @@ mod tests {
         .unwrap();
         assert_eq!(pending.state, CheckState::Pending);
         assert!(!pending.is_required);
+        assert_eq!(pending.started_at, None);
 
         let status = map_rollup_context(&json!({
             "__typename": "StatusContext",
@@ -2554,8 +2588,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(status.name, "ci/legacy");
+        assert_eq!(status.kind, RollupCheckKind::StatusContext);
         assert_eq!(status.state, CheckState::Failure);
         assert!(status.is_required);
+        assert_eq!(status.started_at, None);
 
         // Unknown union members are skipped rather than mis-mapped.
         assert!(map_rollup_context(&json!({ "__typename": "Something" })).is_none());
@@ -2607,9 +2643,11 @@ mod tests {
             review_decision: Some(ReviewDecision::ReviewRequired),
             checks: vec![RollupCheck {
                 name: "build".into(),
+                kind: RollupCheckKind::CheckRun,
                 state: CheckState::Pending,
                 is_required: true,
                 url: None,
+                started_at: None,
             }],
             checks_known: true,
             branch_rules: Some(BranchRules {

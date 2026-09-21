@@ -834,6 +834,17 @@ fn transient_classification_matches_insert_events_wording() {
     let permanent =
         intent_core::Error::Internal("insert failed: UNIQUE constraint failed: event.id".into());
     assert!(!super::bus::is_transient_insert_error(&permanent));
+    // A closed pool (daemon shutdown) shares the `acquire connection failed`
+    // prefix but never recovers; retrying it for the full deadline would stall
+    // every pending publisher instead of failing them promptly.
+    let closed = intent_core::Error::Internal(format!(
+        "acquire connection failed: {}",
+        sqlx::Error::PoolClosed
+    ));
+    assert!(
+        !super::bus::is_transient_insert_error(&closed),
+        "closed-pool acquire failure must classify as permanent: {closed}"
+    );
 }
 
 /// Regression (monorepo#2673): a transient acquire failure must not drop the
@@ -920,8 +931,67 @@ async fn permanent_batch_insert_failure_does_not_retry() {
     );
 }
 
-/// A persistently transient failure exhausts the bounded retry budget, then
-/// resolves publishers with the error (existing behavior) without broadcast.
+/// The write pool's `acquire_timeout` (`connect_write`): every attempt against
+/// a saturated pool blocks this long before failing, so the retry budget must
+/// be reasoned about in wall-clock time, not attempt counts.
+const WRITE_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Regression (intent-hq/intent#5337): a bulk `workspace.delete` (31 in ~2
+/// min) saturated the single-connection write pool for well over 30s — each
+/// bus attempt waited out the 10s acquire timeout, and the old 3-attempt
+/// budget dropped a batch. Ordinary foreground RPC load must never drop a
+/// batch: a starvation window comfortably longer than that old budget still
+/// delivers once the pool frees up. Each injected attempt simulates the real
+/// acquire timeout under a paused clock.
+#[tokio::test(start_paused = true)]
+async fn sustained_pool_starvation_beyond_three_attempts_still_delivers() {
+    const STARVED_FOR: std::time::Duration = std::time::Duration::from_secs(45);
+    let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
+    let stored = stored_event("evt-1", &ev);
+    let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
+
+    let started = tokio::time::Instant::now();
+    let attempts = std::cell::Cell::new(0u32);
+    super::bus::flush_prepared(
+        || {
+            attempts.set(attempts.get() + 1);
+            let stored = stored.clone();
+            async move {
+                if started.elapsed() < STARVED_FOR {
+                    tokio::time::sleep(WRITE_POOL_ACQUIRE_TIMEOUT).await;
+                    Err(transient_error())
+                } else {
+                    Ok(vec![stored])
+                }
+            }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+
+    assert!(
+        attempts.get() > 3,
+        "the starvation window outlasts the old 3-attempt budget (attempts={})",
+        attempts.get()
+    );
+    assert!(pending.is_empty());
+    let resolved = orx
+        .await
+        .expect("oneshot resolved")
+        .expect("publisher sees Ok once the pool frees up");
+    assert_eq!(resolved.id, "evt-1");
+    let broadcast = brx.recv().await.expect("broadcast delivered, not dropped");
+    assert_eq!(broadcast.id, "evt-1");
+}
+
+/// A persistently transient failure exhausts the bounded retry budget
+/// ([`super::bus::INSERT_RETRY_DEADLINE`] of wall-clock time), then resolves
+/// publishers with the error (existing behavior) without broadcast. Each
+/// attempt simulates the write pool's acquire timeout so the bound is
+/// exercised in the unit the daemon actually pays.
 #[tokio::test(start_paused = true)]
 async fn transient_batch_insert_failure_exhausts_retries() {
     let (btx, mut brx) = tokio::sync::broadcast::channel(16);
@@ -929,22 +999,31 @@ async fn transient_batch_insert_failure_exhausts_retries() {
     let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
     let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
 
+    let started = tokio::time::Instant::now();
     let attempts = std::cell::Cell::new(0u32);
     super::bus::flush_prepared(
         || {
             attempts.set(attempts.get() + 1);
-            async { Err(transient_error()) }
+            async {
+                tokio::time::sleep(WRITE_POOL_ACQUIRE_TIMEOUT).await;
+                Err(transient_error())
+            }
         },
         &mut pending,
         &btx,
     )
     .await;
 
-    assert_eq!(
-        attempts.get(),
-        super::bus::INSERT_RETRY_MAX_ATTEMPTS,
-        "retry budget is bounded"
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= super::bus::INSERT_RETRY_DEADLINE,
+        "retries span the whole deadline before dropping (elapsed={elapsed:?})"
     );
+    assert!(
+        elapsed < super::bus::INSERT_RETRY_DEADLINE + 2 * WRITE_POOL_ACQUIRE_TIMEOUT,
+        "retry budget is bounded: at most one attempt past the deadline (elapsed={elapsed:?})"
+    );
+    assert!(attempts.get() > 3, "attempts={}", attempts.get());
     assert!(pending.is_empty());
     let err = orx
         .await

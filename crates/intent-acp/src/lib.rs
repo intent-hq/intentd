@@ -37,6 +37,7 @@ pub use descendant_sweep::{descendant_pids, descendant_pids_many, sweep_escaped_
 pub use error::{
     is_quota_exceeded, is_transient_provider_fetch_failure, is_transient_upstream_disconnect,
     message_is_quota_exceeded, AcpError, AcpResult, JsonRpcError, PROMPT_IDLE_TIMEOUT_PREFIX,
+    PROVIDER_STALL_PREFIX,
 };
 pub use fs::FileService;
 pub use handler::{ClientRequestHandler, EventSink, SinkEvent};
@@ -57,7 +58,7 @@ pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
 };
 pub use session::{MappedToolCall, MappedUpdate};
-pub use spawn::{spawn_provider, SpawnOptions};
+pub use spawn::{spawn_provider, LaunchMode, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};
 pub use tool_restrictions::{
     get_native_tools_to_remove, get_tool_denylist_for_agent_type, get_tools_to_remove,
@@ -71,6 +72,9 @@ mod tests;
 
 #[cfg(test)]
 mod tests_wsapi5;
+
+#[cfg(test)]
+mod tests_hidden_field_egress;
 
 /// Test-only process-global env setup. Runs before `main()` — and therefore
 /// before any test threads exist, making `set_var` race-free. Node children

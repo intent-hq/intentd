@@ -522,7 +522,7 @@ pub(crate) fn spawn_output_stream(
     let Ok(attachment) = pty.attach(pty_id) else {
         return;
     };
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let mut live = attachment.live;
         // Emit any output captured between spawn and attach exactly once, then
         // tail live chunks (the host guarantees history XOR live, never both).
@@ -1680,11 +1680,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 

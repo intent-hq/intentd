@@ -168,10 +168,27 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    wss_send(ws, id, method, params).await;
+    wss_recv(ws, id, method).await
+}
+
+/// Send one request frame without waiting for its reply (pair with
+/// [`wss_recv`]); lets a test put several requests in flight at once.
+async fn wss_send<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
+}
+
+/// Await the successful `result` for request `id`, skipping unrelated frames.
+async fn wss_recv<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
         let next = timeout(Duration::from_secs(15), ws.next())
             .await
@@ -375,6 +392,87 @@ async fn workspace_create_derives_repository_name_over_wss() {
         row["repositoryName"],
         json!("source-repo"),
         "workspace.list round-trips the derived repositoryName"
+    );
+
+    drop(daemon);
+}
+
+/// Two `workspace.create` requests carrying the same fresh `idempotencyKey`
+/// over the real WSS wire shape — two connections, both frames sent before
+/// either reply is read — are exactly-once: both replies name the same
+/// workspace (the second is a byte-equal replay of the first) and
+/// `workspace.list` shows a single workspace. Regression for the lookup → op
+/// → persist window in `with_idempotency`, where two concurrent callers both
+/// missed the lookup and provisioned two workspaces for one key.
+///
+/// What this proves: the exactly-once invariant holds end to end over WSS.
+/// What it does not force: server-side handler overlap — the client cannot
+/// control when each frame is read, so the first request may already have
+/// persisted before the second is dispatched. The deterministic overlap proof
+/// is `concurrent_same_key_creates_yield_one_workspace` in `intent-services`.
+/// Empirically this test failed 10/10 against the pre-lock tree.
+#[tokio::test]
+async fn workspace_create_concurrent_same_key_is_exactly_once_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root_dir = scratch_dir("samekey");
+    let root = root_dir.path().to_path_buf();
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
+
+    let mut ws_a = connect_ws(port, cfg.clone()).await;
+    let mut ws_b = connect_ws(port, cfg).await;
+
+    let key = Uuid::new_v4().to_string();
+    let params = json!({
+        "title": "Same Key",
+        "repositoryPath": repo.to_string_lossy(),
+        "repositoryName": "source-repo",
+        "baseRef": "main",
+        "initialAgent": { "prompt": "fix the auth flow" },
+        "idempotencyKey": key,
+    });
+
+    // Both frames leave before either reply is read (the real client wire
+    // shape); whether the handlers overlap inside the daemon is up to
+    // scheduling — see the doc comment.
+    wss_send(&mut ws_a, 2, "workspace.create", params.clone()).await;
+    wss_send(&mut ws_b, 3, "workspace.create", params).await;
+    let (first, second) = tokio::join!(
+        wss_recv(&mut ws_a, 2, "workspace.create"),
+        wss_recv(&mut ws_b, 3, "workspace.create"),
+    );
+
+    let id = first["workspace"]["id"].as_str().expect("workspace id");
+    assert_eq!(
+        second["workspace"]["id"].as_str(),
+        Some(id),
+        "both replies must name the same workspace"
+    );
+    assert_eq!(
+        serde_json::to_string(&second["workspace"]).unwrap(),
+        serde_json::to_string(&first["workspace"]).unwrap(),
+        "the replayed workspace object must be byte-equal to the first"
+    );
+
+    let list = wss_rpc(&mut ws_a, 4, "workspace.list", json!({})).await;
+    let workspaces = list["workspaces"].as_array().expect("workspaces array");
+    assert_eq!(
+        workspaces
+            .iter()
+            .filter(|w| w["id"].as_str() == Some(id))
+            .count(),
+        1,
+        "exactly one workspace with the shared id"
+    );
+    assert_eq!(
+        workspaces
+            .iter()
+            .filter(|w| w["title"] == json!("Same Key"))
+            .count(),
+        1,
+        "the second caller must not have provisioned a workspace under another id"
     );
 
     drop(daemon);

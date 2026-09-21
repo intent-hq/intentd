@@ -43,6 +43,11 @@ pub(crate) enum FlowPhase {
     Denied,
     /// Polling failed repeatedly (network / non-retryable API error).
     Error,
+    /// The user authorized as a *different* GitHub account while other
+    /// principals or open invites depend on the cached primary identity
+    /// (multiplayer w4): the new token was discarded before persistence and
+    /// the previously stored credential is untouched.
+    IdentityLocked,
 }
 
 impl FlowPhase {
@@ -53,6 +58,7 @@ impl FlowPhase {
             Self::Expired => "expired",
             Self::Denied => "denied",
             Self::Error => "error",
+            Self::IdentityLocked => "identity-locked",
         }
     }
 }
@@ -177,6 +183,7 @@ pub(crate) async fn run_poll_loop(
             Ok(PollStatus::Authorized) => break None,
             Ok(PollStatus::Expired) => break Some(FlowPhase::Expired),
             Ok(PollStatus::Denied) => break Some(FlowPhase::Denied),
+            Ok(PollStatus::Refused) => break Some(FlowPhase::IdentityLocked),
             Err(e) => {
                 consecutive_errors += 1;
                 tracing::warn!(
@@ -220,7 +227,7 @@ pub(crate) async fn run_poll_loop(
     if outcome.is_none() && sync_gh {
         // Best-effort gh CLI sync: loads the token back from the secret store
         // (it never leaves the engine) and pipes it to `gh` via stdin only.
-        tokio::spawn(intent_sourcecontrol::gh_sync::sync_token_to_gh(
+        intent_core::spawn_daemon(intent_sourcecontrol::gh_sync::sync_token_to_gh(
             intent_core::FileSecretStore::new(),
         ));
     }
@@ -275,7 +282,7 @@ pub(crate) fn is_production_login_host(base_uri: &str) -> bool {
 
 /// True iff `uri` is `https://…` or a cleartext `http://` pointing at a
 /// loopback host (`127.0.0.1`, `localhost`, `[::1]`).
-fn is_safe_login_base_uri(uri: &str) -> bool {
+pub(crate) fn is_safe_login_base_uri(uri: &str) -> bool {
     if uri.starts_with("https://") {
         return true;
     }
@@ -409,6 +416,7 @@ mod tests {
         assert_eq!(FlowPhase::Expired.as_wire(), "expired");
         assert_eq!(FlowPhase::Denied.as_wire(), "denied");
         assert_eq!(FlowPhase::Error.as_wire(), "error");
+        assert_eq!(FlowPhase::IdentityLocked.as_wire(), "identity-locked");
     }
 
     #[test]

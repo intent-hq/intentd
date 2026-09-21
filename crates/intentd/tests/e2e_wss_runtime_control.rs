@@ -1769,3 +1769,165 @@ async fn tunnel_settings_over_wss() {
         "settings.update server.tunnel.enabled=false over WSS should succeed: {disable}"
     );
 }
+
+/// Exact update control over authenticated, fingerprint-pinned WSS. A staged
+/// release fixture avoids any public network access; updater HTTP tests exercise
+/// archive download and verification separately.
+#[tokio::test]
+async fn wss_exact_update_validates_reports_failure_and_restarts_without_channel_check() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = temp_data_dir();
+    let data_dir = dir.path().to_path_buf();
+    let sitter_dir = data_dir.join("sitter");
+    std::fs::create_dir_all(&sitter_dir).unwrap();
+    let sitter_bin = sitter_dir.join("intentd-sitter");
+    std::fs::copy("/bin/sh", &sitter_bin).unwrap();
+    let daemon_pid_path = sitter_dir.join("daemon.pid");
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SITTER_EXACT_UPDATE", "1"),
+    ];
+    let mut daemon = Daemon {
+        child: spawn_serve_under_stand_in_sitter(
+            &data_dir,
+            "both",
+            &env,
+            &sitter_bin,
+            &daemon_pid_path,
+        ),
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let daemon_pid = std::fs::read_to_string(&daemon_pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _kill_daemon = KillPidOnDrop(daemon_pid);
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut ws = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let unsupported = wss_rpc(&mut ws, 80, "system.status", json!({})).await;
+    assert_eq!(unsupported["result"]["exactUpdateSupported"], false);
+    let unsupported = wss_rpc(
+        &mut ws,
+        81,
+        "system.requestUpdate",
+        json!({"targetVersion":"99.0.0"}),
+    )
+    .await;
+    assert_eq!(unsupported["error"]["code"], -32603);
+    std::fs::write(
+        sitter_dir.join("sitter.pid"),
+        format!("{}\n", daemon.child.id()),
+    )
+    .unwrap();
+    let supported = wss_rpc(&mut ws, 82, "system.status", json!({})).await;
+    assert_eq!(supported["result"]["exactUpdateSupported"], true);
+    let child_env = wss_rpc(&mut ws, 88, "host.exec", json!({
+        "command":"/bin/sh", "args":["-c", "printf '%s' \"${INTENTD_SITTER_EXACT_UPDATE-unset}\""], "timeoutMs":5000
+    })).await;
+    assert_eq!(
+        child_env["result"]["stdout"], "unset",
+        "handshake must not leak to children: {child_env}"
+    );
+
+    for params in [
+        json!({"targetVersion":"../escape"}),
+        json!({"targetVersion":null}),
+        json!({"targetVersion":"99.0.0+build"}),
+        json!({"targetVersion":"99.0.0", "url":"https://attacker/asset"}),
+    ] {
+        let r = wss_rpc(&mut ws, 83, "system.requestUpdate", params).await;
+        assert_eq!(r["jsonrpc"], "2.0");
+        assert_eq!(r["id"], 83);
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
+    for target in ["0.0.1", env!("CARGO_PKG_VERSION")] {
+        let r = wss_rpc(
+            &mut ws,
+            84,
+            "system.requestUpdate",
+            json!({"targetVersion":target}),
+        )
+        .await;
+        assert_eq!(r["error"]["code"], -32603, "{r}");
+    }
+    let paths = intentd_sitter::paths::SitterPaths::from_data_dir(&data_dir);
+    let mut installed = intentd_sitter::state::SitterState {
+        current_version: Some("99.0.0".into()),
+        ..Default::default()
+    };
+    intentd_sitter::state::save(&paths.state_path, &installed).unwrap();
+    let r = wss_rpc(
+        &mut ws,
+        85,
+        "system.requestUpdate",
+        json!({"targetVersion":"98.0.0"}),
+    )
+    .await;
+    assert_eq!(
+        r,
+        json!({"jsonrpc":"2.0", "id":85, "result":{"ok":true,"targetVersion":"98.0.0"}})
+    );
+    let failed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let r = wss_rpc(&mut ws, 86, "system.status", json!({})).await;
+            if r["result"]["targetUpdate"]["state"] == "failed" {
+                break r;
+            }
+            // timing-guard: bounded polling of observable update state / sitter exit.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed["result"]["targetUpdate"]["targetVersion"], "98.0.0");
+    assert!(failed["result"]["targetUpdate"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("newer version"));
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "failed update must not signal sitter"
+    );
+    installed.current_version = Some("100.0.0".into());
+    intentd_sitter::state::save(&paths.state_path, &installed).unwrap();
+    let binary = paths.daemon_binary("100.0.0");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(binary, b"already verified/staged release fixture").unwrap();
+    let r = wss_rpc(
+        &mut ws,
+        87,
+        "system.requestUpdate",
+        json!({"targetVersion":"100.0.0"}),
+    )
+    .await;
+    assert_eq!(
+        r,
+        json!({"jsonrpc":"2.0", "id":87, "result":{"ok":true,"targetVersion":"100.0.0"}})
+    );
+    let exit = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(exit) = daemon.child.try_wait().unwrap() {
+                break exit;
+            }
+            // timing-guard: bounded polling of observable update state / sitter exit.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        exit.signal(),
+        Some(libc::SIGHUP),
+        "exact install must only restart, never SIGUSR1 channel check"
+    );
+}

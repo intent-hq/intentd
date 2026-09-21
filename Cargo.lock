@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "intent-acp"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "agent-client-protocol",
  "ctor",
@@ -2185,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "intent-context"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "intent-core"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2210,6 +2210,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "time",
+ "tokio",
  "toml",
  "tracing",
  "uuid",
@@ -2218,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "intent-git"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "git2",
  "intent-core",
@@ -2232,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "intent-js"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "rquickjs",
  "serde_json",
@@ -2242,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "intent-linear"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2256,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "intent-providers"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "ctor",
  "intent-core",
@@ -2267,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "intent-pty"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "intent-core",
  "nix 0.31.3",
@@ -2278,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "intent-search"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "globset",
  "grep",
@@ -2291,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sentry"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2305,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "intent-services"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2328,6 +2329,7 @@ dependencies = [
  "intent-sentry",
  "intent-sourcecontrol",
  "intent-store",
+ "intent-test-macros",
  "intent-voice",
  "libc",
  "nix 0.31.3",
@@ -2352,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sourcecontrol"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2370,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "intent-store"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -2387,8 +2389,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "intent-test-macros"
+version = "0.9.55"
+dependencies = [
+ "intent-core",
+ "tokio",
+]
+
+[[package]]
 name = "intent-transport"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "base64 0.23.1",
  "ctor",
@@ -2406,6 +2416,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2437,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "intentd"
-version = "0.9.71"
+version = "0.9.85"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2459,8 +2470,10 @@ dependencies = [
  "intent-services",
  "intent-sourcecontrol",
  "intent-store",
+ "intent-test-macros",
  "intent-transport",
  "intent-voice",
+ "intentd-sitter",
  "intentd-test-support",
  "libc",
  "nix 0.31.3",
@@ -2488,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "intentd-sitter"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "directories",
  "flate2",

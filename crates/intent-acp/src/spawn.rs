@@ -83,6 +83,36 @@ impl<'a> SpawnOptions<'a> {
             && self.npx_fallback_package.is_some()
     }
 
+    /// The launch tier this spawn will use and the program it execs:
+    /// `provider_binary` > npx fallback (both fields) > bare `provider.command`.
+    /// Single decision point shared by [`build_command`] and the spawn-failure
+    /// attribution in [`spawn_provider`].
+    #[must_use]
+    pub fn launch_target(&self) -> (LaunchMode, &'a std::ffi::OsStr) {
+        if let Some(p) = self.provider_binary {
+            (LaunchMode::ResolvedBinary, p.as_os_str())
+        } else if let (true, Some(npx)) = (self.via_npx(), self.npx_fallback_binary) {
+            (LaunchMode::NpxFallback, npx.as_os_str())
+        } else {
+            (
+                LaunchMode::BareCommand,
+                std::ffi::OsStr::new(self.provider.command),
+            )
+        }
+    }
+
+    /// The binary whose parent dir enriches the child's `PATH`
+    /// (`provider_binary`, else the npx binary when a package is pinned).
+    fn path_enrichment_binary(&self) -> Option<&'a Path> {
+        self.provider_binary.or_else(|| {
+            if self.npx_fallback_package.is_some() {
+                self.npx_fallback_binary
+            } else {
+                None
+            }
+        })
+    }
+
     /// Construct options for a provider with all optional inputs unset.
     #[must_use]
     pub fn new(provider: &'a ProviderConfig) -> Self {
@@ -103,6 +133,35 @@ impl<'a> SpawnOptions<'a> {
             npx_fallback_package: None,
             node_max_old_space_mb: None,
         }
+    }
+}
+
+/// Which launch tier [`SpawnOptions::launch_target`] selected. Carried by
+/// [`AcpError::ProviderNotFound`] so a missing **bare** command (nothing
+/// resolved a provider binary and the `PATH` lookup failed) is told apart
+/// from a resolved binary path that vanished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// `provider_binary` — an explicit `providers.paths` override or a
+    /// discovered install — is exec'd directly.
+    ResolvedBinary,
+    /// No resolved binary; the provider's pinned npx package runs via npx.
+    NpxFallback,
+    /// No resolved binary and no npx fallback: the bare `provider.command`
+    /// is exec'd and resolution is left to the enriched `PATH`.
+    BareCommand,
+}
+
+impl std::fmt::Display for LaunchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ResolvedBinary => "resolved provider binary",
+            Self::NpxFallback => "npx fallback binary",
+            Self::BareCommand => {
+                "bare command; no providers.paths override or discovered binary resolved, \
+                 so it was looked up on the daemon PATH"
+            }
+        })
     }
 }
 
@@ -190,13 +249,7 @@ fn build_command_with_captured_env(
     let args = build_args(opts);
 
     // Decide which binary to spawn: provider_binary > npx_fallback (both fields) > provider.command
-    let command = if let Some(p) = opts.provider_binary {
-        p.as_os_str()
-    } else if let (true, Some(npx)) = (opts.via_npx(), opts.npx_fallback_binary) {
-        npx.as_os_str()
-    } else {
-        std::ffi::OsStr::new(opts.provider.command)
-    };
+    let (_, command) = opts.launch_target();
 
     let mut cmd = Command::new(command);
     cmd.args(&args);
@@ -252,14 +305,7 @@ fn build_command_with_captured_env(
 
     // Enhanced PATH must include the binary's parent dir so dependencies resolve
     // (e.g., when spawning npx, node must be findable)
-    let path_binary = opts.provider_binary.or_else(|| {
-        if opts.npx_fallback_package.is_some() {
-            opts.npx_fallback_binary
-        } else {
-            None
-        }
-    });
-    cmd.env("PATH", enhanced_path(path_binary));
+    cmd.env("PATH", enhanced_path(opts.path_enrichment_binary()));
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -339,16 +385,22 @@ impl SpawnedAgent {
 ///
 /// # Errors
 ///
-/// Returns [`AcpError::Spawn`] if the provider process cannot be started or its stdio pipes cannot be taken.
+/// Returns [`AcpError::ProviderNotFound`] when the spawn failed with `ENOENT`
+/// and the launched program is established to be missing (see
+/// [`classify_not_found`]), naming the launch tier that was missing, and
+/// [`AcpError::Spawn`] for every other spawn failure or when the stdio pipes
+/// cannot be taken.
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
     let mut cmd = build_command(opts);
-    let command_name = opts.provider_binary.map_or_else(
-        || opts.provider.command.to_string(),
-        |p| p.display().to_string(),
-    );
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AcpError::Spawn(format!("{command_name}: {e}")))?;
+    let (launch, target) = opts.launch_target();
+    let command_name = target.to_string_lossy().into_owned();
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            classify_not_found(opts, launch, target, &command_name, &e)
+        } else {
+            AcpError::Spawn(format!("{command_name}: {e}"))
+        }
+    })?;
     let stdin = child
         .stdin
         .take()
@@ -363,6 +415,67 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
         .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>);
     let connection = Connection::new(stdin, stdout, stderr, hooks);
     Ok(SpawnedAgent { child, connection })
+}
+
+/// Attribute a spawn `ENOENT`. The kernel returns `ENOENT` for more than a
+/// missing program — a missing `cwd` and a script whose shebang interpreter is
+/// absent surface identically — so [`AcpError::ProviderNotFound`] is reserved
+/// for the case where the program is established to be missing: a resolved
+/// path (or a bare command containing a path separator) that does not exist,
+/// or a bare command that no directory of the child's `PATH` (the same
+/// [`enhanced_path`] `build_command` sets) contains. Every other `ENOENT`
+/// stays an [`AcpError::Spawn`] carrying the original error plus the
+/// established fact (missing working directory, or "program exists").
+pub(crate) fn classify_not_found(
+    opts: &SpawnOptions,
+    launch: LaunchMode,
+    target: &std::ffi::OsStr,
+    command_name: &str,
+    e: &std::io::Error,
+) -> AcpError {
+    let child_path = enhanced_path(opts.path_enrichment_binary());
+    classify_not_found_with_path(opts, launch, target, command_name, e, child_path.as_ref())
+}
+
+/// [`classify_not_found`] with the child's `PATH` injected (test seam — avoids
+/// mutating the process-global `PATH` in parallel tests).
+pub(crate) fn classify_not_found_with_path(
+    opts: &SpawnOptions,
+    launch: LaunchMode,
+    target: &std::ffi::OsStr,
+    command_name: &str,
+    e: &std::io::Error,
+    child_path: &std::ffi::OsStr,
+) -> AcpError {
+    if let Some(cwd) = opts.cwd.filter(|cwd| !cwd.is_dir()) {
+        return AcpError::Spawn(format!(
+            "{command_name}: {e} (working directory `{}` does not exist)",
+            cwd.display()
+        ));
+    }
+    let program = Path::new(target);
+    // The exec happens after the chdir, so a relative program path — and a
+    // relative `PATH` entry — resolves against the child's working directory.
+    let in_child_cwd = |p: &Path| match opts.cwd {
+        Some(cwd) if p.is_relative() => cwd.join(p).exists(),
+        _ => p.exists(),
+    };
+    let program_exists = if launch != LaunchMode::BareCommand || program.components().count() > 1 {
+        in_child_cwd(program)
+    } else {
+        std::env::split_paths(child_path).any(|dir| in_child_cwd(&dir.join(program)))
+    };
+    if program_exists {
+        AcpError::Spawn(format!(
+            "{command_name}: {e} (the program exists; ENOENT from a missing shebang \
+             interpreter or dynamic loader)"
+        ))
+    } else {
+        AcpError::ProviderNotFound {
+            command: command_name.to_string(),
+            launch,
+        }
+    }
 }
 
 #[cfg(test)]

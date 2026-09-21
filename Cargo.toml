@@ -115,9 +115,13 @@ debug = "line-tables-only"
 [profile.dev.package.intentd-sitter]
 debug = "line-tables-only"
 
-# Strip debug symbols from all external dependencies
+# Skip debuginfo for all external dependencies. `debug = false` alone makes
+# cargo pass `-C strip=debuginfo`, and the stripped proc-macro dylibs (e.g.
+# rquickjs-macro) are rejected by macOS 27's dyld ("mis-aligned LINKEDIT
+# string pool", rust-lang/rust#157750). `strip = "none"` avoids the strip pass.
 [profile.dev.package."*"]
 debug = false
+strip = "none"
 
 # The profile that 'dist' will build with
 [profile.dist]

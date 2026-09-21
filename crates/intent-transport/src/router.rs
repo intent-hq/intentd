@@ -163,6 +163,23 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
         e @ (Error::InvalidParams(_) | Error::InvalidInput(_)) => invalid_params(e.to_string()),
+        // Capability refusal (multiplayer w3): the same `-32003 "Forbidden"`
+        // envelope the connection-level allowlist emits, with the reason in
+        // `data.detail` so a client cannot tell the two refusals apart by
+        // code or message.
+        Error::Forbidden(detail) => RpcErr {
+            code: crate::catalog::FORBIDDEN_ERROR_CODE,
+            message: crate::catalog::FORBIDDEN_ERROR_MESSAGE.to_string(),
+            data: Some(json!({ "code": "forbidden", "detail": detail })),
+        },
+        // Invite / identity-only join refusal (multiplayer w4): the kind's
+        // own code with the stable `data.code` so an invite client can route
+        // "expired" / "pin mismatch" / "denied" without matching on prose.
+        ref e @ Error::Invite(kind) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": kind.as_str() })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -589,6 +606,54 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
+        }
+        // `workspace.members.*` (multiplayer w3): membership roster of one
+        // workspace. Member+ may list; removal is Owner-only in the service
+        // layer (`-32003` for a collaborator, `-32602` for a non-member).
+        "workspace.members.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_list(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.members.remove" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let r = api
+                .workspace_members_remove(id, intent_core::PrincipalId::from(principal_id))
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.members.leave` (multiplayer w4): the bound collaborator
+        // drops its own membership; an owner is `-32602`.
+        "workspace.members.leave" => {
+            let id = require_workspace_id(params)?;
+            let r = api
+                .workspace_members_leave(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.invite.*` (multiplayer w4): owner-only invite links.
+        // `workspace.invite.create` is handled on the connection fast-path
+        // (it wraps the secret into the `intent://invite` link with the
+        // listener's own hosts/port); only list/revoke route here.
+        "workspace.invite.list" => {
+            let id = require_workspace_id(params)?;
+            let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;
+            Ok(r)
+        }
+        "workspace.invite.revoke" => {
+            let id = require_workspace_id(params)?;
+            let invite_id = require_str_param(params, "inviteId")?;
+            let r = api
+                .workspace_invite_revoke(id, invite_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
         }
         "workspace.getTokenUsage" => {
             let id = require_workspace_id(params)?;
@@ -1350,7 +1415,21 @@ async fn dispatch(
                     "includeRetired and retiredOnly are mutually exclusive",
                 ));
             }
-            let agents = if retired_only {
+            // Row scope (§5.5): `scope` selects ONE bin of the non-retired
+            // sessions — `"topLevel"` / `"delegated"` / `"background"` —
+            // while absent / null / `"all"` keep today's read. Unlike the
+            // lenient retired flags, an unknown or non-string `scope` is
+            // `-32602`, never coerced, and a bin scope cannot be combined
+            // with either retired flag (retired is its own bin). Every
+            // variant additionally carries `scopeCounts` (one grouped SQL
+            // aggregate over the non-retired rows) under the same
+            // no-snapshot-isolation tolerance as `retiredCount`.
+            let scope = parse_agent_list_scope(params, include_retired || retired_only)?;
+            let agents = if let Some(scope) = scope {
+                api.agent_list_scoped(ws.clone(), scope)
+                    .await
+                    .map_err(domain_to_rpc)?
+            } else if retired_only {
                 api.agent_list_retired_only(ws.clone())
                     .await
                     .map_err(domain_to_rpc)?
@@ -1361,8 +1440,16 @@ async fn dispatch(
             } else {
                 api.agent_list(ws.clone()).await.map_err(domain_to_rpc)?
             };
-            let retired_count = api.agent_retired_count(ws).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "agents": agents, "retiredCount": retired_count }))
+            let retired_count = api
+                .agent_retired_count(ws.clone())
+                .await
+                .map_err(domain_to_rpc)?;
+            let scope_counts = api.agent_scope_counts(ws).await.map_err(domain_to_rpc)?;
+            Ok(json!({
+                "agents": agents,
+                "retiredCount": retired_count,
+                "scopeCounts": scope_counts,
+            }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
         "agent.get" => {
@@ -2918,6 +3005,28 @@ async fn dispatch(
             let r = api.github_get_user().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // `principal.me` (multiplayer w1): the principal this connection was
+        // bound to at admission; no params. Fails when no caller is bound.
+        "principal.me" => {
+            let r = api.principal_me().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `principal.revokeSelf` (multiplayer w4): the bound collaborator
+        // revokes its own credentials and leaves its workspaces; the
+        // transport then closes its connections. The administrator is
+        // `-32602`.
+        "principal.revokeSelf" => {
+            let r = api.principal_revoke_self().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `presence.snapshot` (multiplayer w5): the current `presence:changed`
+        // roster of a member workspace, on demand. Member+; a non-member is
+        // `-32602 not-found` like any other membership-narrowed read.
+        "presence.snapshot" => {
+            let id = require_workspace_id(params)?;
+            let r = api.presence_snapshot(id).await.map_err(workspace_err)?;
+            Ok(r)
+        }
         // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key
         // that is absent or fails the `viewer` probe ("not configured") and any
         // other Linear failure surface as `-32603`; an invalid `filter` is
@@ -3722,7 +3831,12 @@ async fn dispatch(
         // surfaces as `-32602` (`Error::NotFound` → invalid params).
         "hook.list" => {
             let ws = require_ws_note(params)?;
-            api.hook_list(ws, None).await.map_err(domain_to_rpc)
+            // Active hooks only by default; `includeRetired` appends the
+            // terminal rows as a light projection (no code/lastState/lastLogs).
+            let include_retired = opt_bool(params, "includeRetired").unwrap_or(false);
+            api.hook_list(ws, None, include_retired)
+                .await
+                .map_err(domain_to_rpc)
         }
         "hook.cancel" => {
             let ws = require_ws_note(params)?;
@@ -4444,6 +4558,65 @@ fn parse_projection(
         }
         Some(_) => Err(invalid_params("projection must be \"slim\"")),
     }
+}
+
+/// Parse the optional `agent.list` `scope` + `parentAgentId` params (§5.5).
+/// Absent / `null` / `"all"` is `None` — today's read; `"topLevel"` /
+/// `"delegated"` / `"background"` select one bin of the non-retired rows.
+/// Any other value (unknown string OR non-string) is `-32602`, never
+/// coerced. `parentAgentId` (a canonical `agent-{uuid}`) narrows a
+/// `delegated` read to that parent's direct sub-agents and is `-32602` with
+/// any other scope, including the default. A bin scope combined with
+/// `includeRetired` / `retiredOnly` (`retired_flag`) is `-32602`: retired
+/// sessions are their own bin.
+fn parse_agent_list_scope(
+    params: &Map<String, Value>,
+    retired_flag: bool,
+) -> Result<Option<intent_core::AgentListRowScope>, RpcErr> {
+    use intent_core::AgentListRowScope;
+    let parent_agent_id = match params.get("parentAgentId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let id = AgentId::from(s.as_str());
+            if !id.is_canonical() {
+                return Err(invalid_params(
+                    "parentAgentId must be a canonical agent-{uuid} id",
+                ));
+            }
+            Some(id)
+        }
+        Some(_) => {
+            return Err(invalid_params(
+                "parentAgentId must be a canonical agent-{uuid} id",
+            ));
+        }
+    };
+    let scope = match params.get("scope") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "all" => None,
+        Some(Value::String(s)) if s == "topLevel" => Some(AgentListRowScope::TopLevel),
+        Some(Value::String(s)) if s == "delegated" => Some(AgentListRowScope::Delegated {
+            parent_agent_id: parent_agent_id.clone(),
+        }),
+        Some(Value::String(s)) if s == "background" => Some(AgentListRowScope::Background),
+        Some(_) => {
+            return Err(invalid_params(
+                "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"",
+            ));
+        }
+    };
+    if let Some(scope) = &scope {
+        if retired_flag {
+            return Err(invalid_params(format!(
+                "scope \"{}\" cannot be combined with includeRetired or retiredOnly: retired sessions are their own bin",
+                scope.wire_name()
+            )));
+        }
+    }
+    if parent_agent_id.is_some() && !matches!(scope, Some(AgentListRowScope::Delegated { .. })) {
+        return Err(invalid_params("parentAgentId requires scope \"delegated\""));
+    }
+    Ok(scope)
 }
 
 /// Parse the optional `projection` param on `note.list` (§5.2): absent /

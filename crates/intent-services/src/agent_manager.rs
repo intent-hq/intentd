@@ -1094,6 +1094,29 @@ struct BudgetDenial {
     available_memory: Option<u64>,
 }
 
+/// What [`AgentManager::interrupt_inner`] did. `preempted` is `false` only on
+/// the `PreemptedByMessage` path when the live-slot pin found no turn to cut
+/// short (intent-hq/intent#5380): nothing was aborted, cancelled, released or
+/// emitted, and `interrupted_row_id` is `None`.
+#[derive(Debug)]
+struct InterruptOutcome {
+    agent_found: bool,
+    preempted: bool,
+    interrupted_row_id: Option<String>,
+}
+
+impl InterruptOutcome {
+    /// The kill-path fallback (no handle / no `acpSessionId`): `stop` ran, so
+    /// whatever turn there was is gone, and no marker row was appended.
+    fn killed(agent_found: bool) -> Self {
+        Self {
+            agent_found,
+            preempted: true,
+            interrupted_row_id: None,
+        }
+    }
+}
+
 /// Provisional cost charged against the budget for a spawn that has been
 /// admitted but is not yet visible in a tree sample (and credited back when a
 /// process is deregistered). The measured median idle agent subtree is ~660 MB
@@ -1358,7 +1381,7 @@ impl ProcessRegistry {
             );
             if let Some(ref f) = self.event_fn {
                 let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
-                tokio::spawn(fut);
+                intent_core::spawn_daemon(fut);
             }
         }
         true
@@ -1436,7 +1459,7 @@ impl ProcessRegistry {
             );
             if let Some(ref f) = self.event_fn {
                 let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
-                tokio::spawn(fut);
+                intent_core::spawn_daemon(fut);
             }
         }
     }
@@ -1459,7 +1482,7 @@ impl ProcessRegistry {
         );
         if let Some(ref f) = self.event_fn {
             let fut = f(agent_id, "agent:process:resumed", used, self.cap, reason);
-            tokio::spawn(fut);
+            intent_core::spawn_daemon(fut);
         }
     }
 
@@ -1597,7 +1620,7 @@ impl ProcessRegistry {
                     }
                     if let Some(ref f) = self.event_fn {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
-                        tokio::spawn(fut);
+                        intent_core::spawn_daemon(fut);
                     }
                     owed_resume = Some(reason);
                     // A claim-contention wait re-checks on a timer too: the
@@ -1649,7 +1672,7 @@ impl ProcessRegistry {
                         );
                         if let Some(ref f) = self.event_fn {
                             let fut = f(&id, "agent:process:evicted", used, self.cap, reason);
-                            tokio::spawn(fut);
+                            intent_core::spawn_daemon(fut);
                         }
                         kill().await;
                         self.deregister(&id);
@@ -1783,7 +1806,7 @@ impl ProcessRegistry {
                                 self.cap,
                                 REASON_MEMORY_BUDGET,
                             );
-                            tokio::spawn(fut);
+                            intent_core::spawn_daemon(fut);
                         }
                         owed_resume = Some(REASON_MEMORY_BUDGET);
                         Action::Wait(rx)
@@ -1835,7 +1858,7 @@ impl ProcessRegistry {
                                 self.cap,
                                 REASON_MEMORY_BUDGET,
                             );
-                            tokio::spawn(fut);
+                            intent_core::spawn_daemon(fut);
                         }
                         kill().await;
                         self.deregister(&id);
@@ -2015,7 +2038,7 @@ impl ProcessRegistry {
                     self.cap,
                     REASON_IDLE_TTL,
                 );
-                tokio::spawn(fut);
+                intent_core::spawn_daemon(fut);
             }
             kill().await;
             self.deregister(&id);
@@ -2110,7 +2133,7 @@ impl ProcessRegistry {
                     self.cap,
                     REASON_MEMORY_BUDGET,
                 );
-                tokio::spawn(fut);
+                intent_core::spawn_daemon(fut);
             }
             kill().await;
             self.deregister(&id);
@@ -3224,7 +3247,7 @@ impl AgentManager {
             .with_terminal_host(terminal_host),
         );
         let serve_conn = connection.clone();
-        let serve_task = tokio::spawn(async move {
+        let serve_task = intent_core::spawn_daemon(async move {
             while let Some(req) = req_rx.recv().await {
                 if let Err(e) = handler.serve(serve_conn.as_ref(), req).await {
                     tracing::warn!(error = %e, "client-served request failed");
@@ -4775,7 +4798,7 @@ impl AgentManager {
     pub async fn interrupt(&self, agent_id: &AgentId) -> bool {
         self.interrupt_inner(agent_id, InterruptReason::UserStop, None)
             .await
-            .0
+            .agent_found
     }
 
     /// Shared body of [`AgentManager::interrupt`], parameterized on the
@@ -4791,9 +4814,21 @@ impl AgentManager {
     /// passes `UserStop` so STAB-28 behavior (watches fire on interrupt) is
     /// preserved. `agent:stream:end` is emitted unconditionally in both paths.
     ///
-    /// Returns `(agent_found, interrupted_row_message_id)` — the second field
-    /// names the interrupted assistant row this call persisted (`None` when
-    /// no live-turn slot was open or the call fell back to the kill path), so
+    /// The `PreemptedByMessage` decision is made HERE, atomically with the
+    /// live-slot pin (intent-hq/intent#5380): the caller's own eligibility
+    /// read is an unpinned snapshot taken several awaits earlier, and a turn
+    /// can complete in that gap (the worker clears the unpinned slot and
+    /// emits its normal `stream:end`). When the pin finds no slot on the
+    /// preemption path there is nothing to cut short — the call returns with
+    /// `preempted: false` before aborting, cancelling, releasing the slot or
+    /// emitting anything, and the follow-up message queues behind the turn
+    /// that is starting or finishing. The plain `UserStop` path keeps its
+    /// bare interrupt terminal in that state: a pre-first-token stop relies
+    /// on it to close the spinner (PROTOCOL §7.2).
+    ///
+    /// The returned [`InterruptOutcome::interrupted_row_id`] names the
+    /// interrupted assistant row this call persisted (`None` when no
+    /// live-turn slot was open or the call fell back to the kill path), so
     /// `preempt_busy_turn` can exclude that row from its combined-delivery
     /// re-queue check.
     async fn interrupt_inner(
@@ -4801,7 +4836,7 @@ impl AgentManager {
         agent_id: &AgentId,
         reason: InterruptReason,
         interrupted_by: Option<InterruptedBy>,
-    ) -> (bool, Option<String>) {
+    ) -> InterruptOutcome {
         let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
         // The live connection is the interrupt capability; grab it WITHOUT
         // removing the handle so the child stays alive for resume.
@@ -4814,7 +4849,7 @@ impl AgentManager {
         let Some(conn) = conn else {
             // No live session to interrupt → keep-alive is a no-op; fall back to
             // the hard kill path (itself a no-op when the agent is already gone).
-            return (self.stop_with_redelivery_arm(agent_id, reason).await, None);
+            return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
         };
         // Resolve the persisted session for the workspace (terminal event) + the
         // `acpSessionId` to cancel. Without an `acpSessionId` there is no
@@ -4822,7 +4857,7 @@ impl AgentManager {
         let session = self.services.store.get_agent_session(agent_id).await.ok();
         let acp_session_id = session.as_ref().and_then(|s| s.acp_session_id.clone());
         let Some(acp_session_id) = acp_session_id else {
-            return (self.stop_with_redelivery_arm(agent_id, reason).await, None);
+            return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
         };
         // Pin the live-turn slot BEFORE aborting the worker: the abort drops
         // the worker future and with it the LiveTurnGuard, so an UNPINNED slot
@@ -4833,7 +4868,20 @@ impl AgentManager {
         // (monorepo#2110). The busy flag is snapshotted alongside (before
         // `end_turn` below releases it) for the zero-output stop-redelivery
         // arm at the bottom of this method.
-        self.services.pin_live_turn(agent_id);
+        let pinned = self.services.pin_live_turn(agent_id);
+        if !pinned && reason == InterruptReason::PreemptedByMessage {
+            // Nothing to cut short at the pin: the turn `preempt_busy_turn`
+            // saw live has completed in the awaits since (or it never
+            // started — relaunch startup window). Its worker owns the busy
+            // slot and its own terminal emit; aborting it here would only
+            // produce a bare interrupt `agent:stream:end` (no `messageId`)
+            // for a turn that already ended (intent-hq/intent#5380).
+            return InterruptOutcome {
+                agent_found: true,
+                preempted: false,
+                interrupted_row_id: None,
+            };
+        }
         let turn_in_flight = self.is_busy(agent_id);
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
@@ -5160,6 +5208,9 @@ impl AgentManager {
                 if let Some(ref session) = session {
                     data["agentName"] = json!(session.name);
                     data["isBackground"] = json!(session.is_background);
+                    if session.notifications_muted {
+                        data["notificationsMuted"] = json!(true);
+                    }
                     if let Some(ref report) = session.completion_report {
                         // `completionReport` is canonical; `report` is kept
                         // for back-compat with older clients.
@@ -5197,7 +5248,11 @@ impl AgentManager {
                     .await;
             }
         }
-        (true, interrupted_message_id)
+        InterruptOutcome {
+            agent_found: true,
+            preempted: true,
+            interrupted_row_id: interrupted_message_id,
+        }
     }
 
     /// Derive the zero-output stop-redelivery payload (intent-hq/monorepo#1757)
@@ -7360,17 +7415,42 @@ impl AgentManager {
     /// without killing the child, threading a zero-output turn's preempted
     /// user message into `options.prepend_*` for combined delivery
     /// (monorepo#1014). A no-op when the agent is idle, or during turn
-    /// startup (no live handle / `acpSessionId` yet) where the keep-alive
-    /// interrupt would fall back to the `stop` kill path — the caller's send
-    /// then queues behind the starting turn instead.
+    /// startup (no live-turn slot registered yet: spawn / `initialize` /
+    /// `session/new` / `session/load`, including the relaunch of an evicted
+    /// child) where the keep-alive interrupt would have nothing to cancel —
+    /// the caller's send then queues behind the starting turn instead.
     async fn preempt_busy_turn(self: &Arc<Self>, agent_id: &AgentId, options: &mut TurnOptions) {
         if !self.is_busy(agent_id) {
             return;
         }
-        // Preempt only when a cancellable turn is live (handle +
-        // `acpSessionId`); during turn startup the keep-alive interrupt
-        // would fall back to the `stop` kill path, so skip it and let
-        // the caller queue behind the starting turn instead.
+        // Preempt only when a cancellable turn is live: the live-turn slot
+        // is registered by `run_prompt_turn` immediately before
+        // `session/prompt`, so its absence IS the startup window. A handle +
+        // stored `acpSessionId` check is not enough (intent-hq/intent#5380):
+        // a relaunching agent has the fresh child's handle installed before
+        // `start_session` resumes it, and the evicted process's
+        // `acpSessionId` is preserved for that resume, so the startup window
+        // read as cancellable and `interrupt_inner` emitted a bare interrupt
+        // `agent:stream:end` (no `messageId`) for a turn that was never in
+        // flight. Skip it and let the caller queue behind the starting turn.
+        // This read is the early exit only: the decisive check is the pin
+        // inside `interrupt_inner`, made with no await in between.
+        //
+        // STAB-114: the same slot read tells whether the current turn has
+        // produced zero output (no assistant content chunks) BEFORE we
+        // cancel. Use the live-turn slot (not persisted transcript) to detect
+        // zero output: assistant rows are only persisted at turn END, so an
+        // interrupted mid-stream turn would incorrectly look like zero output
+        // if we checked the transcript. The LiveTurn.blocks are assistant
+        // blocks by construction (see Transcript::snapshot_blocks), so
+        // non-empty means output exists.
+        let Some(has_output) = self
+            .services
+            .live_turn(agent_id)
+            .map(|live| !live.blocks.is_empty())
+        else {
+            return;
+        };
         let cancellable = self.contains(agent_id)
             && self
                 .services
@@ -7383,17 +7463,6 @@ impl AgentManager {
         if !cancellable {
             return;
         }
-        // STAB-114: Check if the current turn has produced zero output
-        // (no assistant content chunks) BEFORE we cancel. Use the live-turn
-        // slot (not persisted transcript) to detect zero output: assistant
-        // rows are only persisted at turn END, so an interrupted mid-stream
-        // turn would incorrectly look like zero output if we checked the
-        // transcript. The LiveTurn.blocks are assistant blocks by construction
-        // (see Transcript::snapshot_blocks), so non-empty means output exists.
-        let has_output = self
-            .services
-            .live_turn(agent_id)
-            .is_some_and(|live| !live.blocks.is_empty());
 
         // Sender attribution for the interrupted row / `stream:end` payload:
         // a user-origin delivery is `{ kind: "user" }`; an agent-to-agent
@@ -7424,14 +7493,23 @@ impl AgentManager {
         // settled" to the parent here. The returned row id names the
         // interrupted marker row this preemption just persisted (empty
         // blocks on the zero-output path), excluded from the progress
-        // check below.
-        let (_, interrupted_row_id) = self
+        // check below. The slot read above is an UNPINNED snapshot and the
+        // session lookup awaited since: a turn that completed in that gap
+        // leaves nothing to preempt at `interrupt_inner`'s pin, which then
+        // returns `preempted: false` having emitted nothing — the message
+        // queues behind that turn's own end, and the completed turn's
+        // message was delivered, so no combined re-delivery either.
+        let outcome = self
             .interrupt_inner(
                 agent_id,
                 InterruptReason::PreemptedByMessage,
                 interrupted_by,
             )
             .await;
+        if !outcome.preempted {
+            return;
+        }
+        let interrupted_row_id = outcome.interrupted_row_id;
 
         if !has_output {
             // Zero-output condition: the provider dropped the preempted
@@ -7571,7 +7649,7 @@ impl AgentManager {
         }
         let mgr = self.clone();
         let id = agent_id.clone();
-        let handle = tokio::spawn(async move {
+        let handle = intent_core::spawn_daemon(async move {
             // Clear the durable stop-redelivery mirror before the turn runs
             // (intent-hq/monorepo#1899): the payload was consumed into this
             // turn's prompt above, so a restart after this point must not
@@ -7613,7 +7691,7 @@ impl AgentManager {
     /// or the manager was dropped/never attached (bare test wiring).
     fn spawn_wake_listener(&self, agent_id: AgentId, workspace_id: WorkspaceId) -> JoinHandle<()> {
         let services = self.services.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             loop {
                 tokio::time::sleep(HARNESS_WAKE_POLL).await;
                 let Some(mgr) = services.agent_manager() else {
@@ -7784,7 +7862,7 @@ impl AgentManager {
         // turn is open.
         let mgr = self.clone();
         let (id, ws) = (agent_id.clone(), workspace_id.clone());
-        let drive = tokio::spawn(async move {
+        let drive = intent_core::spawn_daemon(async move {
             let outcome = mgr
                 .services
                 .run_harness_wake_turn(&mut guard, first, &id, &ws, HARNESS_WAKE_SETTLE)
@@ -8369,7 +8447,7 @@ impl AgentManager {
                 let services = self.services.clone();
                 let ws = workspace_id.clone();
                 let aid = agent_id.clone();
-                tokio::spawn(async move {
+                intent_core::spawn_daemon(async move {
                     while let Some((level, message)) = status_rx.recv().await {
                         services
                             .publish_status_event(&ws, &aid, "launch", &message, level.as_str())
@@ -8399,6 +8477,33 @@ impl AgentManager {
                 )
                 .await?;
             resolved.unsloth_endpoint = Some(endpoint);
+        }
+        // Bare-command launch is the last-resort tier: nothing resolved a
+        // provider binary (no honored `providers.paths` override, no
+        // discovered install) and there is no npx fallback, so
+        // `spawn_provider` execs `provider.command` and relies on the daemon
+        // PATH. Record the tier and whether an override was configured at
+        // this moment, so a resulting `ProviderNotFound` failure is
+        // attributable from the daemon log alone — a missing effective
+        // override versus a rejected one (which `resolve_explicit_path`
+        // already warns about) (intent-hq/intent#4971). The mock provider
+        // always launches bare `node`.
+        if resolved.provider_binary.is_none()
+            && resolved.npx_fallback_binary.is_none()
+            && resolved.provider.id != "mock"
+        {
+            let override_configured = read_provider_path_setting(
+                &settings,
+                resolved.provider.primary_binary_provider_id(),
+            )
+            .is_some();
+            tracing::warn!(
+                agent_id = %agent_id,
+                provider_id = resolved.provider.id,
+                command = resolved.provider.command,
+                override_configured,
+                "no provider binary resolved; launching the bare command from the daemon PATH"
+            );
         }
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.cwd = Some(&resolved.cwd);
@@ -8835,7 +8940,7 @@ impl AgentManager {
         let registry = Arc::downgrade(&self.registry);
         let busy = Arc::downgrade(&self.busy);
         let stderr_dir = self.agent_stderr_log_dir(&agent_id);
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             loop {
                 tokio::time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
                 let (Some(handles), Some(registry), Some(busy)) =
@@ -9043,7 +9148,7 @@ async fn kill_child_trees(children: Vec<(Child, Option<u32>)>) {
                 let _ = killpg(pgid, Signal::SIGTERM);
                 pgids.push(pgid);
                 // Reap on a task so all waits run concurrently.
-                waits.push(tokio::spawn(async move {
+                waits.push(intent_core::spawn_daemon(async move {
                     let _ = child.wait().await;
                 }));
             }
@@ -10935,7 +11040,9 @@ async fn run_message_worker(
 /// user's. Same sub-agent definition as the attention-clear gate above and
 /// rules.rs. `NotFound` means the agent was deleted while its drain
 /// finished — nothing to surface, skip. A soft-retired session (`retired_at`
-/// set) is inert and skips the raise too. Archived workspaces additionally
+/// set) is inert and skips the raise too, as does a muted session
+/// (`notifications_muted`): the mute silences the workspace blue dot along
+/// with every other workspace-level surface. Archived workspaces additionally
 /// stay quiet: a turn finishing in a workspace whose status is `Archived`
 /// skips the raise (the user parked the workspace; unarchiving restores
 /// normal behavior — no persisted suppression state). FAIL OPEN on any
@@ -10955,7 +11062,11 @@ pub(crate) async fn should_raise_turn_end_unread(services: &Services, agent_id: 
             return true;
         }
     };
-    if session.parent_agent_id.is_some() || session.is_background || session.retired_at.is_some() {
+    if session.parent_agent_id.is_some()
+        || session.is_background
+        || session.retired_at.is_some()
+        || session.notifications_muted
+    {
         return false;
     }
     match services.store.get_workspace(&session.workspace_id).await {
@@ -11167,12 +11278,13 @@ async fn prepare_flush_turn(
 /// `messageMetadata` (parity with `deliver_wake_message`'s in-block tag) AND on
 /// the row-level `metadata` column (parity with the direct `agent.sendMessage`
 /// persist) — so transcript consumers find the tag regardless of which field
-/// they read. The client-identity `userAppMessageId` key is excluded from the
-/// in-block copy (it stays row-level only): the block embed exists for
-/// attribution tags that history replay should surface, and a queued send's
-/// content block should not diverge from its direct-send counterpart just
-/// because a dedup id rode along. Best-effort; a store or publish error is
-/// logged and the turn still proceeds.
+/// they read. The client-identity `userAppMessageId` key and the daemon's
+/// `fromPrincipalId` stamp are excluded from the in-block copy (they stay
+/// row-level only): the block embed exists for attribution tags that history
+/// replay should surface, and a queued send's content block should not
+/// diverge from its direct-send counterpart just because a dedup id or the
+/// author stamp rode along. Best-effort; a store or publish error is logged
+/// and the turn still proceeds.
 ///
 /// Returns `true` when the user row was durably appended to the transcript,
 /// `false` when the store append failed for every bounded retry attempt
@@ -11203,6 +11315,7 @@ async fn persist_user(
         Value::Object(m) => {
             let mut m = m.clone();
             m.remove(intent_core::USER_APP_MESSAGE_ID_KEY);
+            m.remove(intent_core::FROM_PRINCIPAL_ID_KEY);
             (!m.is_empty()).then_some(Value::Object(m))
         }
         other => Some(other.clone()),
@@ -12310,6 +12423,13 @@ pub(crate) const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
 /// spec's only sanctioned cancel-error shape is code `-32800` (the message is
 /// free text there too). The "cancelled" substring heuristic remains for
 /// non-RPC renderings, which carry no data suffix.
+///
+/// A provider stall (intent-hq/intent#5395) is rejected up front: its
+/// rendering is prefix-anchored on [`intent_acp::PROVIDER_STALL_PREFIX`] and
+/// the open-tool shape embeds the provider-controlled id/title of the hung
+/// tool call, so a call titled "Inspect cancelled jobs" must not turn the
+/// terminal stall into a benign cancel (skipping Error persistence and the
+/// worker's teardown/requeue).
 pub(crate) fn prompt_cancellation_error(err: &Error) -> bool {
     let Error::Internal(msg) = err else {
         return false;
@@ -12317,7 +12437,11 @@ pub(crate) fn prompt_cancellation_error(err: &Error) -> bool {
     let Some(inner) = msg.strip_prefix(PROMPT_FAILED_PREFIX) else {
         return false;
     };
-    if let Some(rest) = inner.trim_start().strip_prefix("JSON-RPC error ") {
+    let inner_trimmed = inner.trim_start();
+    if inner_trimmed.starts_with(intent_acp::PROVIDER_STALL_PREFIX) {
+        return false;
+    }
+    if let Some(rest) = inner_trimmed.strip_prefix("JSON-RPC error ") {
         let code = rest.split(':').next().unwrap_or("").trim();
         return code == "-32800";
     }
@@ -12700,11 +12824,13 @@ mod role_reminder_tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -12758,6 +12884,7 @@ mod role_reminder_tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -14267,7 +14394,7 @@ mod dead_child_respawn_tests {
     /// Insert a fresh agent session on provider `mock` with a cached acp
     /// session id (the provider is immutable once set, so it must be seeded
     /// at insert time, not patched onto `manager_with`'s default agent).
-    async fn seed_mock_session(mgr: &AgentManager, agent_id: &AgentId, acp: &str) {
+    pub(super) async fn seed_mock_session(mgr: &AgentManager, agent_id: &AgentId, acp: &str) {
         let mut s = session(agent_id, &WorkspaceId::from("ws-1"), None);
         s.provider = Some("mock".to_string());
         s.acp_session_id = Some(acp.to_string());
@@ -14450,6 +14577,189 @@ mod dead_child_respawn_tests {
             "only the mapping drops out; the handle awaits the exit watcher"
         );
         mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod startup_preempt_tests {
+    //! Regression for intent-hq/intent#5380: an interrupt-priority delivery
+    //! landing in a relaunching agent's turn-startup window must not preempt.
+    //! After an eviction the persisted `acpSessionId` still names the
+    //! previous process's session, and `create_agent` installs the fresh
+    //! child's handle BEFORE `start_session` resumes it — so a handle +
+    //! stored id check read the startup window as a cancellable turn even
+    //! though no live-turn slot exists, and `interrupt_inner` emitted a bare
+    //! interrupt `agent:stream:end` (no `messageId`) for nothing.
+
+    use super::dead_child_respawn_tests::{install_fake_handle, seed_mock_session};
+    use super::role_reminder_tests::manager_with;
+    use super::tests::EnvGuard;
+    use super::*;
+    use intent_core::events::AGENT_STREAM_END;
+
+    #[tokio::test]
+    async fn preempt_skips_relaunch_startup_window_without_live_turn() {
+        let _env = EnvGuard::apply(&[("MOCK_AGENT_KILLS_ON_INTERRUPT", None)]);
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let ws = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-5380-relaunch");
+        // The previous (evicted) process's session id is what the store holds.
+        seed_mock_session(&mgr, &agent_id, "acp-previous-process").await;
+        // Relaunch window: the turn worker owns the busy slot and the fresh
+        // child's handle is installed, but `start_session` has not resumed
+        // the session yet — no live-turn slot has been registered.
+        assert!(
+            mgr.try_begin(&agent_id, &ws).await,
+            "worker claims the slot"
+        );
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+        assert!(mgr.services.live_turn(&agent_id).is_none());
+
+        let mut options = TurnOptions {
+            interrupt_priority: true,
+            ..TurnOptions::default()
+        };
+        mgr.preempt_busy_turn(&agent_id, &mut options).await;
+
+        assert!(
+            mgr.is_busy(&agent_id),
+            "the starting turn keeps its slot; the interrupt queues behind it"
+        );
+        let ends = mgr
+            .services
+            .store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![AGENT_STREAM_END.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query agent:stream:end events");
+        assert!(
+            ends.is_empty(),
+            "no bare interrupt terminal for a turn that was never in flight: {ends:?}"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("read transcript");
+        assert!(
+            messages.is_empty(),
+            "no interrupted marker row persisted: {messages:?}"
+        );
+        assert!(
+            mgr.contains(&agent_id),
+            "the relaunching child's handle is left alone"
+        );
+        mgr.end_turn(&agent_id).await;
+    }
+
+    /// Teardown boundary: `preempt_busy_turn` snapshots the live slot and
+    /// then awaits the session lookups before `interrupt_inner` pins, so a
+    /// turn can complete (worker clears the slot, emits its own normal
+    /// `stream:end`) in that gap. The preemption decision must therefore be
+    /// made atomically with the pin: a `PreemptedByMessage` interrupt whose
+    /// pin finds no slot returns without aborting, cancelling or emitting —
+    /// the state below is exactly what the pin sees after such a completion.
+    #[tokio::test]
+    async fn preempt_interrupt_without_slot_at_pin_emits_nothing() {
+        let _env = EnvGuard::apply(&[("MOCK_AGENT_KILLS_ON_INTERRUPT", None)]);
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let ws = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-5380-teardown");
+        seed_mock_session(&mgr, &agent_id, "acp-live").await;
+        assert!(
+            mgr.try_begin(&agent_id, &ws).await,
+            "worker still owns the busy slot until its end_turn"
+        );
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+        // The turn was live when the eligibility check ran, then completed:
+        // the worker's normal turn end cleared the unpinned slot.
+        mgr.services.set_live_turn(&agent_id, "msg-done", vec![]);
+        mgr.services.clear_unpinned_live_turn(&agent_id);
+        assert!(mgr.services.live_turn(&agent_id).is_none());
+
+        let outcome = mgr
+            .interrupt_inner(&agent_id, InterruptReason::PreemptedByMessage, None)
+            .await;
+
+        assert!(outcome.agent_found);
+        assert!(!outcome.preempted, "nothing to preempt at the pin");
+        assert!(outcome.interrupted_row_id.is_none());
+        assert!(
+            mgr.is_busy(&agent_id),
+            "the finishing turn's slot is left to its own end_turn"
+        );
+        assert!(mgr.contains(&agent_id), "the handle is left alone");
+        let ends = mgr
+            .services
+            .store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![AGENT_STREAM_END.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query agent:stream:end events");
+        assert!(
+            ends.is_empty(),
+            "no bare interrupt terminal after the turn already ended: {ends:?}"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("read transcript");
+        assert!(
+            messages.is_empty(),
+            "no interrupted marker row persisted: {messages:?}"
+        );
+        mgr.end_turn(&agent_id).await;
+    }
+
+    /// The same no-slot state on the plain `agent.stop` path keeps its bare
+    /// interrupt terminal: a pre-first-token stop relies on it to close the
+    /// spinner (PROTOCOL §7.2), and it is not a preemption.
+    #[tokio::test]
+    async fn user_stop_without_slot_keeps_bare_terminal() {
+        let _env = EnvGuard::apply(&[("MOCK_AGENT_KILLS_ON_INTERRUPT", None)]);
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let ws = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-5380-user-stop");
+        seed_mock_session(&mgr, &agent_id, "acp-live").await;
+        assert!(mgr.try_begin(&agent_id, &ws).await);
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+        assert!(mgr.services.live_turn(&agent_id).is_none());
+
+        let outcome = mgr
+            .interrupt_inner(&agent_id, InterruptReason::UserStop, None)
+            .await;
+
+        assert!(outcome.agent_found);
+        assert!(outcome.preempted);
+        assert!(!mgr.is_busy(&agent_id), "the stop released the slot");
+        let ends = mgr
+            .services
+            .store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![AGENT_STREAM_END.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query agent:stream:end events");
+        assert_eq!(ends.len(), 1, "one bare terminal: {ends:?}");
+        assert_eq!(
+            ends[0].data.get("interruptReason").and_then(Value::as_str),
+            Some("user_stop")
+        );
+        assert!(ends[0].data.get("messageId").is_none());
     }
 }
 
@@ -15646,6 +15956,25 @@ mod retry_tests {
         assert!(!is_retryable_spawn_error(&err));
     }
 
+    /// intent-hq/intent#4971: the typed bare-command ENOENT from
+    /// `spawn_provider` is a resolution failure, not a transient handshake
+    /// fault — retrying the same missing command cannot succeed, and the
+    /// classified text survives the `create_agent` wrap so `agent:failed`
+    /// names the launch tier instead of a raw OS error.
+    #[test]
+    fn provider_not_found_is_not_retryable_and_keeps_its_classification() {
+        let spawn = intent_acp::AcpError::ProviderNotFound {
+            command: "antigravity-acp".to_string(),
+            launch: intent_acp::LaunchMode::BareCommand,
+        };
+        let err = Error::Internal(format!("spawn provider failed: {spawn}"));
+        assert!(!is_retryable_spawn_error(&err));
+        let text = err.to_string();
+        assert!(text.contains("provider executable not found"), "{text}");
+        assert!(text.contains("bare command"), "{text}");
+        assert!(!text.contains("No such file"), "{text}");
+    }
+
     #[test]
     fn generic_internal_error_is_not_retryable() {
         // Default changed to non-retryable for unknown Internal errors to avoid
@@ -15687,6 +16016,41 @@ mod turn_failure_tests {
     fn cancelled_rpc_error_is_benign() {
         let err = Error::Internal(
             "session/prompt failed: JSON-RPC error -32800: Request cancelled".to_string(),
+        );
+        assert!(is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn provider_stall_with_cancelled_in_tool_label_is_terminal() {
+        // intent-hq/intent#5395: the open-tool provider stall embeds the
+        // provider-controlled tool id/title. A hung call titled "Inspect
+        // cancelled jobs" must stay terminal (Error persisted, child torn
+        // down, retry requeued) — the stall prefix wins over the "cancelled"
+        // substring heuristic, for both stall shapes.
+        let stall = intent_acp::AcpError::ProviderStall {
+            silent: std::time::Duration::from_secs(1500),
+            open_tool_call: Some("cancelled-sweep (bash: Inspect cancelled jobs)".to_string()),
+        };
+        let err = Error::Internal(format!("{PROMPT_FAILED_PREFIX} {stall}"));
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("cancelled"),
+            "precondition: the label reaches the flattened wrapper: {err}"
+        );
+        assert!(!prompt_cancellation_error(&err), "{err}");
+        assert!(!is_benign_turn_error(&err), "{err}");
+
+        let stall = intent_acp::AcpError::ProviderStall {
+            silent: std::time::Duration::from_secs(1200),
+            open_tool_call: None,
+        };
+        let err = Error::Internal(format!("{PROMPT_FAILED_PREFIX} {stall}"));
+        assert!(!is_benign_turn_error(&err), "{err}");
+
+        // The prefix is anchored: a stall mention elsewhere in an otherwise
+        // benign cancel does not flip it terminal.
+        let err = Error::Internal(
+            "session/prompt failed: JSON-RPC error -32800: cancelled after provider stall"
+                .to_string(),
         );
         assert!(is_benign_turn_error(&err));
     }
@@ -16085,11 +16449,13 @@ mod agent_retry_tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
             task_stats: None,
         }
     }
@@ -16140,6 +16506,7 @@ mod agent_retry_tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 

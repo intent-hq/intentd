@@ -189,6 +189,24 @@ where
     v["result"].clone()
 }
 
+/// The actor the daemon stamps on this connection's own actions: every
+/// bound wire principal's event carries `{ type: user, id: principalId,
+/// name }` (multiplayer w4), the name being the GitHub login, else the
+/// display name, else the id — `principal.me` projected accordingly.
+async fn caller_actor<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let me = wss_rpc(ws, id, "principal.me", json!({})).await;
+    let principal_id = me["id"].as_str().expect("principal id").to_string();
+    let name = me["login"]
+        .as_str()
+        .or(me["displayName"].as_str())
+        .unwrap_or(&principal_id)
+        .to_string();
+    json!({ "type": "user", "id": principal_id, "name": name })
+}
+
 /// Like [`wss_rpc`] but returns the full response envelope so tests can
 /// assert `error.code` / `error.message` for expected-failure paths.
 async fn wss_rpc_envelope<S>(
@@ -339,10 +357,7 @@ async fn workspace_update_emits_workspace_updated_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert!(evt["id"].is_string(), "event id: {evt}");
     assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    assert_eq!(
-        evt["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(evt["actor"], caller_actor(&mut rpc, 90).await);
     // `changes` is the applied delta only; `skip_serializing_if = "Option::is_none"`
     // keeps un-supplied fields out of the payload (reference-parity emitter).
     // The skip toggle round-trips under its canonical `skipIsolation` name
@@ -1135,10 +1150,7 @@ async fn task_created_emitted_on_every_creation_path_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert!(evt["id"].is_string(), "event id: {evt}");
     assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    assert_eq!(
-        evt["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(evt["actor"], caller_actor(&mut rpc, 90).await);
     assert_eq!(evt["data"]["noteId"], json!(child_id));
     assert_eq!(evt["data"]["noteTitle"], json!("Converted Task"));
     assert_eq!(evt["data"]["status"], json!("not_started"));
@@ -1545,10 +1557,7 @@ async fn comment_respond_emits_comment_added_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert!(evt["id"].is_string(), "event id: {evt}");
     assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    assert_eq!(
-        evt["actor"],
-        json!({ "type": "system", "id": "system", "name": "System" })
-    );
+    assert_eq!(evt["actor"], caller_actor(&mut rpc, 90).await);
     assert_eq!(
         evt["data"],
         json!({ "noteId": note_id, "commentId": reply_id })
@@ -3032,6 +3041,96 @@ async fn workspace_subscribe_snapshot_includes_archived_over_wss() {
         archived["status"],
         json!("Archived"),
         "snapshot includes archived workspaces with their status: {archived}"
+    );
+}
+
+/// End-to-end regression: the virtual Chief of Staff workspace (`__chief__`)
+/// never rides a `workspace.subscribe` delta. `workspace.list` and the seq-0
+/// snapshot filter it at the store, but the delta path re-reads the event's
+/// workspace via `workspace.get` — which synthesizes Chief — so a Chief-scoped
+/// `workspace:updated` used to push `updated: [<chief>]` and clients that
+/// upsert unknown ids (iOS/visionOS) grew a "Chief of Staff" row. A control
+/// update on a real workspace must still arrive as the very next delta
+/// (seq 1: nothing was emitted for Chief in between).
+#[tokio::test]
+async fn workspace_subscribe_deltas_never_carry_chief_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Real WS", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let real_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("real workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(&mut sub, 1, "workspace.subscribe", json!({})).await;
+    let sub_id = sub_res["subscriptionId"]
+        .as_str()
+        .expect("subscriptionId")
+        .to_string();
+    let push = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(push["kind"], json!("snapshot"), "push: {push}");
+    let snap = push["snapshot"].as_array().expect("snapshot array");
+    assert!(
+        !snap
+            .iter()
+            .any(|e| e["id"] == json!(intent_core::CHIEF_WORKSPACE_ID)),
+        "seq-0 snapshot must not surface Chief: {snap:?}"
+    );
+
+    // Chief-scoped `workspace:updated` (the update is a virtual no-op that
+    // still publishes the event), then a control update on the real workspace.
+    let resp = uds_rpc(
+        &socket,
+        3,
+        "workspace.update",
+        json!({ "workspaceId": intent_core::CHIEF_WORKSPACE_ID, "statusMessage": "hello" }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["workspace"]["id"],
+        json!(intent_core::CHIEF_WORKSPACE_ID),
+        "workspace.update on Chief: {resp}"
+    );
+    uds_rpc(
+        &socket,
+        4,
+        "workspace.update",
+        json!({ "workspaceId": real_id, "statusMessage": "control" }),
+    )
+    .await;
+
+    let delta = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(delta["subscriptionId"], sub_id.as_str(), "delta: {delta}");
+    assert_eq!(delta["kind"], json!("delta"), "delta: {delta}");
+    assert_eq!(
+        delta["seq"],
+        json!(1),
+        "the Chief-scoped event must not have consumed a delta seq: {delta}"
+    );
+    let updated = delta["delta"]["updated"].as_array().expect("updated array");
+    assert!(
+        !updated
+            .iter()
+            .any(|e| e["id"] == json!(intent_core::CHIEF_WORKSPACE_ID)),
+        "workspace deltas must never carry Chief: {delta}"
+    );
+    assert_eq!(
+        updated[0]["id"],
+        json!(real_id),
+        "control update on the real workspace still arrives: {delta}"
+    );
+    assert_eq!(
+        updated[0]["statusMessage"],
+        json!("control"),
+        "control delta carries the re-read workspace: {delta}"
     );
 }
 

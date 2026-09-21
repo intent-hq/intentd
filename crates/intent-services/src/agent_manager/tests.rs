@@ -1936,11 +1936,13 @@ async fn process_cap_events_queued_resumed_evicted() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.unwrap();
     let (a, b) = (AgentId::from("a"), AgentId::from("b"));
@@ -1990,6 +1992,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .unwrap();
@@ -2038,6 +2041,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .unwrap();
@@ -2100,6 +2104,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .unwrap();
@@ -2192,6 +2197,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .unwrap();
@@ -4365,11 +4371,13 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -5178,11 +5186,13 @@ async fn seed_agent_with_task_graph(
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     let session = AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -5231,6 +5241,7 @@ async fn seed_agent_with_task_graph(
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     // The chief row is seeded by migration 0033; every other workspace is
     // created here.
@@ -8593,8 +8604,12 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
         .set_acp_session_id(&ws, &id, "acp-int-send")
         .await
         .unwrap();
-    // Claim the in-flight slot so the send sees a busy (mid-turn) agent.
+    // Claim the in-flight slot and register the live-turn slot so the send
+    // sees a busy (mid-turn) agent past `session/prompt` — without the live
+    // slot the busy agent is still in its startup window and the preemption
+    // is skipped (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services.set_live_turn(&id, "msg-int-send", Vec::new());
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let result = mgr
@@ -9918,8 +9933,10 @@ async fn send_queued_message_now_preempts_busy_turn_without_kill() {
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
-    // Claim the in-flight slot so the send sees a busy (mid-turn) agent.
+    // Claim the in-flight slot and register the live-turn slot so the send
+    // sees a busy (mid-turn) agent past `session/prompt` (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services.set_live_turn(&id, "msg-sqmn-busy", Vec::new());
 
     let result = mgr
         .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
@@ -10307,6 +10324,7 @@ fn turn_progress_check_excludes_only_empty_marker_row() {
             content,
             metadata: None,
             app_message_id: None,
+            author: None,
             created_at: now_iso(),
         }
     }
@@ -10446,8 +10464,11 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
         .set_acp_session_id(&ws, &id, "acp-int-noidle")
         .await
         .unwrap();
-    // Claim the in-flight slot so the send preempts a busy (mid-turn) agent.
+    // Claim the in-flight slot and register the live-turn slot so the send
+    // preempts a busy (mid-turn) agent past `session/prompt` (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .set_live_turn(&id, "msg-int-noidle", Vec::new());
 
     // Prime intent-core's process-wide login-shell PATH capture (OnceLock;
     // on Unix the first use spawns `$SHELL -ilc`, up to 5s — a no-op
@@ -10593,8 +10614,10 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
         .set_acp_session_id(&ws, &id, "acp-int-dup")
         .await
         .unwrap();
-    // Claim the in-flight slot so the first delivery preempts a busy turn.
+    // Claim the in-flight slot and register the live-turn slot so the first
+    // delivery preempts a busy turn past `session/prompt` (intent-hq/intent#5380).
     assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services.set_live_turn(&id, "msg-int-dup", Vec::new());
 
     let first = mgr
         .interrupt_send_message(
@@ -10812,6 +10835,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -11078,7 +11102,7 @@ async fn pending_permissions_snapshots_and_respond_unblocks() {
     assert!(!mgr.respond_permission("nope", PermissionOutcome::Cancelled));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn services_pending_and_respond_rpcs_drive_the_registry() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11139,7 +11163,7 @@ async fn services_pending_and_respond_rpcs_drive_the_registry() {
     assert!(matches!(err, Error::InvalidParams(_)));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn services_permission_rpcs_are_inert_without_a_manager() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11216,6 +11240,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     mgr.services
         .store
@@ -11228,7 +11253,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
 /// `AgentManager::stop`: the tracked handles, workers, in-flight busy set, and
 /// `agent_ws` map all drain, and the workspace insert itself is idempotent —
 /// a same-slug recreate observes zero pre-existing agents.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
     // Build the manager inline so we can pin a hermetic `workspaces_root` on
     // Services — the delete path walks it to unlink the daemon-owned
@@ -11318,11 +11343,13 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store
         .insert_workspace(&workspace)
@@ -11342,7 +11369,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
 /// is deleted. The tracked handle (provider child), registry entry, and
 /// session row all survive so unarchive can resume the same session, and no
 /// `agent:deleted` fires; `workspace:updated` still carries the archive delta.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11433,7 +11460,7 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
 /// its worker orphans the tool call and leaks the busy slot (the workspace
 /// stays `agent_running` forever). Every OTHER in-flight turn is still
 /// interrupted keep-alive.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_workspace_skips_the_calling_agents_turn() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11513,7 +11540,7 @@ async fn archive_workspace_skips_the_calling_agents_turn() {
 /// drained into a new turn while the workspace is archived (the archived gate
 /// in `try_drain_queue`); `workspace.unarchive` itself kicks the drain and
 /// delivers the parked queue — no organic follow-up kick required.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_workspace_parks_queue_until_unarchive() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11579,7 +11606,7 @@ async fn archive_workspace_parks_queue_until_unarchive() {
 /// the workspace is archived: the archived gate parks them in the queue
 /// instead of claiming the slot, and unarchive's own drain kick delivers
 /// the parked wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archive_workspace_parks_wake_deliveries() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11634,7 +11661,7 @@ async fn archive_workspace_parks_wake_deliveries() {
 /// strands until the next organic drain trigger. The re-check must self-heal
 /// by kicking the drain once it observes the workspace no longer archived
 /// (mirroring `AgentManager::send_message`'s archived-gate re-check).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11768,7 +11795,7 @@ async fn retired_session_parks_wake_deliveries_until_restore() {
 /// `try_begin` would auto-unarchive the workspace). The workspace stays
 /// Archived with no `autoUnarchive` delta, and unarchive's own drain kick
 /// delivers the parked message.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_workspace_parks_automatic_send_until_unarchive() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11846,7 +11873,7 @@ async fn archived_workspace_parks_automatic_send_until_unarchive() {
 /// event-subscription wake path) into an archived workspace parks in the
 /// parent's queue instead of starting a turn that flips the workspace
 /// straight back to Active.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_workspace_parks_internal_parent_wake() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11890,7 +11917,7 @@ async fn archived_workspace_parks_internal_parent_wake() {
 /// delivery (`interrupt_send_message`) into an archived workspace parks
 /// front-of-queue instead of preempting/driving a turn; the workspace stays
 /// Archived.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_workspace_parks_automatic_interrupt_send_front_of_queue() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -11955,7 +11982,7 @@ async fn archived_workspace_parks_automatic_interrupt_send_front_of_queue() {
 /// Guard the revive path (intent-hq/monorepo#2732 non-goal): a USER-origin
 /// `send_message` into an archived workspace still claims the slot and
 /// auto-unarchives — only automatic deliveries park.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn archived_workspace_user_send_still_auto_unarchives() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -12010,7 +12037,7 @@ async fn archived_workspace_user_send_still_auto_unarchives() {
 /// target's home workspace), so a parent whose home workspace is Active
 /// receives its wake immediately even when the watched child's workspace is
 /// archived.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_parent_wake_unaffected_by_archived_child_workspace() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -12187,7 +12214,7 @@ async fn idle_since_is_none_while_a_claim_is_mid_write() {
     assert!(mgr.idle_since().is_some());
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -12229,7 +12256,7 @@ async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
 /// A busy agent whose session row is missing (e.g. deleted mid-turn by a
 /// concurrent `agent.delete`) is skipped instead of failing the whole
 /// `agent.listActive` response (PR #881 review).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn list_active_skips_busy_agent_with_missing_session_row() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -14373,7 +14400,7 @@ async fn cross_workspace_send_queued_now_binds_woken_agent_to_its_session_worksp
 /// bridge scoped to the caller's workspace. Same binding contract as the
 /// three `ws.agent.send` routes above; this arm covers two ordinary
 /// workspaces.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_wake_or_create_binds_woken_agent_to_its_session_workspace() {
     assert_cross_workspace_send_binds_to_session_workspace(
         SendRoute::WakeOrCreate,
@@ -14390,7 +14417,7 @@ async fn cross_workspace_wake_or_create_binds_woken_agent_to_its_session_workspa
 /// on demand), so the ordinary-workspace arm above is not evidence for it:
 /// this arm asserts the echoed cwd is the chief cwd root, the live bridge
 /// answers the chief workspace id, and the rebind logged the mismatch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn cross_workspace_wake_or_create_binds_chief_homed_target_to_chief_workspace() {
     assert_cross_workspace_send_binds_to_session_workspace(
         SendRoute::WakeOrCreate,
@@ -15855,11 +15882,13 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("existing workspace path resolves");
@@ -15970,11 +15999,13 @@ async fn resolve_spawn_falls_back_to_repository_path() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: Some(intent_core::CheckoutMode::Direct),
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("repository_path fallback resolves");
@@ -16388,11 +16419,13 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -16757,11 +16790,13 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
 
     assert_eq!(
@@ -19195,7 +19230,7 @@ mod unblocked_hints_tests {
     /// appended to the LAST trigger-carrying entry; the delta reflects task
     /// state at annotation time (both deps complete → the gated task rows
     /// once, not per-wake).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn batch_coalesces_triggers_into_one_section_on_last_entry() {
         // The section is gated behind `agentFeatures.taskGraph`
         // (intent-hq/monorepo#2445), so wire a registry with it explicitly on.
@@ -19270,7 +19305,7 @@ mod unblocked_hints_tests {
     /// Idempotency + persisted guards: an entry whose content already carries
     /// the section (terminal-failure requeue) and a `persisted: true` entry
     /// are never (re)annotated.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn requeued_and_persisted_entries_are_not_reannotated() {
         let (_tmp, mgr) = manager().await;
         let ws = WorkspaceId::from("ws-unblocked-idem");
@@ -22725,7 +22760,7 @@ mod enqueue_origin_table {
             .user_origin
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn every_front_door_records_its_origin() {
         for (index, row) in ROWS.iter().enumerate() {
             let (_tmp, mgr) = manager().await;

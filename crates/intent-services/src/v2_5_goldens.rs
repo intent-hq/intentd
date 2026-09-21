@@ -56,12 +56,8 @@ fn v2_5_bundle_changes_only_pr_context_collaborators() {
 }
 
 #[test]
-fn current_harness_version_is_v2_5() {
-    assert_eq!(intent_core::model::CURRENT_HARNESS_VERSION, "2.5");
-    assert_eq!(
-        crate::harness::resolve_entry(intent_core::model::CURRENT_HARNESS_VERSION).version,
-        "2.5"
-    );
+fn v2_5_remains_registered() {
+    assert_eq!(crate::harness::resolve_entry("2.5").version, "2.5");
 }
 
 #[test]

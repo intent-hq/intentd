@@ -321,6 +321,12 @@ pub struct CheckRun {
     pub name: String,
     pub state: CheckState,
     pub url: Option<String>,
+    /// When the run started (REST `started_at`, RFC 3339), used only to pick
+    /// the live run among same-name twins on a head (see
+    /// [`RollupCheck::started_at`]). Daemon-internal: never serialized, so
+    /// the documented `CheckRun` wire shape is unchanged.
+    #[serde(skip)]
+    pub started_at: Option<String>,
 }
 
 /// An issue (PRs excluded; gated by capabilities).
@@ -419,17 +425,43 @@ pub struct ScCapabilities {
 /// One entry of the forge's status-check rollup for a pull request, carrying
 /// the per-check "is this required to merge?" flag GitHub only exposes through
 /// GraphQL (`statusCheckRollup.contexts` → `isRequired(pullRequestNumber:)`).
-/// Both check-runs and legacy commit statuses collapse onto this shape.
+/// Both check-runs and legacy commit statuses collapse onto this shape;
+/// [`RollupCheck::kind`] tells them apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RollupCheck {
     pub name: String,
+    /// Which kind of rollup node this is. A legacy commit status posted under
+    /// a check run's name is independent evidence, not another attempt of
+    /// that run: GitHub requires both to pass when their shared name is
+    /// required.
+    #[serde(default)]
+    pub kind: RollupCheckKind,
     pub state: CheckState,
     /// Whether the host reports this check as required for merging. `false`
     /// when the host says so *and* when the signal is unavailable — callers
     /// that need the distinction consult [`MergeRequirementSignals`].
     pub is_required: bool,
     pub url: Option<String>,
+    /// When the check-run started (GraphQL `CheckRun.startedAt`, RFC 3339).
+    /// `None` for legacy commit statuses and hosts that do not report it.
+    /// A head that carries several runs of the same check (a re-run, or a
+    /// `concurrency`-cancelled duplicate beside the live run) is resolved
+    /// onto the latest start, matching how the host reports the required
+    /// check's state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+}
+
+/// The kind of node a [`RollupCheck`] was mapped from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollupCheckKind {
+    /// A check run (GraphQL `CheckRun`, REST `/check-runs`).
+    #[default]
+    CheckRun,
+    /// A legacy commit status (GraphQL `StatusContext`, REST `/statuses`).
+    StatusContext,
 }
 
 /// Merge-relevant branch rules for a pull request's base branch (GitHub
@@ -481,7 +513,9 @@ pub struct MergeRequirementSignals {
     /// the host did not report the rollup at all.
     pub checks_known: bool,
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
-    /// unsupported endpoint) — a degraded but non-fatal probe.
+    /// unsupported endpoint) — a degraded but non-fatal probe. Quota
+    /// exhaustion on that read is never folded into `None`; it fails the
+    /// probe with [`crate::Error::RateLimited`].
     pub branch_rules: Option<BranchRules>,
     /// Whether the PR is currently queued in the host's merge queue (GitHub
     /// GraphQL `isInMergeQueue`). `None` when the host does not report it.

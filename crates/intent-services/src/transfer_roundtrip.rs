@@ -85,6 +85,7 @@ fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSe
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -536,7 +537,7 @@ async fn relay(
 /// (events zero, drafts dropped), path rewrites, nulled ACP session ids,
 /// interrupted-agent capture, git worktree + sandbox dirty state, the
 /// rehydration counts, and the finalized (archived) source.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn transfer_round_trip_between_two_stacks() {
     let src_db = TempDir::new("rt-src-db");
     let src_ws_root = TempDir::new("rt-src-ws");

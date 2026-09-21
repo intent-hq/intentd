@@ -111,6 +111,19 @@ fn run_owner_check(pwsh: &Path, cwd: &Path, data_dir: &str) -> Verdict {
 /// Like [`run_owner_check`], with a stub prelude prepended to the driver (see
 /// [`service_stubs`]) and extra environment variables set. Also returns the
 /// driver's stdout, so a test can assert on the allowance's info line.
+///
+/// `pwsh` gets a private `XDG_CACHE_HOME` inside the run's temp dir. On
+/// every start PowerShell replays a multicore-JIT startup profile
+/// (`$XDG_CACHE_HOME/powershell/StartupProfileData-NonInteractive`, default
+/// `~/.cache`) and rewrites it non-atomically at exit; once that file is
+/// corrupt, every pwsh dies with `Stack overflow.` before running a line of
+/// script, and every test here fails with an opaque driver error. That is
+/// what took CI down on 2026-09-18 (intent-hq/intent#5367): the tinybox
+/// slots share one `$HOME`, so every slot replayed the same corrupt file —
+/// most plausibly the work of concurrent pwsh processes (the parallel tests
+/// here among them) racing on its rewrite, though the writer was never
+/// pinned down. A per-run cache dir keeps this suite's pwsh from ever
+/// reading or writing the shared PowerShell cache.
 fn run_owner_check_with(
     pwsh: &Path,
     cwd: &Path,
@@ -135,6 +148,8 @@ fn run_owner_check_with(
     let dir = tempfile::tempdir().unwrap();
     let script_path = dir.path().join("driver.ps1");
     fs::write(&script_path, script).unwrap();
+    let xdg_cache_home = dir.path().join("xdg-cache");
+    fs::create_dir_all(&xdg_cache_home).unwrap();
 
     let mut command = Command::new(pwsh);
     command
@@ -145,7 +160,8 @@ fn run_owner_check_with(
         .current_dir(cwd)
         .env_remove("INTENTD_SERVICE_NAME")
         .env_remove("INTENTD_INSTALL_DIR")
-        .env("INTENTD_DATA_DIR", data_dir);
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("XDG_CACHE_HOME", &xdg_cache_home);
     for (key, value) in envs {
         command.env(key, value);
     }

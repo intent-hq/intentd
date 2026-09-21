@@ -401,6 +401,31 @@ impl Transcript {
         self.open_tool_calls.len()
     }
 
+    /// Human-readable label of one open tool call — `"{id} ({name}: {title})"`
+    /// (title omitted when absent) — for the open-tool terminal provider-stall
+    /// error and attention reason (intent-hq/intent#5395). Deterministic
+    /// under several open calls (smallest id), `None` when none is open.
+    fn open_tool_call_label(&self) -> Option<String> {
+        let id = self.open_tool_calls.iter().min()?;
+        let block = self
+            .tool_use_index
+            .get(id)
+            .and_then(|&index| self.blocks.get(index));
+        let name = block
+            .and_then(|b| b.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown tool");
+        let title = block
+            .and_then(|b| b.get("input"))
+            .and_then(|input| input.get("_acpTitle"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty());
+        Some(match title {
+            Some(title) => format!("{id} ({name}: {title})"),
+            None => format!("{id} ({name})"),
+        })
+    }
+
     /// The stable block id for a 0-based block index (`{messageId}:{index}`).
     fn block_id(&self, index: usize) -> String {
         format!("{}:{index}", self.message_id)
@@ -984,12 +1009,14 @@ pub(crate) fn silent_tail_suspect_ms() -> u64 {
 /// silent thinking phases some models run well past 90s while staying below
 /// the 8-minute #2669 silent-tail suspicion window
 /// ([`silent_tail_suspect_ms`]) and far below the 30-minute prompt idle
-/// timeout, which remains the only terminal mechanism — the stall event never
-/// cancels or fails the turn. Tool-call-aware (intent-hq/monorepo#3466):
-/// while ≥1 recorded tool call is still open the stalled advisory is fully
-/// suppressed regardless of silence duration — long tool runs are expected
-/// silence — with the 30-minute prompt idle timeout as the backstop for hung
-/// tools. Overridable via `INTENTD_STREAM_STALL_MS` (test seam).
+/// timeout. The stall event itself never cancels or fails the turn; the
+/// terminal mechanisms are [`provider_stall_terminal_ms`] (tool-free silence),
+/// [`open_tool_call_terminal_ms`] (silence under an open tool call) and the
+/// 30-minute prompt idle timeout. Tool-call-aware
+/// (intent-hq/monorepo#3466): while ≥1 recorded tool call is still open the
+/// advisory is suppressed — long tool runs are expected silence — but only up
+/// to [`open_tool_call_stall_ms`] (intent-hq/intent#5395), past which it fires
+/// regardless. Overridable via `INTENTD_STREAM_STALL_MS` (test seam).
 pub(crate) fn stream_stall_ms() -> u64 {
     if let Ok(val) = std::env::var("INTENTD_STREAM_STALL_MS") {
         if let Ok(ms) = val.parse::<u64>() {
@@ -997,6 +1024,78 @@ pub(crate) fn stream_stall_ms() -> u64 {
         }
     }
     5 * 60 * 1000
+}
+
+/// Silence ceiling for the tool-call-aware stall suppression
+/// (intent-hq/intent#5395): while ≥1 recorded tool call is open, the
+/// `stalled` advisory is suppressed only until the silence reaches this many
+/// ms — then it fires exactly as the tool-free [`stream_stall_ms`] advisory
+/// does. Before this ceiling existed, a `tool_call` that never received its
+/// terminal `tool_call_update` (the opencode/grok signature: the adapter
+/// loses the tool's completion and the prompt hangs) suppressed the advisory
+/// for the whole 30-minute idle window, so the FE showed a bare "Thinking"
+/// for the entire hang. 15 minutes sits well above legitimate long tool runs
+/// (the daemon's own `host.exec` cap is 10 minutes; agent harness shell
+/// tools cap at or below that) while still surfacing the hang midway through
+/// the idle window, and keeps the ordering stall < silent-tail-suspect <
+/// open-tool ceiling < terminal stall < open-tool terminal < 30-minute idle
+/// timeout. Advisory only — the open-tool terminal decision is
+/// [`open_tool_call_terminal_ms`]. Overridable via
+/// `INTENTD_OPEN_TOOL_CALL_STALL_MS` (test seam).
+pub(crate) fn open_tool_call_stall_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_OPEN_TOOL_CALL_STALL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    15 * 60 * 1000
+}
+
+/// Terminal provider-stall threshold (intent-hq/intent#5395): once a turn has
+/// gone this many ms with zero `session/update` traffic AND no recorded tool
+/// call open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn
+/// with [`AcpError::ProviderStall`] — a distinct terminal error naming the
+/// stall — and raises a blocker-style attention request on the agent (the
+/// intent-hq/intent#5419 shape), instead of leaving the silence to the
+/// 30-minute idle timeout's warn-and-continue redrive. A provider that is
+/// neither streaming nor running a tool for this long is hung; silence under
+/// an open tool call gets the longer [`open_tool_call_terminal_ms`] budget
+/// instead. 20 minutes is 4× the advisory threshold and 2.5× the #2669
+/// silent-tail suspicion window — past any observed healthy tool-free
+/// inference tail — and below the 30-minute idle timeout so it is reachable.
+/// Overridable via `INTENTD_PROVIDER_STALL_TERMINAL_MS` (test seam).
+pub(crate) fn provider_stall_terminal_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_PROVIDER_STALL_TERMINAL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    20 * 60 * 1000
+}
+
+/// Terminal provider-stall threshold for silence UNDER an open tool call
+/// (intent-hq/intent#5395): once a turn has gone this many ms with zero
+/// `session/update` traffic of any kind while ≥1 recorded tool call is still
+/// open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn with
+/// [`AcpError::ProviderStall`] naming the hung call and raises the same
+/// blocker-style attention request as the tool-free case. This is the exact
+/// reported signature: the adapter loses the terminal `tool_call_update`
+/// across an event-stream reconnect and the prompt hangs on an open call
+/// forever. Silence means NO update at all — any `tool_call_update` chunk or
+/// content resets the clock, so a legitimately long tool that emits anything
+/// is never killed; a tool call that is completely silent for 25 minutes is
+/// treated as hung (the daemon's own `host.exec` caps at 10 minutes, agent
+/// harness shell tools at or below that). 25 minutes sits above the 15-minute
+/// open-tool advisory and the 20-minute tool-free terminal threshold, and
+/// below the 30-minute idle timeout so it is reachable. Overridable via
+/// `INTENTD_OPEN_TOOL_CALL_TERMINAL_MS` (test seam).
+pub(crate) fn open_tool_call_terminal_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    25 * 60 * 1000
 }
 
 /// Per-agent consecutive suspected-truncation auto-redrive counter
@@ -1939,28 +2038,35 @@ impl Services {
     ///
     /// Callers are exactly the three teardown paths (keep-alive interrupt,
     /// hard stop, graceful shutdown), which pin immediately BEFORE aborting
-    /// the worker and flush AFTER it. Deliberately returns NOTHING (monorepo#2110):
-    /// the flush re-reads the slot — which the pin guarantees is still there,
-    /// against both the [`LiveTurnGuard`] drop and a normal turn end (see
-    /// [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn)) — so a
-    /// `session/update` processed in the pin→abort gap is persisted rather than
-    /// trimmed off a stale pre-abort clone. A no-op when no turn is in flight;
-    /// the flush's `None` says so on its own. Pinning is idempotent and never
-    /// outlives the turn: the next turn's [`begin_live_turn`](Self::begin_live_turn)
-    /// replaces the slot wholesale.
-    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) {
-        if let Ok(mut slots) = self.live_turns.lock() {
-            if let Some(slot) = slots.get_mut(agent_id) {
-                slot.flush_pending = true;
-                // A fresh pin means a fresh flush attempt is in flight, so an
-                // earlier give-up no longer describes this slot: re-pinning a
-                // slot a previous flush abandoned (a later teardown, e.g.
-                // shutdown, reaching the same stranded content) gives it a real
-                // second chance at persisting, and must not leave it looking
-                // abandoned to `try_begin` in the meantime.
-                slot.flush_failed = false;
-            }
-        }
+    /// the worker and flush AFTER it. Deliberately returns no slot CONTENT
+    /// (monorepo#2110): the flush re-reads the slot — which the pin guarantees
+    /// is still there, against both the [`LiveTurnGuard`] drop and a normal
+    /// turn end (see [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn))
+    /// — so a `session/update` processed in the pin→abort gap is persisted
+    /// rather than trimmed off a stale pre-abort clone. Returns whether a slot
+    /// was there to pin: `false` means no turn is in flight at this instant
+    /// (the flush's `None` then agrees), which is the ONE read a caller may
+    /// base an "is there a turn to cut short?" decision on — an unpinned
+    /// `live_turn` snapshot taken before an await can be cleared by a normal
+    /// turn end in that await (intent-hq/intent#5380). Pinning is idempotent
+    /// and never outlives the turn: the next turn's
+    /// [`begin_live_turn`](Self::begin_live_turn) replaces the slot wholesale.
+    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) -> bool {
+        let Ok(mut slots) = self.live_turns.lock() else {
+            return false;
+        };
+        let Some(slot) = slots.get_mut(agent_id) else {
+            return false;
+        };
+        slot.flush_pending = true;
+        // A fresh pin means a fresh flush attempt is in flight, so an
+        // earlier give-up no longer describes this slot: re-pinning a
+        // slot a previous flush abandoned (a later teardown, e.g.
+        // shutdown, reaching the same stranded content) gives it a real
+        // second chance at persisting, and must not leave it looking
+        // abandoned to `try_begin` in the meantime.
+        slot.flush_failed = false;
+        true
     }
 
     /// Read just the text of the live-turn slot's `type: "text"` blocks
@@ -2869,27 +2975,75 @@ impl Services {
         // client-served handler may have side-effected on behalf of this
         // turn, so the attempt is no longer provably idempotent.
         let client_request_watermark = conn.client_request_seq();
+        // Post-output transient fetch failure (intent-hq/intent#5419): the
+        // attempt failed with a transient-shaped provider fetch error AFTER
+        // it streamed output or side-effected, so the #3007 in-place retry is
+        // off the table and the error falls through to terminal
+        // classification. Recorded here so the terminal path below can raise
+        // a blocker-style attention request on the dying agent — the death
+        // is otherwise discovered only later by a delegation-group watch or a
+        // coordinator reading the log. Deliberately NOT a redrive: whether a
+        // redrive is safe after partial output is not yet known. Carries the
+        // number of `session/prompt` dispatches actually made (the failing
+        // attempt's ordinal), captured at each fall-through site because
+        // `fetch_retry_attempt` is bumped BEFORE the backoff and so overcounts
+        // on the abandon-during-backoff path — plus which guard tripped
+        // (streamed output vs. a side-effecting client request), so the
+        // user-visible reason names the actual cause.
+        let mut post_output_transient_fetch_failure: Option<(u32, &'static str)> = None;
+        let retry_guard_cause = |any_update_received: bool| -> &'static str {
+            if any_update_received {
+                "streamed output"
+            } else {
+                "a side-effecting client request"
+            }
+        };
         // Mid-turn stall detection (intent-hq/monorepo#3402): a timer arm in
         // the select loop below samples `activity.idle_ms()` on a fraction of
-        // the stall threshold (clamped to 15s at the 5-minute default) and
+        // the smallest stall threshold (clamped to 15s at the defaults) and
         // emits ONE advisory `stalled` status event once the silence crosses
         // [`stream_stall_ms`].
         // The next received `session/update` emits `resumed` and re-arms the
         // detector, so a later second stall in the same turn reports again.
-        // Advisory only: turn resolution is untouched (the 30-minute prompt
-        // idle timeout stays the terminal backstop).
+        // The advisory itself never resolves the turn.
         //
         // Tool-call-aware (intent-hq/monorepo#3466): while ≥1 recorded tool
         // call is still open (`transcript.open_tool_call_count() > 0`), the
-        // arm emits nothing regardless of silence duration — long tool runs
-        // (builds, test suites) are legitimately silent between `tool_call`
-        // and the terminal `tool_call_update`. Once the last open call
-        // resolves, the standard threshold applies to subsequent silence
-        // (`activity` was touched by the resolving update, so the window
-        // restarts from that point). Hung tools stay covered by the
-        // 30-minute prompt idle timeout.
+        // advisory threshold is [`open_tool_call_stall_ms`] instead — long
+        // tool runs (builds, test suites) are legitimately silent between
+        // `tool_call` and the terminal `tool_call_update`, but not
+        // indefinitely (intent-hq/intent#5395: a `tool_call` whose completion
+        // the adapter lost used to suppress the advisory for the whole idle
+        // window). Once the last open call resolves, the standard threshold
+        // applies to subsequent silence (`activity` was touched by the
+        // resolving update, so the window restarts from that point).
+        //
+        // Terminal provider stall (intent-hq/intent#5395): silence past
+        // [`provider_stall_terminal_ms`] with NO tool call open — or past the
+        // longer [`open_tool_call_terminal_ms`] WITH a tool call open (the
+        // reported opencode/grok signature: the tool's completion was lost
+        // and the call hangs open forever) — ends the attempt with
+        // `AcpError::ProviderStall`. Silence is zero `session/update` traffic
+        // of any kind, so a long tool that keeps emitting `tool_call_update`
+        // chunks resets the clock and is never killed. Breaking out drops
+        // `prompt_fut` (its pending-map entry is cleaned by the transport's
+        // drop guard, exactly like the idle-timeout early return in
+        // `session::prompt`); the error then takes the ordinary terminal
+        // path below (Error status, `agent:failed`, blocker attention raise)
+        // and the worker's `handle_terminal_turn_failure` tears the hung
+        // child down so a retry spawns fresh.
         let stall_threshold_ms = stream_stall_ms();
-        let stall_check = Duration::from_millis((stall_threshold_ms / 6).clamp(10, 15_000));
+        let open_tool_stall_ms = open_tool_call_stall_ms();
+        let stall_terminal_ms = provider_stall_terminal_ms();
+        let open_tool_terminal_ms = open_tool_call_terminal_ms();
+        let stall_check = Duration::from_millis(
+            (stall_threshold_ms
+                .min(open_tool_stall_ms)
+                .min(stall_terminal_ms)
+                .min(open_tool_terminal_ms)
+                / 6)
+            .clamp(10, 15_000),
+        );
         let mut stall_emitted = false;
         let result = loop {
             let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
@@ -2909,17 +3063,43 @@ impl Services {
                         }
                         None => closed = true,
                     },
-                    () = tokio::time::sleep(stall_check), if !stall_emitted => {
+                    () = tokio::time::sleep(stall_check) => {
                         let silent_ms = activity.idle_ms();
-                        if silent_ms >= stall_threshold_ms && transcript.open_tool_call_count() == 0 {
+                        let tool_call_open = transcript.open_tool_call_count() > 0;
+                        let advisory_threshold_ms = if tool_call_open {
+                            open_tool_stall_ms
+                        } else {
+                            stall_threshold_ms
+                        };
+                        if !stall_emitted && silent_ms >= advisory_threshold_ms {
                             stall_emitted = true;
                             tracing::warn!(
                                 agent = %agent_id,
                                 silent_ms,
+                                tool_call_open,
                                 "mid-turn stream stall — no session/update past threshold (monorepo#3402)"
                             );
                             self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
                                 .await;
+                        }
+                        let terminal_ms = if tool_call_open {
+                            open_tool_terminal_ms
+                        } else {
+                            stall_terminal_ms
+                        };
+                        if silent_ms >= terminal_ms {
+                            let open_tool_call = transcript.open_tool_call_label();
+                            tracing::warn!(
+                                agent = %agent_id,
+                                silent_ms,
+                                terminal_ms,
+                                open_tool_call = open_tool_call.as_deref().unwrap_or("none"),
+                                "provider stall — no session/update past the terminal threshold; failing the turn (intent#5395)"
+                            );
+                            break Err(AcpError::ProviderStall {
+                                silent: Duration::from_millis(silent_ms),
+                                open_tool_call,
+                            });
                         }
                     }
                 }
@@ -2984,8 +3164,24 @@ impl Services {
                             attempt = fetch_retry_attempt,
                             "output arrived during retry backoff — abandoning retry (monorepo#3007)"
                         );
+                        // `fetch_retry_attempt` was already bumped for the
+                        // retry that is now abandoned: the failing attempt is
+                        // the one dispatched BEFORE that bump.
+                        post_output_transient_fetch_failure =
+                            Some((fetch_retry_attempt, retry_guard_cause(any_update_received)));
                         break attempt_result;
                     }
+                }
+                Err(e)
+                    if (any_update_received
+                        || conn.client_request_seq() != client_request_watermark)
+                        && intent_acp::is_transient_provider_fetch_failure(e) =>
+                {
+                    post_output_transient_fetch_failure = Some((
+                        fetch_retry_attempt + 1,
+                        retry_guard_cause(any_update_received),
+                    ));
+                    break attempt_result;
                 }
                 _ => break attempt_result,
             }
@@ -3376,7 +3572,7 @@ impl Services {
                 .lock()
                 .ok()
                 .and_then(|mut chain| chain.remove(agent_id));
-            let handle = tokio::spawn(async move {
+            let handle = intent_core::spawn_daemon(async move {
                 if let Some(prev) = prev {
                     let _ = prev.await;
                 }
@@ -3429,6 +3625,109 @@ impl Services {
                 chain.insert(agent_id.clone(), handle);
             }
         }
+        // Post-output transient fetch failure (intent-hq/intent#5419): the
+        // turn is about to fail terminally exactly as today (Error status,
+        // `agent:failed`, no redrive), but the death would otherwise only be
+        // discovered later by a delegation-group watch or a coordinator
+        // reading the log. Raise a blocker-style attention request on the
+        // dying agent through the SAME shared op `ws.agent.reportBlocker`
+        // uses — pending fields persisted on the session, linked task →
+        // `blocked`, immediate parent + watcher wakes — so whoever is waiting
+        // on the agent hears about it at once. Placed AFTER the assistant-row
+        // persist so the transcript notice lands after the streamed partial,
+        // and BEFORE the terminal persist/emits below: the agent is busy
+        // here, so the op parks the user-facing surfacing on the deferred
+        // registry and the `Err` arm's `flush_deferred_attention` surfaces it
+        // ahead of `agent:failed`. The attention columns are written by the
+        // narrow `set_attention_request` writer (not the full-row update the
+        // terminal persist uses), so the two writes cannot clobber each
+        // other; `park_attention_write` guards only the workspace-level
+        // `raise_attention` flag, which this path never touches. Best-effort:
+        // a failed raise logs and the terminal path proceeds unchanged.
+        if let Some((attempts, cause)) = post_output_transient_fetch_failure {
+            if let Err(e) = &result {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    attempts,
+                    cause,
+                    "transient provider fetch failure after output/side effect — not retrying in place; attention raised (monorepo#5419)"
+                );
+                let reason = format!(
+                    "Turn failed with a transient provider fetch failure after {cause} \
+                     (attempt {attempts} of {}; error class: transient provider fetch failure). \
+                     The in-place retry only applies to attempts with no streamed output and no \
+                     side-effecting client request, so the turn was not retried and the agent is \
+                     stopping with status error. Provider error: {e}",
+                    MAX_TRANSIENT_PROMPT_FETCH_RETRIES + 1
+                );
+                if let Err(raise_err) = self
+                    .agent_request_attention_op(
+                        workspace_id.clone(),
+                        "blocker".to_string(),
+                        reason,
+                        Some(agent_id.clone()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %raise_err,
+                        "failed to raise attention for the post-output transient fetch failure (monorepo#5419)"
+                    );
+                }
+            }
+        }
+        // Terminal provider stall (intent-hq/intent#5395): the select loop
+        // above ended the attempt because the provider went silent past
+        // [`provider_stall_terminal_ms`] with no tool call in flight, or past
+        // [`open_tool_call_terminal_ms`] with a tool call hung open. Same
+        // terminal path and same blocker-style attention raise as the #5419
+        // block above (ordering, deferred flush, and best-effort semantics
+        // identical), so the parent / watchers / user learn about the hang at
+        // once instead of after an hour of "Thinking".
+        if let Err(AcpError::ProviderStall {
+            silent,
+            open_tool_call,
+        }) = &result
+        {
+            let reason = match open_tool_call {
+                Some(label) => format!(
+                    "Turn ended after a provider stall: no session/update from the provider for \
+                     {silent:?} with tool call {label} still open (open-tool terminal threshold \
+                     {:?}; error class: provider stall). The tool call never reported completion \
+                     and emitted nothing for the whole window, so the turn was failed instead of \
+                     waiting for the idle timeout; the agent is stopping with status error and its \
+                     provider process is restarted on the next turn. Retry the turn to continue.",
+                    Duration::from_millis(open_tool_terminal_ms),
+                ),
+                None => format!(
+                    "Turn ended after a provider stall: no session/update from the provider for \
+                     {silent:?} with no tool call in flight (terminal threshold {:?}; error class: \
+                     provider stall). The provider is neither streaming nor running a tool, so the \
+                     turn was failed instead of waiting for the idle timeout; the agent is stopping \
+                     with status error and its provider process is restarted on the next turn. Retry \
+                     the turn to continue.",
+                    Duration::from_millis(stall_terminal_ms),
+                ),
+            };
+            if let Err(raise_err) = self
+                .agent_request_attention_op(
+                    workspace_id.clone(),
+                    "blocker".to_string(),
+                    reason,
+                    Some(agent_id.clone()),
+                )
+                .await
+            {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %raise_err,
+                    "failed to raise attention for the provider stall (intent#5395)"
+                );
+            }
+        }
+
         // Durable-before-observable for the streaming terminal-failure path
         // (monorepo#2050): an ordinary mid-turn `session/prompt failed:` error
         // is terminal, and this function emits its own terminal
@@ -3670,6 +3969,12 @@ impl Services {
                 if let Ok(session) = self.store.get_agent_session(agent_id).await {
                     data["agentName"] = Value::String(session.name);
                     data["isBackground"] = Value::Bool(session.is_background);
+                    // Mute hint: present only when true (absent ≠ false, like
+                    // `workspaceArchived`) so notification clients stay quiet
+                    // for a muted agent without a follow-up read.
+                    if session.notifications_muted {
+                        data["notificationsMuted"] = Value::Bool(true);
+                    }
                     if let Some(report) = session.completion_report {
                         data["completionReport"] = Value::String(report.clone());
                         data["report"] = Value::String(report);
@@ -3898,7 +4203,7 @@ impl Services {
                 // against a racing wake sweep / `resolveInterrupted`.
                 let services = self.clone();
                 let debounce = wake_resume_self_heal_debounce();
-                tokio::spawn(async move {
+                intent_core::spawn_daemon(async move {
                     tokio::time::sleep(debounce).await;
                     services.resume_suspend_interrupted_agents().await;
                 });
@@ -4298,6 +4603,9 @@ impl Services {
         if let Ok(session) = self.store.get_agent_session(agent_id).await {
             data["agentName"] = Value::String(session.name);
             data["isBackground"] = Value::Bool(session.is_background);
+            if session.notifications_muted {
+                data["notificationsMuted"] = Value::Bool(true);
+            }
             if let Some(report) = session.completion_report {
                 data["completionReport"] = Value::String(report.clone());
                 data["report"] = Value::String(report);

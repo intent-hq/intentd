@@ -16,11 +16,11 @@ use intent_core::events::{
     AGENT_QUEUE_UPDATED, AGENT_UPDATED,
 };
 use intent_core::{
-    now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ConversationProjection, Error, Event, EventActor, MessageOrigin, NoteId, PullRequestInfo,
-    PullRequestStatus, Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId,
-    MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED,
+    now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentListRowScope, AgentLite,
+    AgentMessage, AgentScopeCounts, AgentSession, AgentStatus, AgentWakeCreateOptions,
+    AgentWakeOrCreateInput, ConversationProjection, Error, Event, EventActor, MessageOrigin,
+    NoteId, PullRequestInfo, PullRequestStatus, Result, SessionStats, TaskStatus, WorkspaceApi,
+    WorkspaceId, MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED,
     SLIM_PAGE_BUDGET_BYTES,
 };
 use intent_sourcecontrol::RepoRef;
@@ -75,7 +75,7 @@ use uuid::Uuid;
 use crate::Services;
 
 /// Row scope selecting which sessions an `agent.list` read serves (§5.5).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum AgentListScope {
     /// Default read: active (not soft-retired) sessions only.
     Active,
@@ -83,6 +83,9 @@ enum AgentListScope {
     All,
     /// `retiredOnly: true`: soft-retired sessions only.
     RetiredOnly,
+    /// `scope: "topLevel" | "delegated" | "background"`: one bin of the
+    /// active sessions ([`AgentListRowScope`]).
+    Scoped(AgentListRowScope),
 }
 
 /// "Running a turn" statuses for the retire guard (§5.5, confirmed
@@ -1206,13 +1209,17 @@ impl QueuedMessage {
     /// `event_notification` payload) — entries without it keep the legacy shape.
     /// `turnId` is only present when set (monorepo#1022: correlation id stable
     /// across requeues; entries rehydrated from legacy payloads always have one
-    /// backfilled).
+    /// backfilled). `author` is ALWAYS present: `null` here, overwritten with
+    /// the resolved projection by
+    /// [`crate::principal_ops::MessageAuthorResolver::attach_queue`] on the
+    /// surfaces that resolve it — a consumer never sees the key absent.
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
             "content": self.content,
             "queuedAt": self.queued_at,
             "position": position,
+            "author": Value::Null,
         });
         if !self.turn_id.is_empty() {
             v["turnId"] = Value::String(self.turn_id.clone());
@@ -2583,7 +2590,11 @@ impl Services {
         let Some(manager) = self.agent_manager() else {
             return Ok(json!({ "streams": [] }));
         };
-        let busy = manager.list_busy();
+        let mut busy = manager.list_busy();
+        // Cross-workspace surface: a collaborator sees only member workspaces.
+        if let Some(visible) = self.visible_workspace_ids().await? {
+            busy.retain(|(_, workspace_id)| visible.contains(workspace_id));
+        }
         if busy.is_empty() {
             return Ok(json!({ "streams": [] }));
         }
@@ -2640,14 +2651,21 @@ impl Services {
     /// capped rather than omitted) are bounded per row to the render-sized
     /// [`intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES`]
     /// ([`AgentLite::cap_list_previews`]); the detail reads keep full values.
-    /// Together these keep a ~250-session response well under the 1 MiB
-    /// outbound frame warn threshold.
+    /// The detail-only fields (`harnessFeatures`, `effortLevels`,
+    /// `contextReferences`, `fileBlocks`, `stats`,
+    /// `metadata.pendingProposals`, `metadata.proposalResolutions` — read only
+    /// by the open agent's UI, intent-hq/intent#5383) are stripped from list
+    /// rows ([`AgentLite::strip_detail_only_fields`]) and served by
+    /// `agent.get` / `agent.getSession` only. Together these keep a
+    /// ~250-session response well under the 1 MiB outbound frame warn
+    /// threshold; the row-budget / key-allowlist goldens in `tests.rs` pin
+    /// the resulting shape.
     ///
-    /// Deliberate asymmetry: the agent channel's seq-0 snapshot goes through
-    /// this op (capped rows), while per-agent deltas re-read via `agent.get`
-    /// (full values) — the bound is a property of list-shaped reads, not a
-    /// channel invariant. Delta frames are single-agent, so the size goal
-    /// holds.
+    /// The agent channel's seq-0 snapshot goes through this op (capped,
+    /// stripped rows); its per-agent deltas re-read via `agent.get` and the
+    /// transport applies the same strip + cap pass before push
+    /// (`intent_transport::subscriptions::agent_delta`), so pushed rows
+    /// satisfy the same allowlist and row budget as list rows.
     ///
     /// Soft retire: the default read excludes retired sessions (SQL-side
     /// `retired_at IS NULL` filter — cost stays O(rows returned)); the wire
@@ -2693,12 +2711,41 @@ impl Services {
         self.store.count_retired_agent_sessions(&workspace_id).await
     }
 
+    /// `agent.list` with `scope: "topLevel" | "delegated" | "background"`
+    /// (PROTOCOL §5.5): ONLY the non-retired sessions in that bin (a
+    /// `delegated` read optionally narrowed to one parent's direct
+    /// sub-agents). SQL-side predicate on both the summary read AND the
+    /// message-projection aggregate ([`intent_store::Store::
+    /// list_scoped_agent_session_summaries`]), so cost stays O(rows returned)
+    /// and the active-only projection cache is bypassed — a scoped read never
+    /// loads the full workspace's projections.
+    pub(crate) async fn agent_list_scoped_op(
+        &self,
+        workspace_id: WorkspaceId,
+        scope: AgentListRowScope,
+    ) -> Result<Vec<AgentLite>> {
+        self.agent_list_impl(workspace_id, AgentListScope::Scoped(scope))
+            .await
+    }
+
+    /// `scopeCounts` (PROTOCOL §5.5): per-bin counts of the workspace's
+    /// non-retired sessions — one grouped SQL aggregate attached to every
+    /// `agent.list` response variant by the router.
+    pub(crate) async fn agent_scope_counts_op(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<AgentScopeCounts> {
+        self.store
+            .count_agent_sessions_by_scope(&workspace_id)
+            .await
+    }
+
     async fn agent_list_impl(
         &self,
         workspace_id: WorkspaceId,
         scope: AgentListScope,
     ) -> Result<Vec<AgentLite>> {
-        let sessions = match scope {
+        let sessions = match &scope {
             AgentListScope::All => {
                 self.store
                     .list_agent_session_summaries(&workspace_id)
@@ -2714,6 +2761,11 @@ impl Services {
                     .list_retired_agent_session_summaries(&workspace_id)
                     .await?
             }
+            AgentListScope::Scoped(row_scope) => {
+                self.store
+                    .list_scoped_agent_session_summaries(&workspace_id, row_scope)
+                    .await?
+            }
         };
         // Message projections are the expensive half (full-workspace COUNT
         // aggregate + preview columns). Each scope loads a projection set
@@ -2723,8 +2775,9 @@ impl Services {
         // create/delete); `retiredOnly` loads the retired-only SQL variant
         // directly (never the full-workspace superset); `includeRetired`
         // loads the full set directly, bypassing the cache in both
-        // directions.
-        let mut projections = match scope {
+        // directions; a `scope` read loads its bin's SQL variant directly
+        // (never the active-only superset).
+        let mut projections = match &scope {
             AgentListScope::Active => {
                 self.agent_list_cache
                     .get_or_load(&self.store, &workspace_id)
@@ -2738,6 +2791,11 @@ impl Services {
             AgentListScope::All => {
                 self.store
                     .get_agent_session_message_projections(&workspace_id)
+                    .await?
+            }
+            AgentListScope::Scoped(row_scope) => {
+                self.store
+                    .get_scoped_agent_session_message_projections(&workspace_id, row_scope)
                     .await?
             }
         };
@@ -2768,10 +2826,12 @@ impl Services {
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
                 lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
-                // List-payload cost contract: bound the render-preview
-                // fields per row (see the doc comment above); the detail
-                // reads keep full values. Applied AFTER the runtime overlay
-                // so live-turn preview text is capped like persisted text.
+                // List-payload cost contract: drop the detail-only fields
+                // and bound the render-preview fields per row (see the doc
+                // comment above); the detail reads keep full values.
+                // Applied AFTER the runtime overlay so live-turn preview
+                // text is capped like persisted text.
+                lite.strip_detail_only_fields();
                 lite.cap_list_previews();
                 lite
             })
@@ -3287,6 +3347,17 @@ impl Services {
         };
         let mut page: Vec<AgentMessage> =
             raw_page.into_iter().map(project_served_message).collect();
+        // Serve-time author projection (multiplayer w2): every user row gets
+        // `author` resolved from its `fromPrincipalId` stamp, else the
+        // workspace's legacy author, else its owner — the one projection
+        // `chat.subscribe` snapshots share. Bounded by the distinct authors
+        // on the page (RPC cost contract), never stored. Attached on the
+        // typed page BEFORE the slim byte budget below, so the profile
+        // strings count toward `SLIM_PAGE_BUDGET_BYTES` instead of landing on
+        // top of an already-at-budget page.
+        crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
+            .attach_typed(&mut page)
+            .await;
         if projection == Some(ConversationProjection::Slim) {
             // One bounded thumbnails read sized by the page (RPC cost
             // contract: O(rows returned); the common all-text page selects
@@ -3363,6 +3434,7 @@ impl Services {
                         content: Value::Array(live.blocks),
                         metadata: None,
                         app_message_id: None,
+                        author: None,
                         created_at: live.last_activity_at.clone(),
                     };
                     let mut row = project_served_message(row);
@@ -3521,6 +3593,7 @@ impl Services {
                     content: Value::Array(live.blocks),
                     metadata: None,
                     app_message_id: None,
+                    author: None,
                     created_at: live.last_activity_at,
                 },
                 None => {
@@ -3641,18 +3714,28 @@ impl Services {
         message: &AgentMessage,
         turn_id: Option<&str>,
     ) {
-        self.publish_agent_mutation_event(
-            workspace_id,
-            agent_id,
-            AGENT_MESSAGE,
-            agent_message_event_payload(agent_id, message, turn_id),
-        )
-        .await;
+        let mut payload = agent_message_event_payload(agent_id, message, turn_id);
+        let mut last_payload = agent_last_message_event_payload(agent_id, message, turn_id);
+        // Serve-time author (multiplayer w2): a user-row echo carries the
+        // same `author` projection `agent.getConversation` serves, so live
+        // subscribers render the sender without a follow-up read.
+        if message.role == "user" {
+            if let Some(author) =
+                crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
+                    .resolve(message.metadata.as_ref())
+                    .await
+            {
+                payload["author"] = author.clone();
+                last_payload["author"] = author;
+            }
+        }
+        self.publish_agent_mutation_event(workspace_id, agent_id, AGENT_MESSAGE, payload)
+            .await;
         self.publish_agent_mutation_event(
             workspace_id,
             agent_id,
             intent_core::events::AGENT_LAST_MESSAGE,
-            agent_last_message_event_payload(agent_id, message, turn_id),
+            last_payload,
         )
         .await;
     }
@@ -4398,6 +4481,7 @@ impl Services {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),
@@ -4790,7 +4874,7 @@ impl Services {
         if let Some(existing) =
             self.pending_agent_deletes
                 .schedule(key, delete_at.clone(), move |generation| {
-                    tokio::spawn(async move {
+                    intent_core::spawn_daemon(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         // Claim-or-abstain: only the timer that still owns the
                         // entry commits. A cancel or an immediate delete that
@@ -5193,6 +5277,12 @@ impl Services {
         if session.harness_features.is_none() {
             session.harness_features = self.current_agent_features_snapshot();
         }
+        // Serve-time author projection (multiplayer w2) on the typed
+        // transcript — the same shim `agent.getConversation` applies, so a
+        // client hydrating through either route sees one attribution shape.
+        crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
+            .attach_typed(&mut session.messages)
+            .await;
         Ok(session)
     }
 
@@ -5210,6 +5300,7 @@ impl Services {
         };
         let mut session = self.store.get_agent_session(&agent_id).await?;
         let prior_model = session.model.clone();
+        let prior_muted = session.notifications_muted;
         let allowed = [
             "status",
             "isActive",
@@ -5232,6 +5323,7 @@ impl Services {
             "imageBlocks",
             "fileBlocks",
             "isBackground",
+            "notificationsMuted",
         ];
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
@@ -5422,14 +5514,46 @@ impl Services {
                         )
                     })?;
                 }
+                "notificationsMuted" => {
+                    session.notifications_muted = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams(
+                            "agent.update: `notificationsMuted` must be a boolean".to_string(),
+                        )
+                    })?;
+                }
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
         session.updated_at = now_iso();
         let workspace_id = session.workspace_id.clone();
+        // Muting drops the session out of the workspace unread derivation
+        // (§5.1), so snapshot the unread state BEFORE the write — the
+        // post-write settle below needs it (same contract as `agent.retire`
+        // / `agent.markSeen`).
+        let mute_changed = session.notifications_muted != prior_muted;
+        let unread_before = if mute_changed && session.notifications_muted {
+            Some(self.snapshot_workspace_unread(&workspace_id).await)
+        } else {
+            None
+        };
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
+        // `notifications_muted` is excluded from the full-row write above
+        // (its only post-insert mutator is this scoped UPDATE), so a
+        // concurrent `agent.update` on unrelated fields — or a long-lived
+        // in-memory session persisted at turn end — can never revert the
+        // user's toggle. Same-value writes are a store-level no-op.
+        if obj.contains_key("notificationsMuted") {
+            self.store
+                .set_agent_notifications_muted(
+                    &workspace_id,
+                    &agent_id,
+                    session.notifications_muted,
+                    &session.updated_at,
+                )
+                .await?;
+        }
         // The stored model changed, so any persisted display resolution now
         // names the wrong model — clear it, same anti-staleness contract as
         // `agent.setModel` (the next session open re-resolves). Best-effort:
@@ -5460,12 +5584,25 @@ impl Services {
             Value::Object(event_data),
         )
         .await;
-        // `status` / `isBackground` feed the needs_attention derivation (a
-        // deleted or background session's pending request/question no longer
-        // counts): recompute-and-compare (§6.5 step 0); other fields skip the
-        // probe entirely.
-        if obj.contains_key("status") || obj.contains_key("isBackground") {
+        // `status` / `isBackground` / `notificationsMuted` feed the
+        // needs_attention derivation (a deleted, background, or muted
+        // session's pending request/question/error no longer counts):
+        // recompute-and-compare (§6.5 step 0); other fields skip the probe
+        // entirely.
+        if obj.contains_key("status") || obj.contains_key("isBackground") || mute_changed {
             self.maybe_emit_display_status_changed(&workspace_id).await;
+        }
+        // A muted session no longer counts toward the workspace's derived
+        // `unread`, so settle the stored flag exactly as the last seen-marker
+        // advance would: when this was the last unread top-level session,
+        // clear the stored `unread` and emit ONE `workspace:attention-changed
+        // { none }` (`review_required` untouched; a still-unread workspace
+        // stays silent). Unmuting writes nothing at the workspace level — an
+        // unmuted session with an unseen assistant tail re-derives `unread`
+        // on the next read (the `agent.restore` precedent).
+        if let Some(before) = unread_before {
+            self.settle_workspace_unread_after_seen(&workspace_id, before)
+                .await;
         }
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
@@ -6021,19 +6158,33 @@ impl Services {
     /// `agent.getQueue` (PROTOCOL §5.5). When `workspace_id` is supplied the
     /// callee verifies the session belongs to that workspace (defense-in-depth
     /// against a bare `agentId` probe across workspaces); a mismatch surfaces
-    /// as `NotFound`.
+    /// as `NotFound`. Entries carry the resolved `author` projection
+    /// ([`crate::principal_ops::MessageAuthorResolver::attach_queue`]) — the
+    /// same shape and resolution order as `agent.getConversation` user rows.
+    /// The key is present on every row regardless: when the unscoped read
+    /// finds no session to resolve against, entries keep the `null` default
+    /// from [`QueuedMessage::to_value`].
     pub(crate) async fn agent_get_queue_op(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
+        let owning_ws = match self.store.get_agent_session_summary(&agent_id).await {
+            Ok(session) => Some(session.workspace_id),
+            Err(e) if workspace_id.is_some() => return Err(e),
+            Err(_) => None,
+        };
         if let Some(ws) = workspace_id.as_ref() {
-            let session = self.store.get_agent_session(&agent_id).await?;
-            if session.workspace_id != *ws {
+            if owning_ws.as_ref() != Some(ws) {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let queue = self.queue_snapshot(&agent_id);
+        let mut queue = self.queue_snapshot(&agent_id);
+        if let Some(ws) = owning_ws.as_ref() {
+            crate::principal_ops::MessageAuthorResolver::new(self, ws)
+                .attach_queue(&mut queue)
+                .await;
+        }
         Ok(json!({ "success": true, "queue": queue }))
     }
 
@@ -6060,6 +6211,17 @@ impl Services {
         content: String,
         editing: Option<bool>,
     ) -> Result<Value> {
+        // Principal stamp (multiplayer w2): an edit by a wire caller makes
+        // the editor the author of a human-authored entry; an agent /
+        // daemon edit leaves the original stamp alone. Human authorship is
+        // the entry's principal stamp (or a user-origin lifecycle) — NOT
+        // `user_origin` alone: a human wake parked by `deliver_wake_message`
+        // and a direct send that fell into the append-failure auto-queue are
+        // both enqueued as `Automatic` yet carry the author's stamp.
+        let restamp = matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Wire { .. })
+        );
         let (edited, was_editing, now_editing) = {
             let mut guard = self
                 .agent_queues
@@ -6073,7 +6235,27 @@ impl Services {
                 .position(|m| m.id == message_id)
                 .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
             let was = queue[position].editing;
+            let human_authored = queue[position].user_origin
+                || crate::principal_ops::carries_principal_stamp(
+                    queue[position].message_metadata.as_ref(),
+                );
+            // The restamp is the one fallible step (a durable pre-attribution
+            // entry may carry scalar metadata, which the stamp rejects), so
+            // it is computed on a copy BEFORE anything on the entry moves: a
+            // rejected edit leaves content and metadata exactly as they were
+            // instead of a mutated entry that never published and that a
+            // later queue write would persist.
+            let restamped = if restamp && human_authored {
+                Some(crate::principal_ops::stamp_principal_attribution(
+                    queue[position].message_metadata.clone(),
+                )?)
+            } else {
+                None
+            };
             queue[position].content = content;
+            if let Some(metadata) = restamped {
+                queue[position].message_metadata = metadata;
+            }
             if let Some(flag) = editing {
                 queue[position].editing = flag;
             }
@@ -8384,24 +8566,20 @@ impl Services {
         // Everything below this branch (linked-task transition, parent wake,
         // watcher fan-out) stays immediate either way — backend coordination
         // must not wait for the child's turn to end.
+        let raise = crate::DeferredAttention {
+            meta_kind,
+            reason: reason.clone(),
+            saved_at: saved_at.clone(),
+            attention_data: attention_data.clone(),
+        };
         if self.agent_is_busy(caller.clone()) {
-            self.mark_deferred_attention(
-                &caller,
-                crate::DeferredAttention {
-                    meta_kind,
-                    reason: reason.clone(),
-                    saved_at: saved_at.clone(),
-                    attention_data: attention_data.clone(),
-                },
-            );
+            self.mark_deferred_attention(&caller, raise);
         } else {
             self.surface_attention_request(
                 &workspace_id,
                 &caller,
-                meta_kind,
-                &reason,
-                &saved_at,
-                &attention_data,
+                &raise,
+                session.notifications_muted,
             )
             .await;
         }
@@ -8552,7 +8730,10 @@ impl Services {
     ///   survives rehydration — best-effort, the session fields are the
     ///   durable contract;
     /// - the self-sufficient `agent:attention-requested` event (FE sticky
-    ///   toast);
+    ///   toast), stamped `notificationsMuted: true` (present only when true)
+    ///   when the session is muted — the stamp rides the published event
+    ///   ONLY, never the parent/watcher wake payload (the agent must not
+    ///   learn about the flag);
     /// - the debounced lastActivity schedule and the displayStatus
     ///   recompute (a pending request on a top-level agent promotes the
     ///   derived displayStatus to `needs_attention`, §6.5 step 0;
@@ -8561,16 +8742,21 @@ impl Services {
     ///
     /// Callers: the immediate arm of `agent_request_attention_op` (no
     /// in-flight turn) and [`Services::flush_deferred_attention`] (turn-end
-    /// flush of a mid-turn raise).
+    /// flush of a mid-turn raise). `raise` is the payload captured at raise
+    /// time; `notifications_muted` is the session's flag at surfacing time.
     pub(crate) async fn surface_attention_request(
         &self,
         workspace_id: &WorkspaceId,
         caller: &AgentId,
-        meta_kind: &str,
-        reason: &str,
-        saved_at: &str,
-        attention_data: &Value,
+        raise: &crate::DeferredAttention,
+        notifications_muted: bool,
     ) {
+        let crate::DeferredAttention {
+            meta_kind,
+            reason,
+            saved_at,
+            attention_data,
+        } = raise;
         let kind = attention_data
             .get("kind")
             .and_then(Value::as_str)
@@ -8609,11 +8795,15 @@ impl Services {
                 );
             }
         }
+        let mut event_data = attention_data.clone();
+        if notifications_muted {
+            event_data["notificationsMuted"] = Value::Bool(true);
+        }
         self.publish_agent_mutation_event(
             workspace_id,
             caller,
             intent_core::events::AGENT_ATTENTION_REQUESTED,
-            attention_data.clone(),
+            event_data,
         )
         .await;
         // Schedule debounced lastActivity event (§10.1).
@@ -8665,10 +8855,8 @@ impl Services {
             self.surface_attention_request(
                 workspace_id,
                 agent_id,
-                entry.meta_kind,
-                &entry.reason,
-                &entry.saved_at,
-                &entry.attention_data,
+                &entry,
+                session.notifications_muted,
             )
             .await;
         }
@@ -9113,7 +9301,7 @@ impl Services {
                         _release: settled,
                     };
                     let ws_id = workspace_id.clone();
-                    tokio::spawn(async move {
+                    intent_core::spawn_daemon(async move {
                         guard
                             .services
                             .provision_delegate_sandbox(&ws_id, &guard.aid, root)
@@ -12323,7 +12511,7 @@ impl Services {
             // Post-restart recovery: a woken agent must resume pending work.
             if !queued {
                 if let Some(mgr) = self.agent_manager() {
-                    tokio::spawn({
+                    intent_core::spawn_daemon({
                         let mgr = mgr.clone();
                         let agent_id = agent_id.clone();
                         let workspace_id = target_home_ws;
@@ -12885,7 +13073,17 @@ impl Services {
             c
         };
         let content = annotated.as_str();
-        let build_block = || match message_metadata {
+        // The `fromPrincipalId` stamp stays row-level only (parity with the
+        // drain-time `persist_user` fold).
+        let block_md = message_metadata.and_then(|md| match md {
+            Value::Object(m) => {
+                let mut m = m.clone();
+                m.remove(intent_core::FROM_PRINCIPAL_ID_KEY);
+                (!m.is_empty()).then_some(Value::Object(m))
+            }
+            other => Some(other.clone()),
+        });
+        let build_block = || match &block_md {
             Some(md) => json!({ "type": "text", "text": content, "messageMetadata": md }),
             None => json!({ "type": "text", "text": content }),
         };
@@ -13126,11 +13324,18 @@ impl Services {
         // non-goal — the worker still mints one internally at spawn).
         self.publish_agent_message_events(workspace_id, agent_id, &message, None)
             .await;
+        // The worker's options carry the same row-level metadata so a
+        // terminal spawn/turn failure requeues the wake WITH its tag and
+        // principal stamp (`agent.getQueue` / `agent:queue:*` / the retry
+        // turn keep the author); the row itself is already persisted above.
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
             workspace_id.clone(),
             content_owned,
-            crate::agent_manager::TurnOptions::default(),
+            crate::agent_manager::TurnOptions {
+                message_metadata: message_metadata.cloned(),
+                ..Default::default()
+            },
         );
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
@@ -13747,7 +13952,7 @@ impl Services {
         let services = self.clone();
         let agent = agent_id.clone();
         let mid = message_id.to_string();
-        let task = tokio::spawn(async move {
+        let task = intent_core::spawn_daemon(async move {
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
@@ -14752,9 +14957,15 @@ impl Services {
     /// arriving after the settled shrink and resurrecting a drained entry).
     /// Publication order thus equals snapshot order, so the stream of
     /// `agent:queue:updated` payloads is monotone in queue mutation order.
+    /// The `author` projection is attached under the same gate (one batched
+    /// principal read per publish, see
+    /// [`crate::principal_ops::MessageAuthorResolver::attach_queue`]).
     async fn publish_queue_event(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) {
         let _gate = self.agent_queue_publish_gate.lock().await;
-        let queue = self.queue_snapshot(agent_id);
+        let mut queue = self.queue_snapshot(agent_id);
+        crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
+            .attach_queue(&mut queue)
+            .await;
         let event = intent_store::NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),

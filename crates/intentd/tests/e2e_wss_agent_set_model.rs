@@ -188,6 +188,72 @@ where
     }
 }
 
+/// Read the live Antigravity catalog over `models.list`, tolerating a failed
+/// probe (intent-hq/intent#4971). A probe that times out or whose adapter
+/// exits is answered with the daemon's static fallback (`source: "static"`,
+/// `models: []`, `warning`) — the designed degraded response, and under
+/// package-level CPU load the fixed 4s `initialize` budget makes it a
+/// reachable one — so asserting `models[0]` on the first response races the
+/// probe and fails with an uninformative `Null`. The first read is a plain,
+/// cache-honoring read so the identity/staleness assertions callers make stay
+/// meaningful (a stale last-good list is still served as `source:
+/// "antigravity"` + `stale: true`, never as `static`); only a static fallback
+/// is re-read, with `forceRefresh` to bypass the 60s negative entry the failed
+/// probe recorded. Panics with the last response (its `warning` names the
+/// probe failure) once the budget is spent.
+async fn antigravity_catalog<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(45));
+    let mut response = wss_rpc(ws, id, "models.list", json!({"providerId":"antigravity"})).await;
+    let mut attempts = 1;
+    while response["source"] == "static" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "antigravity catalog probe kept failing after {attempts} attempts: {response}"
+        );
+        attempts += 1;
+        response = wss_rpc(
+            ws,
+            id,
+            "models.list",
+            json!({"providerId":"antigravity","forceRefresh":true}),
+        )
+        .await;
+    }
+    response
+}
+
+/// Read the live Antigravity auth verdict over `host.providerAuthStatus`
+/// (`force: true`), tolerating an inconclusive probe (intent-hq/intent#4971).
+/// The auth probe is the same one-shot ACP `initialize` against the configured
+/// executable, with the same fixed budget, and the wire folds a failed or
+/// timed-out probe to `authenticated: null` — no reason travels with it, so a
+/// single read under package-level CPU load cannot distinguish "not yet" from
+/// "unauthenticated". Re-probes while the verdict is `null`; a `true` / `false`
+/// verdict is returned as-is for the caller to assert. Panics with the last
+/// response once the budget is spent (the retained daemon.log names the probe
+/// failure).
+async fn antigravity_auth_status<S>(ws: &mut WebSocketStream<S>, id: i64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(45));
+    let params = json!({"providerId":"antigravity","force":true});
+    let mut response = wss_rpc(ws, id, "host.providerAuthStatus", params.clone()).await;
+    let mut attempts = 1;
+    while response["providers"][0]["authenticated"].is_null() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "antigravity auth probe stayed inconclusive after {attempts} attempts: {response}"
+        );
+        attempts += 1;
+        response = wss_rpc(ws, id, "host.providerAuthStatus", params.clone()).await;
+    }
+    response
+}
+
 fn gate() -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -256,15 +322,9 @@ async fn antigravity_catalog_override_change_and_restart_use_current_executable_
             json!({"changes":[{"path":"providers.paths","value":{"antigravity":wrappers[index]}}]}),
         )
         .await;
-        let response = wss_rpc(
-            &mut rpc,
-            2,
-            "models.list",
-            json!({"providerId":"antigravity"}),
-        )
-        .await;
+        let response = antigravity_catalog(&mut rpc, 2).await;
         assert_eq!(response["source"], "antigravity");
-        assert_eq!(response["models"][0]["id"], expected);
+        assert_eq!(response["models"][0]["id"], expected, "{response}");
     }
     // Persist B's setting while the last saved catalog still belongs to A.
     wss_rpc(
@@ -286,14 +346,9 @@ async fn antigravity_catalog_override_change_and_restart_use_current_executable_
         client_config(status["result"]["fingerprint"].as_str().unwrap()),
     )
     .await;
-    let response = wss_rpc(
-        &mut rpc,
-        4,
-        "models.list",
-        json!({"providerId":"antigravity"}),
-    )
-    .await;
-    assert_eq!(response["models"][0]["id"], "model-b");
+    let response = antigravity_catalog(&mut rpc, 4).await;
+    assert_eq!(response["source"], "antigravity", "{response}");
+    assert_eq!(response["models"][0]["id"], "model-b", "{response}");
     assert_eq!(response["models"][0]["isDefault"], true, "{response}");
     let workspace = wss_rpc(
         &mut rpc,
@@ -379,25 +434,13 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
         // resolvedPath intentionally reports auto-detection, while installed
         // and the auth/model/session paths honor the configured override.
         assert_eq!(provider["command"], "antigravity-acp");
-        let authenticated = wss_rpc(
-            &mut rpc,
-            3,
-            "host.providerAuthStatus",
-            json!({"providerId":"antigravity","force":true}),
-        )
-        .await;
+        let authenticated = antigravity_auth_status(&mut rpc, 3).await;
         assert_eq!(
             authenticated["providers"],
             json!([{"id":"antigravity","authenticated":true}])
         );
-        let models = wss_rpc(
-            &mut rpc,
-            4,
-            "models.list",
-            json!({"providerId":"antigravity","forceRefresh":true}),
-        )
-        .await;
-        assert_eq!(models["models"].as_array().unwrap().len(), 2);
+        let models = antigravity_catalog(&mut rpc, 4).await;
+        assert_eq!(models["models"].as_array().unwrap().len(), 2, "{models}");
         assert_eq!(models["models"][0]["id"], "gemini-3.7-flash-low");
         assert_eq!(models["models"][0]["isDefault"], true);
         assert!(models["models"][0].get("effortLevels").is_none());
@@ -432,11 +475,15 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
                         if event["data"]["agentId"] == agent {
                             if event["type"] == "agent:failed" {
                                 assert!(should_fail, "session error: {event}");
-                                assert!(event.to_string().contains(if reject_model {
+                                let expected = if reject_model {
                                     "rejected model"
                                 } else {
                                     "stdout closed"
-                                }));
+                                };
+                                assert!(
+                                    event.to_string().contains(expected),
+                                    "expected a {expected:?} failure, got: {event}"
+                                );
                                 break;
                             }
                             if event["type"] == "agent:idle" {

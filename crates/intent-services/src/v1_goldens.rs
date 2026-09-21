@@ -79,11 +79,13 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -329,6 +331,7 @@ fn golden_supervisor_history_wrapper() {
         content: json!([{ "type": "text", "text": text }]),
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: "2026-01-02T03:04:05Z".to_string(),
     };
     // The default per-block cap (4000) keeps the golden byte-identical.
@@ -1251,6 +1254,7 @@ async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     svc.store()
         .insert_agent_session(&session)
@@ -1501,6 +1505,7 @@ fn golden_supervisor_history_truncation_markers() {
         content: blocks,
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: "2026-01-02T03:04:05Z".to_string(),
     };
     // Two exchanges with a budget that only fits the newest: the omission
@@ -2066,6 +2071,7 @@ fn golden_isolation_hints() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,

@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 mod client;
+mod exact_update;
 mod git_credential;
 mod import;
 mod legacy_import;
@@ -256,6 +257,7 @@ fn main() -> ExitCode {
         std::sync::atomic::Ordering::Relaxed,
     );
     std::env::remove_var(SITTER_IDLE_RESTART_ENV);
+    exact_update::capture_sitter_handshake();
     // Parse the CLI here too — before the tokio runtime — so `serve
     // --specialists-dir` can fold into INTENTD_SPECIALISTS_DIR while
     // `env::set_var` is still sound (the flag wins over an inherited env
@@ -269,10 +271,29 @@ fn main() -> ExitCode {
     {
         std::env::set_var("INTENTD_SPECIALISTS_DIR", dir);
     }
-    async_main(cli)
+    build_runtime().block_on(async_main(cli))
 }
 
-#[tokio::main]
+/// Stack size for the runtime's worker (and blocking) threads. Tokio's
+/// default is the std thread default, 2 MiB. A debug build's nested `poll`
+/// frames along the agent-turn / completion-delivery paths already sit
+/// within a few hundred KB of that (`run_message_worker` alone is ~660 KB),
+/// so the daemon reserves its worker stacks explicitly instead of aborting
+/// with "has overflowed its stack" on the next few frames of growth. Thread
+/// stacks are reserved virtual memory; only the pages a thread actually
+/// touches are committed, so the larger reservation costs nothing at rest.
+const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// The daemon's tokio runtime: multi-threaded, all drivers enabled, worker
+/// stacks sized by [`WORKER_THREAD_STACK_BYTES`].
+fn build_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_THREAD_STACK_BYTES)
+        .build()
+        .expect("build tokio runtime")
+}
+
 async fn async_main(cli: Cli) -> ExitCode {
     let command = match cli.command {
         Command::Provider { command } if command.is_internal_helper() => {
@@ -297,68 +318,74 @@ async fn async_main(cli: Cli) -> ExitCode {
     if !matches!(command, Command::Serve { .. } | Command::McpBridge { .. }) {
         ONE_SHOT_CLI.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    match command {
-        Command::Provider { command } => provider::run(command).await,
-        Command::Serve {
-            mode,
-            insecure,
-            resume_all,
-            // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
-            specialists_dir: _,
-        } => match cmd_serve(mode.as_deref(), insecure, resume_all).await {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        },
-        Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
-        Command::Status => cmd_status().await,
-        Command::Stop => cmd_stop().await,
-        Command::Doctor => cmd_doctor().await,
-        Command::Settings { name, value, stdin } => {
-            to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
-        }
-        Command::McpBridge { connect } => {
-            // The bridge reads stdin via `tokio::io::stdin()`, whose pending
-            // blocking-pool read outlives `run_stdio_bridge`; returning
-            // through the runtime drop would wait on it — i.e. until the
-            // provider closes stdin — so an initial-connect give-up would
-            // never actually exit (monorepo#908). Exit explicitly instead;
-            // there is no bridge state to unwind and stdout is flushed per
-            // line.
-            match cmd_mcp_bridge(&connect).await {
-                Ok(()) => std::process::exit(0),
+    // The composition root acts as the daemon: every service call made from
+    // the main task (startup pins, resume, one-shot subcommands) is bound so
+    // the capability gates never see an unbound request (fail-closed).
+    intent_core::with_caller(intent_core::Caller::Daemon, async move {
+        match command {
+            Command::Provider { command } => provider::run(command).await,
+            Command::Serve {
+                mode,
+                insecure,
+                resume_all,
+                // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
+                specialists_dir: _,
+            } => match cmd_serve(mode.as_deref(), insecure, resume_all).await {
+                Ok(code) => code,
                 Err(e) => {
                     eprintln!("error: {e}");
-                    std::process::exit(1);
+                    ExitCode::FAILURE
+                }
+            },
+            Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
+            Command::Status => cmd_status().await,
+            Command::Stop => cmd_stop().await,
+            Command::Doctor => cmd_doctor().await,
+            Command::Settings { name, value, stdin } => {
+                to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
+            }
+            Command::McpBridge { connect } => {
+                // The bridge reads stdin via `tokio::io::stdin()`, whose pending
+                // blocking-pool read outlives `run_stdio_bridge`; returning
+                // through the runtime drop would wait on it — i.e. until the
+                // provider closes stdin — so an initial-connect give-up would
+                // never actually exit (monorepo#908). Exit explicitly instead;
+                // there is no bridge state to unwind and stdout is flushed per
+                // line.
+                match cmd_mcp_bridge(&connect).await {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
-        }
-        Command::Import { from } => to_exit(cmd_import(&from).await),
-        Command::ImportLegacy {
-            root,
-            app_dir,
-            dry_run,
-            force,
-        } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
-        Command::Pair {
-            png,
-            svg,
-            yes,
-            select_endpoints,
-            rotate,
-        } => {
-            if select_endpoints {
-                to_exit(cmd_pair_select_endpoints().await)
-            } else {
-                to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate).await)
+            Command::Import { from } => to_exit(cmd_import(&from).await),
+            Command::ImportLegacy {
+                root,
+                app_dir,
+                dry_run,
+                force,
+            } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
+            Command::Pair {
+                png,
+                svg,
+                yes,
+                select_endpoints,
+                rotate,
+            } => {
+                if select_endpoints {
+                    to_exit(cmd_pair_select_endpoints().await)
+                } else {
+                    to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate).await)
+                }
             }
+            Command::GitCredential { operation } => cmd_git_credential(&operation).await,
+            #[cfg(feature = "js-engine")]
+            Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
         }
-        Command::GitCredential { operation } => cmd_git_credential(&operation).await,
-        #[cfg(feature = "js-engine")]
-        Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
-    }
+    })
+    .await
 }
 
 /// WSAPI-1 spike: run one JS snippet in a fresh QuickJS context, enforce a
@@ -1639,7 +1666,7 @@ async fn cmd_serve(
                 let event_bus = Some(bus.clone());
                 let lock = legacy_import_lock.clone();
                 let resumed = decision == legacy_import::FirstBootDecision::Resume;
-                Some(tokio::spawn(async move {
+                Some(intent_core::spawn_daemon(async move {
                     let _guard = lock.lock().await;
                     legacy_import::run_first_boot_import(
                         &store,
@@ -2002,7 +2029,7 @@ async fn cmd_serve(
     // removal never blocks startup; best-effort throughout — a failure never
     // aborts startup, and a missing workspaces root is a silent no-op.
     let services_trash_sweep = services.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let removed = services_trash_sweep.sweep_orphaned_worktree_trash().await;
         if removed > 0 {
             tracing::info!(
@@ -2015,13 +2042,13 @@ async fn cmd_serve(
     // are in-memory only, so after a restart every leftover staging dir is an
     // orphan. Spawned + best-effort like the worktree trash sweep above.
     let services_export_sweep = services.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         services_export_sweep.sweep_stale_export_staging().await;
     });
     // Sweep expired attachment idempotency-key bindings (7-day retention,
     // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
     let services_idempotency_sweep = services.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         services_idempotency_sweep
             .sweep_expired_attachment_idempotency_keys()
             .await;
@@ -2128,7 +2155,7 @@ async fn cmd_serve(
     // clean shutdown, which drops the registry and every watcher it owns.
     let mut mcp_start_task = {
         let services = services.clone();
-        tokio::spawn(async move { services.start_enabled_mcp_servers().await })
+        intent_core::spawn_daemon(async move { services.start_enabled_mcp_servers().await })
     };
     // Watch-health handle created BEFORE the backgrounded registry start so
     // DaemonControl can hold it now; it snapshots `None` (fileWatch absent
@@ -2329,6 +2356,7 @@ async fn cmd_serve(
         legacy_import_bus: bus.clone(),
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
+        exact_update: exact_update::ExactUpdate::default(),
         tunnel: tunnel_supervisor.clone(),
         #[cfg(unix)]
         idle_update_state: idle_update_state.clone(),
@@ -2538,7 +2566,7 @@ async fn cmd_serve(
         const WAKE_RESUME_DEBOUNCE: Duration = Duration::from_secs(2);
         let services_clone = services.clone();
         let mut resume_rx = tracker.subscribe();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             use tokio::sync::broadcast::error::RecvError;
             loop {
                 match resume_rx.recv().await {
@@ -2589,7 +2617,7 @@ async fn cmd_serve(
     let repository_metadata_prewarm = {
         let services = services.clone();
         let socket_path = config.socket_path.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             while !uds_is_live(&socket_path).await {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -2754,6 +2782,7 @@ struct DaemonControl {
     /// `<data_dir>/sitter/sitter.pid` — the supervising sitter's pidfile,
     /// read by `system.requestUpdate` to find the process to SIGUSR1.
     sitter_pid_path: PathBuf,
+    exact_update: exact_update::ExactUpdate,
     /// Tailcat tunnel sidecar supervisor (`server.tunnel.*`). Always present
     /// so the runtime toggle works whether or not the tunnel was boot-started.
     tunnel: Arc<tunnel::TunnelSupervisor>,
@@ -2946,7 +2975,7 @@ fn spawn_route_info_sampler() -> Arc<RouteInfo> {
         inner: std::sync::RwLock::new(sample()),
     });
     let task_info = info.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let period = Duration::from_secs(15);
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3021,7 +3050,7 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
     };
 
     let task_usage = usage.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         // Start one period out: `interval`'s first tick fires immediately,
         // which would re-refresh right after the startup sample — under
         // sysinfo's MINIMUM_CPU_UPDATE_INTERVAL, yielding an unreliable delta.
@@ -3229,7 +3258,7 @@ fn spawn_workspaces_disk_sampler(root: PathBuf) -> Arc<WorkspacesDiskUsage> {
     sample(&usage);
 
     let task_usage = usage.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let period = Duration::from_secs(30);
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3599,7 +3628,7 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
     };
 
     let task_usage = usage.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         // `without_tasks()`: on Linux, `nothing()` still enumerates every
         // `/proc/<pid>/task` directory and lists each thread as a process
         // row (monorepo#2342). The walk filters thread rows defensively,
@@ -3895,7 +3924,22 @@ impl SystemControl for DaemonControl {
     }
 
     fn request_update(&self) -> Result<(), String> {
+        if self.exact_update.active() {
+            return Err("an exact-version update is already in progress".into());
+        }
         signal_sitter_update(&self.sitter_pid_path)
+    }
+
+    fn exact_update_supported(&self) -> bool {
+        exact_update::supported(&self.sitter_pid_path)
+    }
+
+    fn target_update_status(&self) -> Option<Value> {
+        self.exact_update.status()
+    }
+
+    fn request_exact_update(&self, target: &str) -> Result<(), String> {
+        self.exact_update.start(&self.sitter_pid_path, target)
     }
 
     fn import_legacy(
@@ -4934,7 +4978,7 @@ fn spawn_idle_update_requester(
             "sitter did not advertise the idle-restart handshake; idle update requests disabled"
         );
     }
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let mut ticker = tokio::time::interval(IDLE_UPDATE_TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -5007,7 +5051,7 @@ fn spawn_staged_restart_watcher(
     state: Arc<IdleUpdateState>,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         use tokio::signal::unix::{signal, SignalKind};
         let mut usr2 = match signal(SignalKind::user_defined2()) {
             Ok(stream) => stream,
@@ -5274,7 +5318,7 @@ fn spawn_idle_reap_loop(
         );
         budget_floor
     };
-    Some(tokio::spawn(async move {
+    Some(intent_core::spawn_daemon(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -5373,7 +5417,7 @@ fn spawn_stream_retention_loop(
         );
         interval
     };
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -5421,7 +5465,7 @@ fn spawn_idempotency_reap_loop(
         interval_secs = interval.as_secs(),
         "idempotency reaper enabled"
     );
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -5483,7 +5527,7 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
         interval_secs = SANDBOX_MERGE_SWEEP_INTERVAL.as_secs(),
         "merge-pending retry sweep enabled"
     );
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         // Crash recovery: a daemon that died mid-merge leaves sandboxes
         // stranded `merging` — invisible to the sweep. No merge can be in
         // flight on a fresh daemon, so reset them to `merge_pending` before
@@ -5567,7 +5611,7 @@ fn spawn_watcher_registry_init(
     refresher: Arc<GitStatusRefresher>,
     watch_health: intent_services::WatchHealth,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         // `block_in_place`, not a bare `spawn`: the registrations inside are
         // synchronous `fseventsd` IPC that block the calling *thread*, so
         // spawning alone would only move them onto another Tokio worker — on a
@@ -5613,7 +5657,7 @@ fn spawn_config_watcher_init(
     registry: Arc<intent_services::SettingsRegistry>,
     services: Services,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let watcher_services = services.clone();
         let started = intent_services::ConfigWatcher::start(
             &hub,
@@ -7106,6 +7150,31 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for [`WORKER_THREAD_STACK_BYTES`]: a task whose
+    /// frame needs more than the 2 MiB std default must still complete on a
+    /// runtime worker. On a default-sized runtime this aborts the test
+    /// process with "has overflowed its stack" instead of failing an
+    /// assertion, which is the same symptom the daemon showed.
+    #[test]
+    fn runtime_workers_carry_more_than_the_default_thread_stack() {
+        const FRAME_BYTES: usize = 3 * 1024 * 1024;
+        // The oversized frame is the point: it has to live on the worker's
+        // stack, not the heap, to exercise the configured stack size.
+        #[expect(clippy::large_stack_arrays)]
+        #[inline(never)]
+        fn burn_stack() -> usize {
+            let mut buf = [0u8; FRAME_BYTES];
+            std::hint::black_box(&mut buf);
+            usize::from(buf[0]) + usize::from(buf[FRAME_BYTES - 1])
+        }
+        let sum = build_runtime().block_on(async {
+            tokio::spawn(async { burn_stack() })
+                .await
+                .expect("stack-heavy task joins")
+        });
+        assert_eq!(sum, 0);
+    }
 
     #[test]
     fn banner_build_commit_passes_through_embedded_commit() {

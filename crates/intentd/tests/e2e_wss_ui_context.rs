@@ -98,7 +98,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
 /// `workspace.getUiContext` starts null; `workspace.updateUiContext` persists
 /// the caller-supplied blob verbatim (including arbitrary nested fields) and
 /// round-trips byte-for-byte. No shape interpretation, no coercion.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_ui_context_round_trip() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -185,7 +185,7 @@ async fn workspace_ui_context_round_trip() {
 }
 
 /// Unknown workspace → -32602 Invalid params (same as workspace.get).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_ui_context_unknown_workspace() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
