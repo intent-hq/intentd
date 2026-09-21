@@ -662,6 +662,7 @@ mod tests {
     fn principal(login: &str) -> Principal {
         Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some(login.to_string()),
             display_name: Some(format!("{login} name")),

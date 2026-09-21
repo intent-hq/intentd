@@ -5136,16 +5136,62 @@ impl WorkspaceGitRoot {
     }
 }
 
-/// A person known to the daemon (multiplayer w1). Principals are GitHub
-/// identities: `github_user_id` is the stable GitHub account id once linked
-/// (`None` for the primary principal until the auth flow links it), and
-/// `login` / `display_name` / `avatar_url` are cached profile fields refreshed
-/// on each link. Exactly one principal per daemon is `is_primary` — the
-/// daemon's original single user, minted by migration `0125_principals`.
+/// The provider-neutral identity key of a principal (migration
+/// `0130_principal_identity`): which forge (`provider`, e.g. `github` /
+/// `gitlab`), which instance of it (`host`, e.g. `github.com` or a
+/// self-hosted GitLab host) and the account's stable id there
+/// (`external_user_id`, the provider's numeric id as text). Two accounts
+/// with the same numeric id on different providers or hosts are different
+/// principals. Stored and compared verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrincipalIdentity {
+    pub provider: String,
+    pub host: String,
+    pub external_user_id: String,
+}
+
+impl PrincipalIdentity {
+    /// The `provider` of every github.com account.
+    pub const GITHUB_PROVIDER: &'static str = "github";
+    /// The `host` of every github.com account.
+    pub const GITHUB_HOST: &'static str = "github.com";
+
+    /// The identity of a github.com account by its numeric user id — the
+    /// triple migration `0130` backfills from `github_user_id`.
+    #[must_use]
+    pub fn github(github_user_id: i64) -> Self {
+        Self {
+            provider: Self::GITHUB_PROVIDER.to_string(),
+            host: Self::GITHUB_HOST.to_string(),
+            external_user_id: github_user_id.to_string(),
+        }
+    }
+
+    /// The numeric GitHub user id when this is a github.com identity; `None`
+    /// for every other provider / host.
+    #[must_use]
+    pub fn github_user_id(&self) -> Option<i64> {
+        (self.provider == Self::GITHUB_PROVIDER && self.host == Self::GITHUB_HOST)
+            .then(|| self.external_user_id.parse().ok())
+            .flatten()
+    }
+}
+
+/// A person known to the daemon (multiplayer w1). A principal is keyed by
+/// its provider-neutral [`PrincipalIdentity`] once linked (`None` for the
+/// primary principal until the auth flow links it); `github_user_id` is the
+/// legacy github.com projection of that key, kept populated for github
+/// principals (dual-write) and `None` for every other provider. `login` /
+/// `display_name` / `avatar_url` are cached profile fields refreshed on each
+/// link. Exactly one principal per daemon is `is_primary` — the daemon's
+/// original single user, minted by migration `0125_principals`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Principal {
     pub id: PrincipalId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<PrincipalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_user_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5157,6 +5203,26 @@ pub struct Principal {
     pub is_primary: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Principal {
+    /// The identity key this row resolves by: the stored `identity`, or —
+    /// for a row written before the triple existed (or a caller that only
+    /// set the legacy field) — the github.com triple of `github_user_id`.
+    #[must_use]
+    pub fn identity_key(&self) -> Option<PrincipalIdentity> {
+        self.identity
+            .clone()
+            .or_else(|| self.github_user_id.map(PrincipalIdentity::github))
+    }
+
+    /// Link (or unlink, with `None`) a github.com account: sets the identity
+    /// triple and its legacy `github_user_id` projection together, so the two
+    /// never disagree.
+    pub fn set_github_user_id(&mut self, github_user_id: Option<i64>) {
+        self.github_user_id = github_user_id;
+        self.identity = github_user_id.map(PrincipalIdentity::github);
+    }
 }
 
 /// A principal's role within a workspace. Wire/DB words are the lowercase
@@ -5241,6 +5307,11 @@ pub struct WorkspaceInvite {
     #[serde(default, skip_serializing)]
     pub secret: Option<String>,
     pub created_by_principal_id: PrincipalId,
+    /// The account the invite is pinned to, as the provider-neutral triple
+    /// (migration `0130`); `pin_github_user_id` is its legacy github.com
+    /// projection, kept populated for a github pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_identity: Option<PrincipalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_github_user_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5259,11 +5330,21 @@ pub struct WorkspaceInvite {
 }
 
 impl WorkspaceInvite {
+    /// The identity the invite is pinned to: the stored `pin_identity`, or
+    /// the github.com triple of a legacy `pin_github_user_id`; `None` when
+    /// unpinned.
+    #[must_use]
+    pub fn pin_identity_key(&self) -> Option<PrincipalIdentity> {
+        self.pin_identity
+            .clone()
+            .or_else(|| self.pin_github_user_id.map(PrincipalIdentity::github))
+    }
+
     /// Whether the invite stays open across redemptions: `true` when
-    /// unpinned, `false` when pinned to one GitHub account (single-use).
+    /// unpinned, `false` when pinned to one account (single-use).
     #[must_use]
     pub fn is_reusable(&self) -> bool {
-        self.pin_github_user_id.is_none()
+        self.pin_identity.is_none() && self.pin_github_user_id.is_none()
     }
 
     /// Whether the invite can still be redeemed at `now` (ISO-8601 UTC,

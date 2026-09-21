@@ -120,6 +120,7 @@ async fn member_services(
         .expect("workspace");
     let principal = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("collab".to_string()),
         display_name: None,

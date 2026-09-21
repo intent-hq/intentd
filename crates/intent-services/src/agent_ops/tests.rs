@@ -7623,6 +7623,7 @@ async fn get_conversation_slim_budget_counts_attached_author_bytes() {
     svc.store()
         .upsert_principal(&Principal {
             id: guest.clone(),
+            identity: None,
             github_user_id: None,
             login: Some("guest".into()),
             display_name: Some(long_name.clone()),
@@ -13229,6 +13230,7 @@ async fn queue_reads_and_queue_updated_carry_resolved_author() {
     svc.store()
         .upsert_principal(&Principal {
             id: guest.clone(),
+            identity: None,
             github_user_id: None,
             login: Some("guest".into()),
             display_name: Some("Guest User".into()),
@@ -13656,6 +13658,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
         svc.store()
             .upsert_principal(&Principal {
                 id: id.clone(),
+                identity: None,
                 github_user_id: None,
                 login: Some(login.into()),
                 display_name: None,
@@ -14148,6 +14151,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
     svc.store()
         .upsert_principal(&Principal {
             id: guest.clone(),
+            identity: None,
             github_user_id: None,
             login: Some("octocat".into()),
             display_name: Some("The Octocat".into()),
@@ -14501,6 +14505,7 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
     svc.store()
         .upsert_principal(&Principal {
             id: guest.clone(),
+            identity: None,
             github_user_id: None,
             login: Some("octocat".into()),
             display_name: Some("The Octocat".into()),
@@ -14785,6 +14790,7 @@ async fn collaborator_sender_preamble_on_append_message_user_rows() {
     svc.store()
         .upsert_principal(&Principal {
             id: guest.clone(),
+            identity: None,
             github_user_id: None,
             login: Some("octocat".into()),
             display_name: Some("The Octocat".into()),
@@ -14938,6 +14944,7 @@ async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_poin
     svc.store()
         .upsert_principal(&Principal {
             id: strict.clone(),
+            identity: None,
             github_user_id: None,
             login: Some("strict".into()),
             display_name: None,
@@ -15088,6 +15095,7 @@ async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
     svc.store()
         .upsert_principal(&Principal {
             id: editor.clone(),
+            identity: None,
             github_user_id: None,
             login: Some("editor".into()),
             display_name: None,

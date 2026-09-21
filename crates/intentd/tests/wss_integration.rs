@@ -3272,6 +3272,7 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     let guest_token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: None,
@@ -3408,6 +3409,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
 
     let guest = |login: &str, github_user_id: i64, created_at: &str| Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: Some(github_user_id),
         login: Some(login.to_string()),
         display_name: Some(format!("{login} name")),
@@ -3457,6 +3459,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "older name",
                 "avatarUrl": "https://example.test/older.png",
                 "githubUserId": 11,
+                "identity": { "provider": "github", "host": "github.com", "externalUserId": "11" },
             },
             {
                 "principalId": newer.id.0,
@@ -3464,6 +3467,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "newer name",
                 "avatarUrl": "https://example.test/newer.png",
                 "githubUserId": 12,
+                "identity": { "provider": "github", "host": "github.com", "externalUserId": "12" },
             },
         ] }),
         "{owner_view}"
@@ -3573,6 +3577,7 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
     // Two guests with their own credentials; one revokes itself.
     let guest_of = |login: &str| Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some(login.to_string()),
         display_name: Some(format!("{login} name")),
@@ -3928,6 +3933,7 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
     let guest_token = "edededededededededededededededededededededededededededededededed";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: Some("Guest User".to_string()),
@@ -4376,6 +4382,7 @@ async fn wss_collaborator_client_ids_are_principal_scoped() {
     ] {
         let principal = Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some(login.to_string()),
             display_name: None,
@@ -4517,6 +4524,7 @@ impl Guest {
         use intent_core::{Principal, PrincipalId};
         let principal = Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some("guest".to_string()),
             display_name: Some("Guest User".to_string()),
@@ -5284,6 +5292,7 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
     let guest_token = "dcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: None,
@@ -5535,6 +5544,7 @@ async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
     let guest_token = "dedededededededededededededededededededededededededededededededede";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: None,
@@ -5760,6 +5770,7 @@ async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
     let guest_token = "ececececececececececececececececececececececececececececececececec";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: None,
@@ -6065,6 +6076,7 @@ async fn seed_principal(store: &Store, login: &str, token: &str) -> intent_core:
     use intent_core::{Principal, PrincipalId};
     let p = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some(login.to_string()),
         display_name: None,
@@ -6905,6 +6917,7 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
     let guest_token = "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: Some("Guest User".to_string()),
@@ -9845,6 +9858,7 @@ async fn wss_guest_connection_caps_refuse_503_and_release_on_disconnect() {
     for (n, token) in tokens.iter().enumerate() {
         let guest = Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some(format!("guest-{n}")),
             display_name: None,
@@ -9962,6 +9976,7 @@ async fn wss_guest_connection_caps_apply_live_on_settings_update() {
     for (n, token) in tokens.iter().enumerate() {
         let guest = Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some(format!("guest-{n}")),
             display_name: None,

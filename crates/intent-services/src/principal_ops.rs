@@ -620,6 +620,7 @@ impl Services {
                     "displayName": p.display_name,
                     "avatarUrl": p.avatar_url,
                     "githubUserId": p.github_user_id,
+                    "identity": p.identity,
                 })
             })
             .collect();
@@ -794,7 +795,7 @@ impl Services {
             return Err(Error::Invite(InviteErrorKind::IdentityLocked));
         }
         let mut updated = principal.clone();
-        updated.github_user_id = fetched_id;
+        updated.set_github_user_id(fetched_id);
         updated.login = Some(user.login.clone());
         updated.display_name = user.name.clone();
         updated.avatar_url = user.avatar_url.clone();
@@ -860,6 +861,7 @@ mod tests {
     fn principal(login: &str) -> Principal {
         Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some(login.to_string()),
             display_name: Some(format!("{login} name")),
@@ -872,7 +874,9 @@ mod tests {
 
     /// `principal.list`: the daemon (and the administrator) get every
     /// non-primary principal with an active credential — full profile
-    /// fields, `githubUserId` included, oldest first — while the primary
+    /// fields, `githubUserId` and the neutral `identity` triple included
+    /// (the store dual-writes the github triple for a `github_user_id`-only
+    /// upsert), oldest first — while the primary
     /// principal and a guest whose credentials were all revoked are omitted.
     /// A per-principal wire caller is `Forbidden`, whatever its workspace
     /// roles; an agent passes like the daemon.
@@ -916,6 +920,11 @@ mod tests {
                 "displayName": "active name",
                 "avatarUrl": "https://example.test/active.png",
                 "githubUserId": 42,
+                "identity": {
+                    "provider": "github",
+                    "host": "github.com",
+                    "externalUserId": "42",
+                },
             }] })
         );
 
