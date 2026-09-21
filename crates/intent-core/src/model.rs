@@ -3038,6 +3038,40 @@ pub struct AgentScopeCounts {
     pub background: u64,
 }
 
+/// One parent's entry in [`AgentDelegatedCounts::by_parent`] (§5.5):
+/// `total` is the number of non-retired sessions whose `parent_agent_id`
+/// names that parent (direct children only — a grandchild counts under its
+/// own parent), `running` the subset whose persisted status is
+/// `pending` / `active` / legacy `Processing` (the daemon's
+/// `is_running_turn` rule).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentParentDelegatedCounts {
+    pub total: u64,
+    pub running: u64,
+}
+
+/// The always-present `delegatedCounts` field on every `agent.list`
+/// response variant (§5.5): the workspace's non-retired delegated sessions
+/// (the `delegated` bin, `parent_agent_id IS NOT NULL`) counted per DIRECT
+/// parent, one grouped SQL aggregate — so a client renders each top-level
+/// agent's collapsed "N delegated" / "R / N running" group from the counts
+/// alone and pulls one parent's children only on expand. `running` is the
+/// workspace-wide running delegated count (`Σ byParent[*].running`);
+/// `by_parent` carries NO entry for a parent without non-retired children
+/// and is always serialized (an empty object on a workspace with no
+/// delegated sessions), and its keys are the raw `parent_agent_id` values,
+/// so a key may name a parent outside this workspace (cross-workspace
+/// delegation). Invariant: `Σ byParent[*].total == scopeCounts.delegated`.
+/// Like [`AgentScopeCounts`], the counts stay workspace-wide even when the
+/// rows read was narrowed by `scope` or `parentAgentId`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDelegatedCounts {
+    pub running: u64,
+    pub by_parent: BTreeMap<AgentId, AgentParentDelegatedCounts>,
+}
+
 /// Per-field byte budget for `agent.list` row previews (list-payload cost
 /// contract, extending monorepo#2932): the preview fields exist to render a
 /// one-line summary in list contexts (sidebar rows, HUD cells), so each is
@@ -3129,7 +3163,10 @@ pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 6 * 1024;
 /// over, re-applies [`AgentLite::cap_list_previews_to`] with a tighter
 /// preview budget. 1,000 KiB leaves ≈ 24 KiB under the warn threshold for
 /// the envelope (`{"jsonrpc":"2.0","id":…,"result":{"agents":[…],
-/// "retiredCount":…,"scopeCounts":{…}}}`, well under 300 B with the small
+/// "retiredCount":…,"scopeCounts":{…},"delegatedCounts":{…}}}`, well under
+/// 300 B on a workspace without delegated sessions and ≈ 70 B per
+/// `byParent` entry otherwise (outside the rows array; see the §5.5 row) with
+/// the small
 /// counter / UUID `id`s real clients send). The `id` is client-chosen and
 /// echoed by the router; the service layer never sees it, so a client that
 /// sends a multi-KiB `id` adds its own bytes on top of this budget and can

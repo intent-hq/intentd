@@ -8,8 +8,9 @@
 //! a derived snapshot and is never persisted — sessions load with `stats: None`.
 
 use intent_core::{
-    AgentId, AgentListRowScope, AgentMessage, AgentScopeCounts, AgentSession, AgentStatus, Error,
-    NoteId, Result, TokenUsageTotals, UsageCost, WorkspaceId, PENDING_QUESTIONS_MESSAGE_ID_KEY,
+    AgentDelegatedCounts, AgentId, AgentListRowScope, AgentMessage, AgentParentDelegatedCounts,
+    AgentScopeCounts, AgentSession, AgentStatus, Error, NoteId, Result, TokenUsageTotals,
+    UsageCost, WorkspaceId, PENDING_QUESTIONS_MESSAGE_ID_KEY,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -170,6 +171,25 @@ pub(crate) fn scope_counts_sql() -> &'static str {
         COALESCE(SUM(parent_agent_id IS NOT NULL), 0) AS delegated, \
         COALESCE(SUM(parent_agent_id IS NULL AND is_background <> 0), 0) AS background \
      FROM agent_session WHERE workspace_id = ? AND retired_at IS NULL"
+}
+
+/// SQL behind [`Store::count_delegated_agent_sessions_by_parent`] — ONE
+/// grouped statement over the workspace's non-retired delegated rows (the
+/// `delegated` predicate of [`scope_predicate`]) yielding `delegatedCounts`
+/// (§5.5): one row per direct parent with the child count and the subset
+/// whose persisted status is running. The running set is the daemon's
+/// `is_running_turn` rule — `pending` / `active` / legacy capitalized
+/// `Processing` (the serde names of `AgentStatus`, which is how the column is
+/// written). Same `idx_agent_workspace` search as [`scope_counts_sql`], so
+/// `SUM(total)` over the result always equals `scopeCounts.delegated`.
+pub(crate) fn delegated_counts_sql() -> &'static str {
+    "SELECT \
+        parent_agent_id, \
+        COUNT(*) AS total, \
+        COALESCE(SUM(status IN ('pending', 'active', 'Processing')), 0) AS running \
+     FROM agent_session \
+     WHERE workspace_id = ? AND retired_at IS NULL AND parent_agent_id IS NOT NULL \
+     GROUP BY parent_agent_id"
 }
 
 /// SQL predicate selecting an **unread top-level session** row (§5.1): a
@@ -1281,6 +1301,45 @@ impl Store {
             delegated: count("delegated"),
             background: count("background"),
         })
+    }
+
+    /// Per-parent counts of the workspace's non-retired delegated sessions —
+    /// the `delegatedCounts` field served on every `agent.list` response
+    /// variant (§5.5). One grouped statement ([`delegated_counts_sql`]) over
+    /// the workspace's `idx_agent_workspace` entries — O(delegated rows), the
+    /// same order as the default rows read it accompanies. No rows are
+    /// hydrated. A parent with no non-retired children has no entry; keys
+    /// are the raw `parent_agent_id` values, so a cross-workspace parent
+    /// still appears.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_delegated_agent_sessions_by_parent(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<AgentDelegatedCounts> {
+        let rows = sqlx::query(delegated_counts_sql())
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "count delegated agent sessions by parent failed: {e}"
+                ))
+            })?;
+        let mut counts = AgentDelegatedCounts::default();
+        for row in &rows {
+            let count = |col: &str| -> u64 { u64::try_from(row.get::<i64, _>(col)).unwrap_or(0) };
+            let parent = AgentId::from(row.get::<String, _>("parent_agent_id"));
+            let entry = AgentParentDelegatedCounts {
+                total: count("total"),
+                running: count("running"),
+            };
+            counts.running += entry.running;
+            counts.by_parent.insert(parent, entry);
+        }
+        Ok(counts)
     }
 
     /// Get message count, whether any assistant message exists, and the total
@@ -5519,8 +5578,14 @@ mod tests {
             },
             AgentListRowScope::Background,
         ];
-        let mut statements: Vec<(String, String, Option<String>)> =
-            vec![("counts".to_string(), scope_counts_sql().to_string(), None)];
+        let mut statements: Vec<(String, String, Option<String>)> = vec![
+            ("counts".to_string(), scope_counts_sql().to_string(), None),
+            (
+                "delegatedCounts".to_string(),
+                delegated_counts_sql().to_string(),
+                None,
+            ),
+        ];
         for scope in &scopes {
             let (predicate, bind) = scope_predicate(scope);
             statements.push((
@@ -5558,6 +5623,184 @@ mod tests {
                 "{label} must not scan agent_session, plan: {details:?}"
             );
         }
+    }
+
+    /// The grouped `delegatedCounts` aggregate (§5.5): one entry per DIRECT
+    /// parent with its non-retired child count, `running` counting only the
+    /// `pending` / `active` / legacy `Processing` statuses; retired children
+    /// are excluded (a parent whose only child is retired has NO entry); a
+    /// background child counts under its parent like any delegated row; a
+    /// grandchild counts under its own parent, never the grandparent; the
+    /// key set includes a parent that is not a session of this workspace
+    /// (cross-workspace delegation); other workspaces' rows never leak in;
+    /// the top-level `running` is the sum over parents; and `Σ total` equals
+    /// `scopeCounts.delegated` from the same store. An empty workspace
+    /// answers `{ running: 0, byParent: {} }`.
+    #[tokio::test]
+    async fn delegated_counts_group_non_retired_children_by_parent() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-delegated-counts".to_string());
+        let other_ws = WorkspaceId("ws-other".to_string());
+        let empty_ws = WorkspaceId("ws-empty".to_string());
+        for w in [&ws, &other_ws, &empty_ws] {
+            insert_test_workspace(&store, w).await;
+        }
+        let ts = "2026-01-01T00:00:00Z";
+        let id = |n: u32| AgentId::from(format!("agent-00000000-0000-4000-8000-{n:012}"));
+        let (top_a, top_b, childless, foreign_parent) = (id(1), id(2), id(3), id(9));
+        let seed = |agent: AgentId,
+                    ws: &WorkspaceId,
+                    parent: Option<&AgentId>,
+                    status: AgentStatus,
+                    background: bool,
+                    retired: bool| {
+            let mut s = baseline_test_session(&agent, ws, ts, None);
+            s.parent_agent_id = parent.cloned();
+            s.status = status;
+            s.is_background = background;
+            s.retired_at = retired.then(|| ts.to_string());
+            s
+        };
+        let sessions = [
+            seed(top_a.clone(), &ws, None, AgentStatus::Active, false, false),
+            seed(top_b.clone(), &ws, None, AgentStatus::Idle, false, false),
+            seed(
+                childless.clone(),
+                &ws,
+                None,
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // top_a: three live children (pending, Processing, idle-background), one retired active.
+            seed(
+                id(10),
+                &ws,
+                Some(&top_a),
+                AgentStatus::Pending,
+                false,
+                false,
+            ),
+            seed(
+                id(11),
+                &ws,
+                Some(&top_a),
+                AgentStatus::Processing,
+                false,
+                false,
+            ),
+            seed(
+                id(12),
+                &ws,
+                Some(&top_a),
+                AgentStatus::RuntimeIdle,
+                true,
+                false,
+            ),
+            seed(id(13), &ws, Some(&top_a), AgentStatus::Active, false, true),
+            // A grandchild under child 10 counts under 10, not top_a.
+            seed(
+                id(14),
+                &ws,
+                Some(&id(10)),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // top_b: one live waiting child, one retired child.
+            seed(
+                id(20),
+                &ws,
+                Some(&top_b),
+                AgentStatus::Waiting,
+                false,
+                false,
+            ),
+            seed(id(21), &ws, Some(&top_b), AgentStatus::Pending, false, true),
+            // A parent that is not a session of this workspace.
+            seed(
+                id(30),
+                &ws,
+                Some(&foreign_parent),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // Another workspace's delegated rows never leak in.
+            seed(
+                id(40),
+                &other_ws,
+                Some(&top_a),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+        ];
+        for s in &sessions {
+            store.insert_agent_session(s).await.expect("insert session");
+        }
+
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("delegated counts");
+        let entry = |total: u64, running: u64| AgentParentDelegatedCounts { total, running };
+        assert_eq!(
+            counts,
+            AgentDelegatedCounts {
+                running: 4,
+                by_parent: [
+                    (top_a.clone(), entry(3, 2)),
+                    (id(10), entry(1, 1)),
+                    (top_b.clone(), entry(1, 0)),
+                    (foreign_parent.clone(), entry(1, 1)),
+                ]
+                .into_iter()
+                .collect(),
+            }
+        );
+        assert!(
+            !counts.by_parent.contains_key(&childless),
+            "a parent without children has no entry"
+        );
+        let scope_counts = store
+            .count_agent_sessions_by_scope(&ws)
+            .await
+            .expect("scope counts");
+        assert_eq!(
+            counts.by_parent.values().map(|c| c.total).sum::<u64>(),
+            scope_counts.delegated,
+            "Σ byParent[*].total == scopeCounts.delegated"
+        );
+        assert_eq!(
+            counts.by_parent.values().map(|c| c.running).sum::<u64>(),
+            counts.running
+        );
+
+        // Retiring top_b's last live child drops its entry entirely.
+        store
+            .set_agent_session_retired_at(&ws, &id(20), Some(ts), ts)
+            .await
+            .expect("retire");
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("delegated counts after retire");
+        assert!(!counts.by_parent.contains_key(&top_b));
+        assert_eq!(counts.by_parent.len(), 3);
+
+        // Wire shape: `byParent` is always an object, empty on a workspace
+        // with no delegated sessions.
+        let empty = store
+            .count_delegated_agent_sessions_by_parent(&empty_ws)
+            .await
+            .expect("empty workspace");
+        assert_eq!(empty, AgentDelegatedCounts::default());
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap(),
+            serde_json::json!({ "running": 0, "byParent": {} })
+        );
     }
 
     /// The three unread-derivation statements (single-workspace EXISTS
