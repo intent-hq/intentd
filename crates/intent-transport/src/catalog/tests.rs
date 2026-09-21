@@ -168,15 +168,19 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// method (`invite.redeem`); the guest joins through `invite.challenge` /
 /// `invite.prove` (or `invite.accept` with a credential) instead.
 ///
+/// Direct member add: +2 router methods (`principal.list`, the owner-only
+/// roster of credentialed guests; `workspace.members.add`, the owner-only
+/// direct attach of one of them).
+///
 /// Provider-generic auth (protocol 10.5, §5.27): +5 router methods
 /// (`sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
 /// `getUser`); the `github.*` auth quintet stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 390;
+const EXPECTED_TOTAL_METHODS: usize = 392;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 332;
+const EXPECTED_ROUTER_METHODS: usize = 334;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -442,7 +446,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
     ),
     (
         "agent.retry",
-        "re-delivers the requeued entry with the stamp captured at enqueue / wake delivery — the retrier is never the author (`guest_wake_stamp_survives_terminal_failure_requeue_over_wss`)",
+        "re-delivers the requeued entry with the stamp captured at enqueue / wake delivery — the retrier is never the author (`wake_stamp_survives_terminal_failure_requeue_over_wss`)",
     ),
     (
         "agent.sendMessage",
@@ -730,6 +734,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "primitive.addCli",
     "primitive.addPatch",
     "primitive.addReference",
+    "principal.list",
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
@@ -856,6 +861,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.list",
     "workspace.localChanges",
     "workspace.markSeen",
+    "workspace.members.add",
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
@@ -1121,8 +1127,10 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// and `system.status`),
 /// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
-/// `git.agentCommit` (agent-only), agent deletion / proposals / one-shot
-/// completions, `agent.replaceMessages` (persists client-supplied user rows
+/// `git.agentCommit` (agent-only), agent creation / delegation (decided
+/// 2026-09-19: guests steer existing agents only — `agent.create`,
+/// `agent.delegate`, `agent.wakeOrCreate`), agent deletion / proposals /
+/// one-shot completions, `agent.replaceMessages` (persists client-supplied user rows
 /// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
 /// PR-monitor cancel/flush, daemon-wide metrics, and the `accept-changes.*` /
 /// `file-tracking.*` publishing flow (stages, commits, pushes and merges as
@@ -1135,6 +1143,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.prepare",
     "agent.cancelDelete",
     "agent.completeOnce",
+    "agent.create",
+    "agent.delegate",
     "agent.delete",
     "agent.diagnostics",
     "agent.enhancePrompt",
@@ -1142,6 +1152,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveProposal",
+    "agent.wakeOrCreate",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -1244,6 +1255,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "pairing.getInfo",
     "prMonitor.cancel",
     "prMonitor.flush",
+    "principal.list",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1330,6 +1342,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "workspace.invite.create",
     "workspace.invite.list",
     "workspace.invite.revoke",
+    "workspace.members.add",
     "workspace.members.remove",
     "workspace.restore",
     "workspace.saveSetupScript",
@@ -1478,7 +1491,8 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "presence.snapshot",
         "presence.update",
         "note.presence.subscribe",
-        "agent.create",
+        "agent.rename",
+        "agent.update",
         "agent.stop",
         "agent.sendMessage",
         "agent.setModel",
@@ -1506,7 +1520,11 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "voice.transcribe",
         "workspace.create",
         "git.clone",
+        "agent.create",
+        "agent.delegate",
+        "agent.wakeOrCreate",
         "agent.delete",
+        "agent.cancelDelete",
         "agent.replaceMessages",
         "terminal.list",
         "script.list",
@@ -1722,6 +1740,11 @@ mod unbound_owner_only_methods {
                 "agent.completeOnce",
                 json!({ "prompt": "p", "timeoutMs": 1 }),
             ),
+            ("agent.create", json!({ "workspaceId": ws })),
+            (
+                "agent.delegate",
+                json!({ "workspaceId": ws, "taskNoteId": "t1" }),
+            ),
             ("agent.delete", json!({ "agentId": "a1" })),
             ("agent.diagnostics", json!({ "workspaceId": ws })),
             (
@@ -1740,6 +1763,10 @@ mod unbound_owner_only_methods {
             (
                 "agent.resolveProposal",
                 json!({ "workspaceId": ws, "agentId": "a1", "proposalId": "p1", "outcome": "reject" }),
+            ),
+            (
+                "agent.wakeOrCreate",
+                json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
             ),
             ("client.list", json!({})),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
@@ -1851,6 +1878,7 @@ mod unbound_owner_only_methods {
                 "prMonitor.flush",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),
             ),
+            ("principal.list", json!({})),
             ("repo.list", json!({})),
             ("repo.remove", json!({ "path": dir })),
             (
@@ -1973,6 +2001,10 @@ mod unbound_owner_only_methods {
             (
                 "workspace.invite.revoke",
                 json!({ "workspaceId": ws, "inviteId": "inv" }),
+            ),
+            (
+                "workspace.members.add",
+                json!({ "workspaceId": ws, "principalId": "p" }),
             ),
             (
                 "workspace.members.remove",

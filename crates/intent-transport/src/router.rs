@@ -644,12 +644,25 @@ async fn dispatch(
             Ok(json!({ "workspace": ws }))
         }
         // `workspace.members.*` (multiplayer w3): membership roster of one
-        // workspace. Member+ may list; removal is Owner-only in the service
-        // layer (`-32003` for a collaborator, `-32602` for a non-member).
+        // workspace. Member+ may list; add / removal are Owner-only in the
+        // service layer (`-32003` for a collaborator, `-32602` for a
+        // non-member).
         "workspace.members.list" => {
             let id = require_workspace_id(params)?;
             let r = api
                 .workspace_members_list(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(r)
+        }
+        // `workspace.members.add` (direct member add): attach a credentialed
+        // guest as a collaborator; `-32602` for an unknown / primary /
+        // uncredentialed principal or a spent guest cap.
+        "workspace.members.add" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let r = api
+                .workspace_members_add(id, intent_core::PrincipalId::from(principal_id))
                 .await
                 .map_err(workspace_err)?;
             Ok(r)
@@ -3136,6 +3149,13 @@ async fn dispatch(
         // bound to at admission; no params. Fails when no caller is bound.
         "principal.me" => {
             let r = api.principal_me().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `principal.list` (direct member add): the host's credentialed
+        // guests for the owner's share dialog; no params. Owner-only in the
+        // service layer (`-32003` for a collaborator).
+        "principal.list" => {
+            let r = api.principal_list().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
         // `principal.revokeSelf` (multiplayer w4): the bound collaborator

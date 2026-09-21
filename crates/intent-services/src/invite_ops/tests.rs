@@ -2423,6 +2423,62 @@ async fn invite_create_refuses_at_the_guest_limit() {
     assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
 }
 
+/// A direct `workspace.members.add` spends the same cap as an invite mint
+/// (collaborators plus open invites): at the cap it is `GuestLimit` and no
+/// row is written; an already-seated member is still the idempotent
+/// `added: false` past the cap; raising the cap live admits the guest, and
+/// `members.list` counts the new seat.
+#[tokio::test]
+async fn members_add_refuses_at_the_guest_limit() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 3).await;
+    let guest = principal("guest", Some(3003));
+    f.store.upsert_principal(&guest).await.expect("guest");
+    f.store
+        .insert_principal_credential(&guest.id, &hash_secret("guest-token"))
+        .await
+        .expect("guest credential");
+    f.store
+        .insert_principal_credential(&f.collaborator, &hash_secret("collab-token"))
+        .await
+        .expect("collaborator credential");
+    f.create_invite(None).await;
+    assert_eq!(guest_summary(&f).await, (3, 3));
+
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_members_add_op(&f.ws, &guest.id),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+    assert_eq!(r.unwrap_err().code(), -32602);
+    assert!(
+        f.store
+            .get_workspace_member_role(&f.ws, &guest.id)
+            .await
+            .expect("role")
+            .is_none(),
+        "a refused add leaves no row"
+    );
+    let seated = with_caller(
+        wire(&f.owner),
+        f.services.workspace_members_add_op(&f.ws, &f.collaborator),
+    )
+    .await
+    .expect("seated member");
+    assert_eq!(seated["added"], json!(false));
+
+    set_cap(&registry, 4);
+    let added = with_caller(
+        wire(&f.owner),
+        f.services.workspace_members_add_op(&f.ws, &guest.id),
+    )
+    .await
+    .expect("add under the raised cap");
+    assert_eq!(added["added"], json!(true));
+    assert_eq!(guest_summary(&f).await, (4, 4));
+}
+
 /// The join re-checks the cap against collaborators inside the store
 /// transaction: an open invite minted under a higher cap is `WorkspaceFull`
 /// once the cap drops to the seated count — nothing is written and the
@@ -2523,6 +2579,172 @@ async fn concurrent_joins_cannot_overshoot_the_guest_cap() {
         "refused joins leave their invites open; the reusable winner stays open too"
     );
     assert_eq!(guest_summary(&f).await, (6, 3));
+}
+
+/// Concurrent `workspace.members.add` calls for the last seat: exactly one
+/// commits, the rest are `GuestLimit` with no row written, and mixing in
+/// joins on an open invite (which reserves the seat against every add and
+/// admits exactly one joiner) still never overshoots the cap.
+#[tokio::test]
+async fn concurrent_member_adds_cannot_overshoot_the_guest_cap() {
+    let tmp = TempDb::new();
+    let (f, registry, _cfg) = capped_fixture(&tmp, 3).await;
+    let mut guests = Vec::new();
+    for n in 0..8 {
+        let guest = principal(&format!("guest-{n}"), Some(4000 + n));
+        f.store.upsert_principal(&guest).await.expect("guest");
+        f.store
+            .insert_principal_credential(&guest.id, &hash_secret(&format!("guest-token-{n}")))
+            .await
+            .expect("guest credential");
+        guests.push(guest.id);
+    }
+
+    let mut handles = Vec::new();
+    for guest in guests.iter().take(4) {
+        let services = f.services.clone();
+        let (ws, owner, guest) = (f.ws.clone(), f.owner.clone(), guest.clone());
+        handles.push(tokio::spawn(async move {
+            with_caller(wire(&owner), async move {
+                services.workspace_members_add_op(&ws, &guest).await
+            })
+            .await
+        }));
+    }
+    let mut added = 0;
+    let mut full = 0;
+    for h in handles {
+        match h.await.expect("task") {
+            Ok(v) => {
+                assert_eq!(v["added"], json!(true));
+                added += 1;
+            }
+            r => {
+                assert_eq!(invite_kind(&r), InviteErrorKind::GuestLimit);
+                full += 1;
+            }
+        }
+    }
+    assert_eq!((added, full), (1, 3));
+    assert_eq!(guest_summary(&f).await, (3, 3));
+
+    // Adds racing joins for one seat: the open invite (minted under a
+    // higher cap) reserves it against every add; one join wins it.
+    set_cap(&registry, 5);
+    let invite = id_of(&f.create_invite(None).await);
+    set_cap(&registry, 4);
+    let mut handles = Vec::new();
+    for n in 0..3u64 {
+        let services = f.services.clone();
+        let invite = invite.clone();
+        handles.push(tokio::spawn(async move {
+            let r = services
+                .complete_invite_join(&invite, &identity(&format!("joiner-{n}"), 9100 + n))
+                .await;
+            r.is_ok() || invite_kind(&r) == InviteErrorKind::WorkspaceFull
+        }));
+    }
+    for guest in guests.iter().skip(4) {
+        let services = f.services.clone();
+        let (ws, owner, guest) = (f.ws.clone(), f.owner.clone(), guest.clone());
+        handles.push(tokio::spawn(async move {
+            let r = with_caller(wire(&owner), async move {
+                services.workspace_members_add_op(&ws, &guest).await
+            })
+            .await;
+            invite_kind(&r) == InviteErrorKind::GuestLimit
+        }));
+    }
+    for h in handles {
+        assert!(h.await.expect("task"));
+    }
+    // Four collaborators plus the still-open reusable invite.
+    assert_eq!(guest_summary(&f).await, (5, 4));
+}
+
+/// `workspace.members.add` racing the guest's own `principal.revokeSelf`
+/// (intentd#2025 review): the credential predicate is evaluated inside the
+/// add's insert transaction and `revokeSelf` revokes credentials before it
+/// snapshots memberships, so whichever commits first, the guest ends up
+/// with no active credential AND no membership — either the add was
+/// refused `InvalidParams`, or it seated the guest and the revocation tore
+/// the seat down (`workspaces: 1`). A seated member without a credential
+/// (the TOCTOU the pre-transaction check allowed) is never observable.
+#[tokio::test]
+async fn members_add_racing_revoke_self_never_leaves_a_credential_less_member() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    for n in 0..24i64 {
+        let guest = principal(&format!("racer-{n}"), Some(7000 + n));
+        f.store.upsert_principal(&guest).await.expect("guest");
+        f.store
+            .insert_principal_credential(&guest.id, &hash_secret(&format!("racer-token-{n}")))
+            .await
+            .expect("guest credential");
+
+        let add = {
+            let services = f.services.clone();
+            let (ws, owner, guest) = (f.ws.clone(), f.owner.clone(), guest.id.clone());
+            tokio::spawn(async move {
+                with_caller(wire(&owner), async move {
+                    services.workspace_members_add_op(&ws, &guest).await
+                })
+                .await
+            })
+        };
+        let revoke = {
+            let services = f.services.clone();
+            let guest = guest.id.clone();
+            tokio::spawn(async move {
+                with_caller(wire(&guest), async move {
+                    services.principal_revoke_self_op().await
+                })
+                .await
+            })
+        };
+        let add = add.await.expect("add task");
+        let revoked = revoke
+            .await
+            .expect("revoke task")
+            .expect("revokeSelf succeeds");
+        assert_eq!(revoked["credentials"], json!(1), "round {n}: {revoked}");
+        match add {
+            Ok(v) => {
+                assert_eq!(v["added"], json!(true), "round {n}: {v}");
+                assert_eq!(
+                    revoked["workspaces"],
+                    json!(1),
+                    "round {n}: the add committed first, so revokeSelf tore the seat down"
+                );
+            }
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("no active credential"), "round {n}: {msg}");
+                assert_eq!(
+                    revoked["workspaces"],
+                    json!(0),
+                    "round {n}: the revocation committed first, so the add was refused"
+                );
+            }
+            Err(e) => panic!("round {n}: unexpected add error {e:?}"),
+        }
+        assert_eq!(
+            f.store
+                .get_workspace_member_role(&f.ws, &guest.id)
+                .await
+                .expect("role"),
+            None,
+            "round {n}: a revoked principal is never left seated"
+        );
+        assert!(
+            f.store
+                .list_principal_credentials(&guest.id)
+                .await
+                .expect("credentials")
+                .iter()
+                .all(|c| !c.is_active()),
+            "round {n}: every credential is revoked"
+        );
+    }
 }
 
 // --- leave / revokeSelf ----------------------------------------------------

@@ -4509,6 +4509,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `principal.list` (direct member add): the host's credentialed guests
+    /// → `{ principals: [{ principalId, login?, displayName?, avatarUrl?,
+    /// githubUserId? }] }` — every non-primary principal holding at least
+    /// one active (non-revoked) credential, by `createdAt`; a guest that
+    /// revoked itself is omitted (it cannot connect). No params.
+    /// Owner-only: a per-principal (collaborator) wire caller is
+    /// `Forbidden`; the administrator, agents and the daemon pass.
+    fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::principal_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `workspace.members.list` (multiplayer w3): the members of a workspace
     /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
     /// addedAt }], guestCount, guestLimit }`, owners first. `guestCount` is
@@ -4523,6 +4538,27 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_members_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.members.add` (direct member add): attach an existing
+    /// credentialed guest as a collaborator → `{ added: bool, memberCount }`;
+    /// `added: false` when the principal is already a member (idempotent,
+    /// nothing published). Owner-only. `InvalidParams` for an unknown
+    /// principal, the primary principal, or a principal without an active
+    /// credential; `guest-limit` when the workspace's guest cap is spent.
+    /// On an add the same `workspace:updated { members: true,
+    /// addedPrincipalId, memberCount }` an invite join publishes.
+    fn workspace_members_add(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_members_add not implemented".to_string(),
             ))
         })
     }

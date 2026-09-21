@@ -65,6 +65,21 @@ impl WorkspaceGuestCount {
     }
 }
 
+/// Result of [`Store::add_workspace_collaborator_within_cap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollaboratorAddOutcome {
+    /// A `collaborator` row was inserted.
+    Added,
+    /// The principal was already a member (any role); nothing was written.
+    AlreadyMember,
+    /// The principal has no active (unrevoked) credential; nothing was
+    /// written.
+    NoActiveCredential,
+    /// The workspace's committed seats (collaborators plus open invites)
+    /// already reach the cap; nothing was written.
+    WorkspaceFull,
+}
+
 /// Result of [`Store::join_workspace_by_invite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InviteJoinOutcome {
@@ -189,6 +204,29 @@ impl Store {
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list principals failed: {e}")))?;
+        Ok(rows.iter().map(map_principal_row).collect())
+    }
+
+    /// The credentialed guests (`principal.list`): every non-primary
+    /// principal holding at least one active (`revoked_at IS NULL`)
+    /// credential, by `created_at`. A guest whose credentials were all
+    /// revoked (`principal.revokeSelf`) is omitted — it cannot connect.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_credentialed_guest_principals(&self) -> Result<Vec<Principal>> {
+        let sql = format!(
+            "SELECT {PRINCIPAL_COLUMNS} FROM principal p \
+             WHERE p.is_primary = 0 AND EXISTS (\
+                 SELECT 1 FROM principal_credential c \
+                 WHERE c.principal_id = p.id AND c.revoked_at IS NULL) \
+             ORDER BY p.created_at, p.id"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list credentialed guests failed: {e}")))?;
         Ok(rows.iter().map(map_principal_row).collect())
     }
 
@@ -470,6 +508,104 @@ impl Store {
             Ok(res.rows_affected() > 0)
         })
         .await
+    }
+
+    /// Seat a `collaborator` only while the workspace's committed guest
+    /// seats (collaborators plus open invites, the count
+    /// [`Store::count_workspace_guests`] reports and an invite mint spends)
+    /// stay under `max_guests` and the principal holds an active
+    /// credential: the membership check, the credential check, the count
+    /// and the insert run in one `BEGIN IMMEDIATE` transaction, so two
+    /// concurrent adds — or an add racing an invite join, whose cap check
+    /// is inside its own write transaction — cannot both take the last
+    /// seat, and a `revoke_all_principal_credentials` that committed
+    /// before the transaction began is always observed (no seat for a
+    /// principal that can no longer authenticate). The credential predicate
+    /// is evaluated first, so a seated principal whose credentials are all
+    /// revoked is `NoActiveCredential`, not `AlreadyMember`; an already
+    /// seated credentialed principal takes no new seat and is reported
+    /// without a write.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails (including
+    /// an unknown workspace or principal, rejected by the FKs).
+    pub async fn add_workspace_collaborator_within_cap(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        max_guests: u32,
+    ) -> Result<CollaboratorAddOutcome> {
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("capped member add acquire failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("capped member add begin failed: {e}")))?;
+
+        let body_result: Result<CollaboratorAddOutcome> = async {
+            let active_credential: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM principal_credential \
+                    WHERE principal_id = ? AND revoked_at IS NULL LIMIT 1",
+            )
+            .bind(&principal_id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("capped member add credential check failed: {e}"))
+            })?;
+            if active_credential.is_none() {
+                return Ok(CollaboratorAddOutcome::NoActiveCredential);
+            }
+            let already_member: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
+            )
+            .bind(&workspace_id.0)
+            .bind(&principal_id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("capped member add member check failed: {e}")))?;
+            if already_member.is_some() {
+                return Ok(CollaboratorAddOutcome::AlreadyMember);
+            }
+            let sql = format!(
+                "SELECT \
+                    (SELECT COUNT(*) FROM workspace_member m \
+                        WHERE m.workspace_id = ? AND m.role = 'collaborator') + \
+                    (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = ? \
+                        AND {INVITE_OPEN})"
+            );
+            let committed: i64 = sqlx::query_scalar(&sql)
+                .bind(&workspace_id.0)
+                .bind(&workspace_id.0)
+                .bind(now_iso())
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("capped member add guest count failed: {e}"))
+                })?;
+            if u64::try_from(committed).unwrap_or(u64::MAX) >= u64::from(max_guests) {
+                return Ok(CollaboratorAddOutcome::WorkspaceFull);
+            }
+            let insert =
+                format!("INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?)");
+            sqlx::query(&insert)
+                .bind(&workspace_id.0)
+                .bind(&principal_id.0)
+                .bind(WorkspaceRole::Collaborator.as_str())
+                .bind(now_iso())
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_owner_violation(&e, workspace_id, "capped member add"))?;
+            Ok(CollaboratorAddOutcome::Added)
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(conn, body_result, "capped member add commit failed")
+            .await
     }
 
     /// Change an existing member's role. `workspace.owner_principal_id` is

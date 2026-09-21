@@ -140,6 +140,15 @@ impl Harness for V2_4 {
         V1.a2a_sender_note(name, agent_id)
     }
 
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String {
+        V1.collaborator_sender_preamble(login, display_name, principal_id)
+    }
+
     fn wait_duration(&self, secs: i64) -> String {
         V1.wait_duration(secs)
     }

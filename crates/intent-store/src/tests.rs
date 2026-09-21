@@ -8702,6 +8702,96 @@ async fn principal_credential_insert_lookup_touch_revoke() {
     );
 }
 
+/// `list_credentialed_guest_principals` (`principal.list`): a non-primary
+/// principal is listed while at least one of its credentials is active and
+/// exactly once regardless of how many it holds; the primary principal is
+/// never listed even when credentialed; a principal with no credential, or
+/// only revoked ones, is omitted — and reappears once a fresh credential is
+/// minted. Rows come back oldest first.
+#[tokio::test]
+async fn list_credentialed_guest_principals_filters_primary_and_revoked() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let primary = store.get_primary_principal().await.expect("primary");
+    store
+        .insert_principal_credential(&primary.id, &"0".repeat(64))
+        .await
+        .expect("primary credential");
+    assert!(
+        store
+            .list_credentialed_guest_principals()
+            .await
+            .expect("list")
+            .is_empty(),
+        "the primary principal is never a guest"
+    );
+
+    let guest = |login: &str, github_user_id: i64, created_at: &str| Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(github_user_id),
+        login: Some(login.to_string()),
+        display_name: Some(format!("{login} name")),
+        avatar_url: Some(format!("https://example.test/{login}.png")),
+        is_primary: false,
+        created_at: created_at.to_string(),
+        updated_at: created_at.to_string(),
+    };
+    let older = guest("older", 1, "2026-01-01T00:00:00Z");
+    let newer = guest("newer", 2, "2026-01-02T00:00:00Z");
+    let uncredentialed = guest("never", 3, "2026-01-03T00:00:00Z");
+    let revoked = guest("revoked", 4, "2026-01-04T00:00:00Z");
+    for p in [&older, &newer, &uncredentialed, &revoked] {
+        store.upsert_principal(p).await.expect("upsert");
+    }
+    // `older` holds two active credentials: still one row.
+    for hash in [&"1".repeat(64), &"2".repeat(64)] {
+        store
+            .insert_principal_credential(&older.id, hash)
+            .await
+            .expect("older credential");
+    }
+    store
+        .insert_principal_credential(&newer.id, &"3".repeat(64))
+        .await
+        .expect("newer credential");
+    store
+        .insert_principal_credential(&revoked.id, &"4".repeat(64))
+        .await
+        .expect("revoked credential");
+    assert_eq!(
+        store
+            .revoke_all_principal_credentials(&revoked.id)
+            .await
+            .expect("revoke"),
+        1
+    );
+
+    let listed = store
+        .list_credentialed_guest_principals()
+        .await
+        .expect("list");
+    assert_eq!(
+        listed.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+        vec![older.id.clone(), newer.id.clone()],
+        "{listed:?}"
+    );
+    assert_eq!(listed[0], older, "the full principal row is returned");
+
+    // A fresh credential brings a revoked guest back.
+    store
+        .insert_principal_credential(&revoked.id, &"5".repeat(64))
+        .await
+        .expect("re-mint");
+    let listed = store
+        .list_credentialed_guest_principals()
+        .await
+        .expect("list");
+    assert_eq!(
+        listed.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+        vec![older.id, newer.id, revoked.id]
+    );
+}
+
 /// `resolve_active_principal_credential` is the single-statement
 /// resolve+touch behind the WSS bearer seam: an active hash resolves to its
 /// principal and records the use; an unknown or revoked hash resolves to
@@ -9281,6 +9371,318 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
             open_invites: 10,
         },
         "refused joins leave their invites open, and unpinned redeemed ones stay open too"
+    );
+}
+
+/// `add_workspace_collaborator_within_cap` spends the committed seats
+/// (collaborators plus open invites) inside its own `BEGIN IMMEDIATE`
+/// transaction: a full workspace is refused with nothing written, a seated
+/// principal is `AlreadyMember` past the cap, an open invite reserves a
+/// seat against a direct add, and a race of concurrent adds for the last
+/// seat — interleaved with joins for it — never overshoots the cap.
+#[tokio::test]
+async fn add_workspace_collaborator_within_cap_is_atomic() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Capped", false))
+        .await
+        .expect("insert ws");
+    let primary = store.get_primary_principal().await.expect("primary").id;
+    let guests: Vec<Principal> = (1..=12).map(guest_identity).collect();
+    for g in &guests {
+        store.upsert_principal(g).await.expect("guest");
+        store
+            .insert_principal_credential(&g.id, &format!("cred-{}", g.id.0))
+            .await
+            .expect("guest credential");
+    }
+
+    // Cap 0: refused, no row.
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[0].id, 0)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::WorkspaceFull
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &guests[0].id)
+            .await
+            .expect("role"),
+        None
+    );
+    // Cap 1: seated; a second add of the same principal is idempotent even
+    // past the cap; a different guest is refused.
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[0].id, 1)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::Added
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &guests[0].id)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[0].id, 1)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::AlreadyMember
+    );
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[1].id, 1)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::WorkspaceFull
+    );
+    // The owner is a member too, but holds no per-principal credential: the
+    // credential predicate is evaluated first, so it is `NoActiveCredential`
+    // (the service refuses the primary principal before reaching the store);
+    // never a second row either way.
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &primary, 5)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::NoActiveCredential
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &primary)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Owner)
+    );
+    // An open invite reserves a seat against a direct add (cap 2 with one
+    // collaborator and one open invite is full); revoking it frees the seat.
+    store
+        .insert_workspace_invite(&guest_invite("reserved", &ws, &primary))
+        .await
+        .expect("insert invite");
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[1].id, 2)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::WorkspaceFull
+    );
+    store
+        .revoke_workspace_invite("reserved")
+        .await
+        .expect("revoke");
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guests[1].id, 2)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::Added
+    );
+
+    // Race for the last seat: cap 3 with two seated collaborators, eight
+    // concurrent direct adds of distinct guests — exactly one more commits.
+    let mut handles = Vec::new();
+    for g in &guests[2..10] {
+        let store = store.clone();
+        let ws = ws.clone();
+        let id = g.id.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .add_workspace_collaborator_within_cap(&ws, &id, 3)
+                .await
+                .expect("add")
+        }));
+    }
+    let mut added = 0;
+    let mut full = 0;
+    for h in handles {
+        match h.await.expect("task") {
+            crate::CollaboratorAddOutcome::Added => added += 1,
+            crate::CollaboratorAddOutcome::WorkspaceFull => full += 1,
+            crate::CollaboratorAddOutcome::AlreadyMember => {
+                panic!("a first add was reported as already seated")
+            }
+            crate::CollaboratorAddOutcome::NoActiveCredential => {
+                panic!("a credentialed guest was refused for its credential")
+            }
+        }
+    }
+    assert_eq!((added, full), (1, 7));
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.expect("count"),
+        crate::WorkspaceGuestCount {
+            collaborators: 3,
+            open_invites: 0,
+        }
+    );
+
+    // Adds racing joins for one seat (cap 4 with three seated): the open
+    // invite reserves the seat against every add, and the joins' own
+    // transaction admits exactly one of them.
+    store
+        .insert_workspace_invite(&guest_invite("race", &ws, &primary))
+        .await
+        .expect("insert invite");
+    let mut handles = Vec::new();
+    for n in 0..3i64 {
+        let store = store.clone();
+        let ws = ws.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .join_workspace_by_invite(
+                    "race",
+                    &ws,
+                    &guest_identity(500 + n),
+                    &format!("cred-race-{n}"),
+                    None,
+                    4,
+                )
+                .await
+                .expect("join")
+                == crate::InviteJoinOutcome::WorkspaceFull
+        }));
+    }
+    for g in &guests[10..] {
+        let store = store.clone();
+        let ws = ws.clone();
+        let id = g.id.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .add_workspace_collaborator_within_cap(&ws, &id, 4)
+                .await
+                .expect("add")
+                == crate::CollaboratorAddOutcome::WorkspaceFull
+        }));
+    }
+    let mut full = 0;
+    for h in handles {
+        if h.await.expect("task") {
+            full += 1;
+        }
+    }
+    assert_eq!(
+        full, 4,
+        "one of the three joins won the seat; every add saw it reserved"
+    );
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.expect("count"),
+        crate::WorkspaceGuestCount {
+            collaborators: 4,
+            open_invites: 1,
+        },
+        "the reusable invite stays open after its winner joined"
+    );
+}
+
+/// The active-credential predicate is evaluated inside the same write
+/// transaction as the insert (the `principal.revokeSelf` race, intentd#2025):
+/// a principal without a credential, or whose credentials were all revoked
+/// before the transaction began, is `NoActiveCredential` with no row
+/// written; the predicate runs before the membership short-circuit, so a
+/// seated principal whose credentials were revoked is `NoActiveCredential`
+/// too (never `AlreadyMember`), with its row left untouched.
+#[tokio::test]
+async fn add_workspace_collaborator_within_cap_requires_an_active_credential() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Credentialed", false))
+        .await
+        .expect("insert ws");
+    let uncredentialed = guest_identity(21);
+    let revoked = guest_identity(22);
+    let seated = guest_identity(23);
+    for g in [&uncredentialed, &revoked, &seated] {
+        store.upsert_principal(g).await.expect("guest");
+    }
+    for (g, hash) in [(&revoked, "cred-revoked"), (&seated, "cred-seated")] {
+        store
+            .insert_principal_credential(&g.id, hash)
+            .await
+            .expect("credential");
+    }
+
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &uncredentialed.id, 10)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::NoActiveCredential
+    );
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &seated.id, 10)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::Added
+    );
+
+    // The revocation commits before the add's transaction begins — the
+    // ordering `principal.revokeSelf` guarantees by revoking credentials
+    // before it snapshots memberships — so the add is refused, not seated.
+    assert_eq!(
+        store
+            .revoke_all_principal_credentials(&revoked.id)
+            .await
+            .expect("revoke"),
+        1
+    );
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &revoked.id, 10)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::NoActiveCredential
+    );
+    for g in [&uncredentialed, &revoked] {
+        assert_eq!(
+            store
+                .get_workspace_member_role(&ws, &g.id)
+                .await
+                .expect("role"),
+            None,
+            "a refused add leaves no row"
+        );
+    }
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.expect("count"),
+        crate::WorkspaceGuestCount {
+            collaborators: 1,
+            open_invites: 0,
+        }
+    );
+
+    // A seated principal whose credentials are revoked afterwards is
+    // `NoActiveCredential`, not `AlreadyMember`: the contract has no
+    // already-member exception. Nothing is written — the seat is left for
+    // the revocation path to tear down.
+    store
+        .revoke_all_principal_credentials(&seated.id)
+        .await
+        .expect("revoke seated");
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &seated.id, 10)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::NoActiveCredential
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &seated.id)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator),
+        "the refusal writes nothing"
     );
 }
 

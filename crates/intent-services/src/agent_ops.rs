@@ -6208,7 +6208,7 @@ impl Services {
         &self,
         agent_id: AgentId,
         message_id: String,
-        content: String,
+        mut content: String,
         editing: Option<bool>,
     ) -> Result<Value> {
         // Principal stamp (multiplayer w2): an edit by a wire caller makes
@@ -6222,6 +6222,16 @@ impl Services {
             intent_core::current_caller(),
             Some(intent_core::Caller::Wire { .. })
         );
+        // Collaborator sender preamble (multiplayer): the editor's, on the
+        // same human-authored entries the restamp re-attributes. Resolved
+        // (one store read, collaborator callers only) BEFORE the queue lock
+        // is taken; applied to the replacement content below.
+        let preamble = if restamp {
+            self.collaborator_sender_preamble_for_agent(&agent_id)
+                .await?
+        } else {
+            None
+        };
         let (edited, was_editing, now_editing) = {
             let mut guard = self
                 .agent_queues
@@ -6252,6 +6262,9 @@ impl Services {
             } else {
                 None
             };
+            if let Some(preamble) = preamble.as_deref().filter(|_| human_authored) {
+                crate::principal_ops::prepend_collaborator_preamble(&mut content, preamble);
+            }
             queue[position].content = content;
             if let Some(metadata) = restamped {
                 queue[position].message_metadata = metadata;
@@ -8954,6 +8967,23 @@ impl Services {
             .as_deref()
             .and_then(first_nonempty)
             .or_else(|| task_text_msg.clone());
+        // Collaborator sender preamble (multiplayer): `agentInstructions` /
+        // `taskText` are caller-supplied free text that reaches the child's
+        // model verbatim, so a collaborator's text is annotated like every
+        // other human-authored front door — BEFORE the TASK-C wrapper below,
+        // so the preamble heads the first message. The task-note fallback is
+        // note content, not the caller's text, and stays byte-identical; the
+        // helper is a no-op for owner / administrator / agent / absent callers.
+        // The same caller-supplied text also carries the caller's principal
+        // stamp (`fromPrincipalId`, exactly what the `agent.sendMessage` front
+        // door stamps) so the served row's author resolves to the sender, not
+        // the workspace owner; the note-content fallback is left unstamped.
+        let mut message_metadata = None;
+        if let Some(text) = message.as_mut() {
+            self.annotate_collaborator_sender(&workspace_id, text)
+                .await?;
+            message_metadata = crate::principal_ops::stamp_principal_attribution(None)?;
+        }
         // Load the linked task note whenever the delegation names one: the
         // note's title/body feeds the message fallback, the child name
         // derivation, and the TASK-C reference preamble that prefixes the
@@ -9398,12 +9428,15 @@ impl Services {
                             workspace_id,
                             message,
                             None,
-                            crate::agent_manager::TurnOptions::default(),
+                            crate::agent_manager::TurnOptions {
+                                message_metadata: message_metadata.clone(),
+                                ..Default::default()
+                            },
                         )
                         .await
                 }
                 None => {
-                    self.agent_send_message_op(child, message, None, None, None, None)
+                    self.agent_send_message_op(child, message, None, None, None, message_metadata)
                         .await
                 }
             };

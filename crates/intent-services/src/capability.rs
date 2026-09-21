@@ -30,7 +30,7 @@
 //!
 //! Classes: *Member+* (Read / Steer & edit) → [`Services::require_member`];
 //! *Owner-only* (`workspace.delete` / `archive` / `export.*`,
-//! `workspace.members.remove`, `agent.delete`, `hook.runNow` / `cancel`,
+//! `workspace.members.add` / `remove`, `agent.delete`, `hook.runNow` / `cancel`,
 //! `prMonitor.cancel` / `flush`, settings writes) →
 //! [`Services::require_owner`]; *administrator-only* (`mcp.servers.*`,
 //! `host.listDirectory` / `env`, `git.clone`, `github.*` / `linear.*` /
@@ -49,6 +49,7 @@ use intent_core::{
     current_caller, lift_from_principal_id, AgentId, Caller, Error, PrincipalId, Result, Workspace,
     WorkspaceId, WorkspaceRole,
 };
+use intent_store::CollaboratorAddOutcome;
 use serde_json::{json, Value};
 
 use crate::Services;
@@ -446,6 +447,102 @@ impl Services {
         Ok(json!({ "removed": removed }))
     }
 
+    /// `workspace.members.add`: see
+    /// [`intent_core::WorkspaceApi::workspace_members_add`]. Owner-only. The
+    /// principal must be a credentialed guest — it exists, is not the primary
+    /// principal and holds at least one active credential, the same
+    /// predicate `principal.list` rows satisfy — else `InvalidParams`. An
+    /// existing member (either role) is answered `added: false` with nothing
+    /// published; otherwise the guest cap is spent like an invite mint
+    /// (collaborators plus open invites, `guest-limit` at the cap). The
+    /// credential predicate, the cap check and the insert run in one store
+    /// transaction, so concurrent adds cannot overshoot the last seat and a
+    /// `principal.revokeSelf` that commits first can never leave a seated
+    /// member without an active credential (it revokes credentials before
+    /// it snapshots memberships, so an add that committed first is torn
+    /// down by the revocation instead). On insert the `addedPrincipalId`
+    /// `workspace:updated` is published, so the guest's open workspace
+    /// channel (which re-reads under its own caller) upserts the now-visible
+    /// workspace without a reconnect.
+    pub(crate) async fn workspace_members_add_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<Value> {
+        self.require_owner(workspace_id, "workspace.members.add")
+            .await?;
+        self.store.get_workspace(workspace_id).await?;
+        let principal = match self.store.get_principal(principal_id).await {
+            Ok(p) => p,
+            Err(Error::NotFound(_)) => {
+                return Err(Error::InvalidParams(format!(
+                    "unknown principal {principal_id}"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        if principal.is_primary {
+            return Err(Error::InvalidParams(format!(
+                "principal {principal_id} is the primary principal and cannot be added as a guest"
+            )));
+        }
+        let added = self.attach_collaborator(workspace_id, principal_id).await?;
+        let member_count = self.member_count(workspace_id).await?;
+        Ok(json!({ "added": added, "memberCount": member_count }))
+    }
+
+    /// Mirror of [`Self::detach_collaborator`] for a direct add: seat the
+    /// `collaborator` under the guest cap in one store transaction
+    /// ([`intent_store::Store::add_workspace_collaborator_within_cap`]) and,
+    /// when a row was inserted, publish the `addedPrincipalId`
+    /// `workspace:updated` an invite join publishes (`commit_invite_join`
+    /// keeps its own copy: its insert is part of the invite-redemption
+    /// transaction). Returns whether a row was inserted; a full workspace is
+    /// `guest-limit`, a principal without an active credential (checked
+    /// inside the same transaction) is `InvalidParams`.
+    pub(crate) async fn attach_collaborator(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<bool> {
+        let added = match self
+            .store
+            .add_workspace_collaborator_within_cap(
+                workspace_id,
+                principal_id,
+                self.max_guests_per_workspace(),
+            )
+            .await?
+        {
+            CollaboratorAddOutcome::Added => true,
+            CollaboratorAddOutcome::AlreadyMember => false,
+            CollaboratorAddOutcome::NoActiveCredential => {
+                return Err(Error::InvalidParams(format!(
+                    "principal {principal_id} has no active credential on this host"
+                )));
+            }
+            CollaboratorAddOutcome::WorkspaceFull => {
+                return Err(Error::Invite(intent_core::InviteErrorKind::GuestLimit));
+            }
+        };
+        if added {
+            let member_count = self.member_count(workspace_id).await?;
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                crate::workspace_updated_event(
+                    workspace_id,
+                    &json!({
+                        "members": true,
+                        "addedPrincipalId": principal_id,
+                        "memberCount": member_count,
+                    }),
+                ),
+            )
+            .await;
+        }
+        Ok(added)
+    }
+
     /// Shared teardown of a collaborator membership (`members.remove`,
     /// `members.leave`, `principal.revokeSelf`): delete the row, drop the
     /// member's queued messages and publish the `removedPrincipalId`
@@ -696,6 +793,13 @@ mod tests {
     async fn owner_class_by_role() {
         let tmp = TempDb::new();
         let f = fixture(&tmp).await;
+        // A credential for the collaborator so an add of it passes the
+        // credentialed-guest check and lands on the idempotent branch.
+        f.services
+            .store
+            .insert_principal_credential(&f.collaborator, &"c".repeat(64))
+            .await
+            .expect("collaborator credential");
         for role in ROLES {
             let expected = match role {
                 Role::Collaborator => "forbidden",
@@ -720,6 +824,19 @@ mod tests {
                 expected,
                 "workspace.members.remove as {role:?}"
             );
+            // Adding the existing collaborator is the idempotent no-op, so
+            // the fixture survives every column too.
+            let add = f
+                .run(
+                    role,
+                    f.services
+                        .workspace_members_add(f.ws.clone(), f.collaborator.clone()),
+                )
+                .await;
+            assert_eq!(cell(&add), expected, "workspace.members.add as {role:?}");
+            if let Ok(v) = add {
+                assert_eq!(v["added"], false, "{role:?}: {v}");
+            }
         }
         let refused = f
             .run(
@@ -751,6 +868,8 @@ mod tests {
                 .run(role, async { Services::require_administrator("git.clone") })
                 .await;
             assert_eq!(cell(&guard), expected, "require_administrator as {role:?}");
+            let roster = f.run(role, f.services.principal_list()).await;
+            assert_eq!(cell(&roster), expected, "principal.list as {role:?}");
             // `host.exec` through the trait: a collaborator never reaches the
             // runner; an agent (steered by anyone) and the daemon do — the
             // empty args fail on params, past the guard.
@@ -874,6 +993,17 @@ mod tests {
                     .workspace_members_remove(f.ws.clone(), f.outsider.clone())
                     .await
                     .map(drop),
+            ),
+            (
+                "workspace.members.add",
+                f.services
+                    .workspace_members_add(f.ws.clone(), f.outsider.clone())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "principal.list",
+                f.services.principal_list().await.map(drop),
             ),
             (
                 "host.exec",
@@ -1240,6 +1370,124 @@ mod tests {
         assert!(
             matches!(self_remove, Err(Error::InvalidParams(_))),
             "{self_remove:?}"
+        );
+    }
+
+    /// Direct member add: the owner attaches a credentialed guest, which
+    /// answers `{ added: true, memberCount }`, publishes the
+    /// `addedPrincipalId` `workspace:updated`, and makes the guest's next
+    /// read succeed; a second add is `{ added: false }` and publishes
+    /// nothing. An unknown principal, the primary principal and a guest
+    /// without an active credential — including one already seated whose
+    /// credentials were since revoked — are `InvalidParams`.
+    #[tokio::test]
+    async fn add_member_grants_visibility_and_is_idempotent() {
+        let tmp = TempDb::new();
+        let mut f = fixture(&tmp).await;
+        let bus = crate::events::EventBus::new(f.services.store.clone());
+        f.services = f.services.with_event_bus(bus.clone());
+        let mut events = bus.subscribe(crate::events::SubscriptionFilter {
+            event_types: vec!["workspace:updated".into()],
+            workspace_id: Some(f.ws.0.clone()),
+            ..Default::default()
+        });
+        let add = |principal: &PrincipalId| {
+            f.run(
+                Role::Owner,
+                f.services
+                    .workspace_members_add(f.ws.clone(), principal.clone()),
+            )
+        };
+
+        // No credential yet: refused, still a non-member.
+        let refused = add(&f.outsider).await.unwrap_err();
+        assert!(
+            matches!(refused, Error::InvalidParams(ref m) if m.contains("no active credential")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            cell(
+                &f.run(Role::NonMember, f.services.get_workspace(f.ws.clone()))
+                    .await
+            ),
+            "not-found"
+        );
+        let unknown = add(&PrincipalId::new()).await.unwrap_err();
+        assert!(
+            matches!(unknown, Error::InvalidParams(ref m) if m.contains("unknown principal")),
+            "{unknown:?}"
+        );
+        let primary = add(&f.primary).await.unwrap_err();
+        assert!(
+            matches!(primary, Error::InvalidParams(ref m) if m.contains("primary principal")),
+            "{primary:?}"
+        );
+
+        f.services
+            .store
+            .insert_principal_credential(&f.outsider, &"a".repeat(64))
+            .await
+            .expect("outsider credential");
+        let added = add(&f.outsider).await.expect("add");
+        // owner + demoted primary + collaborator + the new guest
+        assert_eq!(added, json!({ "added": true, "memberCount": 4 }));
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("event in time")
+            .expect("event batch");
+        let ev = batch
+            .iter()
+            .find(|e| e.data["changes"]["addedPrincipalId"] == json!(f.outsider.0))
+            .unwrap_or_else(|| panic!("member event: {batch:?}"));
+        assert_eq!(ev.data["workspaceId"], json!(f.ws.0));
+        assert_eq!(ev.data["changes"]["members"], json!(true));
+        assert_eq!(ev.data["changes"]["memberCount"], json!(4));
+        let after = f
+            .run(Role::NonMember, f.services.get_workspace(f.ws.clone()))
+            .await
+            .expect("now a member");
+        assert_eq!(
+            after.membership.as_ref().and_then(|m| m.my_role),
+            Some(WorkspaceRole::Collaborator)
+        );
+
+        let again = add(&f.outsider).await.expect("add again");
+        assert_eq!(again, json!({ "added": false, "memberCount": 4 }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
+                .await
+                .is_err(),
+            "an idempotent add publishes nothing"
+        );
+
+        // Seated, then every credential revoked: the credential predicate
+        // has no already-member exception, so the add is `InvalidParams`
+        // rather than `added: false`, publishes nothing, and leaves the
+        // existing row alone.
+        f.services
+            .store
+            .revoke_all_principal_credentials(&f.outsider)
+            .await
+            .expect("revoke outsider");
+        let seated_revoked = add(&f.outsider).await.unwrap_err();
+        assert!(
+            matches!(seated_revoked, Error::InvalidParams(ref m) if m.contains("no active credential")),
+            "{seated_revoked:?}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
+                .await
+                .is_err(),
+            "a refused add publishes nothing"
+        );
+        assert_eq!(
+            f.services
+                .store
+                .get_workspace_member_role(&f.ws, &f.outsider)
+                .await
+                .expect("role"),
+            Some(WorkspaceRole::Collaborator),
+            "the refusal writes nothing"
         );
     }
 }

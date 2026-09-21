@@ -102,8 +102,12 @@ pub(crate) fn principal_attribution_name(principal: &Principal) -> String {
 /// rejected with `InvalidParams` (the same rule `agent.queueMessage` and
 /// `userAppMessageId` already apply) — a human send must never be credited
 /// to the workspace fallback because its metadata had the wrong shape.
-/// Metadata only — the content is never annotated, so prompts stay
-/// byte-identical.
+/// Metadata only — this stamp never touches the content. The one content
+/// annotation a human message receives is the collaborator sender preamble
+/// ([`Services::annotate_collaborator_sender`]), applied beside the stamp
+/// at the same entry points and only when the bound wire caller is a
+/// `collaborator` member of the target workspace; the owner's (and every
+/// UDS / legacy-token) prompt stays byte-identical.
 pub(crate) fn stamp_principal_attribution(
     message_metadata: Option<Value>,
 ) -> Result<Option<Value>> {
@@ -176,6 +180,171 @@ pub(crate) fn strip_principal_attribution(message_metadata: Option<Value>) -> Op
             Some(Value::Object(obj))
         }
         other => other,
+    }
+}
+
+/// Prepend `preamble` (+ blank line) to a collaborator's message content.
+/// Idempotency is **exact-match**, like the A2A header
+/// (`agent_ops::annotate_sender_attribution`): the caller rebuilds the
+/// preamble from the bound principal's row and this skips only when the
+/// content already starts with exactly that preamble + blank line, so the
+/// layered front doors (`agent.editAndRegenerate` → `agent_send_message_op`)
+/// annotate once and a caller-authored lookalike first line never
+/// suppresses the genuine preamble.
+pub(crate) fn prepend_collaborator_preamble(content: &mut String, preamble: &str) {
+    let annotated_head = format!("{preamble}\n\n");
+    if content.starts_with(&annotated_head) {
+        return;
+    }
+    *content = format!("{annotated_head}{content}");
+}
+
+/// [`prepend_collaborator_preamble`] over a transcript row's `content`
+/// `Value` (`agent.appendMessage`): a string is annotated in place; a
+/// content-block array is annotated on its first `type: "text"` block, or
+/// gains a leading text block carrying the preamble in its canonical
+/// `{preamble}\n\n` shape when it has none (image / file-only rows) so the
+/// model still sees the sender and a second pass recognises that block as
+/// already annotated. Any other shape carries no text the daemon can
+/// annotate and is left unchanged.
+pub(crate) fn prepend_collaborator_preamble_value(content: &mut Value, preamble: &str) {
+    match content {
+        Value::String(text) => prepend_collaborator_preamble(text, preamble),
+        Value::Array(blocks) => {
+            let first_text = blocks.iter_mut().find_map(|block| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| block.get_mut("text"))
+                    .flatten()
+            });
+            if let Some(Value::String(text)) = first_text {
+                prepend_collaborator_preamble(text, preamble);
+            } else {
+                let mut text = String::new();
+                prepend_collaborator_preamble(&mut text, preamble);
+                blocks.insert(0, json!({ "type": "text", "text": text }));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `true` when the bound caller is a per-principal (collaborator-class)
+/// wire connection — the only caller class that can carry the
+/// collaborator sender preamble. Cheap pre-check so the owner / agent /
+/// daemon paths never pay a store read for it.
+fn is_collaborator_class_caller() -> bool {
+    matches!(
+        current_caller(),
+        Some(Caller::Wire {
+            is_administrator: false,
+            ..
+        })
+    )
+}
+
+impl Services {
+    /// The collaborator sender preamble for a human message into
+    /// `workspace_id` (multiplayer): `Some(text)` only when the bound caller
+    /// is a per-principal wire connection whose membership role there is
+    /// `collaborator`. The owner (any role `owner`, the administrator, UDS
+    /// and legacy-token callers), agents, the daemon and an absent caller
+    /// get `None`. The text is
+    /// [`crate::harness::Harness::collaborator_sender_preamble`] rendered
+    /// from the principal row's `login` / `display_name` (a vanished row
+    /// falls back to the principal id).
+    pub(crate) async fn collaborator_sender_preamble(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<String>> {
+        let Some(Caller::Wire {
+            principal_id,
+            is_administrator: false,
+        }) = current_caller()
+        else {
+            return Ok(None);
+        };
+        let role = self
+            .store
+            .get_workspace_member_role(workspace_id, &principal_id)
+            .await?;
+        if role != Some(intent_core::WorkspaceRole::Collaborator) {
+            return Ok(None);
+        }
+        let (login, display_name) = match self.store.get_principal(&principal_id).await {
+            Ok(principal) => (principal.login, principal.display_name),
+            Err(Error::NotFound(_)) => (None, None),
+            Err(e) => return Err(e),
+        };
+        Ok(Some(crate::harness::latest().collaborator_sender_preamble(
+            login.as_deref(),
+            display_name.as_deref(),
+            &principal_id.0,
+        )))
+    }
+
+    /// Prepend the collaborator sender preamble to `content` when
+    /// [`Self::collaborator_sender_preamble`] yields one for `workspace_id`;
+    /// a no-op (content byte-identical) otherwise. Applied at every
+    /// human-authored entry point BEFORE the payload is persisted or
+    /// enqueued, beside [`stamp_principal_attribution`], so direct persists,
+    /// queue entries and their drain all carry the same content the model
+    /// sees.
+    pub(crate) async fn annotate_collaborator_sender(
+        &self,
+        workspace_id: &WorkspaceId,
+        content: &mut String,
+    ) -> Result<()> {
+        if let Some(preamble) = self.collaborator_sender_preamble(workspace_id).await? {
+            prepend_collaborator_preamble(content, &preamble);
+        }
+        Ok(())
+    }
+
+    /// [`Self::collaborator_sender_preamble`] keyed by the target agent
+    /// (`agent.queueMessage`, `agent.editQueuedMessage`): resolves the
+    /// agent's workspace with one metadata-only read, collaborator-class
+    /// callers only.
+    pub(crate) async fn collaborator_sender_preamble_for_agent(
+        &self,
+        agent_id: &intent_core::AgentId,
+    ) -> Result<Option<String>> {
+        if !is_collaborator_class_caller() {
+            return Ok(None);
+        }
+        let workspace_id = self.agent_workspace(agent_id).await?;
+        self.collaborator_sender_preamble(&workspace_id).await
+    }
+
+    /// [`Self::annotate_collaborator_sender`] keyed by the target agent.
+    pub(crate) async fn annotate_collaborator_sender_for_agent(
+        &self,
+        agent_id: &intent_core::AgentId,
+        content: &mut String,
+    ) -> Result<()> {
+        if let Some(preamble) = self
+            .collaborator_sender_preamble_for_agent(agent_id)
+            .await?
+        {
+            prepend_collaborator_preamble(content, &preamble);
+        }
+        Ok(())
+    }
+
+    /// [`Self::annotate_collaborator_sender_for_agent`] over a transcript
+    /// row's `content` `Value` (`agent.appendMessage`, `user` rows), see
+    /// [`prepend_collaborator_preamble_value`] for the per-shape rule.
+    pub(crate) async fn annotate_collaborator_sender_value_for_agent(
+        &self,
+        agent_id: &intent_core::AgentId,
+        content: &mut Value,
+    ) -> Result<()> {
+        if let Some(preamble) = self
+            .collaborator_sender_preamble_for_agent(agent_id)
+            .await?
+        {
+            prepend_collaborator_preamble_value(content, &preamble);
+        }
+        Ok(())
     }
 }
 
@@ -433,6 +602,30 @@ impl Services {
         Ok(principal_to_wire(&principal, is_administrator))
     }
 
+    /// `principal.list`: see [`intent_core::WorkspaceApi::principal_list`].
+    /// Owner-only via the administrator gate: the method is not scoped to a
+    /// workspace and the primary user owns every workspace (no transfer
+    /// RPC), so a per-principal wire caller is refused outright.
+    pub(crate) async fn principal_list_op(&self) -> Result<Value> {
+        Self::require_administrator("principal.list")?;
+        let principals: Vec<Value> = self
+            .store
+            .list_credentialed_guest_principals()
+            .await?
+            .iter()
+            .map(|p| {
+                json!({
+                    "principalId": p.id,
+                    "login": p.login,
+                    "displayName": p.display_name,
+                    "avatarUrl": p.avatar_url,
+                    "githubUserId": p.github_user_id,
+                })
+            })
+            .collect();
+        Ok(json!({ "principals": principals }))
+    }
+
     /// Spawn a rate-limited, bounded background refresh of the primary
     /// principal's GitHub identity from `GET /user`. Detached: the read that
     /// triggered it never waits, and any failure (not configured, offline,
@@ -675,6 +868,77 @@ mod tests {
             created_at: now_iso(),
             updated_at: now_iso(),
         }
+    }
+
+    /// `principal.list`: the daemon (and the administrator) get every
+    /// non-primary principal with an active credential — full profile
+    /// fields, `githubUserId` included, oldest first — while the primary
+    /// principal and a guest whose credentials were all revoked are omitted.
+    /// A per-principal wire caller is `Forbidden`, whatever its workspace
+    /// roles; an agent passes like the daemon.
+    #[intent_test_macros::daemon_test]
+    async fn principal_list_is_owner_only_and_lists_credentialed_guests() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let primary = store.get_primary_principal().await.expect("primary");
+        store
+            .insert_principal_credential(&primary.id, &"0".repeat(64))
+            .await
+            .expect("primary credential");
+        let mut active = principal("active");
+        active.github_user_id = Some(42);
+        let mut revoked = principal("revoked");
+        revoked.created_at = "2026-01-01T00:00:00Z".to_string();
+        let uncredentialed = principal("never");
+        for p in [&active, &revoked, &uncredentialed] {
+            store.upsert_principal(p).await.expect("upsert");
+        }
+        store
+            .insert_principal_credential(&active.id, &"1".repeat(64))
+            .await
+            .expect("active credential");
+        store
+            .insert_principal_credential(&revoked.id, &"2".repeat(64))
+            .await
+            .expect("revoked credential");
+        store
+            .revoke_all_principal_credentials(&revoked.id)
+            .await
+            .expect("revoke");
+        let services = Services::new(store);
+
+        let listed = services.principal_list_op().await.expect("daemon lists");
+        assert_eq!(
+            listed,
+            json!({ "principals": [{
+                "principalId": active.id.0,
+                "login": "active",
+                "displayName": "active name",
+                "avatarUrl": "https://example.test/active.png",
+                "githubUserId": 42,
+            }] })
+        );
+
+        let administrator = Caller::Wire {
+            principal_id: primary.id.clone(),
+            is_administrator: true,
+        };
+        let as_admin = with_caller(administrator, services.principal_list_op()).await;
+        assert_eq!(as_admin.expect("administrator lists"), listed);
+        let agent = Caller::Agent {
+            agent_id: AgentId::new(),
+        };
+        let as_agent = with_caller(agent, services.principal_list_op()).await;
+        assert_eq!(as_agent.expect("agent lists"), listed);
+
+        let refused = with_caller(wire(&active.id), services.principal_list_op())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, Error::Forbidden(ref m) if m.contains("principal.list")),
+            "{refused:?}"
+        );
+        assert_eq!(refused.code(), -32003);
     }
 
     /// A wire caller's principal overwrites a client-supplied stamp, is

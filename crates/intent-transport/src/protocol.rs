@@ -553,8 +553,53 @@
 //! `redemptionCount`, with `redeemedAt` / `redeemedByPrincipalId` naming
 //! the latest redemption; `openInviteCount` / `guestCount` count a
 //! reusable invite as open while it is unexpired and unrevoked, redeemed
-//! or not. The catalog contains
-//! 326 router methods, 56 fast-path methods, and two aliases: 384
+//! or not. Also within 10.3 (behavior only), the collaborator sender
+//! preamble: a human message sent by a per-principal wire caller whose
+//! role in the target workspace is `collaborator` (`agent.sendMessage`
+//! user-origin, `agent.sendToTask`, `agent.queueMessage`,
+//! `agent.editAndRegenerate`, a collaborator's `agent.editQueuedMessage`
+//! of a human-authored entry, a `role: user` row of
+//! `agent.appendMessage` (string content, or the first `text` block of a
+//! block array — a text-less array gains a leading text block; other roles
+//! byte-identical), and the free text of `agent.wakeOrCreate`
+//! (`contextMessage`) and `agent.delegate` (`agentInstructions` /
+//! `taskText`; not the task-note fallback) — both
+//! refused to collaborators at the transport gate (`-32003`), so their
+//! service-level preamble is defense in depth) is persisted — and delivered
+//! to the model — with the
+//! daemon-prepended single-line paragraph `Message from @{login}
+//! ({displayName}), a collaborator (guest) of this workspace — not the
+//! workspace owner.` plus a blank line above the caller's text (login-only
+//! / display-name-only / `principal {id}` fallbacks). Idempotent by exact
+//! match, like the `[MESSAGE FROM AGENT …]` header; the owner's, the
+//! administrator's and every UDS / legacy-token send stay byte-identical,
+//! and the `fromPrincipalId` stamp is unchanged. Intentional exception: a
+//! collaborator's `agent.editQueuedMessage` of an agent-authored (A2A /
+//! automatic) entry is not preambled — its sender stays the originating
+//! agent's header; the edit is recorded by the stamp only. Also within
+//! 10.3, direct member add (additive): `principal.list` (owner-only, no
+//! params) → `{ principals: [{ principalId, login?, displayName?,
+//! avatarUrl?, githubUserId? }] }`, every non-primary principal holding at
+//! least one active (non-revoked) credential, by creation time; a guest
+//! that revoked itself is omitted. A per-principal (collaborator) caller
+//! is `-32003`. `workspace.members.add { workspaceId, principalId }`
+//! (owner-only) → `{ added, memberCount }`: attaches such a guest as a
+//! collaborator; `added: false` when already a member (idempotent, nothing
+//! published); `-32602` for an unknown principal, the primary principal, a
+//! principal without an active credential (`invalid-params`) or a spent
+//! guest cap (`guest-limit`; collaborators plus open invites). The
+//! credential predicate, the cap check and the seat are one store
+//! transaction, so concurrent adds cannot overshoot the last seat and a
+//! `principal.revokeSelf` racing the add (which revokes credentials before
+//! it drops memberships) never leaves a seated member without an active
+//! credential. The seated count is protected at redemption, not at mint:
+//! an invite minted concurrently with a direct add may be refused
+//! `workspace-full` at join. An add publishes the same `workspace:updated
+//! { changes: { members: true, addedPrincipalId, memberCount } }` an invite
+//! join does, so the guest's open `workspace` channel — whose forwarder
+//! re-reads under the guest's own caller — upserts the now-visible row as
+//! an `updated` delta without a reconnect. The catalog contains
+//! 328 router methods, 56 fast-path methods, and two aliases: 386
 //! client-callable names.
 
 //! Version 10.3 adds optional `system.requestUpdate.targetVersion` and
@@ -581,8 +626,8 @@
 //! `host`, the `device-grant-unsupported` / `source-control-unauthorized`
 //! typed errors, the `sourceControl:auth-changed { provider, host, status }`
 //! event and the `sourceControl.gitlab.*` settings. The `github.*` auth
-//! quintet is served as byte-identical aliases. The catalog contains 332
-//! router methods, 56 fast-path methods, and two aliases: 390
+//! quintet is served as byte-identical aliases. The catalog contains 334
+//! router methods, 56 fast-path methods, and two aliases: 392
 //! client-callable names.
 
 use std::sync::Mutex;
