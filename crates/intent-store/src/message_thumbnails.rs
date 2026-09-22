@@ -107,9 +107,15 @@ pub(crate) fn needs_dimensions(content: &Value) -> bool {
         .is_some_and(|blocks| blocks.iter().any(image_block_needs_dimensions))
 }
 
+/// A slim-read block (`dataIsThumbnail: true`) carries the downscaled
+/// thumbnail as `data`, so decoding it would record the thumbnail's size as
+/// the original's. Such a block is stampable only through dimensions it
+/// already carries; a pre-v10.7 one re-persisted by a transfer/replace stays
+/// without `width`/`height` rather than lying about them.
 fn image_block_needs_dimensions(block: &Value) -> bool {
     block.get("type").and_then(Value::as_str) == Some("image")
         && block.get("data").and_then(Value::as_str).is_some()
+        && block.get("dataIsThumbnail").and_then(Value::as_bool) != Some(true)
         && !(block.get("width").and_then(Value::as_u64).is_some()
             && block.get("height").and_then(Value::as_u64).is_some())
 }
@@ -378,5 +384,31 @@ mod tests {
         assert!(!stamp_image_dimensions(&mut content));
         assert_eq!(content[0]["width"], 1024);
         assert_eq!(content[0]["height"], 768);
+    }
+
+    /// A pre-v10.7 slim-read block (`dataIsThumbnail: true`, no dimensions)
+    /// re-persisted by a transfer/replace is NOT stamped: its `data` is the
+    /// downscaled thumbnail, so decoding it would record the thumbnail's size
+    /// as the original's. The block stays dimensionless; a sibling full
+    /// image block in the same message is still stamped.
+    #[test]
+    fn legacy_thumbnail_block_without_dimensions_is_not_stamped() {
+        let thumb = noise_png_base64(8, 8);
+        let full = noise_png_base64(16, 4);
+        let mut content = json!([
+            { "type": "image", "data": thumb, "mimeType": "image/png",
+              "dataIsThumbnail": true, "dataTruncated": true, "dataBytes": 123_456 },
+            { "type": "image", "data": full, "mimeType": "image/png" },
+        ]);
+        let legacy_before = content[0].clone();
+        assert!(needs_dimensions(&content), "sibling full image needs dims");
+        assert!(stamp_image_dimensions(&mut content));
+        assert_eq!(content[0], legacy_before, "thumbnail block untouched");
+        assert_eq!(content[1]["width"], 16);
+        assert_eq!(content[1]["height"], 4);
+        let mut only_legacy = json!([legacy_before.clone()]);
+        assert!(!needs_dimensions(&only_legacy));
+        assert!(!stamp_image_dimensions(&mut only_legacy));
+        assert_eq!(only_legacy[0], legacy_before);
     }
 }

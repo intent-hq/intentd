@@ -6911,6 +6911,104 @@ mod tests {
         );
     }
 
+    /// Legacy transfer/replace path (pre-v10.7 slim shape): a
+    /// `dataIsThumbnail: true` image block WITHOUT `width`/`height` re-persisted
+    /// via `replace_agent_messages` must stay dimensionless — its `data` is the
+    /// downscaled thumbnail, so decoding it would record the thumbnail's size
+    /// as the original's. A sibling full image block in the same replaced
+    /// message is still stamped, and a slim block that already carries the
+    /// original dimensions keeps them.
+    #[tokio::test]
+    async fn replace_leaves_legacy_thumbnail_blocks_unstamped() {
+        use base64::Engine as _;
+        use intent_core::now_iso;
+
+        fn noise_png(w: u32, h: u32) -> String {
+            let img = image::RgbImage::from_fn(w, h, |x, y| {
+                let v = (x.wrapping_mul(31).wrapping_add(y.wrapping_mul(17)) % 251) as u8;
+                image::Rgb([v, v.wrapping_add(97), v.wrapping_add(193)])
+            });
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .expect("encode test png");
+            base64::engine::general_purpose::STANDARD.encode(&buf)
+        }
+
+        let tmp = TempDb::new("test-legacy-thumb-replace");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-legacy-thumb".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-legacy-thumb".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "placeholder" }]),
+                &ts,
+            )
+            .await
+            .expect("append placeholder");
+
+        let thumb = noise_png(8, 8);
+        let full = noise_png(16, 4);
+        let legacy = serde_json::json!({
+            "type": "image", "data": thumb, "mimeType": "image/png",
+            "dataIsThumbnail": true, "dataTruncated": true, "dataBytes": 123_456,
+        });
+        let stamped_slim = serde_json::json!({
+            "type": "image", "data": thumb, "mimeType": "image/png",
+            "dataIsThumbnail": true, "width": 1024, "height": 768,
+        });
+        let content = serde_json::json!([
+            legacy.clone(),
+            { "type": "image", "data": full, "mimeType": "image/png" },
+            stamped_slim.clone(),
+        ]);
+        let swapped = store
+            .replace_agent_messages(
+                &agent_id,
+                &[ReplaceMessage {
+                    role: "user",
+                    content: &content,
+                    metadata: None,
+                    created_at: &ts,
+                }],
+            )
+            .await
+            .expect("replace");
+        assert_eq!(swapped.len(), 1);
+        assert_eq!(
+            swapped[0].content[0], legacy,
+            "legacy thumbnail block returned unstamped"
+        );
+        assert_eq!(swapped[0].content[1]["width"], 16);
+        assert_eq!(swapped[0].content[1]["height"], 4);
+        assert_eq!(swapped[0].content[2], stamped_slim);
+
+        let stored = store
+            .get_agent_message_by_id(&agent_id, &swapped[0].id)
+            .await
+            .expect("read stored row")
+            .expect("row exists");
+        assert_eq!(
+            stored.content[0], legacy,
+            "legacy thumbnail block persisted unstamped: {}",
+            stored.content
+        );
+        assert_eq!(stored.content[1]["width"], 16);
+        assert_eq!(stored.content[1]["height"], 4);
+        assert_eq!(stored.content[2], stamped_slim);
+    }
+
     /// 0108 heavy-payload extraction: an over-threshold `tool_result.output`
     /// / `tool_use.input` body is externalized into `agent_message_payload`
     /// (the stored `content` column carries a `null` placeholder) and every
