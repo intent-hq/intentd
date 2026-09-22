@@ -23,9 +23,10 @@
 //!
 //! Where a `#[cfg(test)]` item ends: one introduced by `const` / `static` /
 //! `type` / `use` (any `const` other than `const fn`), a statement-level
-//! `let` (including `let … else { … };`), or a `mod name;` declaration ends
-//! at the first `;` at depth 0, so an initializer with its own blocks is
-//! skipped whole; one introduced by `fn` / `mod` / `impl` /
+//! `let` (including `let … else { … };`, but not the `let` of an `if let` /
+//! `while let`), or a `mod name;` declaration ends at the first `;` at depth
+//! 0, so an initializer with its own blocks is skipped whole; one introduced
+//! by `fn` / `mod` / `impl` /
 //! `struct` / `enum` / `union` / `trait` / `macro_rules` ends at the `}`
 //! closing its body, or at a `;` at depth 0 seen first (`struct X;`, a trait
 //! method signature). Anything else falls back to the first balanced `}` or
@@ -63,9 +64,9 @@ const BODY_ITEM_KEYWORDS: &[&str] = &[
     "trait",
     "macro_rules",
 ];
-/// Items (and the statement-level `let`) that end at the first `;` at depth
-/// 0, whatever blocks their initializer contains.
-const SEMICOLON_ITEM_KEYWORDS: &[&str] = &["const", "static", "type", "use", "let"];
+/// Items that end at the first `;` at depth 0, whatever blocks their
+/// initializer contains. A leading `let` does too; see [`item_shape`].
+const SEMICOLON_ITEM_KEYWORDS: &[&str] = &["const", "static", "type", "use"];
 /// Qualifiers that turn `const` into `const fn` / `const unsafe fn` / ….
 const FN_QUALIFIERS: &[&str] = &["fn", "unsafe", "extern", "async"];
 
@@ -550,11 +551,15 @@ struct ItemShape {
 
 /// Looks past further attributes and qualifiers (`pub(crate)`, `unsafe`, …)
 /// to the item keyword; an unrecognized item is treated as body-terminated.
+/// A `let` statement takes no qualifiers, so `let` ends at a `;` only as the
+/// first word after the attribute(s); preceded by another word (`if let`,
+/// `while let`) it introduces a body-terminated construct.
 fn item_shape(chars: &[char], mut j: usize) -> ItemShape {
     let body = ItemShape {
         ends_at_semicolon: false,
         out_of_line_mod: None,
     };
+    let mut seen_word = false;
     loop {
         j = skip_whitespace(chars, j);
         match chars.get(j) {
@@ -571,6 +576,13 @@ fn item_shape(chars: &[char], mut j: usize) -> ItemShape {
                     return body;
                 };
                 j = next;
+                let leading = !std::mem::replace(&mut seen_word, true);
+                if word == "let" {
+                    return ItemShape {
+                        ends_at_semicolon: leading,
+                        out_of_line_mod: None,
+                    };
+                }
                 if word == "mod" {
                     let after = skip_whitespace(chars, j);
                     if let Some((name, end)) = word_at(chars, after) {
@@ -1074,6 +1086,61 @@ fn with_let_else(y: Option<u8>) -> u8 {
         let ranges = cfg_test_item_ranges(&chars);
         assert_eq!(ranges.len(), 1);
         assert_eq!(chars[ranges[0].1 - 1], ';');
+    }
+
+    #[test]
+    fn cfg_test_if_let_ends_at_its_body_and_keeps_the_production_line_after_it() {
+        let src = "\
+fn with_if_let(y: Option<u8>) {
+    #[cfg(test)]
+    if let Some(x) = y { consume(x); } else { fallback(); }
+    production_after_if_let(y);
+    more_production(y);
+}
+";
+        let text = production_text(src);
+        assert!(
+            !text.contains("consume(x)"),
+            "the `if let` body is blanked:\n{text}"
+        );
+        for needle in ["production_after_if_let(y);", "more_production(y);"] {
+            assert_eq!(
+                line_of(&text, needle),
+                line_of(src, needle),
+                "the production line after the `if let` survives:\n{text}"
+            );
+        }
+
+        let chars: Vec<char> = lex(src).blanked.chars().collect();
+        let ranges = cfg_test_item_ranges(&chars);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(chars[ranges[0].1 - 1], '}');
+    }
+
+    #[test]
+    fn cfg_test_while_let_ends_at_its_body_and_keeps_the_production_line_after_it() {
+        let src = "\
+fn with_while_let(mut it: impl Iterator<Item = u8>) {
+    #[cfg(test)]
+    while let Some(x) = it.next() { consume(x); }
+    production_after_while_let();
+}
+";
+        let text = production_text(src);
+        assert!(
+            !text.contains("consume(x)"),
+            "the `while let` body is blanked:\n{text}"
+        );
+        assert_eq!(
+            line_of(&text, "production_after_while_let();"),
+            line_of(src, "production_after_while_let();"),
+            "the production line after the `while let` survives:\n{text}"
+        );
+
+        let chars: Vec<char> = lex(src).blanked.chars().collect();
+        let ranges = cfg_test_item_ranges(&chars);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(chars[ranges[0].1 - 1], '}');
     }
 
     #[test]
