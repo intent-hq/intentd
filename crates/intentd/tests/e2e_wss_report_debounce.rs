@@ -395,34 +395,36 @@ fn blocks_text(message: &Value) -> String {
     serde_json::to_string(&message["contentBlocks"]).unwrap_or_default()
 }
 
-/// Serialized conversation text for an agent.
-async fn conversation_text(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> String {
-    let convo = wss_rpc(
+/// The `agent.getConversation` page for an agent.
+async fn conversation_page(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> Value {
+    wss_rpc(
         rpc,
         id,
         "agent.getConversation",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
-    .await;
-    convo.to_string()
+    .await
 }
 
 /// Poll until the agent's conversation stops changing across two consecutive
-/// reads 400ms apart (all queued wake turns drained). Returns the settled text.
+/// reads 400ms apart (all queued wake turns drained). "Changing" is judged on
+/// the `common::conversation_fingerprint` (persisted row identity/content),
+/// not the raw payload, so read-time `author` hydration cannot keep the loop
+/// spinning (intent-hq/intent#5603). Returns the settled page.
 async fn await_conversation_settled(
     rpc: &mut TlsWs,
     req_id: &mut i64,
     ws_id: &str,
     agent_id: &str,
     deadline: tokio::time::Instant,
-) -> String {
-    let mut prev = conversation_text(rpc, *req_id, ws_id, agent_id).await;
+) -> Value {
+    let mut prev = conversation_page(rpc, *req_id, ws_id, agent_id).await;
     *req_id += 1;
     loop {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let next = conversation_text(rpc, *req_id, ws_id, agent_id).await;
+        let next = conversation_page(rpc, *req_id, ws_id, agent_id).await;
         *req_id += 1;
-        if next == prev {
+        if common::conversation_fingerprint(&next) == common::conversation_fingerprint(&prev) {
             return next;
         }
         prev = next;
@@ -644,7 +646,8 @@ async fn debounced_report_combined_with_completion_wake_over_wss() {
         &parent,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         !text.contains("reported. Report:"),
         "no separate progress wake was delivered: {text}"
