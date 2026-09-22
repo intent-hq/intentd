@@ -1875,6 +1875,11 @@ pub struct NoteUpdateMetadataResult {
     pub skipped: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The note's `rev` after the write: the base a follow-up conditional
+    /// write should send as `expectedVersion`. Absent on the `skipped` arm,
+    /// which writes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<i64>,
 }
 
 /// Result of `note.delete`.

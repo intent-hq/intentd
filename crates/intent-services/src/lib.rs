@@ -23073,6 +23073,11 @@ impl WorkspaceApi for Services {
                     .update_note_metadata_versioned(&note, expected_version)
                     .await?;
             }
+            // Return the row as committed — the bumped `rev`, the stored
+            // `updated_at`, and (on the metadata arm) any content a
+            // concurrent write landed — rather than the pre-write copy
+            // (intent-hq/intent#5589).
+            note = fetch_note(&store, &workspace_id, &note_id).await?;
             if let Some(plan) = reanchor_plan {
                 plan.apply_orphaned(&store, &workspace_id).await?;
             }
@@ -23513,13 +23518,16 @@ impl WorkspaceApi for Services {
                     updated_at: None,
                     skipped: Some(true),
                     reason: Some("spec title cannot be modified".to_string()),
+                    rev: None,
                 });
             }
-            let now = now_iso();
-            note.updated_at = now.clone();
+            note.updated_at = now_iso();
             store
                 .update_note_metadata_versioned(&note, expected_version)
                 .await?;
+            // Report the row as committed (intent-hq/intent#5589): the
+            // bumped `rev` and stored `updated_at`, not the pre-write copy.
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -23536,9 +23544,10 @@ impl WorkspaceApi for Services {
                 note_id: note.id,
                 title: Some(note.title),
                 tags: Some(note.tags),
-                updated_at: Some(now),
+                updated_at: Some(note.updated_at),
                 skipped: None,
                 reason: None,
+                rev: Some(note.rev),
             })
         })
     }
