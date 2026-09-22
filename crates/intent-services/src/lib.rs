@@ -44,8 +44,8 @@ use intent_core::{
     TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRoot,
-    WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
-    WorkspaceUpdate,
+    WorkspaceGitRootId, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient};
 use intent_store::{EventQuery, NewEvent, Store};
@@ -504,6 +504,14 @@ pub struct Services {
     /// generation up front and commits the fallback subject. In-memory only,
     /// shared across clones like the other registries.
     auto_commit_cooldowns: Arc<Mutex<HashMap<WorkspaceId, std::time::Instant>>>,
+    /// Per-workspace setup-stage state (§6.5 lifecycle) backing
+    /// [`WorkspaceApi::workspace_setup_status`]: written at every
+    /// `workspace:setup:started` / `workspace:setup:completed` publish site
+    /// (create, duplicate, transfer import, skip-worktree) and set to
+    /// `pending` before the initial agent's first message is sent so a turn
+    /// started at create time can observe it. In-memory only — a workspace
+    /// absent from the map reads `unknown` — shared across clones.
+    workspace_setup_states: WorkspaceSetupStates,
     /// Daemon-global parent→child completion-watch registry (AS-2). One table
     /// for all workspaces: each watch/group carries its own workspace anchors
     /// (parent home + child workspace), so the same code path serves
@@ -1288,6 +1296,7 @@ impl Services {
             auto_commit_timeout_ms: None,
             auto_commit_cooldown_ms: None,
             auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            workspace_setup_states: Arc::new(Mutex::new(HashMap::new())),
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
@@ -13035,6 +13044,89 @@ pub(crate) fn workspace_setup_completed_event(
     }
 }
 
+/// Shared per-workspace setup-stage state map (see
+/// [`Services::workspace_setup_states`]).
+pub(crate) type WorkspaceSetupStates = Arc<Mutex<HashMap<WorkspaceId, WorkspaceSetupStatus>>>;
+
+/// Record `pending` for `workspace_id`: the worktree exists and the setup
+/// stage is about to resolve its effective script. Called synchronously in
+/// `workspace.create` before the initial agent's message is sent.
+pub(crate) fn record_setup_pending(states: &WorkspaceSetupStates, workspace_id: &WorkspaceId) {
+    states
+        .lock()
+        .expect("workspace setup state map poisoned")
+        .insert(
+            workspace_id.clone(),
+            WorkspaceSetupStatus::new(WorkspaceSetupState::Pending),
+        );
+}
+
+/// Record `skipped` for `workspace_id`: the setup stage never runs (no
+/// effective script, `skipWorktree`, duplicate, transfer import). Pairs with
+/// the immediate `workspace:setup:completed { ranScript: false }` publish.
+pub(crate) fn record_setup_skipped(states: &WorkspaceSetupStates, workspace_id: &WorkspaceId) {
+    let mut record = WorkspaceSetupStatus::new(WorkspaceSetupState::Skipped);
+    record.finished_at = Some(now_iso());
+    states
+        .lock()
+        .expect("workspace setup state map poisoned")
+        .insert(workspace_id.clone(), record);
+}
+
+/// Record `running` for `workspace_id`: a script was resolved and a spawn
+/// will be attempted. Pairs with `workspace:setup:started`; the terminal id
+/// is attached by [`record_setup_terminal`] once the spawn succeeds.
+pub(crate) fn record_setup_running(states: &WorkspaceSetupStates, workspace_id: &WorkspaceId) {
+    let mut record = WorkspaceSetupStatus::new(WorkspaceSetupState::Running);
+    record.started_at = Some(now_iso());
+    states
+        .lock()
+        .expect("workspace setup state map poisoned")
+        .insert(workspace_id.clone(), record);
+}
+
+/// Attach the spawned setup terminal's id to the `running` record.
+pub(crate) fn record_setup_terminal(
+    states: &WorkspaceSetupStates,
+    workspace_id: &WorkspaceId,
+    terminal_id: &str,
+) {
+    if let Some(record) = states
+        .lock()
+        .expect("workspace setup state map poisoned")
+        .get_mut(workspace_id)
+    {
+        record.terminal_id = Some(terminal_id.to_string());
+    }
+}
+
+/// Record the terminal state of a setup stage that was `started`: `completed`
+/// when the script ran to an observed exit `0`, else `failed` (non-zero exit,
+/// unobserved exit, or a spawn / pre-spawn failure — `exit_code` is then
+/// whatever was observed, possibly nothing). The `terminalId` / `startedAt`
+/// recorded by [`record_setup_running`] are kept. Pairs with the
+/// `workspace:setup:completed` publish carrying the same `ran_script` /
+/// `exit_code`.
+pub(crate) fn record_setup_finished(
+    states: &WorkspaceSetupStates,
+    workspace_id: &WorkspaceId,
+    ran_script: bool,
+    exit_code: Option<u32>,
+) {
+    let state = if ran_script && exit_code == Some(0) {
+        WorkspaceSetupState::Completed
+    } else {
+        WorkspaceSetupState::Failed
+    };
+    let mut map = states.lock().expect("workspace setup state map poisoned");
+    let record = map
+        .entry(workspace_id.clone())
+        .or_insert_with(|| WorkspaceSetupStatus::new(state));
+    record.state = state;
+    record.exit_code = exit_code;
+    record.finished_at = Some(now_iso());
+}
+
 /// Publish a `workspace:created` event for a workspace row inserted outside
 /// the `Services` surface (the legacy importer writes through `Store`
 /// directly, so `create_workspace`'s own publish never fires). Best-effort
@@ -18206,6 +18298,15 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn workspace_setup_status(&self, id: &WorkspaceId) -> WorkspaceSetupStatus {
+        self.workspace_setup_states
+            .lock()
+            .expect("workspace setup state map poisoned")
+            .get(id)
+            .cloned()
+            .unwrap_or_else(WorkspaceSetupStatus::unknown)
+    }
+
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let this = self.clone();
@@ -20092,6 +20193,24 @@ impl WorkspaceApi for Services {
                     // the stored result instead of re-sending. An empty/missing
                     // prompt persists the row without a message; the FE first
                     // send starts the turn.
+                    //
+                    // Setup state (§6.5): recorded BEFORE the initial agent's
+                    // message is sent so a turn started at create time can
+                    // observe the in-progress stage via
+                    // `ws.workspace.details().setupStatus`. `pending` when a
+                    // worktree exists (the effective script is resolved by the
+                    // background task below); `skipped` when the stage never
+                    // runs (skipWorktree / no worktree provisioned).
+                    let setup_worktree = if ws.skip_worktree {
+                        None
+                    } else {
+                        crate::git_ops::worktree_path(&ws)
+                    };
+                    if setup_worktree.is_some() {
+                        record_setup_pending(&services.workspace_setup_states, &ws.id);
+                    } else {
+                        record_setup_skipped(&services.workspace_setup_states, &ws.id);
+                    }
                     let mut initial_agent = None;
                     if let Some((mut plan, prompt, image_blocks)) = planned_initial_agent {
                         // Harness-owned commits: same derivation as
@@ -20203,11 +20322,7 @@ impl WorkspaceApi for Services {
                     // publish nothing (same as `workspace:created`).
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
-                    let setup_worktree = if ws.skip_worktree {
-                        None
-                    } else {
-                        crate::git_ops::worktree_path(&ws)
-                    };
+                    let setup_states = self.workspace_setup_states.clone();
                     if let Some(worktree_path_buf) = setup_worktree {
                         // Spawn background task to read + execute setup script (fire-and-forget).
                         // Move config IO into the task so workspace.create doesn't block on it.
@@ -20247,6 +20362,7 @@ impl WorkspaceApi for Services {
                             };
                             let Some(script) = effective_script else {
                                 // No script to execute: the setup stage is done.
+                                record_setup_skipped(&setup_states, &workspace_id);
                                 publish_event(
                                     bus_for_setup.as_ref(),
                                     workspace_setup_completed_event(&workspace_id, false, None),
@@ -20261,6 +20377,7 @@ impl WorkspaceApi for Services {
                                 "executing setup script in background"
                             );
                             // A script was resolved and a spawn will be attempted.
+                            record_setup_running(&setup_states, &workspace_id);
                             publish_event(
                                 bus_for_setup.as_ref(),
                                 workspace_setup_started_event(&workspace_id),
@@ -20388,6 +20505,11 @@ impl WorkspaceApi for Services {
                                         terminal_id = %terminal_id,
                                         "setup script terminal spawned"
                                     );
+                                    record_setup_terminal(
+                                        &setup_states,
+                                        &workspace_id,
+                                        &terminal_id,
+                                    );
                                     // Spawn output stream to fan setup script output to event bus
                                     crate::terminal_ops::spawn_output_stream(
                                         pty_for_setup.clone(),
@@ -20420,6 +20542,12 @@ impl WorkspaceApi for Services {
                                 }
                             }
                             };
+                            record_setup_finished(
+                                &setup_states,
+                                &workspace_id,
+                                ran_script,
+                                exit_code,
+                            );
                             publish_event(
                                 bus_for_setup.as_ref(),
                                 workspace_setup_completed_event(
@@ -20432,7 +20560,8 @@ impl WorkspaceApi for Services {
                         });
                     } else {
                         // skipWorktree / no worktree provisioned: the setup stage
-                        // never runs, but the lifecycle still completes.
+                        // never runs (state already recorded `skipped` above),
+                        // but the lifecycle still completes.
                         publish_event(
                             bus_for_setup.as_ref(),
                             workspace_setup_completed_event(&ws.id, false, None),
@@ -22068,6 +22197,7 @@ impl WorkspaceApi for Services {
             // `workspace.duplicate` never runs a setup script, but the setup
             // lifecycle (§6.5) still completes so clients waiting on
             // `workspace:setup:completed` converge on every create-shaped flow.
+            record_setup_skipped(&this.workspace_setup_states, &ws.id);
             publish_event(
                 bus.as_ref(),
                 workspace_setup_completed_event(&ws.id, false, None),

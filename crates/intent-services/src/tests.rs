@@ -32125,7 +32125,7 @@ mod setup_lifecycle_events {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use intent_core::{WorkspaceApi, WorkspaceCreate};
+    use intent_core::{WorkspaceApi, WorkspaceCreate, WorkspaceSetupState};
     use intent_store::Store;
     use serde_json::{json, Value};
 
@@ -32226,6 +32226,13 @@ mod setup_lifecycle_events {
         assert_eq!(ev["type"], "workspace:setup:started");
         assert_eq!(ev["workspaceId"], ws.id.0);
         assert_eq!(ev["data"], json!({ "workspaceId": ws.id.0 }));
+        // The state map is written before the publish, so an observer of
+        // `started` already reads `running`.
+        let running = svc.workspace_setup_status(&ws.id);
+        assert_eq!(running.state, WorkspaceSetupState::Running);
+        assert!(running.started_at.is_some(), "running carries startedAt");
+        assert_eq!(running.exit_code, None);
+        assert_eq!(running.finished_at, None);
 
         let ev = recv_setup(&mut sub).await;
         assert_eq!(ev["type"], "workspace:setup:completed");
@@ -32233,6 +32240,12 @@ mod setup_lifecycle_events {
         assert_eq!(ev["data"]["workspaceId"], ws.id.0);
         assert_eq!(ev["data"]["ranScript"], json!(true));
         assert_eq!(ev["data"]["exitCode"], json!(0));
+        let done = svc.workspace_setup_status(&ws.id);
+        assert_eq!(done.state, WorkspaceSetupState::Completed);
+        assert_eq!(done.exit_code, Some(0));
+        assert!(done.terminal_id.is_some(), "completed keeps the terminalId");
+        assert_eq!(done.started_at, running.started_at);
+        assert!(done.finished_at.is_some(), "completed carries finishedAt");
 
         assert_quiet(&mut sub).await;
     }
@@ -32270,6 +32283,10 @@ mod setup_lifecycle_events {
         assert_eq!(ev["type"], "workspace:setup:completed");
         assert_eq!(ev["data"]["ranScript"], json!(true));
         assert_eq!(ev["data"]["exitCode"], json!(7));
+        let failed = svc.workspace_setup_status(&ws.id);
+        assert_eq!(failed.state, WorkspaceSetupState::Failed);
+        assert_eq!(failed.exit_code, Some(7));
+        assert!(failed.finished_at.is_some());
 
         assert_quiet(&mut sub).await;
     }
@@ -32305,6 +32322,10 @@ mod setup_lifecycle_events {
             json!({ "workspaceId": ws.id.0, "ranScript": false }),
             "no exitCode key when no script ran"
         );
+        let skipped = svc.workspace_setup_status(&ws.id);
+        assert_eq!(skipped.state, WorkspaceSetupState::Skipped);
+        assert_eq!(skipped.exit_code, None);
+        assert_eq!(skipped.terminal_id, None);
 
         assert_quiet(&mut sub).await;
     }
@@ -32339,8 +32360,90 @@ mod setup_lifecycle_events {
             ev["data"],
             json!({ "workspaceId": ws.id.0, "ranScript": false })
         );
+        assert_eq!(
+            svc.workspace_setup_status(&ws.id).state,
+            WorkspaceSetupState::Skipped
+        );
 
         assert_quiet(&mut sub).await;
+    }
+
+    /// The setup state map's transitions, driven directly: `pending` →
+    /// `running` (+ terminal) → `completed` / `failed`; a `started` stage
+    /// whose spawn failed (`ranScript: false`) is `failed` with no exit code;
+    /// an unrecorded workspace reads `unknown`; the wire shape omits absent
+    /// optional fields instead of emitting `null`.
+    #[test]
+    fn setup_state_transitions_and_unknown_default() {
+        use crate::{
+            record_setup_finished, record_setup_pending, record_setup_running,
+            record_setup_skipped, record_setup_terminal, WorkspaceSetupStates,
+        };
+        use intent_core::WorkspaceId;
+
+        let states = WorkspaceSetupStates::default();
+        let read = |id: &WorkspaceId| {
+            states
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .unwrap_or_else(intent_core::WorkspaceSetupStatus::unknown)
+        };
+
+        let unrecorded = WorkspaceId::new();
+        let unknown = read(&unrecorded);
+        assert_eq!(unknown.state, WorkspaceSetupState::Unknown);
+        assert_eq!(
+            serde_json::to_value(&unknown).unwrap(),
+            json!({ "state": "unknown" }),
+            "optional fields are omitted, never null"
+        );
+
+        let ok = WorkspaceId::new();
+        record_setup_pending(&states, &ok);
+        assert_eq!(
+            serde_json::to_value(read(&ok)).unwrap(),
+            json!({ "state": "pending" })
+        );
+        record_setup_running(&states, &ok);
+        let running = read(&ok);
+        assert_eq!(running.state, WorkspaceSetupState::Running);
+        assert!(running.started_at.is_some());
+        assert_eq!(running.terminal_id, None);
+        record_setup_terminal(&states, &ok, "term-1");
+        let running = read(&ok);
+        assert_eq!(running.terminal_id.as_deref(), Some("term-1"));
+        record_setup_finished(&states, &ok, true, Some(0));
+        let done = read(&ok);
+        assert_eq!(done.state, WorkspaceSetupState::Completed);
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(done.terminal_id.as_deref(), Some("term-1"));
+        assert_eq!(done.started_at, running.started_at);
+        assert!(done.finished_at.is_some());
+
+        let nonzero = WorkspaceId::new();
+        record_setup_running(&states, &nonzero);
+        record_setup_finished(&states, &nonzero, true, Some(3));
+        let failed = read(&nonzero);
+        assert_eq!(failed.state, WorkspaceSetupState::Failed);
+        assert_eq!(failed.exit_code, Some(3));
+
+        let spawn_failed = WorkspaceId::new();
+        record_setup_running(&states, &spawn_failed);
+        record_setup_finished(&states, &spawn_failed, false, None);
+        let failed = read(&spawn_failed);
+        assert_eq!(failed.state, WorkspaceSetupState::Failed);
+        assert_eq!(failed.exit_code, None);
+        assert!(failed.finished_at.is_some());
+
+        let skipped = WorkspaceId::new();
+        record_setup_pending(&states, &skipped);
+        record_setup_skipped(&states, &skipped);
+        let skipped = read(&skipped);
+        assert_eq!(skipped.state, WorkspaceSetupState::Skipped);
+        assert!(skipped.finished_at.is_some());
+        assert_eq!(skipped.exit_code, None);
     }
 
     /// `workspace.duplicate` runs no setup script: exactly one immediate
@@ -32375,6 +32478,10 @@ mod setup_lifecycle_events {
         assert_eq!(
             ev["data"],
             json!({ "workspaceId": dup.id.0, "ranScript": false })
+        );
+        assert_eq!(
+            svc.workspace_setup_status(&dup.id).state,
+            WorkspaceSetupState::Skipped
         );
 
         assert_quiet(&mut sub).await;

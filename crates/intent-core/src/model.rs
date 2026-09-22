@@ -954,6 +954,65 @@ pub struct SetupScript {
     pub generated_by: Option<SetupScriptGeneratedBy>,
 }
 
+/// Lifecycle state of a workspace's setup stage (§6.5 `workspace:setup:*`),
+/// as tracked in the daemon's in-memory per-workspace map and surfaced to
+/// agents through `ws.workspace.details().setupStatus`. Never persisted: a
+/// workspace with no record (created before the daemon booted) reads
+/// [`Unknown`](Self::Unknown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceSetupState {
+    /// The worktree exists; the effective setup script is not yet resolved.
+    Pending,
+    /// A setup script was resolved and its terminal spawned.
+    Running,
+    /// The script exited `0`.
+    Completed,
+    /// The script exited non-zero, or failed before/at spawn (no exit code).
+    Failed,
+    /// No effective script (or no worktree): the stage never ran.
+    Skipped,
+    /// No record for this workspace in the current daemon lifetime.
+    Unknown,
+}
+
+/// Snapshot of a workspace's setup stage: the [`WorkspaceSetupState`] plus
+/// the details known at that point. Optional fields are omitted (never
+/// `null`) when not applicable to the state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSetupStatus {
+    pub state: WorkspaceSetupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+impl WorkspaceSetupStatus {
+    /// The bare status for `state` with every optional detail omitted.
+    #[must_use]
+    pub fn new(state: WorkspaceSetupState) -> Self {
+        Self {
+            state,
+            exit_code: None,
+            terminal_id: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// The status of a workspace with no record: `state: "unknown"`.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::new(WorkspaceSetupState::Unknown)
+    }
+}
+
 /// Script mode for repo scripts (service = long-running, command = run-once).
 /// Matches `RepoScript.mode` in `cloudlands-fe/src/shared/types/repo-config.types.ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
