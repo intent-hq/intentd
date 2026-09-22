@@ -28,9 +28,9 @@ use intent_sourcecontrol::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
-    PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewDecision,
-    ReviewThread, ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, SourceControl,
-    UserIdentity,
+    PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Result as ScResult, Review,
+    ReviewComment, ReviewDecision, ReviewThread, ReviewVerdict, RollupCheck, RollupCheckKind,
+    ScCapabilities, SourceControl, UserIdentity,
 };
 use intent_store::{PrMonitorPollUpdate, Store};
 use intent_transport::{
@@ -160,6 +160,11 @@ struct ForgeState {
     /// When set, `get_pr` fails with `RateLimited` (exhausted forge quota),
     /// so a monitor sweep opens the daemon's global rate-limit pause.
     rate_limit_get_pr: bool,
+    /// The `remaining` quota (of a 5000 `limit`) the quota-free
+    /// `rate_limit_status` probe reports; `None` is the host-without-signal
+    /// default (no early lift). A recovered value lets the next sweep lift
+    /// the pause early.
+    rate_limit_remaining: Option<u64>,
 }
 
 impl Default for ForgeState {
@@ -174,6 +179,7 @@ impl Default for ForgeState {
             merge_queue_removal: None,
             review_threads_unreadable: false,
             rate_limit_get_pr: false,
+            rate_limit_remaining: None,
         }
     }
 }
@@ -251,6 +257,14 @@ impl SourceControl for StubForge {
     }
     async fn create_pr(&self, _: &RepoRef, _: NewPullRequest) -> ScResult<PullRequest> {
         unsupported("create_pr")
+    }
+    async fn rate_limit_status(&self) -> ScResult<RateLimitStatus> {
+        let remaining = self.state.lock().unwrap().rate_limit_remaining;
+        Ok(RateLimitStatus {
+            reset_at: None,
+            remaining,
+            limit: remaining.map(|_| 5000),
+        })
     }
     async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
         let merged = {
@@ -726,7 +740,7 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
         .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
         .await
         .expect("register");
-    assert_eq!(requirements.state, "open");
+    assert_eq!(requirements.expect("baseline fetched").state, "open");
 
     let evt = next_event(&mut sub, "prMonitor:registered").await;
     assert_eq!(evt["workspaceId"], fx.ws_id.as_str());
@@ -794,7 +808,10 @@ async fn pr_monitor_list_omits_unreadable_threads_unresolved_over_wss() {
         .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
         .await
         .expect("register");
-    assert_eq!(requirements.threads.unresolved, None);
+    assert_eq!(
+        requirements.expect("baseline fetched").threads.unresolved,
+        None
+    );
 
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
     let listed = wss_rpc(
@@ -1952,6 +1969,102 @@ async fn pr_monitor_list_carries_paused_until_over_wss() {
         row.get("lastError").is_none(),
         "terminal row untouched: {row}"
     );
+}
+
+/// A registration under an exhausted forge quota is not lost (PROTOCOL
+/// §5.42): the `ws.pr.monitor` entry point answers `ok: true` with the
+/// persisted (baseline-less) row, `requirements: null` and the pause
+/// deadline as `pausedUntil`; `prMonitor:registered` fires over the wire,
+/// and `prMonitor.list` serves the ACTIVE row carrying the same
+/// `pausedUntil` + pause `lastError` with no `lastSnapshot` / `title` /
+/// `url` yet — the first post-pause poll fills those in.
+#[intent_test_macros::daemon_test]
+async fn a_rate_limited_registration_defers_its_baseline_over_wss() {
+    let fx = boot().await;
+    let api: Arc<dyn WorkspaceApi> = fx.services.clone();
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:registered"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    fx.forge.edit(|s| s.rate_limit_get_pr = true);
+    let started = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("a rate limit never fails registration");
+    assert_eq!(started["ok"], json!(true), "{started}");
+    assert!(started["requirements"].is_null(), "{started}");
+    let until = started["pausedUntil"]
+        .as_str()
+        .unwrap_or_else(|| panic!("pausedUntil on a deferred registration: {started}"));
+    assert!(
+        intent_core::parse_iso(until).is_some(),
+        "pausedUntil is RFC 3339: {until}"
+    );
+    let pause_error = format!("rate limited; PR monitor polling paused until {until}");
+    let monitor = &started["monitor"];
+    assert_eq!(monitor["state"], "active", "{started}");
+    assert_eq!(monitor["pausedUntil"], json!(until), "{started}");
+    assert_eq!(monitor["lastError"], json!(pause_error), "{started}");
+    assert!(monitor.get("lastPolledAt").is_none(), "{started}");
+    assert!(monitor.get("lastSnapshot").is_none(), "{started}");
+    let monitor_id = monitor["monitorId"]
+        .as_str()
+        .expect("monitorId")
+        .to_string();
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], monitor_id);
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "{listed}");
+    let row = &rows[0];
+    assert_eq!(row["monitorId"], monitor_id, "{listed}");
+    assert_eq!(row["state"], "active", "{listed}");
+    assert_eq!(row["pausedUntil"], json!(until), "{listed}");
+    assert_eq!(row["lastError"], json!(pause_error), "{listed}");
+    assert!(row.get("title").is_none(), "no baseline yet: {listed}");
+    assert!(row.get("url").is_none(), "no baseline yet: {listed}");
+    assert!(
+        row.get("lastSnapshot").is_none(),
+        "no baseline yet: {listed}"
+    );
+
+    // Quota back: the next sweep's free probe lifts the pause early, and
+    // the first poll adopts the baseline (nothing pending) — the list
+    // serves the filled-in row.
+    fx.forge.edit(|s| {
+        s.rate_limit_get_pr = false;
+        s.rate_limit_remaining = Some(5000);
+    });
+    fx.services.poll_due_pr_monitors().await;
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(row["monitorId"], monitor_id, "{listed}");
+    assert!(row.get("pausedUntil").is_none(), "gate open: {listed}");
+    assert_eq!(row["url"], "https://github.com/o/r/pull/42", "{listed}");
+    assert_eq!(row["lastSnapshot"]["state"], "open", "{listed}");
+    assert_eq!(row["hasPendingChanges"], json!(false), "{listed}");
+    assert!(row.get("lastPolledAt").is_some(), "{listed}");
 }
 
 /// A merged PR on a LINKED workspace refreshes the persisted PR linkage as
