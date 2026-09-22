@@ -964,6 +964,62 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// Stable identity projection of an `agent.getConversation` page for
+/// cross-time equality assertions ("no wake was delivered between these two
+/// reads"): one entry per `messages[]` row keeping exactly the persisted
+/// fields that identify a delivered message — `id`, `seq`, `role`,
+/// `contentBlocks`, `timestamp` — and dropping every field the daemon
+/// attaches at read time. In particular `author` is excluded: it is resolved
+/// from the principal store on every read, and the daemon refreshes the
+/// primary principal's GitHub profile asynchronously, so two reads of an
+/// unchanged transcript can differ only in `author` (`login` /
+/// `displayName` / `avatarUrl` null → hydrated) — comparing the raw payload
+/// registered that hydration as a delivered wake (intent-hq/intent#5603).
+/// Page-level fields (`turnInFlight`, `lastStreamActivityAt`, cursors) are
+/// likewise outside the fingerprint. A genuinely new or edited message still
+/// changes it. Compare with `==`; on mismatch print [`fingerprint_diff`].
+pub fn conversation_fingerprint(convo: &serde_json::Value) -> Vec<serde_json::Value> {
+    convo["messages"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "id": row["id"],
+                        "seq": row["seq"],
+                        "role": row["role"],
+                        "contentBlocks": row["contentBlocks"],
+                        "timestamp": row["timestamp"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Row-by-row description of how two [`conversation_fingerprint`]s differ
+/// (changed / added / removed rows by index, each with its projected row),
+/// for assertion messages; empty when the fingerprints are equal.
+pub fn fingerprint_diff(before: &[serde_json::Value], after: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for i in 0..before.len().max(after.len()) {
+        match (before.get(i), after.get(i)) {
+            (Some(b), Some(a)) if b == a => {}
+            (Some(b), Some(a)) => {
+                let _ = writeln!(out, "row {i} changed:\n  before: {b}\n  after:  {a}");
+            }
+            (Some(b), None) => {
+                let _ = writeln!(out, "row {i} removed: {b}");
+            }
+            (None, Some(a)) => {
+                let _ = writeln!(out, "row {i} added: {a}");
+            }
+            (None, None) => unreachable!("index bounded by the longer fingerprint"),
+        }
+    }
+    out
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1168,6 +1224,128 @@ mod tests {
         assert!(
             !retained.exists(),
             "retention is scoped to the panicking thread"
+        );
+    }
+
+    /// A synthetic `agent.getConversation` page whose `user` row carries the
+    /// given `author`; the assistant row has none (as served).
+    fn conversation_page(author: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "agentId": "agent-1",
+                    "seq": 1,
+                    "role": "user",
+                    "contentBlocks": [{ "id": "user-msg-1:0", "type": "text", "text": "hello" }],
+                    "author": author,
+                    "timestamp": "2026-09-22T00:00:00Z",
+                },
+                {
+                    "id": "asst-msg-1",
+                    "agentId": "agent-1",
+                    "seq": 2,
+                    "role": "assistant",
+                    "contentBlocks": [{ "id": "blk-1", "type": "text", "text": "hi" }],
+                    "timestamp": "2026-09-22T00:00:01Z",
+                },
+            ],
+            "truncated": false,
+            "totalMessages": 2,
+            "nextToken": null,
+            "turnInFlight": false,
+            "lastStreamActivityAt": null,
+        })
+    }
+
+    #[test]
+    fn conversation_fingerprint_ignores_author_hydration() {
+        let before = conversation_page(&serde_json::json!({
+            "principalId": "prin-1",
+            "login": null,
+            "displayName": null,
+            "avatarUrl": null,
+        }));
+        let after = conversation_page(&serde_json::json!({
+            "principalId": "prin-1",
+            "login": "octocat",
+            "displayName": "The Octocat",
+            "avatarUrl": "https://avatars.example/octocat",
+        }));
+        assert_ne!(before, after, "the raw payloads differ in author");
+        let (fp_before, fp_after) = (
+            conversation_fingerprint(&before),
+            conversation_fingerprint(&after),
+        );
+        assert_eq!(
+            fp_before,
+            fp_after,
+            "author hydration must not change the fingerprint:\n{}",
+            fingerprint_diff(&fp_before, &fp_after)
+        );
+        assert!(fingerprint_diff(&fp_before, &fp_after).is_empty());
+        assert!(
+            fp_before
+                .iter()
+                .all(|row| row.get("author").is_none() && row.get("agentId").is_none()),
+            "fingerprint rows carry only identity fields: {fp_before:?}"
+        );
+    }
+
+    #[test]
+    fn conversation_fingerprint_detects_appended_message() {
+        let before = conversation_page(&serde_json::Value::Null);
+        let mut after = before.clone();
+        after["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .push(serde_json::json!({
+                "id": "user-msg-2",
+                "agentId": "agent-1",
+                "seq": 3,
+                "role": "user",
+                "contentBlocks": [{ "id": "user-msg-2:0", "type": "text", "text": "wake" }],
+                "timestamp": "2026-09-22T00:00:02Z",
+            }));
+        after["totalMessages"] = serde_json::json!(3);
+        let (fp_before, fp_after) = (
+            conversation_fingerprint(&before),
+            conversation_fingerprint(&after),
+        );
+        assert_ne!(
+            fp_before, fp_after,
+            "an appended row must change the fingerprint"
+        );
+        let diff = fingerprint_diff(&fp_before, &fp_after);
+        assert!(
+            diff.starts_with("row 2 added: ") && diff.contains("user-msg-2"),
+            "diff names the appended row: {diff}"
+        );
+    }
+
+    #[test]
+    fn conversation_fingerprint_detects_changed_content_blocks() {
+        let before = conversation_page(&serde_json::Value::Null);
+        let mut after = before.clone();
+        after["messages"][1]["contentBlocks"] =
+            serde_json::json!([{ "id": "blk-1", "type": "text", "text": "edited" }]);
+        let (fp_before, fp_after) = (
+            conversation_fingerprint(&before),
+            conversation_fingerprint(&after),
+        );
+        assert_ne!(
+            fp_before, fp_after,
+            "changed contentBlocks under the same ids must change the fingerprint"
+        );
+        let diff = fingerprint_diff(&fp_before, &fp_after);
+        assert!(
+            diff.starts_with("row 1 changed:") && diff.contains("edited"),
+            "diff names the changed row: {diff}"
+        );
+        assert!(
+            !diff.contains("row 0"),
+            "unchanged rows are not listed: {diff}"
         );
     }
 }
