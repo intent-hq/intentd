@@ -276,7 +276,7 @@ API:
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
   ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings. `status` is `idle` | `starting` | `running` | `restarting` | `exited`. For a command-mode script the settled condition is exactly `status === "exited"`; `starting` / `running` / `restarting` are live (a poll mid-launch or mid-restart must keep waiting), and `idle` after a start means a `ws.script.stop` aborted the launch. A service-mode script may publish `exited` briefly before `restarting`; `exited` alone does not establish final service completion. Every `exited` carries an `exitCode`: the real code when a process ran (0 success, non-zero failure; `error` absent), or the sentinel `-1` when no code could be observed. A startup failure (PTY allocation, a cwd escaping the workspace root, a spawn error) never ran a process, so it settles as `exited` with `exitCode: -1`, `error` = the original failure text (kept verbatim — no success code is invented) and `stoppedAt`. Never gate completion on `exitCode` alone and never read `-1` as a real code: check `status`, then `error`.
-    Canonical completion hook for command-mode scripts — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\\n" + out };' })` — the `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile.
+    Canonical completion hook for command-mode scripts — settles on success, non-zero exit, startup failure AND a launch aborted by `ws.script.stop`, and keeps waiting through `starting` / `running` / `restarting`: `const id = "<id>"; ws.hook.schedule({ name: ("script " + id + " done").slice(0, 50), delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const id = ' + JSON.stringify(id) + '; const s = await ws.script.status(id); if (s.status === "idle") return { dispatch: true, message: "script " + id + " was stopped by ws.script.stop before it settled" }; if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output(id, 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script " + id + " " + outcome + "\\n" + out };' })` — schedule it only after `ws.script.start` has returned (the hook's immediate validation run would otherwise see the pre-start `idle` and dispatch at once). `<id>` is written exactly once, as an ordinary JavaScript string literal; it reaches the hook body through `JSON.stringify`, so a caller-chosen `scriptId` containing quotes, backslashes or newlines needs no hand-escaping inside the body. The `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
     `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with the completion hook documented under `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
@@ -531,7 +531,7 @@ API:
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
   ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings. `status` is `idle` | `starting` | `running` | `restarting` | `exited`. For a command-mode script the settled condition is exactly `status === "exited"`; `starting` / `running` / `restarting` are live (a poll mid-launch or mid-restart must keep waiting), and `idle` after a start means a `ws.script.stop` aborted the launch. A service-mode script may publish `exited` briefly before `restarting`; `exited` alone does not establish final service completion. Every `exited` carries an `exitCode`: the real code when a process ran (0 success, non-zero failure; `error` absent), or the sentinel `-1` when no code could be observed. A startup failure (PTY allocation, a cwd escaping the workspace root, a spawn error) never ran a process, so it settles as `exited` with `exitCode: -1`, `error` = the original failure text (kept verbatim — no success code is invented) and `stoppedAt`. Never gate completion on `exitCode` alone and never read `-1` as a real code: check `status`, then `error`.
-    Canonical completion hook for command-mode scripts — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\\n" + out };' })` — the `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile.
+    Canonical completion hook for command-mode scripts — settles on success, non-zero exit, startup failure AND a launch aborted by `ws.script.stop`, and keeps waiting through `starting` / `running` / `restarting`: `const id = "<id>"; ws.hook.schedule({ name: ("script " + id + " done").slice(0, 50), delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const id = ' + JSON.stringify(id) + '; const s = await ws.script.status(id); if (s.status === "idle") return { dispatch: true, message: "script " + id + " was stopped by ws.script.stop before it settled" }; if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output(id, 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script " + id + " " + outcome + "\\n" + out };' })` — schedule it only after `ws.script.start` has returned (the hook's immediate validation run would otherwise see the pre-start `idle` and dispatch at once). `<id>` is written exactly once, as an ordinary JavaScript string literal; it reaches the hook body through `JSON.stringify`, so a caller-chosen `scriptId` containing quotes, backslashes or newlines needs no hand-escaping inside the body. The `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
     `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with the completion hook documented under `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
@@ -715,7 +715,7 @@ const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
 /// `agentFeatures.backgroundHooks` is off so the surviving script docs never
 /// advertise a pruned method (a unit test guards the needle verbatim in both
 /// variants).
-const SCRIPT_COMPLETION_HOOK_LINE: &str = r#"    Canonical completion hook for command-mode scripts — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\\n" + out };' })` — the `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile.
+const SCRIPT_COMPLETION_HOOK_LINE: &str = r#"    Canonical completion hook for command-mode scripts — settles on success, non-zero exit, startup failure AND a launch aborted by `ws.script.stop`, and keeps waiting through `starting` / `running` / `restarting`: `const id = "<id>"; ws.hook.schedule({ name: ("script " + id + " done").slice(0, 50), delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const id = ' + JSON.stringify(id) + '; const s = await ws.script.status(id); if (s.status === "idle") return { dispatch: true, message: "script " + id + " was stopped by ws.script.stop before it settled" }; if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output(id, 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script " + id + " " + outcome + "\\n" + out };' })` — schedule it only after `ws.script.start` has returned (the hook's immediate validation run would otherwise see the pre-start `idle` and dispatch at once). `<id>` is written exactly once, as an ordinary JavaScript string literal; it reaches the hook body through `JSON.stringify`, so a caller-chosen `scriptId` containing quotes, backslashes or newlines needs no hand-escaping inside the body. The `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile.
 "#;
 /// The `ws.script.start` / `ws.script.run` clauses pointing at that recipe;
 /// scrubbed (or rewritten to plain status polling) alongside it so the
@@ -725,7 +725,7 @@ const SCRIPT_START_RECIPE_XREF: &str =
 const SCRIPT_RUN_RECIPE_XREF: &str =
     "wait with the completion hook documented under `ws.script.status(scriptId)`";
 const SCRIPT_RUN_RECIPE_XREF_OFF: &str =
-    "poll `ws.script.status(scriptId)` until `status === \"exited\"`";
+    "poll `ws.script.status(scriptId)` until `status === \"exited\"` (or `\"idle\"`, a `ws.script.stop` aborted it)";
 
 /// Task-graph teaching scrubbed from the assembled description when
 /// `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). Docs only —
@@ -2644,17 +2644,38 @@ mod tests {
         const SETTLED: &str =
             "For a command-mode script the settled condition is exactly `status === \"exited\"`";
         const SERVICE_CAVEAT: &str = "A service-mode script may publish `exited` briefly before `restarting`; `exited` alone does not establish final service completion";
+        const IDLE_ABORTED: &str =
+            "`idle` after a start means a `ws.script.stop` aborted the launch";
         // Retired: a poll-count rule cannot establish service finality (two
         // polls can sample `exited` from different runs), so no variant may
         // prescribe one.
         let prescribes_service_algorithm =
             |doc: &str| doc.contains("consecutive poll") || doc.contains("two consecutive polls");
+        // The recipe binds `<id>` once as an outer JS literal and reaches the
+        // hook body through `JSON.stringify`, so a caller-chosen `scriptId`
+        // never has to be hand-escaped inside the nested string, and it
+        // treats the `idle` an aborted launch leaves as terminal.
+        assert!(SCRIPT_COMPLETION_HOOK_LINE.contains("`const id = \"<id>\"; ws.hook.schedule("));
+        assert!(SCRIPT_COMPLETION_HOOK_LINE.contains("JSON.stringify(id)"));
+        assert!(SCRIPT_COMPLETION_HOOK_LINE
+            .contains("if (s.status === \"idle\") return { dispatch: true"));
+        let snippet_end = SCRIPT_COMPLETION_HOOK_LINE
+            .find(")` — schedule it only after")
+            .expect("recipe snippet closes before the ordering rule");
+        assert!(
+            SCRIPT_COMPLETION_HOOK_LINE[..snippet_end]
+                .matches("<id>")
+                .count()
+                == 1
+        );
+        assert!(SCRIPT_RUN_RECIPE_XREF_OFF.contains("`\"idle\"`"));
         for base in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
             assert!(base.contains(SCRIPT_COMPLETION_HOOK_LINE));
             assert!(base.contains(SCRIPT_START_RECIPE_XREF));
             assert!(base.contains(SCRIPT_RUN_RECIPE_XREF));
             assert!(base.contains(SETTLED));
             assert!(base.contains(SERVICE_CAVEAT));
+            assert!(base.contains(IDLE_ABORTED));
             assert!(!prescribes_service_algorithm(base));
             assert!(base.contains(
                 "settles as `exited` with `exitCode: -1`, `error` = the original failure text"
@@ -2687,6 +2708,10 @@ mod tests {
                 "chief={is_chief}: the service-mode caveat did not survive disabling backgroundHooks"
             );
             assert!(
+                pruned.contains(IDLE_ABORTED),
+                "chief={is_chief}: the aborted-launch `idle` contract did not survive disabling backgroundHooks"
+            );
+            assert!(
                 !prescribes_service_algorithm(&pruned),
                 "chief={is_chief}: a retired consecutive-poll service rule resurfaced"
             );
@@ -2695,9 +2720,12 @@ mod tests {
 
     // Regression (intent-hq/intentd#2054 review): the recipe's hook body is a
     // JavaScript string nested inside the documented `ws.hook.schedule` call,
-    // so its message newline must survive BOTH parsing layers. Evaluate the
-    // outer call exactly as an agent would paste it, then compile and run the
-    // captured `code` against every documented terminal / live status.
+    // so its message newline must survive BOTH parsing layers, and `scriptId`
+    // is caller-supplied without character validation, so the id must reach
+    // the body intact even when it contains quotes, backslashes or newlines.
+    // Evaluate the snippet exactly as an agent would paste it (with a hostile
+    // id), then compile and run the captured `code` against every documented
+    // terminal / live status, including the `idle` an aborted launch leaves.
     // Self-skips when `node` is not on PATH (same convention as the intentd
     // e2e suites).
     #[test]
@@ -2705,37 +2733,50 @@ mod tests {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
 
+        // Source form of the id `a"b\c<newline>d` — exactly what an agent
+        // types between the quotes of an ordinary JS string literal.
+        const HOSTILE_ID_SRC: &str = r#"a\"b\\c\nd"#;
+
         let start = SCRIPT_COMPLETION_HOOK_LINE
-            .find("`ws.hook.schedule(")
-            .expect("recipe opens with a ws.hook.schedule call");
-        let rest = &SCRIPT_COMPLETION_HOOK_LINE[start + "`ws.hook.schedule(".len()..];
+            .find("`const id = \"<id>\"; ws.hook.schedule(")
+            .expect("recipe opens by binding the id, then a ws.hook.schedule call");
+        let rest = &SCRIPT_COMPLETION_HOOK_LINE[start + 1..];
         let end = rest
             .find(")`")
             .expect("recipe call closes before the backtick");
-        let opts = rest[..end]
+        let snippet = rest[..=end]
             .replace("<expected runtime + margin>", "60000")
-            .replace("<id>", "abc");
+            .replace("<id>", HOSTILE_ID_SRC);
+        assert!(
+            !snippet.contains("<id>") && snippet.matches(HOSTILE_ID_SRC).count() == 1,
+            "the id must be written exactly once: {snippet}"
+        );
 
         let script = format!(
             r#"
-const opts = ({opts});
+const ID = "{HOSTILE_ID_SRC}";
+const ws = {{ hook: {{ schedule: (o) => o }} }};
+const opts = eval({snippet:?});
 if (typeof opts.code !== "string") throw new Error("code is not a string");
+const expect = (cond, msg) => {{ if (!cond) throw new Error(msg); }};
+expect(opts.name === ("script " + ID + " done").slice(0, 50) && opts.name.length <= 50, "name: " + JSON.stringify(opts.name));
 const run = async (s, out) => {{
-  const ws = {{ script: {{ status: async () => s, output: async () => out }} }};
+  const ws = {{ script: {{ status: async (id) => {{ expect(id === ID, "status id: " + JSON.stringify(id)); return s; }}, output: async (id) => {{ expect(id === ID, "output id: " + JSON.stringify(id)); return out; }} }} }};
   return await new Function("ws", "hookState", "return (async () => {{" + opts.code + "}})()")(ws, null);
 }};
-const expect = (cond, msg) => {{ if (!cond) throw new Error(msg); }};
 (async () => {{
   for (const status of ["starting", "running", "restarting"]) {{
     const r = await run({{ status }}, "");
     expect(r.dispatch === false, "live status " + status + " must not dispatch");
   }}
   let r = await run({{ status: "exited", exitCode: 0 }}, "l1\nl2");
-  expect(r.dispatch === true && r.message === "script abc succeeded\nl1\nl2", "success: " + JSON.stringify(r));
+  expect(r.dispatch === true && r.message === "script " + ID + " succeeded\nl1\nl2", "success: " + JSON.stringify(r));
   r = await run({{ status: "exited", exitCode: 7 }}, "boom");
-  expect(r.message === "script abc exited with code 7\nboom", "non-zero: " + JSON.stringify(r));
+  expect(r.message === "script " + ID + " exited with code 7\nboom", "non-zero: " + JSON.stringify(r));
   r = await run({{ status: "exited", exitCode: -1, error: "spawn failed" }}, "");
-  expect(r.message === "script abc failed: spawn failed\n", "startup failure: " + JSON.stringify(r));
+  expect(r.message === "script " + ID + " failed: spawn failed\n", "startup failure: " + JSON.stringify(r));
+  r = await run({{ status: "idle" }}, "");
+  expect(r.dispatch === true && r.message === "script " + ID + " was stopped by ws.script.stop before it settled", "aborted launch: " + JSON.stringify(r));
 }})().then(() => process.stdout.write("ok"), (e) => {{ process.stderr.write(String(e && e.stack || e)); process.exit(1); }});
 "#
         );
