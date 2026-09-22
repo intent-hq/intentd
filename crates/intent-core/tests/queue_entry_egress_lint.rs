@@ -23,10 +23,14 @@
 //!   `fn` (so `persist_queue_snapshot(` and the definitions themselves are not
 //!   hits). It is claimed when the enclosing fn — the nearest `fn <name>`
 //!   definition before it in the file — is named by a `Key::Fn` row.
-//! - **Queue-event publish**: an `event_type: <path::>AGENT_QUEUE_UPDATED` /
-//!   `AGENT_QUEUE_PROCESSING` struct-field initializer (`.to_string()` and
-//!   any path prefix allowed). It is claimed when the const is named by a
-//!   `Key::Event` row. Comparisons (`event_type == …`) are not publishes.
+//! - **Queue-event publish**: an `event_type: <path::>AGENT_QUEUE_*`
+//!   struct-field initializer (`.to_string()` and any path prefix allowed)
+//!   naming a queue event const. The watched consts are derived every run
+//!   from `crates/intent-core/src/events.rs`: every `const` / `static` whose
+//!   string value starts with `agent:queue:` — so a new `agent:queue:*`
+//!   constant is watched the moment it is defined, with no edit here. The
+//!   publish is claimed when the const is named by a `Key::Event` row.
+//!   Comparisons (`event_type == …`) are not publishes.
 //!
 //! Table coherence, checked every run: each `QueueSurface` variant (parsed
 //! from the enum body in the contract file) must be claimed by at least one
@@ -62,12 +66,13 @@ use std::path::{Path, PathBuf};
 
 const SELF_FILE: &str = "crates/intent-core/tests/queue_entry_egress_lint.rs";
 const CONTRACT_FILE: &str = "crates/intent-core/src/queue_visibility_contract.rs";
+const EVENTS_FILE: &str = "crates/intent-core/src/events.rs";
 const SURFACE_ENUM: &str = "QueueSurface";
 const TABLE_CONST: &str = "REGISTERED_EGRESS";
 const OPT_OUT_MARKER: &str = "// queue-egress: allow";
 const SNAPSHOT_CALLS: &[&str] = &["queue_snapshot", "queue_snapshot_preview"];
 const EVENT_FIELD: &str = "event_type";
-const QUEUE_EVENT_CONSTS: &[&str] = &["AGENT_QUEUE_UPDATED", "AGENT_QUEUE_PROCESSING"];
+const QUEUE_EVENT_PREFIX: &str = "agent:queue:";
 const CFG_TEST_TOKENS: &[&str] = &["#", "[", "cfg", "(", "test", ")", "]"];
 const EXCERPT_CHARS: usize = 120;
 
@@ -596,10 +601,58 @@ fn event_initializer(chars: &[char], toks: &[Token], idx: usize) -> Option<Strin
     }
 }
 
+/// The name of every non-test `const` / `static` in the events source whose
+/// string value starts with [`QUEUE_EVENT_PREFIX`]: the publishes the lint
+/// watches. Derived from the source rather than listed in this file, so a new
+/// `agent:queue:*` constant needs no edit here to be caught.
+fn queue_event_consts(events_src: &str) -> Result<BTreeSet<String>, String> {
+    let raw: Vec<char> = events_src.chars().collect();
+    let blanked = blank_cfg_test_items(&blank_literals_and_comments(events_src).text);
+    let chars: Vec<char> = blanked.chars().collect();
+    let toks = tokens(&chars);
+    let mut out = BTreeSet::new();
+    for (idx, tok) in toks.iter().enumerate() {
+        let lifetime = raw.get(tok.start.wrapping_sub(1)) == Some(&'\'');
+        if (tok.word != "const" && tok.word != "static") || lifetime {
+            continue;
+        }
+        let Some(name) = toks
+            .get(idx + 1)
+            .filter(|t| t.start == skip_whitespace(&chars, tok.end))
+            .filter(|t| !FN_QUALIFIERS.contains(&t.word.as_str()))
+        else {
+            continue;
+        };
+        let mut eq = name.end;
+        while chars.get(eq).is_some_and(|c| !matches!(c, '=' | ';')) {
+            eq += 1;
+        }
+        if chars.get(eq) != Some(&'=') {
+            continue;
+        }
+        let open = skip_whitespace(&raw, eq + 1);
+        if raw.get(open) != Some(&'"') {
+            continue;
+        }
+        let value: String = raw[open + 1..].iter().take_while(|c| **c != '"').collect();
+        if value.starts_with(QUEUE_EVENT_PREFIX) {
+            out.insert(name.word.clone());
+        }
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "{EVENTS_FILE}: no `const` with a `{QUEUE_EVENT_PREFIX}*` string value found — the \
+             queue event constants moved; update `EVENTS_FILE` in {SELF_FILE}"
+        ));
+    }
+    Ok(out)
+}
+
 /// Scans one Rust source file's text: every egress not suppressed by a
 /// reasoned opt-out marker, plus the `fn` / `const` / `static` names the file
-/// defines outside test code.
-fn scan_source(src: &str) -> Scan {
+/// defines outside test code. `queue_events` is the watched const set from
+/// [`queue_event_consts`].
+fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
     let stripped = blank_literals_and_comments(src);
     let markers = markers_by_line(src, &stripped.line_comments);
     let blanked = blank_cfg_test_items(&stripped.text);
@@ -641,8 +694,8 @@ fn scan_source(src: &str) -> Scan {
                 }
             }
             EVENT_FIELD => {
-                if let Some(event) = event_initializer(&chars, &toks, idx)
-                    .filter(|e| QUEUE_EVENT_CONSTS.contains(&e.as_str()))
+                if let Some(event) =
+                    event_initializer(&chars, &toks, idx).filter(|e| queue_events.contains(e))
                 {
                     raw_hits.push((tok.start, Egress::Publish { event }));
                 }
@@ -706,12 +759,18 @@ fn surface_labels(contract_src: &str) -> Result<Vec<String>, String> {
 
 /// Runs the lint over already-read sources: `files` is `(relative path,
 /// text)`; `labels` the `QueueSurface` variants; `rows` the registration
-/// table. Returns every failure, each naming the file and the table to edit.
-fn check(labels: &[String], rows: &[(&str, Key)], files: &[(&str, &str)]) -> Vec<String> {
+/// table; `queue_events` the watched const set. Returns every failure, each
+/// naming the file and the table to edit.
+fn check(
+    labels: &[String],
+    rows: &[(&str, Key)],
+    files: &[(&str, &str)],
+    queue_events: &BTreeSet<String>,
+) -> Vec<String> {
     let mut failures = Vec::new();
     let scans: Vec<(&str, Scan)> = files
         .iter()
-        .map(|(rel, src)| (*rel, scan_source(src)))
+        .map(|(rel, src)| (*rel, scan_source(src, queue_events)))
         .collect();
     let fns: BTreeSet<&str> = scans
         .iter()
@@ -840,6 +899,11 @@ fn every_queue_entry_egress_is_registered_in_the_contract_table() {
         panic!("read {CONTRACT_FILE}: {e} — the contract table moved; update `CONTRACT_FILE` in {SELF_FILE}")
     });
     let labels = surface_labels(&contract).unwrap_or_else(|e| panic!("{e}"));
+    let events_path = root.join(EVENTS_FILE);
+    let events_src = fs::read_to_string(&events_path).unwrap_or_else(|e| {
+        panic!("read {EVENTS_FILE}: {e} — the events module moved; update `EVENTS_FILE` in {SELF_FILE}")
+    });
+    let queue_events = queue_event_consts(&events_src).unwrap_or_else(|e| panic!("{e}"));
 
     let mut files = Vec::new();
     let crates_dir = root.join("crates");
@@ -873,18 +937,24 @@ fn every_queue_entry_egress_is_registered_in_the_contract_table() {
         .map(|(rel, src)| (rel.as_str(), src.as_str()))
         .collect();
 
-    let report = check(&labels, REGISTERED_EGRESS, &borrowed);
+    let report = check(&labels, REGISTERED_EGRESS, &borrowed, &queue_events);
     assert!(
         report.is_empty(),
         "queue-entry egress is out of step with the visibility contract table:\n\n{}\n\n\
          Every production `queue_snapshot()` / `queue_snapshot_preview()` call and every \
-         `event_type: AGENT_QUEUE_*` publish must be claimed by a `{TABLE_CONST}` row in \
+         `event_type:` publish of an `{QUEUE_EVENT_PREFIX}*` const from {EVENTS_FILE} \
+         (currently: {}) must be claimed by a `{TABLE_CONST}` row in \
          {SELF_FILE} naming the `{SURFACE_ENUM}` variant it serves ({CONTRACT_FILE}; add the \
          variant and its contract cells when the surface is new, so the harnesses drive it). \
          A call that lets no entry leave the daemon may opt out with \
          `// queue-egress: allow — <reason>` on the line immediately above the call or its \
          statement; the reason is required.",
-        report.join("\n")
+        report.join("\n"),
+        queue_events
+            .iter()
+            .map(|e| format!("`{e}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 }
 
@@ -898,11 +968,32 @@ fn line_of(src: &str, needle: &str) -> usize {
 }
 
 fn hit_lines(src: &str) -> Vec<usize> {
-    scan_source(src).hits.into_iter().map(|h| h.line).collect()
+    scan_source(src, &queue_events())
+        .hits
+        .into_iter()
+        .map(|h| h.line)
+        .collect()
 }
 
 fn labels(names: &[&str]) -> Vec<String> {
     names.iter().map(ToString::to_string).collect()
+}
+
+/// The events-module shapes: queue consts among non-queue ones, a doc-comment
+/// and a `#[cfg(test)]` mention that must not count.
+const EVENTS_FIXTURE: &str = r#"
+pub const AGENT_STARTED: &str = "agent:started";
+/// `agent:queue:*` events carry `data.queue`; see AGENT_QUEUE_DOC_ONLY.
+pub const AGENT_QUEUE_UPDATED: &str = "agent:queue:updated";
+pub(crate) const AGENT_QUEUE_PROCESSING: &'static str = "agent:queue:processing";
+pub static QUEUE_PREFIX_NOT_AN_EVENT: &str = "queue:agent:";
+#[cfg(test)]
+pub const AGENT_QUEUE_TEST_ONLY: &str = "agent:queue:test-only";
+pub const ALL_EVENT_TYPES: &[&str] = &[AGENT_STARTED, AGENT_QUEUE_UPDATED, AGENT_QUEUE_PROCESSING];
+"#;
+
+fn queue_events() -> BTreeSet<String> {
+    queue_event_consts(EVENTS_FIXTURE).unwrap()
 }
 
 const CONTRACT_FIXTURE: &str = r"
@@ -971,19 +1062,78 @@ fn surface_labels_come_from_the_enum_body_only() {
 }
 
 #[test]
+fn queue_event_consts_are_derived_from_the_events_source_by_string_value() {
+    assert_eq!(
+        queue_events(),
+        BTreeSet::from([
+            "AGENT_QUEUE_UPDATED".to_string(),
+            "AGENT_QUEUE_PROCESSING".to_string()
+        ])
+    );
+    assert!(
+        queue_event_consts("pub const AGENT_STARTED: &str = \"agent:started\";")
+            .unwrap_err()
+            .contains("no `const` with a `agent:queue:*` string value found")
+    );
+}
+
+#[test]
+fn new_queue_event_const_is_watched_without_editing_the_lint() {
+    let events = format!(
+        "{EVENTS_FIXTURE}pub const AGENT_QUEUE_VERIFIER_PROBE: &str = \"agent:queue:verifier-probe\";\n"
+    );
+    let watched = queue_event_consts(&events).unwrap();
+    assert!(
+        watched.contains("AGENT_QUEUE_VERIFIER_PROBE"),
+        "{watched:?}"
+    );
+
+    let src = "pub const AGENT_QUEUE_VERIFIER_PROBE: &str = \"agent:queue:verifier-probe\";\nfn probe(&self) {\n    let event = NewEvent {\n        event_type: AGENT_QUEUE_VERIFIER_PROBE.to_string(),\n        data: json!({ \"queue\": self.queue_rows() }),\n    };\n}\n";
+    let files = [("crates/x/src/lib.rs", src)];
+
+    let unregistered = check(&labels(&[]), &[], &files, &watched);
+    assert_eq!(unregistered.len(), 1, "{unregistered:#?}");
+    assert!(
+        unregistered[0]
+            .starts_with("crates/x/src/lib.rs:4: publish of `AGENT_QUEUE_VERIFIER_PROBE`"),
+        "{}",
+        unregistered[0]
+    );
+    assert!(unregistered[0]
+        .contains("`REGISTERED_EGRESS` in crates/intent-core/tests/queue_entry_egress_lint.rs"));
+
+    let registered = check(
+        &labels(&["QueueUpdatedEvent"]),
+        &[(
+            "QueueUpdatedEvent",
+            Key::Event("AGENT_QUEUE_VERIFIER_PROBE"),
+        )],
+        &files,
+        &watched,
+    );
+    assert!(registered.is_empty(), "{registered:#?}");
+
+    assert!(
+        check(&labels(&[]), &[], &files, &queue_events()).is_empty(),
+        "a const the events source does not define is not a queue event"
+    );
+}
+
+#[test]
 fn registered_production_shapes_pass() {
     let fixture_labels = surface_labels(CONTRACT_FIXTURE).unwrap();
     let failures = check(
         &fixture_labels,
         PRODUCTION_ROWS,
         &[("crates/x/src/lib.rs", PRODUCTION_FIXTURE)],
+        &queue_events(),
     );
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]
 fn definitions_and_persist_call_are_not_hits() {
-    let scan = scan_source(PRODUCTION_FIXTURE);
+    let scan = scan_source(PRODUCTION_FIXTURE, &queue_events());
     let lines: Vec<usize> = scan.hits.iter().map(|h| h.line).collect();
     assert_eq!(
         lines,
@@ -1007,7 +1157,12 @@ fn definitions_and_persist_call_are_not_hits() {
 #[test]
 fn unregistered_snapshot_call_fails_naming_the_fn_and_the_table() {
     let src = "impl S {\n    pub(crate) async fn agent_peek_op(&self) -> Result<Value> {\n        let q = self.queue_snapshot(&id);\n        Ok(json!({ \"queue\": q }))\n    }\n}\n";
-    let failures = check(&labels(&[]), &[], &[("crates/x/src/lib.rs", src)]);
+    let failures = check(
+        &labels(&[]),
+        &[],
+        &[("crates/x/src/lib.rs", src)],
+        &queue_events(),
+    );
     assert_eq!(failures.len(), 1, "{failures:#?}");
     assert!(
         failures[0].starts_with("crates/x/src/lib.rs:3: `queue_snapshot(` in fn `agent_peek_op`")
@@ -1019,7 +1174,12 @@ fn unregistered_snapshot_call_fails_naming_the_fn_and_the_table() {
 #[test]
 fn unregistered_publish_fails_naming_the_const() {
     let src = "fn publish(&self) {\n    let event = NewEvent {\n        event_type: intent_core::events::AGENT_QUEUE_PROCESSING.to_string(),\n        data: json!({}),\n    };\n}\n";
-    let failures = check(&labels(&[]), &[], &[("crates/x/src/lib.rs", src)]);
+    let failures = check(
+        &labels(&[]),
+        &[],
+        &[("crates/x/src/lib.rs", src)],
+        &queue_events(),
+    );
     assert_eq!(failures.len(), 1, "{failures:#?}");
     assert!(failures[0].starts_with("crates/x/src/lib.rs:3: publish of `AGENT_QUEUE_PROCESSING`"));
 }
@@ -1039,7 +1199,12 @@ fn every_surface_variant_must_be_claimed_and_rows_must_be_live() {
         ("QueueUpdatedEvent", Key::Event("AGENT_QUEUE_REMOVED")),
     ];
     let src = "fn agent_get_queue_op() {}\n";
-    let failures = check(&fixture_labels, rows, &[("crates/x/src/lib.rs", src)]);
+    let failures = check(
+        &fixture_labels,
+        rows,
+        &[("crates/x/src/lib.rs", src)],
+        &queue_events(),
+    );
     let joined = failures.join("\n");
     assert!(
         joined.contains("row `Diagnostics` names no `QueueSurface` variant"),
@@ -1065,7 +1230,12 @@ fn every_surface_variant_must_be_claimed_and_rows_must_be_live() {
     );
     assert_eq!(failures.len(), 3, "{failures:#?}");
 
-    let failures = check(&fixture_labels, &rows[..1], &[("crates/x/src/lib.rs", src)]);
+    let failures = check(
+        &fixture_labels,
+        &rows[..1],
+        &[("crates/x/src/lib.rs", src)],
+        &queue_events(),
+    );
     assert_eq!(failures.len(), 1, "{failures:#?}");
     assert!(failures[0]
         .contains("`QueueSurface::QueueUpdatedEvent` is claimed by no `REGISTERED_EGRESS` row"));
@@ -1093,12 +1263,12 @@ fn opt_out_marker_without_a_reason_still_fails_as_malformed() {
         let src = format!(
             "fn probe(&self) {{\n    {marker}\n    let q = self.queue_snapshot(&id);\n}}\n"
         );
-        let scan = scan_source(&src);
+        let scan = scan_source(&src, &queue_events());
         assert_eq!(scan.hits.len(), 1, "{marker}");
         assert!(scan.hits[0].marker_malformed, "{marker}");
     }
     let two_above = "fn probe(&self) {\n    // queue-egress: allow — two lines above\n\n    let q = self.queue_snapshot(&id);\n}\n";
-    let scan = scan_source(two_above);
+    let scan = scan_source(two_above, &queue_events());
     assert_eq!(scan.hits.len(), 1);
     assert!(!scan.hits[0].marker_malformed);
     let trailing = "fn probe(&self) {\n    let q = self.queue_snapshot(&id); // queue-egress: allow — trailing\n}\n";
@@ -1108,7 +1278,7 @@ fn opt_out_marker_without_a_reason_still_fails_as_malformed() {
 #[test]
 fn comments_strings_and_cfg_test_items_are_blanked() {
     let src = "// self.queue_snapshot(&id) in a comment\n/* event_type: AGENT_QUEUE_UPDATED */\nfn doc() -> &'static str {\n    \"queue_snapshot(&id) event_type: AGENT_QUEUE_UPDATED\"\n}\n#[cfg(test)]\nmod tests {\n    fn t(&self) { let q = self.queue_snapshot(&id); }\n}\n#[cfg(test)]\nfn helper(&self) -> Vec<Value> { self.queue_snapshot_preview(&id) }\n";
-    let scan = scan_source(src);
+    let scan = scan_source(src, &queue_events());
     assert!(scan.hits.is_empty(), "{:#?}", scan.hits);
     assert!(scan.fns.contains("doc"));
     assert!(!scan.fns.contains("helper"));
@@ -1117,7 +1287,7 @@ fn comments_strings_and_cfg_test_items_are_blanked() {
 #[test]
 fn preview_call_is_attributed_to_its_enclosing_fn() {
     let src = "fn diag(&self) -> Value {\n    let entries = self.queue_snapshot_preview(&id);\n    json!({ \"entries\": entries })\n}\n";
-    let scan = scan_source(src);
+    let scan = scan_source(src, &queue_events());
     assert_eq!(
         scan.hits[0].egress,
         Egress::Call {
@@ -1129,6 +1299,7 @@ fn preview_call_is_attributed_to_its_enclosing_fn() {
         &labels(&[]),
         &[("Diagnostics", Key::Fn("diag"))],
         &[("crates/x/src/lib.rs", src)],
+        &queue_events(),
     );
     assert_eq!(failures.len(), 1, "{failures:#?}");
     assert!(failures[0].contains("row `Diagnostics` names no `QueueSurface` variant"));
