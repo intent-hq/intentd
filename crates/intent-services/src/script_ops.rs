@@ -3582,6 +3582,126 @@ mod tests {
         );
     }
 
+    /// The completion contract a `script.start` watcher relies on
+    /// (intent-hq/intent#5577): `status === "exited"` is the one settled
+    /// condition across every outcome, and it is never reached without an
+    /// `exitCode`. A run that finished carries its real code (0 or non-zero,
+    /// `error` absent); a startup failure — no process ever ran — carries
+    /// [`EXIT_CODE_UNOBSERVABLE`] with the spawn error as `error` and a
+    /// `stoppedAt`, so a watcher keyed on `exitCode !== undefined` also
+    /// settles instead of polling until its TTL. `starting` is live: a
+    /// parked launch window never reads as settled.
+    #[intent_test_macros::daemon_test]
+    async fn script_start_completion_contract_covers_every_outcome() {
+        fn settled(st: &Value) -> bool {
+            st["status"] == "exited"
+        }
+        let h = harness_with_worktree(true).await;
+        let mut sub = subscribe(&h);
+
+        let ok = create_simple(&h, "ok", "exit 0", ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), ok.clone())
+            .await
+            .expect("start ok");
+        let ev = await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == ok.as_str() && settled(&v["data"])
+        })
+        .await;
+        assert_eq!(ev["data"]["exitCode"], 0, "successful exit: {ev}");
+        assert!(ev["data"]["error"].is_null(), "no error on success: {ev}");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), ok.clone())
+            .await
+            .expect("status");
+        assert!(settled(&st) && st["exitCode"] == 0, "settled ok: {st}");
+
+        let bad = create_simple(&h, "bad", "exit 7", ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), bad.clone())
+            .await
+            .expect("start bad");
+        let ev = await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == bad.as_str() && settled(&v["data"])
+        })
+        .await;
+        assert_eq!(ev["data"]["exitCode"], 7, "non-zero exit: {ev}");
+        assert!(
+            ev["data"]["error"].is_null(),
+            "no error on a real code: {ev}"
+        );
+
+        let failed = create(
+            &h,
+            ScriptCreateParams {
+                name: "spawn-failure".into(),
+                command: "echo never".into(),
+                mode: ScriptMode::Command,
+                cwd: Some("../escape".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        h.services
+            .script_start(h.ws.clone(), failed.clone())
+            .await
+            .expect("start failed");
+        let ev = await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == failed.as_str() && settled(&v["data"])
+        })
+        .await;
+        let d = &ev["data"];
+        assert_eq!(
+            d["exitCode"], EXIT_CODE_UNOBSERVABLE,
+            "no invented success code on a startup failure: {ev}"
+        );
+        assert!(
+            d["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("escapes workspace root"),
+            "spawn error text kept visible: {ev}"
+        );
+        assert!(d["stoppedAt"].is_string(), "stoppedAt set: {ev}");
+        assert!(d["pid"].is_null(), "no pid, no process ran: {ev}");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), failed)
+            .await
+            .expect("status");
+        assert!(settled(&st), "status settles on the failure: {st}");
+        assert_eq!(st["exitCode"], EXIT_CODE_UNOBSERVABLE, "{st}");
+        assert!(st["error"].is_string(), "{st}");
+
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let live = create_simple(&h, "live", SERVICE_CMD, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), live.clone())
+            .await
+            .expect("start live");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("spawn parked");
+        let st = services
+            .script_status(h.ws.clone(), live.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "starting", "{st}");
+        assert!(!settled(&st), "starting is live, never settled: {st}");
+        assert!(st["exitCode"].is_null(), "{st}");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == live.as_str() && v["data"]["status"] == "running"
+        })
+        .await;
+        services
+            .script_stop(h.ws.clone(), live)
+            .await
+            .expect("stop");
+    }
+
     /// A `script.stop` inside the launch window (intent-hq/intent#4858) has no
     /// recorded PTY yet: the supervisor's `mark_running` refuses on the stop
     /// flag and reaps its PTY, and the status settles back to `idle` with a
