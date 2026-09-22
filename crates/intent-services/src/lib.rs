@@ -169,6 +169,8 @@ mod v2_3_goldens;
 mod v2_4_goldens;
 #[cfg(test)]
 mod v2_5_goldens;
+#[cfg(test)]
+mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
@@ -21465,22 +21467,30 @@ impl WorkspaceApi for Services {
                 }
                 // Cancel every active background hook in the workspace: task
                 // aborted, state persisted to `cancelled`, `hook:cancelled`
-                // emitted, owner woken with a notice. Unarchive does NOT
-                // resurrect cancelled hooks — the notice tells the owner to
-                // reschedule if the condition still matters. Runs AFTER the
-                // archived row is persisted so the cancel wakes park behind the
-                // archived gate in `deliver_wake_message` (queued at most, no
-                // turn spawned) — the same reason the interrupt sweep above
-                // runs post-persist.
-                this.cancel_workspace_hooks(&id).await;
+                // emitted — silently per hook. Unarchive does NOT resurrect
+                // cancelled hooks; the consolidated notice below tells the
+                // owner to reschedule if the condition still matters.
+                let cancelled_hooks = this.cancel_workspace_hooks(&id).await;
                 // Cancel every ACTIVE PR monitor the same way
                 // (intent-hq/monorepo#1828): state persisted to `cancelled`,
-                // `prMonitor:cancelled` emitted, owner woken with a notice
-                // that parks behind the same archived gate. Unarchive does
-                // NOT resurrect cancelled monitors. Without this sweep an
-                // archived workspace's displayStatus rollup reads
-                // `in_progress` indefinitely off the active-monitor signal.
-                this.cancel_workspace_pr_monitors(&id).await;
+                // `prMonitor:cancelled` emitted, silently per monitor.
+                // Unarchive does NOT resurrect cancelled monitors. Without
+                // this sweep an archived workspace's displayStatus rollup
+                // reads `in_progress` indefinitely off the active-monitor
+                // signal.
+                let cancelled_monitors = this.cancel_workspace_pr_monitors(&id).await;
+                // ONE consolidated wake per affected owner naming every hook
+                // and monitor the two sweeps cancelled, THEN the owner's
+                // deferral backstop (the per-item cancels above skipped it so
+                // a deferred completion watch stays armed behind the queued
+                // notice). Runs AFTER the archived row is persisted so the
+                // wake parks behind the archived gate in
+                // `deliver_wake_message` (queued at most, no turn spawned) —
+                // the same reason the interrupt sweep above runs post-persist
+                // — and is only ever read after unarchive, which is the
+                // moment its wording is written for.
+                this.notify_owners_of_archived_watches(&id, cancelled_hooks, cancelled_monitors)
+                    .await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,
                 // and persist it through the scoped monotonic write
@@ -32161,6 +32171,75 @@ impl WorkspaceApi for Services {
 /// (`workspace.unarchive` / `workspace.restore`) and the turn-start
 /// auto-unarchive (monorepo — auto-unarchive on agent activity).
 impl Services {
+    /// Archive tail: queue ONE consolidated wake per agent whose background
+    /// hooks and/or PR monitors the archive sweeps
+    /// ([`Services::cancel_workspace_hooks`],
+    /// [`Services::cancel_workspace_pr_monitors`]) just cancelled — the
+    /// [`crate::harness::Harness::workspace_archived_watches_cancelled_notice`]
+    /// surface naming every cancelled hook (`name` + id) and monitor
+    /// (label) plus the re-arm calls, tagged
+    /// `{ type: "workspace_archive_wake", hookIds, prMonitorIds }` (both
+    /// arrays always present). Agents with nothing cancelled get nothing.
+    /// The wake rides the archived gate in [`Services::deliver_wake_message`]
+    /// — parked in the queue, delivered by the unarchive drain kick
+    /// ([`Services::unarchive_workspace_inner`]) or folded into the combined
+    /// turn of a post-archive user send — so the notice is only ever read
+    /// after the workspace is Active again, and its wording says so.
+    ///
+    /// The per-item cancels were DEFERRED
+    /// ([`crate::hook_manager::CancelSettlement::Deferred`]): none ran the
+    /// deferral backstop, so this tail runs
+    /// [`Services::redeliver_completion_after_queue_mutation`] once per
+    /// owner AFTER queueing its wake — on delivery failure too. Ordering is
+    /// the point: a completion watch deferred on a monitoring-idle owner
+    /// must find the queued notice (ready-to-send → the backstop defers,
+    /// exactly as it did behind the retired per-item wakes) and stay armed
+    /// for the owner's real turn after unarchive, not be consumed by a
+    /// synthesized completion the final per-item cancel would otherwise
+    /// produce against an empty queue. Best-effort per agent: a delivery
+    /// failure is logged and the tail moves on — the cancels themselves
+    /// already persisted.
+    async fn notify_owners_of_archived_watches(
+        &self,
+        workspace_id: &WorkspaceId,
+        hooks: std::collections::BTreeMap<AgentId, Vec<(String, intent_core::HookId)>>,
+        monitors: std::collections::BTreeMap<AgentId, Vec<(String, intent_core::PrMonitorId)>>,
+    ) {
+        let owners: std::collections::BTreeSet<&AgentId> =
+            hooks.keys().chain(monitors.keys()).collect();
+        for owner in owners {
+            let agent_hooks = hooks.get(owner).map(Vec::as_slice).unwrap_or_default();
+            let agent_monitors = monitors.get(owner).map(Vec::as_slice).unwrap_or_default();
+            let hook_items: Vec<(&str, &str)> = agent_hooks
+                .iter()
+                .map(|(name, id)| (name.as_str(), id.as_str()))
+                .collect();
+            let monitor_labels: Vec<&str> = agent_monitors
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect();
+            let notice = crate::harness::latest()
+                .workspace_archived_watches_cancelled_notice(&hook_items, &monitor_labels);
+            let metadata = serde_json::json!({
+                "type": "workspace_archive_wake",
+                "hookIds": agent_hooks.iter().map(|(_, id)| id).collect::<Vec<_>>(),
+                "prMonitorIds": agent_monitors.iter().map(|(_, id)| id).collect::<Vec<_>>(),
+            });
+            if let Err(e) = self
+                .deliver_wake_message(workspace_id, owner, &notice, Some(&metadata))
+                .await
+            {
+                tracing::warn!(
+                    workspace = %workspace_id.as_str(),
+                    agent = %owner.as_str(),
+                    error = %e,
+                    "archive sweep: consolidated watch-cancel wake delivery failed"
+                );
+            }
+            self.redeliver_completion_after_queue_mutation(owner).await;
+        }
+    }
+
     /// Flip an archived workspace back to Active: persist the row, kick the
     /// drains parked by the archived gates, derive `lastActivity`/`activity`,
     /// and publish ONE `workspace:updated` delta. `auto_unarchive` — set only
