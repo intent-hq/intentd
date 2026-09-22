@@ -8,7 +8,9 @@
 //! `AgentStatus::is_running_turn` in `crates/intent-core/src/model.rs`;
 //! nothing else stops a fifth copy. This source-scanning test fails, naming
 //! `file:line`, whenever an or-pattern anywhere under `crates/*/src/**/*.rs`
-//! other than `model.rs` spells out exactly that variant set again.
+//! other than `model.rs` spells out exactly that variant set again (the Rust
+//! rule), or a string literal under `crates/intent-store/src/**/*.rs` spells
+//! the set as a SQL list again (the SQL rule).
 //!
 //! The heuristic is deliberately small:
 //!
@@ -51,13 +53,26 @@
 //!   such as `allowance` is malformed), and it must be followed by
 //!   whitespace, an em dash or hyphen, and a nonempty reason. A malformed
 //!   marker never suppresses the hit; the report says so.
+//! - **SQL rule**: every string literal the lexer collected — cooked or raw,
+//!   a `format!` template included — in non-test code under
+//!   `crates/intent-store/src/**/*.rs` (same `tests/` / `tests.rs` /
+//!   `#[cfg(test)]` skipping) is a hit when its body, as written, contains
+//!   both `'active'` and `'Processing'` (case-sensitive: the lowercase /
+//!   legacy-capitalized pair is the fingerprint of the running set as the
+//!   persisted serde names). The hit is reported at the literal's line
+//!   carrying the first of the two words; the opt-out marker goes on the
+//!   line above the literal's opening line or above its statement's first
+//!   line (a literal is never split across statements, so the statement is
+//!   the text back to the previous `;` / `{` / `}`).
 //!
 //! Limits: bare imported variants (`use AgentStatus::*; Pending | Active |
 //! Processing`) are not recognized, a `Self::` triple on some other enum
 //! with the same variant names is a false positive (opt out with a reason),
-//! and a test module file that is not named `tests.rs` and not under a
-//! `tests/` directory is scanned like production code unless its item is
-//! `#[cfg(test)]`.
+//! a test module file that is not named `tests.rs` and not under a `tests/`
+//! directory is scanned like production code unless its item is
+//! `#[cfg(test)]`, and a SQL list assembled from several literals (`"IN
+//! ('active', "` + `"'Processing')"`) or one that omits `'active'` is not
+//! recognized.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -68,6 +83,9 @@ const VARIANT_OWNERS: &[&str] = &["AgentStatus", "Self"];
 const OPT_OUT_MARKER: &str = "// running-turn: allow";
 const CFG_TEST_TOKENS: &[&str] = &["#", "[", "cfg", "(", "test", ")", "]"];
 const EXEMPT_FILE: &[&str] = &["crates", "intent-core", "src", "model.rs"];
+/// Both must appear in one literal for the SQL rule to fire.
+const SQL_RUNNING_FINGERPRINT: &[&str] = &["'active'", "'Processing'"];
+const SQL_LITERAL_DIR: &[&str] = &["crates", "intent-store", "src"];
 const EXCERPT_CHARS: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,25 +478,23 @@ fn cfg_test_item_ends_at_semicolon(chars: &[char], mut j: usize) -> bool {
     }
 }
 
-/// Blanks every `#[cfg(test)]` attribute together with the whole item that
-/// follows it (see the module doc for where each kind of item ends). Runs on
-/// already-blanked text, so the attribute cannot hide inside a string or
-/// comment.
-fn blank_cfg_test_items(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
+/// Char ranges `[start, end)` of every `#[cfg(test)]` attribute together
+/// with the whole item that follows it (see the module doc for where each
+/// kind of item ends). Runs on already-blanked text, so the attribute cannot
+/// hide inside a string or comment.
+fn cfg_test_item_ranges(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        if !starts_with_cfg_test(&chars, i) {
-            out.push(chars[i]);
+        if !starts_with_cfg_test(chars, i) {
             i += 1;
             continue;
         }
-        let ends_at_semicolon = cfg_test_item_ends_at_semicolon(&chars, i);
+        let start = i;
+        let ends_at_semicolon = cfg_test_item_ends_at_semicolon(chars, i);
         let mut depth = 0usize;
         while i < chars.len() {
             let c = chars[i];
-            push_blank(&mut out, c);
             i += 1;
             match c {
                 '{' => depth += 1,
@@ -492,8 +508,34 @@ fn blank_cfg_test_items(text: &str) -> String {
                 _ => {}
             }
         }
+        out.push((start, i));
     }
     out
+}
+
+/// Blanks every `#[cfg(test)]` item range of `text` (newlines preserved).
+fn blank_cfg_test_items(text: &str) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    for (start, end) in cfg_test_item_ranges(&chars) {
+        for c in &mut chars[start..end] {
+            if *c != '\n' {
+                *c = ' ';
+            }
+        }
+    }
+    chars.into_iter().collect()
+}
+
+/// 1-based line of the first non-whitespace character of the statement (text
+/// back to the previous `;` / `{` / `}`) containing the char at `offset` of
+/// the blanked source; `offset` itself when nothing precedes it there.
+fn statement_line(chars: &[char], offset: usize) -> usize {
+    let boundary = chars[..offset]
+        .iter()
+        .rposition(|c| matches!(c, ';' | '{' | '}'))
+        .map_or(0, |b| b + 1);
+    let start = skip_whitespace(chars, boundary).min(offset);
+    chars[..start].iter().filter(|c| **c == '\n').count() + 1
 }
 
 struct Statement {
@@ -744,6 +786,58 @@ fn scan_source(src: &str) -> Vec<Hit> {
     hits
 }
 
+/// `(line offset within the literal, that line's text)` for the first
+/// occurrence of any fingerprint word in a literal body.
+fn sql_fingerprint_line(text: &str) -> (usize, &str) {
+    let idx = SQL_RUNNING_FINGERPRINT
+        .iter()
+        .filter_map(|word| text.find(word))
+        .min()
+        .expect("caller checked the fingerprint");
+    let offset = text[..idx].matches('\n').count();
+    (offset, text.lines().nth(offset).unwrap_or(""))
+}
+
+/// Scans one Rust source file's text and returns every string literal in
+/// non-test code whose body carries the SQL running-set fingerprint and is not
+/// suppressed by a reasoned opt-out marker above the literal or its statement.
+fn scan_sql_literals(src: &str) -> Vec<Hit> {
+    let lexed = lex(src);
+    let markers = markers_by_line(src, &lexed.line_comments);
+    let blanked: Vec<char> = lexed.blanked.chars().collect();
+    let test_ranges = cfg_test_item_ranges(&blanked);
+    let marker_at = |line: usize| markers.get(line - 1).copied().unwrap_or(Marker::Absent);
+    let mut hits = Vec::new();
+    for literal in &lexed.literals {
+        if !SQL_RUNNING_FINGERPRINT
+            .iter()
+            .all(|word| literal.text.contains(word))
+        {
+            continue;
+        }
+        if test_ranges
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&literal.offset))
+        {
+            continue;
+        }
+        let states = [
+            marker_at(literal.line),
+            marker_at(statement_line(&blanked, literal.offset)),
+        ];
+        if states.contains(&Marker::WithReason) {
+            continue;
+        }
+        let (line_offset, line_text) = sql_fingerprint_line(&literal.text);
+        hits.push(Hit {
+            line: literal.line + line_offset,
+            excerpt: excerpt(line_text),
+            marker_malformed: states.contains(&Marker::Malformed),
+        });
+    }
+    hits
+}
+
 /// Every `*.rs` under `dir`, skipping `tests/` directories and `tests.rs`.
 fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
@@ -844,6 +938,59 @@ fn running_turn_rule_is_only_spelled_in_agent_status() {
          for \"the agent is running a turn\" (intent-hq/intentd#2058). A site that genuinely \
          needs the same variant set for a different rule may opt out with \
          `// running-turn: allow — <reason>` on the line immediately above the pattern or \
+         its statement; the reason is required.",
+        report.join("\n")
+    );
+}
+
+/// Sorted non-test sources of the SQL rule's scope, `crates/intent-store/src`.
+fn sql_literal_sources(root: &Path) -> Vec<PathBuf> {
+    let dir: PathBuf = SQL_LITERAL_DIR.iter().collect();
+    let mut files = Vec::new();
+    collect_rust_sources(&root.join(&dir), &mut files);
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no Rust sources found under {}; update SQL_LITERAL_DIR",
+        display_rel(&dir)
+    );
+    files
+}
+
+#[test]
+fn running_turn_sql_list_is_generated_not_spelled_in_store() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let mut report = Vec::new();
+    for file in sql_literal_sources(&root) {
+        let rel = file
+            .strip_prefix(&root)
+            .expect("source path under the workspace root");
+        let src =
+            fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        for hit in scan_sql_literals(&src) {
+            let note = if hit.marker_malformed {
+                "  (opt-out marker is malformed: expected `// running-turn: allow — <reason>`)"
+            } else {
+                ""
+            };
+            report.push(format!(
+                "{}:{}: {}{note}",
+                display_rel(rel),
+                hit.line,
+                hit.excerpt
+            ));
+        }
+    }
+
+    assert!(
+        report.is_empty(),
+        "the running-turn status set is spelled out as a SQL literal in intent-store:\n\n{}\n\n\
+         Generate the status list from `AgentStatus::ALL.iter().filter(|s| s.is_running_turn())` \
+         as `delegated_counts_sql` (crates/intent-store/src/agent_repo.rs) does, so the store \
+         cannot drift from `AgentStatus::is_running_turn`, the single source for \"the agent \
+         is running a turn\" (intent-hq/intentd#2058). A literal that genuinely needs both \
+         `'active'` and `'Processing'` for a different rule may opt out with \
+         `// running-turn: allow — <reason>` on the line immediately above the literal or \
          its statement; the reason is required.",
         report.join("\n")
     );
@@ -1179,4 +1326,188 @@ fn lexer_keeps_string_literal_bodies_with_their_lines() {
     assert!(lexed.line_comments[0].standalone);
     assert_eq!(lexed.blanked.lines().count(), src.lines().count());
     assert!(!lexed.blanked.contains('"') && !lexed.blanked.contains("tail"));
+}
+
+// ---- SQL rule fixtures ------------------------------------------------------
+
+fn sql_hit_lines(src: &str) -> Vec<usize> {
+    scan_sql_literals(src).into_iter().map(|h| h.line).collect()
+}
+
+/// `delegated_counts_sql` in `crates/intent-store/src/agent_repo.rs` as it
+/// stood before intentd commit e6703788 (#2058): the literal `IN` list.
+const DELEGATED_COUNTS_SQL_PRE_2058: &str = r#"
+/// grouped statement over the workspace's non-retired delegated rows (the
+/// `delegated` predicate of [`scope_predicate`]) yielding `delegatedCounts`
+/// (§5.5): one row per direct parent with the child count and the subset
+/// whose persisted status is running. The running set is the daemon's
+/// `is_running_turn` rule — `pending` / `active` / legacy capitalized
+/// `Processing` (the serde names of `AgentStatus`, which is how the column is
+/// written). Same `idx_agent_workspace` search as [`scope_counts_sql`], so
+/// `SUM(total)` over the result always equals `scopeCounts.delegated`.
+pub(crate) fn delegated_counts_sql() -> &'static str {
+    "SELECT \
+        parent_agent_id, \
+        COUNT(*) AS total, \
+        COALESCE(SUM(status IN ('pending', 'active', 'Processing')), 0) AS running \
+     FROM agent_session \
+     WHERE workspace_id = ? AND retired_at IS NULL AND parent_agent_id IS NOT NULL \
+     GROUP BY parent_agent_id"
+}
+"#;
+
+#[test]
+fn pre_2058_delegated_counts_sql_literal_is_flagged() {
+    let src = DELEGATED_COUNTS_SQL_PRE_2058;
+    let hits = scan_sql_literals(src);
+    assert_eq!(
+        hits,
+        vec![Hit {
+            line: line_of(src, "COALESCE(SUM(status IN"),
+            excerpt:
+                "COALESCE(SUM(status IN ('pending', 'active', 'Processing')), 0) AS running \\"
+                    .into(),
+            marker_malformed: false,
+        }]
+    );
+}
+
+#[test]
+fn sql_rule_sees_raw_strings_and_format_templates() {
+    let src = r##"
+fn a() -> String {
+    format!(
+        "SELECT COUNT(*) FROM agent_session \
+         WHERE workspace_id = {ws} AND status IN ('pending', 'active', 'Processing')"
+    )
+}
+fn b() -> &'static str {
+    r#"SELECT 1 WHERE status IN ('active', 'Processing')"#
+}
+"##;
+    assert_eq!(
+        sql_hit_lines(src),
+        vec![
+            line_of(src, "WHERE workspace_id = {ws}"),
+            line_of(src, "r#\"SELECT 1"),
+        ]
+    );
+}
+
+#[test]
+fn sql_literals_with_one_fingerprint_word_are_not_hits() {
+    let src = r#"
+fn pr_monitor_queries() -> Vec<String> {
+    vec![
+        "UPDATE pr_monitor SET updated_at = ?1 WHERE monitor_id = ?2 AND state = 'active'".into(),
+        format!("SELECT {COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at"),
+        "SELECT 1 FROM pr_monitor WHERE state IN ('active', 'completed')".into(),
+        "SELECT 1 FROM agent_session WHERE status = 'Processing'".into(),
+        "SELECT 1 FROM agent_session WHERE status IN ('pending', 'Processing')".into(),
+        "SELECT 1 FROM agent_session WHERE status IN ('Active', 'processing')".into(),
+    ]
+}
+"#;
+    assert!(
+        sql_hit_lines(src).is_empty(),
+        "{:?}",
+        scan_sql_literals(src)
+    );
+}
+
+#[test]
+fn sql_literals_in_test_code_and_comments_are_not_hits() {
+    let src = r#"
+//! The store test pins `status IN ('pending', 'active', 'Processing')`.
+
+/// Generated from `AgentStatus::ALL`; never spell `('pending', 'active', 'Processing')`.
+pub(crate) fn delegated_counts_sql() -> String {
+    /* status IN ('pending', 'active', 'Processing') */
+    let running = running_status_list();
+    format!("COALESCE(SUM(status IN ({running})), 0) AS running")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn delegated_counts_sql_running_set_matches_core_rule() {
+        assert!(
+            delegated_counts_sql().contains("status IN ('pending', 'active', 'Processing')"),
+        );
+    }
+}
+
+#[cfg(test)]
+const EXPECTED: &str = "status IN ('pending', 'active', 'Processing')";
+
+#[cfg(not(test))]
+fn scanned() -> &'static str {
+    "status IN ('pending', 'active', 'Processing')"
+}
+"#;
+    assert_eq!(sql_hit_lines(src), vec![line_of(src, "fn scanned") + 1]);
+}
+
+#[test]
+fn sql_rule_marker_above_literal_or_statement_suppresses_but_malformed_does_not() {
+    let src = r#"
+fn f() -> Vec<&'static str> {
+    // running-turn: allow — fixture for the lint itself
+    let a = "status IN ('pending', 'active', 'Processing')";
+    // running-turn: allow - the statement line is the `let b` line
+    let b = format!(
+        "SELECT 1 WHERE \
+         status IN ('pending', 'active', 'Processing')"
+    );
+    let c = format!(
+        // running-turn: allow — directly above the literal
+        "status IN ('pending', 'active', 'Processing')"
+    );
+    // running-turn: allow
+    let d = "status IN ('pending', 'active', 'Processing')";
+    let e = "status IN ('pending', 'active', 'Processing')"; // running-turn: allow — trailing
+    // running-turn: allow — two lines above
+
+    let f = "status IN ('pending', 'active', 'Processing')";
+    vec![a, b, c, d, e, f]
+}
+"#;
+    let hits = scan_sql_literals(src);
+    let expect: Vec<(usize, bool)> = [("let d", true), ("let e", false), ("let f", false)]
+        .iter()
+        .map(|(needle, malformed)| (line_of(src, needle), *malformed))
+        .collect();
+    assert_eq!(
+        hits.iter()
+            .map(|h| (h.line, h.marker_malformed))
+            .collect::<Vec<_>>(),
+        expect
+    );
+}
+
+#[test]
+fn sql_rule_scope_is_intent_store_non_test_sources() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let dir: PathBuf = SQL_LITERAL_DIR.iter().collect();
+    let files = sql_literal_sources(&root);
+    for file in &files {
+        let rel = file
+            .strip_prefix(&root)
+            .expect("source path under the workspace root");
+        assert!(
+            rel.starts_with(&dir),
+            "{} is outside the SQL rule's scope",
+            display_rel(rel)
+        );
+        assert!(
+            rel.file_name().is_some_and(|n| n != "tests.rs")
+                && !rel.components().any(|c| c.as_os_str() == "tests"),
+            "{} is test code",
+            display_rel(rel)
+        );
+    }
+    assert!(
+        files.iter().any(|f| f.ends_with("agent_repo.rs")),
+        "agent_repo.rs (home of delegated_counts_sql) is not in scope"
+    );
 }
