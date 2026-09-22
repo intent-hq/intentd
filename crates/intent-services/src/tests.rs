@@ -16534,6 +16534,20 @@ pub(crate) mod pr {
         /// (`add_permits(1)`): the caller proves the read it triggered from
         /// returned while `GET /user` was still in flight.
         pub(crate) get_user_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        /// When set, the FIRST `get_pr` signals `entered` and holds until
+        /// `release` is notified, so a test can land a concurrent
+        /// signal-bearing fold while a REST refresh's read is in flight
+        /// (intent-hq/intent#5654).
+        pub(crate) get_pr_park: Option<std::sync::Arc<GetPrPark>>,
+    }
+
+    /// One-shot park for [`StubForge::get_pr`]: `entered` fires when the
+    /// held read begins, `release` lets it return.
+    #[derive(Default)]
+    pub(crate) struct GetPrPark {
+        claimed: std::sync::atomic::AtomicBool,
+        pub(crate) entered: tokio::sync::Notify,
+        pub(crate) release: tokio::sync::Notify,
     }
 
     impl StubForge {
@@ -16813,6 +16827,12 @@ pub(crate) mod pr {
             if self.hang_get_pr == Some(number) {
                 // A TCP connection that went dark: the future never resolves.
                 std::future::pending::<()>().await;
+            }
+            if let Some(park) = &self.get_pr_park {
+                if !park.claimed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
             }
             if self.missing_pr == Some(number) {
                 return Err(ScError::NotFound("no such PR".into()));
@@ -18522,6 +18542,104 @@ pub(crate) mod pr {
             .await
             .unwrap();
         assert_eq!(evs2.len(), 1);
+    }
+
+    /// Linked workspace whose persisted pool holds the sample PR with the
+    /// given queue signal and no `activePullRequest`, so a refresh's
+    /// snapshot compare always writes; the forge parks its first `get_pr`.
+    async fn parked_refresh_setup(
+        signal: Option<bool>,
+    ) -> (TempDb, Services, WorkspaceId, Arc<GetPrPark>) {
+        let park = Arc::new(GetPrPark::default());
+        let forge = StubForge {
+            get_pr_park: Some(park.clone()),
+            ..Default::default()
+        };
+        let (t, svc, ws_id) = refresh_setup(forge, "feature", Some(42), false).await;
+        let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+        ws.pull_requests = Some(vec![crate::pr_ops::build_pr_info_with_merge_queue(
+            &sample_pr(),
+            signal,
+        )]);
+        svc.store().update_workspace_pr_linkage(&ws).await.unwrap();
+        (t, svc, ws_id, park)
+    }
+
+    /// A REST refresh whose row read predates a signal-bearing fold must not
+    /// erase the enqueue the fold persisted (intent-hq/intent#5654): the
+    /// read is held in flight, the fold writes `Some(true)` on the same
+    /// head, and the refresh's persist re-derives the carry against the
+    /// row at write time instead of its stale snapshot.
+    #[tokio::test]
+    async fn rest_refresh_keeps_a_queue_signal_folded_while_its_read_was_in_flight() {
+        let (_t, svc, ws_id, park) = parked_refresh_setup(None).await;
+        let refresh = svc.refresh_workspace_pr(&ws_id);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_fetched_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true))
+                .await
+                .expect("fold");
+            let mid = svc.store().get_workspace(&ws_id).await.unwrap();
+            assert_eq!(
+                mid.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+                Some(true),
+                "the fold landed while the REST read was held"
+            );
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.expect("refresh"), crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        let pooled = &after.pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.is_in_merge_queue, Some(true));
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            Some(true),
+            "activePullRequest mirrors the rebased pool entry"
+        );
+    }
+
+    /// The mirror image: the refresh's snapshot still carries `Some(true)`
+    /// when a fold observes the PR dequeued; the persist must not resurrect
+    /// the cleared signal from that snapshot (intent-hq/intent#5654).
+    #[tokio::test]
+    async fn rest_refresh_does_not_resurrect_a_queue_signal_a_fold_cleared_mid_read() {
+        let (_t, svc, ws_id, park) = parked_refresh_setup(Some(true)).await;
+        let refresh = svc.refresh_workspace_pr(&ws_id);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_fetched_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false))
+                .await
+                .expect("fold");
+            let mid = svc.store().get_workspace(&ws_id).await.unwrap();
+            assert_eq!(
+                mid.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+                None,
+                "the fold cleared the signal while the REST read was held"
+            );
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.expect("refresh"), crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None
+        );
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            None
+        );
     }
 
     #[tokio::test]
@@ -20444,6 +20562,90 @@ pub(crate) mod pr {
         assert!(list.iter().any(|p| p.number == 77));
     }
 
+    /// Linked root (branch `feature` = the sample PR head) whose persisted
+    /// pool holds the sample PR with the given queue signal and no
+    /// `pr_status`, so the refresh always persists; the forge parks its
+    /// first `get_pr`.
+    async fn parked_root_setup(
+        signal: Option<bool>,
+    ) -> (
+        TempDb,
+        Services,
+        intent_core::Workspace,
+        intent_core::WorkspaceGitRoot,
+        Arc<GetPrPark>,
+        SweepRepo,
+        SweepRepo,
+    ) {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pull_requests = Some(vec![crate::pr_ops::build_pr_info_with_merge_queue(
+            &sample_pr(),
+            signal,
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let park = Arc::new(GetPrPark::default());
+        (t, svc, ws, root, park, primary, secondary)
+    }
+
+    /// Git-root analogue of the workspace enqueue race: the root refresh's
+    /// snapshot predates a fold that enqueued the pooled PR; the persist
+    /// keeps the fold's `Some(true)` (intent-hq/intent#5654).
+    #[tokio::test]
+    async fn root_refresh_keeps_a_queue_signal_folded_while_its_read_was_in_flight() {
+        let (_t, svc, ws, root, park, _p, _s) = parked_root_setup(None).await;
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            get_pr_park: Some(park.clone()),
+            ..Default::default()
+        });
+        let refresh = svc.refresh_git_root_pr(root, &sc);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_fetched_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true))
+                .await
+                .expect("fold");
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.unwrap(), crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let pooled = &roots[0].pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.number, 42);
+        assert_eq!(pooled.is_in_merge_queue, Some(true));
+    }
+
+    /// Git-root analogue of the workspace dequeue race: the snapshot still
+    /// carries `Some(true)` after a fold cleared it; the persist does not
+    /// resurrect it (intent-hq/intent#5654).
+    #[tokio::test]
+    async fn root_refresh_does_not_resurrect_a_queue_signal_a_fold_cleared_mid_read() {
+        let (_t, svc, ws, root, park, _p, _s) = parked_root_setup(Some(true)).await;
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            get_pr_park: Some(park.clone()),
+            ..Default::default()
+        });
+        let refresh = svc.refresh_git_root_pr(root, &sc);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_fetched_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false))
+                .await
+                .expect("fold");
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.unwrap(), crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let pooled = &roots[0].pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.number, 42);
+        assert_eq!(pooled.is_in_merge_queue, None);
+    }
+
     /// A spec-child task note in `status`, so it counts into the workspace's
     /// `taskStats` for the displayStatus derivation.
     fn sweep_task_note(ws_id: &WorkspaceId, status: intent_core::TaskStatus) -> intent_core::Note {
@@ -21667,15 +21869,20 @@ pub(crate) mod pr {
                 "2026-01-03T00:00:00Z",
             ),
         ]);
+        let mut fetched_fresh = Vec::new();
         let (changed, rate_limited) = crate::pr_ops::refresh_stale_pool_entries(
             &sc,
             &repo,
             &mut list,
-            &[],
+            &mut fetched_fresh,
             std::time::Duration::from_secs(1),
         )
         .await;
         assert!(!changed);
+        assert!(
+            fetched_fresh.is_empty(),
+            "a rate-limited re-fetch is not fresh"
+        );
         assert!(
             rate_limited.is_some_and(|d| d.contains("rate limit")),
             "the limit surfaces to the caller"

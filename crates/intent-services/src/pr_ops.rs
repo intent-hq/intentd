@@ -312,8 +312,16 @@ pub(crate) async fn discover_matching_open_pr(
 /// unknown. A signal-bearing read always wins: `fresh` carrying `Some(_)`
 /// (or written through [`upsert_pr_info_by_url`], which never carries) is
 /// taken as reported.
+///
+/// The donor must be the same PR, not merely a same-numbered one: pools can
+/// be cross-repository, and a queued `fork/repo#42` may share a commit with
+/// an unqueued `upstream/repo#42` (the same head pushed to both), so identity
+/// is the URL ([`same_pr_url`]) in addition to the number the caller matched.
 pub(crate) fn carry_merge_queue_signal(fresh: &mut PullRequestInfo, previous: &PullRequestInfo) {
-    if fresh.is_in_merge_queue.is_some() || previous.is_in_merge_queue != Some(true) {
+    if fresh.is_in_merge_queue.is_some()
+        || previous.is_in_merge_queue != Some(true)
+        || !same_pr_url(&fresh.url, &previous.url)
+    {
         return;
     }
     let open = fresh.status == PullRequestStatus::Open && fresh.is_draft != Some(true);
@@ -417,6 +425,84 @@ pub(crate) fn upsert_pr_info_by_url(
     true
 }
 
+/// Rebase a REST-path `pull_requests` list about to be persisted onto the
+/// pool currently in the store (intent-hq/intent#5654). REST refreshes build
+/// their list from a row read taken before the forge round trip (the sweep
+/// reads it once at sweep start), so a signal-bearing `github.pulls.get`
+/// fold landing in between is invisible to them: taking the list verbatim
+/// would erase a concurrent enqueue (the fold's `Some(true)` is not in the
+/// snapshot the carry ran against) or resurrect a concurrent dequeue (the
+/// snapshot still holds the `Some(true)` the fold cleared) — and, unlike the
+/// plain REST fields, [`carry_merge_queue_signal`] would then perpetuate the
+/// stale value sweep after sweep instead of converging. Runs inside the
+/// store's write transaction, against the row as it is at write time:
+///
+/// - an entry whose number is in `refreshed` was fetched fresh from the forge
+///   this pass, so its REST fields stand and only its queue signal is
+///   re-derived — the snapshot-based carry is discarded and
+///   [`carry_merge_queue_signal`] reruns against the persisted same-PR
+///   entry;
+/// - any other entry was not touched this pass, so the persisted copy (at
+///   least as new as the snapshot's) replaces it wholesale;
+/// - a persisted entry the outgoing list lacks (appended by a concurrent
+///   fold) is kept.
+///
+/// Identity is number plus [`same_pr_url`] throughout, so a same-numbered PR
+/// of another repository never donates or replaces. A row with no persisted
+/// list leaves `outgoing` as built.
+pub(crate) fn rebase_pool_on_persisted(
+    outgoing: &mut Option<Vec<PullRequestInfo>>,
+    persisted: Option<Vec<PullRequestInfo>>,
+    refreshed: &[u64],
+) {
+    let Some(persisted) = persisted else {
+        return;
+    };
+    let same = |a: &PullRequestInfo, b: &PullRequestInfo| {
+        a.number == b.number && same_pr_url(&a.url, &b.url)
+    };
+    let items = outgoing.get_or_insert_with(Vec::new);
+    for entry in items.iter_mut() {
+        let Some(current) = persisted.iter().find(|p| same(p, entry)) else {
+            continue;
+        };
+        if refreshed.contains(&entry.number) {
+            entry.is_in_merge_queue = None;
+            carry_merge_queue_signal(entry, current);
+        } else {
+            *entry = current.clone();
+        }
+    }
+    for current in persisted {
+        if !items.iter().any(|e| same(e, &current)) {
+            items.push(current);
+        }
+    }
+}
+
+/// Workspace form of [`rebase_pool_on_persisted`] for the REST-path
+/// persist (`Store::update_workspace_pr_linkage_rebased`): rebases
+/// `ws.pull_requests`, then re-mirrors `activePullRequest` from the linked
+/// PR's rebased pool entry so the two persisted copies stay one coherent
+/// snapshot.
+pub(crate) fn rebase_workspace_pr_pool(
+    ws: &mut Workspace,
+    persisted: Option<Vec<PullRequestInfo>>,
+    refreshed: &[u64],
+) {
+    rebase_pool_on_persisted(&mut ws.pull_requests, persisted, refreshed);
+    if let (Some(number), Some(active)) = (ws.pr_number, ws.active_pull_request.as_mut()) {
+        let pooled = ws.pull_requests.as_deref().and_then(|items| {
+            items
+                .iter()
+                .find(|p| p.number == number && same_pr_url(&p.url, &active.url))
+        });
+        if let Some(entry) = pooled {
+            *active = entry.clone();
+        }
+    }
+}
+
 /// Cap on stale `pull_requests` re-fetches per git root per sweep
 /// (monorepo#3127). Bounds the forge calls added by
 /// [`refresh_stale_pool_entries`] so a long PR history stays within the
@@ -433,8 +519,11 @@ pub(crate) const MAX_STALE_POOL_REFETCHES: usize = 5;
 /// is the only irreversible forge state — a Closed PR can be reopened, and
 /// the list PR pool merge is deliberately one-way (a terminal entry is never
 /// downgraded by a candidate), so only this authoritative re-fetch can move
-/// a persisted Closed entry back to Open. `exclude` names PR numbers already
-/// fetched fresh this pass (the linked / just-discovered PR). At most
+/// a persisted Closed entry back to Open. `fetched_fresh` names PR numbers
+/// already fetched fresh this pass (the linked / just-discovered PR), which
+/// are skipped; every number this call re-fetches successfully is appended
+/// to it, so the caller's persist can tell fresh entries from untouched ones
+/// ([`rebase_pool_on_persisted`]). At most
 /// [`MAX_STALE_POOL_REFETCHES`] entries are re-fetched per call, oldest
 /// `updatedAt` first (unparseable timestamps sort oldest, ties by number);
 /// fail-soft per entry — a forge error logs and keeps the persisted
@@ -450,7 +539,7 @@ pub(crate) async fn refresh_stale_pool_entries(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     list: &mut Option<Vec<PullRequestInfo>>,
-    exclude: &[u64],
+    fetched_fresh: &mut Vec<u64>,
     per_entry_timeout: std::time::Duration,
 ) -> (bool, Option<String>) {
     let Some(items) = list.as_deref() else {
@@ -458,7 +547,7 @@ pub(crate) async fn refresh_stale_pool_entries(
     };
     let mut candidates: Vec<(Option<OffsetDateTime>, u64)> = items
         .iter()
-        .filter(|p| p.status != PullRequestStatus::Merged && !exclude.contains(&p.number))
+        .filter(|p| p.status != PullRequestStatus::Merged && !fetched_fresh.contains(&p.number))
         .map(|p| (parse_iso(&p.updated_at), p.number))
         .collect();
     candidates.sort();
@@ -467,6 +556,7 @@ pub(crate) async fn refresh_stale_pool_entries(
     for (_, number) in candidates {
         match tokio::time::timeout(per_entry_timeout, sc.get_pr(repo_ref, number)).await {
             Ok(Ok(pr)) => {
+                fetched_fresh.push(number);
                 changed |= upsert_pr_info(list, &mut build_pr_info(&pr));
             }
             Ok(Err(intent_sourcecontrol::Error::RateLimited(detail))) => {
@@ -1837,6 +1927,102 @@ mod tests {
         let mut fresh = build_pr_info(&queued);
         assert!(upsert_pr_info(&mut list, &mut fresh));
         assert_eq!(fresh.is_in_merge_queue, None);
+    }
+
+    /// The donor must be the same PR: a queued `fork/repo#42` sharing its
+    /// head commit with an unqueued `upstream/repo#42` never lends it the
+    /// signal, while the same PR under a case-variant URL still does.
+    #[test]
+    fn carry_merge_queue_signal_requires_the_same_pr_url() {
+        let queued = queued_pooled_pr();
+        let mut rest = pr(PrState::Open, false, Some(true), Some("clean"));
+        rest.head_sha = Some("sha1".into());
+
+        // Same number + head, another repository → no inheritance.
+        rest.url = "https://github.com/fork/repo/pull/1".into();
+        let mut stranger = build_pr_info(&rest);
+        carry_merge_queue_signal(&mut stranger, &queued);
+        assert_eq!(stranger.is_in_merge_queue, None);
+        let mut list = Some(vec![queued.clone()]);
+        let mut stranger = build_pr_info(&rest);
+        assert!(upsert_pr_info(&mut list, &mut stranger));
+        assert_eq!(stranger.is_in_merge_queue, None);
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, None);
+
+        // Same PR, slug casing differs → inherits.
+        rest.url = queued.url.to_ascii_uppercase();
+        let mut same = build_pr_info(&rest);
+        carry_merge_queue_signal(&mut same, &queued);
+        assert_eq!(same.is_in_merge_queue, Some(true));
+    }
+
+    /// The write-time rebase re-derives a fresh entry's queue signal from the
+    /// persisted row rather than the snapshot the refresh started from: a
+    /// fold that enqueued in between is kept, a fold that dequeued in between
+    /// is not resurrected, a moved head lapses, an untouched entry takes the
+    /// persisted copy wholesale, a concurrently appended entry survives, and
+    /// a same-numbered stranger is left alone (intent-hq/intent#5654).
+    #[test]
+    fn rebase_pool_on_persisted_rederives_the_queue_signal_at_write_time() {
+        let mut rest = pr(PrState::Open, false, Some(true), Some("clean"));
+        rest.head_sha = Some("sha1".into());
+        rest.updated_at = "2026-01-02T00:00:00Z".into();
+        let fresh = build_pr_info(&rest);
+
+        // Snapshot had no signal; a fold enqueued before the write.
+        let mut outgoing = Some(vec![fresh.clone()]);
+        rebase_pool_on_persisted(&mut outgoing, Some(vec![queued_pooled_pr()]), &[1]);
+        let items = outgoing.as_ref().unwrap();
+        assert_eq!(items[0].is_in_merge_queue, Some(true));
+        assert_eq!(
+            items[0].updated_at, "2026-01-02T00:00:00Z",
+            "REST fields stand"
+        );
+
+        // Snapshot carried `Some(true)`; a fold dequeued before the write.
+        let mut carried = fresh.clone();
+        carried.is_in_merge_queue = Some(true);
+        let mut outgoing = Some(vec![carried.clone()]);
+        let mut dequeued = queued_pooled_pr();
+        dequeued.is_in_merge_queue = None;
+        rebase_pool_on_persisted(&mut outgoing, Some(vec![dequeued]), &[1]);
+        assert_eq!(outgoing.as_ref().unwrap()[0].is_in_merge_queue, None);
+
+        // Persisted queued on another head → lapses.
+        let mut moved = fresh.clone();
+        moved.head_sha = Some("sha2".into());
+        let mut outgoing = Some(vec![moved]);
+        rebase_pool_on_persisted(&mut outgoing, Some(vec![queued_pooled_pr()]), &[1]);
+        assert_eq!(outgoing.as_ref().unwrap()[0].is_in_merge_queue, None);
+
+        // Not refreshed this pass → the persisted copy replaces the snapshot's.
+        let mut outgoing = Some(vec![fresh.clone()]);
+        rebase_pool_on_persisted(&mut outgoing, Some(vec![queued_pooled_pr()]), &[]);
+        assert_eq!(outgoing.as_ref().unwrap()[0], queued_pooled_pr());
+
+        // A concurrently appended entry is kept; a same-numbered stranger
+        // neither donates nor replaces.
+        let mut other = pr(PrState::Open, false, Some(true), Some("clean"));
+        other.number = 2;
+        other.url = "https://github.com/o/r/pull/2".into();
+        let mut stranger = queued_pooled_pr();
+        stranger.url = "https://github.com/fork/repo/pull/1".into();
+        let mut outgoing = Some(vec![fresh.clone()]);
+        rebase_pool_on_persisted(
+            &mut outgoing,
+            Some(vec![stranger.clone(), build_pr_info(&other)]),
+            &[1],
+        );
+        let items = outgoing.as_ref().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], fresh);
+        assert_eq!(items[1], stranger);
+        assert_eq!(items[2].number, 2);
+
+        // No persisted list → the outgoing list stands.
+        let mut outgoing = Some(vec![carried.clone()]);
+        rebase_pool_on_persisted(&mut outgoing, None, &[1]);
+        assert_eq!(outgoing.as_ref().unwrap()[0], carried);
     }
 
     #[test]
