@@ -25,14 +25,16 @@
 //!   itself, not inside a `run: |` block;
 //! - a `crates/*/tests/**/*_lint.rs` file defines its own `fn lex(`,
 //!   `fn markers_by_line(`, `fn blank_cfg_test_items(`,
-//!   `fn cfg_test_item_ranges(`, or `fn split_statements(` (`pub` optional,
-//!   whitespace-tolerant, matched on comment- and literal-blanked text). Those
-//!   are the shared scaffolding in `intentd_test_support::source_lint`; the
-//!   lints used to carry private copies, and two #2073 fixes (`102c347a`
-//!   statement line accounting, `f2c685af` `cfg(test)` bracket nesting) had
-//!   to be re-applied copy by copy. Opt out with a standalone
+//!   `fn cfg_test_item_ranges(`, or `fn split_statements(` (`pub` optional;
+//!   any whitespace, line breaks included, between `fn`, the name, and `(`;
+//!   matched on the whole comment- and literal-blanked text and reported at
+//!   the line of the `fn` keyword). Those are the shared scaffolding in
+//!   `intentd_test_support::source_lint`; the lints used to carry private
+//!   copies, and two #2073 fixes (`102c347a` statement line accounting,
+//!   `f2c685af` `cfg(test)` bracket nesting) had to be re-applied copy by
+//!   copy. Opt out with a standalone
 //!   `// source-lint-scaffolding: allow — <reason>` on the line above the
-//!   definition; a marker without a reason is itself a failure. The shared
+//!   `fn` keyword; a marker without a reason is itself a failure. The shared
 //!   module lives under `src/`, so the rule never sees it.
 //!
 //! The workspace root is located from `CARGO_MANIFEST_DIR`, as the other lints
@@ -44,7 +46,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use intentd_test_support::source_lint::{lex, markers_by_line, Marker};
+use intentd_test_support::source_lint::{lex, markers_by_line, skip_whitespace, word_at, Marker};
 
 const LINT_SUFFIX: &str = "_lint";
 const RS_LINT_SUFFIX: &str = "_lint.rs";
@@ -171,35 +173,53 @@ fn display_rel(rel: &Path) -> String {
         .join("/")
 }
 
-/// `Some(name)` when `line` (one line of comment- and literal-blanked source)
-/// defines a function named after one of [`SCAFFOLDING_FNS`]: optional `pub`
-/// (with or without a `(…)` restriction), `fn`, the name, then `(`, any
-/// whitespace between them.
-fn scaffolding_definition(line: &str) -> Option<&'static str> {
-    let mut rest = line.trim_start();
-    if let Some(after_pub) = rest.strip_prefix("pub") {
-        let after_pub = after_pub.trim_start();
-        rest = match after_pub.strip_prefix('(') {
-            Some(restriction) => restriction.split_once(')')?.1.trim_start(),
-            None => after_pub,
+/// Whether the keyword `fn` starts at `i`: not glued to an identifier
+/// character before it and followed by whitespace (so `fnlex`, `pub_fn`, and
+/// the `fn(` of a function-pointer type are not keywords).
+fn fn_keyword_at(chars: &[char], i: usize) -> bool {
+    chars.get(i) == Some(&'f')
+        && chars.get(i + 1) == Some(&'n')
+        && chars.get(i + 2).is_some_and(|c| c.is_whitespace())
+        && !i
+            .checked_sub(1)
+            .is_some_and(|p| chars[p].is_ascii_alphanumeric() || chars[p] == '_')
+}
+
+/// `(line, name)` for every definition in `blanked` (comment- and
+/// literal-blanked source) of a function named after one of
+/// [`SCAFFOLDING_FNS`]: the keyword `fn`, the name, then `(`, with any
+/// whitespace — line breaks included — between them. `line` is the 1-based
+/// line of the `fn` keyword.
+fn scaffolding_definitions(blanked: &str) -> Vec<(usize, &'static str)> {
+    let chars: Vec<char> = blanked.chars().collect();
+    let mut hits = Vec::new();
+    let mut line = 1;
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\n' {
+            line += 1;
+            continue;
+        }
+        if !fn_keyword_at(&chars, i) {
+            continue;
+        }
+        let Some((word, after_name)) = word_at(&chars, skip_whitespace(&chars, i + 2)) else {
+            continue;
         };
+        if chars.get(skip_whitespace(&chars, after_name)) != Some(&'(') {
+            continue;
+        }
+        if let Some(name) = SCAFFOLDING_FNS.into_iter().find(|name| *name == word) {
+            hits.push((line, name));
+        }
     }
-    let after_fn = rest.strip_prefix("fn")?;
-    if !after_fn.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let after_fn = after_fn.trim_start();
-    SCAFFOLDING_FNS.into_iter().find(|name| {
-        after_fn
-            .strip_prefix(name)
-            .is_some_and(|tail| tail.trim_start().starts_with('('))
-    })
+    hits
 }
 
 /// Every private copy of a shared scaffolding function defined in a
 /// `*_lint.rs` file under `root`, each rendered as one failure line; a
-/// `// source-lint-scaffolding: allow` marker on the line above with a
-/// reason suppresses the hit, one without a reason is reported instead.
+/// `// source-lint-scaffolding: allow` marker on the line above the `fn`
+/// keyword with a reason suppresses the hit, one without a reason is
+/// reported instead.
 fn scaffolding_copies(root: &Path) -> Vec<String> {
     let mut failures = Vec::new();
     for rel in lint_files(root) {
@@ -208,11 +228,7 @@ fn scaffolding_copies(root: &Path) -> Vec<String> {
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let lexed = lex(&src);
         let markers = markers_by_line(&src, &lexed.line_comments, SCAFFOLDING_TAG);
-        for (idx, line) in lexed.blanked.lines().enumerate() {
-            let Some(name) = scaffolding_definition(line) else {
-                continue;
-            };
-            let line_no = idx + 1;
+        for (line_no, name) in scaffolding_definitions(&lexed.blanked) {
             let marker_above = markers.get(line_no - 1).copied().unwrap_or(Marker::Absent);
             let file = display_rel(&rel);
             match marker_above {
@@ -286,7 +302,7 @@ fn every_lint_file_is_a_lint_test_target() {
 
 #[cfg(test)]
 mod fixture {
-    use super::{scaffolding_definition, undiscovered_lints, CI_INVOCATION, CI_WORKFLOW};
+    use super::{scaffolding_definitions, undiscovered_lints, CI_INVOCATION, CI_WORKFLOW};
     use std::fs;
     use std::path::Path;
 
@@ -479,34 +495,96 @@ mod fixture {
     }
 
     #[test]
+    fn copy_split_between_fn_and_its_name_is_reported_at_the_fn_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_lint(
+            tmp.path(),
+            "use std::fs;\n\nfn\nlex(src: &str) -> Vec<()> {\n    vec![]\n}\n\n#[test]\nfn t() {}\n",
+        );
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            "crates/a/tests/x_lint.rs:3 — private copy of source_lint::lex; ",
+        );
+    }
+
+    #[test]
+    fn copy_split_between_its_name_and_the_paren_is_reported_at_the_fn_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_lint(
+            tmp.path(),
+            "use std::fs;\n\npub fn lex\n    (src: &str) -> Vec<()> {\n    vec![]\n}\n\n#[test]\nfn t() {}\n",
+        );
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            "crates/a/tests/x_lint.rs:3 — private copy of source_lint::lex; ",
+        );
+    }
+
+    #[test]
+    fn reasoned_marker_above_the_fn_line_of_a_split_copy_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_lint(
+            tmp.path(),
+            "// source-lint-scaffolding: allow — fixture exercising a deliberately different lexer\n\
+             fn\nlex(src: &str) -> Vec<()> {\n    vec![]\n}\n\n#[test]\nfn t() {}\n",
+        );
+        assert_eq!(undiscovered_lints(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn bare_marker_above_the_fn_line_of_a_split_copy_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_lint(
+            tmp.path(),
+            "// source-lint-scaffolding: allow\nfn\nlex(src: &str) -> Vec<()> {\n    vec![]\n}\n\n#[test]\nfn t() {}\n",
+        );
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            "crates/a/tests/x_lint.rs:2 — private copy of source_lint::lex under a \
+             `// source-lint-scaffolding: allow` marker with no reason; ",
+        );
+    }
+
+    #[test]
     fn scaffolding_names_in_comments_strings_or_calls_are_not_hits() {
         let tmp = tempfile::tempdir().unwrap();
         fixture(tmp.path(), "");
         write_lint(
             tmp.path(),
             "// fn lex(src) used to live here\n\
+             /* fn\n   lex(src) used to live here too */\n\
              const DOC: &str = \"fn split_statements(text)\";\n\
+             const SPLIT: &str = \"fn\n   lex(src)\";\n\
              fn run() { let _ = lex(DOC); }\n\
              fn lexer(src: &str) -> usize { src.len() }\n\
-             fn lex_all() {}\n\n#[test]\nfn t() { run(); lexer(\"\"); lex_all(); }\n",
+             fn lex_all() {}\n\n#[test]\nfn t() { run(); lexer(SPLIT); lex_all(); }\n",
         );
         assert_eq!(undiscovered_lints(tmp.path()), Vec::<String>::new());
     }
 
     #[test]
-    fn scaffolding_definition_matches_each_shared_name() {
+    fn scaffolding_definitions_match_each_shared_name() {
         for name in super::SCAFFOLDING_FNS {
             assert_eq!(
-                scaffolding_definition(&format!("fn {name}(x: &str) {{")),
-                Some(name)
+                scaffolding_definitions(&format!("fn {name}(x: &str) {{")),
+                vec![(1, name)]
             );
             assert_eq!(
-                scaffolding_definition(&format!("pub fn {name}(x: &str) {{")),
-                Some(name)
+                scaffolding_definitions(&format!("\npub(crate) fn {name}(x: &str) {{")),
+                vec![(2, name)]
+            );
+            assert_eq!(
+                scaffolding_definitions(&format!("\n\nfn\n{name}\n(x: &str) {{")),
+                vec![(3, name)]
             );
         }
-        assert_eq!(scaffolding_definition("fn lexer(x: &str) {"), None);
-        assert_eq!(scaffolding_definition("fnlex(x: &str) {"), None);
-        assert_eq!(scaffolding_definition("pub_fn lex(x: &str) {"), None);
+        assert_eq!(scaffolding_definitions("fn lexer(x: &str) {"), vec![]);
+        assert_eq!(scaffolding_definitions("fnlex(x: &str) {"), vec![]);
+        assert_eq!(scaffolding_definitions("pub_fn lex(x: &str) {"), vec![]);
+        assert_eq!(scaffolding_definitions("let f: fn(&str) = lex;"), vec![]);
     }
 }
