@@ -177,19 +177,33 @@ pub(crate) fn scope_counts_sql() -> &'static str {
 /// grouped statement over the workspace's non-retired delegated rows (the
 /// `delegated` predicate of [`scope_predicate`]) yielding `delegatedCounts`
 /// (§5.5): one row per direct parent with the child count and the subset
-/// whose persisted status is running. The running set is the daemon's
-/// `is_running_turn` rule — `pending` / `active` / legacy capitalized
-/// `Processing` (the serde names of `AgentStatus`, which is how the column is
-/// written). Same `idx_agent_workspace` search as [`scope_counts_sql`], so
-/// `SUM(total)` over the result always equals `scopeCounts.delegated`.
-pub(crate) fn delegated_counts_sql() -> &'static str {
-    "SELECT \
-        parent_agent_id, \
-        COUNT(*) AS total, \
-        COALESCE(SUM(status IN ('pending', 'active', 'Processing')), 0) AS running \
-     FROM agent_session \
-     WHERE workspace_id = ? AND retired_at IS NULL AND parent_agent_id IS NOT NULL \
-     GROUP BY parent_agent_id"
+/// whose persisted status is running. The running set is derived from
+/// [`AgentStatus::is_running_turn`] over [`AgentStatus::ALL`] (the serde
+/// names, which is how the column is written), so the aggregate cannot
+/// drift from the daemon's rule. Same `idx_agent_workspace` search as
+/// [`scope_counts_sql`], so `SUM(total)` over the result always equals
+/// `scopeCounts.delegated`.
+pub(crate) fn delegated_counts_sql() -> String {
+    let running = AgentStatus::ALL
+        .iter()
+        .filter(|s| s.is_running_turn())
+        .map(|s| {
+            format!(
+                "'{}'",
+                enum_to_db(s).expect("AgentStatus encodes as a string")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT \
+            parent_agent_id, \
+            COUNT(*) AS total, \
+            COALESCE(SUM(status IN ({running})), 0) AS running \
+         FROM agent_session \
+         WHERE workspace_id = ? AND retired_at IS NULL AND parent_agent_id IS NOT NULL \
+         GROUP BY parent_agent_id"
+    )
 }
 
 /// SQL predicate selecting an **unread top-level session** row (§5.1): a
@@ -1319,7 +1333,8 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<AgentDelegatedCounts> {
-        let rows = sqlx::query(delegated_counts_sql())
+        let sql = delegated_counts_sql();
+        let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -5580,11 +5595,7 @@ mod tests {
         ];
         let mut statements: Vec<(String, String, Option<String>)> = vec![
             ("counts".to_string(), scope_counts_sql().to_string(), None),
-            (
-                "delegatedCounts".to_string(),
-                delegated_counts_sql().to_string(),
-                None,
-            ),
+            ("delegatedCounts".to_string(), delegated_counts_sql(), None),
         ];
         for scope in &scopes {
             let (predicate, bind) = scope_predicate(scope);
@@ -5623,6 +5634,18 @@ mod tests {
                 "{label} must not scan agent_session, plan: {details:?}"
             );
         }
+    }
+
+    /// The `delegatedCounts.running` predicate is generated from
+    /// `AgentStatus::is_running_turn`, so the emitted SQL carries exactly the
+    /// golden running set as persisted serde names.
+    #[test]
+    fn delegated_counts_sql_running_set_matches_core_rule() {
+        assert!(
+            delegated_counts_sql().contains("status IN ('pending', 'active', 'Processing')"),
+            "sql: {}",
+            delegated_counts_sql()
+        );
     }
 
     /// The grouped `delegatedCounts` aggregate (§5.5): one entry per DIRECT

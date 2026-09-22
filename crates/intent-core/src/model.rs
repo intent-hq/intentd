@@ -2646,6 +2646,41 @@ pub enum AgentStatus {
     Processing,
 }
 
+impl AgentStatus {
+    /// Every variant in declaration order — the enumeration behind the
+    /// running-turn golden and the store's SQL status lists.
+    pub const ALL: [Self; 9] = [
+        Self::Pending,
+        Self::Active,
+        Self::RuntimeIdle,
+        Self::Error,
+        Self::Deleted,
+        Self::Idle,
+        Self::Waiting,
+        Self::Completed,
+        Self::Processing,
+    ];
+
+    /// Whether a session persisted in this status is running a turn: `pending`,
+    /// `active`, or the legacy capitalized `Processing`. The single definition
+    /// of the rule behind the §5.5 retire guard, the §5.19 agent-lock liveness
+    /// test, the transfer export "agents-running" warning, and the
+    /// `delegatedCounts.running` SQL aggregate on `agent.list`. Exhaustive so a
+    /// new variant fails to compile until it is classified.
+    #[must_use]
+    pub const fn is_running_turn(self) -> bool {
+        match self {
+            Self::Pending | Self::Active | Self::Processing => true,
+            Self::RuntimeIdle
+            | Self::Error
+            | Self::Deleted
+            | Self::Idle
+            | Self::Waiting
+            | Self::Completed => false,
+        }
+    }
+}
+
 /// Per-session credit/message/tool stats (§9.1 / §19.2). A derived snapshot
 /// populated from `auggie session stats --json`; it is **not** persisted in the
 /// `agent_session` table (the `stats` field is recomputed on demand). Field
@@ -6749,6 +6784,47 @@ mod tests {
             assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
             assert_eq!(serde_json::from_str::<AgentStatus>(wire).unwrap(), variant);
         }
+    }
+
+    /// Golden for the running-turn rule (PROTOCOL §5.5 `agent.list`
+    /// `delegatedCounts` "running rule"): exactly `pending`, `active` and the
+    /// legacy capitalized `Processing` count as running, keyed by the persisted
+    /// wire name so the docs prose has one authoritative counterpart.
+    /// `AgentStatus::ALL` must enumerate every variant exactly once.
+    #[test]
+    fn agent_status_running_turn_golden() {
+        let expected = [
+            ("pending", true),
+            ("active", true),
+            ("idle", false),
+            ("error", false),
+            ("deleted", false),
+            ("Idle", false),
+            ("Waiting", false),
+            ("Completed", false),
+            ("Processing", true),
+        ];
+        assert_eq!(AgentStatus::ALL.len(), expected.len());
+        for (status, (wire, running)) in AgentStatus::ALL.into_iter().zip(expected) {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{wire}\""),
+                "ALL order must match the golden"
+            );
+            assert_eq!(
+                status.is_running_turn(),
+                running,
+                "running-turn classification of {wire}"
+            );
+        }
+        assert_eq!(
+            AgentStatus::ALL
+                .iter()
+                .filter(|s| s.is_running_turn())
+                .map(|s| serde_json::to_value(s).unwrap())
+                .collect::<Vec<_>>(),
+            vec![json!("pending"), json!("active"), json!("Processing")]
+        );
     }
 
     /// `WorkspaceStatus` serializes to the `PascalCase` TS `WorkspaceStatus` string
