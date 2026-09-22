@@ -13087,14 +13087,21 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     const URGENT: &str = "urgent sibling interrupt";
     const RELEASE_NOTE: &str = "release-5669";
     const RELAY_RESULT_NOTE: &str = "relay-result-5669";
+    const ENTERED_NOTE: &str = "entered-tool-5669";
+    const EXHAUSTED_NOTE: &str = "exhausted-5669";
 
-    // Bounded poll (each iteration is one bridge round trip) so the tool call
-    // can never outlive the eval budget even if the release never lands.
+    // Entered-tool barrier: the tool call announces itself (a `note:created`
+    // the test awaits) BEFORE polling, so the interrupt is provably sent while
+    // the workspace_api eval is in flight. The poll is bounded (each iteration
+    // is one bridge round trip) so the call can never outlive the eval budget;
+    // exhaustion leaves an observable note the test asserts is absent.
     let spin_code = format!(
-        "for (let i = 0; i < 4000; i++) {{ \
+        "await ws.note.create('{ENTERED_NOTE}', 'in'); \
+         for (let i = 0; i < 4000; i++) {{ \
            const notes = await ws.note.list(); \
            if (notes.some(n => n.title === '{RELEASE_NOTE}')) return 'released'; \
          }} \
+         await ws.note.create('{EXHAUSTED_NOTE}', 'poll exhausted before release'); \
          return 'gave up';"
     );
     let relay_code = format!(
@@ -13153,7 +13160,7 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+        json!({ "eventTypes": ["agent:*", "note:*"], "workspaceId": &ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -13188,6 +13195,27 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     .await;
     assert_eq!(sent["success"], true, "kick-off ok: {sent}");
     assert_eq!(sent["queued"], false, "kick-off streams: {sent}");
+
+    // Barrier: the target's workspace_api eval has started (it created the
+    // entered note) and its turn has NOT ended — every step below happens
+    // while the real tool call is in flight.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut entered = false;
+    while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
+        let event = &frame["params"]["event"];
+        if event["type"] == "note:created" && event["data"]["title"] == ENTERED_NOTE {
+            entered = true;
+            break;
+        }
+        assert!(
+            !(event["type"] == "agent:stream:end" && event["data"]["agentId"] == json!(target_id)),
+            "the target's turn ended before its tool call was entered: {event}"
+        );
+    }
+    assert!(
+        entered,
+        "the target's tool call announced itself (entered note)"
+    );
 
     // Two normal-priority entries park behind the busy turn.
     for (id, content) in [(13, QUEUED_ONE), (14, QUEUED_TWO)] {
@@ -13224,11 +13252,21 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     assert_eq!(relayed["success"], true, "sender kick-off ok: {relayed}");
 
     // Wait for the sender's turn to end (its tool call completed → the
-    // relay result note exists), then read the send outcome.
+    // relay result note exists), then read the send outcome. The target's
+    // preemption end may land during this wait, so it is tracked here too.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut sender_done = false;
+    let mut saw_preempt_end = false;
+    let is_target_preempt_end = |event: &Value| {
+        event["type"] == "agent:stream:end"
+            && event["data"]["agentId"] == json!(target_id)
+            && event["data"]["interruptReason"] == "preempted_by_message"
+    };
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
+        if is_target_preempt_end(event) {
+            saw_preempt_end = true;
+        }
         if event["type"] == "agent:stream:end" && event["data"]["agentId"] == json!(sender_id) {
             sender_done = true;
             break;
@@ -13281,29 +13319,33 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
 
     // Settlement: the target drains its queue and goes idle.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-    let mut saw_preempt_end = false;
     let mut saw_settle_idle = false;
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
-        if event["data"]["agentId"] != json!(target_id) {
-            continue;
+        if is_target_preempt_end(event) {
+            saw_preempt_end = true;
         }
-        match event["type"].as_str() {
-            Some("agent:stream:end")
-                if event["data"]["interruptReason"] == "preempted_by_message" =>
-            {
-                saw_preempt_end = true;
-            }
-            Some("agent:idle") => {
-                saw_settle_idle = true;
-                break;
-            }
-            _ => {}
+        if event["type"] == "agent:idle" && event["data"]["agentId"] == json!(target_id) {
+            saw_settle_idle = true;
+            break;
         }
     }
     assert!(
+        saw_preempt_end,
+        "the in-flight tool-call turn ended with interruptReason=preempted_by_message"
+    );
+    assert!(
         saw_settle_idle,
-        "the target settled (agent:idle) after the A2A interrupt; preempt end seen = {saw_preempt_end}"
+        "the target settled (agent:idle) after the A2A interrupt"
+    );
+    let listed = wss_rpc(&mut rpc, 23, "note.list", json!({ "workspaceId": &ws_id })).await;
+    assert!(
+        !listed["notes"]
+            .as_array()
+            .expect("notes array")
+            .iter()
+            .any(|n| n["title"] == EXHAUSTED_NOTE),
+        "the spinning tool call exited via the release, not poll exhaustion: {listed}"
     );
     let queue = wss_rpc(
         &mut rpc,
