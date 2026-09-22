@@ -58,7 +58,7 @@ pub struct UpdateCheck {
     pub installed: Option<String>,
     /// Version the channel manifest points at.
     pub latest: String,
-    /// True when a real check would install `latest`.
+    /// True when a real check would install `latest` or repair the current release.
     pub update_available: bool,
 }
 
@@ -141,7 +141,7 @@ impl Updater {
                     "a newer version is already installed".into(),
                 ));
             }
-            if current == target && self.paths.daemon_binary(current).exists() {
+            if current == target && self.installation_complete(current) {
                 return Ok(UpdateOutcome::AlreadyCurrent {
                     version: current.into(),
                 });
@@ -281,8 +281,8 @@ impl Updater {
 
     /// Dry-run: fetch the channel manifest and report installed vs latest
     /// without downloading or installing anything. Applies the same
-    /// newer-only comparison (and the same "installed only counts when the
-    /// binary exists" rule) as [`Updater::check_and_install`].
+    /// version comparison and payload completeness checks as
+    /// [`Updater::check_and_install`].
     ///
     /// # Errors
     ///
@@ -301,7 +301,10 @@ impl Updater {
             .current_version
             .filter(|current| self.paths.daemon_binary(current).exists());
         let update_available = match installed.as_deref() {
-            Some(current) => manifest_is_newer(&manifest.version, current)?,
+            Some(current) => {
+                !self.installation_complete(current)
+                    || manifest_is_newer(&manifest.version, current)?
+            }
             None => true,
         };
         Ok(UpdateCheck {
@@ -331,14 +334,22 @@ impl Updater {
         let state = state::load(&self.paths.state_path);
         if !force {
             if let Some(current) = state.current_version.as_deref() {
-                // Only trust "already current" when the binary actually
-                // exists; a wiped versions dir must trigger a reinstall.
+                // A version match is insufficient: older sitters discarded
+                // the sidecar payload even when installing recent releases.
                 if self.paths.daemon_binary(current).exists()
                     && !manifest_is_newer(&manifest.version, current)?
                 {
-                    return Ok(UpdateOutcome::AlreadyCurrent {
-                        version: current.to_string(),
-                    });
+                    if self.installation_complete(current) {
+                        return Ok(UpdateOutcome::AlreadyCurrent {
+                            version: current.to_string(),
+                        });
+                    }
+                    // Repair the installed release, never downgrade to a
+                    // channel that trails it. For an equal version use the
+                    // already fetched channel archive below.
+                    if current != manifest.version {
+                        return self.install_exact(current, current);
+                    }
                 }
             }
         }
@@ -413,6 +424,19 @@ impl Updater {
                     });
                 }
             }
+        }
+        if !force
+            && latest.current_version.as_deref() == Some(version)
+            && self.paths.daemon_binary(version).is_file()
+            && bundles_tailcat(version)
+        {
+            self.repair_payload(version, &extracted_bin, &entry.asset)?;
+            // Keep the daemon inode, rollback version and scheduling state:
+            // a payload repair does not activate a different release.
+            return Ok(UpdateOutcome::Installed {
+                version: version.into(),
+                previous: Some(version.into()),
+            });
         }
         self.install_version(version, &extracted_bin)?;
 
@@ -533,6 +557,45 @@ impl Updater {
         Ok(())
     }
 
+    fn installation_complete(&self, version: &str) -> bool {
+        let bin = self.paths.daemon_binary(version);
+        bin.is_file()
+            && (!bundles_tailcat(version)
+                || tailcat_payload_complete(&bin.parent().unwrap().join("libexec")))
+    }
+
+    /// Restore only the missing payload, without unlinking a running daemon
+    /// or pruning its previous release. Each replacement is an atomic rename.
+    fn repair_payload(
+        &self,
+        version: &str,
+        src_bin: &Path,
+        asset: &str,
+    ) -> Result<(), UpdateError> {
+        let source = src_bin.parent().unwrap().join("libexec");
+        if !tailcat_payload_complete(&source) {
+            return Err(UpdateError::Archive {
+                asset: asset.into(),
+                reason: "archive lacks the executable Tailcat sidecar or its license; cannot repair installation".into(),
+            });
+        }
+        let dest = self.paths.versions_dir.join(version).join("libexec");
+        fs::create_dir_all(&dest)?;
+        for name in [TAILCAT_BIN_NAME, "tailcat.LICENSE"] {
+            let target = dest.join(name);
+            if usable_payload_file(&target, name == TAILCAT_BIN_NAME) {
+                continue;
+            }
+            let staged = dest.join(format!(".{name}-repair-{}", std::process::id()));
+            fs::copy(source.join(name), &staged)?;
+            fs::File::open(&staged)?.sync_all()?;
+            fs::rename(&staged, &target)?;
+        }
+        sync_dir(&dest)?;
+        sync_dir(dest.parent().unwrap())?;
+        Ok(())
+    }
+
     /// Stage the binary under `versions/` with exec permissions, fsync it,
     /// stage the archive's sibling payload (e.g. `libexec/tailcat`) next to
     /// it, then atomically rename the staging dir to `versions/<version>/`.
@@ -589,6 +652,40 @@ impl Updater {
             }
         }
     }
+}
+
+const TAILCAT_BIN_NAME: &str = if cfg!(windows) {
+    "tailcat.exe"
+} else {
+    "tailcat"
+};
+
+fn bundles_tailcat(version: &str) -> bool {
+    semver::Version::parse(version).is_ok_and(|v| v >= semver::Version::new(0, 9, 10))
+}
+
+fn usable_payload_file(path: &Path, executable: bool) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if executable && metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    true
+}
+
+fn tailcat_payload_complete(libexec: &Path) -> bool {
+    usable_payload_file(&libexec.join(TAILCAT_BIN_NAME), true)
+        && usable_payload_file(&libexec.join("tailcat.LICENSE"), false)
 }
 
 /// Strict release identifier, safe as one URL/path component.

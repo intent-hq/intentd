@@ -87,7 +87,9 @@ fn tailcat_spawn_error_impl(
         return Error::Internal(format!(
             "cannot run tailcat {action}: the tailcat sidecar binary was not found \
              ({}; checked libexec/ and the directory next to the intentd binary, \
-             then PATH). Update intentd (`intentd update`) — releases before \
+             then PATH). The installation may be incomplete. Run `intentd update` \
+             to update or repair it. If it still reports already up to date, \
+             reinstall intentd to refresh the updater. Releases before \
              v0.9.10 did not bundle the tailcat sidecar \
              (https://github.com/tailscale/tailcat)",
             bin.display()
@@ -622,7 +624,13 @@ esac
         assert!(msg.contains("sidecar binary was not found"), "{msg}");
         assert!(msg.contains("/opt/intentd/libexec/tailcat"), "{msg}");
         assert!(msg.contains("intentd update"), "{msg}");
+        assert!(msg.contains("installation may be incomplete"), "{msg}");
+        assert!(msg.contains("update or repair"), "{msg}");
         assert!(msg.contains("before v0.9.10"), "{msg}");
+        assert!(
+            msg.contains("reinstall intentd to refresh the updater"),
+            "{msg}"
+        );
         assert!(
             msg.contains("https://github.com/tailscale/tailcat"),
             "{msg}"
