@@ -49,7 +49,7 @@ use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
     now_iso, parse_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus,
     BoxFuture, Error, EventActor, Result, UsageCost, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    WorkspaceSetupState, WorkspaceStatus,
 };
 use intent_providers::{InjectionMechanism, ProviderConfig};
 use intent_store::{NewEvent, NewTrackedChange};
@@ -2536,6 +2536,12 @@ pub struct AgentManager {
     /// `<supervisor>` XML so the fresh session has context, then clears the flag
     /// (parity: TS `sessionWasRecreated`).
     recreated: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents already told that their workspace's setup script `failed`
+    /// (§6.5): the failure notice is prepended to exactly one turn per agent,
+    /// the first that starts after the failure. In-memory like the setup
+    /// state map it mirrors — a restart forgets both, and the state reads
+    /// `unknown` (no notice) anyway.
+    setup_failure_notified: Arc<Mutex<HashSet<AgentId>>>,
     /// Agents whose NEXT turn must carry the assembled system prompt prepended
     /// as a `<system>` block — the `FirstTurnPrepend` fallback (§18.1) for
     /// providers with no (usable) native injection mechanism (codex, cortex,
@@ -2710,6 +2716,7 @@ impl AgentManager {
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             recreated: Arc::new(Mutex::new(HashSet::new())),
+            setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             stop_redelivery: Arc::new(Mutex::new(HashMap::new())),
@@ -4345,6 +4352,39 @@ impl AgentManager {
         }
         Some(crate::harness::latest().first_turn_prepend_block(prompt))
     }
+
+    /// The workspace setup-stage notice for a turn starting now (§6.5),
+    /// prompt-only: while the setup script is `pending` / `running` every
+    /// turn carries the in-progress notice (the worktree is provisional until
+    /// then); the first turn after the script `failed` carries the failure
+    /// notice once per agent; `completed` / `skipped` / `unknown` carry
+    /// nothing. Reads the in-memory setup state map — no store round trip.
+    fn build_setup_notice(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> Option<String> {
+        let status = self.services.workspace_setup_status(workspace_id);
+        match status.state {
+            WorkspaceSetupState::Pending | WorkspaceSetupState::Running => {
+                Some(crate::harness::latest().setup_in_progress_notice(crate::SETUP_TERMINAL_NAME))
+            }
+            WorkspaceSetupState::Failed => {
+                if !self
+                    .setup_failure_notified
+                    .lock()
+                    .unwrap()
+                    .insert(agent_id.clone())
+                {
+                    return None;
+                }
+                Some(
+                    crate::harness::latest()
+                        .setup_failed_notice(status.exit_code, crate::SETUP_TERMINAL_NAME),
+                )
+            }
+            WorkspaceSetupState::Completed
+            | WorkspaceSetupState::Skipped
+            | WorkspaceSetupState::Unknown => None,
+        }
+    }
+
     /// Compute the fire-once agent/workspace naming instruction for the
     /// outbound prompt, or `None` when both independently gated instructions
     /// should be omitted. Ported from the reference
@@ -4501,6 +4541,12 @@ impl AgentManager {
         // the snapshot is trivial (all counts zero, no pending attention),
         // leaving the prompt byte-identical to pre-feature output.
         let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
+        // Workspace setup-stage notice (§6.5): sits between the snapshot line
+        // and the Context block, ahead of the user content, so an agent whose
+        // turn starts while the setup script is still running (the create-time
+        // initial send, or any later message) is told the worktree is
+        // provisional — and told once when the script failed. Never persisted.
+        let setup_notice = self.build_setup_notice(agent_id, workspace_id);
         // FirstTurnPrepend fallback (§18.1): for providers with no (usable)
         // native system-prompt mechanism (codex, cortex, pi, grok, mock), the
         // assembled system prompt is delivered as the OUTERMOST `<system>`
@@ -4513,6 +4559,7 @@ impl AgentManager {
             crate::harness::latest().compose_turn_prompt(&crate::harness::TurnEnvelopeParams {
                 first_turn_prepend: prepend.as_deref(),
                 snapshot_line: snapshot_line.as_deref(),
+                setup_notice: setup_notice.as_deref(),
                 stdin_context,
                 naming_nudge: naming.as_deref(),
                 role_reminder: reminder.as_deref(),

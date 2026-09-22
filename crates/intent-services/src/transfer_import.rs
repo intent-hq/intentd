@@ -535,6 +535,7 @@ impl Services {
         // Imports run no setup stage: publish the completion immediately so
         // the watcher registry starts this workspace's watchers instead of
         // holding the deferred start until the setup backstop expires.
+        crate::record_setup_skipped(&self.workspace_setup_states, &workspace_id);
         publish_event(
             self.event_bus.as_ref(),
             workspace_setup_completed_event(&workspace_id, false, None),
@@ -2116,6 +2117,12 @@ mod tests {
 
         let imported = svc.store.get_workspace(&ws).await.expect("workspace live");
         assert_eq!(imported.title, "Imported");
+        // Imports run no setup stage: the setup state records `skipped`
+        // alongside the immediate `workspace:setup:completed` publish.
+        assert_eq!(
+            intent_core::WorkspaceApi::workspace_setup_status(&svc, &ws).state,
+            intent_core::WorkspaceSetupState::Skipped
+        );
         let expected_wt = ws_root.0.join(&ws.0).join("repo");
         assert_eq!(
             imported.worktree_path.as_deref(),

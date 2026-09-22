@@ -118,8 +118,9 @@ pub use model::{
     TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, Workspace, WorkspaceActivity,
     WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
     WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus,
-    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
+    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceSetupState,
+    WorkspaceSetupStatus, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{

@@ -135,7 +135,6 @@ const BASELINE: &[&str] = &[
     "crates/intentd/tests/e2e_wss_server_pairing.rs",
     "crates/intentd/tests/e2e_wss_settings_atomic_rollback.rs",
     "crates/intentd/tests/e2e_wss_settings_live_reload.rs",
-    "crates/intentd/tests/e2e_wss_setup_lifecycle.rs",
     "crates/intentd/tests/e2e_wss_setup_script.rs",
     "crates/intentd/tests/e2e_wss_specialist_frontmatter_model.rs",
     "crates/intentd/tests/e2e_wss_specialists_changed.rs",

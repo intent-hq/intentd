@@ -59,14 +59,19 @@ use intent_core::settings_file::AgentFeaturesSettings;
 /// harness wraps itself (`stdin_context`) or a surface string already
 /// rendered by this same harness (`first_turn_prepend` via
 /// [`Harness::first_turn_prepend_block`], `snapshot_line` via
-/// [`Harness::snapshot_line`], `naming_nudge` via [`Harness::naming_nudge`],
-/// `role_reminder` via [`Harness::role_reminder_prefix`]) — the caller only
-/// decides presence, never wording.
+/// [`Harness::snapshot_line`], `setup_notice` via
+/// [`Harness::setup_in_progress_notice`] / [`Harness::setup_failed_notice`],
+/// `naming_nudge` via [`Harness::naming_nudge`], `role_reminder` via
+/// [`Harness::role_reminder_prefix`]) — the caller only decides presence,
+/// never wording.
 pub(crate) struct TurnEnvelopeParams<'a> {
     /// Fire-once `<system>`-wrapped assembled system prompt (§18.1 fallback).
     pub first_turn_prepend: Option<&'a str>,
     /// Recurring `current ws.agent.snapshot() => {json}` line.
     pub snapshot_line: Option<&'a str>,
+    /// Workspace setup-stage notice (§6.5): present while the setup script is
+    /// still `pending` / `running`, and once after it `failed`.
+    pub setup_notice: Option<&'a str>,
     /// Raw stdin/context-reference text; the harness owns the `Context:`
     /// block shape around it.
     pub stdin_context: Option<&'a str>,
@@ -174,9 +179,21 @@ pub(crate) trait Harness: Send + Sync {
     ) -> String;
     /// Per-turn `[Role Reminder: You are a {name}. {reminder}]` prefix.
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String;
+    /// `[System: workspace setup is still running …]` notice for a turn that
+    /// starts while the workspace's setup script is `pending` / `running`:
+    /// names the terminal, marks the worktree provisional, and tells the
+    /// agent to wait with a self-checking hook on
+    /// `ws.workspace.details().setupStatus` that dispatches once `state` is
+    /// anything other than `pending` / `running` (safe under any ordering,
+    /// including a stage that settles `skipped`).
+    fn setup_in_progress_notice(&self, terminal_name: &str) -> String;
+    /// `[System: workspace setup failed …]` notice for the first turn after
+    /// the setup script `failed`; `exit_code` is `None` when the script died
+    /// before an exit code was observed.
+    fn setup_failed_notice(&self, exit_code: Option<u32>, terminal_name: &str) -> String;
     /// Compose the full outbound turn prompt: the layering order
-    /// (`FirstTurnPrepend` → snapshot → Context → naming nudge → role reminder
-    /// → body) is itself versioned.
+    /// (`FirstTurnPrepend` → snapshot → setup notice → Context → naming nudge
+    /// → role reminder → body) is itself versioned.
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String;
 
     // --- Queue notes and warnings (`agent_manager.rs`) ---

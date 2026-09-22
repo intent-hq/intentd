@@ -53,6 +53,7 @@ sqlx.workspace = true
 ctor = "1.0.10"
 intent-test-macros = { path = "../intent-test-macros" }
 tracing-subscriber.workspace = true
+intentd-test-support = { path = "../intentd-test-support" }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }

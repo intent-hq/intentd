@@ -2334,6 +2334,7 @@ dependencies = [
  "intent-store",
  "intent-test-macros",
  "intent-voice",
+ "intentd-test-support",
  "libc",
  "nix 0.31.3",
  "notify",
