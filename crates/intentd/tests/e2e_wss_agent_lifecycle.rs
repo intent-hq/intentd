@@ -13257,16 +13257,25 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut sender_done = false;
     let mut saw_preempt_end = false;
-    let is_target_preempt_end = |event: &Value| {
-        event["type"] == "agent:stream:end"
-            && event["data"]["agentId"] == json!(target_id)
-            && event["data"]["interruptReason"] == "preempted_by_message"
+    let mut target_complete_ends = 0usize;
+    let is_target_stream_end = |event: &Value| {
+        event["type"] == "agent:stream:end" && event["data"]["agentId"] == json!(target_id)
     };
+    let is_target_preempt_end =
+        |event: &Value| event["data"]["interruptReason"] == "preempted_by_message";
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
-        if is_target_preempt_end(event) {
-            saw_preempt_end = true;
+        if is_target_stream_end(event) {
+            if is_target_preempt_end(event) {
+                saw_preempt_end = true;
+            } else {
+                target_complete_ends += 1;
+            }
         }
+        assert!(
+            !(event["type"] == "agent:idle" && event["data"]["agentId"] == json!(target_id)),
+            "the target must not go idle before the interrupt turn has run: {event}"
+        );
         if event["type"] == "agent:stream:end" && event["data"]["agentId"] == json!(sender_id) {
             sender_done = true;
             break;
@@ -13322,10 +13331,18 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     let mut saw_settle_idle = false;
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
-        if is_target_preempt_end(event) {
-            saw_preempt_end = true;
+        if is_target_stream_end(event) {
+            if is_target_preempt_end(event) {
+                saw_preempt_end = true;
+            } else {
+                target_complete_ends += 1;
+            }
         }
         if event["type"] == "agent:idle" && event["data"]["agentId"] == json!(target_id) {
+            assert_ne!(
+                event["data"]["reason"], "interrupted",
+                "a preemption is not a settlement — no synthetic interrupted idle: {event}"
+            );
             saw_settle_idle = true;
             break;
         }
@@ -13333,6 +13350,10 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     assert!(
         saw_preempt_end,
         "the in-flight tool-call turn ended with interruptReason=preempted_by_message"
+    );
+    assert!(
+        target_complete_ends >= 2,
+        "the interrupt turn and at least one drained turn completed: {target_complete_ends}"
     );
     assert!(
         saw_settle_idle,
