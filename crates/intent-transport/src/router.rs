@@ -197,6 +197,17 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": kind.as_str() })),
         },
+        // Forge rate limiting — every cause the source-control layer
+        // classifies as `RateLimited` (REST primary 403/429, secondary-limit
+        // 403s, GraphQL RATE_LIMIT) on `github.getUser`, the identity-proof
+        // methods and PR reads: same `-32603` code and human message, plus
+        // the stable `data.code` so clients route "wait for the limit to
+        // reset" instead of prompting a sign-in (intent-hq/intent#5627).
+        ref e @ Error::RateLimited(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "rate-limited" })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
