@@ -38,19 +38,19 @@ use crate::config::{
     ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN,
     DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, DEFAULT_HOOKS_MAX_PER_AGENT,
     DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
-    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
-    DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
-    DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST, DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE,
-    DEFAULT_SHARING_MAX_GUEST_CONNECTIONS, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_UPDATES_CHECK_ON_IDLE,
-    DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
-    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
-    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
-    MAX_CONCURRENT_ADAPTERS_LIMIT, MAX_SHARING_MAX_GUESTS_PER_WORKSPACE,
-    MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
-    TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+    DEFAULT_PR_CACHE_MAX_AGE_SECONDS, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
+    DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET, DEFAULT_PR_MONITOR_POLL_SECONDS,
+    DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST,
+    DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE, DEFAULT_SHARING_MAX_GUEST_CONNECTIONS,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
+    DEFAULT_UPDATES_CHECK_ON_IDLE, DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+    DEFAULT_UPDATES_IDLE_GRACE_SECONDS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN, MAX_CONCURRENT_ADAPTERS_LIMIT,
+    MAX_SHARING_MAX_GUESTS_PER_WORKSPACE, MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+    MIN_UPDATES_IDLE_GRACE_SECONDS, TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
 use crate::error::{Error, Result};
 
@@ -83,6 +83,7 @@ pub struct SettingsFile {
     pub agent_features: AgentFeaturesSettings,
     pub wake_resume: WakeResumeSettings,
     pub pr_monitor: PrMonitorSettings,
+    pub pr_cache: PrCacheSettings,
     pub updates: UpdatesSettings,
 }
 
@@ -1078,6 +1079,26 @@ impl Default for PrMonitorSettings {
     }
 }
 
+/// `[prCache]` — the shared in-memory PR cache every PR read goes through
+/// (`prCache.*`). Read live like `prMonitor.*`; out-of-range values are
+/// clamped at read time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrCacheSettings {
+    /// `prCache.maxAgeSeconds` — how old a cached PR read may be and still
+    /// be served to an on-demand reader (`github.pulls.get`,
+    /// `ws.pr.snapshot`) without a forge call.
+    pub max_age_seconds: u64,
+}
+
+impl Default for PrCacheSettings {
+    fn default() -> Self {
+        Self {
+            max_age_seconds: DEFAULT_PR_CACHE_MAX_AGE_SECONDS,
+        }
+    }
+}
+
 /// `[updates]` — idle-triggered update-check knobs (`updates.*`). The raw
 /// values are kept as parsed; consumers read them through the `effective_*`
 /// accessors, which clamp sub-floor values up to their floors (mirroring the
@@ -1929,6 +1950,13 @@ hourlyRequestBudget = 1500
 # has to stop it. A host without the signal uses the hourly budget alone
 # (minimum 1, maximum 100).
 quotaSharePercent = 50
+
+[prCache]
+# PR cache max age seconds -- how old (in seconds) a cached PR read may be
+# and still be served to an on-demand reader (github.pulls.get,
+# ws.pr.snapshot) without a forge call. PR-monitor polls refresh the cache
+# (minimum 10, maximum 600).
+maxAgeSeconds = 60
 
 [updates]
 # Check for updates when idle -- ask the sitter (via SIGUSR2) to check for
@@ -2820,6 +2848,25 @@ mod tests {
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.pr_monitor, parsed.pr_monitor);
         assert!(templated.agent_features.pr_monitor);
+    }
+
+    #[test]
+    fn pr_cache_defaults_template_and_override_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.pr_cache.max_age_seconds,
+            DEFAULT_PR_CACHE_MAX_AGE_SECONDS
+        );
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[prCache]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.pr_cache, parsed.pr_cache);
+        let overridden =
+            SettingsFile::parse_str("[prCache]\nmaxAgeSeconds = 120\n").expect("override parses");
+        assert_eq!(overridden.pr_cache.max_age_seconds, 120);
+        let err = SettingsFile::parse_str("[prCache]\nmaxAge = 30\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("prCache"), "names the table: {msg}");
+        assert!(msg.contains("maxAge"), "names the bad key: {msg}");
     }
 
     #[test]

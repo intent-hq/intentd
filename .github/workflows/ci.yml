@@ -1559,7 +1559,10 @@ jobs:
   # is never a purge candidate; an unmarked idle one is), plus the
   # stubbed-cargo harness for scripts/changed-tests.sh (the changed-tests
   # selection the monorepo's `make test-changed` delegates to, and its
-  # --instrumented llvm-cov form; intent-hq/intentd#1947). Seconds-long like
+  # --instrumented llvm-cov form; intent-hq/intentd#1947), and the stub-root
+  # harness for the repo-root Makefile (every gate target forwards to the
+  # monorepo root make with its command-line variables; a standalone clone or
+  # an unrelated parent Makefile gets the exit-2 refusal). Seconds-long like
   # the other utility jobs, so it runs directly on ubuntu-latest.
   release-scripts:
     runs-on: ubuntu-latest
@@ -1579,6 +1582,8 @@ jobs:
         run: ./scripts/test-ci-target-slot.sh
       - name: Test changed-tests.sh
         run: ./scripts/test-changed-tests.sh
+      - name: Test the Makefile gate forwarder
+        run: ./scripts/test-makefile-forwarder.sh
 
   # install.ps1's Windows-only paths (intent-hq/intent#3229): the `check`
   # job's install_ps1_owner suite runs the installer's ownership check under

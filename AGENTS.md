@@ -60,6 +60,7 @@ only on `intent-services`, never on `intent-store`.
 | binary CLI + composition     | `crates/intentd/src/`                                        |
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
+| writing a source lint (`*_lint.rs`) | `crates/intentd-test-support/src/source_lint.rs` (lexer, markers, cfg(test) blanking, statement splitter, file walker); "Gates → source lints" below |
 | RPC performance / cost rules | "Performance — the RPC cost contract" below; durable principles in `../../docs/ARCHITECTURE.md` |
 
 ## Performance — the RPC cost contract
@@ -199,7 +200,9 @@ that contract:
 ## Gates — keep them green
 
 Before opening a submodule PR (and before bumping the monorepo gitlink), the gates must
-pass. Run them from the monorepo root via the top-level `Makefile`:
+pass. Run them from the monorepo root via the top-level `Makefile` (the same targets also
+work from `packages/intentd`, whose `Makefile` forwards them to the monorepo root; in a
+standalone clone they exit 2 and name the monorepo command):
 
 ```bash
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
@@ -225,12 +228,12 @@ The CI `check` job also runs the **source lints**: every `crates/<crate>/tests/*
 integration test is a source-scanning lint, selected by convention — run them all with
 `make lint-sources` from the monorepo root or `cargo test --workspace --test '*_lint'` in
 `packages/intentd`. Each lint fails naming `file:line`; its rationale, heuristic, and
-limits live in its module doc. `source_lint_discovery_lint` fails when a `*_lint.rs` file
-exists that the glob does not select (nested dir, `autotests = false`, renamed `[[test]]`)
-or when ci.yml's `check` job has no non-comment `run:` line invoking the glob, so a new
-lint needs no CI, Makefile, or docs wiring — add the file and a row below. Every opt-out
-marker requires a reason; baselines only ratchet down (the lint fails until a fixed
-file's entry is removed or lowered).
+limits live in its module doc. A new lint imports `intentd_test_support::source_lint`
+rather than copying scaffolding and needs no CI, Makefile, or docs wiring — add the file
+and a row below; `source_lint_discovery_lint` enforces all of this (a `*_lint.rs` the glob
+does not select, a ci.yml `check` job with no non-comment `run:` line invoking the glob,
+or copied scaffolding). Every opt-out marker requires a reason; baselines only ratchet
+down (the lint fails until a fixed file's entry is removed or lowered).
 
 | Lint | Fails on | Opt-out / baseline |
 | --- | --- | --- |
@@ -244,7 +247,7 @@ file's entry is removed or lowered).
 | `serve_spawn_lint` | a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"`, or a file calling `enable_ws_api(` without `serve_command` in code | `// serve-spawn: allow — <reason>` on the statement line, or anywhere in the file for the second rule |
 | `agent_hidden_field_egress_lint` | a `mcp_server/bindings/` file that reads session/event rows (`AgentLite` / `Event`, `agent_get(` / `agent_list(` / `event_query(` …) without a `SCRUBBED_BINDINGS` row (scrubs with `strip_agent_hidden_fields` + `EGRESS_REGISTRY` entries), or an `intent-services` fn copying `.data` wholesale into `json!` without a `WAKE_METADATA_BUILDERS` row; allowlist rows and registry entries are cross-checked for staleness | `HAND_PICKED_BINDINGS` / `SAFE_DATA_COPIES` rows in the lint (reason required) |
 | `queue_entry_egress_lint` | a non-test `queue_snapshot(` / `queue_snapshot_preview(` call whose enclosing fn, or an `event_type: <const>` publish of any const whose string value in `crates/intent-core/src/events.rs` starts with `agent:queue:` (the watched set is derived from that file, so a new `agent:queue:*` constant is watched without editing the lint) whose const, is named by no `REGISTERED_EGRESS` row (the row maps it to a `QueueSurface` variant in `crates/intent-core/src/queue_visibility_contract.rs`, so the contract harnesses drive it); outside `events.rs`, any other reference to a watched const (helper argument, local binding, `json!` value, comparison; `use` items excepted) or an `"agent:queue:*"` string literal whose enclosing fn is named by no `Key::Fn` row; a variant no row claims, or a row naming a variant / fn / const that no longer exists, also fails (multiplayer queue visibility, intentd#2068) | `// queue-egress: allow — <reason>` on the line above the call / reference or its statement, only when no entry leaves the daemon (a consumer matching on the type) |
-| `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, or a ci.yml `check` job with no non-comment `run:` line invoking the glob | none |
+| `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, a ci.yml `check` job with no non-comment `run:` line invoking the glob, or a `*_lint.rs` file defining its own `fn lex(` / `markers_by_line(` / `blank_cfg_test_items(` / `cfg_test_item_ranges(` / `split_statements(` instead of importing `intentd_test_support::source_lint` (the #2073 fixes had to be re-applied per private copy) | `// source-lint-scaffolding: allow — <reason>` on the line above the definition; none for the first two rules |
 | `workflow_grep_quiet_lint` | a `\| grep -q` / `-Eq` / `--quiet` / `--silent` pipeline in `.github/workflows/*.yml` — under `bash -eo pipefail` a large matched input makes the producer die of SIGPIPE and the step report "no match" (cloudlands-fe#2709); use a here-string for variable input, `\| grep -E pat >/dev/null` for a real producer, or `grep -q pat file` | none |
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump

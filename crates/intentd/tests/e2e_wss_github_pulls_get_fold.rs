@@ -14,6 +14,7 @@
 mod common;
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,9 +28,9 @@ use intent_core::{
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
     AuthStatus, Branch, CheckRun, Comment, CommentAnchor, Issue, IssueQuery, MergeMethod,
-    MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
-    PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewThread,
-    ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
+    MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability, NewPullRequest, Page,
+    PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review,
+    ReviewComment, ReviewThread, ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -141,9 +142,20 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 }
 
 /// Stub forge: `get_pr` reports every PR merged (head `feature`) at the
-/// canonical `o/r` URL for its number; nothing else is exercised.
+/// canonical `o/r` URL for its number and counts its calls (the cache
+/// assertions); the probe reports the PR queued so the hover card's
+/// `isInMergeQueue` has a source; the remaining sub-reads of the full PR
+/// read answer empty.
 #[derive(Default)]
-struct StubForge;
+struct StubForge {
+    get_pr_calls: AtomicUsize,
+}
+
+impl StubForge {
+    fn fetches(&self) -> usize {
+        self.get_pr_calls.load(Ordering::SeqCst)
+    }
+}
 
 fn merged_pr(number: u64) -> PullRequest {
     PullRequest {
@@ -215,7 +227,14 @@ impl SourceControl for StubForge {
         unimplemented!()
     }
     async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
+        self.get_pr_calls.fetch_add(1, Ordering::SeqCst);
         Ok(merged_pr(number))
+    }
+    async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
+        Ok(MergeRequirementSignals {
+            is_in_merge_queue: Some(true),
+            ..Default::default()
+        })
     }
     async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
         unimplemented!()
@@ -248,10 +267,10 @@ impl SourceControl for StubForge {
         unimplemented!()
     }
     async fn list_reviews(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Review>> {
-        unimplemented!()
+        Ok(Vec::new())
     }
     async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
-        unimplemented!()
+        Ok(Vec::new())
     }
     async fn add_comment(
         &self,
@@ -285,7 +304,10 @@ impl SourceControl for StubForge {
         _: u64,
         _: PageParams,
     ) -> ScResult<Page<ReviewThread>> {
-        unimplemented!()
+        Ok(Page {
+            items: Vec::new(),
+            next_cursor: None,
+        })
     }
     async fn resolve_thread(&self, _: &str) -> ScResult<bool> {
         unimplemented!()
@@ -294,7 +316,7 @@ impl SourceControl for StubForge {
         unimplemented!()
     }
     async fn check_runs(&self, _: &RepoRef, _: &str) -> ScResult<Vec<CheckRun>> {
-        unimplemented!()
+        Ok(Vec::new())
     }
     async fn create_issue(&self, _: &RepoRef, _: &str, _: Option<&str>) -> ScResult<Issue> {
         unimplemented!()
@@ -334,6 +356,7 @@ struct Fixture {
     cfg: Arc<ClientConfig>,
     ws_id: WorkspaceId,
     root_id: WorkspaceGitRootId,
+    forge: Arc<StubForge>,
     _dir: tempfile::TempDir,
 }
 
@@ -420,11 +443,12 @@ async fn boot() -> Fixture {
         .await
         .expect("seed git root");
 
+    let forge = Arc::new(StubForge::default());
     let services = Arc::new(
         Services::new(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
-            .with_source_control(Arc::new(StubForge)),
+            .with_source_control(forge.clone()),
     );
     let api: Arc<dyn WorkspaceApi> = services.clone();
     let tls = ensure_tls_certificate(&dir).expect("cert");
@@ -445,6 +469,7 @@ async fn boot() -> Fixture {
         cfg,
         ws_id,
         root_id,
+        forge,
         _dir: dir_guard,
     }
 }
@@ -596,6 +621,11 @@ async fn github_pulls_get_folds_fetched_pr_into_workspace_pr_state_over_wss() {
     assert_eq!(pull["merged"], true);
     assert_eq!(pull["draft"], false);
     assert_eq!(pull["headRef"], "feature");
+    // The additive, presence-detected merge-queue flag rides the shared PR
+    // cache's checklist onto the hover card (§5.27).
+    assert_eq!(pull["isInMergeQueue"], true, "pull: {pull}");
+    assert_eq!(fx.forge.fetches(), 1, "a cache miss is one forge PR read");
+    let first_pull = pull.clone();
 
     // The fold's events: the workspace delta first (pool + linked columns,
     // then the derived rollup), the git root's pool delta after.
@@ -654,5 +684,24 @@ async fn github_pulls_get_folds_fetched_pr_into_workspace_pr_state_over_wss() {
     )
     .await;
     assert_eq!(other["pull"]["number"], 99);
+    assert_eq!(fx.forge.fetches(), 2, "another PR is another miss");
+    assert_no_events(&mut sub).await;
+
+    // A repeat hover within `prCache.maxAgeSeconds` is served from the
+    // shared cache: the same `{ pull }`, no forge request, and nothing to
+    // fold (no events).
+    let again = wss_rpc(
+        &mut rpc,
+        5,
+        "github.pulls.get",
+        json!({ "owner": "o", "repo": "r", "number": 42 }),
+    )
+    .await;
+    assert_eq!(again["pull"], first_pull, "a hit answers the cached object");
+    assert_eq!(
+        fx.forge.fetches(),
+        2,
+        "a hit within max_age costs no forge request"
+    );
     assert_no_events(&mut sub).await;
 }

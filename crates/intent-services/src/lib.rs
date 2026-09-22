@@ -100,7 +100,9 @@ mod agent_list_cache;
 mod harness;
 mod history_xml;
 mod hook_manager;
+mod image_dimensions;
 mod invite_ops;
+mod issue_cache;
 mod line_attribution;
 mod linear_ops;
 mod model_catalog;
@@ -787,6 +789,24 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_task_update_projection_park`.
     task_update_projection_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Per-workspace archive ↔ unarchive fence (see [`ArchiveFence`]);
+    /// shared across [`Services`] clones.
+    archive_fence: Arc<ArchiveFence>,
+    /// Test park seam for the `workspace.archive` post-commit tail: parks
+    /// the detached tail INSIDE the fenced window — after the guest sweep
+    /// committed and its removal deltas went out, before the fence is
+    /// released — so a concurrent unarchive + re-add + enqueue of the same
+    /// principal is deterministically ordered behind it. `None` in
+    /// production wiring; tests inject via the `#[cfg(test)]`-only
+    /// `with_archive_tail_park`.
+    archive_tail_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam for the `workspace.archive` post-commit, PRE-drop
+    /// window: parks the detached tail right after the guest sweep
+    /// committed and BEFORE the detached guests' queued messages are dropped
+    /// and their removal deltas published (fence held). `None` in production
+    /// wiring; tests inject via the `#[cfg(test)]`-only
+    /// `with_archive_predrop_park`.
+    archive_predrop_park: Option<Arc<script_ops::SupervisePark>>,
     /// Test park seam (intentd#2068) for the per-id queue mutations
     /// (`agent.editQueuedMessage` / `removeQueuedMessage` /
     /// `sendQueuedMessageNow`): parks each between its ownership
@@ -1119,12 +1139,29 @@ pub struct Services {
     /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
     /// that acts on each entry; shared across clones.
     pr_monitor_catch_up: pr_monitor::PrMonitorCatchUp,
-    /// Per-PR memory of the sweep's last FULL forge fetch (change
-    /// fingerprint + shared snapshot), so a poll whose `get_pr` reports an
-    /// unchanged fingerprint reuses the previous sub-fetches instead of
-    /// re-issuing them (see [`pr_monitor::PrMonitorFetchCache`]). In-memory
-    /// only; shared across clones.
-    pr_monitor_fetch_cache: pr_monitor::PrMonitorFetchCache,
+    /// The shared PR cache: every PR read's memory of its last full forge
+    /// read (PR record, shared snapshot, change fingerprint), so the
+    /// monitor sweep reuses the previous sub-fetches while the fingerprint
+    /// is unchanged and the on-demand readers are served from the newest
+    /// read within `prCache.maxAgeSeconds` (see [`pr_monitor::PrCache`]).
+    /// In-memory only; shared across clones.
+    pr_cache: pr_monitor::PrCache,
+    /// The issue cache behind `github.issues.get`: each issue's last forge
+    /// read, served within `prCache.maxAgeSeconds` like the PR cache and
+    /// retained under the same unmonitored policy (see
+    /// [`issue_cache::IssueCache`]). In-memory only; shared across clones.
+    issue_cache: issue_cache::IssueCache,
+    /// Explicit override for how old a cached PR (or issue) read may be and
+    /// still be served on demand (seconds). `None` — the production wiring
+    /// — reads `prCache.maxAgeSeconds` live from the settings registry;
+    /// values outside [floor, ceiling] are clamped at read time.
+    pr_cache_max_age_seconds: Option<u64>,
+    /// Test park seam for the on-demand PR read's miss→fetch window: parks
+    /// [`Services::read_pr`] after its preflight cache miss and before the
+    /// shared path's authoritative lookup, so a concurrent fill landing
+    /// inside that window is deterministic. `None` in production wiring;
+    /// tests inject via the `#[cfg(test)]`-only `with_pr_read_park`.
+    pr_read_park: Option<Arc<CompletionClassifyPark>>,
     /// Explicit override for the centralized PR-monitor loop's poll cadence
     /// (seconds). `None` — the production wiring — reads
     /// `prMonitor.pollSeconds` live from the settings registry; values below
@@ -1338,6 +1375,9 @@ impl Services {
             unread_settle_entry_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
+            archive_fence: Arc::new(ArchiveFence::default()),
+            archive_tail_park: None,
+            archive_predrop_park: None,
             queue_mutation_gate_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
@@ -1400,7 +1440,10 @@ impl Services {
             hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
-            pr_monitor_fetch_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_cache: Arc::new(Mutex::new(HashMap::new())),
+            issue_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_cache_max_age_seconds: None,
+            pr_read_park: None,
             pr_monitor_poll_seconds: None,
             pr_monitor_hourly_request_budget: None,
             pr_monitor_quota_share_percent: None,
@@ -1419,6 +1462,23 @@ impl Services {
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
+    }
+
+    /// Pin how old a cached PR read may be and still be served on demand,
+    /// bypassing the live `prCache.maxAgeSeconds` setting (test wiring).
+    /// Values outside [floor, ceiling] are clamped when read.
+    #[cfg(test)]
+    pub(crate) fn with_pr_cache_max_age_seconds(mut self, seconds: u64) -> Self {
+        self.pr_cache_max_age_seconds = Some(seconds);
+        self
+    }
+
+    /// Park the on-demand PR read between its preflight cache miss and the
+    /// shared path's authoritative lookup (test wiring); see `pr_read_park`.
+    #[cfg(test)]
+    pub(crate) fn with_pr_read_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.pr_read_park = Some(park);
+        self
     }
 
     /// Pin the PR-monitor poll cadence, bypassing the live
@@ -2172,6 +2232,31 @@ impl Services {
             park.entered.notify_one();
             park.release.notified().await;
         }
+    }
+
+    /// Test seam: park the `workspace.archive` post-commit tail inside its
+    /// fenced window (guest sweep committed and announced, fence still
+    /// held) so a concurrent unarchive + re-add + enqueue of a detached
+    /// principal is deterministically ordered behind the fence. Production
+    /// wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_archive_tail_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
+        self.archive_tail_park = Some(park);
+        self
+    }
+
+    /// Test seam: park the `workspace.archive` post-commit tail BEFORE the
+    /// detached guests' queued messages are dropped (guest sweep committed,
+    /// fence held, nothing announced yet) so a lifecycle write racing the
+    /// drop is deterministically ordered behind the fence. Production
+    /// wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_archive_predrop_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.archive_predrop_park = Some(park);
+        self
     }
 
     /// Test seam: park one selected pending-question marker mutation before it
@@ -14109,6 +14194,78 @@ impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
     }
 }
 
+/// Per-workspace archive ↔ unarchive lifecycle fence. `workspace.archive`
+/// holds a workspace's fence from before its guest-detaching transaction
+/// until the detached collaborators' queued messages are dropped and their
+/// `removedPrincipalId` deltas are out; every unarchive (manual RPC, the
+/// turn-start auto-unarchive, and a `workspace.update` carrying `archived` /
+/// `status`, which delegates to those two paths) takes the same fence around
+/// its conditional flip. The invariant also relies on the store: the
+/// generic full-row `Store::update_workspace` never writes `archived` /
+/// `archived_at`, so a stale non-lifecycle write (card edit, repository-owner
+/// backfill, PR writeback) cannot revert the lifecycle behind the fence.
+/// Without it an unarchive + re-add of the same principal + a fresh
+/// queued message could all land between the archive commit and its
+/// post-commit tail, which then dropped the FRESH message and announced the
+/// removal of a CURRENT member. Owned guards ([`tokio::sync::OwnedMutexGuard`])
+/// so the archive tail — a detached task — can carry the hold across its
+/// spawn; an entry is pruned once nobody holds or awaits it.
+#[derive(Default)]
+pub(crate) struct ArchiveFence {
+    locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl ArchiveFence {
+    /// Take `workspace_id`'s fence (FIFO among waiters: tokio's mutex is
+    /// fair, so an unarchive queued behind an archive tail acquires before
+    /// the tail's own re-acquire).
+    async fn acquire(self: &Arc<Self>, workspace_id: &WorkspaceId) -> ArchiveFenceGuard {
+        let lock = self
+            .locks
+            .lock()
+            .expect("archive fence registry poisoned")
+            .entry(workspace_id.clone())
+            .or_default()
+            .clone();
+        let guard = lock.lock_owned().await;
+        ArchiveFenceGuard {
+            fence: Arc::clone(self),
+            key: workspace_id.clone(),
+            guard: Some(guard),
+        }
+    }
+}
+
+/// One hold on an [`ArchiveFence`] entry; releases the lock and prunes the
+/// entry on drop once no other caller holds or awaits it.
+pub(crate) struct ArchiveFenceGuard {
+    fence: Arc<ArchiveFence>,
+    key: WorkspaceId,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for ArchiveFenceGuard {
+    fn drop(&mut self) {
+        let mut locks = self
+            .fence
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Release under the registry mutex (same reasoning as
+        // `KeyedInflightSlot::drop`): the prune check and a concurrent
+        // drop must not both see each other's ref and both skip removal.
+        drop(self.guard.take());
+        // Only the map's ref left = nobody holds or awaits the key (a
+        // pending `lock_owned` future owns its own `Arc` clone).
+        if locks
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.key);
+        }
+    }
+}
+
 /// `(workspace_id, idempotency_key)` — the dedupe identity of one
 /// [`with_idempotency`] call (`workspace_id` is `""` for global methods).
 pub(crate) type IdempotencyIdent = (String, String);
@@ -20558,7 +20715,7 @@ impl WorkspaceApi for Services {
                 normalised.status_image_asset_id = Some(None);
             }
         }
-        let changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
+        let mut changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
             self.require_member(&id).await?;
             // Multiplayer w3: a member may steer the workspace card (title /
@@ -20581,6 +20738,31 @@ impl WorkspaceApi for Services {
                 chief_workspace()
             } else {
                 store.get_workspace(&id).await?
+            };
+            // Archive lifecycle (`archived` / `status: "Archived"`) is owned
+            // by the fenced `workspace.archive` / `workspace.unarchive`
+            // paths (see `ArchiveFence`): the generic row write below never
+            // touches `archived` / `archived_at` and holds `status` while the
+            // row is archived, so a lifecycle request here delegates to
+            // those paths AFTER the card write instead of flipping the
+            // columns directly — otherwise `workspace.update { archived:
+            // false }` could land inside an in-flight archive's post-commit
+            // window, ahead of its guest drop. A `status` that merely
+            // disagrees with an archived row (`Active` on an archived
+            // workspace) reads as an unarchive; a non-archived status on a
+            // live row is a plain column write.
+            let want_archived = match (update.archived, update.status) {
+                (Some(archived), Some(status))
+                    if archived != (status == WorkspaceStatus::Archived) =>
+                {
+                    return Err(Error::InvalidParams(
+                        "workspace.update: `archived` and `status` disagree".to_string(),
+                    ));
+                }
+                (Some(archived), _) => Some(archived),
+                (None, Some(WorkspaceStatus::Archived)) => Some(true),
+                (None, Some(_)) if ws.archived => Some(false),
+                (None, _) => None,
             };
             if let Some(v) = update.title {
                 ws.title = v;
@@ -20695,24 +20877,47 @@ impl WorkspaceApi for Services {
                 ws.activity = this.workspace_activity(&ws.id);
             } else {
                 store.update_workspace(&ws).await?;
-                // Derive `lastActivity` (§9.1) on the returned record so
-                // `workspace.update` callers get the authoritative wire shape
-                // without a follow-up `workspace.get`, and persist it through
-                // the scoped monotonic write (monorepo#1585). Chief is
-                // skipped: its timestamps are pinned above.
-                this.derive_and_persist_last_activity(&mut ws, "workspace.update")
-                    .await;
-                // Derive `activity` from live agent state (§9.9) so the mutation
-                // response carries `agent_running` when agents are in-flight,
-                // not the stale default `idle` from the persisted row.
-                ws.activity = this.workspace_activity(&ws.id);
+                if let Some(archived) = want_archived {
+                    // Delegate the lifecycle flip to the fenced path: it
+                    // returns the derived record (`lastActivity` /
+                    // `activity`) and publishes the authoritative
+                    // `{ archived, status, archivedAt }` delta itself.
+                    ws = if archived {
+                        this.archive_workspace(id.clone(), None).await?
+                    } else {
+                        this.unarchive_workspace(id.clone()).await?
+                    };
+                } else {
+                    // Derive `lastActivity` (§9.1) on the returned record so
+                    // `workspace.update` callers get the authoritative wire shape
+                    // without a follow-up `workspace.get`, and persist it through
+                    // the scoped monotonic write (monorepo#1585). Chief is
+                    // skipped: its timestamps are pinned above.
+                    this.derive_and_persist_last_activity(&mut ws, "workspace.update")
+                        .await;
+                    // Derive `activity` from live agent state (§9.9) so the mutation
+                    // response carries `agent_running` when agents are in-flight,
+                    // not the stale default `idle` from the persisted row.
+                    ws.activity = this.workspace_activity(&ws.id);
+                }
                 if repository_path_changed {
                     this.spawn_repository_owner_backfill(std::slice::from_ref(&ws));
+                }
+                // The delegated flip already announced the lifecycle under
+                // the fence; re-announcing it here could trail a concurrent
+                // flip the other way and leave clients on a stale state.
+                if want_archived.is_some() {
+                    if let Some(obj) = changes.as_object_mut() {
+                        obj.remove("archived");
+                        obj.remove("status");
+                    }
                 }
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
-            publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
+            if changes.as_object().is_some_and(|obj| !obj.is_empty()) || want_archived.is_none() {
+                publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
+            }
             // PR link/status changes feed the derived displayStatus (the
             // `pr_*` rungs sit between activity and taskStats), and so does
             // the attention flag (`unread` / `review_required` axes):
@@ -21399,12 +21604,29 @@ impl WorkspaceApi for Services {
                 return Ok(chief_workspace());
             }
             let mut ws = store.get_workspace(&id).await?;
+            // Archive ↔ unarchive fence (see `ArchiveFence`): held from
+            // before the commit until the detached guests' queued messages
+            // are dropped and their removal deltas are out (the guard moves
+            // into the detached tail below). Every unarchive flips under the
+            // same fence, and `workspace.members.add` refuses while the row
+            // is archived, so no unarchive + re-add + fresh enqueue of a
+            // detached principal can interleave with the tail's drop — the
+            // tail never drops a message a CURRENT member queued nor
+            // announces the removal of a member who is seated again.
+            let fence = this.archive_fence.acquire(&id).await;
             let now = now_iso();
+            // Archiving removes guests: the Archived flip, every non-owner
+            // membership delete and every open-invite revoke commit in ONE
+            // `BEGIN IMMEDIATE` transaction (scoped column write — never a
+            // full-row replace of the `get_workspace` read above). A store
+            // failure fails the RPC with the row still active: access
+            // revocation is never best-effort. Unarchive does NOT restore
+            // either; a guest rejoins by a fresh invite.
+            let guest_sweep = store.archive_workspace_detaching_guests(&id, &now).await?;
             ws.status = WorkspaceStatus::Archived;
             ws.archived = true;
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
-            store.update_workspace(&ws).await?;
             // Everything below the persist runs on a DETACHED task
             // (intent-hq/monorepo#1577): the sweeps can cancel this very
             // caller. A background hook whose script calls
@@ -21423,6 +21645,25 @@ impl WorkspaceApi for Services {
             let id_for_log = id.clone();
             let tail = intent_core::spawn_daemon(async move {
                 let mut ws = ws;
+                // Announce the committed guest sweep first — one
+                // `{ members, removedPrincipalId, memberCount }` delta per
+                // detached collaborator (queued messages dropped), then one
+                // `{ invites: true }` when an invite was revoked — so the
+                // deltas describe the transaction that just committed and
+                // precede every other archive-tail event. Still under the
+                // fence taken before the commit: released right after, so
+                // a waiting unarchive proceeds only once the drops and the
+                // removal deltas are done.
+                if let Some(park) = &this.archive_predrop_park {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
+                this.publish_archived_guest_deltas(&id, &guest_sweep).await;
+                if let Some(park) = &this.archive_tail_park {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
+                drop(fence);
                 // Gracefully interrupt every in-flight turn in the workspace —
                 // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
                 // turn cancelled over the wire, draining worker aborted, terminal
@@ -21507,18 +21748,42 @@ impl WorkspaceApi for Services {
                 // (`archived`/`status`/`archivedAt`) so subscribers flip state
                 // without a re-read. `archivedAt` is the same timestamp persisted
                 // on the row above.
-                publish_event(
-                    bus.as_ref(),
-                    workspace_updated_event(
-                        &ws.id,
-                        &serde_json::json!({
-                            "archived": true,
-                            "status": ws.status,
-                            "archivedAt": ws.archived_at,
-                        }),
-                    ),
-                )
-                .await;
+                //
+                // Fenced on the archive still being current: the sweeps above
+                // ran outside the fence, so an unarchive may have flipped the
+                // row (and announced `archived: false`) meanwhile — its own
+                // delta is the latest word, and re-announcing THIS call's
+                // archive after it would leave clients on a stale archived
+                // state. Re-read under the fence and publish only when the
+                // row still carries this call's `archivedAt`; the flip and
+                // its delta happen under the same fence, so the two
+                // announcements can never cross.
+                let _fence = this.archive_fence.acquire(&ws.id).await;
+                let still_archived = match store.get_workspace(&ws.id).await {
+                    Ok(row) => row.archived && row.archived_at == ws.archived_at,
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            error = %e,
+                            "workspace.archive: row re-read failed before the archived delta; publishing"
+                        );
+                        true
+                    }
+                };
+                if still_archived {
+                    publish_event(
+                        bus.as_ref(),
+                        workspace_updated_event(
+                            &ws.id,
+                            &serde_json::json!({
+                                "archived": true,
+                                "status": ws.status,
+                                "archivedAt": ws.archived_at,
+                            }),
+                        ),
+                    )
+                    .await;
+                }
                 ws
             });
             // Awaiting the handle keeps the caller-visible contract intact
@@ -21527,7 +21792,7 @@ impl WorkspaceApi for Services {
             // tail runs on. A `JoinError` means the tail itself panicked —
             // the row is already archived, so surface it rather than
             // reporting a bogus success shape.
-            tail.await.map_err(|e| {
+            let mut ws = tail.await.map_err(|e| {
                 // The `JoinError` text names no workspace, so log the id —
                 // otherwise a panicked tail is undiagnosable from daemon logs.
                 tracing::error!(
@@ -21536,7 +21801,12 @@ impl WorkspaceApi for Services {
                     "workspace.archive: post-persist tail task failed; row is archived"
                 );
                 Error::Internal(format!("archive tail task failed: {e}"))
-            })
+            })?;
+            // Membership summary (multiplayer w1) read AFTER the guest
+            // sweep, so the mutation response carries the post-detach
+            // `memberCount` / `openInviteCount`.
+            self.attach_workspace_membership(&mut ws).await;
+            Ok(ws)
         })
     }
 
@@ -29490,7 +29760,6 @@ impl WorkspaceApi for Services {
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
-        let injected = self.source_control.clone();
         let this = self.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
@@ -29506,42 +29775,35 @@ impl WorkspaceApi for Services {
                 None => pr_ops::repo_of(&ws)?,
             };
             let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
-                intent_sourcecontrol::Error::NotFound(_) => {
-                    Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
-                }
-                other => pr_ops::map_sc_err(other),
-            })?;
+            // Served from the shared PR cache (§5.7): the entry is the PR
+            // monitor's own full read — the PR record plus EXACTLY the
+            // checklist the monitor works with — so `ws.pr.snapshot`,
+            // monitor wakes and `prMonitor.list` summaries all describe a
+            // PR with the same object, and a snapshot within
+            // `prCache.maxAgeSeconds` of a hover, a poll or a registration
+            // costs no forge call. A miss is one full read (every sub-read
+            // degrades on its own; only quota exhaustion fails it), stored
+            // for the next reader. This registers nothing and triggers no
+            // monitoring.
+            let (entry, _) = self.serve_pr(&repo_ref, pr_number).await?;
+            let pr = entry.pr;
+            let requirements = entry.snapshot.requirements;
+            let review_comment_count = entry.snapshot.review_comment_count;
             let state = pr_ops::derive_status_state(&pr);
             let mergeable_state = pr
                 .mergeable_state
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-
-            // The one-shot read composes EXACTLY the checklist the PR monitor
-            // works with, so `ws.pr.snapshot`, monitor wakes and
-            // `prMonitor.list` summaries all describe a PR with the same
-            // object — this registers nothing and triggers no monitoring.
-            // Every forge sub-read inside degrades on its own; only quota
-            // exhaustion (`RateLimited`) fails the snapshot, exactly as a
-            // rate-limited `get_pr` above would.
-            let (requirements, review_comment_count, _ejection_known) =
-                pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await?;
             let unresolved_thread_count = requirements.threads.unresolved;
             // The conversation-comment count is not part of the checklist; a
-            // failing read reports zero rather than failing the snapshot.
-            let conversation_count = match sc.list_comments(&repo_ref, pr_number).await {
-                Ok(comments) => i64::try_from(comments.len()).expect("value fits in i64"),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        pr_number,
-                        "pr.snapshot: conversation comments unavailable, reporting zero"
-                    );
-                    0
-                }
-            };
+            // read that degraded reports zero rather than failing the snapshot.
+            let conversation_count = entry.snapshot.conversation_count.unwrap_or_else(|| {
+                tracing::warn!(
+                    pr_number,
+                    "pr.snapshot: conversation comments unavailable, reporting zero"
+                );
+                0
+            });
             // The pre-existing compact blocks stay stable for callers that
             // already read them, but are projected off the checklist rather
             // than computed a second time. `checks.failedNames` lists every
@@ -29660,27 +29922,35 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
         Box::pin(async move {
             Self::require_administrator("github.pullsGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let pr = sc
-                .get_pr(&repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            // Fail-soft: the hover card always gets its `{ pull }`; a fold
-            // failure only costs the daemon-owned state its early refresh.
-            if let Err(e) = self.fold_fetched_pr(&repo_ref, &pr).await {
-                tracing::warn!(
-                    owner = %repo_ref.owner,
-                    repo = %repo_ref.name,
-                    pr_number = number,
-                    error = %e,
-                    "github.pulls.get: folding the fetched PR into workspace PR state failed"
-                );
+            // Served from the shared PR cache (§5.27): no forge call while
+            // the entry is younger than `prCache.maxAgeSeconds`, else one
+            // full read — the same read the monitor's poll performs — that
+            // refreshes the entry the next hover and `ws.pr.snapshot` serve.
+            let (entry, fetched) = self.serve_pr(&repo_ref, number).await?;
+            // The fold rides a REAL fetch only: a hit reports nothing the
+            // daemon-owned state has not already seen. Fail-soft: the hover
+            // card always gets its `{ pull }`; a fold failure only costs the
+            // daemon-owned state its early refresh.
+            if fetched {
+                if let Err(e) = self.fold_fetched_pr(&repo_ref, &entry.pr).await {
+                    tracing::warn!(
+                        owner = %repo_ref.owner,
+                        repo = %repo_ref.name,
+                        pr_number = number,
+                        error = %e,
+                        "github.pulls.get: folding the fetched PR into workspace PR state failed"
+                    );
+                }
             }
-            Ok(serde_json::json!({ "pull": github_ops::pull_to_json(&pr) }))
+            Ok(serde_json::json!({
+                "pull": github_ops::pull_to_json_with_merge_queue(
+                    &entry.pr,
+                    entry.snapshot.merge_queue_reported,
+                ),
+            }))
         })
     }
 
@@ -29910,15 +30180,12 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
         Box::pin(async move {
             Self::require_administrator("github.issuesGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let issue = sc
-                .get_issue(&repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
+            // Served from the issue cache within `prCache.maxAgeSeconds`;
+            // a miss costs one `get_issue` and seeds the next read.
+            let issue = self.read_issue(&repo_ref, number).await?;
             Ok(serde_json::json!({
                 "issue": github_ops::issue_to_json(&issue, &repo_ref.owner, &repo_ref.name)
             }))
@@ -32257,6 +32524,11 @@ impl Services {
     /// emitted) but skips the emit entirely on the auto path — the losing
     /// racer must not re-announce a flip it did not perform (the winner's
     /// stamped delta already went out).
+    ///
+    /// Membership is NOT restored: archive detached every collaborator and
+    /// revoked every open invite (`archive_workspace_detaching_guests`), and unarchive
+    /// leaves the owner as the sole member — like the cancelled hooks and
+    /// PR monitors, guests come back only through a fresh invite.
     async fn unarchive_workspace_inner(
         &self,
         id: WorkspaceId,
@@ -32271,10 +32543,19 @@ impl Services {
         // Conditional flip: writes only when the row is currently archived,
         // so two racing unarchivers (concurrent turn starts, or a manual
         // unarchive racing the turn-start auto-unarchive) resolve to
-        // exactly one `flipped = true`.
-        let flipped = store
-            .unarchive_workspace_if_archived(&id, &now_iso())
-            .await?;
+        // exactly one `flipped = true`. Under the archive fence (see
+        // `ArchiveFence`): an in-flight `workspace.archive` holds it until
+        // its detached guests' queued messages are dropped and their
+        // removal deltas are out, so the flip — and every re-add / enqueue
+        // it unlocks — lands strictly after the archive tail's drop, never
+        // inside it. Held only across the flip: the drain kicks below can
+        // re-enter the turn-start auto-unarchive, which takes this fence.
+        let flipped = {
+            let _fence = self.archive_fence.acquire(&id).await;
+            store
+                .unarchive_workspace_if_archived(&id, &now_iso())
+                .await?
+        };
         let mut ws = store.get_workspace(&id).await?;
         // The losing racer on the auto path stops here: the winner (a
         // concurrent turn start or a manual unarchive) already kicked the

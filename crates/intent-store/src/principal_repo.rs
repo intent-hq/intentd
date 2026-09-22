@@ -9,12 +9,12 @@ use std::collections::HashMap;
 
 use intent_core::{
     now_iso, Error, Principal, PrincipalCredential, PrincipalId, Result, WorkspaceId,
-    WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+    WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole, WorkspaceStatus,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::{enum_from_db, Store};
+use crate::{enum_from_db, enum_to_db, Store};
 
 const PRINCIPAL_COLUMNS: &str =
     "id, github_user_id, login, display_name, avatar_url, is_primary, created_at, updated_at";
@@ -23,7 +23,8 @@ const MEMBER_COLUMNS: &str = "workspace_id, principal_id, role, added_at";
 
 const CREDENTIAL_COLUMNS: &str = "token_hash, principal_id, created_at, last_used_at, revoked_at";
 
-const INVITE_COLUMNS: &str = "id, workspace_id, secret_hash, secret, created_by_principal_id, \
+pub(crate) const INVITE_COLUMNS: &str =
+    "id, workspace_id, secret_hash, secret, created_by_principal_id, \
      pin_github_user_id, pin_login, created_at, expires_at, redeemed_at, \
      redeemed_by_principal_id, revoked_at, redemption_count";
 
@@ -65,6 +66,18 @@ impl WorkspaceGuestCount {
     }
 }
 
+/// What [`Store::archive_workspace_detaching_guests`] committed alongside
+/// the archive flip.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ArchivedGuestSweep {
+    /// The `collaborator` memberships deleted, in `added_at` order.
+    pub removed_collaborators: Vec<PrincipalId>,
+    /// Open invites flipped to revoked.
+    pub revoked_invites: u64,
+    /// Membership rows left after the sweep (the owner, when seated).
+    pub member_count: u64,
+}
+
 /// Result of [`Store::add_workspace_collaborator_within_cap`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollaboratorAddOutcome {
@@ -78,6 +91,19 @@ pub enum CollaboratorAddOutcome {
     /// The workspace's committed seats (collaborators plus open invites)
     /// already reach the cap; nothing was written.
     WorkspaceFull,
+    /// The workspace is archived (checked inside the write transaction, so
+    /// an archive that committed first is always seen); nothing was written.
+    WorkspaceArchived,
+}
+
+/// Result of [`Store::insert_workspace_invite`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteInsertOutcome {
+    /// The invite row was inserted.
+    Inserted,
+    /// The workspace is archived (checked inside the write transaction);
+    /// nothing was written.
+    WorkspaceArchived,
 }
 
 /// Result of [`Store::join_workspace_by_invite`].
@@ -105,6 +131,28 @@ pub enum InviteJoinOutcome {
     /// credential is minted for the primary row. Nothing was written and the
     /// invite stays open.
     OwnerSelfJoin,
+    /// The workspace is archived (checked inside the write transaction, so
+    /// an archive that committed first is always seen — its sweep also
+    /// closed the invite, so this is the guard behind the open check);
+    /// nothing was written.
+    WorkspaceArchived,
+}
+
+/// Whether `workspace_id` is archived, read on the transaction's own
+/// connection so the answer is the one the surrounding write commits
+/// against. `None` when the workspace does not exist (the caller's FK or
+/// scoped write reports that as before).
+async fn workspace_archived_in_txn(
+    conn: &mut sqlx::SqliteConnection,
+    workspace_id: &WorkspaceId,
+    what: &str,
+) -> Result<Option<bool>> {
+    let archived: Option<i64> = sqlx::query_scalar("SELECT archived FROM workspace WHERE id = ?")
+        .bind(&workspace_id.0)
+        .fetch_optional(conn)
+        .await
+        .map_err(|e| Error::Internal(format!("{what} archived check failed: {e}")))?;
+    Ok(archived.map(|a| a != 0))
 }
 
 impl Store {
@@ -524,7 +572,9 @@ impl Store {
     /// is evaluated first, so a seated principal whose credentials are all
     /// revoked is `NoActiveCredential`, not `AlreadyMember`; an already
     /// seated credentialed principal takes no new seat and is reported
-    /// without a write.
+    /// without a write. An archived workspace is `WorkspaceArchived` (read
+    /// under the same lock, so an archive whose sweep committed first is
+    /// never followed by a fresh seat).
     ///
     /// # Errors
     ///
@@ -547,6 +597,11 @@ impl Store {
             .map_err(|e| Error::Internal(format!("capped member add begin failed: {e}")))?;
 
         let body_result: Result<CollaboratorAddOutcome> = async {
+            if workspace_archived_in_txn(&mut conn, workspace_id, "capped member add").await?
+                == Some(true)
+            {
+                return Ok(CollaboratorAddOutcome::WorkspaceArchived);
+            }
             let active_credential: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM principal_credential \
                     WHERE principal_id = ? AND revoked_at IS NULL LIMIT 1",
@@ -910,38 +965,69 @@ impl Store {
     /// Persist a freshly minted invite (multiplayer w4). `secret_hash` is the
     /// hex SHA-256 of the link secret — the service layer hashes; the
     /// plaintext `secret` is kept alongside so the link can be rebuilt on
-    /// `workspace.invite.list`.
+    /// `workspace.invite.list`. The insert runs in a `BEGIN IMMEDIATE`
+    /// transaction behind an archived check on the same connection: an
+    /// archived workspace is `WorkspaceArchived` and nothing is written, so
+    /// no open invite can be minted after an archive's sweep committed.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn insert_workspace_invite(&self, invite: &WorkspaceInvite) -> Result<()> {
-        let sql = format!(
-            "INSERT INTO workspace_invite ({INVITE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
-        );
-        sqlx::query(&sql)
-            .bind(&invite.id)
-            .bind(&invite.workspace_id.0)
-            .bind(&invite.secret_hash)
-            .bind(&invite.secret)
-            .bind(&invite.created_by_principal_id.0)
-            .bind(invite.pin_github_user_id)
-            .bind(&invite.pin_login)
-            .bind(&invite.created_at)
-            .bind(&invite.expires_at)
-            .bind(&invite.redeemed_at)
-            .bind(
-                invite
-                    .redeemed_by_principal_id
-                    .as_ref()
-                    .map(|p| p.0.as_str()),
-            )
-            .bind(&invite.revoked_at)
-            .bind(i64::try_from(invite.redemption_count).unwrap_or(i64::MAX))
-            .execute(self.write_pool())
+    pub async fn insert_workspace_invite(
+        &self,
+        invite: &WorkspaceInvite,
+    ) -> Result<InviteInsertOutcome> {
+        let mut conn =
+            self.write_pool().acquire().await.map_err(|e| {
+                Error::Internal(format!("insert workspace invite acquire failed: {e}"))
+            })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
             .await
-            .map_err(|e| Error::Internal(format!("insert workspace invite failed: {e}")))?;
-        Ok(())
+            .map_err(|e| Error::Internal(format!("insert workspace invite begin failed: {e}")))?;
+
+        let body_result: Result<InviteInsertOutcome> = async {
+            if workspace_archived_in_txn(&mut conn, &invite.workspace_id, "insert workspace invite")
+                .await?
+                == Some(true)
+            {
+                return Ok(InviteInsertOutcome::WorkspaceArchived);
+            }
+            let sql = format!(
+                "INSERT INTO workspace_invite ({INVITE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            );
+            sqlx::query(&sql)
+                .bind(&invite.id)
+                .bind(&invite.workspace_id.0)
+                .bind(&invite.secret_hash)
+                .bind(&invite.secret)
+                .bind(&invite.created_by_principal_id.0)
+                .bind(invite.pin_github_user_id)
+                .bind(&invite.pin_login)
+                .bind(&invite.created_at)
+                .bind(&invite.expires_at)
+                .bind(&invite.redeemed_at)
+                .bind(
+                    invite
+                        .redeemed_by_principal_id
+                        .as_ref()
+                        .map(|p| p.0.as_str()),
+                )
+                .bind(&invite.revoked_at)
+                .bind(i64::try_from(invite.redemption_count).unwrap_or(i64::MAX))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("insert workspace invite failed: {e}")))?;
+            Ok(InviteInsertOutcome::Inserted)
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "insert workspace invite commit failed",
+        )
+        .await
     }
 
     /// Fetch an invite by id, open or closed (`None` when unknown).
@@ -1003,6 +1089,105 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("revoke workspace invite failed: {e}")))?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// `workspace.archive`'s durable write: flip the row to Archived
+    /// (scoped `status`/`archived`/`archived_at`/`updated_at` write), delete
+    /// every non-owner membership, revoke every open invite and count the
+    /// surviving members — in ONE `BEGIN IMMEDIATE` transaction, so the
+    /// archive and the access revocation commit together or not at all.
+    /// Under IMMEDIATE an `invite.accept` / capped member add (both write
+    /// transactions of their own) serializes entirely before or entirely
+    /// after this sweep: a join that committed first is swept here, one that
+    /// commits later finds its invite closed. A failed statement rolls the
+    /// whole transaction back and the workspace stays active.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist;
+    /// `Error::Internal` if the database operation fails.
+    pub async fn archive_workspace_detaching_guests(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+    ) -> Result<ArchivedGuestSweep> {
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("archive workspace acquire failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("archive workspace begin failed: {e}")))?;
+
+        let body_result: Result<ArchivedGuestSweep> = async {
+            let flipped = sqlx::query(
+                "UPDATE workspace SET status=?, archived=1, archived_at=?, updated_at=? \
+                 WHERE id=?",
+            )
+            .bind(enum_to_db(&WorkspaceStatus::Archived)?)
+            .bind(archived_at)
+            .bind(archived_at)
+            .bind(&id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("archive workspace failed: {e}")))?;
+            if flipped.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            }
+            let removed_collaborators: Vec<PrincipalId> = sqlx::query_scalar::<_, String>(
+                "SELECT principal_id FROM workspace_member \
+                 WHERE workspace_id = ? AND role <> 'owner' ORDER BY added_at, principal_id",
+            )
+            .bind(&id.0)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("archive guest listing failed: {e}")))?
+            .into_iter()
+            .map(PrincipalId)
+            .collect();
+            let deleted = sqlx::query(
+                "DELETE FROM workspace_member WHERE workspace_id = ? AND role <> 'owner'",
+            )
+            .bind(&id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("archive guest detach failed: {e}")))?;
+            if usize::try_from(deleted.rows_affected()).ok() != Some(removed_collaborators.len()) {
+                return Err(Error::Internal(format!(
+                    "archive guest detach removed {} rows, expected {}",
+                    deleted.rows_affected(),
+                    removed_collaborators.len()
+                )));
+            }
+            let revoke_sql = format!(
+                "UPDATE workspace_invite AS i SET revoked_at = ? \
+                 WHERE i.workspace_id = ? AND {INVITE_OPEN}"
+            );
+            let revoked = sqlx::query(&revoke_sql)
+                .bind(archived_at)
+                .bind(&id.0)
+                .bind(archived_at)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("archive invite revoke failed: {e}")))?;
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM workspace_member WHERE workspace_id = ?")
+                    .bind(&id.0)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| Error::Internal(format!("archive member count failed: {e}")))?;
+            Ok(ArchivedGuestSweep {
+                removed_collaborators,
+                revoked_invites: revoked.rows_affected(),
+                member_count: u64::try_from(remaining).unwrap_or(0),
+            })
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(conn, body_result, "archive workspace commit failed")
+            .await
     }
 
     /// Record a redemption of an **open** invite by `principal_id`: stamps
@@ -1079,6 +1264,11 @@ impl Store {
     /// presenting the same credential exactly one mints, and a revoke that
     /// lands between the caller's lookup and the join refuses the mint.
     ///
+    /// An archived workspace is [`InviteJoinOutcome::WorkspaceArchived`],
+    /// checked first on the same connection: an archive whose sweep
+    /// committed before this transaction began is always observed, so no
+    /// join lands on an archived workspace.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails (including
@@ -1108,6 +1298,11 @@ impl Store {
 
         let body_result: Result<InviteJoinOutcome> = async {
             let now = now_iso();
+            if workspace_archived_in_txn(&mut conn, workspace_id, "invite join").await?
+                == Some(true)
+            {
+                return Ok(InviteJoinOutcome::WorkspaceArchived);
+            }
             // Open-invite check before any write: under IMMEDIATE no other
             // writer can close it between here and the UPDATE below, so a
             // refused join commits a read-only transaction (no-op).

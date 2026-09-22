@@ -1,6 +1,6 @@
 [package]
 name = "intent-core"
-version = "0.9.95"
+version = "0.9.96"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -33,6 +33,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 ctor = "1.0.10"
+intentd-test-support = { path = "../intentd-test-support" }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt", "macros"] }
 

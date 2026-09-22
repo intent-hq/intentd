@@ -10025,3 +10025,218 @@ fn load_auth_required_error_matches_mapped_shape() {
         assert!(!super::load_auth_required_error(&err), "{err:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Text-block `media` sidecar (§7.1): header-only Markdown image dimension
+// probe on the streaming write path.
+// ---------------------------------------------------------------------------
+
+/// A probe context rooted in a scratch dir: `<dir>/root` is the workspace
+/// root, `<dir>/assets` the assets root, workspace `ws-1`.
+fn probe_context(dir: &std::path::Path) -> super::ProbeContext {
+    std::fs::create_dir_all(dir.join("root")).unwrap();
+    super::ProbeContext {
+        workspace_id: "ws-1".to_string(),
+        workspace_root: dir.join("root").to_string_lossy().into_owned(),
+        assets_root: Some(dir.join("assets")),
+    }
+}
+
+fn write_png(path: &std::path::Path, w: u32, h: u32) {
+    crate::image_dimensions::tests::write_image(path, w, h, image::ImageFormat::Png);
+}
+
+/// A reference split across chunks resolves exactly once — on the chunk that
+/// completes it — and the flushed block carries the union of every entry the
+/// chunks resolved; a block that resolved nothing carries no `media` key.
+#[test]
+fn media_sidecar_resolves_split_reference_once_and_persists_union() {
+    let dir = crate::test_support::test_tempdir("media-split-");
+    write_png(&dir.path().join("assets/ws-1/a.png"), 640, 480);
+    write_png(&dir.path().join("root/docs/b.png"), 8, 9);
+    let mut t =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+
+    t.push_chunk("See ![shot](workspace-asset://ws-1/a.p", false);
+    assert_eq!(
+        t.probe_new_images(),
+        None,
+        "incomplete reference resolves nothing"
+    );
+    t.push_chunk("ng) and ![b](docs/b.png).", false);
+    assert_eq!(
+        t.probe_new_images().map(Value::Object),
+        Some(json!({
+            "workspace-asset://ws-1/a.png": { "width": 640, "height": 480 },
+            "docs/b.png": { "width": 8, "height": 9 },
+        })),
+        "the completing chunk carries both entries"
+    );
+    t.push_chunk(
+        " Again ![shot](workspace-asset://ws-1/a.png) and ![x](https://e.com/x.png).",
+        false,
+    );
+    assert_eq!(
+        t.probe_new_images(),
+        None,
+        "a repeated src and an https source add no NEW entry"
+    );
+    assert_eq!(
+        t.snapshot_blocks()[0]["media"],
+        json!({
+            "workspace-asset://ws-1/a.png": { "width": 640, "height": 480 },
+            "docs/b.png": { "width": 8, "height": 9 },
+        }),
+        "the mid-turn snapshot carries the union so far"
+    );
+
+    // A tool block closes the text block; the next text block starts clean.
+    t.push_block(json!({ "type": "tool_use", "name": "t", "input": {} }));
+    t.push_chunk("no images here", false);
+    assert_eq!(t.probe_new_images(), None);
+
+    let blocks = t.into_blocks();
+    assert_eq!(
+        blocks[0]["media"],
+        json!({
+            "workspace-asset://ws-1/a.png": { "width": 640, "height": 480 },
+            "docs/b.png": { "width": 8, "height": 9 },
+        }),
+        "persisted media = union of what was sent live"
+    );
+    assert_eq!(blocks[0]["text"].as_str().unwrap().matches("![").count(), 4);
+    assert!(
+        blocks[2].get("media").is_none(),
+        "no media key when nothing resolved"
+    );
+}
+
+/// The per-turn probe cache serves a repeated `src` without touching the
+/// filesystem again: the file is deleted after its first probe and a later
+/// block still resolves it.
+#[test]
+fn media_sidecar_probe_cache_serves_repeats_across_blocks() {
+    let dir = crate::test_support::test_tempdir("media-cache-");
+    let png = dir.path().join("root/shot.png");
+    write_png(&png, 31, 17);
+    let mut t =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+
+    t.push_chunk("![a](shot.png)", false);
+    assert!(t.probe_new_images().is_some());
+    std::fs::remove_file(&png).unwrap();
+    t.push_block(json!({ "type": "tool_use", "name": "t", "input": {} }));
+    t.push_chunk("![again](shot.png)", false);
+    assert_eq!(
+        t.probe_new_images().map(Value::Object),
+        Some(json!({ "shot.png": { "width": 31, "height": 17 } })),
+        "cache hit — the file is gone"
+    );
+    assert_eq!(
+        t.into_blocks()[2]["media"],
+        json!({ "shot.png": { "width": 31, "height": 17 } })
+    );
+}
+
+/// At most [`super::MAX_IMAGE_REFS_PER_BLOCK`] references are examined per
+/// text block; the cap resets on the next block.
+#[test]
+fn media_sidecar_caps_references_per_block() {
+    let dir = crate::test_support::test_tempdir("media-cap-");
+    let cap = super::MAX_IMAGE_REFS_PER_BLOCK;
+    for i in 0..=cap {
+        write_png(&dir.path().join(format!("root/i{i}.png")), 4, 4);
+    }
+    let mut t =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+    let refs = (0..=cap).fold(String::new(), |mut acc, i| {
+        acc.push_str("![i](i");
+        acc.push_str(&i.to_string());
+        acc.push_str(".png) ");
+        acc
+    });
+    t.push_chunk(&refs, false);
+    let media = t.probe_new_images().expect("entries resolved");
+    assert_eq!(
+        media.len(),
+        cap,
+        "the {}th reference is not examined",
+        cap + 1
+    );
+    assert!(!media.contains_key(&format!("i{cap}.png")));
+    t.push_chunk(&format!("![late](i{cap}.png)"), false);
+    assert_eq!(
+        t.probe_new_images(),
+        None,
+        "past the cap nothing more is examined"
+    );
+
+    t.push_block(json!({ "type": "tool_use", "name": "t", "input": {} }));
+    t.push_chunk(&format!("![late](i{cap}.png)"), false);
+    assert!(t.probe_new_images().is_some(), "the cap is per block");
+}
+
+/// Reasoning never resolves entries, and a probe-less transcript (no
+/// context) leaves every block untouched.
+#[test]
+fn media_sidecar_skips_thinking_and_probeless_transcripts() {
+    let dir = crate::test_support::test_tempdir("media-skip-");
+    write_png(&dir.path().join("root/shot.png"), 3, 3);
+    let mut t =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+    t.push_chunk("![a](shot.png)", true);
+    assert_eq!(t.probe_new_images(), None);
+    let blocks = t.into_blocks();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert!(blocks[0].get("media").is_none());
+
+    let mut t = super::Transcript::new("m1".to_string());
+    t.push_chunk("![a](shot.png)", false);
+    assert_eq!(t.probe_new_images(), None);
+    assert!(t.into_blocks()[0].get("media").is_none());
+}
+
+/// End to end through `route_notification`: the `chat:stream:delta` event of
+/// the chunk that completes a reference carries `media`; earlier chunks do
+/// not.
+#[tokio::test]
+async fn chunk_delta_event_carries_media_for_the_completing_chunk() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let dir = crate::test_support::test_tempdir("media-event-");
+    write_png(&dir.path().join("assets/ws-1/a.png"), 20, 10);
+    let mut transcript =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    for note in [
+        message_note("Here: ![a](workspace-asset://ws-1/"),
+        message_note("a.png) done"),
+    ] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+    let mut deltas: Vec<Event> = Vec::new();
+    while deltas.len() < 2 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        deltas.extend(
+            batch
+                .into_iter()
+                .filter(|e| e.event_type == "chat:stream:delta"),
+        );
+    }
+    assert!(deltas[0].data.get("media").is_none());
+    assert_eq!(
+        deltas[1].data["media"],
+        json!({ "workspace-asset://ws-1/a.png": { "width": 20, "height": 10 } })
+    );
+    assert_eq!(deltas[1].data["blockType"], "text");
+    assert_eq!(
+        transcript.into_blocks()[0]["media"],
+        json!({ "workspace-asset://ws-1/a.png": { "width": 20, "height": 10 } })
+    );
+}

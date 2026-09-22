@@ -763,6 +763,320 @@ async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
     );
 }
 
+/// Text-block `media` sidecar (PROTOCOL §7.1) over the real WSS wire: the
+/// daemon probes the dimensions of a `workspace-asset://` Markdown image the
+/// provider streams — a reference split across chunks resolves on the chunk
+/// that completes it, so that chunk's `chat:stream:delta` carries `media`
+/// keyed by the exact `src` while the chunks before and after carry none.
+/// On the canonical `chat.subscribe` channel the same holds in BOTH
+/// `deltaEncoding` modes (only the entries that chunk resolved travel, never
+/// the accumulated map), the terminal reconcile frame carries the persisted
+/// union, and the persisted text block on `agent.getConversation` carries the
+/// same entry, so a reloading client can reserve the layout box without a
+/// round-trip.
+#[intent_test_macros::daemon_test]
+async fn text_block_media_sidecar_over_wss() {
+    let Some(script) = gate("WSS media sidecar E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // A real 20×10 PNG in the daemon's asset layout
+    // (`<data_dir>/assets/<workspaceId>/<assetId>`).
+    let asset_dir = data_dir.join("assets").join(&ws_id);
+    std::fs::create_dir_all(&asset_dir).expect("mkdir assets");
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(20, 10, image::Rgb([10, 20, 30]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode png");
+    std::fs::write(asset_dir.join("shot.png"), png.into_inner()).expect("write png");
+    let src = format!("workspace-asset://{ws_id}/shot.png");
+    let (head, tail) = src.split_at(src.len() - 6);
+    let behavior = json!({
+        "rawUpdates": [
+            { "sessionUpdate": "agent_message_chunk",
+              "content": { "type": "text", "text": format!("Here: ![shot]({head}") } },
+            { "sessionUpdate": "agent_message_chunk",
+              "content": { "type": "text", "text": format!("{tail})") } },
+            { "sessionUpdate": "agent_message_chunk",
+              "content": { "type": "text", "text": " done" } },
+        ],
+        "omitResponse": true,
+    })
+    .to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-MEDIA", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Canonical chat channels, one per `deltaEncoding`, subscribed BEFORE the
+    // turn so every live delta is observed.
+    let mut chat_full = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat_full,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed (full): {chat_resp}"
+    );
+    let snap = wss_push(&mut chat_full, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+    let mut chat_inc = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat_inc,
+        21,
+        "chat.subscribe",
+        json!({ "agentId": agent_id, "deltaEncoding": "incremental" }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed (incremental): {chat_resp}"
+    );
+    let snap = wss_push(&mut chat_inc, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+    assert_eq!(
+        snap["params"]["snapshot"]["deltaEncoding"], "incremental",
+        "the daemon honored the incremental encoding: {snap}"
+    );
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "show me" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    let expected_media = json!({ &src: { "width": 20, "height": 10 } });
+    let full_text = format!("Here: ![shot]({src}) done");
+    let mut deltas: Vec<Value> = Vec::new();
+    let mut message_id: Option<String> = None;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("chat:stream:delta") if event["data"]["blockType"] == json!("text") => {
+                deltas.push(event["data"].clone());
+            }
+            Some("agent:stream:end") => {
+                message_id = event["data"]["messageId"].as_str().map(str::to_string);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        deltas.len(),
+        3,
+        "one text delta per streamed chunk: {deltas:?}"
+    );
+    assert!(
+        deltas[0].get("media").is_none(),
+        "the chunk that only OPENS the reference carries no media: {}",
+        deltas[0]
+    );
+    assert_eq!(
+        deltas[1]["media"], expected_media,
+        "the chunk that COMPLETES the reference carries its dimensions: {}",
+        deltas[1]
+    );
+    assert!(
+        deltas[2].get("media").is_none(),
+        "a later chunk that resolves nothing carries no media: {}",
+        deltas[2]
+    );
+    assert!(
+        deltas.iter().all(|d| d["blockId"] == deltas[0]["blockId"]),
+        "all chunks belong to the same text block: {deltas:?}"
+    );
+
+    // Drain one chat channel: the live text-block entities in order, then the
+    // terminal reconcile entity (`streamingComplete: true`) for that block.
+    // Single total deadline (per-frame reads would reset on heartbeat Pings).
+    async fn drain_text_block<S>(
+        chat: &mut WebSocketStream<S>,
+        agent_id: &str,
+    ) -> (Vec<Value>, Value)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        timeout(Duration::from_secs(30), async {
+            let mut live: Vec<Value> = Vec::new();
+            loop {
+                let frame = wss_push(chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = &frame["params"]["delta"];
+                let entities = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .filter(|e| {
+                        e["agentId"] == agent_id
+                            && e["role"] == "assistant"
+                            && e["block"]["type"] == "text"
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for entity in entities {
+                    if entity["streamingComplete"] == true {
+                        return (live, entity);
+                    }
+                    live.push(entity);
+                }
+            }
+        })
+        .await
+        .expect("chat channel settled the text block")
+    }
+
+    let (full_live, full_terminal) = drain_text_block(&mut chat_full, &agent_id).await;
+    assert_eq!(
+        full_live.len(),
+        3,
+        "full mode: one entity per streamed chunk: {full_live:?}"
+    );
+    assert!(
+        full_live[0]["block"].get("media").is_none(),
+        "full mode: opening chunk carries no media: {}",
+        full_live[0]
+    );
+    assert_eq!(
+        full_live[1]["block"]["media"], expected_media,
+        "full mode: completing chunk carries only what it resolved: {}",
+        full_live[1]
+    );
+    assert!(
+        full_live[2]["block"].get("media").is_none(),
+        "full mode: a chunk that resolves nothing omits media (never resends the union): {}",
+        full_live[2]
+    );
+    assert_eq!(
+        full_live[2]["block"]["text"].as_str(),
+        Some(full_text.as_str()),
+        "full mode still carries the accumulated text: {}",
+        full_live[2]
+    );
+    assert_eq!(
+        full_terminal["block"]["media"], expected_media,
+        "full mode: the terminal reconcile carries the persisted union: {full_terminal}"
+    );
+
+    let (inc_live, inc_terminal) = drain_text_block(&mut chat_inc, &agent_id).await;
+    assert_eq!(
+        inc_live.len(),
+        3,
+        "incremental mode: one entity per streamed chunk: {inc_live:?}"
+    );
+    assert!(
+        inc_live[0]["block"].get("media").is_none(),
+        "incremental mode: opening chunk carries no media: {}",
+        inc_live[0]
+    );
+    assert_eq!(
+        inc_live[1]["block"]["media"], expected_media,
+        "incremental mode: completing chunk carries only what it resolved: {}",
+        inc_live[1]
+    );
+    assert_eq!(
+        inc_live[1]["block"]["textDelta"].as_str(),
+        Some(format!("{tail})").as_str()),
+        "incremental mode carries only the fragment: {}",
+        inc_live[1]
+    );
+    assert!(
+        inc_live[2]["block"].get("media").is_none(),
+        "incremental mode: a chunk that resolves nothing omits media: {}",
+        inc_live[2]
+    );
+    assert_eq!(
+        inc_terminal["block"]["media"], expected_media,
+        "incremental mode: the terminal reconcile carries the persisted union: {inc_terminal}"
+    );
+
+    // Durable half: the persisted block carries the same sidecar.
+    let message_id = message_id.expect("stream:end carries the persisted messageId");
+    let convo = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let assistant = convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"] == json!(message_id))
+        .expect("assistant row from the turn present in the transcript")
+        .clone();
+    let block = assistant["contentBlocks"]
+        .as_array()
+        .expect("contentBlocks")
+        .iter()
+        .find(|b| b["type"] == json!("text"))
+        .expect("persisted text block")
+        .clone();
+    assert_eq!(
+        block["text"].as_str(),
+        Some(format!("Here: ![shot]({src}) done").as_str()),
+        "chunks concatenated into one text block: {block}"
+    );
+    assert_eq!(
+        block["media"], expected_media,
+        "the persisted text block carries the media sidecar: {block}"
+    );
+}
+
 /// intent-hq/monorepo#2669 over the real WSS wire: a turn that resolves a
 /// clean `end_turn` after a sustained stream-silence tail (the incident
 /// signature of a silently-truncated turn under session bloat) gets the
@@ -12616,6 +12930,10 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
         .expect("image block persisted on the user row");
     assert_eq!(image["data"], image_data);
     assert_eq!(image["mimeType"], "image/png");
+    // v10.7 image dimension sidecar: the write path stamps the intrinsic
+    // pixel dimensions of the (1x1) PNG onto the persisted block.
+    assert_eq!(image["width"], 1, "{image}");
+    assert_eq!(image["height"], 1, "{image}");
     let file = blocks
         .iter()
         .find(|b| b["type"] == "file")

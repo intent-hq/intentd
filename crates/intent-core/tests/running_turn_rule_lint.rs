@@ -12,30 +12,18 @@
 //! rule), or a string literal under `crates/intent-store/src/**/*.rs` spells
 //! the set as a SQL list again (the SQL rule).
 //!
-//! The heuristic is deliberately small:
+//! The pre-processing — blanking comments, string literals, and `#[cfg(test)]`
+//! items, keeping every string literal's body with its line for the SQL rule,
+//! cutting the text into statements (a block expression used as an operand —
+//! its `}` followed by `.`, `?`, or `else` — chains with the text around it
+//! while the block bodies stay their own statements), locating the opt-out
+//! marker, and walking `crates/*/src/**/*.rs` minus `tests/` directories and
+//! `tests.rs` files — is the shared `intentd_test_support::source_lint`
+//! scaffolding; its module doc spells out those semantics. The rules
+//! themselves are deliberately small:
 //!
-//! - Skipped: `crates/intent-core/src/model.rs` (the definition), any file
-//!   named `tests.rs` or under a `tests/` directory, and any `#[cfg(test)]`
-//!   item, attribute to end of item. An item introduced by `const` /
-//!   `static` / `type` / `use` (any `const` other than `const fn`) ends at
-//!   the first `;` at brace depth 0, so a `const` initializer with its own
-//!   blocks is skipped whole; one introduced by `fn` / `mod` / `impl` /
-//!   `struct` / `enum` / `union` / `trait` / `macro_rules` ends at the `}`
-//!   closing its body, or at a `;` at depth 0 seen first (`mod tests;`,
-//!   `struct X;`, a trait method signature). Anything else falls back to the
-//!   first balanced `}` or `;`. The attribute is matched as the token
-//!   sequence `# [ cfg ( test ) ]` with any whitespace between tokens, after
-//!   comments are blanked — so `#[cfg( test )]` and `#[cfg(/* c */ test)]`
-//!   are skipped, while `#[cfg(not(test))]` and `#[cfg(all(test, …))]` are
-//!   scanned like ordinary code.
-//! - String literals and comments are blanked first, so the triple quoted in
-//!   a doc comment or a message never counts. The lexer keeps every string
-//!   literal's content with its line so a rule over literal text (the SQL
-//!   `IN` list) can share this pass. A "statement" is the text between `;` /
-//!   `{` / `}` boundaries, except that a block expression used as an operand
-//!   — its `}` followed by `.`, `?`, or `else` — is chained: the text before
-//!   its `{` and the text after its `}` form one statement, while the block
-//!   bodies stay their own statements.
+//! - Skipped: `crates/intent-core/src/model.rs` (the definition), on top of
+//!   the test code the shared walker and `#[cfg(test)]` blanking leave out.
 //! - An **or-group** is a maximal run of path alternatives (`A::B::C`)
 //!   joined by single `|` inside one statement — `matches!(s, A | B | C)`,
 //!   an `A | B | C =>` match arm, any order, across lines. An alternative
@@ -49,13 +37,10 @@
 //!   and are not hits.
 //! - Opt-out: `// running-turn: allow — <reason>` on the line immediately
 //!   above the group's first line, or above the statement's first line (the
-//!   `matches!(` line for a multi-line `matches!`). The marker counts only
-//!   as a standalone `//` line comment (nothing but whitespace before it,
-//!   not inside a `/* … */` block comment or a string literal, not trailing
-//!   code), the token must be exactly `running-turn: allow` (a longer word
-//!   such as `allowance` is malformed), and it must be followed by
-//!   whitespace, an em dash or hyphen, and a nonempty reason. A malformed
-//!   marker never suppresses the hit; the report says so.
+//!   `matches!(` line for a multi-line `matches!`), in the shared marker
+//!   grammar (a standalone `//` line comment, the exact token, whitespace, an
+//!   em dash or hyphen, and a nonempty reason). A malformed marker never
+//!   suppresses the hit; the report says so.
 //! - **SQL rule**: every string literal the lexer collected — cooked or raw,
 //!   a `format!` template included — in non-test code under
 //!   `crates/intent-store/src/**/*.rs` (same `tests/` / `tests.rs` /
@@ -83,10 +68,14 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use intentd_test_support::source_lint::{
+    blank_cfg_test_items, cfg_test_item_ranges, crate_src_files, lex, markers_by_line,
+    split_statements, statement_line, word_at, workspace_root, Marker,
+};
+
 const RUNNING_TURN_VARIANTS: &[&str] = &["Pending", "Active", "Processing"];
 const VARIANT_OWNERS: &[&str] = &["AgentStatus", "Self"];
-const OPT_OUT_MARKER: &str = "// running-turn: allow";
-const CFG_TEST_TOKENS: &[&str] = &["#", "[", "cfg", "(", "test", ")", "]"];
+const OPT_OUT_TAG: &str = "running-turn";
 const EXEMPT_FILE: &[&str] = &["crates", "intent-core", "src", "model.rs"];
 /// Both must appear in one literal for the SQL rule to fire.
 const SQL_RUNNING_FINGERPRINT: &[&str] = &["'active'", "'Processing'"];
@@ -100,520 +89,6 @@ struct Hit {
     /// A line checked for the opt-out carried something that starts like the
     /// marker but is malformed (longer token, or no reason).
     marker_malformed: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Marker {
-    Absent,
-    WithReason,
-    Malformed,
-}
-
-/// A string literal found by the lexer, with its body as written (escape
-/// sequences are not evaluated; raw strings are taken verbatim) and the
-/// 1-based line it opens on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Literal {
-    /// Char offset of the opening quote in the source.
-    offset: usize,
-    line: usize,
-    text: String,
-}
-
-/// A real `//` line comment found by the lexer (never one nested inside a
-/// block comment or a string literal).
-struct LineComment {
-    line: usize,
-    /// Only whitespace precedes the `//` on its line.
-    standalone: bool,
-    text: String,
-}
-
-/// Source text with comments/literals blanked, plus what the lexer passed
-/// over on the way.
-struct Lexed {
-    blanked: String,
-    literals: Vec<Literal>,
-    line_comments: Vec<LineComment>,
-}
-
-/// Marker state of one line comment's text: `Absent` unless it starts with
-/// the marker prefix; `WithReason` only when the token is exactly the marker
-/// (not a longer word such as `allowance`) followed by whitespace, a dash,
-/// and a nonempty reason; anything else that starts like the marker is
-/// `Malformed`.
-fn classify_marker(comment: &str) -> Marker {
-    let Some(rest) = comment.strip_prefix(OPT_OUT_MARKER) else {
-        return Marker::Absent;
-    };
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Marker::Malformed;
-    }
-    let after_space = rest.trim_start();
-    if after_space.len() == rest.len() && !rest.is_empty() {
-        return Marker::Malformed;
-    }
-    let Some(reason) = after_space
-        .strip_prefix('—')
-        .or_else(|| after_space.strip_prefix('-'))
-    else {
-        return Marker::Malformed;
-    };
-    if reason.trim().is_empty() {
-        Marker::Malformed
-    } else {
-        Marker::WithReason
-    }
-}
-
-/// Opt-out marker state per line; index 0 is a placeholder so the vector is
-/// addressed by 1-based line number. Only a standalone `//` line comment can
-/// carry the marker.
-fn markers_by_line(src: &str, line_comments: &[LineComment]) -> Vec<Marker> {
-    let mut out = vec![Marker::Absent; src.lines().count() + 1];
-    for comment in line_comments.iter().filter(|c| c.standalone) {
-        if let Some(slot) = out.get_mut(comment.line) {
-            *slot = classify_marker(&comment.text);
-        }
-    }
-    out
-}
-
-fn push_blank(out: &mut String, c: char) {
-    out.push(if c == '\n' { '\n' } else { ' ' });
-}
-
-/// `Some(hashes)` when a raw string literal (`r"`, `r#"`, `br"`, `cr#"`, …)
-/// starts at `i`; `None` otherwise. Cooked `b"…"` / `c"…"` strings need no
-/// special case: their prefix letter is left as an inert identifier and the
-/// `"` branch consumes the body.
-fn raw_string_hashes(chars: &[char], i: usize) -> Option<usize> {
-    let preceded_by_ident = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
-    if preceded_by_ident {
-        return None;
-    }
-    let mut j = i;
-    if matches!(chars.get(j), Some('b' | 'c')) {
-        j += 1;
-    }
-    if chars.get(j) != Some(&'r') {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0;
-    while chars.get(j) == Some(&'#') {
-        hashes += 1;
-        j += 1;
-    }
-    (chars.get(j) == Some(&'"')).then_some(hashes)
-}
-
-/// Lexes `src` once: every comment, string literal, and char literal is
-/// blanked (newlines preserved) in `blanked` so neither their contents nor
-/// their delimiters take part in statement splitting or token matching;
-/// every string literal's body is collected with its line; and every `//`
-/// line comment is reported (only those may carry the opt-out marker).
-fn lex(src: &str) -> Lexed {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut literals = Vec::new();
-    let mut line_comments = Vec::new();
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if c == '\n' {
-            out.push('\n');
-            line += 1;
-            line_start = i + 1;
-            i += 1;
-        } else if c == '/' && next == Some('/') {
-            let start = i;
-            while i < chars.len() && chars[i] != '\n' {
-                out.push(' ');
-                i += 1;
-            }
-            line_comments.push(LineComment {
-                line,
-                standalone: chars[line_start..start].iter().all(|c| c.is_whitespace()),
-                text: chars[start..i].iter().collect(),
-            });
-        } else if c == '/' && next == Some('*') {
-            let mut depth = 0usize;
-            while i < chars.len() {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    out.push_str("  ");
-                    i += 2;
-                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    out.push_str("  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    if chars[i] == '\n' {
-                        line += 1;
-                        line_start = i + 1;
-                    }
-                    push_blank(&mut out, chars[i]);
-                    i += 1;
-                }
-            }
-        } else if let Some(hashes) = raw_string_hashes(&chars, i) {
-            while chars[i] != '"' {
-                out.push(' ');
-                i += 1;
-            }
-            let offset = i;
-            let open_line = line;
-            out.push(' ');
-            i += 1;
-            let body_start = i;
-            let mut body_end = i;
-            while i < chars.len() {
-                let closing =
-                    chars[i] == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#'));
-                if chars[i] == '\n' {
-                    line += 1;
-                    line_start = i + 1;
-                }
-                push_blank(&mut out, chars[i]);
-                i += 1;
-                if closing {
-                    body_end = i - 1;
-                    out.push_str(&" ".repeat(hashes));
-                    i += hashes;
-                    break;
-                }
-            }
-            literals.push(Literal {
-                offset,
-                line: open_line,
-                text: chars[body_start..body_end].iter().collect(),
-            });
-        } else if c == '"' {
-            let offset = i;
-            let open_line = line;
-            out.push(' ');
-            i += 1;
-            let body_start = i;
-            let mut body_end = i;
-            while i < chars.len() {
-                let d = chars[i];
-                if d == '\n' {
-                    line += 1;
-                    line_start = i + 1;
-                }
-                push_blank(&mut out, d);
-                i += 1;
-                if d == '\\' {
-                    if let Some(&escaped) = chars.get(i) {
-                        if escaped == '\n' {
-                            line += 1;
-                            line_start = i + 1;
-                        }
-                        push_blank(&mut out, escaped);
-                        i += 1;
-                    }
-                } else if d == '"' {
-                    body_end = i - 1;
-                    break;
-                }
-            }
-            literals.push(Literal {
-                offset,
-                line: open_line,
-                text: chars[body_start..body_end].iter().collect(),
-            });
-        } else if c == '\'' {
-            // `'\…'` and `'x'` are char literals; anything else is a lifetime
-            // or loop label, which carries no path token.
-            if next == Some('\\') {
-                let start = i;
-                i += 2;
-                if chars.get(i) == Some(&'u') {
-                    while i < chars.len() && chars[i] != '}' {
-                        i += 1;
-                    }
-                }
-                i += 1;
-                if chars.get(i) == Some(&'\'') {
-                    i += 1;
-                }
-                i = i.min(chars.len());
-                for &d in &chars[start..i] {
-                    push_blank(&mut out, d);
-                }
-            } else if chars.get(i + 2) == Some(&'\'') {
-                out.push_str("   ");
-                i += 3;
-            } else {
-                out.push(' ');
-                i += 1;
-            }
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    Lexed {
-        blanked: out,
-        literals,
-        line_comments,
-    }
-}
-
-/// Whether the `#[cfg(test)]` token sequence starts at `i`, ignoring any
-/// whitespace between tokens (a blanked `/* comment */` inside the attribute
-/// leaves spaces behind, and `# [cfg(test)]` is legal Rust).
-fn starts_with_cfg_test(chars: &[char], i: usize) -> bool {
-    if chars.get(i) != Some(&'#') {
-        return false;
-    }
-    let mut j = i;
-    for token in CFG_TEST_TOKENS {
-        while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-            j += 1;
-        }
-        for want in token.chars() {
-            if chars.get(j) != Some(&want) {
-                return false;
-            }
-            j += 1;
-        }
-    }
-    true
-}
-
-/// Items whose body is a brace block; they end at the `}` closing it (or at a
-/// `;` at depth 0 seen first).
-const BODY_ITEM_KEYWORDS: &[&str] = &[
-    "fn",
-    "mod",
-    "impl",
-    "struct",
-    "enum",
-    "union",
-    "trait",
-    "macro_rules",
-];
-/// Items that end at the first `;` at depth 0, whatever blocks their
-/// initializer contains.
-const SEMICOLON_ITEM_KEYWORDS: &[&str] = &["const", "static", "type", "use"];
-/// Qualifiers that turn `const` into `const fn` / `const unsafe fn` / ….
-const FN_QUALIFIERS: &[&str] = &["fn", "unsafe", "extern", "async"];
-
-fn skip_whitespace(chars: &[char], mut j: usize) -> usize {
-    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-        j += 1;
-    }
-    j
-}
-
-/// Index just past the delimiter group (`(…)` or `[…]`) opening at `j`.
-fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
-    let mut depth = 0usize;
-    while let Some(&c) = chars.get(j) {
-        j += 1;
-        if c == open {
-            depth += 1;
-        } else if c == close {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-        }
-    }
-    j
-}
-
-/// `(word, index past it)` for the identifier starting at `j`, if any.
-fn word_at(chars: &[char], j: usize) -> Option<(String, usize)> {
-    let mut k = j;
-    while chars
-        .get(k)
-        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
-    {
-        k += 1;
-    }
-    (k > j).then(|| (chars[j..k].iter().collect(), k))
-}
-
-/// Whether the item introduced after the attribute(s) starting at `j` ends at
-/// a `;` at brace depth 0 rather than at the `}` closing its body. Looks past
-/// further attributes and qualifiers (`pub(crate)`, `unsafe`, …) to the item
-/// keyword; an unrecognized item is treated as body-terminated.
-fn cfg_test_item_ends_at_semicolon(chars: &[char], mut j: usize) -> bool {
-    loop {
-        j = skip_whitespace(chars, j);
-        match chars.get(j) {
-            Some('#') => {
-                j += 1;
-                if chars.get(j) == Some(&'!') {
-                    j += 1;
-                }
-                j = skip_group(chars, j, '[', ']');
-            }
-            Some('(') => j = skip_group(chars, j, '(', ')'),
-            Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
-                let (word, next) = word_at(chars, j).expect("identifier start");
-                j = next;
-                if BODY_ITEM_KEYWORDS.contains(&word.as_str()) {
-                    return false;
-                }
-                if word == "const" {
-                    let after = skip_whitespace(chars, j);
-                    return !word_at(chars, after)
-                        .is_some_and(|(w, _)| FN_QUALIFIERS.contains(&w.as_str()));
-                }
-                if SEMICOLON_ITEM_KEYWORDS.contains(&word.as_str()) {
-                    return true;
-                }
-            }
-            _ => return false,
-        }
-    }
-}
-
-/// Char ranges `[start, end)` of every `#[cfg(test)]` attribute together
-/// with the whole item that follows it (see the module doc for where each
-/// kind of item ends). Depth counts `(…)` and `[…]` as well as `{…}`, so a
-/// `;` inside an array type (`[&str; 1]`) or a parameter list never ends
-/// the item. Runs on already-blanked text, so the attribute cannot hide
-/// inside a string or comment.
-fn cfg_test_item_ranges(chars: &[char]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if !starts_with_cfg_test(chars, i) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        let ends_at_semicolon = cfg_test_item_ends_at_semicolon(chars, i);
-        let mut depth = 0usize;
-        while i < chars.len() {
-            let c = chars[i];
-            i += 1;
-            match c {
-                '{' | '(' | '[' => depth += 1,
-                ')' | ']' => depth = depth.saturating_sub(1),
-                '}' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 && !ends_at_semicolon {
-                        break;
-                    }
-                }
-                ';' if depth == 0 => break,
-                _ => {}
-            }
-        }
-        out.push((start, i));
-    }
-    out
-}
-
-/// Blanks every `#[cfg(test)]` item range of `text` (newlines preserved).
-fn blank_cfg_test_items(text: &str) -> String {
-    let mut chars: Vec<char> = text.chars().collect();
-    for (start, end) in cfg_test_item_ranges(&chars) {
-        for c in &mut chars[start..end] {
-            if *c != '\n' {
-                *c = ' ';
-            }
-        }
-    }
-    chars.into_iter().collect()
-}
-
-/// 1-based line of the first non-whitespace character of the statement (text
-/// back to the previous `;` / `{` / `}`) containing the char at `offset` of
-/// the blanked source; `offset` itself when nothing precedes it there.
-fn statement_line(chars: &[char], offset: usize) -> usize {
-    let boundary = chars[..offset]
-        .iter()
-        .rposition(|c| matches!(c, ';' | '{' | '}'))
-        .map_or(0, |b| b + 1);
-    let start = skip_whitespace(chars, boundary).min(offset);
-    chars[..start].iter().filter(|c| **c == '\n').count() + 1
-}
-
-struct Statement {
-    line: usize,
-    text: String,
-}
-
-/// Whether the `}` just before `j` is followed by `.`, `?`, or `else`, i.e.
-/// the block is an operand and the enclosing statement continues after it.
-fn block_is_operand(chars: &[char], j: usize) -> bool {
-    let j = skip_whitespace(chars, j);
-    match chars.get(j) {
-        Some('.' | '?') => true,
-        Some(_) => word_at(chars, j).is_some_and(|(w, _)| w == "else"),
-        None => false,
-    }
-}
-
-/// Splits blanked source at `;` / `{` / `}`; each statement records the line
-/// of its first non-whitespace character. The text before a `{` is held back
-/// until the matching `}`: when that `}` is followed by `.`, `?`, or `else`
-/// the held text resumes as the current statement (so an operand block chains
-/// with what surrounds it), otherwise it is emitted as it stood. A chained
-/// statement keeps one newline per source line the block body spanned, so
-/// `tokenize` still reports source lines for the text after the block.
-/// Statements come back in source order.
-fn split_statements(text: &str) -> Vec<Statement> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = Vec::new();
-    let mut line = 1usize;
-    let mut current = String::new();
-    let mut start_line: Option<usize> = None;
-    let mut held: Vec<(usize, Option<Statement>)> = Vec::new();
-    let take = |current: &mut String, start_line: &mut Option<usize>| {
-        let text = std::mem::take(current);
-        start_line.take().map(|line| Statement { line, text })
-    };
-    for (i, &c) in chars.iter().enumerate() {
-        match c {
-            ';' => out.extend(take(&mut current, &mut start_line)),
-            '{' => held.push((line, take(&mut current, &mut start_line))),
-            '}' => {
-                out.extend(take(&mut current, &mut start_line));
-                if let Some((open_line, Some(prefix))) = held.pop() {
-                    if block_is_operand(&chars, i + 1) {
-                        current = prefix.text;
-                        current.push(' ');
-                        current.extend(std::iter::repeat_n('\n', line - open_line));
-                        start_line = Some(prefix.line);
-                    } else {
-                        out.push(prefix);
-                    }
-                }
-            }
-            '\n' => {
-                line += 1;
-                current.push(c);
-            }
-            _ => {
-                if !c.is_whitespace() && start_line.is_none() {
-                    start_line = Some(line);
-                }
-                current.push(c);
-            }
-        }
-    }
-    out.extend(take(&mut current, &mut start_line));
-    out.extend(held.into_iter().filter_map(|(_, s)| s));
-    out.sort_by_key(|s| s.line);
-    out
 }
 
 /// The tokens an or-group is made of. Everything that is neither a path, a
@@ -816,7 +291,7 @@ fn excerpt(text: &str) -> String {
 /// the line above the group or above its statement.
 fn scan_source(src: &str) -> Vec<Hit> {
     let lexed = lex(src);
-    let markers = markers_by_line(src, &lexed.line_comments);
+    let markers = markers_by_line(src, &lexed.line_comments, OPT_OUT_TAG);
     let blanked = blank_cfg_test_items(&lexed.blanked);
     let marker_at = |line: usize| markers.get(line - 1).copied().unwrap_or(Marker::Absent);
     let mut hits = Vec::new();
@@ -856,7 +331,7 @@ fn sql_fingerprint_line(text: &str) -> (usize, &str) {
 /// suppressed by a reasoned opt-out marker above the literal or its statement.
 fn scan_sql_literals(src: &str) -> Vec<Hit> {
     let lexed = lex(src);
-    let markers = markers_by_line(src, &lexed.line_comments);
+    let markers = markers_by_line(src, &lexed.line_comments, OPT_OUT_TAG);
     let blanked: Vec<char> = lexed.blanked.chars().collect();
     let test_ranges = cfg_test_item_ranges(&blanked);
     let marker_at = |line: usize| markers.get(line - 1).copied().unwrap_or(Marker::Absent);
@@ -891,23 +366,6 @@ fn scan_sql_literals(src: &str) -> Vec<Hit> {
     hits
 }
 
-/// Every `*.rs` under `dir`, skipping `tests/` directories and `tests.rs`.
-fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
-    for entry in entries {
-        let entry = entry.unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
-        let path = entry.path();
-        let name = entry.file_name();
-        if path.is_dir() {
-            if name != "tests" {
-                collect_rust_sources(&path, out);
-            }
-        } else if path.extension().is_some_and(|ext| ext == "rs") && name != "tests.rs" {
-            out.push(path);
-        }
-    }
-}
-
 fn is_exempt(rel: &Path) -> bool {
     let parts: Vec<_> = rel.components().map(Component::as_os_str).collect();
     parts.len() == EXEMPT_FILE.len()
@@ -926,7 +384,7 @@ fn display_rel(rel: &Path) -> String {
 
 #[test]
 fn running_turn_rule_is_only_spelled_in_agent_status() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = workspace_root();
     let exempt: PathBuf = EXEMPT_FILE.iter().collect();
     let exempt_src = fs::read_to_string(root.join(&exempt)).unwrap_or_else(|e| {
         panic!(
@@ -941,21 +399,11 @@ fn running_turn_rule_is_only_spelled_in_agent_status() {
         display_rel(&exempt)
     );
 
-    let mut files = Vec::new();
-    let crates_dir = root.join("crates");
-    let crates = fs::read_dir(&crates_dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()));
-    for entry in crates {
-        let src = entry.expect("crate dir entry").path().join("src");
-        if src.is_dir() {
-            collect_rust_sources(&src, &mut files);
-        }
-    }
-    files.sort();
+    let files = crate_src_files(&root);
     assert!(
         !files.is_empty(),
         "no Rust sources found under {}",
-        crates_dir.display()
+        root.join("crates").display()
     );
 
     let mut report = Vec::new();
@@ -999,9 +447,13 @@ fn running_turn_rule_is_only_spelled_in_agent_status() {
 /// Sorted non-test sources of the SQL rule's scope, `crates/intent-store/src`.
 fn sql_literal_sources(root: &Path) -> Vec<PathBuf> {
     let dir: PathBuf = SQL_LITERAL_DIR.iter().collect();
-    let mut files = Vec::new();
-    collect_rust_sources(&root.join(&dir), &mut files);
-    files.sort();
+    let files: Vec<PathBuf> = crate_src_files(root)
+        .into_iter()
+        .filter(|file| {
+            file.strip_prefix(root)
+                .is_ok_and(|rel| rel.starts_with(&dir))
+        })
+        .collect();
     assert!(
         !files.is_empty(),
         "no Rust sources found under {}; update SQL_LITERAL_DIR",
@@ -1012,7 +464,7 @@ fn sql_literal_sources(root: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn running_turn_sql_list_is_generated_not_spelled_in_store() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = workspace_root();
     let mut report = Vec::new();
     for file in sql_literal_sources(&root) {
         let rel = file
@@ -1355,93 +807,6 @@ fn nested_in_some(s: Option<AgentStatus>) -> bool {
 }
 
 #[test]
-fn cfg_test_item_survives_semicolons_inside_brackets_and_parens() {
-    // A `;` inside an array type or a parameter list is not an item boundary
-    // (PR #2073 review); the production item after each test item is still
-    // scanned, so the range does not over-extend either.
-    let src = r"
-#[cfg(test)]
-fn fixture(status: AgentStatus, _: [u8; 1]) -> bool {
-    matches!(status, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
-}
-
-fn after_fn(s: AgentStatus) -> bool {
-    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
-}
-
-#[cfg(test)]
-const RUNNING: [fn(AgentStatus) -> bool; 1] =
-    [|s| matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)];
-
-fn after_const(s: AgentStatus) -> bool {
-    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
-}
-
-#[cfg(test)]
-static TABLE: [(AgentStatus, bool); 1] = [(AgentStatus::Active, true)];
-
-fn after_static(s: AgentStatus) -> bool {
-    match s {
-        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing => true,
-        _ => false,
-    }
-}
-
-fn with_test_statement(s: AgentStatus) -> bool {
-    #[cfg(test)]
-    let probe: [u8; 1] = [0];
-    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
-}
-";
-    assert_eq!(
-        hit_lines(src),
-        vec![
-            line_of(src, "fn after_fn") + 1,
-            line_of(src, "fn after_const") + 1,
-            line_of(src, "fn after_static") + 2,
-            line_of(src, "fn with_test_statement") + 3,
-        ]
-    );
-}
-
-#[test]
-fn lexer_edge_cases_and_cfg_qualifiers() {
-    let src = r###"
-/* outer /* nested */ AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing */
-fn a(c: char) -> bool {
-    let quote = '\'';
-    let backslash = '\\';
-    let raw = r##"AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing "# still"##;
-    c == quote || c == backslash || raw.is_empty()
-}
-
-#[cfg(all(test, unix))]
-fn qualified(s: AgentStatus) -> bool {
-    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
-}
-
-#[cfg(test)]
-mod tests {
-    const RUNNING: [AgentStatus; 3] = [AgentStatus::Pending, AgentStatus::Active, AgentStatus::Processing];
-    fn helper(s: AgentStatus) -> bool {
-        matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
-    }
-}
-
-fn scanned(s: AgentStatus) -> bool {
-    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
-}
-"###;
-    assert_eq!(
-        hit_lines(src),
-        vec![
-            line_of(src, "fn qualified") + 1,
-            line_of(src, "fn scanned") + 1,
-        ]
-    );
-}
-
-#[test]
 fn reasoned_marker_suppresses_above_group_or_statement() {
     let src = r"
 fn f(s: AgentStatus) -> bool {
@@ -1499,31 +864,6 @@ fn f(s: AgentStatus) -> bool {
             .collect::<Vec<_>>(),
         expect
     );
-}
-
-#[test]
-fn lexer_keeps_string_literal_bodies_with_their_lines() {
-    let src = "let a = \"x'y\\\"z\";\nlet b = r#\"in ('a', 'b')\"#;\nlet c = 'q';\n// tail";
-    let lexed = lex(src);
-    assert_eq!(
-        lexed.literals,
-        vec![
-            Literal {
-                offset: 8,
-                line: 1,
-                text: "x'y\\\"z".into()
-            },
-            Literal {
-                offset: 28,
-                line: 2,
-                text: "in ('a', 'b')".into()
-            },
-        ]
-    );
-    assert_eq!(lexed.line_comments.len(), 1);
-    assert!(lexed.line_comments[0].standalone);
-    assert_eq!(lexed.blanked.lines().count(), src.lines().count());
-    assert!(!lexed.blanked.contains('"') && !lexed.blanked.contains("tail"));
 }
 
 // ---- SQL rule fixtures ------------------------------------------------------
@@ -1713,7 +1053,7 @@ fn f() -> Vec<&'static str> {
 
 #[test]
 fn sql_rule_scope_is_intent_store_non_test_sources() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = workspace_root();
     let dir: PathBuf = SQL_LITERAL_DIR.iter().collect();
     let files = sql_literal_sources(&root);
     for file in &files {
