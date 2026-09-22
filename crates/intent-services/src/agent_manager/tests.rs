@@ -2848,13 +2848,9 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     let ws = WorkspaceId::from("ws-auto-unarchive");
     let id = AgentId::from("a-auto-unarchive");
     seed_agent(&mgr, &ws, &id).await;
-    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
-    row.status = WorkspaceStatus::Archived;
-    row.archived = true;
-    row.archived_at = Some(now_iso());
     mgr.services
         .store
-        .update_workspace(&row)
+        .archive_workspace_detaching_guests(&ws, &now_iso())
         .await
         .expect("archive row");
 
@@ -2978,13 +2974,9 @@ async fn suppressed_reclaim_persists_no_notice() {
     let ws = WorkspaceId::from("ws-suppressed-reclaim");
     let id = AgentId::from("a-suppressed-reclaim");
     seed_agent(&mgr, &ws, &id).await;
-    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
-    row.status = WorkspaceStatus::Archived;
-    row.archived = true;
-    row.archived_at = Some(now_iso());
     mgr.services
         .store
-        .update_workspace(&row)
+        .archive_workspace_detaching_guests(&ws, &now_iso())
         .await
         .expect("archive row");
 
@@ -3028,13 +3020,9 @@ async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
     let ws = WorkspaceId::from("ws-flag-hygiene");
     let id = AgentId::from("a-flag-hygiene");
     seed_agent(&mgr, &ws, &id).await;
-    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
-    row.status = WorkspaceStatus::Archived;
-    row.archived = true;
-    row.archived_at = Some(now_iso());
     mgr.services
         .store
-        .update_workspace(&row)
+        .archive_workspace_detaching_guests(&ws, &now_iso())
         .await
         .expect("archive row");
 
@@ -14524,11 +14512,9 @@ async fn cross_workspace_interrupt_archived_gate_keys_on_target_workspace() {
     // workspace activity, which would auto-unarchive a row archived earlier.
     // Flip the flag on the row directly — `workspace.archive` refuses while
     // an agent is running.
-    let mut row = mgr.services.store.get_workspace(&home_ws).await.unwrap();
-    row.archived = true;
     mgr.services
         .store
-        .update_workspace(&row)
+        .archive_workspace_detaching_guests(&home_ws, &now_iso())
         .await
         .expect("archive the target's home workspace");
 
@@ -20950,13 +20936,9 @@ mod archived_flush_gates {
     }
 
     async fn archive_row(mgr: &AgentManager, ws: &WorkspaceId) {
-        let mut row = mgr.services.store.get_workspace(ws).await.unwrap();
-        row.status = WorkspaceStatus::Archived;
-        row.archived = true;
-        row.archived_at = Some(now_iso());
         mgr.services
             .store
-            .update_workspace(&row)
+            .archive_workspace_detaching_guests(ws, &now_iso())
             .await
             .expect("archive row");
     }
