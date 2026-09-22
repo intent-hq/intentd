@@ -22939,6 +22939,252 @@ pub(crate) mod pr {
         );
     }
 
+    /// The hit projection is atomic with the row (intent-hq/intent#5654,
+    /// intentd#2079 re-verification): a REST refresh commits fresher
+    /// same-head fields (title, `updatedAt`, `mergeableState`) and a second
+    /// pool entry AFTER the fold's referencing-rows lookup but BEFORE its
+    /// write. The projection reads the row at write time, so the fresher
+    /// fields survive, the added entry stays, only `is_in_merge_queue`
+    /// changes, and the linked scalars are never reserialized.
+    #[intent_test_macros::daemon_test]
+    async fn hit_projection_lands_on_a_same_head_refresh_committed_mid_window() {
+        let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let svc = svc.with_fold_hit_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+            let mut fresher = ws.pull_requests.as_ref().unwrap()[0].clone();
+            fresher.title = "renamed by the sweep".into();
+            fresher.updated_at = "2099-01-01T00:00:00Z".into();
+            fresher.mergeable_state = Some("blocked".into());
+            let other = pool_entry(43, intent_core::PullRequestStatus::Open, "");
+            ws.pull_requests = Some(vec![fresher.clone(), other.clone()]);
+            ws.active_pull_request = Some(fresher.clone());
+            svc.store().update_workspace_pr_linkage(&ws).await.unwrap();
+            park.release.notify_one();
+            (fresher, other)
+        };
+        let (outcome, (fresher, other)) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        let mut expected = fresher;
+        expected.is_in_merge_queue = Some(true);
+        assert_eq!(
+            after.pull_requests,
+            Some(vec![expected.clone(), other]),
+            "the refresh's fields and entry survive; only the signal changed"
+        );
+        assert_eq!(after.active_pull_request, Some(expected));
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_url.as_deref(), Some(sample_pr().url.as_str()));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// A REST refresh moves the pooled copy to a newer head inside the hit's
+    /// lookup → write window (intent-hq/intent#5654): the cached signal
+    /// describes the head the pool has left, so the projection — evaluated
+    /// against the row at write time, not the pre-read copy — writes
+    /// nothing: no persist, no `pr:updated`, no displayStatus transition,
+    /// and the refresh's record stands untouched.
+    #[intent_test_macros::daemon_test]
+    async fn hit_projection_writes_nothing_when_the_head_moved_mid_window() {
+        let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let svc = svc.with_fold_hit_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+            let mut moved = ws.pull_requests.as_ref().unwrap()[0].clone();
+            moved.head_sha = Some("moved-past-the-cached-head".into());
+            moved.title = "renamed by the sweep".into();
+            ws.pull_requests = Some(vec![moved.clone()]);
+            ws.active_pull_request = Some(moved);
+            ws.updated_at = "2099-01-01T00:00:00Z".into();
+            svc.store().update_workspace_pr_linkage(&ws).await.unwrap();
+            park.release.notify_one();
+            ws
+        };
+        let (outcome, refreshed) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.updated_at, refreshed.updated_at, "nothing persisted");
+        assert_eq!(after.pull_requests, refreshed.pull_requests);
+        assert_eq!(after.active_pull_request, refreshed.active_pull_request);
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+    }
+
+    /// A pool-only git root whose #42 entry the fold reaches as a hit, with
+    /// the fold parked between its root lookup and its projection.
+    async fn parked_root_hit_setup() -> (
+        TempDb,
+        super::WorkspacesRoot,
+        Services,
+        WorkspaceId,
+        Arc<crate::script_ops::SupervisePark>,
+        SweepRepo,
+    ) {
+        let (t, wsroot, svc, ws_id) = fold_setup_with(queue_signal_forge(true), |_| {}).await;
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let mut root = sweep_root(&ws_id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            42,
+            intent_core::PullRequestStatus::Open,
+            "",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let svc = svc.with_fold_hit_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+        (t, wsroot, svc, ws_id, park, secondary)
+    }
+
+    /// Git-root analogue of the same-head race: the root sweep commits
+    /// fresher fields and a second entry inside the hit's window; the
+    /// projection lands only the signal on the refreshed row and keeps the
+    /// root's linked scalars as they were.
+    #[intent_test_macros::daemon_test]
+    async fn root_hit_projection_lands_on_a_same_head_refresh_committed_mid_window() {
+        let (_t, _root, svc, ws_id, park, _s) = parked_root_hit_setup().await;
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut root = svc
+                .store()
+                .list_workspace_git_roots(&ws_id)
+                .await
+                .unwrap()
+                .remove(0);
+            let mut fresher = root.pull_requests.as_ref().unwrap()[0].clone();
+            fresher.title = "renamed by the sweep".into();
+            fresher.updated_at = "2099-01-01T00:00:00Z".into();
+            fresher.mergeable_state = Some("blocked".into());
+            let other = pool_entry(43, intent_core::PullRequestStatus::Open, "");
+            root.pull_requests = Some(vec![fresher.clone(), other.clone()]);
+            svc.store()
+                .update_workspace_git_root_pr(&root)
+                .await
+                .unwrap();
+            park.release.notify_one();
+            (fresher, other)
+        };
+        let (outcome, (fresher, other)) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+        let mut expected = fresher;
+        expected.is_in_merge_queue = Some(true);
+        assert_eq!(roots[0].pull_requests, Some(vec![expected, other]));
+        assert_eq!(roots[0].pr_number, None, "passive fold never links");
+        assert_eq!(roots[0].pr_status, None);
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "gitRoot:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// Git-root analogue of the moved-head race: the root sweep moves the
+    /// entry to a newer head inside the hit's window, so the projection
+    /// writes nothing and the sweep's record stands.
+    #[intent_test_macros::daemon_test]
+    async fn root_hit_projection_writes_nothing_when_the_head_moved_mid_window() {
+        let (_t, _root, svc, ws_id, park, _s) = parked_root_hit_setup().await;
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut root = svc
+                .store()
+                .list_workspace_git_roots(&ws_id)
+                .await
+                .unwrap()
+                .remove(0);
+            let mut moved = root.pull_requests.as_ref().unwrap()[0].clone();
+            moved.head_sha = Some("moved-past-the-cached-head".into());
+            moved.title = "renamed by the sweep".into();
+            root.pull_requests = Some(vec![moved]);
+            root.updated_at = "2099-01-01T00:00:00Z".into();
+            svc.store()
+                .update_workspace_git_root_pr(&root)
+                .await
+                .unwrap();
+            park.release.notify_one();
+            root
+        };
+        let (outcome, refreshed) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+        assert_eq!(
+            roots[0].updated_at, refreshed.updated_at,
+            "nothing persisted"
+        );
+        assert_eq!(roots[0].pull_requests, refreshed.pull_requests);
+        assert_eq!(
+            roots[0].pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "gitRoot:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+    }
+
     /// Unlinking on a branch mismatch still refreshes an existing pool entry
     /// for that PR in place — the fetched snapshot is authoritative and
     /// already paid for — without the heal re-fetching it this pass.

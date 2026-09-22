@@ -303,6 +303,98 @@ impl Store {
         .await
     }
 
+    /// Project onto a workspace's persisted PR snapshots atomically
+    /// (intent-hq/intent#5654, the cache-hit fold): inside ONE
+    /// `BEGIN IMMEDIATE` write-pool transaction, read the stored
+    /// `pull_requests` and `active_pull_request`, hand both to the caller's
+    /// synchronous `project` closure, and — when it returns `true` — write
+    /// back ONLY those two columns plus `updated_at`. The closure never
+    /// sees a pre-read entity, so a REST refresh that committed between
+    /// the caller's row lookup and this write is what gets projected onto,
+    /// never rolled back; the linked scalars (`pr_number`, `pr_url`,
+    /// `pr_status`) are untouched. Returns the written pair on a committed
+    /// write, `None` when the closure declined. `NotFound` when the
+    /// workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails or a stored snapshot is malformed.
+    pub async fn project_workspace_pr_snapshots<F>(
+        &self,
+        id: &WorkspaceId,
+        updated_at: &str,
+        project: F,
+    ) -> Result<Option<(Option<Vec<PullRequestInfo>>, Option<PullRequestInfo>)>>
+    where
+        F: FnOnce(&mut Option<Vec<PullRequestInfo>>, &mut Option<PullRequestInfo>) -> bool,
+    {
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "project workspace pr snapshots acquire failed: {e}"
+            ))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("project workspace pr snapshots begin failed: {e}"))
+            })?;
+
+        let body_result = async {
+            let row = sqlx::query(
+                "SELECT pull_requests, active_pull_request FROM workspace WHERE id = ?",
+            )
+            .bind(&id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("project workspace pr snapshots read failed: {e}"))
+            })?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            };
+            let mut pool = pull_requests_from_db(row.get::<Option<String>, _>("pull_requests"))?;
+            let mut active =
+                active_pr_from_db(row.get::<Option<String>, _>("active_pull_request"))?;
+            if !project(&mut pool, &mut active) {
+                return Ok(None);
+            }
+            let pool_json = pool
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| Error::Internal(format!("encode pull_requests failed: {e}")))?;
+            let active_json = active
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| Error::Internal(format!("encode active_pull_request failed: {e}")))?;
+            let res = sqlx::query(
+                "UPDATE workspace SET pull_requests=?, active_pull_request=?, updated_at=? \
+                 WHERE id=?",
+            )
+            .bind(pool_json)
+            .bind(active_json)
+            .bind(updated_at)
+            .bind(&id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("project workspace pr snapshots failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            }
+            Ok(Some((pool, active)))
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "project workspace pr snapshots commit failed",
+        )
+        .await
+    }
+
     /// Recompute-and-store a workspace's `token_usage` snapshot atomically
     /// (§5.23, monorepo#738): inside ONE write-pool transaction, read the
     /// per-session usage rows and the stored workspace `token_usage`, invoke

@@ -775,6 +775,13 @@ pub struct Services {
     /// wiring; tests inject via the `#[cfg(test)]`-only
     /// `with_unread_settle_entry_park`.
     unread_settle_entry_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intent-hq/intent#5654) for the cache-hit fold's
+    /// row lookup → projection window: parks `fold_served_pr` per hit row
+    /// after the referencing-rows read, before the atomic signal
+    /// projection, so a REST refresh committing in between is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_fold_hit_park`.
+    fold_hit_park: Option<Arc<script_ops::SupervisePark>>,
     /// Test park seam (intent-hq/monorepo#2739) for the
     /// `deliver_wake_message` archived-gate read → enqueue window: parks the
     /// wake delivery after the gate observed the workspace archived and
@@ -1373,6 +1380,7 @@ impl Services {
             completion_flip_take_park: None,
             attention_write_park: None,
             unread_settle_entry_park: None,
+            fold_hit_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
             archive_fence: Arc::new(ArchiveFence::default()),
@@ -2186,6 +2194,16 @@ impl Services {
         self
     }
 
+    /// Test seam (intent-hq/intent#5654): park the cache-hit fold per
+    /// referencing row between its row lookup and the atomic queue-signal
+    /// projection, so a REST refresh committing inside that window is
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_fold_hit_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
+        self.fold_hit_park = Some(park);
+        self
+    }
+
     /// Test seam (intent-hq/monorepo#2739): park `deliver_wake_message` in
     /// its archived-gate read → enqueue window so a concurrent
     /// `workspace.unarchive` inside that window is deterministic. Production
@@ -2295,6 +2313,15 @@ impl Services {
     /// (no-op in production wiring).
     async fn park_unread_settle_entry(&self) {
         if let Some(park) = &self.unread_settle_entry_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+    }
+
+    /// Park a cache-hit fold row before its projection when the test seam
+    /// is armed (no-op in production wiring).
+    async fn park_fold_hit(&self) {
+        if let Some(park) = &self.fold_hit_park {
             park.entered.notify_one();
             park.release.notified().await;
         }
@@ -5451,7 +5478,15 @@ impl Services {
     /// (`ws.pr.snapshot`, a monitor poll) carried into the cache lands on
     /// the next hover instead of being skipped as a hit, while the older
     /// cached REST fields never roll back a sweep that ran since the fill,
-    /// and a hit that agrees with the pool writes nothing.
+    /// and a hit that agrees with the pool writes nothing. The projection
+    /// runs against the row as persisted at write time
+    /// (`Store::project_workspace_pr_snapshots` /
+    /// `project_workspace_git_root_pull_requests`, one `BEGIN IMMEDIATE`
+    /// each), never against the copies the referencing-rows lookup
+    /// returned: a REST refresh committing a newer head or fresher fields
+    /// between that lookup and the write is what the signal is projected
+    /// onto (or, on a moved head, what is left alone), not what is
+    /// overwritten.
     pub(crate) async fn fold_served_pr(
         &self,
         repo_ref: &intent_sourcecontrol::RepoRef,
@@ -5465,8 +5500,9 @@ impl Services {
             .list_workspaces_referencing_pr_url(&pr.url)
             .await?;
         for mut ws in workspaces {
-            let linked = ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
-            let changed = if fetched {
+            let persisted = if fetched {
+                let linked =
+                    ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
                 let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
                 if linked
                     && (ws.pr_status != Some(info.status)
@@ -5478,25 +5514,39 @@ impl Services {
                     ws.active_pull_request = Some(info.clone());
                     changed = true;
                 }
-                changed
-            } else {
-                let mut changed = pr_ops::project_pool_queue_signal(&mut ws.pull_requests, &info);
-                if linked {
-                    if let Some(active) = ws
-                        .active_pull_request
-                        .as_mut()
-                        .filter(|active| pr_ops::same_pr_url(&active.url, &info.url))
-                    {
-                        changed |= pr_ops::project_served_queue_signal(active, &info);
-                    }
+                if !changed {
+                    continue;
                 }
-                changed
+                ws.updated_at = now_iso();
+                self.store.update_workspace_pr_linkage(&ws).await
+            } else {
+                self.park_fold_hit().await;
+                let updated_at = now_iso();
+                match self
+                    .store
+                    .project_workspace_pr_snapshots(&ws.id, &updated_at, |pool, active| {
+                        let mut changed = pr_ops::project_pool_queue_signal(pool, &info);
+                        if let Some(active) = active
+                            .as_mut()
+                            .filter(|active| pr_ops::same_pr_url(&active.url, &info.url))
+                        {
+                            changed |= pr_ops::project_served_queue_signal(active, &info);
+                        }
+                        changed
+                    })
+                    .await
+                {
+                    Ok(None) => continue,
+                    Ok(Some((pool, active))) => {
+                        ws.pull_requests = pool;
+                        ws.active_pull_request = active;
+                        ws.updated_at = updated_at;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
             };
-            if !changed {
-                continue;
-            }
-            ws.updated_at = now_iso();
-            if let Err(e) = self.store.update_workspace_pr_linkage(&ws).await {
+            if let Err(e) = persisted {
                 tracing::warn!(
                     workspace_id = %ws.id.as_str(),
                     error = %e,
@@ -5512,10 +5562,10 @@ impl Services {
             .list_workspace_git_roots_referencing_pr_url(&pr.url)
             .await?;
         for mut root in roots {
-            let linked =
-                root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
-            let changed =
+            let persisted =
                 if fetched {
+                    let linked =
+                        root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
                     let mut changed = false;
                     if root.pull_requests.as_deref().is_some_and(|items| {
                         items.iter().any(|p| pr_ops::same_pr_url(&p.url, &pr.url))
@@ -5530,15 +5580,31 @@ impl Services {
                         root.pr_url = Some(pr.url.clone());
                         changed = true;
                     }
-                    changed
+                    if !changed {
+                        continue;
+                    }
+                    root.updated_at = now_iso();
+                    self.store.update_workspace_git_root_pr(&root).await
                 } else {
-                    pr_ops::project_pool_queue_signal(&mut root.pull_requests, &info)
+                    self.park_fold_hit().await;
+                    let updated_at = now_iso();
+                    match self
+                        .store
+                        .project_workspace_git_root_pull_requests(&root.id, &updated_at, |pool| {
+                            pr_ops::project_pool_queue_signal(pool, &info)
+                        })
+                        .await
+                    {
+                        Ok(None) => continue,
+                        Ok(Some(pool)) => {
+                            root.pull_requests = pool;
+                            root.updated_at = updated_at;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
                 };
-            if !changed {
-                continue;
-            }
-            root.updated_at = now_iso();
-            if let Err(e) = self.store.update_workspace_git_root_pr(&root).await {
+            if let Err(e) = persisted {
                 tracing::warn!(
                     git_root = %root.id.as_str(),
                     error = %e,

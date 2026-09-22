@@ -451,6 +451,79 @@ impl Store {
         .await
     }
 
+    /// Project onto a git root's persisted `pull_requests` atomically — the
+    /// git-root sibling of [`Store::project_workspace_pr_snapshots`]
+    /// (intent-hq/intent#5654, the cache-hit fold): inside ONE
+    /// `BEGIN IMMEDIATE` write-pool transaction, read the stored pool, hand
+    /// it to the caller's synchronous `project` closure, and — when it
+    /// returns `true` — write back ONLY `pull_requests` plus `updated_at`;
+    /// the linked scalars are untouched and no pre-read entity is ever
+    /// reserialized. Returns the written pool on a committed write, `None`
+    /// when the closure declined. `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails or the stored pool is malformed.
+    pub async fn project_workspace_git_root_pull_requests<F>(
+        &self,
+        id: &WorkspaceGitRootId,
+        updated_at: &str,
+        project: F,
+    ) -> Result<Option<Option<Vec<PullRequestInfo>>>>
+    where
+        F: FnOnce(&mut Option<Vec<PullRequestInfo>>) -> bool,
+    {
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "project workspace git root pool acquire failed: {e}"
+            ))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("project workspace git root pool begin failed: {e}"))
+            })?;
+
+        let body_result = async {
+            let row = sqlx::query("SELECT pull_requests FROM workspace_git_root WHERE id = ?")
+                .bind(&id.0)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("project workspace git root pool read failed: {e}"))
+                })?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace git root {id}")));
+            };
+            let mut pool = pull_requests_from_db(row.get::<Option<String>, _>("pull_requests"))?;
+            if !project(&mut pool) {
+                return Ok(None);
+            }
+            let res = sqlx::query(
+                "UPDATE workspace_git_root SET pull_requests = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(pull_requests_to_db(pool.as_ref())?)
+            .bind(updated_at)
+            .bind(&id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("project workspace git root pool failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace git root {id}")));
+            }
+            Ok(Some(pool))
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "project workspace git root pool commit failed",
+        )
+        .await
+    }
+
     /// Stamp a git root's `registered_commit_sha` ONLY when it is currently
     /// NULL — the best-effort backfill the background sweep runs on rows that
     /// predate the column (or whose HEAD was unreadable at registration). The
