@@ -30514,10 +30514,9 @@ impl WorkspaceApi for Services {
     }
 
     fn github_get_user(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
         Box::pin(async move {
             Self::require_administrator("github.getUser")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = self.identity_source_control().await?;
             let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
         })
