@@ -1188,7 +1188,11 @@ async fn await_queue_snapshots(
 ///    its author`), the guest's `agent.editQueuedMessage` and
 ///    `agent.removeQueuedMessage` of the owner's entry (`queued message not
 ///    found` — an invisible entry reads as absent). Both queues are
-///    unchanged afterwards.
+///    unchanged afterwards. Administrator override: the guest queues a
+///    scratch entry, the owner's `agent.removeQueuedMessage` of it succeeds
+///    (`{ success: true }`) and BOTH views return to exactly their previous
+///    two-entry / one-entry state (the removal snapshots are consumed on
+///    both subscriptions).
 /// 4. Flush intact: the drain publishes ONE empty snapshot to each
 ///    subscriber (2 → 0 for the owner, 1 → 0 projected for the guest),
 ///    exactly ONE `agent:queue:processing` fires (same `turnId` on both
@@ -1456,6 +1460,104 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
     assert_eq!(
         guest_after["queue"], guest_view["queue"],
         "refused edits/removes leave the guest's view untouched"
+    );
+
+    // (3b) Administrator override: the owner CAN remove a guest-authored
+    // entry. The guest queues a scratch entry, the owner removes it, and
+    // both views return to exactly their previous state — the removal's
+    // snapshots are consumed here so (4) still sees only the drain's.
+    let scratch_q = wss_rpc(
+        &mut guest_rpc,
+        105,
+        "agent.queueMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "guest scratch" }),
+    )
+    .await;
+    assert_eq!(
+        scratch_q["success"], true,
+        "guest scratch queue: {scratch_q}"
+    );
+    let scratch_id = scratch_q["queuedMessage"]["id"]
+        .as_str()
+        .expect("scratch entry id")
+        .to_string();
+    let owner_grown = await_queue_snapshots(&mut owner_sub, &agent_id, |q| {
+        queue_ids(q) == [owner_id.clone(), guest_id.clone(), scratch_id.clone()]
+    })
+    .await;
+    assert_eq!(
+        owner_grown.len(),
+        1,
+        "one enqueue snapshot: {owner_grown:?}"
+    );
+    let guest_grown = await_queue_snapshots(&mut guest_sub, &agent_id, |q| {
+        queue_ids(q) == [guest_id.clone(), scratch_id.clone()]
+    })
+    .await;
+    assert_eq!(
+        guest_grown.len(),
+        1,
+        "one projected enqueue snapshot: {guest_grown:?}"
+    );
+    assert_eq!(
+        guest_grown[0][1]["position"],
+        json!(2),
+        "scratch keeps its full-queue position in the projection: {guest_grown:?}"
+    );
+
+    let owner_remove = wss_rpc_envelope(
+        &mut rpc,
+        16,
+        "agent.removeQueuedMessage",
+        json!({ "agentId": agent_id, "messageId": scratch_id }),
+    )
+    .await;
+    assert!(owner_remove.get("error").is_none(), "{owner_remove}");
+    assert_eq!(
+        owner_remove["result"],
+        json!({ "success": true }),
+        "the administrator removes the guest's entry: {owner_remove}"
+    );
+    let owner_shrunk = await_queue_snapshots(&mut owner_sub, &agent_id, |q| {
+        queue_ids(q) == [owner_id.clone(), guest_id.clone()]
+    })
+    .await;
+    assert_eq!(
+        owner_shrunk.len(),
+        1,
+        "one removal snapshot: {owner_shrunk:?}"
+    );
+    let guest_shrunk = await_queue_snapshots(&mut guest_sub, &agent_id, |q| {
+        queue_ids(q) == [guest_id.clone()]
+    })
+    .await;
+    assert_eq!(
+        guest_shrunk.len(),
+        1,
+        "one projected removal snapshot: {guest_shrunk:?}"
+    );
+
+    let owner_restored = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        owner_restored["queue"], owner_view["queue"],
+        "only the scratch entry is gone; the owner's view is exactly as before"
+    );
+    let guest_restored = wss_rpc(
+        &mut guest_rpc,
+        106,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        guest_restored["queue"], guest_view["queue"],
+        "the guest's own surviving entry is untouched"
     );
 
     // (4) Flush intact — observed on both subscriptions: kick-off
