@@ -4994,8 +4994,9 @@ async fn github_auth_status_connect_revoke_get_user_route_without_params() {
 }
 
 /// `github.cancelAuth` takes an optional string `flowId`: the connect-issued
-/// id is forwarded verbatim (the stub cancels only its own "7"), and any
-/// other JSON type is `-32602` rather than silently widening the cancel.
+/// id is forwarded verbatim (the stub cancels only its own "7"); only an
+/// OMITTED key is the unscoped cancel, and any present non-string — an
+/// explicit `null` included — is `-32602` rather than silently widening it.
 #[tokio::test]
 async fn github_cancel_auth_forwards_flow_id_and_rejects_non_string() {
     let own =
@@ -5011,13 +5012,12 @@ async fn github_cancel_auth_forwards_flow_id_and_rejects_non_string() {
     assert_eq!(other["result"]["ok"], serde_json::json!(true));
     assert_eq!(other["result"]["cancelled"], serde_json::json!(false));
 
-    let null =
-        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{"flowId":null}}"#)
-            .await
-            .unwrap();
-    assert_eq!(null["result"]["cancelled"], serde_json::json!(true));
+    let omitted = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(omitted["result"]["cancelled"], serde_json::json!(true));
 
-    for bad in ["7", "true", "{}", r#"["7"]"#] {
+    for bad in ["null", "7", "true", "{}", r#"["7"]"#] {
         let v = call(&format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{{"flowId":{bad}}}}}"#
         ))

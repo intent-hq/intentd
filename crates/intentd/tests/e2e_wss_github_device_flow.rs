@@ -610,13 +610,24 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
     let v = wss_rpc(&mut rpc, 12, "github.authStatus", json!({})).await;
     assert_eq!(v["result"]["deviceFlow"]["status"], json!("pending"));
 
-    // A non-string flowId is invalid params, never a widened cancel.
+    // A present non-string flowId — an explicit null included — is invalid
+    // params, never a widened cancel: the flow is still pending afterwards.
     let v = wss_rpc(&mut rpc, 13, "github.cancelAuth", json!({ "flowId": 7 })).await;
     assert_eq!(v["error"]["code"], json!(-32602));
-
     let v = wss_rpc(
         &mut rpc,
         14,
+        "github.cancelAuth",
+        json!({ "flowId": Value::Null }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602));
+    let v = wss_rpc(&mut rpc, 15, "github.authStatus", json!({})).await;
+    assert_eq!(v["result"]["deviceFlow"]["status"], json!("pending"));
+
+    let v = wss_rpc(
+        &mut rpc,
+        16,
         "github.cancelAuth",
         json!({ "flowId": flow_id }),
     )
@@ -624,7 +635,7 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
     assert_eq!(v["result"]["ok"], json!(true));
     assert_eq!(v["result"]["cancelled"], json!(true));
 
-    let v = wss_rpc(&mut rpc, 15, "github.authStatus", json!({})).await;
+    let v = wss_rpc(&mut rpc, 17, "github.authStatus", json!({})).await;
     assert_eq!(v["result"]["deviceFlow"], Value::Null);
 
     // Authorize AFTER the cancel: the aborted poll task must never mint the
