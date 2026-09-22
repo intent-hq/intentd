@@ -177,19 +177,33 @@ pub(crate) fn scope_counts_sql() -> &'static str {
 /// grouped statement over the workspace's non-retired delegated rows (the
 /// `delegated` predicate of [`scope_predicate`]) yielding `delegatedCounts`
 /// (§5.5): one row per direct parent with the child count and the subset
-/// whose persisted status is running. The running set is the daemon's
-/// `is_running_turn` rule — `pending` / `active` / legacy capitalized
-/// `Processing` (the serde names of `AgentStatus`, which is how the column is
-/// written). Same `idx_agent_workspace` search as [`scope_counts_sql`], so
-/// `SUM(total)` over the result always equals `scopeCounts.delegated`.
-pub(crate) fn delegated_counts_sql() -> &'static str {
-    "SELECT \
-        parent_agent_id, \
-        COUNT(*) AS total, \
-        COALESCE(SUM(status IN ('pending', 'active', 'Processing')), 0) AS running \
-     FROM agent_session \
-     WHERE workspace_id = ? AND retired_at IS NULL AND parent_agent_id IS NOT NULL \
-     GROUP BY parent_agent_id"
+/// whose persisted status is running. The running set is derived from
+/// [`AgentStatus::is_running_turn`] over [`AgentStatus::ALL`] (the serde
+/// names, which is how the column is written), so the aggregate cannot
+/// drift from the daemon's rule. Same `idx_agent_workspace` search as
+/// [`scope_counts_sql`], so `SUM(total)` over the result always equals
+/// `scopeCounts.delegated`.
+pub(crate) fn delegated_counts_sql() -> String {
+    let running = AgentStatus::ALL
+        .iter()
+        .filter(|s| s.is_running_turn())
+        .map(|s| {
+            format!(
+                "'{}'",
+                enum_to_db(s).expect("AgentStatus encodes as a string")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT \
+            parent_agent_id, \
+            COUNT(*) AS total, \
+            COALESCE(SUM(status IN ({running})), 0) AS running \
+         FROM agent_session \
+         WHERE workspace_id = ? AND retired_at IS NULL AND parent_agent_id IS NOT NULL \
+         GROUP BY parent_agent_id"
+    )
 }
 
 /// SQL predicate selecting an **unread top-level session** row (§5.1): a
@@ -1069,6 +1083,43 @@ impl Store {
         }
     }
 
+    /// Batched `updated_at` projection: the timestamp of every id in `ids`
+    /// in ONE `IN`-list statement (the `agent.listActive` busy-set read —
+    /// intent-hq/intent#5626). Replaces a per-agent
+    /// [`Self::get_agent_session_updated_at`] loop so the caller stays at a
+    /// fixed statement count regardless of how many agents are busy. Ids
+    /// without a session row are simply absent from the map (the caller's
+    /// missing-row skip); an empty `ids` issues no statement. The id list is
+    /// chunked well under `SQLite`'s 32766 bind-variable cap (same defense as
+    /// [`Self::get_agent_statuses`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_agent_session_updated_at_batch(
+        &self,
+        ids: &[AgentId],
+    ) -> Result<std::collections::HashMap<AgentId, String>> {
+        const IDS_PER_STATEMENT: usize = 32_000;
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(IDS_PER_STATEMENT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql =
+                format!("SELECT id, updated_at FROM agent_session WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(&id.0);
+            }
+            let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+                Error::Internal(format!("get agent session updated_at batch failed: {e}"))
+            })?;
+            for row in &rows {
+                out.insert(AgentId(row.get::<String, _>("id")), row.get("updated_at"));
+            }
+        }
+        Ok(out)
+    }
+
     /// Lightweight name-only lookup used by hot paths that just need the
     /// session's display name (e.g. note-version author stamping). Skips the
     /// full message-log fetch that `get_agent_session` performs.
@@ -1319,7 +1370,8 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<AgentDelegatedCounts> {
-        let rows = sqlx::query(delegated_counts_sql())
+        let sql = delegated_counts_sql();
+        let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -5580,11 +5632,7 @@ mod tests {
         ];
         let mut statements: Vec<(String, String, Option<String>)> = vec![
             ("counts".to_string(), scope_counts_sql().to_string(), None),
-            (
-                "delegatedCounts".to_string(),
-                delegated_counts_sql().to_string(),
-                None,
-            ),
+            ("delegatedCounts".to_string(), delegated_counts_sql(), None),
         ];
         for scope in &scopes {
             let (predicate, bind) = scope_predicate(scope);
@@ -5623,6 +5671,18 @@ mod tests {
                 "{label} must not scan agent_session, plan: {details:?}"
             );
         }
+    }
+
+    /// The `delegatedCounts.running` predicate is generated from
+    /// `AgentStatus::is_running_turn`, so the emitted SQL carries exactly the
+    /// golden running set as persisted serde names.
+    #[test]
+    fn delegated_counts_sql_running_set_matches_core_rule() {
+        assert!(
+            delegated_counts_sql().contains("status IN ('pending', 'active', 'Processing')"),
+            "sql: {}",
+            delegated_counts_sql()
+        );
     }
 
     /// The grouped `delegatedCounts` aggregate (§5.5): one entry per DIRECT
@@ -11666,6 +11726,66 @@ mod tests {
             .get_agent_statuses(&[])
             .await
             .expect("empty id list")
+            .is_empty());
+    }
+
+    /// `get_agent_session_updated_at_batch` returns the `updated_at` of every
+    /// requested id that has a session row in one batched query, omits ids
+    /// without a row, and issues no statement for an empty id list
+    /// (intent-hq/intent#5626 — the `agent.listActive` busy-set read).
+    #[tokio::test]
+    async fn get_agent_session_updated_at_batch_returns_present_ids_only() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-updated-at-batch".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let first = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let second = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&first, &ws_id, &ts, None))
+            .await
+            .expect("insert first session");
+        store
+            .insert_agent_session(&baseline_test_session(&second, &ws_id, &ts, None))
+            .await
+            .expect("insert second session");
+        let first_updated_at = store
+            .get_agent_session_updated_at(&first)
+            .await
+            .expect("first updated_at");
+        let second_updated_at = store
+            .get_agent_session_updated_at(&second)
+            .await
+            .expect("second updated_at");
+
+        let missing = AgentId("agent-missing".to_string());
+        let batch = store
+            .get_agent_session_updated_at_batch(&[first.clone(), missing.clone(), second.clone()])
+            .await
+            .expect("batched updated_at");
+        assert_eq!(
+            batch.len(),
+            2,
+            "missing id is absent, not an error: {batch:?}"
+        );
+        assert_eq!(batch.get(&first), Some(&first_updated_at));
+        assert_eq!(batch.get(&second), Some(&second_updated_at));
+        assert!(!batch.contains_key(&missing));
+
+        // An empty id list must not touch the pool at all: with the pools
+        // closed any statement would fail, so `Ok(empty)` proves none ran.
+        store.close().await;
+        assert!(store
+            .get_agent_session_updated_at_batch(&[])
+            .await
+            .expect("empty id list issues no statement")
             .is_empty());
     }
 

@@ -181,9 +181,13 @@ mod collaborator_fan_out {
     use std::time::Duration;
 
     use futures::future::BoxFuture;
-    use intent_core::events::{CLIENT_CONNECTED, NOTE_UPDATED, TERMINAL_DATA, WORKSPACE_UPDATED};
+    use intent_core::events::{
+        AGENT_QUEUE_PROCESSING, AGENT_QUEUE_UPDATED, CLIENT_CONNECTED, NOTE_UPDATED, TERMINAL_DATA,
+        WORKSPACE_UPDATED,
+    };
     use intent_core::{
-        ActorType, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi, WorkspaceId,
+        ActorType, AgentId, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi,
+        WorkspaceId, FROM_PRINCIPAL_ID_KEY, QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY,
     };
     use intent_services::EventBus;
     use intent_store::{NewEvent, Store};
@@ -536,6 +540,200 @@ mod collaborator_fan_out {
                 NOTE_UPDATED.to_string()
             ]
         );
+    }
+
+    /// A mixed-author `agent:queue:updated` payload as the publisher emits
+    /// it (`author` attached; a `null` author for an agent-sent entry whose
+    /// `messageMetadata` names the agent, no `author` key and no metadata
+    /// for a legacy human entry the workspace could not attribute).
+    fn mixed_queue(own: &PrincipalId) -> Value {
+        json!([
+            { "id": "m-own", "content": "mine", "position": 0,
+              "author": { "principalId": own.as_str(), "login": "me" } },
+            { "id": "m-other", "content": "theirs", "position": 1,
+              "author": { "principalId": "p-other", "login": "them" } },
+            { "id": "m-agent", "content": "agent", "position": 2, "author": null,
+              "messageMetadata": { "type": "agent_message", "fromAgentId": "agent-9" } },
+            { "id": "m-legacy", "content": "legacy", "position": 3 },
+        ])
+    }
+
+    /// Subscribe to `agent:queue:updated` under `caller`, publish one
+    /// mixed-author queue event on `ws-1`, and return the `data` of every
+    /// delivered frame.
+    async fn queue_frames_for(caller: Caller, own: &PrincipalId) -> Vec<Value> {
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            json!({"eventTypes":[AGENT_QUEUE_UPDATED]}),
+        )
+        .await;
+        h.bus
+            .publish(&event_with(
+                AGENT_QUEUE_UPDATED,
+                "ws-1",
+                json!({ "agentId": "agent-1", "queue": mixed_queue(own) }),
+            ))
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), h.rx.bulk.recv()).await
+        {
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["params"]["event"]["type"], AGENT_QUEUE_UPDATED);
+            out.push(v["params"]["event"]["data"].clone());
+        }
+        drop(h.subs);
+        out
+    }
+
+    fn queue_ids(data: &Value) -> Vec<&str> {
+        data["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect()
+    }
+
+    /// A guest's `agent:queue:updated` frame carries only its own entries
+    /// plus unattributed (agent-sent) ones; the other member's entry AND the
+    /// unattributable legacy human entry never reach its connection, and the
+    /// surviving entries keep their `position`.
+    #[tokio::test]
+    async fn guest_queue_updated_frames_are_projected_to_the_principal() {
+        let principal_id = PrincipalId::new();
+        let guest = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        let frames = queue_frames_for(guest, &principal_id).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["agentId"], "agent-1");
+        assert_eq!(queue_ids(&frames[0]), vec!["m-own", "m-agent"]);
+        assert_eq!(frames[0]["queue"][1]["position"], 2, "no renumbering");
+    }
+
+    /// The administrator's and non-wire callers' frames are the publisher's
+    /// payload, untouched.
+    #[tokio::test]
+    async fn administrator_and_internal_queue_updated_frames_are_unchanged() {
+        let principal_id = PrincipalId::new();
+        let owner = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: true,
+        };
+        let agent = Caller::Agent {
+            agent_id: AgentId::from("agent-9"),
+        };
+        for caller in [owner, agent, Caller::Daemon] {
+            let frames = queue_frames_for(caller.clone(), &principal_id).await;
+            assert_eq!(frames.len(), 1, "{caller:?}: {frames:?}");
+            assert_eq!(frames[0]["queue"], mixed_queue(&principal_id), "{caller:?}");
+        }
+    }
+
+    /// The `messageId`s [`processing_frames_for`] publishes, in the order it
+    /// returns them: stamped by the subscriber, stamped by another principal,
+    /// an unattributable human entry (the unknown-human marker), unstamped.
+    const PROCESSING_IDS: [&str; 4] = ["m-own", "m-other", "m-unknown", "m-agent"];
+
+    /// Subscribe to `agent:queue:processing` under `caller`, publish one
+    /// frame per attribution ([`PROCESSING_IDS`]), and return the delivered
+    /// `data` payloads in that order.
+    async fn processing_frames_for(caller: Caller, own: &PrincipalId) -> Vec<Value> {
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            json!({"eventTypes":[AGENT_QUEUE_PROCESSING]}),
+        )
+        .await;
+        for (id, metadata) in [
+            (
+                "m-own",
+                Some(json!({ FROM_PRINCIPAL_ID_KEY: own.as_str() })),
+            ),
+            ("m-other", Some(json!({ FROM_PRINCIPAL_ID_KEY: "p-other" }))),
+            (
+                "m-unknown",
+                Some(json!({ QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY: true })),
+            ),
+            ("m-agent", None),
+        ] {
+            let mut ev = event_with(
+                AGENT_QUEUE_PROCESSING,
+                "ws-1",
+                json!({ "agentId": "agent-1", "messageId": id, "content": format!("text of {id}"), "turnId": id }),
+            );
+            ev.metadata = metadata;
+            h.bus.publish(&ev).await.unwrap();
+        }
+        let mut out = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), h.rx.bulk.recv()).await
+        {
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["params"]["event"]["type"], AGENT_QUEUE_PROCESSING);
+            out.push(v["params"]["event"]["data"].clone());
+        }
+        drop(h.subs);
+        let rank = |d: &Value| {
+            PROCESSING_IDS
+                .iter()
+                .position(|id| Some(*id) == d["messageId"].as_str())
+                .unwrap_or(PROCESSING_IDS.len())
+        };
+        out.sort_by_key(rank);
+        out
+    }
+
+    /// A guest's `agent:queue:processing` frame for an entry it may not see
+    /// — another member's, or a human-origin entry the workspace could not
+    /// attribute — keeps the ids the FE keys the turn on but loses
+    /// `content`; its own and unattributed entries arrive whole.
+    #[tokio::test]
+    async fn guest_queue_processing_frames_drop_foreign_content() {
+        let principal_id = PrincipalId::new();
+        let guest = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        let frames = processing_frames_for(guest, &principal_id).await;
+        assert_eq!(frames.len(), 4, "{frames:?}");
+        assert_eq!(frames[0]["content"], "text of m-own", "{frames:?}");
+        assert_eq!(
+            frames[1],
+            json!({ "agentId": "agent-1", "messageId": "m-other", "turnId": "m-other" }),
+            "foreign entry: ids only"
+        );
+        assert_eq!(
+            frames[2],
+            json!({ "agentId": "agent-1", "messageId": "m-unknown", "turnId": "m-unknown" }),
+            "unknown-human entry: ids only"
+        );
+        assert_eq!(frames[3]["content"], "text of m-agent", "{frames:?}");
+    }
+
+    /// The administrator's and non-wire callers' processing frames carry the
+    /// publisher's `content` whoever authored the entry.
+    #[tokio::test]
+    async fn administrator_and_internal_queue_processing_frames_are_unchanged() {
+        let principal_id = PrincipalId::new();
+        let owner = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: true,
+        };
+        let agent = Caller::Agent {
+            agent_id: AgentId::from("agent-9"),
+        };
+        for caller in [owner, agent, Caller::Daemon] {
+            let frames = processing_frames_for(caller.clone(), &principal_id).await;
+            assert_eq!(frames.len(), 4, "{caller:?}: {frames:?}");
+            for (frame, id) in frames.iter().zip(PROCESSING_IDS) {
+                assert_eq!(frame["content"], format!("text of {id}"), "{caller:?}");
+            }
+        }
     }
 
     /// The reverse registry's transition → event-type mapping resolves to

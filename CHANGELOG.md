@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.95] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Register and defer the baseline under a GitHub rate limit ([#2060](https://github.com/intent-hq/intentd/pull/2060))
+
+### 🧪 Testing
+
+- *(intentd)* Stable conversation fingerprint for WSS E2E no-wake assertions ([#2062](https://github.com/intent-hq/intentd/pull/2062))
+
+
+## [0.9.94] - 2026-09-22
+
+### 🚀 Features
+
+- Require the tunnel for invite links and emit tc only ([#2057](https://github.com/intent-hq/intentd/pull/2057))
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Document and test the startup-failure completion path; gate the non-UTF-8 ref test to Linux ([#2054](https://github.com/intent-hq/intentd/pull/2054))
+- *(notes)* Note.update / note.updateMetadata return the committed revision ([#2056](https://github.com/intent-hq/intentd/pull/2056))
+
+### 🔧 Refactor
+
+- *(core)* Single source for the running-turn status rule ([#2058](https://github.com/intent-hq/intentd/pull/2058))
+
+
 ## [0.9.93] - 2026-09-21
 
 ### 🚀 Features

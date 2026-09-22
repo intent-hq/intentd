@@ -605,6 +605,7 @@ impl WorkspaceApi for FakeApi {
                 updated_at: Some("t1".to_string()),
                 skipped: None,
                 reason: None,
+                rev: Some(1),
             })
         })
     }
@@ -2563,6 +2564,27 @@ fn voice_not_configured_maps_to_structured_error_data() {
     assert_eq!(
         rpc.data.expect("structured data"),
         serde_json::json!({ "code": "voice-no-api-key", "detail": detail })
+    );
+}
+
+#[test]
+fn rate_limited_maps_to_structured_error_data() {
+    // Forge rate limiting (intent-hq/intent#5627) — any cause the
+    // source-control layer classifies as `RateLimited` — keeps the -32603
+    // code and the exact `source control rate limited: <detail>` message,
+    // and carries `error.data = { code: "rate-limited" }` so the invite flow
+    // routes "wait for the limit to reset" instead of a sign-in prompt.
+    let rpc = super::domain_to_rpc(intent_core::Error::RateLimited(
+        "API rate limit exceeded for user ID 1.".to_string(),
+    ));
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.message,
+        "source control rate limited: API rate limit exceeded for user ID 1."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({ "code": "rate-limited" })
     );
 }
 

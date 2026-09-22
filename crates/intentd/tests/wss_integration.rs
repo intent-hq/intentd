@@ -5133,7 +5133,9 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
 /// persisted queue snapshot a later drain or restart would redrive), while
 /// the removed member's connection loses access (`agent.getQueue` and
 /// `workspace.get` are `NotFound`). A second collaborator's entry is not
-/// touched.
+/// touched. Per-user queue visibility throughout: the owner reads the full
+/// queue; each collaborator's `agent.getQueue` shows only its own entry
+/// (`position` not renumbered).
 #[tokio::test]
 async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     use intent_core::events::AGENT_QUEUE_UPDATED;
@@ -5220,9 +5222,15 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         "{staying_queued}"
     );
 
-    let before = leaving
-        .call("agent.getQueue", json!({ "agentId": agent_id }))
-        .await;
+    // The owner (administrator) reads the full queue.
+    let before = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getQueue","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
     let queue = before["result"]["queue"].as_array().expect("queue");
     assert_eq!(queue.len(), 3, "{before}");
     // A collaborator's entry carries the sender preamble above its text
@@ -5266,6 +5274,30 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         Some(json!(staying.principal.id.0)),
         "{before}"
     );
+
+    // Each collaborator reads only its own entry, at its full-queue
+    // position (the projection filters, it does not renumber).
+    for (guest, body, position) in [
+        (&mut leaving, "from leaving", 1),
+        (&mut staying, "from staying", 2),
+    ] {
+        let own = guest
+            .call("agent.getQueue", json!({ "agentId": agent_id }))
+            .await;
+        let visible = own["result"]["queue"].as_array().expect("queue");
+        assert_eq!(
+            visible.len(),
+            1,
+            "collaborator sees only its own entry: {own}"
+        );
+        assert_eq!(body_of(&visible[0]), body, "{own}");
+        assert_eq!(visible[0]["position"], json!(position), "{own}");
+        assert_eq!(
+            visible[0]["author"]["principalId"],
+            json!(guest.principal.id.0),
+            "{own}"
+        );
+    }
 
     // Owner subscribes for the shrunk-queue echo, then removes the member.
     let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
@@ -5444,10 +5476,17 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     let still = staying
         .call("agent.getQueue", json!({ "agentId": agent_id }))
         .await;
+    let still_queue = still["result"]["queue"].as_array().expect("queue");
     assert_eq!(
-        still["result"]["queue"].as_array().map(Vec::len),
-        Some(2),
-        "{still}"
+        still_queue.len(),
+        1,
+        "staying collaborator still sees only its own entry: {still}"
+    );
+    assert_eq!(body_of(&still_queue[0]), "from staying", "{still}");
+    assert_eq!(
+        still_queue[0]["position"],
+        json!(1),
+        "the removed entry's slot closed up ahead of it: {still}"
     );
 
     drop(leaving);

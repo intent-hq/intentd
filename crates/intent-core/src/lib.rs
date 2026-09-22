@@ -45,7 +45,12 @@ pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
 };
-pub use caller::{current_caller, spawn_daemon, with_caller, Caller};
+pub use caller::{
+    current_caller, is_human_authored_metadata, project_queue_for_caller,
+    queue_attribution_visible_to, queue_attribution_with, queue_entry_attribution,
+    queue_processing_event_attribution, queue_processing_event_metadata, queue_visible_to,
+    spawn_daemon, with_caller, Caller, QueueAttribution, QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY,
+};
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd};
 pub use clock::{
     iso_from_unix_secs, iso_minutes_ago, iso_ms_from_now, now_epoch_ms, now_iso, parse_iso,

@@ -4697,8 +4697,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// serialised `WorkspaceInvite` (secrets never included as fields) plus
     /// the additive `url`, the invite's `intent://invite?…` link rebuilt from
     /// the stored secret; `url` is omitted when the row predates the stored
-    /// secret or no link can be built right now (listener down, no dialable
-    /// route). Owner-only.
+    /// secret or no link can be built right now (listener down, tunnel
+    /// down — invite links are tunnel-only). Owner-only.
     fn workspace_invite_list(
         &self,
         workspace_id: WorkspaceId,
@@ -7271,9 +7271,13 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.pr.monitor`: register (idempotently) a centralized monitor on
     /// `pr_number` for `agent_id`, returning the monitor row plus the freshly
-    /// fetched merge-requirements checklist. `repo` is an optional
-    /// `"owner/name"` override; `None` resolves the workspace repo. MCP-only
-    /// — monitors are agent-owned, so there is no wire registration method.
+    /// fetched merge-requirements checklist — `requirements: null` plus a
+    /// `pausedUntil` deadline when the forge quota is exhausted and the
+    /// baseline fetch is deferred to the end of the daemon's global
+    /// rate-limit pause (the monitor is still registered). `repo` is an
+    /// optional `"owner/name"` override; `None` resolves the workspace repo.
+    /// MCP-only — monitors are agent-owned, so there is no wire registration
+    /// method.
     fn pr_monitor_start(
         &self,
         workspace_id: WorkspaceId,

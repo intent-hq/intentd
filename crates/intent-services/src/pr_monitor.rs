@@ -67,7 +67,7 @@
 //! refreshes what the next hover serves and a hover seeds what the next
 //! hover serves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,7 @@ use intent_sourcecontrol::{
 use intent_store::{NewEvent, PrMonitorListEntry, PrMonitorPollUpdate};
 use serde_json::{json, Value};
 
+use crate::hook_manager::CancelSettlement;
 use crate::pr_ops::{self, MergeRequirements};
 use crate::rate_limit::RATE_LIMIT_MAX_PAUSE;
 use crate::workspace_status::MonitorPrSignals;
@@ -1119,7 +1120,11 @@ pub enum PrMonitorRegistration {
     /// The caller now owns an active monitor on the PR.
     Registered {
         monitor: Box<PrMonitor>,
-        requirements: MergeRequirements,
+        /// The freshly fetched checklist, or `None` when the baseline fetch
+        /// was DEFERRED because the forge quota is exhausted: the row is
+        /// persisted without a baseline and the first post-pause poll
+        /// adopts the PR's state then (nothing pending).
+        requirements: Option<MergeRequirements>,
         /// `Some(previous owner)` when the row was ADOPTED from an agent
         /// that can no longer receive wakes (intent-hq/intent#5079);
         /// `None` for a fresh registration or the owner's own re-arm.
@@ -1858,10 +1863,12 @@ impl Services {
     }
 
     /// Register (or idempotently re-arm) a monitor on `(repo, pr_number)` for
-    /// `agent_id`, returning the row plus the freshly fetched checklist. A
-    /// re-register of an existing ACTIVE monitor never duplicates the row: it
-    /// refreshes the baseline and clears any pending changes, so the agent's
-    /// next wake reports only what moves from here.
+    /// `agent_id`, returning the row plus the freshly fetched checklist —
+    /// `None` when the fetch was deferred under the forge rate-limit pause
+    /// (see [`Services::pr_monitor_try_register`]). A re-register of an
+    /// existing ACTIVE monitor never duplicates the row: it refreshes the
+    /// baseline and clears any pending changes, so the agent's next wake
+    /// reports only what moves from here.
     ///
     /// The direct-service convenience over [`Services::pr_monitor_try_register`]:
     /// a workspace-level refusal (another live agent already holds the PR's
@@ -1880,7 +1887,7 @@ impl Services {
         repo_owner: &str,
         repo_name: &str,
         pr_number: u64,
-    ) -> Result<(PrMonitor, MergeRequirements)> {
+    ) -> Result<(PrMonitor, Option<MergeRequirements>)> {
         match self
             .pr_monitor_try_register(workspace_id, agent_id, repo_owner, repo_name, pr_number)
             .await?
@@ -1925,7 +1932,16 @@ impl Services {
     ///
     /// The initial fetch is load-bearing — a forge that cannot read the PR
     /// (unsupported host, missing PR, no token) fails registration rather
-    /// than persisting a monitor that could never poll.
+    /// than persisting a monitor that could never poll — with ONE exception:
+    /// forge quota exhaustion. A rate limit is transient and says nothing
+    /// about the PR, so the registration is never lost to it
+    /// ([`Services::fetch_registration_baseline`]): the row is persisted
+    /// (or re-armed / adopted) WITHOUT a baseline — `lastSnapshot` /
+    /// `baselineSnapshot` / `lastPolledAt` cleared, `lastError` naming the
+    /// pause — the fetch joins the global forge rate-limit pause the sweeps
+    /// share, and the outcome carries `requirements: None`; the first
+    /// post-pause poll adopts the PR's state then with nothing pending
+    /// (exactly the fresh-baseline semantics, delayed to the reset).
     ///
     /// # Errors
     ///
@@ -1977,18 +1993,24 @@ impl Services {
             }
         }
 
+        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = RepoRef::new(repo_owner, repo_name);
         // A full fetch, stored for the sweep and the on-demand readers
         // (the generation bump keeps an in-flight sweep read from
-        // overwriting it).
-        let mut snapshot = self
-            .read_pr(&repo_ref, pr_number, PrReadPolicy::REFRESH)
-            .await?
-            .snapshot
-            .materialize(None);
+        // overwriting it) — or deferred while the forge quota is exhausted.
+        let fetched = self
+            .fetch_registration_baseline(&sc, &repo_ref, pr_number)
+            .await?;
         let now = now_iso();
-        snapshot.observed_at = Some(now.clone());
-        let baseline = serde_json::to_string(&snapshot).ok();
+        let (baseline, requirements) = match fetched {
+            Some(mut snapshot) => {
+                snapshot.observed_at = Some(now.clone());
+                let baseline = serde_json::to_string(&snapshot).ok();
+                (baseline, Some(snapshot.requirements))
+            }
+            None => (None, None),
+        };
+        let deferred = requirements.is_none();
 
         let mut adopted_from = None;
         let mut monitor = match existing {
@@ -2030,25 +2052,41 @@ impl Services {
             }
         }
         if monitor.is_none() {
-            let m = PrMonitor {
-                monitor_id: PrMonitorId::new(),
-                workspace_id: workspace_id.clone(),
-                agent_id: agent_id.clone(),
-                repo_owner: repo_owner.to_string(),
-                repo_name: repo_name.to_string(),
-                pr_number: pr_number.cast_signed(),
-                state: PrMonitorState::Active,
-                last_snapshot: baseline.clone(),
-                baseline_snapshot: baseline.clone(),
-                pending_changes: Vec::new(),
-                pending_since: None,
-                last_change_at: None,
-                last_polled_at: Some(now.clone()),
-                last_error: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
+            // A deferred baseline is no poll: the row sorts oldest for the
+            // first post-pause due-sweep. The pause stamp it is born with
+            // and the insert are one gate critical section
+            // ([`crate::rate_limit::RateLimitGate::reconcile`]): the row is
+            // stamped from the gate's LIVE state and a lift's clear — which
+            // runs under the same section — cannot land between the two,
+            // so the row never carries a pause the gate already released.
+            let inserted = {
+                let _reconcile = self.sweep_rate_limit.reconcile().await;
+                let m = PrMonitor {
+                    monitor_id: PrMonitorId::new(),
+                    workspace_id: workspace_id.clone(),
+                    agent_id: agent_id.clone(),
+                    repo_owner: repo_owner.to_string(),
+                    repo_name: repo_name.to_string(),
+                    pr_number: pr_number.cast_signed(),
+                    state: PrMonitorState::Active,
+                    last_snapshot: baseline.clone(),
+                    baseline_snapshot: baseline.clone(),
+                    pending_changes: Vec::new(),
+                    pending_since: None,
+                    last_change_at: None,
+                    last_polled_at: (!deferred).then(|| now.clone()),
+                    last_error: deferred
+                        .then(|| {
+                            self.sweeps_rate_limited()
+                                .then(|| self.rate_limit_pause_error())
+                        })
+                        .flatten(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                };
+                self.store.insert_pr_monitor(&m).await?.then_some(m)
             };
-            if self.store.insert_pr_monitor(&m).await? {
+            if let Some(m) = inserted {
                 monitor = Some(m);
             } else if let Some(winner) = self
                 .store
@@ -2089,11 +2127,24 @@ impl Services {
                 }
             }
         }
-        let monitor = monitor.ok_or_else(|| {
+        let mut monitor = monitor.ok_or_else(|| {
             Error::Internal(
                 "pr.monitor: registration raced a concurrent monitor mutation; retry".to_string(),
             )
         })?;
+        if deferred {
+            // A re-armed / adopted row keeps the pause annotation the gate
+            // transition stamped on it (the guarded write composes with it
+            // in SQL); re-read so the returned image names the pause too.
+            monitor = self.store.get_pr_monitor(&monitor.monitor_id).await?;
+            tracing::info!(
+                monitor = %monitor.monitor_id,
+                label = %monitor_label(&monitor),
+                paused_until = ?self.sweep_rate_limit_paused_until(),
+                "pr monitor: forge rate limited; registered without a baseline, \
+                 first poll deferred to the end of the pause"
+            );
+        }
         let extra = adopted_from
             .as_ref()
             .map(|from| json!({ "adoptedFrom": from }));
@@ -2110,9 +2161,45 @@ impl Services {
         self.maybe_emit_waiting_changed(workspace_id).await;
         Ok(PrMonitorRegistration::Registered {
             monitor: Box::new(monitor),
-            requirements: snapshot.requirements,
+            requirements,
             adopted_from,
         })
+    }
+
+    /// The registration fetch behind [`Services::pr_monitor_try_register`]:
+    /// the PR's fresh snapshot, or `None` when the fetch is DEFERRED
+    /// because the forge quota is exhausted. The gate is the same global
+    /// rate-limit pause the sweeps share (monorepo#2961): while it is
+    /// closed the call spends one quota-free `rate_limit` probe
+    /// ([`Services::maybe_lift_rate_limit_pause`]) — exactly like a sweep
+    /// tick — and fetches only if that lifts the pause; and a fetch that
+    /// fails with [`Error::RateLimited`] opens (or extends) the pause
+    /// ([`Services::pause_sweeps_for_rate_limit`]) instead of failing the
+    /// registration. Every other forge failure propagates unchanged — the
+    /// fetch stays load-bearing for "can this PR be read at all". The fetch
+    /// itself is a [`PrReadPolicy::REFRESH`] read through the shared cache
+    /// ([`Services::read_pr`]), so the sweep and the on-demand readers see
+    /// it.
+    async fn fetch_registration_baseline(
+        &self,
+        sc: &Arc<dyn SourceControl>,
+        repo_ref: &RepoRef,
+        pr_number: u64,
+    ) -> Result<Option<PrMonitorSnapshot>> {
+        if self.sweeps_rate_limited() && self.maybe_lift_rate_limit_pause(sc).await.is_none() {
+            return Ok(None);
+        }
+        match self
+            .read_pr(repo_ref, pr_number, PrReadPolicy::REFRESH)
+            .await
+        {
+            Ok(entry) => Ok(Some(entry.snapshot.materialize(None))),
+            Err(Error::RateLimited(detail)) => {
+                self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The workspace-level duplicate check behind [`Services::pr_monitor_try_register`]:
@@ -2250,7 +2337,10 @@ impl Services {
     /// reports only what moves from here rather than the dead owner's
     /// backlog. Returns `None` when the guarded write loses — the row was
     /// cancelled/completed/polled/adopted concurrently — so the caller can
-    /// re-read instead of clobbering.
+    /// re-read instead of clobbering. A `None` baseline is a DEFERRED
+    /// registration fetch (forge rate limited): the snapshots are cleared
+    /// and `lastPolledAt` is NOT stamped, so the first post-pause sweep
+    /// polls the row first and adopts the PR's state then.
     async fn adopt_pr_monitor(
         &self,
         mut m: PrMonitor,
@@ -2258,6 +2348,7 @@ impl Services {
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
+        let polled_at = baseline.is_some().then_some(now);
         let updated = self
             .store
             .adopt_pr_monitor(
@@ -2268,7 +2359,7 @@ impl Services {
                     last_snapshot: baseline.as_deref(),
                     baseline_snapshot: baseline.as_deref(),
                     pending_changes: &[],
-                    last_polled_at: Some(now),
+                    last_polled_at: polled_at,
                     updated_at: now,
                     expected_updated_at: &m.updated_at,
                     ..Default::default()
@@ -2296,7 +2387,7 @@ impl Services {
         m.pending_changes = Vec::new();
         m.pending_since = None;
         m.last_change_at = None;
-        m.last_polled_at = Some(now.to_string());
+        m.last_polled_at = polled_at.map(str::to_string);
         m.last_error = None;
         m.updated_at = now.to_string();
         Ok(Some(m))
@@ -2306,13 +2397,17 @@ impl Services {
     /// refresh the baseline, clear the pending state, and reset the debounce
     /// anchors. Returns `None` when the guarded write loses — the row was
     /// cancelled/completed/re-registered concurrently — so the caller can
-    /// fall back instead of clobbering.
+    /// fall back instead of clobbering. A `None` baseline is a DEFERRED
+    /// registration fetch (forge rate limited): the snapshots are cleared
+    /// and `lastPolledAt` is NOT stamped, so the first post-pause sweep
+    /// polls the row first and adopts the PR's state then.
     async fn rearm_pr_monitor(
         &self,
         mut m: PrMonitor,
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
+        let polled_at = baseline.is_some().then_some(now);
         let updated = self
             .store
             .update_pr_monitor_poll(
@@ -2321,7 +2416,7 @@ impl Services {
                     last_snapshot: baseline.as_deref(),
                     baseline_snapshot: baseline.as_deref(),
                     pending_changes: &[],
-                    last_polled_at: Some(now),
+                    last_polled_at: polled_at,
                     updated_at: now,
                     expected_updated_at: &m.updated_at,
                     ..Default::default()
@@ -2336,7 +2431,7 @@ impl Services {
         m.pending_changes = Vec::new();
         m.pending_since = None;
         m.last_change_at = None;
-        m.last_polled_at = Some(now.to_string());
+        m.last_polled_at = polled_at.map(str::to_string);
         m.last_error = None;
         m.updated_at = now.to_string();
         Ok(Some(m))
@@ -2479,10 +2574,11 @@ impl Services {
         let notice = caller.is_none().then(|| {
             crate::harness::latest().pr_monitor_cancelled_from_app_notice(&monitor_label(&monitor))
         });
-        match self
-            .cancel_active_pr_monitor(monitor, notice.as_deref())
-            .await?
-        {
+        let settlement = match notice.as_deref() {
+            Some(notice) => CancelSettlement::Notify(notice),
+            None => CancelSettlement::Resettle,
+        };
+        match self.cancel_active_pr_monitor(monitor, settlement).await? {
             Some(monitor) => Ok(monitor),
             // A concurrent cancel/complete won between our read and the
             // guarded write; the monitor is no longer active either way.
@@ -2496,20 +2592,16 @@ impl Services {
     /// Core cancel transition shared by [`Services::pr_monitor_cancel`] and
     /// the archive sweep ([`Services::cancel_workspace_pr_monitors`]),
     /// mirroring [`Services::cancel_active_hook`]: guarded CAS write to
-    /// `cancelled`, catch-up-marker removal, `prMonitor:cancelled` emit.
-    /// With a `wake_notice` the owner is woken (the wake runs the deferral
-    /// backstop itself, inside `wake_pr_monitor_owner`, after the delivery
-    /// attempt); without one, no wake is delivered — a deferred completion
-    /// watch on the (idle) owner would otherwise never settle when this was
-    /// its last active monitor, so the backstop runs directly. Ends with the
-    /// transition-only displayStatus recompute (§6.5). Returns `Ok(None)`
-    /// when a concurrent cancel/complete won the CAS — the monitor is no
-    /// longer active either way. The caller must have verified the monitor
-    /// is ACTIVE.
+    /// `cancelled`, catch-up-marker removal, `prMonitor:cancelled` emit. How
+    /// the owner's deferred completion watches settle is the caller's
+    /// [`CancelSettlement`] choice. Ends with the transition-only
+    /// displayStatus recompute (§6.5). Returns `Ok(None)` when a concurrent
+    /// cancel/complete won the CAS — the monitor is no longer active either
+    /// way. The caller must have verified the monitor is ACTIVE.
     async fn cancel_active_pr_monitor(
         &self,
         mut monitor: PrMonitor,
-        wake_notice: Option<&str>,
+        settlement: CancelSettlement<'_>,
     ) -> Result<Option<PrMonitor>> {
         let now = now_iso();
         if !self
@@ -2527,15 +2619,16 @@ impl Services {
             .remove(&monitor.monitor_id);
         self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
             .await;
-        match wake_notice {
-            Some(notice) => {
+        match settlement {
+            CancelSettlement::Notify(notice) => {
                 self.wake_pr_monitor_owner(&monitor, notice, "cancelled")
                     .await;
             }
-            None => {
+            CancelSettlement::Resettle => {
                 self.resettle_owner_after_pr_monitor_terminal(&monitor)
                     .await;
             }
+            CancelSettlement::Deferred => {}
         }
         // A cancelled monitor's open-PR signal lapses — the derived
         // displayStatus can drop off `pr_open`/`pr_ready` (§6.5) — and the
@@ -2551,17 +2644,25 @@ impl Services {
     /// in the workspace through the shared cancel transition
     /// ([`Services::cancel_active_pr_monitor`]), mirroring the hook sweep
     /// ([`Services::cancel_workspace_hooks`]) — state persisted to
-    /// `cancelled`, `prMonitor:cancelled` emitted, owner woken with a notice
-    /// so the agent learns why its watch stopped. Runs AFTER the archived
-    /// row is persisted: the wake rides the archived gate in
-    /// [`Services::deliver_wake_message`], so it parks in the queue (at
-    /// most) and never starts a turn while the workspace is archived.
+    /// `cancelled`, `prMonitor:cancelled` emitted, waiting recomputed
+    /// (§5.1). Each cancel is SILENT (no per-monitor wake) and DEFERRED
+    /// ([`CancelSettlement::Deferred`]: no per-item completion backstop
+    /// either): the cancelled monitors are returned grouped by owner as
+    /// `(label, monitor_id)` pairs, and the archive tail
+    /// ([`crate::Services::notify_owners_of_archived_watches`]) folds them
+    /// with the swept hooks into ONE consolidated notice per agent and only
+    /// THEN runs the backstop, so a deferred completion watch on the owner
+    /// stays armed behind the queued notice.
     /// Terminal monitors are untouched, and unarchive does NOT resurrect
     /// cancelled monitors — the notice tells the owner to re-register if the
     /// PR still matters. Best-effort per monitor: a store failure is logged
     /// and the sweep moves on — archiving must not fail because one monitor
     /// row would not update.
-    pub(crate) async fn cancel_workspace_pr_monitors(&self, workspace_id: &WorkspaceId) {
+    pub(crate) async fn cancel_workspace_pr_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> BTreeMap<AgentId, Vec<(String, PrMonitorId)>> {
+        let mut cancelled: BTreeMap<AgentId, Vec<(String, PrMonitorId)>> = BTreeMap::new();
         let monitors = match self
             .store
             .list_active_pr_monitors_by_workspace(workspace_id)
@@ -2574,24 +2675,34 @@ impl Services {
                     error = %e,
                     "archive pr-monitor sweep: monitor list failed; skipping"
                 );
-                return;
+                return cancelled;
             }
         };
         for monitor in monitors {
             let monitor_id = monitor.monitor_id.clone();
-            let notice = crate::harness::latest()
-                .pr_monitor_cancelled_workspace_archived_notice(&monitor_label(&monitor));
-            // `Ok(None)` = a concurrent cancel/complete won the CAS between
-            // the list read and the guarded write; no longer active either way.
-            if let Err(e) = self.cancel_active_pr_monitor(monitor, Some(&notice)).await {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    monitor = %monitor_id.0,
-                    error = %e,
-                    "archive pr-monitor sweep: cancel failed; continuing"
-                );
+            match self
+                .cancel_active_pr_monitor(monitor, CancelSettlement::Deferred)
+                .await
+            {
+                Ok(Some(monitor)) => cancelled
+                    .entry(monitor.agent_id.clone())
+                    .or_default()
+                    .push((monitor_label(&monitor), monitor.monitor_id)),
+                // A concurrent cancel/complete won the CAS between the list
+                // read and the guarded write; no longer active either way,
+                // and not this sweep's to report.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        monitor = %monitor_id.0,
+                        error = %e,
+                        "archive pr-monitor sweep: cancel failed; continuing"
+                    );
+                }
             }
         }
+        cancelled
     }
 
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE PR monitor
@@ -2622,7 +2733,10 @@ impl Services {
             let monitor_id = monitor.monitor_id.clone();
             // `Ok(None)` = a concurrent cancel/complete won the CAS between
             // the list read and the guarded write; no longer active either way.
-            if let Err(e) = self.cancel_active_pr_monitor(monitor, None).await {
+            if let Err(e) = self
+                .cancel_active_pr_monitor(monitor, CancelSettlement::Resettle)
+                .await
+            {
                 tracing::warn!(
                     agent = %agent_id.0,
                     monitor = %monitor_id.0,
@@ -3605,12 +3719,24 @@ impl Services {
     }
 
     /// `ws.pr.monitor`: register (idempotently) a monitor and return
-    /// `{ ok, monitor, requirements }` — the row the UI lists plus the
-    /// freshly fetched merge-requirements checklist the model acts on.
-    /// When another agent in the workspace already holds the PR's active
-    /// monitor the call is REFUSED with a structured, non-error payload
-    /// (`ok: false, refused: true, reason: "already-monitored"`) naming the
-    /// owner, so the model can coordinate instead of retrying.
+    /// `{ ok, monitor, requirements, pausedUntil? }` — the row the UI lists
+    /// plus the freshly fetched merge-requirements checklist the model acts
+    /// on. `requirements` is `null` exactly when the baseline fetch was
+    /// DEFERRED under the forge rate-limit pause
+    /// ([`Services::pr_monitor_try_register`]); `pausedUntil` (RFC 3339)
+    /// is present while that pause is closed AT RESULT TIME — alongside a
+    /// `null` checklist unless a probe lifted the pause between the
+    /// deferral and this sample (the row then carries no pause either and
+    /// is due on the very next sweep), and alongside a fresh one only if a
+    /// sibling sweep closed the gate between the fetch and this result —
+    /// and omitted (never null) otherwise. The gate is one in-memory
+    /// value read at distinct instants, so the two are never re-fetched
+    /// into agreement; a consumer treats `requirements: null` as "deferred,
+    /// poll pending" and `pausedUntil` as "and the pause still stands".
+    /// When another agent in the workspace already holds the
+    /// PR's active monitor the call is REFUSED with a structured, non-error
+    /// payload (`ok: false, refused: true, reason: "already-monitored"`)
+    /// naming the owner, so the model can coordinate instead of retrying.
     pub(crate) async fn pr_monitor_start_op(
         &self,
         workspace_id: &WorkspaceId,
@@ -3634,6 +3760,9 @@ impl Services {
                     "monitor": pr_monitor_wire(&monitor, paused_until.as_deref()),
                     "requirements": requirements,
                 });
+                if let Some(until) = paused_until {
+                    payload["pausedUntil"] = json!(until);
+                }
                 if let Some(from) = adopted_from {
                     payload["adoptedFrom"] = json!(from);
                 }
@@ -5461,7 +5590,7 @@ mod tests {
             .await
             .expect("register");
         assert_eq!(first.state, PrMonitorState::Active);
-        assert_eq!(requirements.state, "open");
+        assert_eq!(requirements.expect("baseline fetched").state, "open");
         assert!(first.last_snapshot.is_some(), "baseline captured");
 
         // A change lands, then the SAME (agent, repo, pr) re-registers: the
@@ -5524,7 +5653,7 @@ mod tests {
             .pr_monitor_register(&ws, &owner, "o", "r", 42)
             .await
             .expect("register");
-        assert_one_passed_each(&requirements.checks);
+        assert_one_passed_each(&requirements.expect("baseline fetched").checks);
 
         // Same data, then reordered, then back: every poll is quiet. The
         // edits bump the PR's fingerprint so each poll is a FULL fetch that
@@ -9297,6 +9426,283 @@ mod tests {
         for id in &ids {
             assert_eq!(last_error(&svc, id).await, None);
         }
+    }
+
+    /// A registration whose baseline fetch hits the exhausted forge quota
+    /// is NOT lost to it: the row is persisted without a baseline (no
+    /// snapshots, no `lastPolledAt`, the pause as `lastError`), the fetch
+    /// opens the shared rate-limit pause, and the outcome carries no
+    /// checklist. While the gate stays closed, a re-register of a monitor
+    /// that already has a baseline defers the same way — clearing the
+    /// baseline instead of keeping a stale one — and spends one quota-free
+    /// probe and no PR fetch; the MCP payload reports `requirements: null`
+    /// plus the pause deadline as `pausedUntil`.
+    #[tokio::test]
+    async fn a_rate_limited_registration_persists_the_monitor_and_defers_its_baseline() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let probes = || forge.sub_fetches("rate_limit_status");
+
+        // A monitor registered BEFORE the quota ran out has a baseline.
+        let (armed, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("register 7");
+        assert!(armed.last_snapshot.is_some());
+        forge.take_fetched_numbers();
+
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        let (m, requirements) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 42)
+            .await
+            .expect("a rate limit never fails registration");
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![42],
+            "the fetch was attempted"
+        );
+        assert_eq!(probes(), 1, "opening the pause reads the reset once");
+        assert!(
+            svc.sweeps_rate_limited(),
+            "the fetch opened the shared pause"
+        );
+        assert!(requirements.is_none(), "no checklist to return");
+        let pause_error = expected_pause_error(&svc);
+        assert_eq!(m.state, PrMonitorState::Active);
+        assert_eq!(m.last_snapshot, None);
+        assert_eq!(m.baseline_snapshot, None);
+        assert_eq!(m.last_polled_at, None, "a deferred fetch is no poll");
+        assert_eq!(m.last_error.as_deref(), Some(pause_error.as_str()));
+        let row = svc.store().get_pr_monitor(&m.monitor_id).await.unwrap();
+        assert_eq!(row, m, "the returned image is the persisted row");
+        assert_eq!(
+            svc.pr_monitors_for_agent(&owner).await.unwrap().len(),
+            2,
+            "both monitors are active"
+        );
+
+        // Re-registering the armed monitor while paused: one free probe, no
+        // PR fetch, the same row re-armed WITHOUT its now-unobservable
+        // baseline, still naming the pause.
+        let (rearmed, requirements) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("re-register 7");
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "no PR fetch while paused"
+        );
+        assert_eq!(probes(), 2, "one lift probe per paused registration");
+        assert!(requirements.is_none());
+        assert_eq!(rearmed.monitor_id, armed.monitor_id, "no duplicate row");
+        assert_eq!(rearmed.last_snapshot, None, "the stale baseline is cleared");
+        assert_eq!(rearmed.baseline_snapshot, None);
+        assert_eq!(rearmed.last_polled_at, None);
+        assert_eq!(rearmed.last_error.as_deref(), Some(pause_error.as_str()));
+
+        // The MCP payload: `requirements: null`, `pausedUntil` on the
+        // payload and the row, the same monitor.
+        let until = svc.sweep_rate_limit_paused_until().unwrap();
+        let payload = svc
+            .pr_monitor_start_op(&ws, &owner, 42, Some("o/r".into()))
+            .await
+            .expect("op");
+        assert_eq!(payload["ok"], json!(true), "{payload}");
+        assert!(payload["requirements"].is_null(), "{payload}");
+        assert_eq!(payload["pausedUntil"], json!(until), "{payload}");
+        assert_eq!(
+            payload["monitor"]["monitorId"],
+            json!(m.monitor_id),
+            "{payload}"
+        );
+        assert_eq!(payload["monitor"]["pausedUntil"], json!(until), "{payload}");
+        assert_eq!(
+            payload["monitor"]["lastError"],
+            json!(pause_error),
+            "{payload}"
+        );
+        assert!(
+            payload["monitor"].get("lastSnapshot").is_none(),
+            "{payload}"
+        );
+        assert!(payload.get("adoptedFrom").is_none(), "{payload}");
+        assert!(forge.take_fetched_numbers().is_empty());
+
+        // Any OTHER fetch failure still fails registration: the fetch stays
+        // load-bearing for "can this PR be read at all".
+        elapse_pause(&svc).await;
+        forge.edit(|s| {
+            s.rate_limit_get_pr = false;
+            s.fail_get_pr = true;
+        });
+        svc.pr_monitor_register(&ws, &owner, "o", "r", 43)
+            .await
+            .expect_err("a forge that cannot read the PR fails registration");
+        assert!(
+            svc.store()
+                .find_active_pr_monitor(&owner, "o", "r", 43)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing persisted"
+        );
+    }
+
+    /// A deferred fresh registration's insert runs under the gate's
+    /// reconcile section ([`crate::rate_limit::RateLimitGate::reconcile`])
+    /// and stamps the gate's LIVE state: the insert waits for a held
+    /// section, and a lift that lands first leaves the new row without the
+    /// pause it read before the lock — otherwise the lift's clear (scoped to
+    /// rows that exist) would miss the row and it would carry a released
+    /// pause until its old deadline, since successful polls keep an
+    /// annotation whose deadline has not passed.
+    #[tokio::test]
+    async fn a_deferred_registration_inserts_under_the_gate_and_stamps_its_live_state() {
+        // The deferral is decided by the registration's one quota probe;
+        // once that probe is counted, the next await is the gate section.
+        async fn probed(forge: &StubForge, n: usize) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while forge.sub_fetches("rate_limit_status") < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for probe {n}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        svc.pr_monitor_register(&ws, &owner, "o", "r", 42)
+            .await
+            .expect("the first registration opens the pause");
+        assert!(svc.sweeps_rate_limited());
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+        assert_eq!(forge.take_fetched_numbers(), vec![42]);
+        let pause_error = expected_pause_error(&svc);
+        let active = |svc: &Services| {
+            let (svc, owner) = (svc.clone(), owner.clone());
+            async move { svc.pr_monitors_for_agent(&owner).await.unwrap().len() }
+        };
+
+        // Held section: the deferral is decided (one probe, no fetch) but
+        // the row does not land until the section is released.
+        let held = svc.sweep_rate_limit.reconcile().await;
+        let register = tokio::spawn({
+            let (svc, ws, owner) = (svc.clone(), ws.clone(), owner.clone());
+            async move { svc.pr_monitor_register(&ws, &owner, "o", "r", 43).await }
+        });
+        probed(&forge, 2).await;
+        assert!(!register.is_finished(), "the insert waits for the section");
+        assert_eq!(active(&svc).await, 1, "no row landed under a held section");
+        drop(held);
+        let (m, requirements) = register.await.unwrap().expect("register 43");
+        assert!(requirements.is_none());
+        assert!(forge.take_fetched_numbers().is_empty(), "no PR fetch");
+        assert_eq!(m.last_polled_at, None);
+        assert_eq!(m.last_error.as_deref(), Some(pause_error.as_str()));
+        assert_eq!(active(&svc).await, 2);
+
+        // A lift landing inside the window between the deferral decision and
+        // the insert: the row is born without the released pause, and the
+        // wire payload says so consistently — `requirements: null` (the
+        // fetch WAS deferred) with no `pausedUntil` and no `lastError`.
+        let held = svc.sweep_rate_limit.reconcile().await;
+        let register = tokio::spawn({
+            let (svc, ws, owner) = (svc.clone(), ws.clone(), owner.clone());
+            async move {
+                svc.pr_monitor_start_op(&ws, &owner, 44, Some("o/r".into()))
+                    .await
+            }
+        });
+        probed(&forge, 3).await;
+        assert!(!register.is_finished(), "the insert waits for the section");
+        assert!(svc.sweep_rate_limit.lift(), "lifted under the held section");
+        drop(held);
+        let payload = register.await.unwrap().expect("register 44");
+        assert_eq!(payload["ok"], json!(true), "{payload}");
+        assert!(
+            payload["requirements"].is_null(),
+            "the deferral decision stands: {payload}"
+        );
+        assert!(payload.get("pausedUntil").is_none(), "{payload}");
+        assert!(payload["monitor"].get("pausedUntil").is_none(), "{payload}");
+        assert!(
+            payload["monitor"].get("lastError").is_none(),
+            "no stamp for a pause the gate released: {payload}"
+        );
+        assert!(
+            payload["monitor"].get("lastPolledAt").is_none(),
+            "{payload}"
+        );
+        assert!(
+            payload["monitor"].get("lastSnapshot").is_none(),
+            "{payload}"
+        );
+        let row = svc
+            .store()
+            .find_active_pr_monitor(&owner, "o", "r", 44)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert_eq!(row.last_error, None);
+        assert_eq!(row.last_polled_at, None, "still due on the first sweep");
+        assert_eq!(row.last_snapshot, None);
+        assert_eq!(active(&svc).await, 3);
+    }
+
+    /// The first post-pause poll of a baseline-less monitor adopts the PR's
+    /// state as its baseline with NOTHING pending and no wake — exactly what
+    /// a registration fetch would have recorded, delayed to the reset — and
+    /// clears the pause error; the monitor then reports only what moves
+    /// from there. A never-polled row is due on the first sweep, so the
+    /// deferral costs no extra interval once the gate opens.
+    #[tokio::test]
+    async fn the_first_post_pause_poll_adopts_the_deferred_baseline_without_a_wake() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        let (m, requirements) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 42)
+            .await
+            .expect("register");
+        assert!(requirements.is_none());
+        forge.take_fetched_numbers();
+
+        // Paused: the due-sweep spends nothing on the forge and leaves the
+        // baseline-less row alone.
+        svc.poll_due_pr_monitors().await;
+        assert!(forge.take_fetched_numbers().is_empty(), "paused: no fetch");
+        assert_eq!(svc.store().get_pr_monitor(&m.monitor_id).await.unwrap(), m);
+
+        // The PR moved while the quota was exhausted: that history is not
+        // reportable — the monitor never observed the earlier state.
+        forge.edit(|s| s.conversation_comments = 5);
+        elapse_pause(&svc).await;
+        forge.edit(|s| s.rate_limit_get_pr = false);
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![42],
+            "due on the first open sweep"
+        );
+        let row = svc.store().get_pr_monitor(&m.monitor_id).await.unwrap();
+        assert!(row.last_snapshot.is_some(), "baseline adopted");
+        assert_eq!(row.baseline_snapshot, row.last_snapshot);
+        assert!(row.pending_changes.is_empty(), "nothing pending: {row:?}");
+        assert!(row.last_polled_at.is_some());
+        assert_eq!(row.last_error, None, "the pause error is cleared");
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("PR monitor"),
+            "adopting a baseline is not a change"
+        );
+
+        // From here the monitor diffs against the adopted baseline.
+        forge.edit(|s| s.conversation_comments = 6);
+        svc.poll_pr_monitors().await;
+        let row = svc.store().get_pr_monitor(&m.monitor_id).await.unwrap();
+        assert_eq!(row.pending_changes.len(), 1, "{:?}", row.pending_changes);
     }
 
     /// The shared gate is re-consulted before EVERY vacant-cache fetch, not
