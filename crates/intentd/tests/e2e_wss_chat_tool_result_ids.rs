@@ -84,6 +84,11 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
     let mut cmd = common::serve_command();
+    // The reconcile assertion compares the user row's `author` (anonymous
+    // principal: null login/displayName/avatarUrl) against a fresh snapshot;
+    // a host `gh auth login` would hydrate the real login onto the primary
+    // principal mid-test and race it (intent-hq/intent#5645).
+    common::hermetic_github_identity(&mut cmd, data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
