@@ -443,11 +443,24 @@ struct Booted {
     prompt_log: PathBuf,
 }
 
-async fn boot_daemon(data_dir: &Path, script: &str, first_turn_delay_ms: u64) -> Booted {
+/// `kickoff_release`: when set, the mock ALSO holds the kick-off turn
+/// (`KICKOFF_MSG`) open until this file exists — a barrier the test releases
+/// once its busy-window work is provably done, instead of a timer that host
+/// scheduling can outrun.
+async fn boot_daemon(
+    data_dir: &Path,
+    script: &str,
+    first_turn_delay_ms: u64,
+    kickoff_release: Option<&Path>,
+) -> Booted {
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
-    let behavior =
-        json!({ "response": "flush reply", "firstTurnDelayMs": first_turn_delay_ms }).to_string();
+    let mut behavior =
+        json!({ "response": "flush reply", "firstTurnDelayMs": first_turn_delay_ms });
+    if let Some(release) = kickoff_release {
+        behavior["rules"] = json!([{ "ifPromptContains": KICKOFF_MSG, "releaseFile": release }]);
+    }
+    let behavior = behavior.to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         // The busy window sits below the 5s dequeue-wait annotation
@@ -487,7 +500,7 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
         port,
         cfg,
         prompt_log,
-    } = boot_daemon(data_dir, script, 2000).await;
+    } = boot_daemon(data_dir, script, 2000, None).await;
 
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_resp = wss_rpc(
@@ -1215,15 +1228,17 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, guest) = seed_workspace_with_guest(&data_dir).await;
-    // A wider busy window than the single-member cases: two connections'
-    // worth of enqueue reads, pushes and refusals must all land before the
-    // kick-off turn ends (an early end panics in `await_queue_snapshots`).
+    // Two connections' worth of enqueue reads, pushes and refusals must all
+    // land before the kick-off turn ends (an early end panics in
+    // `await_queue_snapshots`), so the busy window is a barrier the test
+    // releases before (4) rather than a timer host scheduling could outrun.
+    let kickoff_release = data_dir.join("release-kickoff");
     let Booted {
         daemon: _daemon,
         port,
         cfg,
         prompt_log,
-    } = boot_daemon(&data_dir, &script, 5000).await;
+    } = boot_daemon(&data_dir, &script, 0, Some(&kickoff_release)).await;
 
     // Both members subscribe to `agent:*` BEFORE the kick-off send.
     let mut owner_sub = connect_ws(port, cfg.clone()).await;
@@ -1567,7 +1582,9 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
     );
 
     // (4) Flush intact — observed on both subscriptions: kick-off
-    // stream:end, then the ONE combined flush turn.
+    // stream:end, then the ONE combined flush turn. Everything the busy
+    // window had to cover is done; let the kick-off turn end.
+    std::fs::write(&kickoff_release, b"go").expect("write kick-off release file");
     let (owner_obs, guest_obs) = tokio::join!(
         observe_drain(&mut owner_sub, &agent_id, 2),
         observe_drain(&mut guest_sub, &agent_id, 2),
