@@ -101,6 +101,7 @@ mod harness;
 mod history_xml;
 mod hook_manager;
 mod invite_ops;
+mod issue_cache;
 mod line_attribution;
 mod linear_ops;
 mod model_catalog;
@@ -1116,10 +1117,15 @@ pub struct Services {
     /// read within `prCache.maxAgeSeconds` (see [`pr_monitor::PrCache`]).
     /// In-memory only; shared across clones.
     pr_cache: pr_monitor::PrCache,
-    /// Explicit override for how old a cached PR read may be and still be
-    /// served on demand (seconds). `None` — the production wiring — reads
-    /// `prCache.maxAgeSeconds` live from the settings registry; values
-    /// outside [floor, ceiling] are clamped at read time.
+    /// The issue cache behind `github.issues.get`: each issue's last forge
+    /// read, served within `prCache.maxAgeSeconds` like the PR cache and
+    /// retained under the same unmonitored policy (see
+    /// [`issue_cache::IssueCache`]). In-memory only; shared across clones.
+    issue_cache: issue_cache::IssueCache,
+    /// Explicit override for how old a cached PR (or issue) read may be and
+    /// still be served on demand (seconds). `None` — the production wiring
+    /// — reads `prCache.maxAgeSeconds` live from the settings registry;
+    /// values outside [floor, ceiling] are clamped at read time.
     pr_cache_max_age_seconds: Option<u64>,
     /// Explicit override for the centralized PR-monitor loop's poll cadence
     /// (seconds). `None` — the production wiring — reads
@@ -1396,6 +1402,7 @@ impl Services {
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
+            issue_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_cache_max_age_seconds: None,
             pr_monitor_poll_seconds: None,
             pr_monitor_hourly_request_budget: None,
@@ -29880,15 +29887,12 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
         Box::pin(async move {
             Self::require_administrator("github.issuesGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let issue = sc
-                .get_issue(&repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
+            // Served from the issue cache within `prCache.maxAgeSeconds`;
+            // a miss costs one `get_issue` and seeds the next read.
+            let issue = self.read_issue(&repo_ref, number).await?;
             Ok(serde_json::json!({
                 "issue": github_ops::issue_to_json(&issue, &repo_ref.owner, &repo_ref.name)
             }))

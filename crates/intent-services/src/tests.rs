@@ -16167,6 +16167,12 @@ pub(crate) mod pr {
         /// PR numbers `get_pr` was called with, in call order (sweep
         /// stale-pool heal tests assert cap + ordering).
         seen_get_pr: std::sync::Mutex<Vec<u64>>,
+        /// Issue numbers `get_issue` was called with, in call order (the
+        /// issue cache tests assert a hit costs no forge read).
+        seen_get_issue: std::sync::Mutex<Vec<u64>>,
+        /// Issue number whose `get_issue` fails with `NotFound`, exercising
+        /// the issue cache's never-cache-errors rule.
+        missing_issue: Option<u64>,
         /// When true, `get_pr` and `list_prs` fail with `RateLimited`
         /// (exhausted GitHub core quota, monorepo#2961), exercising the
         /// global sweep pause.
@@ -16834,6 +16840,15 @@ pub(crate) mod pr {
             unimplemented!()
         }
         async fn get_issue(&self, _: &RepoRef, number: u64) -> ScResult<Issue> {
+            self.seen_get_issue.lock().unwrap().push(number);
+            if self.rate_limited {
+                return Err(ScError::RateLimited(
+                    "API rate limit exceeded for user ID 526899.".into(),
+                ));
+            }
+            if self.missing_issue == Some(number) {
+                return Err(ScError::NotFound("no such issue".into()));
+            }
             Ok(Issue {
                 number,
                 ..stub_issue()
@@ -19348,6 +19363,150 @@ pub(crate) mod pr {
         assert_eq!(issue["repo"], "r");
         assert_eq!(issue["labels"], json!([]));
         assert_eq!(issue["comments"], 0);
+    }
+
+    /// `github.issues.get` reads through the issue cache under the PR
+    /// cache's `prCache.maxAgeSeconds`: the first read costs one `get_issue`,
+    /// a repeat within the window answers the identical JSON with no forge
+    /// call (case-variant addressing shares the entry), another issue is
+    /// another miss, and an entry aged past the window is re-fetched.
+    #[intent_test_macros::daemon_test]
+    async fn github_issues_get_is_served_from_the_issue_cache_within_max_age() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+
+        let first = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![7]);
+        assert_eq!(svc.issue_cache_len(), 1);
+
+        let again = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(again, first, "a hit answers the cached issue");
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7],
+            "a hit within max_age costs no forge request"
+        );
+
+        // The RepoRef identity is case-insensitive: the same slot is hit,
+        // while the DTO echoes the caller's addressing.
+        let folded = svc
+            .github_issues_get("O".into(), "R".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![7]);
+        assert_eq!(folded["issue"]["owner"], "O");
+        assert_eq!(folded["issue"]["number"], 7);
+
+        svc.github_issues_get("o".into(), "r".into(), 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7, 8],
+            "another issue is another miss"
+        );
+        assert_eq!(svc.issue_cache_len(), 2);
+
+        svc.backdate_issue_cache(std::time::Duration::from_secs(61));
+        svc.github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7, 8, 7],
+            "an entry older than max_age is re-fetched"
+        );
+    }
+
+    /// A failed `get_issue` propagates to the caller and stores nothing: the
+    /// next read reaches the forge again (a `NotFound`, then a rate-limit
+    /// error mapped to `Error::RateLimited`, neither poisons the cache).
+    #[intent_test_macros::daemon_test]
+    async fn github_issues_get_never_caches_errors() {
+        let forge = Arc::new(StubForge {
+            missing_issue: Some(404),
+            ..Default::default()
+        });
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+
+        for _ in 0..2 {
+            let err = svc
+                .github_issues_get("o".into(), "r".into(), 404)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Internal(_)), "{err:?}");
+        }
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![404, 404]);
+        assert_eq!(svc.issue_cache_len(), 0, "a failed read is never cached");
+        assert!(!svc.issue_cached(&RepoRef::new("o", "r"), 404));
+
+        let quota = Arc::new(StubForge {
+            rate_limited: true,
+            ..Default::default()
+        });
+        let (_t2, svc2, _ws2) = setup_with_shared(quota.clone(), false).await;
+        let err = svc2
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::RateLimited(_)), "{err:?}");
+        assert_eq!(svc2.issue_cache_len(), 0);
+    }
+
+    /// Retention mirrors the PR cache's unmonitored policy: the map is
+    /// bounded by [`crate::issue_cache::ISSUE_CACHE_MAX_ENTRIES`] on every
+    /// write (oldest fetch evicted first), and an entry idle past
+    /// [`crate::issue_cache::ISSUE_CACHE_MAX_IDLE`] is dropped by the next
+    /// write.
+    #[intent_test_macros::daemon_test]
+    async fn the_issue_cache_is_bounded_and_expires_idle_entries_on_write() {
+        use crate::issue_cache::{ISSUE_CACHE_MAX_ENTRIES, ISSUE_CACHE_MAX_IDLE};
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let repo = RepoRef::new("o", "r");
+
+        let oldest = 1_000_u64;
+        svc.github_issues_get("o".into(), "r".into(), oldest)
+            .await
+            .unwrap();
+        svc.backdate_issue_cache(std::time::Duration::from_secs(30));
+        let overflow = 8;
+        for written in 1..=ISSUE_CACHE_MAX_ENTRIES + overflow {
+            let number = written as u64;
+            svc.github_issues_get("o".into(), "r".into(), number)
+                .await
+                .unwrap();
+            assert_eq!(
+                svc.issue_cache_len(),
+                (written + 1).min(ISSUE_CACHE_MAX_ENTRIES),
+                "bounded after write #{number}"
+            );
+        }
+        assert!(
+            !svc.issue_cached(&repo, oldest),
+            "the oldest fetch went first"
+        );
+        for number in 1..=overflow as u64 {
+            assert!(
+                !svc.issue_cached(&repo, number),
+                "#{number} was evicted in fetch order"
+            );
+        }
+        assert!(svc.issue_cached(&repo, (ISSUE_CACHE_MAX_ENTRIES + overflow) as u64));
+
+        svc.backdate_issue_cache(ISSUE_CACHE_MAX_IDLE + std::time::Duration::from_secs(1));
+        svc.github_issues_get("o".into(), "r".into(), oldest)
+            .await
+            .unwrap();
+        assert_eq!(svc.issue_cache_len(), 1, "only the fresh write survives");
+        assert!(svc.issue_cached(&repo, oldest));
     }
 
     #[intent_test_macros::daemon_test]
