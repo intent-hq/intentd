@@ -39770,6 +39770,194 @@ async fn retire_settles_hook_deferred_watch_with_retired_notice() {
     );
 }
 
+/// Which archive-swept watches the monitoring-idle child owns in
+/// [`archive_keeps_deferred_watch_armed_until_the_childs_real_turn_ends`].
+#[derive(Clone, Copy)]
+enum ArchivedWatches {
+    HookOnly,
+    MonitorOnly,
+    Mixed,
+}
+
+/// Archive sweep vs a completion watch deferred on a monitoring-idle child
+/// (PR #2074 review): the per-item cancels must NOT run the deferral
+/// backstop — on the child's last hook/monitor it would see an empty queue
+/// and no remaining watches and synthesize a genuine completion, consuming
+/// the parent's watch BEFORE the consolidated archive notice is queued. The
+/// tail queues the notice first and runs the backstop after it, so the
+/// watch stays armed (ready-to-send defers, as behind the retired per-item
+/// wakes), the parent hears nothing, and exactly one consolidated wake is
+/// parked for the child. After unarchive drains the notice and the child's
+/// real turn ends, the parent's completion fires — waiting semantics
+/// unchanged, only the owner notification changed.
+async fn archive_keeps_deferred_watch_armed_until_the_childs_real_turn_ends(
+    watches: ArchivedWatches,
+) {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let hook = match watches {
+        ArchivedWatches::HookOnly | ArchivedWatches::Mixed => {
+            Some(seed_active_hook(&svc, &ws, &child, "ci-poll").await)
+        }
+        ArchivedWatches::MonitorOnly => None,
+    };
+    let monitor = match watches {
+        ArchivedWatches::MonitorOnly | ArchivedWatches::Mixed => {
+            Some(seed_active_pr_monitor(&svc, &ws, &child, 7).await)
+        }
+        ArchivedWatches::HookOnly => None,
+    };
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    // Advisory already delivered this episode, so the child's monitoring
+    // idle defers silently — interim-skip marker recorded, no wake, watch
+    // armed.
+    svc.store()
+        .record_advisory_wake_delivery(&parent, &child, &now_iso())
+        .await
+        .expect("seed advisory marker");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "idle deferred while the watches are active"
+    );
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    svc.archive_workspace(ws.clone(), None)
+        .await
+        .expect("archive");
+
+    // The swept rows are cancelled...
+    if let Some(hook) = &hook {
+        let row = svc.store().get_hook(&hook.hook_id).await.expect("hook");
+        assert_eq!(row.state, intent_core::HookState::Cancelled);
+    }
+    if let Some(monitor) = &monitor {
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .expect("monitor");
+        assert_eq!(row.state, intent_core::PrMonitorState::Cancelled);
+    }
+    // ...the parent's watch is still armed and the parent heard nothing —
+    // no completion wake persisted, none parked in its queue...
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "archive must not consume the deferred completion watch"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no completion wake for the parent at archive time"
+    );
+    assert!(
+        svc.queue_snapshot(&parent).is_empty(),
+        "no completion wake parked for the parent: {:?}",
+        svc.queue_snapshot(&parent)
+    );
+    // ...and exactly ONE consolidated owner wake is parked for the child.
+    let parked = svc.queue_snapshot(&child);
+    assert_eq!(
+        parked.len(),
+        1,
+        "one consolidated wake parked behind the archived gate: {parked:?}"
+    );
+    let notice = parked[0]["content"].as_str().expect("wake content");
+    assert!(
+        notice.contains("This workspace was archived and has since been unarchived"),
+        "{notice}"
+    );
+    if hook.is_some() {
+        assert!(notice.contains("hook \"ci-poll\""), "{notice}");
+    } else {
+        assert!(!notice.contains("hook "), "{notice}");
+    }
+    if monitor.is_some() {
+        assert!(notice.contains("PR monitor acme/widgets#7"), "{notice}");
+    } else {
+        assert!(!notice.contains("PR monitor"), "{notice}");
+    }
+
+    // Unarchive: the drain kick delivers the parked notice to the child
+    // (its wake turn starts), the watch is still armed.
+    svc.unarchive_workspace(ws.clone())
+        .await
+        .expect("unarchive");
+    assert!(
+        svc.queue_snapshot(&child).is_empty(),
+        "unarchive's drain kick delivers the parked notice"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "delivering the notice does not settle the watch"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // The child's real turn ends with no active watches left: that idle is
+    // its genuine completion and the still-armed watch fires exactly once.
+    // (Tear the child's wake-turn worker down first — its spawn attempt
+    // errors without a provider but holds the busy slot meanwhile.)
+    manager.stop(&child).await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "re-armed what still mattered" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "the parent's completion fires once the child's real turn ends"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("completed"), "completion wording: {text}");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "the watch retires at the real completion"
+    );
+    manager.stop(&parent).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn archive_keeps_hook_deferred_watch_armed_until_real_turn_ends() {
+    archive_keeps_deferred_watch_armed_until_the_childs_real_turn_ends(ArchivedWatches::HookOnly)
+        .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn archive_keeps_monitor_deferred_watch_armed_until_real_turn_ends() {
+    archive_keeps_deferred_watch_armed_until_the_childs_real_turn_ends(
+        ArchivedWatches::MonitorOnly,
+    )
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn archive_keeps_mixed_deferred_watch_armed_until_real_turn_ends() {
+    archive_keeps_deferred_watch_armed_until_the_childs_real_turn_ends(ArchivedWatches::Mixed)
+        .await;
+}
+
 /// Cross-workspace cascade at the services level: a settled descendant
 /// living in a DIFFERENT workspace retires with the parent — its active
 /// hook and PR monitor are cancelled, its watcher resolves with the retired

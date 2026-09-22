@@ -21458,12 +21458,15 @@ impl WorkspaceApi for Services {
                 // signal.
                 let cancelled_monitors = this.cancel_workspace_pr_monitors(&id).await;
                 // ONE consolidated wake per affected owner naming every hook
-                // and monitor the two sweeps cancelled. Runs AFTER the
-                // archived row is persisted so the wake parks behind the
-                // archived gate in `deliver_wake_message` (queued at most, no
-                // turn spawned) — the same reason the interrupt sweep above
-                // runs post-persist — and is only ever read after unarchive,
-                // which is the moment its wording is written for.
+                // and monitor the two sweeps cancelled, THEN the owner's
+                // deferral backstop (the per-item cancels above skipped it so
+                // a deferred completion watch stays armed behind the queued
+                // notice). Runs AFTER the archived row is persisted so the
+                // wake parks behind the archived gate in
+                // `deliver_wake_message` (queued at most, no turn spawned) —
+                // the same reason the interrupt sweep above runs post-persist
+                // — and is only ever read after unarchive, which is the
+                // moment its wording is written for.
                 this.notify_owners_of_archived_watches(&id, cancelled_hooks, cancelled_monitors)
                     .await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
@@ -32156,11 +32159,21 @@ impl Services {
     /// — parked in the queue, delivered by the unarchive drain kick
     /// ([`Services::unarchive_workspace_inner`]) or folded into the combined
     /// turn of a post-archive user send — so the notice is only ever read
-    /// after the workspace is Active again, and its wording says so. The
-    /// per-item cancels already ran the deferral backstop
-    /// ([`Services::redeliver_completion_after_queue_mutation`]) for each
-    /// owner. Best-effort per agent: a delivery failure is logged and the
-    /// tail moves on — the cancels themselves already persisted.
+    /// after the workspace is Active again, and its wording says so.
+    ///
+    /// The per-item cancels were DEFERRED
+    /// ([`crate::hook_manager::CancelSettlement::Deferred`]): none ran the
+    /// deferral backstop, so this tail runs
+    /// [`Services::redeliver_completion_after_queue_mutation`] once per
+    /// owner AFTER queueing its wake — on delivery failure too. Ordering is
+    /// the point: a completion watch deferred on a monitoring-idle owner
+    /// must find the queued notice (ready-to-send → the backstop defers,
+    /// exactly as it did behind the retired per-item wakes) and stay armed
+    /// for the owner's real turn after unarchive, not be consumed by a
+    /// synthesized completion the final per-item cancel would otherwise
+    /// produce against an empty queue. Best-effort per agent: a delivery
+    /// failure is logged and the tail moves on — the cancels themselves
+    /// already persisted.
     async fn notify_owners_of_archived_watches(
         &self,
         workspace_id: &WorkspaceId,
@@ -32198,6 +32211,7 @@ impl Services {
                     "archive sweep: consolidated watch-cancel wake delivery failed"
                 );
             }
+            self.redeliver_completion_after_queue_mutation(owner).await;
         }
     }
 

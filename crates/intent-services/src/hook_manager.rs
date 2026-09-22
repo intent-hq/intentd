@@ -123,6 +123,28 @@ const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 /// appended to that run's logs.
 const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
 
+/// How a cancel transition ([`Services::cancel_active_hook`],
+/// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
+/// completion watches. A completion watch on an idle owner defers while the
+/// owner has active hooks / PR monitors, so cancelling the LAST one must
+/// re-run the deferral backstop
+/// ([`Services::redeliver_completion_after_queue_mutation`]) — either
+/// through a wake or directly — or the watch strands forever.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CancelSettlement<'a> {
+    /// Wake the owner with this notice; the wake runs the backstop itself
+    /// after the delivery attempt (FE/app cancel).
+    Notify(&'a str),
+    /// No wake; run the backstop directly (owner-side cancel, retire sweep).
+    Resettle,
+    /// Neither: the caller sweeps several items and runs the backstop ONCE
+    /// per owner after queueing its consolidated wake (archive sweep). The
+    /// per-item backstop would otherwise see an empty queue and no remaining
+    /// watches on the final item and synthesize a genuine completion,
+    /// consuming a parent's watch BEFORE the consolidated notice is queued.
+    Deferred,
+}
+
 /// Cap (in chars) on the `message` a dispatching run returns and on the error
 /// text an eviction wake carries. Longer text is head-kept and tail-marked
 /// before framing, so the hook-supplied part of a wake stays bounded. The
@@ -1293,21 +1315,26 @@ impl Services {
         let notice = caller
             .is_none()
             .then(|| crate::harness::latest().hook_cancelled_from_app_notice());
-        let hook = self.cancel_active_hook(hook, notice.as_deref()).await?;
+        let settlement = match notice.as_deref() {
+            Some(notice) => CancelSettlement::Notify(notice),
+            None => CancelSettlement::Resettle,
+        };
+        let hook = self.cancel_active_hook(hook, settlement).await?;
         Ok(json!({ "ok": true, "hook": hook }))
     }
 
     /// Core cancel transition shared by [`Services::hook_cancel_op`] and the
     /// archive / retire sweeps ([`Services::cancel_workspace_hooks`],
     /// [`Services::cancel_agent_hooks`]): abort the scheduler task, persist
-    /// `cancelled`, clear `nextRunAt`, and emit `hook:cancelled`. With a
-    /// `wake_notice` the owner is woken (the wake runs the deferral backstop
-    /// itself, inside `wake_hook_owner`, after the delivery attempt);
-    /// without one, no wake is delivered — a deferred completion watch on
-    /// the (idle) owner would otherwise never settle when this was its last
-    /// active hook, so the backstop runs directly. The caller must have
-    /// verified the hook is ACTIVE.
-    async fn cancel_active_hook(&self, mut hook: Hook, wake_notice: Option<&str>) -> Result<Hook> {
+    /// `cancelled`, clear `nextRunAt`, and emit `hook:cancelled`. How the
+    /// owner's deferred completion watches settle is the caller's
+    /// [`CancelSettlement`] choice. The caller must have verified the hook
+    /// is ACTIVE.
+    async fn cancel_active_hook(
+        &self,
+        mut hook: Hook,
+        settlement: CancelSettlement<'_>,
+    ) -> Result<Hook> {
         self.abort_hook_task(&hook.hook_id);
         self.store
             .update_hook_state(&hook.hook_id, HookState::Cancelled)
@@ -1316,9 +1343,12 @@ impl Services {
         hook.state = HookState::Cancelled;
         hook.next_run_at = None;
         self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
-        match wake_notice {
-            Some(notice) => self.wake_hook_owner(&hook, notice, "cancelled").await,
-            None => self.resettle_owner_after_hook_terminal(&hook).await,
+        match settlement {
+            CancelSettlement::Notify(notice) => {
+                self.wake_hook_owner(&hook, notice, "cancelled").await;
+            }
+            CancelSettlement::Resettle => self.resettle_owner_after_hook_terminal(&hook).await,
+            CancelSettlement::Deferred => {}
         }
         // The last active hook settling can demote the derived displayStatus
         // (§6.5) and drop the orthogonal `waiting` flag (§5.1) —
@@ -1333,11 +1363,15 @@ impl Services {
     /// (`scheduled`/`running`) hook in the workspace through the shared
     /// cancel transition ([`Services::cancel_active_hook`]) — task aborted,
     /// state persisted to `cancelled`, `hook:cancelled` emitted, waiting
-    /// recomputed (§5.1). Each cancel is SILENT (no per-hook wake, like the
-    /// retire sweep): the cancelled hooks are returned grouped by owner as
-    /// `(name, hook_id)` pairs, and the archive tail
+    /// recomputed (§5.1). Each cancel is SILENT (no per-hook wake) and
+    /// DEFERRED ([`CancelSettlement::Deferred`]: no per-item completion
+    /// backstop either): the cancelled hooks are returned grouped by owner
+    /// as `(name, hook_id)` pairs, and the archive tail
     /// ([`crate::Services::notify_owners_of_archived_watches`]) folds them
-    /// with the swept PR monitors into ONE consolidated notice per agent.
+    /// with the swept PR monitors into ONE consolidated notice per agent and
+    /// only THEN runs the backstop — so a completion watch deferred on a
+    /// monitoring-idle owner sees the queued notice and stays armed, exactly
+    /// as it did behind the retired per-item wakes.
     /// Terminal hooks (`dispatched`/`evicted`/`cancelled`/`expired`) are
     /// untouched, and unarchive does NOT resurrect cancelled hooks — the
     /// notice tells the owner to reschedule if the condition still matters.
@@ -1364,7 +1398,10 @@ impl Services {
                 continue;
             }
             let hook_id = hook.hook_id.clone();
-            match self.cancel_active_hook(hook, None).await {
+            match self
+                .cancel_active_hook(hook, CancelSettlement::Deferred)
+                .await
+            {
                 Ok(hook) => cancelled
                     .entry(hook.agent_id)
                     .or_default()
@@ -1411,7 +1448,10 @@ impl Services {
                 continue;
             }
             let hook_id = hook.hook_id.clone();
-            if let Err(e) = self.cancel_active_hook(hook, None).await {
+            if let Err(e) = self
+                .cancel_active_hook(hook, CancelSettlement::Resettle)
+                .await
+            {
                 tracing::warn!(
                     agent = %agent_id.0,
                     hook = %hook_id.0,
