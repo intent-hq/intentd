@@ -485,13 +485,23 @@ async fn github_device_flow_full_lifecycle_over_wss() {
     );
     assert_eq!(r["interval"], json!(1));
     assert!(r["expiresIn"].as_u64().expect("expiresIn") > 0);
+    // `flowId` is the opaque cancel handle: a non-empty string that is
+    // neither the device code nor the user code.
+    let flow_id = r["flowId"]
+        .as_str()
+        .expect("flowId is a string")
+        .to_string();
+    assert!(!flow_id.is_empty());
+    assert_ne!(flow_id, "e2e-device-code-opaque");
+    assert_ne!(flow_id, USER_CODE);
     // 🔒 Never the device code or a token on the wire.
     assert!(r.get("deviceCode").is_none());
     assert!(r.get("accessToken").is_none());
 
-    // 2. connect again while pending → the SAME codes (idempotent).
+    // 2. connect again while pending → the SAME codes and flowId (idempotent).
     let v = wss_rpc(&mut rpc, 11, "github.connect", json!({})).await;
     assert_eq!(v["result"]["userCode"], json!(USER_CODE));
+    assert_eq!(v["result"]["flowId"], json!(flow_id));
 
     // 3. authStatus while pending → deviceFlow.status == "pending" and the
     //    verification uri doubles as oauthUrl for existing FE consumers.
@@ -546,9 +556,12 @@ async fn github_device_flow_full_lifecycle_over_wss() {
     assert_eq!(v["result"]["cancelled"], json!(false));
 }
 
-/// Cancelling a pending flow stops the background poll: `cancelAuth` reports
-/// `cancelled: true`, authStatus drops back to `deviceFlow: null`, and a
-/// LATER authorize on the mock must NOT mint a token (the poll task is gone).
+/// Cancelling a pending flow stops the background poll: a `cancelAuth` scoped
+/// to a `flowId` that is not the pending flow's is a no-op (`cancelled:
+/// false`, the flow keeps polling), one scoped to the connect-issued `flowId`
+/// reports `cancelled: true`, authStatus drops back to `deviceFlow: null`,
+/// and a LATER authorize on the mock must NOT mint a token (the poll task is
+/// gone).
 #[tokio::test]
 async fn github_cancel_auth_stops_the_background_poll_over_wss() {
     let mock = spawn_mock_github().await;
@@ -578,12 +591,51 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
 
     let v = wss_rpc(&mut rpc, 10, "github.connect", json!({})).await;
     assert_eq!(v["result"]["ok"], json!(true));
+    let flow_id = v["result"]["flowId"]
+        .as_str()
+        .expect("flowId is a string")
+        .to_string();
 
-    let v = wss_rpc(&mut rpc, 11, "github.cancelAuth", json!({})).await;
+    // A cancel scoped to some other flow's id must not touch this flow.
+    let stale = format!("{flow_id}-stale");
+    let v = wss_rpc(
+        &mut rpc,
+        11,
+        "github.cancelAuth",
+        json!({ "flowId": stale }),
+    )
+    .await;
+    assert_eq!(v["result"]["ok"], json!(true));
+    assert_eq!(v["result"]["cancelled"], json!(false));
+    let v = wss_rpc(&mut rpc, 12, "github.authStatus", json!({})).await;
+    assert_eq!(v["result"]["deviceFlow"]["status"], json!("pending"));
+
+    // A present non-string flowId — an explicit null included — is invalid
+    // params, never a widened cancel: the flow is still pending afterwards.
+    let v = wss_rpc(&mut rpc, 13, "github.cancelAuth", json!({ "flowId": 7 })).await;
+    assert_eq!(v["error"]["code"], json!(-32602));
+    let v = wss_rpc(
+        &mut rpc,
+        14,
+        "github.cancelAuth",
+        json!({ "flowId": Value::Null }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602));
+    let v = wss_rpc(&mut rpc, 15, "github.authStatus", json!({})).await;
+    assert_eq!(v["result"]["deviceFlow"]["status"], json!("pending"));
+
+    let v = wss_rpc(
+        &mut rpc,
+        16,
+        "github.cancelAuth",
+        json!({ "flowId": flow_id }),
+    )
+    .await;
     assert_eq!(v["result"]["ok"], json!(true));
     assert_eq!(v["result"]["cancelled"], json!(true));
 
-    let v = wss_rpc(&mut rpc, 12, "github.authStatus", json!({})).await;
+    let v = wss_rpc(&mut rpc, 17, "github.authStatus", json!({})).await;
     assert_eq!(v["result"]["deviceFlow"], Value::Null);
 
     // Authorize AFTER the cancel: the aborted poll task must never mint the

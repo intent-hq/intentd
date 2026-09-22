@@ -1275,6 +1275,7 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async {
             Ok(serde_json::json!({
                 "ok": true,
+                "flowId": "7",
                 "userCode": "ABCD-1234",
                 "verificationUri": "https://github.com/login/device",
                 "expiresIn": 900,
@@ -1283,8 +1284,13 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async { Ok(serde_json::json!({ "ok": true, "cancelled": true })) })
+    fn github_cancel_auth(&self, flow_id: Option<String>) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "cancelled": flow_id.as_deref().is_none_or(|id| id == "7"),
+            }))
+        })
     }
 
     fn github_revoke(&self) -> BoxFuture<'_, Result<Value>> {
@@ -4964,6 +4970,8 @@ async fn github_auth_status_connect_revoke_get_user_route_without_params() {
         serde_json::json!("https://github.com/login/device")
     );
 
+    assert_eq!(connect["result"]["flowId"], serde_json::json!("7"));
+
     let cancel = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{}}"#)
         .await
         .unwrap();
@@ -4983,6 +4991,44 @@ async fn github_auth_status_connect_revoke_get_user_route_without_params() {
         serde_json::json!("octocat")
     );
     assert!(user["result"]["user"].get("id").is_none());
+}
+
+/// `github.cancelAuth` takes an optional string `flowId`: the connect-issued
+/// id is forwarded verbatim (the stub cancels only its own "7"); only an
+/// OMITTED key is the unscoped cancel, and any present non-string — an
+/// explicit `null` included — is `-32602` rather than silently widening it.
+#[tokio::test]
+async fn github_cancel_auth_forwards_flow_id_and_rejects_non_string() {
+    let own =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{"flowId":"7"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(own["result"]["cancelled"], serde_json::json!(true));
+
+    let other =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{"flowId":"6"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(other["result"]["ok"], serde_json::json!(true));
+    assert_eq!(other["result"]["cancelled"], serde_json::json!(false));
+
+    let omitted = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(omitted["result"]["cancelled"], serde_json::json!(true));
+
+    for bad in ["null", "7", "true", "{}", r#"["7"]"#] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{{"flowId":{bad}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "flowId {bad}: {v}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("flowId must be a string")
+        );
+    }
 }
 
 #[tokio::test]
