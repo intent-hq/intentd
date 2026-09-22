@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.97] - 2026-09-22
+
+### 🚀 Features
+
+- *(workspace)* Surface setup-script state to agents ([#2075](https://github.com/intent-hq/intentd/pull/2075))
+
+### 🐛 Bug Fixes
+
+- *(pr)* Derive the pool-path pr_queued from a persisted isInMergeQueue ([#2079](https://github.com/intent-hq/intentd/pull/2079))
+
+### 🔧 Refactor
+
+- Share source-lint scaffolding across *_lint.rs tests ([#2078](https://github.com/intent-hq/intentd/pull/2078))
+
+### 🧪 Testing
+
+- *(agent)* Table-driven queue visibility contract and egress lint ([#2081](https://github.com/intent-hq/intentd/pull/2081))
+- *(e2e)* Make uds_integration and the WSS tool-result-ids suite hermetic to host GitHub identity ([#2077](https://github.com/intent-hq/intentd/pull/2077))
+- *(e2e)* Decouple spawn-retry WSS suite from host Node startup latency ([#2080](https://github.com/intent-hq/intentd/pull/2080))
+
+
 ## [0.9.96] - 2026-09-22
 
 ### 🚀 Features
