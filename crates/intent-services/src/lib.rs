@@ -956,10 +956,11 @@ pub struct Services {
     /// envelope); unset means no `url` is stamped. Shared across clones.
     invite_links: Arc<OnceLock<Arc<dyn intent_core::InviteLinkBuilder>>>,
     /// In-memory watermark cache for incremental token-usage scanning (finding F2).
-    /// Maps `workspace_id` → `agent_message` count. When the watermark is unchanged
+    /// Maps `workspace_id` → (`agent_message` count, transcript mutation epoch).
+    /// When both are unchanged
     /// since the last scan, the workspace is skipped. A restart rescans once.
     /// Shared across clones so every scan tick observes the same watermark state.
-    token_usage_watermarks: Arc<Mutex<HashMap<WorkspaceId, u64>>>,
+    token_usage_watermarks: Arc<Mutex<HashMap<WorkspaceId, (u64, u64)>>>,
     /// The single in-flight (or last-terminal) GitHub device-flow slot backing
     /// `github.connect` / `github.cancelAuth` / `github.authStatus` (§5.27).
     /// At most one flow exists at a time; a `connect` while one is pending
@@ -5523,11 +5524,16 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<bool> {
-        // Cheap change detection: skip when the watermark is unchanged (finding F2).
-        let current_watermark = self
+        // Reuse the existing per-workspace mutation revision: replacement or
+        // delete+append can change provenance without changing COUNT(*).
+        // Capture BEFORE awaiting reads/recompute. A concurrent invalidation
+        // must remain visible to the next scan, not be consumed by this one.
+        let epoch = self.agent_list_cache.current_epoch(&workspace_id.0);
+        let message_count = self
             .store
             .get_workspace_message_watermark(workspace_id)
             .await?;
+        let current_watermark = (message_count, epoch);
         let last_watermark = self
             .token_usage_watermarks
             .lock()
@@ -5536,7 +5542,7 @@ impl Services {
             .copied();
         if let Some(last) = last_watermark {
             if last == current_watermark {
-                // No messages added/removed since last scan — skip tallying.
+                // No count change or service transcript mutation — skip tallying.
                 return Ok(false);
             }
         }

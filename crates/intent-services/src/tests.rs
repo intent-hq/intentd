@@ -39365,7 +39365,7 @@ mod last_activity_events {
             .get(&h.ws)
             .copied()
             .expect("watermark set after first scan");
-        assert_eq!(watermark1, 1, "watermark should be 1 after one message");
+        assert_eq!(watermark1.0, 1, "watermark should be 1 after one message");
 
         let changed2 = h
             .services
@@ -39406,7 +39406,7 @@ mod last_activity_events {
             .get(&h.ws)
             .copied()
             .expect("watermark 1");
-        assert_eq!(watermark1, 1, "one message");
+        assert_eq!(watermark1.0, 1, "one message");
 
         let usage2 = serde_json::json!({ "usage": { "inputTokens": 20, "outputTokens": 10 } });
         h.store
@@ -39429,7 +39429,7 @@ mod last_activity_events {
             .get(&h.ws)
             .copied()
             .expect("watermark 2");
-        assert_eq!(watermark2, 2, "two messages");
+        assert_eq!(watermark2.0, 2, "two messages");
 
         let ws = h.store.get_workspace(&h.ws).await.unwrap();
         let usage = ws.token_usage.expect("usage persisted");
@@ -40250,12 +40250,12 @@ mod turn_token_usage {
     use crate::{EventBus, Subscription, SubscriptionFilter};
     use intent_acp::session::Usage;
     use intent_core::events::WORKSPACE_TOKEN_USAGE_CHANGED;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::time::Duration;
     use tokio::time::timeout;
 
     struct Harness {
-        _tmp: TempDb,
+        tmp: TempDb,
         store: Store,
         services: Services,
         bus: EventBus,
@@ -40273,7 +40273,7 @@ mod turn_token_usage {
         let bus = EventBus::new(store.clone());
         let services = Services::new(store.clone()).with_event_bus(bus.clone());
         Harness {
-            _tmp: tmp,
+            tmp,
             store,
             services,
             bus,
@@ -40359,6 +40359,205 @@ mod turn_token_usage {
             retired_at: None,
             notifications_muted: false,
         }
+    }
+
+    #[tokio::test]
+    async fn token_scan_observes_same_length_role_and_model_replacements() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .unwrap();
+        h.services
+            .agent_append_message_op(agent.clone(), "user".into(), json!([]), None)
+            .await
+            .unwrap();
+        assert!(h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        let original_watermark = h.services.token_usage_watermarks.lock().unwrap()[&h.ws];
+        let initial = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let initial_cells = initial.by_agent_model.unwrap();
+        assert_eq!(
+            (
+                initial_cells[0].human_messages,
+                initial_cells[0].agent_messages
+            ),
+            (1, 0)
+        );
+
+        // The role changes first; then only the model changes. Both mutations
+        // retain COUNT(*) = 1, and neither waits for another ACP turn.
+        for model in ["model-a", "model-b"] {
+            h.store
+                .set_agent_session_model(&h.ws, &agent, model, None, &now_iso())
+                .await
+                .unwrap();
+            h.services
+                .agent_replace_messages_op(
+                    agent.clone(),
+                    json!([{
+                        "role":"assistant", "contentBlocks":[{"type":"text","text":model}]
+                    }]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                h.store
+                    .get_workspace_message_watermark(&h.ws)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let mut sub = subscribe_usage(&h);
+            assert!(h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+            let event = recv_usage_event(&mut sub).await;
+            assert_eq!(
+                event["data"]["tokenUsage"]["byAgentModel"][0]["model"],
+                model
+            );
+            let usage = h
+                .store
+                .get_workspace(&h.ws)
+                .await
+                .unwrap()
+                .token_usage
+                .unwrap();
+            let cells = usage.by_agent_model.unwrap();
+            assert_eq!(cells.len(), 1);
+            assert_eq!(cells[0].model, model);
+            assert_eq!((cells[0].human_messages, cells[0].agent_messages), (0, 1));
+            assert_eq!(usage.totals, intent_core::TokenUsageTotals::default());
+            let watermark = h.services.token_usage_watermarks.lock().unwrap()[&h.ws];
+            assert_eq!(watermark.0, original_watermark.0);
+            assert_ne!(watermark.1, original_watermark.1);
+            assert!(
+                !h.services.scan_workspace_token_usage(&h.ws).await.unwrap(),
+                "unchanged scan still skips"
+            );
+        }
+
+        // A committed mutation just before shutdown must be caught by the
+        // first rehydrated scan even though process-local epochs start empty.
+        h.services
+            .agent_replace_messages_op(
+                agent.clone(),
+                json!([{
+                    "role":"user", "contentBlocks":[]
+                }]),
+            )
+            .await
+            .unwrap();
+        h.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        let services = Services::new(reopened.clone());
+        assert!(services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        let usage = reopened
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let cells = usage.by_agent_model.unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].model, "model-b");
+        assert_eq!((cells[0].human_messages, cells[0].agent_messages), (1, 0));
+        assert!(!services.scan_workspace_token_usage(&h.ws).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn token_scan_observes_edit_truncate_then_append_at_unchanged_count() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .unwrap();
+        for role in ["user", "assistant", "user", "assistant"] {
+            h.services
+                .agent_append_message_op(agent.clone(), role.into(), json!([]), None)
+                .await
+                .unwrap();
+        }
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 20, 0, 0)), None)
+            .await;
+        h.services.scan_workspace_token_usage(&h.ws).await.unwrap();
+        let before = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let old_watermark = h.services.token_usage_watermarks.lock().unwrap()[&h.ws];
+        let messages = h.store.get_agent_messages(&agent, None).await.unwrap();
+        assert_eq!(
+            h.services
+                .agent_edit_truncate_op(&agent, &messages[2].id)
+                .await
+                .unwrap(),
+            2
+        );
+        h.store
+            .set_agent_session_model(&h.ws, &agent, "model-b", None, &now_iso())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            h.services
+                .agent_append_message_op(agent.clone(), "assistant".into(), json!([]), None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            h.store
+                .get_workspace_message_watermark(&h.ws)
+                .await
+                .unwrap(),
+            old_watermark.0
+        );
+        let mut sub = subscribe_usage(&h);
+        assert!(h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        recv_usage_event(&mut sub).await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        assert_eq!(
+            usage.totals, before.totals,
+            "edit never reduces historical spend"
+        );
+        let cells = usage.by_agent_model.unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].model, "model-a");
+        assert_eq!((cells[0].human_messages, cells[0].agent_messages), (1, 1));
+        assert_eq!(cells[1].model, "model-b");
+        assert_eq!((cells[1].human_messages, cells[1].agent_messages), (0, 2));
+        assert_eq!(cells[1].totals, intent_core::TokenUsageTotals::default());
+        assert!(!h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        h.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        let services = Services::new(reopened.clone());
+        assert!(!services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        assert_eq!(
+            reopened
+                .get_workspace(&h.ws)
+                .await
+                .unwrap()
+                .token_usage
+                .unwrap()
+                .by_agent_model
+                .unwrap(),
+            cells
+        );
     }
 
     /// Two turns on the same session: the workspace tally equals the LATEST

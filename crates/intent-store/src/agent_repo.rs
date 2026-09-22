@@ -522,6 +522,85 @@ pub(crate) async fn fetch_agent_usage_rows(
     Ok(result)
 }
 
+/// Consume downward cumulative-report corrections from existing contributions,
+/// never from a newly inserted cell. Prefer the reporting model; if it cannot
+/// cover the correction (e.g. a switch before its first report), consume the
+/// remainder in stable model order. No provenance is moved between models or
+/// currencies. Only corrections pay this O(model cells) cost.
+async fn subtract_usage_cell_corrections(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    agent_id: &AgentId,
+    model: &str,
+    deltas: [i64; 5],
+    mut cost_corrections: std::collections::BTreeMap<String, f64>,
+) -> Result<()> {
+    let mut remaining = deltas.map(|delta| delta.saturating_neg().max(0));
+    if remaining == [0; 5] && cost_corrections.is_empty() {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT model, input_tokens, output_tokens, cache_read_tokens, \
+         cache_creation_tokens, thought_tokens, costs_json FROM agent_usage_cell \
+         WHERE agent_id=? ORDER BY (model=?) DESC, model",
+    )
+    .bind(&agent_id.0)
+    .bind(model)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| Error::Internal(format!("read usage corrections failed: {e}")))?;
+    for row in rows {
+        let mut counters = [
+            row.get::<i64, _>("input_tokens"),
+            row.get("output_tokens"),
+            row.get("cache_read_tokens"),
+            row.get("cache_creation_tokens"),
+            row.get("thought_tokens"),
+        ];
+        let mut changed = false;
+        for (counter, remainder) in counters.iter_mut().zip(&mut remaining) {
+            let correction = (*counter).max(0).min(*remainder);
+            *counter -= correction;
+            *remainder -= correction;
+            changed |= correction != 0;
+        }
+        let mut costs: std::collections::BTreeMap<String, f64> =
+            serde_json::from_str(&row.get::<String, _>("costs_json")).unwrap_or_default();
+        for (currency, remainder) in &mut cost_corrections {
+            if let Some(amount) = costs.get_mut(currency) {
+                let correction = amount.max(0.0).min(*remainder);
+                *amount -= correction;
+                *remainder -= correction;
+                changed |= correction != 0.0;
+            }
+        }
+        if changed {
+            costs.retain(|_, amount| *amount > 0.0);
+            let costs_json = serde_json::to_string(&costs)
+                .map_err(|e| Error::Internal(format!("encode usage corrections failed: {e}")))?;
+            sqlx::query(
+                "UPDATE agent_usage_cell SET input_tokens=?, output_tokens=?, \
+                 cache_read_tokens=?, cache_creation_tokens=?, thought_tokens=?, costs_json=? \
+                 WHERE agent_id=? AND model=?",
+            )
+            .bind(counters[0])
+            .bind(counters[1])
+            .bind(counters[2])
+            .bind(counters[3])
+            .bind(counters[4])
+            .bind(costs_json)
+            .bind(&agent_id.0)
+            .bind(row.get::<String, _>("model"))
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Error::Internal(format!("subtract usage corrections failed: {e}")))?;
+        }
+        if remaining == [0; 5] && cost_corrections.values().all(|amount| *amount == 0.0) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Interrupted agent record (INT-41). Returned by
 /// [`Store::list_interrupted_agents`], joined with `agent_session` and workspace.
 #[derive(Debug, Clone)]
@@ -2013,6 +2092,37 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("seed legacy usage cell failed: {e}")))?;
             }
+            let delta = |new: u64, old: u64| {
+                if new >= old {
+                    i64::try_from(new - old).unwrap_or(i64::MAX)
+                } else {
+                    -i64::try_from(old - new).unwrap_or(i64::MAX)
+                }
+            };
+            let deltas = [
+                delta(snapshot.input_tokens, previous.input_tokens),
+                delta(snapshot.output_tokens, previous.output_tokens),
+                delta(snapshot.cache_read_tokens, previous.cache_read_tokens),
+                delta(
+                    snapshot.cache_creation_tokens,
+                    previous.cache_creation_tokens,
+                ),
+                delta(snapshot.thought_tokens, previous.thought_tokens),
+            ];
+            let cost_delta = match (previous.cost.as_ref(), snapshot.cost.as_ref()) {
+                (Some(old), Some(new)) if old.currency == new.currency => new.amount - old.amount,
+                (_, Some(new)) => new.amount,
+                _ => 0.0,
+            };
+            let mut cost_corrections = std::collections::BTreeMap::new();
+            if let (Some(old), Some(new)) = (previous.cost.as_ref(), snapshot.cost.as_ref()) {
+                if old.currency != new.currency {
+                    cost_corrections.insert(old.currency.clone(), old.amount.max(0.0));
+                } else if cost_delta < 0.0 {
+                    cost_corrections.insert(old.currency.clone(), -cost_delta);
+                }
+            }
+            subtract_usage_cell_corrections(&mut tx, id, &model, deltas, cost_corrections).await?;
             let costs_raw =
                 sqlx::query("SELECT costs_json FROM agent_usage_cell WHERE agent_id=? AND model=?")
                     .bind(&id.0)
@@ -2025,39 +2135,17 @@ impl Store {
                 .as_deref()
                 .and_then(|raw| serde_json::from_str(raw).ok())
                 .unwrap_or_default();
-            if let (Some(old), Some(new)) = (previous.cost.as_ref(), snapshot.cost.as_ref()) {
-                if old.currency != new.currency {
-                    let total = costs.entry(old.currency.clone()).or_default();
-                    *total = (*total - old.amount).max(0.0);
-                }
-            }
-            let cost_delta = match (previous.cost.as_ref(), snapshot.cost.as_ref()) {
-                (Some(old), Some(new)) if old.currency == new.currency => new.amount - old.amount,
-                (_, Some(new)) => new.amount,
-                _ => 0.0,
-            };
-            if let Some(new) = snapshot.cost.as_ref().filter(|_| cost_delta != 0.0) {
+            if let Some(new) = snapshot.cost.as_ref().filter(|_| cost_delta > 0.0) {
                 let total = costs.entry(new.currency.clone()).or_default();
                 *total = (*total + cost_delta).max(0.0);
             }
             costs.retain(|_, amount| *amount > 0.0);
             let costs_json = serde_json::to_string(&costs)
                 .map_err(|e| Error::Internal(format!("encode usage-cell costs failed: {e}")))?;
-            let delta = |new: u64, old: u64| {
-                if new >= old {
-                    i64::try_from(new - old).unwrap_or(i64::MAX)
-                } else {
-                    -i64::try_from(old - new).unwrap_or(i64::MAX)
-                }
-            };
-            let input_delta = delta(snapshot.input_tokens, previous.input_tokens);
-            let output_delta = delta(snapshot.output_tokens, previous.output_tokens);
-            let cache_read_delta = delta(snapshot.cache_read_tokens, previous.cache_read_tokens);
-            let cache_creation_delta = delta(
-                snapshot.cache_creation_tokens,
-                previous.cache_creation_tokens,
-            );
-            let thought_delta = delta(snapshot.thought_tokens, previous.thought_tokens);
+            // Corrections were consumed above in this transaction. INSERT and
+            // ON CONFLICT now receive the same non-negative increments.
+            let [input_delta, output_delta, cache_read_delta, cache_creation_delta, thought_delta] =
+                deltas.map(|value| value.max(0));
             sqlx::query(
                 "INSERT INTO agent_usage_cell (agent_id, model, input_tokens, output_tokens, \
                  cache_read_tokens, cache_creation_tokens, thought_tokens, costs_json) \
@@ -5811,6 +5899,36 @@ impl Store {
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("truncate agent messages begin failed: {e}"))
             })?;
+            // Count only the suffix being deleted, using the same persisted
+            // provenance as append/replacement. Historical token spend and
+            // costs survive transcript edits, including cells reduced to zero
+            // messages. This projection never hydrates message bodies.
+            let counts = sqlx::query(
+                "SELECT COALESCE(NULLIF(usage_model,''),'unknown') AS model, \
+                 SUM(usage_origin='human') AS human, SUM(usage_origin='agent') AS agent \
+                 FROM agent_message WHERE agent_id=? AND seq>=? \
+                 AND usage_origin IN ('human','agent') GROUP BY model",
+            )
+            .bind(&agent_id.0)
+            .bind(first_dropped_seq)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("read truncated usage counts failed: {e}")))?;
+            for row in counts {
+                sqlx::query(
+                    "UPDATE agent_usage_cell SET human_messages=MAX(0,human_messages-?), \
+                     agent_messages=MAX(0,agent_messages-?) WHERE agent_id=? AND model=?",
+                )
+                .bind(row.get::<i64, _>("human"))
+                .bind(row.get::<i64, _>("agent"))
+                .bind(&agent_id.0)
+                .bind(row.get::<String, _>("model"))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("subtract truncated usage counts failed: {e}"))
+                })?;
+            }
             let deleted = sqlx::query("DELETE FROM agent_message WHERE agent_id = ? AND seq >= ?")
                 .bind(&agent_id.0)
                 .bind(first_dropped_seq)
@@ -7262,6 +7380,236 @@ mod tests {
             .await
             .expect_err("cross-workspace write rejected");
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn negative_first_usage_delta_and_cross_model_corrections_survive_reopen() {
+        let tmp = TempDb::new("test-negative-usage-delta");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId::new();
+        let agent = AgentId::new();
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        let mut session = baseline_test_session(&agent, &ws, &ts, None);
+        session.model = Some("model-a".into());
+        store.insert_agent_session(&session).await.unwrap();
+        let report = |tokens, amount, currency: &str| TokenUsageTotals {
+            input_tokens: tokens,
+            output_tokens: tokens,
+            cache_read_tokens: tokens,
+            cache_creation_tokens: tokens,
+            thought_tokens: tokens,
+            cost: Some(UsageCost {
+                amount,
+                currency: currency.into(),
+            }),
+        };
+        store
+            .set_agent_session_token_usage(&ws, &agent, &report(100, 10.0, "USD"))
+            .await
+            .unwrap();
+        store
+            .set_agent_session_model(&ws, &agent, "model-b", None, &ts)
+            .await
+            .unwrap();
+
+        // The first model-b delta is -20 in every counter, with no cell to
+        // update. Subsequent corrections exhaust b before consuming a.
+        for (tokens, amount, expected_a, expected_b) in
+            [(80, 8.0, 80, 0), (110, 11.0, 80, 30), (70, 7.0, 70, 0)]
+        {
+            let snapshot = report(tokens, amount, "USD");
+            store
+                .set_agent_session_token_usage(&ws, &agent, &snapshot)
+                .await
+                .unwrap();
+            // Repeating a cumulative report must not apply the correction twice.
+            store
+                .set_agent_session_token_usage(&ws, &agent, &snapshot)
+                .await
+                .unwrap();
+            let rows = store.get_workspace_agent_usage_data(&ws).await.unwrap();
+            assert_eq!(rows[0].2.as_ref(), Some(&snapshot));
+            assert_eq!(rows[0].5.len(), 2, "legitimate zero cell is retained");
+            for (cell, expected) in rows[0].5.iter().zip([expected_a, expected_b]) {
+                let totals = &cell.reported_totals;
+                assert_eq!(
+                    [
+                        totals.input_tokens,
+                        totals.output_tokens,
+                        totals.cache_read_tokens,
+                        totals.cache_creation_tokens,
+                        totals.thought_tokens,
+                    ],
+                    [expected; 5]
+                );
+            }
+            let costs: f64 = rows[0]
+                .5
+                .iter()
+                .filter_map(|c| c.reported_totals.cost.as_ref())
+                .map(|c| {
+                    assert_eq!(c.currency, "USD");
+                    c.amount
+                })
+                .sum();
+            assert!((costs - amount).abs() < f64::EPSILON);
+        }
+        // Correct a currency after switching models: do not leave the old
+        // cumulative contribution attached to the previous model.
+        store
+            .set_agent_session_token_usage(&ws, &agent, &report(70, 3.0, "EUR"))
+            .await
+            .unwrap();
+        store.close().await;
+        let reopened = Store::open(&tmp).await.unwrap();
+        let rows = reopened.get_workspace_agent_usage_data(&ws).await.unwrap();
+        assert_eq!(rows[0].5[0].reported_totals.input_tokens, 70);
+        assert_eq!(rows[0].5[0].reported_totals.cost, None);
+        assert_eq!(
+            rows[0].5[1].reported_totals,
+            TokenUsageTotals {
+                cost: Some(UsageCost {
+                    amount: 3.0,
+                    currency: "EUR".into()
+                }),
+                ..Default::default()
+            }
+        );
+        // A real zero report clears contributions, not the row or its identity.
+        reopened
+            .set_agent_session_token_usage(&ws, &agent, &report(0, 0.0, "EUR"))
+            .await
+            .unwrap();
+        let rows = reopened.get_workspace_agent_usage_data(&ws).await.unwrap();
+        assert_eq!(rows[0].5.len(), 2);
+        assert!(rows[0]
+            .5
+            .iter()
+            .all(|c| c.reported_totals == TokenUsageTotals::default()));
+    }
+
+    #[tokio::test]
+    async fn truncate_usage_counts_preserves_spend_and_trusted_prefix_across_reopen() {
+        let tmp = TempDb::new("test-truncate-usage-counts");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId::new();
+        let agent = AgentId::new();
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        let mut session = baseline_test_session(&agent, &ws, &ts, None);
+        session.model = Some("model-a".into());
+        store.insert_agent_session(&session).await.unwrap();
+        let body = serde_json::json!([{"type":"text","text":"message"}]);
+        let spoofed = serde_json::json!({"fromAgentId":"untrusted"});
+        for model in ["model-a", "model-b"] {
+            store
+                .set_agent_session_model(&ws, &agent, model, None, &ts)
+                .await
+                .unwrap();
+            for (suffix, role, origin) in [
+                ("human", "user", UsageMessageOrigin::Human),
+                ("assistant", "assistant", UsageMessageOrigin::Agent),
+                ("agent", "user", UsageMessageOrigin::Agent),
+                ("excluded", "user", UsageMessageOrigin::Excluded),
+            ] {
+                store
+                    .append_agent_message_with_provenance(
+                        &agent,
+                        &format!("{model}-{suffix}"),
+                        role,
+                        &body,
+                        Some(&spoofed),
+                        &ts,
+                        origin,
+                    )
+                    .await
+                    .unwrap();
+            }
+            store
+                .set_agent_session_token_usage(
+                    &ws,
+                    &agent,
+                    &TokenUsageTotals {
+                        input_tokens: if model == "model-a" { 100 } else { 150 },
+                        cost: Some(UsageCost {
+                            amount: if model == "model-a" { 1.0 } else { 1.5 },
+                            currency: "USD".into(),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let before = store.get_workspace_agent_usage_data(&ws).await.unwrap();
+        // Force a failure after count subtraction: both it and the deletion
+        // must roll back as one transaction.
+        sqlx::query("CREATE TRIGGER reject_truncate BEFORE DELETE ON agent_message BEGIN SELECT RAISE(ABORT, 'test rollback'); END")
+            .execute(store.write_pool()).await.unwrap();
+        assert!(store.truncate_agent_messages_from(&agent, 4).await.is_err());
+        let rolled_back = store.get_workspace_agent_usage_data(&ws).await.unwrap();
+        for cell in &rolled_back[0].5 {
+            assert_eq!((cell.human_messages, cell.agent_messages), (1, 2));
+        }
+        assert_eq!(
+            store.get_agent_messages(&agent, None).await.unwrap().len(),
+            8
+        );
+        sqlx::query("DROP TRIGGER reject_truncate")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.truncate_agent_messages_from(&agent, 4).await.unwrap(),
+            4
+        );
+        assert_eq!(
+            store.truncate_agent_messages_from(&agent, 4).await.unwrap(),
+            0
+        );
+        store.close().await;
+        let reopened = Store::open(&tmp).await.unwrap();
+        let rows = reopened.get_workspace_agent_usage_data(&ws).await.unwrap();
+        assert_eq!(rows[0].5.len(), 2);
+        assert_eq!(
+            (rows[0].5[0].human_messages, rows[0].5[0].agent_messages),
+            (1, 2)
+        );
+        assert_eq!(
+            (rows[0].5[1].human_messages, rows[0].5[1].agent_messages),
+            (0, 0)
+        );
+        for (after, before) in rows[0].5.iter().zip(&before[0].5) {
+            assert_eq!(
+                after.reported_totals, before.reported_totals,
+                "edits keep historical spend"
+            );
+        }
+        let kept = reopened.get_agent_messages(&agent, None).await.unwrap();
+        assert_eq!(kept.len(), 4);
+        assert_eq!(kept[2].id, "model-a-agent");
+        assert_eq!(kept[3].id, "model-a-excluded");
+        assert_eq!(
+            reopened
+                .truncate_agent_messages_from(&agent, 0)
+                .await
+                .unwrap(),
+            4
+        );
+        let rows = reopened.get_workspace_agent_usage_data(&ws).await.unwrap();
+        assert!(rows[0]
+            .5
+            .iter()
+            .all(|c| c.human_messages == 0 && c.agent_messages == 0));
+        assert_eq!(rows[0].5[0].reported_totals.input_tokens, 100);
+        assert_eq!(rows[0].5[1].reported_totals.input_tokens, 50);
     }
 
     #[tokio::test]
