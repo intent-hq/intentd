@@ -52,6 +52,7 @@ sqlx.workspace = true
 ctor = "1.0.10"
 image = { version = "0.25.6", default-features = false, features = ["png", "jpeg"] }
 intent-test-macros = { path = "../intent-test-macros" }
+tracing-subscriber.workspace = true
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }

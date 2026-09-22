@@ -2574,8 +2574,10 @@ fn apply_slim_projection(mut message: AgentMessage, thumbnails: Option<&Value>) 
 
 impl Services {
     /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
-    /// the runtime manager's busy set. Only the small busy set reaches `SQLite`,
-    /// and each lookup selects `updated_at` alone.
+    /// the runtime manager's busy set. Only the busy set reaches `SQLite`, in
+    /// ONE batched `updated_at`-only read regardless of how many agents are
+    /// busy (intent-hq/intent#5626 — a per-agent lookup loop tripped the
+    /// `rpc_profile` statement budget on real fan-outs).
     pub(crate) async fn agent_list_active_op(&self) -> Result<Value> {
         let Some(manager) = self.agent_manager() else {
             return Ok(json!({ "streams": [] }));
@@ -2589,22 +2591,20 @@ impl Services {
             return Ok(json!({ "streams": [] }));
         }
 
+        let ids: Vec<AgentId> = busy.iter().map(|(agent_id, _)| agent_id.clone()).collect();
+        let updated_at_by_id = self.store.get_agent_session_updated_at_batch(&ids).await?;
         let mut streams = Vec::with_capacity(busy.len());
         for (agent_id, workspace_id) in busy {
             // A busy agent whose session row is gone (e.g. a concurrent
             // `agent.delete` — an expected race elsewhere in the manager/store
             // paths) is skipped rather than failing the whole response.
-            let updated_at = match self.store.get_agent_session_updated_at(&agent_id).await {
-                Ok(updated_at) => updated_at,
-                Err(Error::NotFound(_)) => {
-                    tracing::debug!(
-                        agent = %agent_id,
-                        "agent.listActive: busy agent has no session row (likely \
-                         deleted mid-turn); skipping"
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
+            let Some(updated_at) = updated_at_by_id.get(&agent_id) else {
+                tracing::debug!(
+                    agent = %agent_id,
+                    "agent.listActive: busy agent has no session row (likely \
+                     deleted mid-turn); skipping"
+                );
+                continue;
             };
             streams.push(json!({
                 "agentId": agent_id,
@@ -2615,7 +2615,7 @@ impl Services {
                 // `updated_at`) when the turn is claimed, so it approximates
                 // the turn start without a dedicated column. The wire name is
                 // part of the 4.1 contract (consumed by FE) — do not rename.
-                "startTime": iso_ms(&updated_at),
+                "startTime": iso_ms(updated_at),
             }));
         }
         Ok(json!({ "streams": streams }))
