@@ -7256,9 +7256,13 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.pr.monitor`: register (idempotently) a centralized monitor on
     /// `pr_number` for `agent_id`, returning the monitor row plus the freshly
-    /// fetched merge-requirements checklist. `repo` is an optional
-    /// `"owner/name"` override; `None` resolves the workspace repo. MCP-only
-    /// — monitors are agent-owned, so there is no wire registration method.
+    /// fetched merge-requirements checklist — `requirements: null` plus a
+    /// `pausedUntil` deadline when the forge quota is exhausted and the
+    /// baseline fetch is deferred to the end of the daemon's global
+    /// rate-limit pause (the monitor is still registered). `repo` is an
+    /// optional `"owner/name"` override; `None` resolves the workspace repo.
+    /// MCP-only — monitors are agent-owned, so there is no wire registration
+    /// method.
     fn pr_monitor_start(
         &self,
         workspace_id: WorkspaceId,
