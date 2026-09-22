@@ -124,11 +124,12 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace (full row replace, except `id` and the
-    /// guarded `last_activity`, see below), or `NotFound`. `activity` is
-    /// derived and never persisted (§9.9).
+    /// Update an existing workspace (full row replace, except `id`, the
+    /// guarded `last_activity` and the archive lifecycle columns, see
+    /// below), or `NotFound`. `activity` is derived and never persisted
+    /// (§9.9).
     ///
-    /// `last_activity` is the one exception to the full-row replace
+    /// `last_activity` is one exception to the full-row replace
     /// (monorepo#1585): it goes through the same monotonic guard as
     /// [`Self::bump_workspace_last_activity`] — the candidate writes only when
     /// it parses AND the stored value is NULL, unparseable, or strictly older.
@@ -136,16 +137,28 @@ impl Store {
     /// read predated a concurrent bump can never silently revert it (the
     /// `attention` clobber shape fixed by #1481).
     ///
+    /// The archive lifecycle is the other exception: `archived` /
+    /// `archived_at` are NEVER written here, and `status` holds whenever the
+    /// row is archived or the candidate is `Archived`. Those columns move
+    /// only through the scoped, fenced flips
+    /// ([`Self::archive_workspace_detaching_guests`] /
+    /// [`Self::unarchive_workspace_if_archived`]), so a full-row write from a
+    /// snapshot read before a concurrent archive can never resurrect the
+    /// workspace behind the archive's guest sweep (the `workspace.archive`
+    /// fence relies on this — see `ArchiveFence` in `intent-services`).
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
+        let status = enum_to_db(&ws.status)?;
         let res = sqlx::query(
-            "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
+            "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, \
+             status=CASE WHEN archived = 1 OR ? = ? THEN status ELSE ? END, \
              status_message=?, status_image_asset_id=?, attention=?, path=?, repository_path=?, \
              repository_owner=?, repository_name=?, worktree_path=?, scope=?, skip_worktree=?, \
              is_remote=?, default_model=?, pr_number=?, pr_url=?, pr_status=?, \
-             active_pull_request=?, pull_requests=?, context_links=?, archived=?, archived_at=?, \
+             active_pull_request=?, pull_requests=?, context_links=?, \
              tags=?, created_at=?, updated_at=?, \
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
@@ -156,7 +169,9 @@ impl Store {
         .bind(&ws.branch)
         .bind(&ws.base_ref)
         .bind(&ws.base_commit_sha)
-        .bind(enum_to_db(&ws.status)?)
+        .bind(&status)
+        .bind(enum_to_db(&WorkspaceStatus::Archived)?)
+        .bind(&status)
         .bind(&ws.status_message)
         .bind(&ws.status_image_asset_id)
         .bind(enum_to_db(&ws.attention)?)
@@ -175,8 +190,6 @@ impl Store {
         .bind(active_pr_to_db(ws)?)
         .bind(pull_requests_to_db(ws)?)
         .bind(context_links_to_db(ws)?)
-        .bind(i64::from(ws.archived))
-        .bind(&ws.archived_at)
         .bind(tags_to_db(&ws.tags)?)
         .bind(&ws.created_at)
         .bind(&ws.updated_at)

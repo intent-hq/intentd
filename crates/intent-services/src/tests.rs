@@ -12657,19 +12657,359 @@ mod change_event_parity {
         );
     }
 
+    /// Post-commit, PRE-drop barrier (PR #2066 review, round 3): the
+    /// archive's detached tail is parked right after the guest sweep
+    /// committed and BEFORE the detached guest's queued message is dropped
+    /// (fence held, nothing announced yet). A generic `workspace.update {
+    /// archived: false, status: Active }` — the lifecycle bypass — must not
+    /// flip the row inside that window: it delegates to the fenced unarchive
+    /// and stays pending, `members.add` still refuses, so the tail cannot
+    /// drop a message a re-seated member queued nor announce the removal of
+    /// a current one. Once released: removal, then `archived: false`, then
+    /// the re-add; the fresh message and the new seat survive, and no
+    /// `archived: true` trails the unarchive.
+    #[intent_test_macros::daemon_test]
+    async fn archive_predrop_barrier_fences_workspace_update_unarchive_and_readd() {
+        use intent_core::{
+            InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceRole, WorkspaceStatus,
+            WorkspaceUpdate,
+        };
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let mut h = harness().await;
+        h.services = h.services.clone().with_archive_predrop_park(park.clone());
+        let guest = seat_collaborator(&h, "guest").await;
+        h.store
+            .insert_principal_credential(&guest, &crate::invite_ops::hash_secret("guest-token"))
+            .await
+            .expect("guest credential");
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("session");
+        let stamp = json!({ "fromPrincipalId": guest.0 });
+        h.services.enqueue_message(
+            &agent_id,
+            "stale".into(),
+            None,
+            None,
+            Some(stamp.clone()),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+
+        let mut sub = subscribe(&h);
+        let archive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.archive_workspace(ws, None).await }
+        });
+        park.entered.notified().await;
+
+        // Inside the window: committed, but the stale message is NOT dropped
+        // yet and nothing has been announced.
+        assert!(
+            h.store.get_workspace(&h.ws).await.expect("row").archived,
+            "sweep committed before the park"
+        );
+        assert_eq!(
+            h.services.queue_snapshot(&agent_id).len(),
+            1,
+            "the guest's queued message is still pending inside the pre-drop window"
+        );
+        let mut update = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move {
+                svc.update_workspace(
+                    ws,
+                    WorkspaceUpdate {
+                        archived: Some(false),
+                        status: Some(WorkspaceStatus::Active),
+                        title: Some("renamed while archiving".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        });
+        let pending = tokio::time::timeout(Duration::from_millis(200), &mut update).await;
+        assert!(
+            pending.is_err(),
+            "workspace.update {{ archived: false }} must stay fenced behind the archive tail"
+        );
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(row.archived, "the generic write never flips archived");
+        assert_eq!(row.status, WorkspaceStatus::Archived);
+        assert_eq!(
+            row.title, "renamed while archiving",
+            "the card part of the update lands without waiting on the fence"
+        );
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect_err("re-add inside the window is refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+
+        park.release.notify_one();
+        let updated = update
+            .await
+            .expect("update task")
+            .expect("update after the fence releases");
+        assert!(!updated.archived);
+        assert_eq!(updated.status, WorkspaceStatus::Active);
+        assert!(updated.archived_at.is_none());
+        let added = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect("re-add after unarchive");
+        assert_eq!(added["added"], json!(true));
+        h.services.enqueue_message(
+            &agent_id,
+            "fresh".into(),
+            None,
+            None,
+            Some(stamp),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        archive
+            .await
+            .expect("archive task")
+            .expect("archive succeeds");
+
+        // The stale message was dropped by the tail; the re-seated guest's
+        // fresh message and the new seat survive it.
+        let queued = h.services.queue_snapshot(&agent_id);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0]["content"], "fresh");
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        let seat = members
+            .iter()
+            .find(|m| m.principal_id == guest)
+            .expect("guest re-seated");
+        assert_eq!(seat.role, WorkspaceRole::Collaborator);
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(!row.archived);
+        assert_eq!(row.status, WorkspaceStatus::Active);
+
+        // Lifecycle/membership deltas in order: removal (inside the fence),
+        // the unarchive, the re-add — and no `archived: true` afterwards.
+        let mut lifecycle = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while lifecycle.len() < 3 {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace deltas delivered")
+                .expect("subscription open");
+            for ev in batch {
+                let ev = serde_json::to_value(&ev).expect("serialize event");
+                if ev["type"] == "workspace:updated"
+                    && ev["data"]["changes"].get("lastActivity").is_none()
+                    && ev["data"]["changes"].get("title").is_none()
+                {
+                    lifecycle.push(ev["data"]["changes"].clone());
+                }
+            }
+        }
+        assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
+        assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
+        assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
+        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let batch = sub.recv().await.expect("subscription open");
+                for ev in batch {
+                    let ev = serde_json::to_value(&ev).expect("serialize event");
+                    if ev["type"] == "workspace:updated"
+                        && ev["data"]["changes"].get("archived").is_some()
+                    {
+                        return ev;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "stale archived delta after unarchive: {quiet:?}"
+        );
+    }
+
+    /// Post-commit, PRE-drop barrier, stale card-only writer (PR #2066
+    /// review, round 3): a full-row snapshot read BEFORE the archive and a
+    /// generic `workspace.update { statusMessage }` inside the pre-drop
+    /// window neither revert the archived row nor need the fence — the
+    /// generic write never touches the lifecycle columns. So the guards
+    /// keep holding (`members.add` still refused), the tail still drops the
+    /// guest's stale message and announces the removal, the archive's own
+    /// `archived: true` still goes out (the row is still archived at its
+    /// fenced re-read), and no `archived: false` ever appears.
+    #[intent_test_macros::daemon_test]
+    async fn archive_predrop_barrier_survives_stale_card_only_updates() {
+        use intent_core::{
+            InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceStatus, WorkspaceUpdate,
+        };
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let mut h = harness().await;
+        h.services = h.services.clone().with_archive_predrop_park(park.clone());
+        let guest = seat_collaborator(&h, "guest").await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("session");
+        h.services.enqueue_message(
+            &agent_id,
+            "stale".into(),
+            None,
+            None,
+            Some(json!({ "fromPrincipalId": guest.0 })),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        // A full-row snapshot taken before the archive — the shape a
+        // `workspace.update` whose read predated the archive writes back.
+        let mut stale = h.store.get_workspace(&h.ws).await.expect("snapshot");
+        assert!(!stale.archived);
+
+        let mut sub = subscribe(&h);
+        let archive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.archive_workspace(ws, None).await }
+        });
+        park.entered.notified().await;
+
+        // Inside the window: the stale full-row write and a card-only
+        // update both complete without the fence and leave the row archived.
+        stale.title = "stale title".to_string();
+        stale.updated_at = intent_core::now_iso();
+        h.store
+            .update_workspace(&stale)
+            .await
+            .expect("stale full-row write");
+        let card = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.services.update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    status_message: Some("card only".to_string()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("card-only update is not fenced")
+        .expect("card-only update");
+        assert!(card.archived, "{card:?}");
+        assert_eq!(card.status, WorkspaceStatus::Archived);
+        assert_eq!(card.title, "stale title");
+        assert_eq!(card.status_message.as_deref(), Some("card only"));
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(row.archived, "stale writes must not resurrect the row");
+        assert_eq!(row.status, WorkspaceStatus::Archived);
+        assert!(row.archived_at.is_some());
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect_err("re-add stays refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(h.services.queue_snapshot(&agent_id).len(), 1);
+
+        park.release.notify_one();
+        let archived = archive
+            .await
+            .expect("archive task")
+            .expect("archive succeeds");
+        assert!(archived.archived);
+        assert!(
+            h.services.queue_snapshot(&agent_id).is_empty(),
+            "the detached guest's stale message is dropped by the tail"
+        );
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert!(members.iter().all(|m| m.principal_id != guest));
+
+        // Deltas: the card update, the removal, then the archive's own
+        // `archived: true`; never an `archived: false`.
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !seen
+            .iter()
+            .any(|c: &serde_json::Value| c["archived"] == json!(true))
+        {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace deltas delivered")
+                .expect("subscription open");
+            for ev in batch {
+                let ev = serde_json::to_value(&ev).expect("serialize event");
+                if ev["type"] == "workspace:updated"
+                    && ev["data"]["changes"].get("lastActivity").is_none()
+                {
+                    seen.push(ev["data"]["changes"].clone());
+                }
+            }
+        }
+        let removal = seen
+            .iter()
+            .position(|c| c["removedPrincipalId"] == guest.0)
+            .expect("removal delta");
+        let archived_delta = seen
+            .iter()
+            .position(|c| c["archived"] == json!(true))
+            .expect("archived delta");
+        assert!(removal < archived_delta, "{seen:?}");
+        assert!(
+            seen.iter().all(|c| c["archived"] != json!(false)),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|c| c["statusMessage"] == json!("card only")),
+            "{seen:?}"
+        );
+    }
+
     /// Symmetric to archive: `unarchive_workspace` emits one `workspace:updated`
     /// carrying the full applied delta with an explicit `archivedAt: null` so
     /// clients clear the field (Audit D C3).
     #[intent_test_macros::daemon_test]
     async fn unarchive_workspace_emits_workspace_updated_once() {
-        use intent_core::{WorkspaceApi, WorkspaceStatus};
+        use intent_core::WorkspaceApi;
         let h = harness().await;
         // Seed the row as archived so unarchive has a real state to flip.
-        let mut ws = workspace(&h.ws);
-        ws.status = WorkspaceStatus::Archived;
-        ws.archived = true;
-        ws.archived_at = Some(intent_core::now_iso());
-        h.store.update_workspace(&ws).await.expect("archive row");
+        h.store
+            .archive_workspace_detaching_guests(&h.ws, &intent_core::now_iso())
+            .await
+            .expect("archive row");
         let mut sub = subscribe(&h);
         h.services
             .unarchive_workspace(h.ws.clone())
@@ -12755,11 +13095,10 @@ mod change_event_parity {
     async fn auto_unarchive_on_turn_start_emits_stamped_delta() {
         use intent_core::WorkspaceStatus;
         let h = harness().await;
-        let mut ws = workspace(&h.ws);
-        ws.status = WorkspaceStatus::Archived;
-        ws.archived = true;
-        ws.archived_at = Some(intent_core::now_iso());
-        h.store.update_workspace(&ws).await.expect("archive row");
+        h.store
+            .archive_workspace_detaching_guests(&h.ws, &intent_core::now_iso())
+            .await
+            .expect("archive row");
         let agent_id = AgentId::from("agent-auto-unarchive");
         h.store
             .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
@@ -12910,13 +13249,11 @@ mod change_event_parity {
     /// `agentName: null` in the stamp.
     #[tokio::test]
     async fn auto_unarchive_stamps_null_name_when_session_missing() {
-        use intent_core::WorkspaceStatus;
         let h = harness().await;
-        let mut ws = workspace(&h.ws);
-        ws.status = WorkspaceStatus::Archived;
-        ws.archived = true;
-        ws.archived_at = Some(intent_core::now_iso());
-        h.store.update_workspace(&ws).await.expect("archive row");
+        h.store
+            .archive_workspace_detaching_guests(&h.ws, &intent_core::now_iso())
+            .await
+            .expect("archive row");
         let agent_id = AgentId::from("agent-no-row");
         let mut sub = subscribe(&h);
         let flipped = h
