@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.96] - 2026-09-22
+
+### 🚀 Features
+
+- *(agent)* Hide other members' queued chats from guests in shared workspaces ([#2068](https://github.com/intent-hq/intentd/pull/2068))
+- *(agents)* Serve delegatedCounts.orphaned and orphanedOnly on agent.list ([#2072](https://github.com/intent-hq/intentd/pull/2072))
+- Image dimension sidecar (protocol 10.7) ([#2069](https://github.com/intent-hq/intentd/pull/2069))
+
+### 🐛 Bug Fixes
+
+- *(github)* Surface Error::RateLimited with data.code "rate-limited" ([#2071](https://github.com/intent-hq/intentd/pull/2071))
+- *(archive)* One consolidated post-unarchive notice for cancelled hooks and PR monitors ([#2074](https://github.com/intent-hq/intentd/pull/2074))
+- *(pr-monitor)* Replace PrMonitorFetchCache with a shared PrCache every PR read can use ([#2064](https://github.com/intent-hq/intentd/pull/2064))
+
+### ⚡ Performance
+
+- *(agent)* Batch the agent.listActive session lookup into one statement ([#2070](https://github.com/intent-hq/intentd/pull/2070))
+
+### 🧪 Testing
+
+- *(core)* Source lint for re-implemented running-turn status rule ([#2073](https://github.com/intent-hq/intentd/pull/2073))
+
+
 ## [0.9.95] - 2026-09-22
 
 ### 🐛 Bug Fixes

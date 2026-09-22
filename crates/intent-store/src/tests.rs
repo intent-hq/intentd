@@ -708,6 +708,90 @@ async fn workspace_context_links_round_trip_and_clear() {
     assert!(reread.context_links.is_none());
 }
 
+/// The generic full-row `update_workspace` never writes the archive
+/// lifecycle (PR #2066 review, round 3): a snapshot read BEFORE a concurrent
+/// archive, written back AFTER it, keeps its card edit but cannot flip
+/// `archived` / `archived_at` / `status` back — those columns move only
+/// through the scoped, fenced flips. Symmetric for a snapshot that predates
+/// an unarchive, and a snapshot that asks for `Archived` on its own cannot
+/// archive a live row either.
+#[tokio::test]
+async fn workspace_update_never_writes_archive_lifecycle() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&id, "Before", false))
+        .await
+        .expect("insert");
+    let mut stale = store.get_workspace(&id).await.expect("snapshot");
+    let archived_at = now_iso();
+    store
+        .archive_workspace_detaching_guests(&id, &archived_at)
+        .await
+        .expect("concurrent archive");
+
+    stale.title = "Renamed from a stale snapshot".to_string();
+    stale.updated_at = now_iso();
+    store
+        .update_workspace(&stale)
+        .await
+        .expect("stale full-row write");
+    let after = store.get_workspace(&id).await.expect("re-get");
+    assert_eq!(after.title, "Renamed from a stale snapshot");
+    assert!(after.archived, "stale snapshot must not resurrect archived");
+    assert_eq!(after.archived_at.as_deref(), Some(archived_at.as_str()));
+    assert_eq!(after.status, WorkspaceStatus::Archived);
+
+    // Even an explicit request to unarchive through the generic write holds.
+    let mut explicit = after.clone();
+    explicit.archived = false;
+    explicit.archived_at = None;
+    explicit.status = WorkspaceStatus::Active;
+    store.update_workspace(&explicit).await.expect("write");
+    let held = store.get_workspace(&id).await.expect("re-get");
+    assert!(held.archived);
+    assert_eq!(held.status, WorkspaceStatus::Archived);
+
+    // Snapshot read while archived, written after the scoped unarchive.
+    let mut stale_archived = store.get_workspace(&id).await.expect("snapshot");
+    assert!(store
+        .unarchive_workspace_if_archived(&id, &now_iso())
+        .await
+        .expect("unarchive"));
+    stale_archived.title = "Renamed again".to_string();
+    store
+        .update_workspace(&stale_archived)
+        .await
+        .expect("stale write");
+    let live = store.get_workspace(&id).await.expect("re-get");
+    assert_eq!(live.title, "Renamed again");
+    assert!(!live.archived, "stale snapshot must not re-archive");
+    assert!(live.archived_at.is_none());
+    assert_eq!(live.status, WorkspaceStatus::Active);
+
+    // `status: Archived` alone cannot archive a live row; other statuses
+    // still write through the generic path.
+    let mut wants_archived = live.clone();
+    wants_archived.status = WorkspaceStatus::Archived;
+    store
+        .update_workspace(&wants_archived)
+        .await
+        .expect("write");
+    assert_eq!(
+        store.get_workspace(&id).await.expect("re-get").status,
+        WorkspaceStatus::Active
+    );
+    let mut inactive = live.clone();
+    inactive.status = WorkspaceStatus::Inactive;
+    store.update_workspace(&inactive).await.expect("write");
+    assert_eq!(
+        store.get_workspace(&id).await.expect("re-get").status,
+        WorkspaceStatus::Inactive
+    );
+}
+
 /// `update_workspace_pr_linkage` writes ONLY the PR columns + `updated_at`:
 /// a stale snapshot carrying old values for other columns (title, archived)
 /// must never clobber a concurrent mutation of those columns.
@@ -726,13 +810,14 @@ async fn workspace_pr_linkage_update_is_scoped() {
 
     let mut concurrent = store.get_workspace(&id).await.expect("get");
     concurrent.title = "Renamed meanwhile".to_string();
-    concurrent.archived = true;
-    concurrent.archived_at = Some(now_iso());
-    concurrent.status = WorkspaceStatus::Archived;
     store
         .update_workspace(&concurrent)
         .await
         .expect("concurrent mutation");
+    store
+        .archive_workspace_detaching_guests(&id, &now_iso())
+        .await
+        .expect("concurrent archive");
 
     stale.pr_number = Some(99);
     stale.pr_url = Some("https://example.com/pr/99".to_string());
@@ -9522,6 +9607,9 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
             crate::InviteJoinOutcome::OwnerSelfJoin => {
                 panic!("a guest account was taken for the primary principal")
             }
+            crate::InviteJoinOutcome::WorkspaceArchived => {
+                panic!("an active workspace was reported archived")
+            }
         }
     }
     assert_eq!((joined, full), (1, 7));
@@ -9674,6 +9762,9 @@ async fn add_workspace_collaborator_within_cap_is_atomic() {
             crate::CollaboratorAddOutcome::NoActiveCredential => {
                 panic!("a credentialed guest was refused for its credential")
             }
+            crate::CollaboratorAddOutcome::WorkspaceArchived => {
+                panic!("an active workspace was reported archived")
+            }
         }
     }
     assert_eq!((added, full), (1, 7));
@@ -9741,6 +9832,129 @@ async fn add_workspace_collaborator_within_cap_is_atomic() {
         },
         "the reusable invite stays open after its winner joined"
     );
+}
+
+/// Every access-granting write transaction checks the archived flag on its
+/// own connection: after `archive_workspace_detaching_guests` committed, a
+/// capped member add, an invite mint and an invite join are each refused as
+/// `WorkspaceArchived` with nothing written — the guard behind the sweep,
+/// so no seat or open link can land on an archived workspace. Unarchiving
+/// lifts all three.
+#[tokio::test]
+async fn archived_workspace_refuses_member_add_invite_mint_and_join() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Archived", false))
+        .await
+        .expect("insert ws");
+    let primary = store.get_primary_principal().await.expect("primary").id;
+    let guest = guest_identity(501);
+    store.upsert_principal(&guest).await.expect("guest");
+    store
+        .insert_principal_credential(&guest.id, "cred-501")
+        .await
+        .expect("guest credential");
+    // An open invite that survives the sweep only because it is inserted
+    // behind the store's back: the join guard must refuse it regardless.
+    let sweep = store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive");
+    assert_eq!(sweep.revoked_invites, 0);
+    assert!(store.get_workspace(&ws).await.expect("ws").archived);
+
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guest.id, 8)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::WorkspaceArchived
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &guest.id)
+            .await
+            .expect("role"),
+        None,
+        "a refused add leaves no row"
+    );
+    assert_eq!(
+        store
+            .insert_workspace_invite(&guest_invite("late-link", &ws, &primary))
+            .await
+            .expect("insert invite"),
+        crate::InviteInsertOutcome::WorkspaceArchived
+    );
+    assert_eq!(
+        store.get_workspace_invite("late-link").await.expect("get"),
+        None,
+        "a refused mint leaves no row"
+    );
+    sqlx::query(&format!(
+        "INSERT INTO workspace_invite ({}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        crate::principal_repo::INVITE_COLUMNS
+    ))
+    .bind("smuggled")
+    .bind(&ws.0)
+    .bind("hash-smuggled")
+    .bind(Option::<String>::None)
+    .bind(&primary.0)
+    .bind(Option::<i64>::None)
+    .bind(Option::<String>::None)
+    .bind(now_iso())
+    .bind("2999-01-01T00:00:00Z")
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind(0_i64)
+    .execute(store.write_pool())
+    .await
+    .expect("smuggle an open invite");
+    let before = store.count_principals().await.expect("count");
+    assert_eq!(
+        store
+            .join_workspace_by_invite("smuggled", &ws, &guest_identity(502), "cred-502", None, 8)
+            .await
+            .expect("join"),
+        crate::InviteJoinOutcome::WorkspaceArchived
+    );
+    assert_eq!(store.count_principals().await.expect("count"), before);
+    assert_eq!(
+        store
+            .lookup_principal_credential("cred-502")
+            .await
+            .expect("lookup"),
+        None,
+        "a refused join mints nothing"
+    );
+
+    assert!(store
+        .unarchive_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("unarchive"));
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guest.id, 8)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::Added
+    );
+    assert_eq!(
+        store
+            .insert_workspace_invite(&guest_invite("late-link", &ws, &primary))
+            .await
+            .expect("insert invite"),
+        crate::InviteInsertOutcome::Inserted
+    );
+    assert!(matches!(
+        store
+            .join_workspace_by_invite("smuggled", &ws, &guest_identity(502), "cred-502", None, 8)
+            .await
+            .expect("join"),
+        crate::InviteJoinOutcome::Joined(_)
+    ));
 }
 
 /// The active-credential predicate is evaluated inside the same write
