@@ -101,15 +101,137 @@ where
     tokio::spawn(with_caller(Caller::Daemon, f))
 }
 
+/// Whether a queued-message entry (wire shape, `author` already attached)
+/// may be shown to `caller`. A non-administrator wire principal (a guest
+/// collaborator) sees only entries it authored: an entry whose `author` is
+/// an object with a `principalId` other than the caller's is hidden. Entries
+/// with no `author` / `author: null` (agent-sent and automatic entries) stay
+/// visible to everyone; the administrator (workspace owner), agents and the
+/// daemon see the full queue.
+#[must_use]
+pub fn queue_visible_to(caller: &Caller, entry: &serde_json::Value) -> bool {
+    let Caller::Wire {
+        principal_id,
+        is_administrator: false,
+    } = caller
+    else {
+        return true;
+    };
+    match entry.get("author").and_then(|a| a.get("principalId")) {
+        Some(serde_json::Value::String(author)) => author == &principal_id.0,
+        _ => true,
+    }
+}
+
+/// Egress projection of a queue snapshot for `caller`: drops the entries
+/// [`queue_visible_to`] hides, keeping drain order and the entries'
+/// `position` values as they are (no renumbering). `None` (no bound caller)
+/// filters nothing.
+#[must_use]
+pub fn project_queue_for_caller(
+    caller: Option<&Caller>,
+    queue: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    match caller {
+        Some(
+            caller @ Caller::Wire {
+                is_administrator: false,
+                ..
+            },
+        ) => queue
+            .into_iter()
+            .filter(|entry| queue_visible_to(caller, entry))
+            .collect(),
+        Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) | None => queue,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
 
     fn wire(admin: bool) -> Caller {
         Caller::Wire {
             principal_id: PrincipalId("p-1".into()),
             is_administrator: admin,
         }
+    }
+
+    fn entry(id: &str, position: u64, author: &Value) -> Value {
+        json!({ "id": id, "content": id, "position": position, "author": author })
+    }
+
+    fn mixed_queue() -> Vec<Value> {
+        vec![
+            entry("own", 0, &json!({ "principalId": "p-1", "login": "me" })),
+            entry(
+                "foreign",
+                1,
+                &json!({ "principalId": "p-2", "login": "other" }),
+            ),
+            entry("agent", 2, &Value::Null),
+            json!({ "id": "no-key", "content": "no author key", "position": 3 }),
+        ]
+    }
+
+    fn ids(queue: &[Value]) -> Vec<&str> {
+        queue.iter().map(|e| e["id"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn guest_sees_own_and_unauthored_entries_only() {
+        let guest = wire(false);
+        let queue = mixed_queue();
+        assert!(queue_visible_to(&guest, &queue[0]), "own entry");
+        assert!(!queue_visible_to(&guest, &queue[1]), "foreign entry");
+        assert!(queue_visible_to(&guest, &queue[2]), "null author");
+        assert!(queue_visible_to(&guest, &queue[3]), "absent author key");
+
+        let projected = project_queue_for_caller(Some(&guest), queue);
+        assert_eq!(ids(&projected), ["own", "agent", "no-key"]);
+        let positions: Vec<u64> = projected
+            .iter()
+            .map(|e| e["position"].as_u64().unwrap())
+            .collect();
+        assert_eq!(positions, [0, 2, 3], "positions are not renumbered");
+    }
+
+    #[test]
+    fn administrator_agent_daemon_and_unbound_callers_see_everything() {
+        let admin = wire(true);
+        let agent = Caller::Agent {
+            agent_id: AgentId("a-1".into()),
+        };
+        for e in mixed_queue() {
+            assert!(queue_visible_to(&admin, &e), "admin: {e}");
+            assert!(queue_visible_to(&agent, &e), "agent: {e}");
+            assert!(queue_visible_to(&Caller::Daemon, &e), "daemon: {e}");
+        }
+        for caller in [Some(&admin), Some(&agent), Some(&Caller::Daemon), None] {
+            assert_eq!(
+                project_queue_for_caller(caller, mixed_queue()),
+                mixed_queue(),
+                "{caller:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_author_is_kept() {
+        let guest = wire(false);
+        assert!(queue_visible_to(
+            &guest,
+            &json!({ "id": "s", "author": "p-2" })
+        ));
+        assert!(queue_visible_to(
+            &guest,
+            &json!({ "id": "n", "author": { "principalId": 7 } })
+        ));
+        assert!(queue_visible_to(
+            &guest,
+            &json!({ "id": "e", "author": {} })
+        ));
     }
 
     #[tokio::test]

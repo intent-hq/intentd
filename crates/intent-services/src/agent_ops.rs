@@ -6201,7 +6201,10 @@ impl Services {
     /// same shape and resolution order as `agent.getConversation` user rows.
     /// The key is present on every row regardless: when the unscoped read
     /// finds no session to resolve against, entries keep the `null` default
-    /// from [`QueuedMessage::to_value`].
+    /// from [`QueuedMessage::to_value`]. The snapshot is then projected to the
+    /// bound caller ([`intent_core::project_queue_for_caller`]): a guest
+    /// collaborator sees only its own entries plus null-author ones, while
+    /// the administrator, agents and the daemon see the full queue.
     pub(crate) async fn agent_get_queue_op(
         &self,
         agent_id: AgentId,
@@ -6223,6 +6226,10 @@ impl Services {
                 .attach_queue(&mut queue)
                 .await;
         }
+        // Egress-only projection: a guest collaborator sees its own entries
+        // (plus null-author agent/automatic ones); `position` is not renumbered.
+        let queue =
+            intent_core::project_queue_for_caller(intent_core::current_caller().as_ref(), queue);
         Ok(json!({ "success": true, "queue": queue }))
     }
 

@@ -13367,6 +13367,157 @@ async fn queue_reads_and_queue_updated_carry_resolved_author() {
     assert_eq!(peer.get("author"), Some(&serde_json::Value::Null), "{peer}");
 }
 
+/// Shared workspace — `agent.getQueue` is projected to the calling principal
+/// ([`intent_core::project_queue_for_caller`]): a guest collaborator sees only
+/// the entries it authored (plus null-author agent/automatic ones) with the
+/// original drain-order `position` kept, the administrator (owner) sees the
+/// full queue, and an agent caller sees the full queue.
+#[tokio::test]
+async fn get_queue_is_projected_to_the_calling_principal() {
+    use intent_core::{with_caller, Caller, Principal, PrincipalId};
+    use serde_json::Value;
+
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Shared").await;
+    let owner = svc
+        .store()
+        .get_primary_principal()
+        .await
+        .expect("primary principal")
+        .id;
+    let guest = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("guest".into()),
+            display_name: Some("Guest User".into()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    svc.store()
+        .add_workspace_member(&ws, &guest, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    let as_owner = Caller::Wire {
+        principal_id: owner.clone(),
+        is_administrator: true,
+    };
+    let as_guest = Caller::Wire {
+        principal_id: guest.clone(),
+        is_administrator: false,
+    };
+    let as_agent = Caller::Agent {
+        agent_id: AgentId::from("agent-reader"),
+    };
+
+    let owner_entry = with_caller(as_owner.clone(), async {
+        svc.agent_queue_message(id.clone(), "from owner".into(), None, None, None)
+            .await
+    })
+    .await
+    .expect("owner queueMessage")["queuedMessage"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let guest_entry = with_caller(as_guest.clone(), async {
+        svc.agent_queue_message(id.clone(), "from guest".into(), None, None, None)
+            .await
+    })
+    .await
+    .expect("guest queueMessage")["queuedMessage"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let agent_entry = svc
+        .agent_queue_message_op(
+            id.clone(),
+            "from agent".into(),
+            None,
+            None,
+            Some(json!({ "fromAgentId": "agent-peer", "fromAgentName": "Peer" })),
+        )
+        .await
+        .expect("agent-sent queueMessage")["queuedMessage"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let read_as = |caller: Caller| {
+        let svc = &svc;
+        let id = id.clone();
+        let ws = ws.clone();
+        async move {
+            let q = with_caller(
+                caller,
+                async move { svc.agent_get_queue_op(id, Some(ws)).await },
+            )
+            .await
+            .expect("getQueue");
+            q["queue"].as_array().expect("queue array").clone()
+        }
+    };
+    let ids = |queue: &[Value]| -> Vec<String> {
+        queue
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let guest_view = read_as(as_guest).await;
+    assert_eq!(
+        ids(&guest_view),
+        vec![guest_entry.clone(), agent_entry.clone()],
+        "guest sees own + null-author entries only: {}",
+        json!(guest_view)
+    );
+    assert_eq!(guest_view[0]["author"]["principalId"], guest.0);
+    assert_eq!(guest_view[1]["author"], Value::Null);
+    assert_eq!(
+        guest_view[0]["position"],
+        json!(1),
+        "position keeps the drain-order index (not renumbered): {}",
+        guest_view[0]
+    );
+    assert_eq!(guest_view[1]["position"], json!(2));
+
+    let owner_view = read_as(as_owner).await;
+    assert_eq!(
+        ids(&owner_view),
+        vec![
+            owner_entry.clone(),
+            guest_entry.clone(),
+            agent_entry.clone()
+        ],
+        "administrator sees the full queue: {}",
+        json!(owner_view)
+    );
+    assert_eq!(owner_view[0]["author"]["principalId"], owner.0);
+    assert_eq!(owner_view[1]["author"]["principalId"], guest.0);
+
+    let agent_view = read_as(as_agent).await;
+    assert_eq!(
+        ids(&agent_view),
+        vec![owner_entry, guest_entry, agent_entry],
+        "agent caller sees the full queue: {}",
+        json!(agent_view)
+    );
+
+    // No bound caller (daemon-internal / unit reads) is likewise unfiltered.
+    let unbound = svc
+        .agent_get_queue_op(id, Some(ws))
+        .await
+        .expect("getQueue")["queue"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(unbound, 3);
+}
+
 /// `agent.getQueue` never omits `author`: an unscoped read whose session
 /// lookup fails (no session row for the agent — the branch that skips the
 /// resolver) still returns every queued entry with an explicit `author: null`,
