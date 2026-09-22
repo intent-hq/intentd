@@ -89,6 +89,14 @@ pub(crate) struct FlowSlot {
 }
 
 impl FlowSlot {
+    /// The opaque wire `flowId` (§5.27): the generation rendered as a
+    /// decimal string. `github.connect` returns it and `github.cancelAuth
+    /// { flowId }` must echo it to cancel this flow — it is never the device
+    /// code and carries nothing sensitive.
+    pub(crate) fn wire_id(&self) -> String {
+        self.flow_id.to_string()
+    }
+
     /// Seconds until the codes expire (0 when already past the deadline).
     pub(crate) fn remaining_secs(&self) -> u64 {
         self.deadline
@@ -394,6 +402,7 @@ pub(crate) fn poll_sleep(interval_secs: u64) -> Duration {
 pub(crate) fn connect_response(slot: &FlowSlot) -> Value {
     json!({
         "ok": true,
+        "flowId": slot.wire_id(),
         "userCode": slot.user_code,
         "verificationUri": slot.verification_uri,
         "expiresIn": slot.remaining_secs(),
@@ -457,6 +466,7 @@ mod tests {
     fn connect_response_carries_codes_and_remaining_window() {
         let v = connect_response(&slot(FlowPhase::Pending, Duration::from_secs(120)));
         assert_eq!(v["ok"], true);
+        assert_eq!(v["flowId"], "1");
         assert_eq!(v["userCode"], "ABCD-1234");
         assert_eq!(v["verificationUri"], "https://github.com/login/device");
         assert_eq!(v["interval"], 5);

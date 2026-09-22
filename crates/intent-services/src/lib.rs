@@ -31103,7 +31103,10 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn github_cancel_auth(
+        &self,
+        flow_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let state = self.github_auth_flow.clone();
         Box::pin(async move {
             Self::require_administrator("github.cancelAuth")?;
@@ -31114,8 +31117,14 @@ impl WorkspaceApi for Services {
             // slot orphans the poll task, which exits cooperatively at its
             // next tick (and reconciles a raced authorize by deleting the
             // just-persisted token — see `github_auth_ops::FlowSlot`).
+            // A `flowId` scopes the cancel to the flow that connect handed
+            // out: a stale id (a newer connect replaced that flow) is a
+            // no-op, so one caller can never cancel another caller's flow.
             let cancelled = match slot.as_ref() {
-                Some(s) if s.phase == github_auth_ops::FlowPhase::Pending => {
+                Some(s)
+                    if s.phase == github_auth_ops::FlowPhase::Pending
+                        && flow_id.as_deref().is_none_or(|id| id == s.wire_id()) =>
+                {
                     *slot = None;
                     true
                 }
@@ -31417,7 +31426,10 @@ impl WorkspaceApi for Services {
             Self::require_administrator("sourceControl.cancelAuth")?;
             let target = self.resolve_source_control_target(&provider, host.as_deref())?;
             match target {
-                source_control_auth_ops::Target::Github => self.github_cancel_auth().await,
+                // Unscoped cancel: `sourceControl.cancelAuth` carries no
+                // `flowId`, so it cancels whichever GitHub flow is pending
+                // (same as `github.cancelAuth` with `flowId` omitted).
+                source_control_auth_ops::Target::Github => self.github_cancel_auth(None).await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
                     // Host-scoped: only a pending flow for exactly this host
                     // is cancelled; a terminal slot stays until the next
