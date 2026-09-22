@@ -16508,6 +16508,175 @@ async fn send_message_op_rejects_unknown_agent() {
     );
 }
 
+/// Shared assertions for the intent-hq/intent#5669 self-send guard: the
+/// rejection is `InvalidParams` naming the agent id and the alternative,
+/// and it leaves no trace — no persisted row, no queue entry, no event.
+async fn assert_self_send_rejected(
+    svc: &Services,
+    agent_id: &AgentId,
+    err: Error,
+    sub: &mut crate::events::Subscription,
+) {
+    match &err {
+        Error::InvalidParams(msg) => {
+            assert!(
+                msg.contains(&agent_id.0),
+                "error must name the agent id: {msg}"
+            );
+            assert!(
+                msg.contains("cannot message itself"),
+                "error must say the agent cannot message itself: {msg}"
+            );
+            assert!(
+                msg.contains("ws.agent.reportToParent"),
+                "error must name the alternative: {msg}"
+            );
+        }
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    let session = svc
+        .store()
+        .get_agent_session(agent_id)
+        .await
+        .expect("session");
+    assert!(
+        session.messages.is_empty(),
+        "no message row may be persisted for a self-targeted send"
+    );
+    assert!(
+        svc.queue_snapshot(agent_id).is_empty(),
+        "no queue entry may be created for a self-targeted send"
+    );
+    assert!(
+        timeout(Duration::from_millis(200), sub.recv())
+            .await
+            .is_err(),
+        "no event may be published for a self-targeted send"
+    );
+}
+
+/// Self-targeted agent-message metadata as the MCP `ws.agent.send` /
+/// `ws.agent.sendToTask` bindings stamp it for an agent caller.
+fn self_sender_metadata(agent_id: &AgentId) -> serde_json::Value {
+    json!({
+        "type": "agent_message",
+        "fromAgentId": agent_id.0,
+        "fromAgentName": "Self",
+    })
+}
+
+/// intent-hq/intent#5669: the store-only `agent.sendMessage` op rejects a
+/// send whose daemon-stamped `fromAgentId` is the target itself with
+/// `-32602`, before any state change.
+#[tokio::test]
+async fn send_message_op_rejects_self_targeted_send() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent_id = create_agent(&svc, &ws, "SelfSender").await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let err = svc
+        .agent_send_message_op(
+            agent_id.clone(),
+            "note to self".into(),
+            None,
+            None,
+            None,
+            Some(self_sender_metadata(&agent_id)),
+        )
+        .await
+        .expect_err("self-targeted send must be rejected");
+    assert_self_send_rejected(&svc, &agent_id, err, &mut sub).await;
+}
+
+/// intent-hq/intent#5669: `agent.sendToTask` rejects a task whose assignee
+/// is the caller with `-32602`, before any state change.
+#[intent_test_macros::daemon_test]
+async fn send_to_task_op_rejects_self_assigned_caller() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent_id = create_agent(&svc, &ws, "SelfAssignee").await;
+    let note_id = seed_task(&svc, &ws, "self send task").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone(), None)
+        .await
+        .expect("assign");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let err = svc
+        .agent_send_to_task_op(
+            ws.clone(),
+            note_id,
+            "note to self".into(),
+            Some("interrupt".into()),
+            Some(self_sender_metadata(&agent_id)),
+        )
+        .await
+        .expect_err("self-targeted sendToTask must be rejected");
+    assert_self_send_rejected(&svc, &agent_id, err, &mut sub).await;
+}
+
+/// intent-hq/intent#5669: the `WorkspaceApi::agent_send_message` front door
+/// rejects an interrupt-priority self-send BEFORE routing to the attached
+/// runtime manager — the runtime never claims a slot (no
+/// `agent:status-changed`), so the caller's own in-flight turn is never
+/// preempted.
+#[intent_test_macros::daemon_test]
+async fn send_message_rejects_self_targeted_interrupt_before_runtime() {
+    let (_t, svc, _manager, bus, ws) = setup_with_manager().await;
+    let agent_id = create_agent(&svc, &ws, "SelfInterrupter").await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let err = WorkspaceApi::agent_send_message(
+        &svc,
+        ws.clone(),
+        agent_id.clone(),
+        "note to self".into(),
+        None,
+        None,
+        None,
+        Some("interrupt".into()),
+        None,
+        None,
+        None,
+        Some(self_sender_metadata(&agent_id)),
+        MessageOrigin::Automatic,
+    )
+    .await
+    .expect_err("self-targeted interrupt send must be rejected");
+    assert_self_send_rejected(&svc, &agent_id, err, &mut sub).await;
+}
+
+/// Control for the intent-hq/intent#5669 guard: a send attributed to a
+/// DIFFERENT agent (the ordinary A2A case) and an unattributed user/FE send
+/// to the same target are unaffected.
+#[tokio::test]
+async fn send_message_op_allows_other_sender_and_unattributed_sends() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let other = create_agent(&svc, &ws, "Other").await;
+    svc.agent_send_message_op(
+        target.clone(),
+        "from another agent".into(),
+        None,
+        None,
+        None,
+        Some(self_sender_metadata(&other)),
+    )
+    .await
+    .expect("other-agent send must succeed");
+    svc.agent_send_message_op(
+        target.clone(),
+        "from the user".into(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("unattributed send must succeed");
+    let session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("session");
+    assert_eq!(session.messages.len(), 2);
+}
+
 /// monorepo#564 regression: the SUB-1 sender auto-subscribe must fail closed
 /// when the TARGET agent does not exist — no caller→target watch may be
 /// registered for a nonexistent target (the phantom "waiting" state).
