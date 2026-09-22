@@ -181,9 +181,12 @@ mod collaborator_fan_out {
     use std::time::Duration;
 
     use futures::future::BoxFuture;
-    use intent_core::events::{CLIENT_CONNECTED, NOTE_UPDATED, TERMINAL_DATA, WORKSPACE_UPDATED};
+    use intent_core::events::{
+        AGENT_QUEUE_UPDATED, CLIENT_CONNECTED, NOTE_UPDATED, TERMINAL_DATA, WORKSPACE_UPDATED,
+    };
     use intent_core::{
-        ActorType, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi, WorkspaceId,
+        ActorType, AgentId, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi,
+        WorkspaceId,
     };
     use intent_services::EventBus;
     use intent_store::{NewEvent, Store};
@@ -536,6 +539,95 @@ mod collaborator_fan_out {
                 NOTE_UPDATED.to_string()
             ]
         );
+    }
+
+    /// A mixed-author `agent:queue:updated` payload as the publisher emits
+    /// it (`author` attached; a `null` author for an agent-sent entry, no
+    /// `author` key for a legacy one).
+    fn mixed_queue(own: &PrincipalId) -> Value {
+        json!([
+            { "id": "m-own", "content": "mine", "position": 0,
+              "author": { "principalId": own.as_str(), "login": "me" } },
+            { "id": "m-other", "content": "theirs", "position": 1,
+              "author": { "principalId": "p-other", "login": "them" } },
+            { "id": "m-agent", "content": "agent", "position": 2, "author": null },
+            { "id": "m-legacy", "content": "legacy", "position": 3 },
+        ])
+    }
+
+    /// Subscribe to `agent:queue:updated` under `caller`, publish one
+    /// mixed-author queue event on `ws-1`, and return the `data` of every
+    /// delivered frame.
+    async fn queue_frames_for(caller: Caller, own: &PrincipalId) -> Vec<Value> {
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            json!({"eventTypes":[AGENT_QUEUE_UPDATED]}),
+        )
+        .await;
+        h.bus
+            .publish(&event_with(
+                AGENT_QUEUE_UPDATED,
+                "ws-1",
+                json!({ "agentId": "agent-1", "queue": mixed_queue(own) }),
+            ))
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), h.rx.bulk.recv()).await
+        {
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["params"]["event"]["type"], AGENT_QUEUE_UPDATED);
+            out.push(v["params"]["event"]["data"].clone());
+        }
+        drop(h.subs);
+        out
+    }
+
+    fn queue_ids(data: &Value) -> Vec<&str> {
+        data["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect()
+    }
+
+    /// A guest's `agent:queue:updated` frame carries only its own entries
+    /// plus author-less ones; the other member's entry never reaches its
+    /// connection, and the surviving entries keep their `position`.
+    #[tokio::test]
+    async fn guest_queue_updated_frames_are_projected_to_the_principal() {
+        let principal_id = PrincipalId::new();
+        let guest = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        let frames = queue_frames_for(guest, &principal_id).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["agentId"], "agent-1");
+        assert_eq!(queue_ids(&frames[0]), vec!["m-own", "m-agent", "m-legacy"]);
+        assert_eq!(frames[0]["queue"][2]["position"], 3, "no renumbering");
+    }
+
+    /// The administrator's and non-wire callers' frames are the publisher's
+    /// payload, untouched.
+    #[tokio::test]
+    async fn administrator_and_internal_queue_updated_frames_are_unchanged() {
+        let principal_id = PrincipalId::new();
+        let owner = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: true,
+        };
+        let agent = Caller::Agent {
+            agent_id: AgentId::from("agent-9"),
+        };
+        for caller in [owner, agent, Caller::Daemon] {
+            let frames = queue_frames_for(caller.clone(), &principal_id).await;
+            assert_eq!(frames.len(), 1, "{caller:?}: {frames:?}");
+            assert_eq!(frames[0]["queue"], mixed_queue(&principal_id), "{caller:?}");
+        }
     }
 
     /// The reverse registry's transition → event-type mapping resolves to

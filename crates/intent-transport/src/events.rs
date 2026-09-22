@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use intent_core::events::WORKSPACE_UPDATED;
+use intent_core::events::{AGENT_QUEUE_UPDATED, WORKSPACE_UPDATED};
 use intent_core::{Caller, Event, PrincipalId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Map, Value};
 
@@ -129,6 +129,25 @@ impl MembershipGate {
             .insert(workspace_id.to_string(), (allowed, Instant::now()));
         allowed
     }
+}
+
+/// Egress projection of an `agent:queue:updated` payload for the current
+/// request's caller: a non-administrator wire principal's `data.queue` keeps
+/// only the entries it may see ([`intent_core::project_queue_for_caller`] —
+/// its own plus author-less ones; `position` is not renumbered). Every other
+/// event type, and every other caller, passes through untouched. Called on
+/// events that passed the [`MembershipGate`], under the subscriber's caller
+/// re-established by the forwarder spawn.
+pub(crate) fn project_queue_event_for_current_caller(event: &mut Event) {
+    if event.event_type != AGENT_QUEUE_UPDATED {
+        return;
+    }
+    let Some(queue) = event.data.get_mut("queue").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let caller = crate::context::current_caller();
+    let entries = std::mem::take(queue);
+    *queue = intent_core::project_queue_for_caller(caller.as_ref(), entries);
 }
 
 /// The `id` member of a fast-path request: whether it was present (a response is
