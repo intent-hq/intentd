@@ -765,11 +765,14 @@ async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
 
 /// Text-block `media` sidecar (PROTOCOL §7.1) over the real WSS wire: the
 /// daemon probes the dimensions of a `workspace-asset://` Markdown image the
-/// provider streams — a reference split across two chunks resolves on the
-/// chunk that completes it, so that chunk's `chat:stream:delta` carries
-/// `media` keyed by the exact `src` while the earlier chunk carries none —
-/// and the persisted text block on `agent.getConversation` carries the same
-/// entry, so a reloading client can reserve the layout box without a
+/// provider streams — a reference split across chunks resolves on the chunk
+/// that completes it, so that chunk's `chat:stream:delta` carries `media`
+/// keyed by the exact `src` while the chunks before and after carry none.
+/// On the canonical `chat.subscribe` channel the same holds in BOTH
+/// `deltaEncoding` modes (only the entries that chunk resolved travel, never
+/// the accumulated map), the terminal reconcile frame carries the persisted
+/// union, and the persisted text block on `agent.getConversation` carries the
+/// same entry, so a reloading client can reserve the layout box without a
 /// round-trip.
 #[intent_test_macros::daemon_test]
 async fn text_block_media_sidecar_over_wss() {
@@ -795,7 +798,9 @@ async fn text_block_media_sidecar_over_wss() {
             { "sessionUpdate": "agent_message_chunk",
               "content": { "type": "text", "text": format!("Here: ![shot]({head}") } },
             { "sessionUpdate": "agent_message_chunk",
-              "content": { "type": "text", "text": format!("{tail}) done") } },
+              "content": { "type": "text", "text": format!("{tail})") } },
+            { "sessionUpdate": "agent_message_chunk",
+              "content": { "type": "text", "text": " done" } },
         ],
         "omitResponse": true,
     })
@@ -843,6 +848,42 @@ async fn text_block_media_sidecar_over_wss() {
         .as_str()
         .expect("agent id")
         .to_string();
+
+    // Canonical chat channels, one per `deltaEncoding`, subscribed BEFORE the
+    // turn so every live delta is observed.
+    let mut chat_full = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat_full,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed (full): {chat_resp}"
+    );
+    let snap = wss_push(&mut chat_full, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+    let mut chat_inc = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat_inc,
+        21,
+        "chat.subscribe",
+        json!({ "agentId": agent_id, "deltaEncoding": "incremental" }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed (incremental): {chat_resp}"
+    );
+    let snap = wss_push(&mut chat_inc, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+    assert_eq!(
+        snap["params"]["snapshot"]["deltaEncoding"], "incremental",
+        "the daemon honored the incremental encoding: {snap}"
+    );
+
     let sent = wss_rpc(
         &mut rpc,
         11,
@@ -853,6 +894,7 @@ async fn text_block_media_sidecar_over_wss() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
     let expected_media = json!({ &src: { "width": 20, "height": 10 } });
+    let full_text = format!("Here: ![shot]({src}) done");
     let mut deltas: Vec<Value> = Vec::new();
     let mut message_id: Option<String> = None;
     for _ in 0..80 {
@@ -874,7 +916,7 @@ async fn text_block_media_sidecar_over_wss() {
     }
     assert_eq!(
         deltas.len(),
-        2,
+        3,
         "one text delta per streamed chunk: {deltas:?}"
     );
     assert!(
@@ -887,9 +929,118 @@ async fn text_block_media_sidecar_over_wss() {
         "the chunk that COMPLETES the reference carries its dimensions: {}",
         deltas[1]
     );
+    assert!(
+        deltas[2].get("media").is_none(),
+        "a later chunk that resolves nothing carries no media: {}",
+        deltas[2]
+    );
+    assert!(
+        deltas.iter().all(|d| d["blockId"] == deltas[0]["blockId"]),
+        "all chunks belong to the same text block: {deltas:?}"
+    );
+
+    // Drain one chat channel: the live text-block entities in order, then the
+    // terminal reconcile entity (`streamingComplete: true`) for that block.
+    // Single total deadline (per-frame reads would reset on heartbeat Pings).
+    async fn drain_text_block<S>(
+        chat: &mut WebSocketStream<S>,
+        agent_id: &str,
+    ) -> (Vec<Value>, Value)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        timeout(Duration::from_secs(30), async {
+            let mut live: Vec<Value> = Vec::new();
+            loop {
+                let frame = wss_push(chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = &frame["params"]["delta"];
+                let entities = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .filter(|e| {
+                        e["agentId"] == agent_id
+                            && e["role"] == "assistant"
+                            && e["block"]["type"] == "text"
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for entity in entities {
+                    if entity["streamingComplete"] == true {
+                        return (live, entity);
+                    }
+                    live.push(entity);
+                }
+            }
+        })
+        .await
+        .expect("chat channel settled the text block")
+    }
+
+    let (full_live, full_terminal) = drain_text_block(&mut chat_full, &agent_id).await;
     assert_eq!(
-        deltas[0]["blockId"], deltas[1]["blockId"],
-        "both chunks belong to the same text block"
+        full_live.len(),
+        3,
+        "full mode: one entity per streamed chunk: {full_live:?}"
+    );
+    assert!(
+        full_live[0]["block"].get("media").is_none(),
+        "full mode: opening chunk carries no media: {}",
+        full_live[0]
+    );
+    assert_eq!(
+        full_live[1]["block"]["media"], expected_media,
+        "full mode: completing chunk carries only what it resolved: {}",
+        full_live[1]
+    );
+    assert!(
+        full_live[2]["block"].get("media").is_none(),
+        "full mode: a chunk that resolves nothing omits media (never resends the union): {}",
+        full_live[2]
+    );
+    assert_eq!(
+        full_live[2]["block"]["text"].as_str(),
+        Some(full_text.as_str()),
+        "full mode still carries the accumulated text: {}",
+        full_live[2]
+    );
+    assert_eq!(
+        full_terminal["block"]["media"], expected_media,
+        "full mode: the terminal reconcile carries the persisted union: {full_terminal}"
+    );
+
+    let (inc_live, inc_terminal) = drain_text_block(&mut chat_inc, &agent_id).await;
+    assert_eq!(
+        inc_live.len(),
+        3,
+        "incremental mode: one entity per streamed chunk: {inc_live:?}"
+    );
+    assert!(
+        inc_live[0]["block"].get("media").is_none(),
+        "incremental mode: opening chunk carries no media: {}",
+        inc_live[0]
+    );
+    assert_eq!(
+        inc_live[1]["block"]["media"], expected_media,
+        "incremental mode: completing chunk carries only what it resolved: {}",
+        inc_live[1]
+    );
+    assert_eq!(
+        inc_live[1]["block"]["textDelta"].as_str(),
+        Some(format!("{tail})").as_str()),
+        "incremental mode carries only the fragment: {}",
+        inc_live[1]
+    );
+    assert!(
+        inc_live[2]["block"].get("media").is_none(),
+        "incremental mode: a chunk that resolves nothing omits media: {}",
+        inc_live[2]
+    );
+    assert_eq!(
+        inc_terminal["block"]["media"], expected_media,
+        "incremental mode: the terminal reconcile carries the persisted union: {inc_terminal}"
     );
 
     // Durable half: the persisted block carries the same sidecar.

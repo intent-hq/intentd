@@ -3,12 +3,13 @@
 //!
 //! The probe resolves a Markdown image `src` to a file on the daemon host —
 //! `workspace-asset://<wsId>/<assetId>` under the assets root,
-//! `intent://<org>/[<wsId>/]file/<path>` and bare workspace-relative paths
-//! under the workspace root (both through the `file.*` within-root guards) —
-//! and reads ONLY the image header (`ImageReader::into_dimensions`): no pixel
-//! decode, no full read. `http(s)://`, `data:` and every other scheme are
-//! never probed. Every failure is silent (`None`): a missing file, an
-//! out-of-root path, a non-image, or an unreadable header simply yields no
+//! `intent://local/[<wsId>/]file/<path>` and bare workspace-relative paths
+//! under the workspace root (all three through the `file.*` within-root
+//! guards, symlink-aware) — and reads ONLY the image header
+//! (`ImageReader::into_dimensions`): no pixel decode, no full read.
+//! `http(s)://`, `data:`, non-`local` `intent://` authorities and every other
+//! scheme are never probed. Every failure is silent (`None`): a missing file,
+//! an out-of-root path, a non-image, or an unreadable header simply yields no
 //! entry, and the FE falls back to its unsized rendering.
 //!
 //! Cost ladder (`AGENTS.md` → Performance): rung 1 — the probe runs on the
@@ -59,18 +60,17 @@ impl ProbeContext {
             if !is_safe_segment(&asset) {
                 return None;
             }
-            return Some(
-                self.assets_root
-                    .as_ref()?
-                    .join(&self.workspace_id)
-                    .join(asset),
-            );
+            // Same symlink-aware guard as workspace files, rooted at the
+            // assets root so a symlinked `<wsId>/` directory or asset leaf
+            // pointing outside it resolves to nothing.
+            let root = self.assets_root.as_ref()?.to_str()?;
+            let rel = format!("{}/{asset}", self.workspace_id);
+            return file_ops::resolve_within(root, &rel).ok();
         }
         if let Some(rest) = src.strip_prefix("intent://") {
             let rest = strip_query_fragment(rest);
             let mut segments = rest.split('/');
-            let org = segments.next()?;
-            if org.is_empty() {
+            if segments.next()? != "local" {
                 return None;
             }
             let segments: Vec<&str> = segments.collect();
@@ -121,8 +121,15 @@ const MAX_IMAGE_REF_SPAN: usize = 4096;
 /// references and return their `src` values in document order, advancing
 /// `*scan_pos` past the last consumed reference — or to the start of a
 /// still-open one, so a reference split across streamed chunks is detected
-/// once its closing `)` arrives, never twice. An `![alt](src "title")` form
-/// yields only the `src` token (the FE keys `media` by the rendered `src`).
+/// once its closing `)` arrives, never twice.
+///
+/// Follows the `CommonMark` inline-image shape the FE renderer (`marked`)
+/// parses: balanced / backslash-escaped brackets in the label, a destination
+/// that is either `<…>`-delimited (spaces allowed) or bare with balanced
+/// parentheses, and an optional `"title"` / `'title'` / `(title)`. The
+/// returned `src` is the destination as the renderer keys it — angle
+/// brackets stripped and backslash escapes removed — so the `media` key
+/// matches the rendered `src` exactly.
 pub(crate) fn scan_image_refs(text: &str, scan_pos: &mut usize) -> Vec<String> {
     let bytes = text.as_bytes();
     let len = bytes.len();
@@ -133,40 +140,178 @@ pub(crate) fn scan_image_refs(text: &str, scan_pos: &mut usize) -> Vec<String> {
             i += 1;
             continue;
         }
-        let Some(close) = bytes[i + 2..].iter().position(|&b| b == b']') else {
-            if len - i > MAX_IMAGE_REF_SPAN {
-                i += 1;
-                continue;
+        match parse_image_ref(bytes, i + 2) {
+            RefParse::Complete { src, end } => {
+                if !src.is_empty() {
+                    out.push(src);
+                }
+                i = end;
             }
-            break;
-        };
-        let j = i + 2 + close;
-        if j + 1 >= len {
-            break;
-        }
-        if bytes[j + 1] != b'(' {
-            i += 1;
-            continue;
-        }
-        let Some(end) = bytes[j + 2..].iter().position(|&b| b == b')') else {
-            if len - i > MAX_IMAGE_REF_SPAN {
-                i += 1;
-                continue;
+            RefParse::Incomplete => {
+                if len - i > MAX_IMAGE_REF_SPAN {
+                    i += 1;
+                    continue;
+                }
+                break;
             }
-            break;
-        };
-        let k = j + 2 + end;
-        let src = text[j + 2..k]
-            .trim()
-            .split_ascii_whitespace()
-            .next()
-            .unwrap_or_default();
-        if !src.is_empty() {
-            out.push(src.to_string());
+            RefParse::Invalid => i += 1,
         }
-        i = k + 1;
     }
     *scan_pos = i;
+    out
+}
+
+/// Outcome of parsing one `![` opener at a position in the streamed buffer.
+enum RefParse {
+    /// A complete reference: its rendered `src` and the byte offset just past
+    /// the closing `)`.
+    Complete { src: String, end: usize },
+    /// The buffer ended inside the reference — more chunks may close it.
+    Incomplete,
+    /// Not an image reference (the opener is literal text).
+    Invalid,
+}
+
+/// Parse the label, destination and optional title of an image reference
+/// whose `![` ends just before `start`.
+fn parse_image_ref(bytes: &[u8], start: usize) -> RefParse {
+    let len = bytes.len();
+    // Label: balanced brackets, backslash escapes skipped.
+    let mut pos = start;
+    let mut depth = 1usize;
+    loop {
+        if pos >= len {
+            return RefParse::Incomplete;
+        }
+        match bytes[pos] {
+            b'\\' if pos + 1 < len && bytes[pos + 1].is_ascii_punctuation() => pos += 2,
+            b'[' => {
+                depth += 1;
+                pos += 1;
+            }
+            b']' => {
+                depth -= 1;
+                pos += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => pos += 1,
+        }
+    }
+    if pos >= len {
+        return RefParse::Incomplete;
+    }
+    if bytes[pos] != b'(' {
+        return RefParse::Invalid;
+    }
+    pos += 1;
+    pos = skip_whitespace(bytes, pos);
+    if pos >= len {
+        return RefParse::Incomplete;
+    }
+    // Destination: `<…>` (no newline, no nested `<`) or a bare run with
+    // balanced parentheses ending at whitespace or the unbalanced `)`.
+    let dest_start;
+    let dest_end;
+    if bytes[pos] == b'<' {
+        dest_start = pos + 1;
+        pos = dest_start;
+        loop {
+            if pos >= len {
+                return RefParse::Incomplete;
+            }
+            match bytes[pos] {
+                b'\\' if pos + 1 < len && bytes[pos + 1].is_ascii_punctuation() => pos += 2,
+                b'>' => break,
+                b'<' | b'\n' | b'\r' => return RefParse::Invalid,
+                _ => pos += 1,
+            }
+        }
+        dest_end = pos;
+        pos += 1;
+    } else {
+        dest_start = pos;
+        let mut parens = 0usize;
+        loop {
+            if pos >= len {
+                return RefParse::Incomplete;
+            }
+            match bytes[pos] {
+                b'\\' if pos + 1 < len && bytes[pos + 1].is_ascii_punctuation() => pos += 2,
+                b'(' => {
+                    parens += 1;
+                    pos += 1;
+                }
+                b')' if parens == 0 => break,
+                b')' => {
+                    parens -= 1;
+                    pos += 1;
+                }
+                b if b.is_ascii_whitespace() => break,
+                _ => pos += 1,
+            }
+        }
+        dest_end = pos;
+    }
+    pos = skip_whitespace(bytes, pos);
+    if pos >= len {
+        return RefParse::Incomplete;
+    }
+    // Optional title, then the closing `)`.
+    if bytes[pos] != b')' {
+        let closer = match bytes[pos] {
+            b'"' => b'"',
+            b'\'' => b'\'',
+            b'(' => b')',
+            _ => return RefParse::Invalid,
+        };
+        pos += 1;
+        loop {
+            if pos >= len {
+                return RefParse::Incomplete;
+            }
+            match bytes[pos] {
+                b'\\' if pos + 1 < len && bytes[pos + 1].is_ascii_punctuation() => pos += 2,
+                b if b == closer => break,
+                _ => pos += 1,
+            }
+        }
+        pos = skip_whitespace(bytes, pos + 1);
+        if pos >= len {
+            return RefParse::Incomplete;
+        }
+        if bytes[pos] != b')' {
+            return RefParse::Invalid;
+        }
+    }
+    let Ok(dest) = std::str::from_utf8(&bytes[dest_start..dest_end]) else {
+        return RefParse::Invalid;
+    };
+    RefParse::Complete {
+        src: unescape_punctuation(dest.trim()),
+        end: pos + 1,
+    }
+}
+
+fn skip_whitespace(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    pos
+}
+
+/// Drop the backslash of every `\<ASCII punctuation>` escape — the
+/// renderer's destination unescape, so the key matches its `src`.
+fn unescape_punctuation(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek().is_some_and(char::is_ascii_punctuation) {
+            continue;
+        }
+        out.push(c);
+    }
     out
 }
 
@@ -328,6 +473,19 @@ pub(crate) mod tests {
         assert_eq!(ctx.probe("intent://local/file/../outside.png"), None);
         assert_eq!(ctx.probe("intent://local/file/%2e%2e/outside.png"), None);
         assert_eq!(ctx.probe("intent://local/ws-2/file/outside.png"), None);
+        // Only the `local` authority names this daemon's files.
+        std::fs::create_dir_all(dir.path().join("root/docs")).unwrap();
+        write_image(
+            &dir.path().join("root/docs/pic.png"),
+            5,
+            5,
+            image::ImageFormat::Png,
+        );
+        assert_eq!(ctx.probe("intent://local/file/docs/pic.png"), Some((5, 5)));
+        assert_eq!(ctx.probe("intent://remote/file/docs/pic.png"), None);
+        assert_eq!(ctx.probe("intent://remote/ws-1/file/docs/pic.png"), None);
+        assert_eq!(ctx.probe("intent://LOCAL/file/docs/pic.png"), None);
+        assert_eq!(ctx.probe("intent:///file/docs/pic.png"), None);
         assert_eq!(ctx.probe("workspace-asset://ws-2/other.png"), None);
         assert_eq!(ctx.probe("workspace-asset://ws-1/../ws-2/other.png"), None);
         assert_eq!(ctx.probe("workspace-asset://ws-1/"), None);
@@ -340,6 +498,110 @@ pub(crate) mod tests {
         };
         assert_eq!(no_roots.probe("workspace-asset://ws-1/shot.png"), None);
         assert_eq!(no_roots.probe("docs/pic.png"), None);
+    }
+
+    /// A symlink planted under the assets root — an asset leaf or the whole
+    /// `<wsId>/` directory — pointing outside it resolves to nothing, exactly
+    /// as the workspace-file guard treats symlinked workspace paths.
+    #[cfg(unix)]
+    #[test]
+    fn asset_symlink_escapes_yield_no_entry() {
+        use std::os::unix::fs::symlink;
+        let dir = test_tempdir("img-probe-asset-symlink-");
+        let ctx = context(dir.path());
+        let outside = dir.path().join("outside.png");
+        write_image(&outside, 37, 19, image::ImageFormat::Png);
+        write_image(
+            &dir.path().join("assets/ws-1/real.png"),
+            4,
+            4,
+            image::ImageFormat::Png,
+        );
+        symlink(&outside, dir.path().join("assets/ws-1/shot.png")).unwrap();
+        assert_eq!(ctx.probe("workspace-asset://ws-1/real.png"), Some((4, 4)));
+        assert_eq!(ctx.probe("workspace-asset://ws-1/shot.png"), None);
+
+        let elsewhere = dir.path().join("elsewhere");
+        write_image(&elsewhere.join("pic.png"), 37, 19, image::ImageFormat::Png);
+        let dir_ctx = ProbeContext {
+            workspace_id: "ws-link".to_string(),
+            ..context(dir.path())
+        };
+        symlink(&elsewhere, dir.path().join("assets/ws-link")).unwrap();
+        assert_eq!(dir_ctx.probe("workspace-asset://ws-link/pic.png"), None);
+
+        // The workspace-file guard denies the same shapes for `intent://` and
+        // relative sources.
+        std::fs::create_dir_all(dir.path().join("root")).unwrap();
+        symlink(&outside, dir.path().join("root/leak.png")).unwrap();
+        assert_eq!(ctx.probe("leak.png"), None);
+        assert_eq!(ctx.probe("intent://local/file/leak.png"), None);
+    }
+
+    /// The scanner follows the `CommonMark` inline-image shape the FE
+    /// renderer parses, keying by the destination as rendered.
+    #[test]
+    fn scan_parses_commonmark_labels_destinations_and_titles() {
+        let cases: [(&str, &[&str]); 12] = [
+            (
+                "![shot](intent://local/file/shot(1).png)",
+                &["intent://local/file/shot(1).png"],
+            ),
+            (
+                "![shot](<intent://local/file/my shot.png>)",
+                &["intent://local/file/my shot.png"],
+            ),
+            ("![shot [1]](a.png)", &["a.png"]),
+            ("![a\\]b](b.png)", &["b.png"]),
+            ("![e](c\\(1\\).png \"t\")", &["c(1).png"]),
+            ("![t](d.png 'title')", &["d.png"]),
+            ("![t](e.png (title))", &["e.png"]),
+            ("![x](<a b>  \"title (x)\")", &["a b"]),
+            ("![x](f.png)) ![y](g.png", &["f.png"]),
+            ("![bad](<a\nb>) ![ok](ok.png)", &["ok.png"]),
+            ("![bad](h.png junk) ![ok](ok.png)", &["ok.png"]),
+            ("![i](  i.png  ) ![j](\nj.png\n)", &["i.png", "j.png"]),
+        ];
+        for (text, expected) in cases {
+            let mut pos = 0;
+            assert_eq!(scan_image_refs(text, &mut pos), expected, "{text:?}");
+        }
+    }
+
+    /// The same forms split across streamed chunks at every delimiter
+    /// resolve exactly once, when the closing `)` arrives.
+    #[test]
+    fn scan_detects_commonmark_forms_split_across_chunks_exactly_once() {
+        let cases: [(&[&str], &str); 4] = [
+            (
+                &["![shot](intent://local/file/shot(1", ").png", ")"],
+                "intent://local/file/shot(1).png",
+            ),
+            (&["![s](<a", " b", ">", ")"], "a b"),
+            (&["![n [1", "]", "](n.png", ")"], "n.png"),
+            (&["![t](t.png \"ti", "tle\"", ")"], "t.png"),
+        ];
+        for (chunks, expected) in cases {
+            let mut text = String::new();
+            let mut pos = 0;
+            let (last, opening) = chunks.split_last().unwrap();
+            for chunk in opening {
+                text.push_str(chunk);
+                assert!(
+                    scan_image_refs(&text, &mut pos).is_empty(),
+                    "{text:?} still open"
+                );
+                assert_eq!(pos, 0, "{text:?} holds the scan at the opener");
+            }
+            text.push_str(last);
+            assert_eq!(
+                scan_image_refs(&text, &mut pos),
+                vec![expected.to_string()],
+                "{text:?}"
+            );
+            assert_eq!(pos, text.len());
+            assert!(scan_image_refs(&text, &mut pos).is_empty());
+        }
     }
 
     #[test]
