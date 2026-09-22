@@ -1770,7 +1770,8 @@ mod tests {
     /// queue ejection), or the head is unknown on either side.
     #[test]
     fn upsert_pr_info_drops_queued_signal_when_the_pr_leaves_the_queue_shape() {
-        let cases: [(&str, Box<dyn Fn(&mut PullRequest)>); 6] = [
+        type Mutate = Box<dyn Fn(&mut PullRequest)>;
+        let cases: [(&str, Mutate); 6] = [
             ("merged", Box::new(|p| p.state = PrState::Merged)),
             ("closed", Box::new(|p| p.state = PrState::Closed)),
             ("draft", Box::new(|p| p.draft = true)),
