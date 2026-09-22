@@ -425,6 +425,36 @@ pub(crate) fn upsert_pr_info_by_url(
     true
 }
 
+/// Whether a snapshot served from the shared PR cache — a hit, no forge read
+/// of its own — carries something the persisted pool copy has not seen
+/// (intent-hq/intent#5654). The passive fold runs on every serve, fetched or
+/// cached: a fetch always writes the fresh record, while a hit writes only
+/// when the served **queue signal, head or status** differs from the
+/// persisted entry. Rationale: a `ws.pr.snapshot` (or another reader's
+/// fill) can seed the cache with the queue signal the pool never received,
+/// and the next hover must land it instead of skipping the fold as a hit;
+/// but a hit whose record agrees with the pool on those axes must not
+/// re-persist REST fields a later sweep may already have refreshed.
+pub(crate) fn served_pr_differs(persisted: &PullRequestInfo, served: &PullRequestInfo) -> bool {
+    persisted.is_in_merge_queue != served.is_in_merge_queue
+        || persisted.head_sha != served.head_sha
+        || persisted.status != served.status
+}
+
+/// [`served_pr_differs`] over a pool: `true` when any entry sharing the
+/// served URL ([`same_pr_url`]) differs from it (an absent entry never
+/// differs — a hit never grows a pool).
+pub(crate) fn pool_differs_from_served(
+    pool: Option<&[PullRequestInfo]>,
+    served: &PullRequestInfo,
+) -> bool {
+    pool.is_some_and(|items| {
+        items
+            .iter()
+            .any(|p| same_pr_url(&p.url, &served.url) && served_pr_differs(p, served))
+    })
+}
+
 /// Rebase a REST-path `pull_requests` list about to be persisted onto the
 /// pool currently in the store (intent-hq/intent#5654). REST refreshes build
 /// their list from a row read taken before the forge round trip (the sweep
@@ -1954,6 +1984,55 @@ mod tests {
         let mut same = build_pr_info(&rest);
         carry_merge_queue_signal(&mut same, &queued);
         assert_eq!(same.is_in_merge_queue, Some(true));
+    }
+
+    /// The cache-hit fold guard: a served snapshot differs from the persisted
+    /// copy on the queue signal, the head or the status — never on the plain
+    /// REST fields a later sweep may have refreshed — and a pool differs only
+    /// through an entry sharing the served URL (a same-numbered stranger or an
+    /// absent entry never triggers a hit fold).
+    #[test]
+    fn served_pr_differs_only_on_signal_head_or_status() {
+        let persisted = queued_pooled_pr();
+        let mut served = persisted.clone();
+        assert!(!served_pr_differs(&persisted, &served));
+
+        served.title = "renamed".into();
+        served.updated_at = "2026-02-01T00:00:00Z".into();
+        served.mergeable_state = Some("blocked".into());
+        assert!(
+            !served_pr_differs(&persisted, &served),
+            "REST-only fields never trigger a hit fold"
+        );
+
+        let mut dequeued = persisted.clone();
+        dequeued.is_in_merge_queue = None;
+        assert!(served_pr_differs(&persisted, &dequeued));
+        let mut moved = persisted.clone();
+        moved.head_sha = Some("sha2".into());
+        assert!(served_pr_differs(&persisted, &moved));
+        let mut merged = persisted.clone();
+        merged.status = PullRequestStatus::Merged;
+        assert!(served_pr_differs(&persisted, &merged));
+
+        assert!(!pool_differs_from_served(None, &dequeued));
+        assert!(!pool_differs_from_served(Some(&[]), &dequeued));
+        assert!(pool_differs_from_served(
+            Some(std::slice::from_ref(&persisted)),
+            &dequeued
+        ));
+        let mut stranger = dequeued.clone();
+        stranger.url = "https://github.com/fork/repo/pull/1".into();
+        assert!(!pool_differs_from_served(
+            Some(std::slice::from_ref(&persisted)),
+            &stranger
+        ));
+        let mut cased = dequeued.clone();
+        cased.url = persisted.url.to_ascii_uppercase();
+        assert!(pool_differs_from_served(
+            Some(std::slice::from_ref(&persisted)),
+            &cased
+        ));
     }
 
     /// The write-time rebase re-derives a fresh entry's queue signal from the

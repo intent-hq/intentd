@@ -18576,7 +18576,7 @@ pub(crate) mod pr {
         let refresh = svc.refresh_workspace_pr(&ws_id);
         let fold = async {
             park.entered.notified().await;
-            svc.fold_fetched_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true))
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true), true)
                 .await
                 .expect("fold");
             let mid = svc.store().get_workspace(&ws_id).await.unwrap();
@@ -18613,7 +18613,7 @@ pub(crate) mod pr {
         let refresh = svc.refresh_workspace_pr(&ws_id);
         let fold = async {
             park.entered.notified().await;
-            svc.fold_fetched_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false))
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false), true)
                 .await
                 .expect("fold");
             let mid = svc.store().get_workspace(&ws_id).await.unwrap();
@@ -20605,7 +20605,7 @@ pub(crate) mod pr {
         let refresh = svc.refresh_git_root_pr(root, &sc);
         let fold = async {
             park.entered.notified().await;
-            svc.fold_fetched_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true))
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true), true)
                 .await
                 .expect("fold");
             park.release.notify_one();
@@ -20632,7 +20632,7 @@ pub(crate) mod pr {
         let refresh = svc.refresh_git_root_pr(root, &sc);
         let fold = async {
             park.entered.notified().await;
-            svc.fold_fetched_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false))
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false), true)
                 .await
                 .expect("fold");
             park.release.notify_one();
@@ -21569,16 +21569,17 @@ pub(crate) mod pr {
         );
     }
 
-    /// Regression (intent-hq/intentd#2064 review): the fold runs only when
-    /// `github.pulls.get`'s own read fetched the record. A concurrent fill
-    /// landing between the read's preflight cache miss and the shared path's
-    /// authoritative lookup makes that lookup a hit: the hover answers the
-    /// concurrently stored record with no forge request of its own, and the
-    /// linked workspace is never folded (persisted Open stays Open, no
-    /// `pr:updated`, no displayStatus transition). A later read that does
-    /// fetch — the entry aged past `max_age` — folds as usual.
+    /// Regression (intent-hq/intentd#2064 review, revised for
+    /// intent-hq/intent#5654): a concurrent fill landing between the read's
+    /// preflight cache miss and the shared path's authoritative lookup makes
+    /// that lookup a hit. The hover answers the concurrently stored record
+    /// with no forge request of its own — the cache contract — and, because
+    /// the served status differs from the persisted Open, the hit still
+    /// folds (Merged lands, one `pr:updated`, `pr_merged`). A later read
+    /// that fetches — the entry aged past `max_age` — finds nothing left to
+    /// fold.
     #[intent_test_macros::daemon_test]
-    async fn pulls_get_never_folds_when_a_concurrent_fill_serves_the_read() {
+    async fn pulls_get_folds_a_concurrent_fill_that_serves_the_read_without_a_forge_call() {
         let park = Arc::new(crate::CompletionClassifyPark::default());
         let forge = Arc::new(StubForge {
             merged_linked: true,
@@ -21637,38 +21638,258 @@ pub(crate) mod pr {
         let after = svc.store().get_workspace(&ws_id).await.unwrap();
         assert_eq!(
             after.pr_status,
-            Some(intent_core::PullRequestStatus::Open),
-            "a read served from the cache never folds"
+            Some(intent_core::PullRequestStatus::Merged),
+            "a hit whose served status differs from the pool folds"
         );
         assert_eq!(
             after.pull_requests.as_ref().expect("pull_requests")[0].status,
-            intent_core::PullRequestStatus::Open
+            intent_core::PullRequestStatus::Merged
         );
-        assert!(svc
-            .store()
-            .events_by_type(&ws_id, "pr:updated", 10)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
 
-        // Aged past max_age, the next read fetches — and that one folds.
-        // (The still-armed park is released ahead of the read.)
+        // Aged past max_age, the next read fetches — identical forge state,
+        // so nothing persists and nothing emits. (The still-armed park is
+        // released ahead of the read.)
         svc.backdate_pr_cache(std::time::Duration::from_secs(61));
         park.release.notify_one();
         svc.github_pulls_get("o".into(), "r".into(), 42)
             .await
             .expect("pulls.get after expiry");
         assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42, 42]);
-        let folded = svc.store().get_workspace(&ws_id).await.unwrap();
+        let again = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(again.updated_at, after.updated_at);
+        assert_eq!(display_status_events(&svc, &ws_id).await.len(), 1);
+    }
+
+    /// The forge for the cache-hit fold regressions: an open #42 whose
+    /// merge-requirements probe reports the given queue state, so a full
+    /// read composes `merge_queue_reported == Some(queued)`.
+    fn queue_signal_forge(queued: bool) -> Arc<StubForge> {
+        Arc::new(StubForge {
+            merge_signals: Some(MergeRequirementSignals {
+                is_in_merge_queue: Some(queued),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Linked #42 (Open, pooled + `activePullRequest`) persisted with the
+    /// given queue signal, under a 60s cache TTL.
+    async fn cached_hover_setup(
+        forge: Arc<StubForge>,
+        signal: Option<bool>,
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        let mut open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        open.is_in_merge_queue = signal;
+        let (t, root, svc, ws_id) = fold_setup_with(forge, |ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        (t, root, svc.with_pr_cache_max_age_seconds(60), ws_id)
+    }
+
+    /// A cache fill that is NOT a serve — a monitor poll or another reader
+    /// storing #42 — so the entry sits in the cache without any fold.
+    async fn fill_pr_cache(forge: &StubForge, svc: &Services) {
+        crate::pr_monitor::read_pr_via(
+            forge,
+            &RepoRef::new("o", "r"),
+            42,
+            &svc.pr_cache,
+            crate::pr_monitor::PrReadPolicy::REFRESH,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("cache fill");
+    }
+
+    /// Regression (intent-hq/intent#5654, intentd#2079 review): the queue
+    /// signal seeded into the shared cache by another reader — a
+    /// `ws.pr.snapshot`, a monitor poll — must land on the pool at the next
+    /// hover even though that hover is a cache hit. Persisted `None`, cache
+    /// filled with `isInMergeQueue: true`, hover within the TTL: no forge
+    /// request, the pooled and linked copies flip to `Some(true)`, one
+    /// `pr:updated`, and `displayStatus` moves `pr_ready` → `pr_queued`. A
+    /// repeat hit that agrees with the pool writes nothing.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_folds_a_queue_signal_served_from_the_cache() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
         assert_eq!(
-            folded.pr_status,
-            Some(intent_core::PullRequestStatus::Merged),
-            "a read that fetched folds"
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        let filled = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            filled.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None,
+            "a bare cache fill folds nothing"
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["isInMergeQueue"], true);
+        assert_eq!(
+            *forge.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "the hover is a hit: no forge request"
+        );
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            Some(true),
+            "the served signal folded on a cache hit"
+        );
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            Some(true)
+        );
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Open),
+            "the passive fold keeps the link and status"
+        );
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
         assert_eq!(
             display_status_events(&svc, &ws_id).await,
-            vec![json!("pr_merged")]
+            vec![json!("pr_queued")]
+        );
+
+        // A repeat hit agrees with the pool: nothing persists, nothing emits.
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get again");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        let again = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(again.updated_at, after.updated_at);
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(display_status_events(&svc, &ws_id).await.len(), 1);
+    }
+
+    /// The inverse of [`pulls_get_folds_a_queue_signal_served_from_the_cache`]:
+    /// the pool holds `Some(true)` (`pr_queued`), the cached read observed
+    /// the PR dequeued (`isInMergeQueue: false`, same head, still open) —
+    /// the cache-hit hover clears the signal on the pooled and linked copies
+    /// and `displayStatus` falls back to `pr_ready`, again without a forge
+    /// request.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_clears_a_queue_signal_the_cache_reports_lapsed() {
+        let forge = queue_signal_forge(false);
+        let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), Some(true)).await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrQueued)
+        );
+
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        assert_eq!(
+            svc.store()
+                .get_workspace(&ws_id)
+                .await
+                .unwrap()
+                .pull_requests
+                .as_ref()
+                .unwrap()[0]
+                .is_in_merge_queue,
+            Some(true),
+            "a bare cache fill folds nothing"
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["isInMergeQueue"], false);
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None,
+            "the cached dequeue cleared the persisted signal"
+        );
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            None
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_ready")]
+        );
+    }
+
+    /// `ws.pr.snapshot` (`pr.state`) reads through the same serve and folds
+    /// identically to the hover: a cached queue signal lands on the pool
+    /// from a snapshot too (intent-hq/intent#5654).
+    #[intent_test_macros::daemon_test]
+    async fn pr_state_folds_a_queue_signal_served_from_the_cache() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+        fill_pr_cache(forge.as_ref(), &svc).await;
+
+        let v = svc
+            .pr_state(ws_id.clone(), 42, None)
+            .await
+            .expect("snapshot");
+        assert_eq!(v["requirements"]["isInMergeQueue"], true, "{v}");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            Some(true)
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
         );
     }
 

@@ -5364,8 +5364,9 @@ impl Services {
         }
     }
 
-    /// Passively fold a PR snapshot fetched on demand (`github.pulls.get`,
-    /// the FE hover card) into the daemon-owned PR state, so the sidebar's
+    /// Passively fold a PR snapshot served on demand (`github.pulls.get`,
+    /// the FE hover card; `ws.pr.snapshot` — every read through
+    /// [`Self::serve_pr`]) into the daemon-owned PR state, so the sidebar's
     /// `displayStatus` grouping reflects the fresh status through the
     /// existing event plumbing instead of waiting for the next sweep.
     ///
@@ -5394,11 +5395,21 @@ impl Services {
     /// reported `true` lands on every folded copy and anything else clears
     /// a persisted `Some(true)` — the URL-keyed upsert never inherits
     /// (intent-hq/intent#5654).
-    pub(crate) async fn fold_fetched_pr(
+    ///
+    /// `fetched` is whether the serve reached the forge for this record. A
+    /// fetch folds unconditionally (the record is fresh); a cache hit folds
+    /// a row only when the served snapshot's queue signal, head or status
+    /// differs from that row's persisted copy
+    /// ([`pr_ops::served_pr_differs`]) — so a signal another reader's fill
+    /// (`ws.pr.snapshot`, a monitor poll) carried into the cache lands on
+    /// the next hover instead of being skipped as a hit, while a hit that
+    /// agrees with the pool writes nothing.
+    pub(crate) async fn fold_served_pr(
         &self,
         repo_ref: &intent_sourcecontrol::RepoRef,
         pr: &intent_sourcecontrol::PullRequest,
         merge_queue_reported: Option<bool>,
+        fetched: bool,
     ) -> Result<()> {
         let info = pr_ops::build_pr_info_with_merge_queue(pr, merge_queue_reported);
         let workspaces = self
@@ -5406,8 +5417,20 @@ impl Services {
             .list_workspaces_referencing_pr_url(&pr.url)
             .await?;
         for mut ws in workspaces {
-            let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
             let linked = ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
+            // A hit folds only what this row has not seen.
+            let hit_carries_news =
+                pr_ops::pool_differs_from_served(ws.pull_requests.as_deref(), &info)
+                    || (linked
+                        && (ws.pr_status != Some(info.status)
+                            || ws
+                                .active_pull_request
+                                .as_ref()
+                                .is_none_or(|active| pr_ops::served_pr_differs(active, &info))));
+            if !(fetched || hit_carries_news) {
+                continue;
+            }
+            let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
             if linked
                 && (ws.pr_status != Some(info.status)
                     || ws.active_pull_request.as_ref() != Some(&info)
@@ -5438,6 +5461,14 @@ impl Services {
             .list_workspace_git_roots_referencing_pr_url(&pr.url)
             .await?;
         for mut root in roots {
+            let linked =
+                root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
+            let hit_carries_news =
+                pr_ops::pool_differs_from_served(root.pull_requests.as_deref(), &info)
+                    || (linked && root.pr_status != Some(info.status));
+            if !(fetched || hit_carries_news) {
+                continue;
+            }
             let mut changed = false;
             if root
                 .pull_requests
@@ -5446,8 +5477,6 @@ impl Services {
             {
                 changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
             }
-            let linked =
-                root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
             if linked
                 && (root.pr_status != Some(info.status)
                     || root.pr_url.as_deref() != Some(pr.url.as_str()))
@@ -29752,25 +29781,9 @@ impl WorkspaceApi for Services {
             // the entry is younger than `prCache.maxAgeSeconds`, else one
             // full read — the same read the monitor's poll performs — that
             // refreshes the entry the next hover and `ws.pr.snapshot` serve.
-            let (entry, fetched) = self.serve_pr(&repo_ref, number).await?;
-            // The fold rides a REAL fetch only: a hit reports nothing the
-            // daemon-owned state has not already seen. Fail-soft: the hover
-            // card always gets its `{ pull }`; a fold failure only costs the
-            // daemon-owned state its early refresh.
-            if fetched {
-                if let Err(e) = self
-                    .fold_fetched_pr(&repo_ref, &entry.pr, entry.snapshot.merge_queue_reported)
-                    .await
-                {
-                    tracing::warn!(
-                        owner = %repo_ref.owner,
-                        repo = %repo_ref.name,
-                        pr_number = number,
-                        error = %e,
-                        "github.pulls.get: folding the fetched PR into workspace PR state failed"
-                    );
-                }
-            }
+            // The serve folds the snapshot into the daemon-owned PR state
+            // (`fold_served_pr`, fail-soft), hit or miss.
+            let (entry, _) = self.serve_pr(&repo_ref, number).await?;
             Ok(serde_json::json!({
                 "pull": github_ops::pull_to_json_with_merge_queue(
                     &entry.pr,

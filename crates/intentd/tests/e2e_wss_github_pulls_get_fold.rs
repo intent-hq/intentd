@@ -697,8 +697,8 @@ async fn github_pulls_get_folds_fetched_pr_into_workspace_pr_state_over_wss() {
     assert_no_events(&mut sub).await;
 
     // A repeat hover within `prCache.maxAgeSeconds` is served from the
-    // shared cache: the same `{ pull }`, no forge request, and nothing to
-    // fold (no events).
+    // shared cache: the same `{ pull }`, no forge request, and — the served
+    // snapshot agreeing with the pool — nothing to fold (no events).
     let again = wss_rpc(
         &mut rpc,
         5,
