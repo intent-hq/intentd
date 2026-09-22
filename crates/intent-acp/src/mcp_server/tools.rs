@@ -271,7 +271,7 @@ API:
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
   ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
   ws.script.remove(scriptId) → { ok, scriptId }  // Stops and removes a saved script definition.
-  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
+  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously (a call that lands inside a `restarting` gap keeps `restarting`; one on an already `starting` / `running` script is a no-op) and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
   ws.script.stop(scriptId) → { ok, scriptId }  // Stops a running script.
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
@@ -526,7 +526,7 @@ API:
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
   ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
   ws.script.remove(scriptId) → { ok, scriptId }  // Stops and removes a saved script definition.
-  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
+  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously (a call that lands inside a `restarting` gap keeps `restarting`; one on an already `starting` / `running` script is a no-op) and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
   ws.script.stop(scriptId) → { ok, scriptId }  // Stops a running script.
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
