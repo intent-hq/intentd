@@ -60,7 +60,7 @@
 //! fingerprint is blind to the comment / review / thread movement the
 //! monitor exists to report.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2304,17 +2304,22 @@ impl Services {
     /// in the workspace through the shared cancel transition
     /// ([`Services::cancel_active_pr_monitor`]), mirroring the hook sweep
     /// ([`Services::cancel_workspace_hooks`]) — state persisted to
-    /// `cancelled`, `prMonitor:cancelled` emitted, owner woken with a notice
-    /// so the agent learns why its watch stopped. Runs AFTER the archived
-    /// row is persisted: the wake rides the archived gate in
-    /// [`Services::deliver_wake_message`], so it parks in the queue (at
-    /// most) and never starts a turn while the workspace is archived.
+    /// `cancelled`, `prMonitor:cancelled` emitted, waiting recomputed
+    /// (§5.1). Each cancel is SILENT (no per-monitor wake, like the retire
+    /// sweep): the cancelled monitors are returned grouped by owner as
+    /// `(label, monitor_id)` pairs, and the archive tail
+    /// ([`crate::Services::notify_owners_of_archived_watches`]) folds them
+    /// with the swept hooks into ONE consolidated notice per agent.
     /// Terminal monitors are untouched, and unarchive does NOT resurrect
     /// cancelled monitors — the notice tells the owner to re-register if the
     /// PR still matters. Best-effort per monitor: a store failure is logged
     /// and the sweep moves on — archiving must not fail because one monitor
     /// row would not update.
-    pub(crate) async fn cancel_workspace_pr_monitors(&self, workspace_id: &WorkspaceId) {
+    pub(crate) async fn cancel_workspace_pr_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> BTreeMap<AgentId, Vec<(String, PrMonitorId)>> {
+        let mut cancelled: BTreeMap<AgentId, Vec<(String, PrMonitorId)>> = BTreeMap::new();
         let monitors = match self
             .store
             .list_active_pr_monitors_by_workspace(workspace_id)
@@ -2327,24 +2332,31 @@ impl Services {
                     error = %e,
                     "archive pr-monitor sweep: monitor list failed; skipping"
                 );
-                return;
+                return cancelled;
             }
         };
         for monitor in monitors {
             let monitor_id = monitor.monitor_id.clone();
-            let notice = crate::harness::latest()
-                .pr_monitor_cancelled_workspace_archived_notice(&monitor_label(&monitor));
-            // `Ok(None)` = a concurrent cancel/complete won the CAS between
-            // the list read and the guarded write; no longer active either way.
-            if let Err(e) = self.cancel_active_pr_monitor(monitor, Some(&notice)).await {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    monitor = %monitor_id.0,
-                    error = %e,
-                    "archive pr-monitor sweep: cancel failed; continuing"
-                );
+            match self.cancel_active_pr_monitor(monitor, None).await {
+                Ok(Some(monitor)) => cancelled
+                    .entry(monitor.agent_id.clone())
+                    .or_default()
+                    .push((monitor_label(&monitor), monitor.monitor_id)),
+                // A concurrent cancel/complete won the CAS between the list
+                // read and the guarded write; no longer active either way,
+                // and not this sweep's to report.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        monitor = %monitor_id.0,
+                        error = %e,
+                        "archive pr-monitor sweep: cancel failed; continuing"
+                    );
+                }
             }
         }
+        cancelled
     }
 
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE PR monitor

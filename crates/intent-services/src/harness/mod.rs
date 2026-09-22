@@ -343,7 +343,13 @@ pub(crate) trait Harness: Send + Sync {
     fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String;
     /// FE-cancel notice body (`hook.cancel` with no agent caller).
     fn hook_cancelled_from_app_notice(&self) -> String;
-    /// Archive-sweep cancel notice body.
+    /// Pre-v2.7 per-hook archive-sweep cancel notice body. Retired as a
+    /// runtime surface by the consolidated
+    /// [`Harness::workspace_archived_watches_cancelled_notice`]; kept on the
+    /// trait so the per-version goldens keep pinning its bytes.
+    // `expect(dead_code)` cannot pin an unused trait method (rustc treats it as a
+    // liveness root and reports the expectation unfulfilled), hence the allow.
+    #[cfg_attr(not(test), expect(clippy::allow_attributes), allow(dead_code))]
     fn hook_cancelled_workspace_archived_notice(&self) -> String;
 
     // --- PR monitor wakes and notices (`pr_monitor.rs`) ---
@@ -373,7 +379,11 @@ pub(crate) trait Harness: Send + Sync {
     ) -> String;
     /// FE-cancel notice (`pr.unmonitor` with no agent caller).
     fn pr_monitor_cancelled_from_app_notice(&self, label: &str) -> String;
-    /// Archive-sweep cancel notice.
+    /// Pre-v2.7 per-monitor archive-sweep cancel notice. Retired as a
+    /// runtime surface by the consolidated
+    /// [`Harness::workspace_archived_watches_cancelled_notice`]; kept on the
+    /// trait so the per-version goldens keep pinning its bytes.
+    #[cfg_attr(not(test), expect(clippy::allow_attributes), allow(dead_code))]
     fn pr_monitor_cancelled_workspace_archived_notice(&self, label: &str) -> String;
     /// Former-owner notice when the monitor was taken over by the owner's
     /// parent (`reason: "transferred"`).
@@ -385,9 +395,6 @@ pub(crate) trait Harness: Send + Sync {
     /// unarchived, naming every background hook (`(name, hook_id)`) and PR
     /// monitor (label) the archive sweep cancelled and how to re-arm each
     /// kind. Callers pass at least one item; empty kinds are omitted.
-    // `expect(dead_code)` cannot pin an unused trait method (rustc treats it as a
-    // liveness root and reports the expectation unfulfilled), hence the allow.
-    #[cfg_attr(not(test), expect(clippy::allow_attributes), allow(dead_code))]
     fn workspace_archived_watches_cancelled_notice(
         &self,
         hooks: &[(&str, &str)],

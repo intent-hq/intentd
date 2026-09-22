@@ -40,7 +40,7 @@
 //! (still-active) hook so a silently broken check is observable via
 //! `ws.hook.list`; a later all-healthy run clears it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1298,14 +1298,15 @@ impl Services {
     }
 
     /// Core cancel transition shared by [`Services::hook_cancel_op`] and the
-    /// archive sweep ([`Services::cancel_workspace_hooks`]): abort the
-    /// scheduler task, persist `cancelled`, clear `nextRunAt`, and emit
-    /// `hook:cancelled`. With a `wake_notice` the owner is woken (the wake
-    /// runs the deferral backstop itself, inside `wake_hook_owner`, after
-    /// the delivery attempt); without one, no wake is delivered — a deferred
-    /// completion watch on the (idle) owner would otherwise never settle
-    /// when this was its last active hook, so the backstop runs directly.
-    /// The caller must have verified the hook is ACTIVE.
+    /// archive / retire sweeps ([`Services::cancel_workspace_hooks`],
+    /// [`Services::cancel_agent_hooks`]): abort the scheduler task, persist
+    /// `cancelled`, clear `nextRunAt`, and emit `hook:cancelled`. With a
+    /// `wake_notice` the owner is woken (the wake runs the deferral backstop
+    /// itself, inside `wake_hook_owner`, after the delivery attempt);
+    /// without one, no wake is delivered — a deferred completion watch on
+    /// the (idle) owner would otherwise never settle when this was its last
+    /// active hook, so the backstop runs directly. The caller must have
+    /// verified the hook is ACTIVE.
     async fn cancel_active_hook(&self, mut hook: Hook, wake_notice: Option<&str>) -> Result<Hook> {
         self.abort_hook_task(&hook.hook_id);
         self.store
@@ -1329,18 +1330,24 @@ impl Services {
     }
 
     /// Archive sweep (`workspace.archive`): cancel every ACTIVE
-    /// (`scheduled`/`running`) hook in the workspace through the
-    /// `hook.cancel` machinery — task aborted, state persisted to
-    /// `cancelled`, `hook:cancelled` emitted — plus an owner-wake notice so
-    /// the agent learns why its watch stopped. Runs AFTER the archived row
-    /// is persisted: the wake rides the archived gate in
-    /// [`Services::deliver_wake_message`], so it parks in the queue (at
-    /// most) and never starts a turn while the workspace is archived.
+    /// (`scheduled`/`running`) hook in the workspace through the shared
+    /// cancel transition ([`Services::cancel_active_hook`]) — task aborted,
+    /// state persisted to `cancelled`, `hook:cancelled` emitted, waiting
+    /// recomputed (§5.1). Each cancel is SILENT (no per-hook wake, like the
+    /// retire sweep): the cancelled hooks are returned grouped by owner as
+    /// `(name, hook_id)` pairs, and the archive tail
+    /// ([`crate::Services::notify_owners_of_archived_watches`]) folds them
+    /// with the swept PR monitors into ONE consolidated notice per agent.
     /// Terminal hooks (`dispatched`/`evicted`/`cancelled`/`expired`) are
-    /// untouched. Best-effort per hook: a store failure is logged and the
-    /// sweep moves on — archiving must not fail because one hook row would
-    /// not update.
-    pub(crate) async fn cancel_workspace_hooks(&self, workspace_id: &WorkspaceId) {
+    /// untouched, and unarchive does NOT resurrect cancelled hooks — the
+    /// notice tells the owner to reschedule if the condition still matters.
+    /// Best-effort per hook: a store failure is logged and the sweep moves
+    /// on — archiving must not fail because one hook row would not update.
+    pub(crate) async fn cancel_workspace_hooks(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> BTreeMap<AgentId, Vec<(String, HookId)>> {
+        let mut cancelled: BTreeMap<AgentId, Vec<(String, HookId)>> = BTreeMap::new();
         let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
@@ -1349,7 +1356,7 @@ impl Services {
                     error = %e,
                     "archive hook sweep: hook list failed; skipping"
                 );
-                return;
+                return cancelled;
             }
         };
         for hook in hooks {
@@ -1357,21 +1364,22 @@ impl Services {
                 continue;
             }
             let hook_id = hook.hook_id.clone();
-            if let Err(e) = self
-                .cancel_active_hook(
-                    hook,
-                    Some(&crate::harness::latest().hook_cancelled_workspace_archived_notice()),
-                )
-                .await
-            {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    hook = %hook_id.0,
-                    error = %e,
-                    "archive hook sweep: cancel failed; continuing"
-                );
+            match self.cancel_active_hook(hook, None).await {
+                Ok(hook) => cancelled
+                    .entry(hook.agent_id)
+                    .or_default()
+                    .push((hook.name, hook.hook_id)),
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        hook = %hook_id.0,
+                        error = %e,
+                        "archive hook sweep: cancel failed; continuing"
+                    );
+                }
             }
         }
+        cancelled
     }
 
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE

@@ -91,7 +91,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
 
 /// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
 /// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
-struct TempDb {
+pub(crate) struct TempDb {
     path: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -104,7 +104,7 @@ impl TempDb {
     }
 }
 
-async fn setup() -> (TempDb, Services, WorkspaceId) {
+pub(crate) async fn setup() -> (TempDb, Services, WorkspaceId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -802,7 +802,7 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
     }
 }
 
-fn pr_monitor_row() -> intent_core::PrMonitor {
+pub(crate) fn pr_monitor_row() -> intent_core::PrMonitor {
     intent_core::PrMonitor {
         monitor_id: intent_core::PrMonitorId::from("prmon-1"),
         workspace_id: WorkspaceId::from("ws-1"),
@@ -953,8 +953,9 @@ fn golden_pr_monitor_checklist_branch_lines() {
     );
 }
 
-/// FE-cancel and archive-sweep notices for hooks and PR monitors: exact
-/// wake bytes delivered to the owning agent.
+/// FE-cancel notices for hooks and PR monitors: exact wake bytes delivered
+/// to the owning agent. (The archive sweep's consolidated notice is a v2.7
+/// surface, pinned in `v2_7_goldens.rs`.)
 #[tokio::test]
 async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
     let (_t, svc, ws) = setup().await;
@@ -984,7 +985,7 @@ async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
         texts,
         vec!["[Background hook \"watcher\"] This hook was cancelled from the app.".to_string()]
     );
-    // PR monitor FE-cancel + archive-sweep notices.
+    // PR monitor FE-cancel notice.
     let mut monitor = pr_monitor_row();
     monitor.workspace_id = ws.clone();
     monitor.agent_id = owner.clone();
@@ -1001,54 +1002,6 @@ async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
         texts[1],
         "[PR monitor o/r#42] This monitor was cancelled from the app — it will not \
          report again."
-    );
-    let mut monitor2 = pr_monitor_row();
-    monitor2.monitor_id = intent_core::PrMonitorId::from("prmon-2");
-    monitor2.workspace_id = ws.clone();
-    monitor2.agent_id = owner.clone();
-    assert!(svc
-        .store()
-        .insert_pr_monitor(&monitor2)
-        .await
-        .expect("insert 2"));
-    svc.cancel_workspace_pr_monitors(&ws).await;
-    let texts = wake_texts_when(&svc, &owner, 3).await;
-    assert_eq!(
-        texts[2],
-        "[PR monitor o/r#42] This monitor was cancelled because its workspace was \
-         archived — it will not report again."
-    );
-}
-
-/// Archive-sweep hook cancel notice: exact wake bytes (framed like every
-/// hook wake).
-#[tokio::test]
-async fn golden_hook_archive_cancel_notice_bytes() {
-    let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
-    let svc = svc.with_event_bus(bus);
-    let owner = AgentId::from("agent-arch");
-    seed_agent(&svc, &ws, &owner).await;
-    svc.hook_schedule_op(
-        &ws,
-        &owner,
-        &json!({
-            "name": "sweeper",
-            "code": "return { dispatch: false };",
-            "delayMs": 10_000,
-        }),
-    )
-    .await
-    .expect("schedule");
-    svc.cancel_workspace_hooks(&ws).await;
-    let texts = wake_texts_when(&svc, &owner, 1).await;
-    assert_eq!(
-        texts,
-        vec![
-            "[Background hook \"sweeper\"] This hook was cancelled because its workspace \
-             was archived."
-                .to_string()
-        ]
     );
 }
 
@@ -1256,7 +1209,7 @@ fn golden_hook_state_notes_are_single_line_and_embed_hook_id() {
 // ---------------------------------------------------------------------------
 
 /// Seed a bare agent session row owned by `ws` (mirrors the hook tests).
-async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
+pub(crate) async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
     let ts = now_iso();
     let session = intent_core::AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -1315,7 +1268,7 @@ async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
 /// Wake persistence can lag the op return, so poll until at least `expected`
 /// messages are present (generous deadline, monorepo#1358 precedent); on
 /// timeout return whatever was seen and let the caller's assert report it.
-async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
+pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let session = svc.store().get_agent_session(id).await.expect("session");
