@@ -95,6 +95,16 @@ pub struct PullRequestInfo {
     pub mergeable_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_draft: Option<bool>,
+    /// The PR sits in the host's merge queue (GitHub GraphQL
+    /// `isInMergeQueue`). Presence-detected: `Some(true)` exactly when a
+    /// signal-bearing read (the `github.pulls.get` fold, §5.27) reported the
+    /// PR queued, `None` otherwise — a REST read carries no queue signal (a
+    /// queued PR reads `mergeable_state: "clean"`), so the REST-only refresh
+    /// paths inherit a persisted `Some(true)` instead of erasing it
+    /// (`pr_ops::carry_merge_queue_signal`). Rows persisted before the field
+    /// existed read `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_in_merge_queue: Option<bool>,
 }
 
 impl PullRequestInfo {
@@ -103,9 +113,10 @@ impl PullRequestInfo {
     /// [`Workspace::slim_for_list`]. The list-context readers (sidebar PR
     /// dropdown, card status, delete warning) need `number` / `url` /
     /// `title` / `status` / `isDraft` plus the timestamps used for ordering,
-    /// and `mergeable` / `mergeableState` — the FE derives the PR lifecycle
-    /// display status from them on list rows, so both stay. `headSha` and
-    /// `author` feed hover tooltips only, so they are `workspace.get`-only.
+    /// and `mergeable` / `mergeableState` / `isInMergeQueue` — the FE derives
+    /// the PR lifecycle display status from them on list rows, so all three
+    /// stay. `headSha` and `author` feed hover tooltips only, so they are
+    /// `workspace.get`-only.
     pub fn slim_for_list(&mut self) {
         self.head_sha = None;
         self.author = None;
@@ -6061,6 +6072,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         }
     }
 

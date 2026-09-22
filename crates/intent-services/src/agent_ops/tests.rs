@@ -43087,6 +43087,7 @@ fn tracked_pr(
         mergeable,
         mergeable_state: mergeable_state.map(str::to_string),
         is_draft,
+        is_in_merge_queue: None,
     }
 }
 

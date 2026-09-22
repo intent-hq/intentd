@@ -783,6 +783,13 @@ pub struct Services {
     /// wiring; tests inject via the `#[cfg(test)]`-only
     /// `with_unread_settle_entry_park`.
     unread_settle_entry_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intent-hq/intent#5654) for the cache-hit fold's
+    /// row lookup → projection window: parks `fold_served_pr` per hit row
+    /// after the referencing-rows read, before the atomic signal
+    /// projection, so a REST refresh committing in between is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_fold_hit_park`.
+    fold_hit_park: Option<Arc<script_ops::SupervisePark>>,
     /// Test park seam (intent-hq/monorepo#2739) for the
     /// `deliver_wake_message` archived-gate read → enqueue window: parks the
     /// wake delivery after the gate observed the workspace archived and
@@ -1382,6 +1389,7 @@ impl Services {
             completion_flip_take_park: None,
             attention_write_park: None,
             unread_settle_entry_park: None,
+            fold_hit_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
             archive_fence: Arc::new(ArchiveFence::default()),
@@ -2195,6 +2203,16 @@ impl Services {
         self
     }
 
+    /// Test seam (intent-hq/intent#5654): park the cache-hit fold per
+    /// referencing row between its row lookup and the atomic queue-signal
+    /// projection, so a REST refresh committing inside that window is
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_fold_hit_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
+        self.fold_hit_park = Some(park);
+        self
+    }
+
     /// Test seam (intent-hq/monorepo#2739): park `deliver_wake_message` in
     /// its archived-gate read → enqueue window so a concurrent
     /// `workspace.unarchive` inside that window is deterministic. Production
@@ -2304,6 +2322,15 @@ impl Services {
     /// (no-op in production wiring).
     async fn park_unread_settle_entry(&self) {
         if let Some(park) = &self.unread_settle_entry_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+    }
+
+    /// Park a cache-hit fold row before its projection when the test seam
+    /// is armed (no-op in production wiring).
+    async fn park_fold_hit(&self) {
+        if let Some(park) = &self.fold_hit_park {
             park.entered.notify_one();
             park.release.notified().await;
         }
@@ -4979,8 +5006,12 @@ impl Services {
     /// refresh. This is sweep-time work bounded by the caller's
     /// [`PR_REFRESH_FETCH_TIMEOUT`] wrap, never RPC-time.
     ///
-    /// Persists via the scoped `update_workspace_git_root_pr` and emits
-    /// `gitRoot:updated` once, only on change. A persisted change also routes
+    /// Persists via the scoped `update_workspace_git_root_pr_rebased` —
+    /// the merge-queue signal of every pooled entry is re-derived against
+    /// the row at write time ([`pr_ops::rebase_pool_on_persisted`],
+    /// intent-hq/intent#5654), since this REST-only pass cannot observe the
+    /// queue and its snapshot may predate a `github.pulls.get` fold — and
+    /// emits `gitRoot:updated` once, only on change. A persisted change also routes
     /// through the transition-only displayStatus recompute, so a root PR
     /// merging (or opening) regroups the sidebar live instead of waiting for
     /// the next `workspace.list`.
@@ -5005,8 +5036,10 @@ impl Services {
         .flatten()
         .unwrap_or_default();
         let mut changed = false;
-        // PR numbers fetched fresh this pass (linked / just-discovered);
-        // the stale-pool heal below skips them.
+        // PR numbers fetched fresh this pass (linked / just-discovered /
+        // healed); the stale-pool heal skips the ones already listed, and
+        // the persist rebases only these entries' queue signal (the rest
+        // take their persisted copy).
         let mut fetched_fresh: Vec<u64> = Vec::new();
         // A rate-limited relink discovery is captured here (not swallowed
         // as a generic discovery failure) so it surfaces AFTER the status
@@ -5032,7 +5065,10 @@ impl Services {
                 {
                     // `changed` is set unconditionally below (the unlink
                     // itself persists), so the upsert's flag is redundant.
-                    pr_ops::upsert_pr_info(&mut root.pull_requests, &pr_ops::build_pr_info(&pr));
+                    pr_ops::upsert_pr_info(
+                        &mut root.pull_requests,
+                        &mut pr_ops::build_pr_info(&pr),
+                    );
                 }
                 root.pr_number = None;
                 root.pr_url = None;
@@ -5040,8 +5076,8 @@ impl Services {
                 changed = true;
                 PrRefreshOutcome::Unlinked
             } else {
-                let info = pr_ops::build_pr_info(&pr);
-                changed |= pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                let mut info = pr_ops::build_pr_info(&pr);
+                changed |= pr_ops::upsert_pr_info(&mut root.pull_requests, &mut info);
                 // A merged/closed linked PR stays recorded in `pull_requests`
                 // but no longer blocks discovery: relink to a newer open PR on
                 // the same branch. A discovery failure degrades to the plain
@@ -5082,8 +5118,8 @@ impl Services {
                     };
                     if let Some(open_pr) = discovered {
                         fetched_fresh.push(open_pr.number);
-                        let open_info = pr_ops::build_pr_info(&open_pr);
-                        pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
+                        let mut open_info = pr_ops::build_pr_info(&open_pr);
+                        pr_ops::upsert_pr_info(&mut root.pull_requests, &mut open_info);
                         root.pr_number = Some(open_pr.number);
                         root.pr_url = Some(open_pr.url.clone());
                         root.pr_status = Some(open_info.status);
@@ -5114,8 +5150,8 @@ impl Services {
             match found {
                 Some(pr) => {
                     fetched_fresh.push(pr.number);
-                    let info = pr_ops::build_pr_info(&pr);
-                    pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                    let mut info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut root.pull_requests, &mut info);
                     root.pr_number = Some(pr.number);
                     root.pr_url = Some(pr.url.clone());
                     root.pr_status = Some(info.status);
@@ -5137,7 +5173,7 @@ impl Services {
                 sc.as_ref(),
                 &repo_ref,
                 &mut root.pull_requests,
-                &fetched_fresh,
+                &mut fetched_fresh,
                 self.pr_refresh_fetch_timeout / 10,
             )
             .await;
@@ -5152,7 +5188,15 @@ impl Services {
                 outcome = PrRefreshOutcome::Updated;
             }
             root.updated_at = now_iso();
-            self.store.update_workspace_git_root_pr(&root).await?;
+            self.store
+                .update_workspace_git_root_pr_rebased(&mut root, |root, persisted| {
+                    pr_ops::rebase_pool_on_persisted(
+                        &mut root.pull_requests,
+                        persisted,
+                        &fetched_fresh,
+                    );
+                })
+                .await?;
             publish_event(
                 self.event_bus.as_ref(),
                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
@@ -5223,11 +5267,16 @@ impl Services {
     /// resolves the provider once per cycle and passes each workspace from its
     /// sweep-start `list_workspaces` snapshot (avoiding a redundant per-workspace
     /// point read, intent-hq/monorepo#703). Persistence goes through the
-    /// scoped `update_workspace_pr_linkage` (PR columns + `updated_at` only),
-    /// so a possibly-stale snapshot row never clobbers concurrent mutations of
-    /// other columns (archive, title edit, attention) — the PR columns
-    /// themselves are last-writer-wins, which refreshes tolerate by design
-    /// (idempotent against the forge; the next sweep converges).
+    /// scoped `update_workspace_pr_linkage_rebased` (PR columns +
+    /// `updated_at` only), so a possibly-stale snapshot row never clobbers
+    /// concurrent mutations of other columns (archive, title edit, attention)
+    /// — the plain REST PR fields are last-writer-wins, which refreshes
+    /// tolerate by design (idempotent against the forge; the next sweep
+    /// converges), while the merge-queue signal, which a REST read cannot
+    /// re-observe, is rebased onto the row at write time
+    /// ([`pr_ops::rebase_workspace_pr_pool`], intent-hq/intent#5654) so a
+    /// `github.pulls.get` fold landing mid-refresh is neither erased nor
+    /// resurrected.
     async fn refresh_workspace_pr_with_sc(
         &self,
         mut ws: Workspace,
@@ -5257,14 +5306,27 @@ impl Services {
                 ws.pr_status = None;
                 ws.active_pull_request = None;
                 ws.updated_at = now_iso();
-                self.store.update_workspace_pr_linkage(&ws).await?;
+                // The pool is untouched here, so the rebase takes the
+                // persisted copy of every entry over the snapshot's.
+                self.store
+                    .update_workspace_pr_linkage_rebased(&mut ws, |ws, persisted| {
+                        pr_ops::rebase_workspace_pr_pool(ws, persisted, &[]);
+                    })
+                    .await?;
                 publish_event(self.event_bus.as_ref(), pr_unlinked_event(&ws.id)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
                 return Ok(PrRefreshOutcome::Unlinked);
             }
-            let info = pr_ops::build_pr_info(&pr);
+            let mut info = pr_ops::build_pr_info(&pr);
             // Keep the daemon-owned PR list current on every linked refresh.
-            let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+            // The REST read cannot see the merge queue, so the upsert lends
+            // `info` the pooled entry's `is_in_merge_queue` while the PR
+            // stays open on the same head (intent-hq/intent#5654); the
+            // `activePullRequest` written below is that same carried copy,
+            // and the persist re-derives the carry against the row at write
+            // time (`refreshed` names the entries fetched fresh this pass).
+            let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
+            let mut refreshed = vec![number];
             // A rate-limited relink discovery is captured here (not
             // swallowed as a generic discovery failure) so it surfaces
             // AFTER the status delta persist below and the sweep pauses
@@ -5312,14 +5374,19 @@ impl Services {
                     }
                 };
                 if let Some(open_pr) = discovered {
-                    let open_info = pr_ops::build_pr_info(&open_pr);
-                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
+                    let mut open_info = pr_ops::build_pr_info(&open_pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut open_info);
+                    refreshed.push(open_pr.number);
                     ws.pr_number = Some(open_pr.number);
                     ws.pr_url = Some(open_pr.url.clone());
                     ws.pr_status = Some(open_info.status);
                     ws.active_pull_request = Some(open_info);
                     ws.updated_at = now_iso();
-                    self.store.update_workspace_pr_linkage(&ws).await?;
+                    self.store
+                        .update_workspace_pr_linkage_rebased(&mut ws, |ws, persisted| {
+                            pr_ops::rebase_workspace_pr_pool(ws, persisted, &refreshed);
+                        })
+                        .await?;
                     publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
                     return Ok(PrRefreshOutcome::Linked);
@@ -5334,7 +5401,11 @@ impl Services {
                 ws.pr_url = Some(pr.url.clone());
                 ws.active_pull_request = Some(info);
                 ws.updated_at = now_iso();
-                self.store.update_workspace_pr_linkage(&ws).await?;
+                self.store
+                    .update_workspace_pr_linkage_rebased(&mut ws, |ws, persisted| {
+                        pr_ops::rebase_workspace_pr_pool(ws, persisted, &refreshed);
+                    })
+                    .await?;
                 publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
             }
@@ -5366,14 +5437,18 @@ impl Services {
             .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
-                    let info = pr_ops::build_pr_info(&pr);
-                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                    let mut info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
                     ws.pr_number = Some(pr.number);
                     ws.pr_url = Some(pr.url.clone());
                     ws.pr_status = Some(info.status);
                     ws.active_pull_request = Some(info);
                     ws.updated_at = now_iso();
-                    self.store.update_workspace_pr_linkage(&ws).await?;
+                    self.store
+                        .update_workspace_pr_linkage_rebased(&mut ws, |ws, persisted| {
+                            pr_ops::rebase_workspace_pr_pool(ws, persisted, &[pr.number]);
+                        })
+                        .await?;
                     publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
                     Ok(PrRefreshOutcome::Linked)
@@ -5383,8 +5458,9 @@ impl Services {
         }
     }
 
-    /// Passively fold a PR snapshot fetched on demand (`github.pulls.get`,
-    /// the FE hover card) into the daemon-owned PR state, so the sidebar's
+    /// Passively fold a PR snapshot served on demand (`github.pulls.get`,
+    /// the FE hover card; `ws.pr.snapshot` — every read through
+    /// [`Self::serve_pr`]) into the daemon-owned PR state, so the sidebar's
     /// `displayStatus` grouping reflects the fresh status through the
     /// existing event plumbing instead of waiting for the next sweep.
     ///
@@ -5406,34 +5482,91 @@ impl Services {
     /// writes nothing. Per-row persist failures WARN and continue; only the
     /// lookups themselves surface as `Err`, and the RPC caller treats that
     /// as fail-soft too.
-    pub(crate) async fn fold_fetched_pr(
+    ///
+    /// `merge_queue_reported` is the host's merge-queue state from the same
+    /// full read (`SharedPrSnapshot::merge_queue_reported`): the fold is the
+    /// signal-bearing writer of `PullRequestInfo::is_in_merge_queue`, so a
+    /// reported `true` lands on every folded copy and anything else clears
+    /// a persisted `Some(true)` — the URL-keyed upsert never inherits
+    /// (intent-hq/intent#5654).
+    ///
+    /// `fetched` is whether the serve reached the forge for this record. A
+    /// fetch folds the fresh record whole; a cache hit is a projection
+    /// ([`pr_ops::project_served_queue_signal`]): it writes only
+    /// `is_in_merge_queue`, onto copies on the same known head, and only
+    /// when the signal differs — so a signal another reader's fill
+    /// (`ws.pr.snapshot`, a monitor poll) carried into the cache lands on
+    /// the next hover instead of being skipped as a hit, while the older
+    /// cached REST fields never roll back a sweep that ran since the fill,
+    /// and a hit that agrees with the pool writes nothing. The projection
+    /// runs against the row as persisted at write time
+    /// (`Store::project_workspace_pr_snapshots` /
+    /// `project_workspace_git_root_pull_requests`, one `BEGIN IMMEDIATE`
+    /// each), never against the copies the referencing-rows lookup
+    /// returned: a REST refresh committing a newer head or fresher fields
+    /// between that lookup and the write is what the signal is projected
+    /// onto (or, on a moved head, what is left alone), not what is
+    /// overwritten.
+    pub(crate) async fn fold_served_pr(
         &self,
         repo_ref: &intent_sourcecontrol::RepoRef,
         pr: &intent_sourcecontrol::PullRequest,
+        merge_queue_reported: Option<bool>,
+        fetched: bool,
     ) -> Result<()> {
-        let info = pr_ops::build_pr_info(pr);
+        let info = pr_ops::build_pr_info_with_merge_queue(pr, merge_queue_reported);
         let workspaces = self
             .store
             .list_workspaces_referencing_pr_url(&pr.url)
             .await?;
         for mut ws in workspaces {
-            let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
-            let linked = ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
-            if linked
-                && (ws.pr_status != Some(info.status)
-                    || ws.active_pull_request.as_ref() != Some(&info)
-                    || ws.pr_url.as_deref() != Some(pr.url.as_str()))
-            {
-                ws.pr_status = Some(info.status);
-                ws.pr_url = Some(pr.url.clone());
-                ws.active_pull_request = Some(info.clone());
-                changed = true;
-            }
-            if !changed {
-                continue;
-            }
-            ws.updated_at = now_iso();
-            if let Err(e) = self.store.update_workspace_pr_linkage(&ws).await {
+            let persisted = if fetched {
+                let linked =
+                    ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
+                let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
+                if linked
+                    && (ws.pr_status != Some(info.status)
+                        || ws.active_pull_request.as_ref() != Some(&info)
+                        || ws.pr_url.as_deref() != Some(pr.url.as_str()))
+                {
+                    ws.pr_status = Some(info.status);
+                    ws.pr_url = Some(pr.url.clone());
+                    ws.active_pull_request = Some(info.clone());
+                    changed = true;
+                }
+                if !changed {
+                    continue;
+                }
+                ws.updated_at = now_iso();
+                self.store.update_workspace_pr_linkage(&ws).await
+            } else {
+                self.park_fold_hit().await;
+                let updated_at = now_iso();
+                match self
+                    .store
+                    .project_workspace_pr_snapshots(&ws.id, &updated_at, |pool, active| {
+                        let mut changed = pr_ops::project_pool_queue_signal(pool, &info);
+                        if let Some(active) = active
+                            .as_mut()
+                            .filter(|active| pr_ops::same_pr_url(&active.url, &info.url))
+                        {
+                            changed |= pr_ops::project_served_queue_signal(active, &info);
+                        }
+                        changed
+                    })
+                    .await
+                {
+                    Ok(None) => continue,
+                    Ok(Some((pool, active))) => {
+                        ws.pull_requests = pool;
+                        ws.active_pull_request = active;
+                        ws.updated_at = updated_at;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            if let Err(e) = persisted {
                 tracing::warn!(
                     workspace_id = %ws.id.as_str(),
                     error = %e,
@@ -5449,29 +5582,49 @@ impl Services {
             .list_workspace_git_roots_referencing_pr_url(&pr.url)
             .await?;
         for mut root in roots {
-            let mut changed = false;
-            if root
-                .pull_requests
-                .as_deref()
-                .is_some_and(|items| items.iter().any(|p| pr_ops::same_pr_url(&p.url, &pr.url)))
-            {
-                changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
-            }
-            let linked =
-                root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
-            if linked
-                && (root.pr_status != Some(info.status)
-                    || root.pr_url.as_deref() != Some(pr.url.as_str()))
-            {
-                root.pr_status = Some(info.status);
-                root.pr_url = Some(pr.url.clone());
-                changed = true;
-            }
-            if !changed {
-                continue;
-            }
-            root.updated_at = now_iso();
-            if let Err(e) = self.store.update_workspace_git_root_pr(&root).await {
+            let persisted =
+                if fetched {
+                    let linked =
+                        root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
+                    let mut changed = false;
+                    if root.pull_requests.as_deref().is_some_and(|items| {
+                        items.iter().any(|p| pr_ops::same_pr_url(&p.url, &pr.url))
+                    }) {
+                        changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
+                    }
+                    if linked
+                        && (root.pr_status != Some(info.status)
+                            || root.pr_url.as_deref() != Some(pr.url.as_str()))
+                    {
+                        root.pr_status = Some(info.status);
+                        root.pr_url = Some(pr.url.clone());
+                        changed = true;
+                    }
+                    if !changed {
+                        continue;
+                    }
+                    root.updated_at = now_iso();
+                    self.store.update_workspace_git_root_pr(&root).await
+                } else {
+                    self.park_fold_hit().await;
+                    let updated_at = now_iso();
+                    match self
+                        .store
+                        .project_workspace_git_root_pull_requests(&root.id, &updated_at, |pool| {
+                            pr_ops::project_pool_queue_signal(pool, &info)
+                        })
+                        .await
+                    {
+                        Ok(None) => continue,
+                        Ok(Some(pool)) => {
+                            root.pull_requests = pool;
+                            root.updated_at = updated_at;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+            if let Err(e) = persisted {
                 tracing::warn!(
                     git_root = %root.id.as_str(),
                     error = %e,
@@ -30124,22 +30277,9 @@ impl WorkspaceApi for Services {
             // the entry is younger than `prCache.maxAgeSeconds`, else one
             // full read — the same read the monitor's poll performs — that
             // refreshes the entry the next hover and `ws.pr.snapshot` serve.
-            let (entry, fetched) = self.serve_pr(&repo_ref, number).await?;
-            // The fold rides a REAL fetch only: a hit reports nothing the
-            // daemon-owned state has not already seen. Fail-soft: the hover
-            // card always gets its `{ pull }`; a fold failure only costs the
-            // daemon-owned state its early refresh.
-            if fetched {
-                if let Err(e) = self.fold_fetched_pr(&repo_ref, &entry.pr).await {
-                    tracing::warn!(
-                        owner = %repo_ref.owner,
-                        repo = %repo_ref.name,
-                        pr_number = number,
-                        error = %e,
-                        "github.pulls.get: folding the fetched PR into workspace PR state failed"
-                    );
-                }
-            }
+            // The serve folds the snapshot into the daemon-owned PR state
+            // (`fold_served_pr`, fail-soft), hit or miss.
+            let (entry, _) = self.serve_pr(&repo_ref, number).await?;
             Ok(serde_json::json!({
                 "pull": github_ops::pull_to_json_with_merge_queue(
                     &entry.pr,
@@ -33501,8 +33641,8 @@ impl Services {
             .await
             .map_err(pr_ops::map_sc_err)?;
 
-        let info = pr_ops::build_pr_info(&pr);
-        pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+        let mut info = pr_ops::build_pr_info(&pr);
+        pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
         ws.pr_number = Some(pr.number);
         ws.pr_url = Some(pr.url.clone());
         ws.pr_status = Some(info.status);
@@ -33542,11 +33682,12 @@ impl Services {
                 ws.pr_status = Some(intent_core::PullRequestStatus::Merged);
                 if let Some(info) = ws.active_pull_request.as_mut() {
                     info.status = intent_core::PullRequestStatus::Merged;
+                    info.is_in_merge_queue = None;
                 }
                 // Mirror the merged status into the daemon-owned list so the
                 // pr:updated payload below is internally consistent.
-                if let Some(info) = ws.active_pull_request.clone() {
-                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                if let Some(mut info) = ws.active_pull_request.clone() {
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
                 }
                 ws.updated_at = now_iso();
                 let _ = self.store.update_workspace(&ws).await;
