@@ -26,7 +26,7 @@ use crate::model::{
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
     TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceTask, WorkspaceUpdate,
+    WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -78,6 +78,18 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::get_workspace not implemented".to_string(),
             ))
         })
+    }
+
+    /// The daemon-owned, in-memory setup-stage state for `id` (§6.5
+    /// lifecycle: `pending` → `running` → `completed` | `failed`, or
+    /// `skipped`), backing `ws.workspace.details().setupStatus` and the
+    /// turn-start setup notice. Synchronous (no I/O); a workspace with no
+    /// record in this daemon lifetime — including every workspace created
+    /// before boot — reads `state: "unknown"`, which is also the default so
+    /// non-services `WorkspaceApi` impls need not implement it.
+    fn workspace_setup_status(&self, id: &WorkspaceId) -> WorkspaceSetupStatus {
+        let _ = id;
+        WorkspaceSetupStatus::unknown()
     }
 
     /// `workspace.diskUsage`: on-demand cached physical footprint of the
@@ -4251,8 +4263,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.connect`: start (or return the still-pending) GitHub OAuth
-    /// device flow → `{ ok, userCode, verificationUri, expiresIn, interval }`.
-    /// The daemon polls GitHub in the background and emits
+    /// device flow → `{ ok, flowId, userCode, verificationUri, expiresIn,
+    /// interval }`. `flowId` is the opaque handle `github.cancelAuth` scopes
+    /// to. The daemon polls GitHub in the background and emits
     /// `github:auth-changed` on terminal transitions; the token is persisted
     /// server-side and never crosses the wire.
     fn github_connect(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -4265,7 +4278,15 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.cancelAuth`: abort the in-flight device flow, if any →
     /// `{ ok, cancelled }` (`cancelled: false` when nothing was pending).
-    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+    /// With `flow_id` (the `flowId` a `github.connect` returned) only that
+    /// flow is cancelled: any other pending flow is left untouched and the
+    /// call answers `cancelled: false`. `None` cancels whichever flow is
+    /// pending.
+    fn github_cancel_auth(
+        &self,
+        flow_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = flow_id;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_cancel_auth not implemented".to_string(),
@@ -4697,8 +4718,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// serialised `WorkspaceInvite` (secrets never included as fields) plus
     /// the additive `url`, the invite's `intent://invite?…` link rebuilt from
     /// the stored secret; `url` is omitted when the row predates the stored
-    /// secret or no link can be built right now (listener down, no dialable
-    /// route). Owner-only.
+    /// secret or no link can be built right now (listener down, tunnel
+    /// down — invite links are tunnel-only). Owner-only.
     fn workspace_invite_list(
         &self,
         workspace_id: WorkspaceId,
@@ -7271,9 +7292,13 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.pr.monitor`: register (idempotently) a centralized monitor on
     /// `pr_number` for `agent_id`, returning the monitor row plus the freshly
-    /// fetched merge-requirements checklist. `repo` is an optional
-    /// `"owner/name"` override; `None` resolves the workspace repo. MCP-only
-    /// — monitors are agent-owned, so there is no wire registration method.
+    /// fetched merge-requirements checklist — `requirements: null` plus a
+    /// `pausedUntil` deadline when the forge quota is exhausted and the
+    /// baseline fetch is deferred to the end of the daemon's global
+    /// rate-limit pause (the monitor is still registered). `repo` is an
+    /// optional `"owner/name"` override; `None` resolves the workspace repo.
+    /// MCP-only — monitors are agent-owned, so there is no wire registration
+    /// method.
     fn pr_monitor_start(
         &self,
         workspace_id: WorkspaceId,

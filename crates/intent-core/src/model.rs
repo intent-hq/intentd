@@ -95,6 +95,16 @@ pub struct PullRequestInfo {
     pub mergeable_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_draft: Option<bool>,
+    /// The PR sits in the host's merge queue (GitHub GraphQL
+    /// `isInMergeQueue`). Presence-detected: `Some(true)` exactly when a
+    /// signal-bearing read (the `github.pulls.get` fold, §5.27) reported the
+    /// PR queued, `None` otherwise — a REST read carries no queue signal (a
+    /// queued PR reads `mergeable_state: "clean"`), so the REST-only refresh
+    /// paths inherit a persisted `Some(true)` instead of erasing it
+    /// (`pr_ops::carry_merge_queue_signal`). Rows persisted before the field
+    /// existed read `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_in_merge_queue: Option<bool>,
 }
 
 impl PullRequestInfo {
@@ -103,9 +113,10 @@ impl PullRequestInfo {
     /// [`Workspace::slim_for_list`]. The list-context readers (sidebar PR
     /// dropdown, card status, delete warning) need `number` / `url` /
     /// `title` / `status` / `isDraft` plus the timestamps used for ordering,
-    /// and `mergeable` / `mergeableState` — the FE derives the PR lifecycle
-    /// display status from them on list rows, so both stay. `headSha` and
-    /// `author` feed hover tooltips only, so they are `workspace.get`-only.
+    /// and `mergeable` / `mergeableState` / `isInMergeQueue` — the FE derives
+    /// the PR lifecycle display status from them on list rows, so all three
+    /// stay. `headSha` and `author` feed hover tooltips only, so they are
+    /// `workspace.get`-only.
     pub fn slim_for_list(&mut self) {
         self.head_sha = None;
         self.author = None;
@@ -952,6 +963,65 @@ pub struct SetupScript {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_by: Option<SetupScriptGeneratedBy>,
+}
+
+/// Lifecycle state of a workspace's setup stage (§6.5 `workspace:setup:*`),
+/// as tracked in the daemon's in-memory per-workspace map and surfaced to
+/// agents through `ws.workspace.details().setupStatus`. Never persisted: a
+/// workspace with no record (created before the daemon booted) reads
+/// [`Unknown`](Self::Unknown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceSetupState {
+    /// The worktree exists; the effective setup script is not yet resolved.
+    Pending,
+    /// A setup script was resolved and its terminal spawned.
+    Running,
+    /// The script exited `0`.
+    Completed,
+    /// The script exited non-zero, or failed before/at spawn (no exit code).
+    Failed,
+    /// No effective script (or no worktree): the stage never ran.
+    Skipped,
+    /// No record for this workspace in the current daemon lifetime.
+    Unknown,
+}
+
+/// Snapshot of a workspace's setup stage: the [`WorkspaceSetupState`] plus
+/// the details known at that point. Optional fields are omitted (never
+/// `null`) when not applicable to the state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSetupStatus {
+    pub state: WorkspaceSetupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+impl WorkspaceSetupStatus {
+    /// The bare status for `state` with every optional detail omitted.
+    #[must_use]
+    pub fn new(state: WorkspaceSetupState) -> Self {
+        Self {
+            state,
+            exit_code: None,
+            terminal_id: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// The status of a workspace with no record: `state: "unknown"`.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::new(WorkspaceSetupState::Unknown)
+    }
 }
 
 /// Script mode for repo scripts (service = long-running, command = run-once).
@@ -1875,6 +1945,11 @@ pub struct NoteUpdateMetadataResult {
     pub skipped: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The note's `rev` after the write: the base a follow-up conditional
+    /// write should send as `expectedVersion`. Absent on the `skipped` arm,
+    /// which writes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<i64>,
 }
 
 /// Result of `note.delete`.
@@ -2646,6 +2721,44 @@ pub enum AgentStatus {
     Processing,
 }
 
+impl AgentStatus {
+    /// Every variant in declaration order — the enumeration behind the
+    /// running-turn golden and the store's SQL status lists. Completeness is
+    /// pinned against serde's derived variant inventory
+    /// (`agent_status_all_matches_serde_variant_inventory`), so a variant
+    /// added to the enum but not here fails the suite.
+    pub const ALL: [Self; 9] = [
+        Self::Pending,
+        Self::Active,
+        Self::RuntimeIdle,
+        Self::Error,
+        Self::Deleted,
+        Self::Idle,
+        Self::Waiting,
+        Self::Completed,
+        Self::Processing,
+    ];
+
+    /// Whether a session persisted in this status is running a turn: `pending`,
+    /// `active`, or the legacy capitalized `Processing`. The single definition
+    /// of the rule behind the §5.5 retire guard, the §5.19 agent-lock liveness
+    /// test, the transfer export "agents-running" warning, and the
+    /// `delegatedCounts.running` SQL aggregate on `agent.list`. Exhaustive so a
+    /// new variant fails to compile until it is classified.
+    #[must_use]
+    pub const fn is_running_turn(self) -> bool {
+        match self {
+            Self::Pending | Self::Active | Self::Processing => true,
+            Self::RuntimeIdle
+            | Self::Error
+            | Self::Deleted
+            | Self::Idle
+            | Self::Waiting
+            | Self::Completed => false,
+        }
+    }
+}
+
 /// Per-session credit/message/tool stats (§9.1 / §19.2). A derived snapshot
 /// populated from `auggie session stats --json`; it is **not** persisted in the
 /// `agent_session` table (the `stats` field is recomputed on demand). Field
@@ -3007,8 +3120,14 @@ pub enum AgentListRowScope {
     /// lists by default.
     TopLevel,
     /// `parent_agent_id IS NOT NULL`, optionally narrowed to one parent's
-    /// direct sub-agents (`parent_agent_id = ?`).
-    Delegated { parent_agent_id: Option<AgentId> },
+    /// direct sub-agents (`parent_agent_id = ?`) OR — `orphaned_only` — to
+    /// the workspace's orphaned delegated rows (the rows
+    /// [`AgentDelegatedCounts::orphaned`] counts). The two sub-filters are
+    /// mutually exclusive; the router rejects the pair with `-32602`.
+    Delegated {
+        parent_agent_id: Option<AgentId>,
+        orphaned_only: bool,
+    },
     /// `parent_agent_id IS NULL AND is_background <> 0` — unparented
     /// background agents.
     Background,
@@ -3051,6 +3170,22 @@ pub struct AgentParentDelegatedCounts {
     pub running: u64,
 }
 
+/// The **orphaned** subset of [`AgentDelegatedCounts`] (§5.5, within 10.6):
+/// non-retired sessions with `parent_agent_id` set whose parent is NOT a
+/// non-retired `agent_session` row of the same workspace (parent deleted,
+/// soft-retired, or absent). Orphan-hood is decided by the DIRECT parent's
+/// liveness only — a child of a live standalone background parent is not
+/// an orphan, and neither is a child of an orphan. `running` follows the
+/// same `is_running_turn` rule as `byParent[*].running`. Always present:
+/// `{ total: 0, running: 0 }` when the workspace has no orphaned delegated
+/// session. Invariant: `total ≤ scopeCounts.delegated`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentOrphanedDelegatedCounts {
+    pub total: u64,
+    pub running: u64,
+}
+
 /// The always-present `delegatedCounts` field on every `agent.list`
 /// response variant (§5.5): the workspace's non-retired delegated sessions
 /// (the `delegated` bin, `parent_agent_id IS NOT NULL`) counted per DIRECT
@@ -3063,13 +3198,17 @@ pub struct AgentParentDelegatedCounts {
 /// delegated sessions), and its keys are the raw `parent_agent_id` values,
 /// so a key may name a parent outside this workspace (cross-workspace
 /// delegation). Invariant: `Σ byParent[*].total == scopeCounts.delegated`.
+/// `orphaned` is the always-present orphaned sub-aggregate of the same row
+/// set ([`AgentOrphanedDelegatedCounts`]), served from the same statement.
 /// Like [`AgentScopeCounts`], the counts stay workspace-wide even when the
-/// rows read was narrowed by `scope` or `parentAgentId`.
+/// rows read was narrowed by `scope`, `parentAgentId` or `orphanedOnly`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDelegatedCounts {
     pub running: u64,
     pub by_parent: BTreeMap<AgentId, AgentParentDelegatedCounts>,
+    #[serde(default)]
+    pub orphaned: AgentOrphanedDelegatedCounts,
 }
 
 /// Per-field byte budget for `agent.list` row previews (list-payload cost
@@ -3465,7 +3604,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.6";
+pub const CURRENT_HARNESS_VERSION: &str = "2.7";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -5933,6 +6072,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         }
     }
 
@@ -6749,6 +6889,80 @@ mod tests {
             assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
             assert_eq!(serde_json::from_str::<AgentStatus>(wire).unwrap(), variant);
         }
+    }
+
+    /// Golden for the running-turn rule (PROTOCOL §5.5 `agent.list`
+    /// `delegatedCounts` "running rule"): exactly `pending`, `active` and the
+    /// legacy capitalized `Processing` count as running, keyed by the persisted
+    /// wire name so the docs prose has one authoritative counterpart.
+    /// `AgentStatus::ALL` must enumerate every variant exactly once.
+    #[test]
+    fn agent_status_running_turn_golden() {
+        let expected = [
+            ("pending", true),
+            ("active", true),
+            ("idle", false),
+            ("error", false),
+            ("deleted", false),
+            ("Idle", false),
+            ("Waiting", false),
+            ("Completed", false),
+            ("Processing", true),
+        ];
+        assert_eq!(AgentStatus::ALL.len(), expected.len());
+        for (status, (wire, running)) in AgentStatus::ALL.into_iter().zip(expected) {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{wire}\""),
+                "ALL order must match the golden"
+            );
+            assert_eq!(
+                status.is_running_turn(),
+                running,
+                "running-turn classification of {wire}"
+            );
+        }
+        assert_eq!(
+            AgentStatus::ALL
+                .iter()
+                .filter(|s| s.is_running_turn())
+                .map(|s| serde_json::to_value(s).unwrap())
+                .collect::<Vec<_>>(),
+            vec![json!("pending"), json!("active"), json!("Processing")]
+        );
+    }
+
+    /// `AgentStatus::ALL` is complete: serde's derive generates the variant
+    /// inventory from the enum itself and lists it in the unknown-variant
+    /// error ("expected one of `a`, `b`, …"), so a variant added to the
+    /// enum — and classified in the exhaustive `is_running_turn` match — but
+    /// left out of `ALL` fails here instead of silently dropping out of the
+    /// store's generated SQL status list.
+    #[test]
+    fn agent_status_all_matches_serde_variant_inventory() {
+        let err = serde_json::from_str::<AgentStatus>("\"__not_a_status__\"")
+            .unwrap_err()
+            .to_string();
+        let (_, listed) = err
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("serde unknown-variant error shape changed: {err}"));
+        let mut inventory: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+        inventory.sort_unstable();
+        let mut all: Vec<String> = AgentStatus::ALL
+            .iter()
+            .map(|s| {
+                serde_json::to_value(s)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        all.sort_unstable();
+        assert_eq!(
+            all, inventory,
+            "AgentStatus::ALL must list every variant exactly once"
+        );
     }
 
     /// `WorkspaceStatus` serializes to the `PascalCase` TS `WorkspaceStatus` string

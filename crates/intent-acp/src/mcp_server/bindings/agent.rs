@@ -756,7 +756,11 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// with the replace outcome reported on the result. Success results carry a
 /// top-level `delivery` outcome ([`delivery_outcome`]) so `ok: true` +
 /// silently-queued is unambiguous even to a sender that only glances at
-/// the result.
+/// the result. A self-targeted send (`agentId` == the caller) is rejected by
+/// the service layer's `reject_self_targeted_send` guard on the
+/// daemon-stamped `fromAgentId` (intent-hq/intent#5669) — an error naming
+/// `ws.agent.reportToParent` / notes as the alternative, before any state
+/// change.
 ///
 /// The ENTIRE daemon-side sequence — retired-caller read → pending guard
 /// read → sender-name read → send → replace retraction → sender watch —
@@ -874,7 +878,9 @@ async fn send(
 /// `replaceOutcome: "reassigned"`. An agent caller passing
 /// `replacePending: true` always gets a replace report — the fall-through
 /// paths report `replaceOutcome: "none"` rather than silently ignoring the
-/// option. The entire daemon-side sequence (retired-caller read → task
+/// option. A task whose assignee is the caller is rejected by the op's
+/// self-targeted guard (intent-hq/intent#5669), same as [`send`]. The
+/// entire daemon-side sequence (retired-caller read → task
 /// resolution → guard read → sender-name read → send → retraction → watch)
 /// is spawned and budget-bounded exactly like [`send`]
 /// (intent-hq/intent#5387) — nothing awaits before the spawn; the op mints
@@ -1175,6 +1181,7 @@ async fn list(
                 ws.clone(),
                 intent_core::AgentListRowScope::Delegated {
                     parent_agent_id: filter.parent_agent_id.as_deref().map(AgentId::from),
+                    orphaned_only: false,
                 },
             )
             .await

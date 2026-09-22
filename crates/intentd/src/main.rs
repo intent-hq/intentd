@@ -18,6 +18,7 @@ use intent_services::{
     live_adapters, max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes,
     AgentManager, AgentMemorySnapshot, BusEventSink, EventBus, GitStatusRefresher,
     PermissionPolicy, ProcessSample, Services, TreeMemoryProbe, TreeSample, WatcherRegistry,
+    WorkspaceSetupStates,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -1262,6 +1263,7 @@ async fn cmd_import_legacy(
             // running daemon learns about the rows via `system.importLegacy`
             // or its next boot, both of which publish.
             event_bus: None,
+            setup_states: None,
         },
     )
     .await?;
@@ -1641,6 +1643,10 @@ async fn cmd_serve(
     // observe a missing row before either inserts it, turning the loser's
     // idempotent skip into a spurious `insert failed` failure-summary entry.
     let legacy_import_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // Per-workspace setup-stage map shared by the services surface and the
+    // legacy importer (both the first-boot task and `system.importLegacy`),
+    // so an imported row reads `skipped` from `ws.workspace.details()`.
+    let workspace_setup_states = WorkspaceSetupStates::default();
     // First-boot legacy workspace import: the eligibility decision (fresh DB
     // / marker state) is made synchronously here, but the import itself runs
     // in a spawned background task concurrently with the transports coming up
@@ -1664,6 +1670,7 @@ async fn cmd_serve(
                 let assets_root = Some(config.data_dir.join("assets"));
                 let app_dir = legacy_import::default_app_dir();
                 let event_bus = Some(bus.clone());
+                let setup_states = Some(workspace_setup_states.clone());
                 let lock = legacy_import_lock.clone();
                 let resumed = decision == legacy_import::FirstBootDecision::Resume;
                 Some(intent_core::spawn_daemon(async move {
@@ -1674,6 +1681,7 @@ async fn cmd_serve(
                         assets_root,
                         app_dir,
                         event_bus,
+                        setup_states,
                         resumed,
                     )
                     .await;
@@ -1786,6 +1794,7 @@ async fn cmd_serve(
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(&config.data_dir.clone())
         .with_event_bus(bus.clone())
+        .with_workspace_setup_states(workspace_setup_states.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
@@ -2375,6 +2384,7 @@ async fn cmd_serve(
         legacy_import_assets_root: assets_root,
         legacy_import_lock: legacy_import_lock.clone(),
         legacy_import_bus: bus.clone(),
+        legacy_import_setup_states: workspace_setup_states.clone(),
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
         exact_update: exact_update::ExactUpdate::default(),
@@ -2805,6 +2815,9 @@ struct DaemonControl {
     /// Event bus for `workspace:created` publishes on imported rows, so live
     /// subscribers learn about workspaces the importer writes through `Store`.
     legacy_import_bus: EventBus,
+    /// Setup-state map shared with `Services`, so imported rows record
+    /// `skipped` alongside their `workspace:setup:completed` publish.
+    legacy_import_setup_states: WorkspaceSetupStates,
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
@@ -4063,6 +4076,7 @@ impl SystemControl for DaemonControl {
                     assets_root: Some(self.legacy_import_assets_root.clone()),
                     app_dir: legacy_import::default_app_dir(),
                     event_bus: Some(self.legacy_import_bus.clone()),
+                    setup_states: Some(self.legacy_import_setup_states.clone()),
                 },
             )
             .await

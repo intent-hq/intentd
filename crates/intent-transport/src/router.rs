@@ -197,6 +197,17 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": kind.as_str() })),
         },
+        // Forge rate limiting — every cause the source-control layer
+        // classifies as `RateLimited` (REST primary 403/429, secondary-limit
+        // 403s, GraphQL RATE_LIMIT) on `github.getUser`, the identity-proof
+        // methods and PR reads: same `-32603` code and human message, plus
+        // the stable `data.code` so clients route "wait for the limit to
+        // reset" instead of prompting a sign-in (intent-hq/intent#5627).
+        ref e @ Error::RateLimited(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "rate-limited" })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -1454,12 +1465,14 @@ async fn dispatch(
             // while absent / null / `"all"` keep today's read. Unlike the
             // lenient retired flags, an unknown or non-string `scope` is
             // `-32602`, never coerced, and a bin scope cannot be combined
-            // with either retired flag (retired is its own bin). Every
-            // variant additionally carries `scopeCounts` (one grouped SQL
-            // aggregate over the non-retired rows) and `delegatedCounts`
-            // (one grouped aggregate over the non-retired delegated rows,
-            // per direct parent) under the same no-snapshot-isolation
-            // tolerance as `retiredCount`.
+            // with either retired flag (retired is its own bin). A
+            // `delegated` read narrows by `parentAgentId` OR `orphanedOnly`
+            // (never both). Every variant additionally carries
+            // `scopeCounts` (one grouped SQL aggregate over the non-retired
+            // rows) and `delegatedCounts` (one grouped aggregate over the
+            // non-retired delegated rows, per direct parent, with its
+            // `orphaned` sub-aggregate) under the same
+            // no-snapshot-isolation tolerance as `retiredCount`.
             let scope = parse_agent_list_scope(params, include_retired || retired_only)?;
             // Attribute the dispatch to its read variant for the profiling
             // WARNs (flags only — see `RPC_REQUEST_SHAPE_FIELD`).
@@ -3050,7 +3063,19 @@ async fn dispatch(
             Ok(r)
         }
         "github.cancelAuth" => {
-            let r = api.github_cancel_auth().await.map_err(domain_to_rpc)?;
+            // Strict: only an OMITTED `flowId` is the unscoped cancel. Any
+            // present non-string — an explicit `null` included, unlike
+            // `opt_str_strict` — is rejected so it can never silently widen
+            // the cancel to "whichever flow is pending".
+            let flow_id = match params.get("flowId") {
+                None => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(invalid_params("flowId must be a string")),
+            };
+            let r = api
+                .github_cancel_auth(flow_id)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "github.revoke" => {
@@ -4653,18 +4678,10 @@ fn parse_projection(
     }
 }
 
-/// Parse the optional `agent.list` `scope` + `parentAgentId` params (§5.5).
-/// Absent / `null` / `"all"` is `None` — today's read; `"topLevel"` /
-/// `"delegated"` / `"background"` select one bin of the non-retired rows.
-/// Any other value (unknown string OR non-string) is `-32602`, never
-/// coerced. `parentAgentId` (a canonical `agent-{uuid}`) narrows a
-/// `delegated` read to that parent's direct sub-agents and is `-32602` with
-/// any other scope, including the default. A bin scope combined with
-/// `includeRetired` / `retiredOnly` (`retired_flag`) is `-32602`: retired
-/// sessions are their own bin.
 /// The [`RPC_REQUEST_SHAPE_FIELD`] value for one `agent.list` read: which
 /// variant the parsed params selected. Flags only — a `parentAgentId`
-/// narrowing reads as the literal ` parentAgentId` suffix, never the id.
+/// narrowing reads as the literal ` parentAgentId` suffix, never the id;
+/// an `orphanedOnly` narrowing as ` orphanedOnly`.
 fn agent_list_request_shape(
     scope: Option<&intent_core::AgentListRowScope>,
     include_retired: bool,
@@ -4674,7 +4691,12 @@ fn agent_list_request_shape(
     match scope {
         Some(AgentListRowScope::Delegated {
             parent_agent_id: Some(_),
+            ..
         }) => "scope=delegated parentAgentId".to_string(),
+        Some(AgentListRowScope::Delegated {
+            orphaned_only: true,
+            ..
+        }) => "scope=delegated orphanedOnly".to_string(),
         Some(scope) => format!("scope={}", scope.wire_name()),
         None if retired_only => "retiredOnly".to_string(),
         None if include_retired => "includeRetired".to_string(),
@@ -4682,6 +4704,20 @@ fn agent_list_request_shape(
     }
 }
 
+/// Parse the optional `agent.list` `scope` + `parentAgentId` +
+/// `orphanedOnly` params (§5.5). Absent / `null` / `"all"` is `None` —
+/// today's read; `"topLevel"` / `"delegated"` / `"background"` select one
+/// bin of the non-retired rows. Any other value (unknown string OR
+/// non-string) is `-32602`, never coerced. `parentAgentId` (a canonical
+/// `agent-{uuid}`) narrows a `delegated` read to that parent's direct
+/// sub-agents and is `-32602` with any other scope, including the default.
+/// `orphanedOnly: true` (a boolean, else `-32602`) narrows a `delegated`
+/// read the other way, to the workspace's orphaned delegated rows; it is
+/// `-32602` with any other scope and `-32602` combined with `parentAgentId`
+/// (the two sub-filters are mutually exclusive); `false` reads as absent.
+/// A bin scope combined with `includeRetired` / `retiredOnly`
+/// (`retired_flag`) is `-32602`: retired sessions are their own bin. Every
+/// rejection lands before any read.
 fn parse_agent_list_scope(
     params: &Map<String, Value>,
     retired_flag: bool,
@@ -4704,12 +4740,18 @@ fn parse_agent_list_scope(
             ));
         }
     };
+    let orphaned_only = match params.get("orphanedOnly") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(invalid_params("orphanedOnly must be a boolean")),
+    };
     let scope = match params.get("scope") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if s == "all" => None,
         Some(Value::String(s)) if s == "topLevel" => Some(AgentListRowScope::TopLevel),
         Some(Value::String(s)) if s == "delegated" => Some(AgentListRowScope::Delegated {
             parent_agent_id: parent_agent_id.clone(),
+            orphaned_only,
         }),
         Some(Value::String(s)) if s == "background" => Some(AgentListRowScope::Background),
         Some(_) => {
@@ -4728,6 +4770,16 @@ fn parse_agent_list_scope(
     }
     if parent_agent_id.is_some() && !matches!(scope, Some(AgentListRowScope::Delegated { .. })) {
         return Err(invalid_params("parentAgentId requires scope \"delegated\""));
+    }
+    if orphaned_only {
+        if !matches!(scope, Some(AgentListRowScope::Delegated { .. })) {
+            return Err(invalid_params("orphanedOnly requires scope \"delegated\""));
+        }
+        if parent_agent_id.is_some() {
+            return Err(invalid_params(
+                "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
+            ));
+        }
     }
     Ok(scope)
 }

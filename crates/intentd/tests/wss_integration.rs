@@ -1503,12 +1503,14 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
 /// orphaned background and a retired session, `scope: "topLevel"` /
 /// `"delegated"` / `"background"` each return exactly their bin, the bins
 /// partition the default read, `parentAgentId` narrows `delegated` to one
-/// parent's direct sub-agents, every variant carries `scopeCounts`
+/// parent's direct sub-agents, `orphanedOnly` narrows it to the children
+/// whose parent row is gone, every variant carries `scopeCounts`
 /// (workspace-wide, non-retired) and `delegatedCounts` (per direct parent,
-/// with the persisted-status running rule and `Σ total ==
-/// scopeCounts.delegated`) next to `retiredCount`, the default response is
-/// otherwise byte-identical to `scope: "all"`, and the invalid combinations
-/// are `-32602` with the documented messages.
+/// with the persisted-status running rule, `Σ total ==
+/// scopeCounts.delegated`, and the always-present `orphaned` sub-aggregate)
+/// next to `retiredCount`, the default response is otherwise byte-identical
+/// to `scope: "all"`, and the invalid combinations are `-32602` with the
+/// documented messages.
 #[intent_test_macros::daemon_test]
 async fn wss_agent_list_scope_bins_and_counts() {
     let srv = start(WsOptions::default()).await;
@@ -1583,12 +1585,35 @@ async fn wss_agent_list_scope_bins_and_counts() {
             .await
             .expect("retire child");
     }
+    // An orphan: a running child whose parent is hard-deleted over the wire
+    // (the `parent_agent_id` dangles — `agent.retire` would cascade instead).
+    let gamma = create_agent("gamma", false, 30).await;
+    let gamma_child = create_agent("under-gamma", false, 31).await;
+    {
+        let child_id = intent_core::AgentId::from(gamma_child.as_str());
+        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        session.parent_agent_id = Some(intent_core::AgentId::from(gamma.as_str()));
+        srv.store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("link gamma child");
+        let deleted = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":32,"method":"agent.delete","params":{{"workspaceId":"{ws_id}","agentId":"{gamma}"}}}}"#
+            ),
+        )
+        .await;
+        assert!(deleted.get("error").is_none(), "delete gamma: {deleted}");
+    }
     // Persisted statuses drive the `running` rule: `active` counts, the
     // legacy capitalized `Processing` counts, `idle` does not.
     for (child, status) in [
         (&alpha_child, intent_core::AgentStatus::Active),
         (&alpha_bg_child, intent_core::AgentStatus::RuntimeIdle),
         (&beta_child, intent_core::AgentStatus::Processing),
+        (&gamma_child, intent_core::AgentStatus::Active),
     ] {
         let child_id = intent_core::AgentId::from(child.as_str());
         let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
@@ -1629,22 +1654,37 @@ async fn wss_agent_list_scope_bins_and_counts() {
         15,
     )
     .await;
+    let orphans = list(
+        r#","scope":"delegated","orphanedOnly":true"#.to_string(),
+        18,
+    )
+    .await;
+    // `orphanedOnly: false` is the whole-bin read byte-for-byte.
+    let delegated_not_orphaned_only = list(
+        r#","scope":"delegated","orphanedOnly":false"#.to_string(),
+        19,
+    )
+    .await;
 
     let including_retired = list(r#","includeRetired":true"#.to_string(), 16).await;
     let retired_only = list(r#","retiredOnly":true"#.to_string(), 17).await;
 
     // Envelope: every variant is
     // `{ agents, retiredCount, scopeCounts, delegatedCounts }`.
-    let expected_counts = serde_json::json!({ "topLevel": 2, "delegated": 3, "background": 1 });
+    let expected_counts = serde_json::json!({ "topLevel": 2, "delegated": 4, "background": 1 });
     // Per direct parent, non-retired only: top-a has an `active` (running)
     // and an `idle` background child, top-b a legacy `Processing` (running)
-    // child; its retired child is excluded, and Σ total == scopeCounts.delegated.
+    // child — its retired child is excluded — and the deleted gamma keeps
+    // its raw key with its `active` orphan; Σ total == scopeCounts.delegated,
+    // and `orphaned` counts exactly gamma's child.
     let expected_delegated = serde_json::json!({
-        "running": 2,
+        "running": 3,
         "byParent": {
             top_a.as_str(): { "total": 2, "running": 1 },
             top_b.as_str(): { "total": 1, "running": 1 },
-        }
+            gamma.as_str(): { "total": 1, "running": 1 },
+        },
+        "orphaned": { "total": 1, "running": 1 },
     });
     for (label, v) in [
         ("default", &default),
@@ -1653,6 +1693,7 @@ async fn wss_agent_list_scope_bins_and_counts() {
         ("delegated", &delegated),
         ("background", &background),
         ("delegated/parent", &under_a),
+        ("delegated/orphanedOnly", &orphans),
         ("includeRetired", &including_retired),
         ("retiredOnly", &retired_only),
     ] {
@@ -1697,19 +1738,33 @@ async fn wss_agent_list_scope_bins_and_counts() {
             v["result"]["delegatedCounts"]["running"].as_u64().unwrap(),
             "{label}: running == Σ byParent[*].running: {v}"
         );
+        assert!(
+            v["result"]["delegatedCounts"]["orphaned"]["total"]
+                .as_u64()
+                .unwrap()
+                <= v["result"]["scopeCounts"]["delegated"].as_u64().unwrap(),
+            "{label}: orphaned.total ≤ scopeCounts.delegated: {v}"
+        );
     }
     // `scope: "all"` IS the default read.
     assert_eq!(default["result"], all["result"]);
+    // `orphanedOnly: false` IS the whole-bin delegated read.
+    assert_eq!(delegated["result"], delegated_not_orphaned_only["result"]);
 
     // Bins.
     assert_eq!(ids(&top), set(&[&top_a, &top_b]));
     assert_eq!(
         ids(&delegated),
-        set(&[&alpha_child, &alpha_bg_child, &beta_child]),
-        "a background CHILD is delegated, not background"
+        set(&[&alpha_child, &alpha_bg_child, &beta_child, &gamma_child]),
+        "a background CHILD is delegated, not background; an orphan is delegated"
     );
     assert_eq!(ids(&background), set(&[&orphan_bg]));
     assert_eq!(ids(&under_a), set(&[&alpha_child, &alpha_bg_child]));
+    assert_eq!(
+        ids(&orphans),
+        set(&[&gamma_child]),
+        "orphanedOnly serves exactly the children whose parent row is gone"
+    );
     // Partition of the default read: union equal, pairwise disjoint, and
     // the retired row is in no bin.
     let union: std::collections::BTreeSet<String> = ids(&top)
@@ -1725,7 +1780,7 @@ async fn wss_agent_list_scope_bins_and_counts() {
     assert!(!union.contains(&retired_top));
     assert!(!union.contains(&retired_child));
     // Scoped rows are the default read's rows, unchanged.
-    for v in [&top, &delegated, &background, &under_a] {
+    for v in [&top, &delegated, &background, &under_a, &orphans] {
         for row in v["result"]["agents"].as_array().unwrap() {
             let default_row = default["result"]["agents"]
                 .as_array()
@@ -1779,6 +1834,35 @@ async fn wss_agent_list_scope_bins_and_counts() {
     assert_eq!(v["error"]["code"], -32602, "{v}");
     assert_eq!(
         v["error"]["message"], "parentAgentId requires scope \"delegated\"",
+        "{v}"
+    );
+    expect_invalid(
+        r#","scope":"delegated","orphanedOnly":"yes""#,
+        28,
+        "orphanedOnly must be a boolean",
+    )
+    .await;
+    expect_invalid(
+        r#","orphanedOnly":true"#,
+        29,
+        "orphanedOnly requires scope \"delegated\"",
+    )
+    .await;
+    expect_invalid(
+        r#","scope":"background","orphanedOnly":true"#,
+        33,
+        "orphanedOnly requires scope \"delegated\"",
+    )
+    .await;
+    let v = list(
+        format!(r#","scope":"delegated","orphanedOnly":true,"parentAgentId":"{top_a}""#),
+        34,
+    )
+    .await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
         "{v}"
     );
 
@@ -5133,7 +5217,9 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
 /// persisted queue snapshot a later drain or restart would redrive), while
 /// the removed member's connection loses access (`agent.getQueue` and
 /// `workspace.get` are `NotFound`). A second collaborator's entry is not
-/// touched.
+/// touched. Per-user queue visibility throughout: the owner reads the full
+/// queue; each collaborator's `agent.getQueue` shows only its own entry
+/// (`position` not renumbered).
 #[tokio::test]
 async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     use intent_core::events::AGENT_QUEUE_UPDATED;
@@ -5220,9 +5306,15 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         "{staying_queued}"
     );
 
-    let before = leaving
-        .call("agent.getQueue", json!({ "agentId": agent_id }))
-        .await;
+    // The owner (administrator) reads the full queue.
+    let before = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getQueue","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
     let queue = before["result"]["queue"].as_array().expect("queue");
     assert_eq!(queue.len(), 3, "{before}");
     // A collaborator's entry carries the sender preamble above its text
@@ -5266,6 +5358,30 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         Some(json!(staying.principal.id.0)),
         "{before}"
     );
+
+    // Each collaborator reads only its own entry, at its full-queue
+    // position (the projection filters, it does not renumber).
+    for (guest, body, position) in [
+        (&mut leaving, "from leaving", 1),
+        (&mut staying, "from staying", 2),
+    ] {
+        let own = guest
+            .call("agent.getQueue", json!({ "agentId": agent_id }))
+            .await;
+        let visible = own["result"]["queue"].as_array().expect("queue");
+        assert_eq!(
+            visible.len(),
+            1,
+            "collaborator sees only its own entry: {own}"
+        );
+        assert_eq!(body_of(&visible[0]), body, "{own}");
+        assert_eq!(visible[0]["position"], json!(position), "{own}");
+        assert_eq!(
+            visible[0]["author"]["principalId"],
+            json!(guest.principal.id.0),
+            "{own}"
+        );
+    }
 
     // Owner subscribes for the shrunk-queue echo, then removes the member.
     let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
@@ -5444,14 +5560,323 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     let still = staying
         .call("agent.getQueue", json!({ "agentId": agent_id }))
         .await;
+    let still_queue = still["result"]["queue"].as_array().expect("queue");
     assert_eq!(
-        still["result"]["queue"].as_array().map(Vec::len),
-        Some(2),
-        "{still}"
+        still_queue.len(),
+        1,
+        "staying collaborator still sees only its own entry: {still}"
+    );
+    assert_eq!(body_of(&still_queue[0]), "from staying", "{still}");
+    assert_eq!(
+        still_queue[0]["position"],
+        json!(1),
+        "the removed entry's slot closed up ahead of it: {still}"
     );
 
     drop(leaving);
     drop(staying);
+    srv.ws.stop().await;
+}
+
+/// Archiving removes guests: `workspace.archive` over the wire on a
+/// workspace with two collaborators and one open invite. The owner's
+/// `events.subscribe` on `workspace:updated` sees the documented sequence —
+/// one `{ members: true, removedPrincipalId, memberCount }` delta per
+/// collaborator (the `members.remove` shape), one `{ invites: true }`, then
+/// the `{ archived: true, status, archivedAt }` delta — the response
+/// carries `memberCount: 1` / `openInviteCount: 0`, `workspace.members.list`
+/// keeps only the owner row, both guests' connections read `NotFound`, a
+/// `workspace.members.add` while archived is `-32602 { code:
+/// "workspace-archived" }`, and `workspace.unarchive` restores neither
+/// membership nor the invite — but admits the add again (no late sweep).
+#[tokio::test]
+async fn wss_archive_detaches_collaborators_and_revokes_open_invites() {
+    use intent_core::events::WORKSPACE_UPDATED;
+    use intent_core::{WorkspaceInvite, WorkspaceRole};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let primary = srv
+        .store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Archive Removes Guests"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let ws_typed = WorkspaceId::from(ws_id.as_str());
+
+    let mut guest_a = Guest::connect(
+        &srv,
+        "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+    )
+    .await;
+    let mut guest_b = Guest::connect(
+        &srv,
+        "e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6",
+    )
+    .await;
+    for guest in [&guest_a, &guest_b] {
+        srv.store
+            .add_workspace_member(&ws_typed, &guest.principal.id, WorkspaceRole::Collaborator)
+            .await
+            .expect("add collaborator");
+    }
+    // One open (unpinned, unexpired) invite, seeded at the store: the
+    // minting RPC needs a tunnel and a forge identity, which this harness
+    // does not run; the sweep only reads the row's open predicate.
+    let invite = WorkspaceInvite {
+        id: uuid::Uuid::new_v4().to_string(),
+        workspace_id: ws_typed.clone(),
+        secret_hash: sha256_hex(b"archive-invite-secret"),
+        secret: None,
+        created_by_principal_id: primary.id.clone(),
+        pin_github_user_id: None,
+        pin_login: None,
+        created_at: now_iso(),
+        expires_at: intent_core::iso_ms_from_now(3_600_000),
+        redeemed_at: None,
+        redeemed_by_principal_id: None,
+        revoked_at: None,
+        redemption_count: 0,
+    };
+    srv.store
+        .insert_workspace_invite(&invite)
+        .await
+        .expect("open invite");
+
+    let before = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.get","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(before["result"]["workspace"]["memberCount"], 3, "{before}");
+    assert_eq!(
+        before["result"]["workspace"]["openInviteCount"], 1,
+        "{before}"
+    );
+    for guest in [&mut guest_a, &mut guest_b] {
+        let seen = guest
+            .call("workspace.get", json!({ "workspaceId": ws_id }))
+            .await;
+        assert_eq!(
+            seen["result"]["workspace"]["myRole"], "collaborator",
+            "{seen}"
+        );
+    }
+
+    // Owner subscribes to the workspace's `workspace:updated` stream.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"events.subscribe","params":{{"eventTypes":["{WORKSPACE_UPDATED}"],"workspaceId":"{ws_id}"}}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .expect("subscribe");
+    loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                if v["id"] == 3 {
+                    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+                    break;
+                }
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    let archived = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.archive","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(archived["jsonrpc"], "2.0", "{archived}");
+    let ws = &archived["result"]["workspace"];
+    assert_eq!(ws["id"], ws_id.as_str(), "{archived}");
+    assert_eq!(ws["archived"], true, "{archived}");
+    assert_eq!(ws["status"], "Archived", "{archived}");
+    assert_eq!(ws["memberCount"], 1, "{archived}");
+    assert_eq!(ws["openInviteCount"], 0, "{archived}");
+    assert_eq!(ws["myRole"], "owner", "{archived}");
+    let archived_at = ws["archivedAt"].clone();
+    assert!(archived_at.is_string(), "{archived}");
+
+    // The emitted sequence: two removals (memberCount 2 then 1), the invite
+    // delta, then the archived delta.
+    let mut changes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while changes.len() < 4 {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == WORKSPACE_UPDATED
+                    {
+                        let ev = &v["params"]["event"];
+                        assert_eq!(ev["workspaceId"], ws_id.as_str(), "{ev}");
+                        assert_eq!(ev["data"]["workspaceId"], ws_id.as_str(), "{ev}");
+                        changes.push(ev["data"]["changes"].clone());
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("four workspace:updated deltas after archive");
+    let mut removed: Vec<String> = changes[..2]
+        .iter()
+        .zip([2u64, 1])
+        .map(|(c, count)| {
+            assert_eq!(c["members"], true, "{c}");
+            assert_eq!(c["memberCount"], count, "{c}");
+            c["removedPrincipalId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("removedPrincipalId: {c}"))
+                .to_string()
+        })
+        .collect();
+    removed.sort();
+    let mut expected = vec![
+        guest_a.principal.id.0.clone(),
+        guest_b.principal.id.0.clone(),
+    ];
+    expected.sort();
+    assert_eq!(removed, expected, "{changes:?}");
+    assert_eq!(changes[2], json!({ "invites": true }), "{changes:?}");
+    assert_eq!(
+        changes[3],
+        json!({ "archived": true, "status": "Archived", "archivedAt": archived_at }),
+        "{changes:?}"
+    );
+
+    // Roster: only the owner row survives; the guests' connections lost
+    // the workspace.
+    let roster = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.members.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let members = roster["result"]["members"].as_array().expect("members");
+    assert_eq!(members.len(), 1, "{roster}");
+    assert_eq!(members[0]["principalId"], primary.id.0, "{roster}");
+    assert_eq!(members[0]["role"], "owner", "{roster}");
+    assert_eq!(roster["result"]["guestCount"], 0, "{roster}");
+    for guest in [&mut guest_a, &mut guest_b] {
+        let gone = guest
+            .call("workspace.get", json!({ "workspaceId": ws_id }))
+            .await;
+        assert_eq!(gone["error"]["code"], -32602, "{gone}");
+        assert_eq!(gone["error"]["data"]["code"], "not-found", "{gone}");
+    }
+    let stored = srv
+        .store
+        .get_workspace_invite(&invite.id)
+        .await
+        .expect("invite read")
+        .expect("invite row kept");
+    assert!(stored.revoked_at.is_some(), "{stored:?}");
+
+    // While archived, a direct add is refused as `workspace-archived`
+    // (checked inside the add's write transaction) and seats nobody.
+    let refused = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"workspace.members.add","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            guest_a.principal.id.0
+        ),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["code"], "workspace-archived",
+        "{refused}"
+    );
+    assert_eq!(
+        srv.store
+            .get_workspace_member_role(&ws_typed, &guest_a.principal.id)
+            .await
+            .expect("role"),
+        None,
+        "{refused}"
+    );
+
+    // Unarchive resurrects neither the members nor the invite.
+    let restored = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.unarchive","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        restored["result"]["workspace"]["archived"], false,
+        "{restored}"
+    );
+    let after = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"workspace.get","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(after["result"]["workspace"]["memberCount"], 1, "{after}");
+    assert_eq!(
+        after["result"]["workspace"]["openInviteCount"], 0,
+        "{after}"
+    );
+    // ... and the same add now seats the guest again: no late sweep.
+    let readded = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.members.add","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            guest_a.principal.id.0
+        ),
+    )
+    .await;
+    assert_eq!(readded["result"]["added"], true, "{readded}");
+    assert_eq!(readded["result"]["memberCount"], 2, "{readded}");
+    let back = guest_a
+        .call("workspace.get", json!({ "workspaceId": ws_id }))
+        .await;
+    assert_eq!(
+        back["result"]["workspace"]["myRole"], "collaborator",
+        "{back}"
+    );
+
+    drop(guest_a);
+    drop(guest_b);
+    drop(sub_ws);
     srv.ws.stop().await;
 }
 

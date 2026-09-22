@@ -12,8 +12,9 @@
 //!
 //! The heuristic is deliberately small:
 //!
-//! - Comments and string / char literals are blanked first, so a `Child` in a
-//!   doc comment or a fixture string never counts.
+//! - Comments and string / char literals are blanked first (the shared lexer
+//!   in `intentd_test_support::source_lint`), so a `Child` in a doc comment
+//!   or a fixture string never counts.
 //! - A hit is the whole identifier token `Child` — optionally written as the
 //!   path `process::Child`, `std::process::Child`, or `::std::process::Child`
 //!   — in a type position: immediately after `->` (return type), after a
@@ -38,12 +39,11 @@
 //!   wraps `Child`). Only `crates/*/tests/**/*.rs` is scanned, so `src/` code
 //!   is never considered.
 //! - Opt-out: `// raw-child: allow — <reason>` on the line immediately above
-//!   the hit's line. The marker counts only as a standalone `//` line comment
-//!   (nothing but whitespace before it, not inside a `/* … */` block comment
-//!   or a string literal, not trailing code), the token must be exactly
-//!   `raw-child: allow` (a longer word such as `allowance` is malformed), and
-//!   it must be followed by whitespace, an em dash or hyphen, and a nonempty
-//!   reason. A malformed marker never suppresses the hit; the report says so.
+//!   the hit's line, in the shared marker grammar (`source_lint::
+//!   markers_by_line`): a standalone `//` line comment, the exact token
+//!   `raw-child: allow`, then whitespace, an em dash or hyphen, and a
+//!   nonempty reason. A malformed marker never suppresses the hit; the
+//!   report says so.
 //! - Baseline ratchet: a file in [`BASELINE`] may have hits today. An entry
 //!   whose file has no hits any more (or no longer exists) fails the lint
 //!   with a "remove from BASELINE" message, so the list only ever shrinks.
@@ -51,6 +51,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+use intentd_test_support::source_lint::{lex, markers_by_line, rust_files, workspace_root, Marker};
 
 /// Test files (relative to the workspace root, `/`-separated) that still own
 /// a bare `std::process::Child`. Migrate a file onto
@@ -133,7 +135,6 @@ const BASELINE: &[&str] = &[
     "crates/intentd/tests/e2e_wss_server_pairing.rs",
     "crates/intentd/tests/e2e_wss_settings_atomic_rollback.rs",
     "crates/intentd/tests/e2e_wss_settings_live_reload.rs",
-    "crates/intentd/tests/e2e_wss_setup_lifecycle.rs",
     "crates/intentd/tests/e2e_wss_setup_script.rs",
     "crates/intentd/tests/e2e_wss_specialist_frontmatter_model.rs",
     "crates/intentd/tests/e2e_wss_specialists_changed.rs",
@@ -161,7 +162,7 @@ const BASELINE: &[&str] = &[
     "crates/intentd/tests/uds_rpc_profile_warn.rs",
 ];
 
-const OPT_OUT_MARKER: &str = "// raw-child: allow";
+const OPT_OUT_TAG: &str = "raw-child";
 const CHILD: &str = "Child";
 /// Path prefixes (outermost first) under which the `Child` token counts.
 const ALLOWED_PATHS: &[&[&str]] = &[&[], &["process"], &["std", "process"]];
@@ -178,229 +179,6 @@ struct Hit {
     /// The line above carried something that starts like the opt-out marker
     /// but is malformed (longer token, or no reason).
     marker_malformed: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Marker {
-    Absent,
-    WithReason,
-    Malformed,
-}
-
-/// A real `//` line comment found by the lexer (never one nested inside a
-/// block comment or a string literal).
-struct LineComment {
-    line: usize,
-    /// Only whitespace precedes the `//` on its line.
-    standalone: bool,
-    text: String,
-}
-
-/// Source text with comments/literals blanked, plus the line comments the
-/// lexer passed over on the way.
-struct Stripped {
-    text: String,
-    line_comments: Vec<LineComment>,
-}
-
-/// Marker state of one line comment's text: `Absent` unless it starts with
-/// the marker prefix; `WithReason` only when the token is exactly the marker
-/// (not a longer word such as `allowance`) followed by whitespace, a dash,
-/// and a nonempty reason; anything else that starts like the marker is
-/// `Malformed`.
-fn classify_marker(comment: &str) -> Marker {
-    let Some(rest) = comment.strip_prefix(OPT_OUT_MARKER) else {
-        return Marker::Absent;
-    };
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Marker::Malformed;
-    }
-    let after_space = rest.trim_start();
-    if after_space.len() == rest.len() && !rest.is_empty() {
-        return Marker::Malformed;
-    }
-    let Some(reason) = after_space
-        .strip_prefix('—')
-        .or_else(|| after_space.strip_prefix('-'))
-    else {
-        return Marker::Malformed;
-    };
-    if reason.trim().is_empty() {
-        Marker::Malformed
-    } else {
-        Marker::WithReason
-    }
-}
-
-/// Opt-out marker state per line; index 0 is a placeholder so the vector is
-/// addressed by 1-based line number. Only a standalone `//` line comment can
-/// carry the marker.
-fn markers_by_line(src: &str, line_comments: &[LineComment]) -> Vec<Marker> {
-    let mut out = vec![Marker::Absent; src.lines().count() + 1];
-    for comment in line_comments.iter().filter(|c| c.standalone) {
-        if let Some(slot) = out.get_mut(comment.line) {
-            *slot = classify_marker(&comment.text);
-        }
-    }
-    out
-}
-
-fn push_blank(out: &mut String, c: char) {
-    out.push(if c == '\n' { '\n' } else { ' ' });
-}
-
-/// `Some(hashes)` when a raw string literal (`r"`, `r#"`, `br"`, `cr#"`, …)
-/// starts at `i`; `None` otherwise. Cooked `b"…"` / `c"…"` strings need no
-/// special case: their prefix letter is left as an inert identifier and the
-/// `"` branch consumes the body.
-fn raw_string_hashes(chars: &[char], i: usize) -> Option<usize> {
-    let preceded_by_ident = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
-    if preceded_by_ident {
-        return None;
-    }
-    let mut j = i;
-    if matches!(chars.get(j), Some('b' | 'c')) {
-        j += 1;
-    }
-    if chars.get(j) != Some(&'r') {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0;
-    while chars.get(j) == Some(&'#') {
-        hashes += 1;
-        j += 1;
-    }
-    (chars.get(j) == Some(&'"')).then_some(hashes)
-}
-
-/// Replaces every comment, string literal, and char literal with spaces
-/// (newlines preserved) so neither their contents nor their delimiters take
-/// part in token matching. Every `//` line comment the lexer consumes is also
-/// reported, since only those may carry the opt-out marker.
-fn blank_literals_and_comments(src: &str) -> Stripped {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut line_comments = Vec::new();
-    // Line bookkeeping is advanced lazily, only when a `//` comment is met,
-    // so newlines swallowed by the block-comment and string loops still count.
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    let mut counted_upto = 0usize;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if c == '/' && next == Some('/') {
-            let start = i;
-            for (offset, ch) in chars[counted_upto..start].iter().enumerate() {
-                if *ch == '\n' {
-                    line += 1;
-                    line_start = counted_upto + offset + 1;
-                }
-            }
-            counted_upto = start;
-            while i < chars.len() && chars[i] != '\n' {
-                out.push(' ');
-                i += 1;
-            }
-            line_comments.push(LineComment {
-                line,
-                standalone: chars[line_start..start].iter().all(|c| c.is_whitespace()),
-                text: chars[start..i].iter().collect(),
-            });
-        } else if c == '/' && next == Some('*') {
-            let mut depth = 0usize;
-            while i < chars.len() {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    out.push_str("  ");
-                    i += 2;
-                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    out.push_str("  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    push_blank(&mut out, chars[i]);
-                    i += 1;
-                }
-            }
-        } else if let Some(hashes) = raw_string_hashes(&chars, i) {
-            while chars[i] != '"' {
-                out.push(' ');
-                i += 1;
-            }
-            out.push(' ');
-            i += 1;
-            while i < chars.len() {
-                let closing =
-                    chars[i] == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#'));
-                push_blank(&mut out, chars[i]);
-                i += 1;
-                if closing {
-                    out.push_str(&" ".repeat(hashes));
-                    i += hashes;
-                    break;
-                }
-            }
-        } else if c == '"' {
-            out.push(' ');
-            i += 1;
-            while i < chars.len() {
-                let d = chars[i];
-                push_blank(&mut out, d);
-                i += 1;
-                if d == '\\' {
-                    if let Some(&escaped) = chars.get(i) {
-                        push_blank(&mut out, escaped);
-                        i += 1;
-                    }
-                } else if d == '"' {
-                    break;
-                }
-            }
-        } else if c == '\'' {
-            // `'\…'` and `'x'` are char literals; anything else is a lifetime
-            // or loop label, which never spells a type.
-            if next == Some('\\') {
-                let start = i;
-                i += 2;
-                if chars.get(i) == Some(&'u') {
-                    while i < chars.len() && chars[i] != '}' {
-                        i += 1;
-                    }
-                }
-                i += 1;
-                if chars.get(i) == Some(&'\'') {
-                    i += 1;
-                }
-                i = i.min(chars.len());
-                for &d in &chars[start..i] {
-                    push_blank(&mut out, d);
-                }
-            } else if chars.get(i + 2) == Some(&'\'') {
-                out.push_str("   ");
-                i += 3;
-            } else {
-                out.push(' ');
-                i += 1;
-            }
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    Stripped {
-        text: out,
-        line_comments,
-    }
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -537,10 +315,10 @@ fn excerpt(line: &str) -> String {
 /// Scans one Rust source file's text and returns every `Child` type position
 /// that is not suppressed by a reasoned opt-out marker.
 fn scan_source(src: &str) -> Vec<Hit> {
-    let stripped = blank_literals_and_comments(src);
-    let markers = markers_by_line(src, &stripped.line_comments);
+    let lexed = lex(src);
+    let markers = markers_by_line(src, &lexed.line_comments, OPT_OUT_TAG);
     let lines: Vec<&str> = src.lines().collect();
-    let chars: Vec<char> = stripped.text.chars().collect();
+    let chars: Vec<char> = lexed.blanked.chars().collect();
     let mut hits = Vec::new();
     let mut line = 1usize;
     let mut i = 0;
@@ -572,14 +350,6 @@ fn scan_source(src: &str) -> Vec<Hit> {
     hits
 }
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/intentd-test-support sits two levels under the workspace root")
-        .to_path_buf()
-}
-
 fn is_exempt(rel: &Path) -> bool {
     let mut comps = rel.components();
     EXEMPT_CRATE
@@ -590,25 +360,12 @@ fn is_exempt(rel: &Path) -> bool {
 /// Every `crates/*/tests/**/*.rs` file under `root`, sorted, as paths relative
 /// to `root`. Only the `tests/` integration-test trees are scanned.
 fn test_files(root: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
     let mut out = Vec::new();
     let crates = root.join("crates");
     for entry in fs::read_dir(&crates).expect("crates/ dir").flatten() {
         let tests = entry.path().join("tests");
         if tests.is_dir() {
-            walk(&tests, &mut out);
+            out.extend(rust_files(&tests));
         }
     }
     let mut rel: Vec<PathBuf> = out
@@ -691,7 +448,7 @@ fn no_raw_child_types_in_test_suites() {
 
 #[cfg(test)]
 mod heuristic {
-    use super::{classify_marker, scan_source, Marker};
+    use super::scan_source;
 
     fn hit_lines(src: &str) -> Vec<usize> {
         scan_source(src).into_iter().map(|h| h.line).collect()
@@ -823,28 +580,5 @@ mod heuristic {
                 .collect::<Vec<_>>(),
             vec![(2, true), (4, true), (6, true), (8, false), (10, false)]
         );
-    }
-
-    #[test]
-    fn marker_classification() {
-        assert_eq!(
-            classify_marker("// raw-child: allow — why"),
-            Marker::WithReason
-        );
-        assert_eq!(
-            classify_marker("// raw-child: allow - why"),
-            Marker::WithReason
-        );
-        assert_eq!(classify_marker("// raw-child: allow"), Marker::Malformed);
-        assert_eq!(classify_marker("// raw-child: allow —"), Marker::Malformed);
-        assert_eq!(
-            classify_marker("// raw-child: allow why"),
-            Marker::Malformed
-        );
-        assert_eq!(
-            classify_marker("// raw-child: allowance — x"),
-            Marker::Malformed
-        );
-        assert_eq!(classify_marker("// something else"), Marker::Absent);
     }
 }

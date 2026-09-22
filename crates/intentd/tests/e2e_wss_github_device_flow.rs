@@ -245,7 +245,9 @@ where
 // `DELETE /gists/{id}` the gist identity proof needs (`GET /user` and
 // `GET /gists/{id}` report the `gist` scope in `X-OAuth-Scopes` while
 // `gist_scope` is set; the minted gist reads back as a proof gist, the
-// `OTHER_GIST_ID` gist as an unrelated one-file gist).
+// `OTHER_GIST_ID` gist as an unrelated one-file gist). While `rate_limited`
+// is set every API-side request is answered `403` with GitHub's primary
+// rate-limit body, the way an exhausted quota looks on the wire.
 // ---------------------------------------------------------------------------
 
 /// The gist id the mock mints for every `POST /gists`.
@@ -259,6 +261,7 @@ struct MockGithub {
     base_uri: String,
     authorize: Arc<AtomicBool>,
     gist_scope: Arc<AtomicBool>,
+    rate_limited: Arc<AtomicBool>,
 }
 
 async fn spawn_mock_github() -> MockGithub {
@@ -268,8 +271,10 @@ async fn spawn_mock_github() -> MockGithub {
     let port = listener.local_addr().expect("mock addr").port();
     let authorize = Arc::new(AtomicBool::new(false));
     let gist_scope = Arc::new(AtomicBool::new(true));
+    let rate_limited = Arc::new(AtomicBool::new(false));
     let flag = authorize.clone();
     let scope = gist_scope.clone();
+    let limited = rate_limited.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -277,8 +282,9 @@ async fn spawn_mock_github() -> MockGithub {
             };
             let flag = flag.clone();
             let scope = scope.clone();
+            let limited = limited.clone();
             tokio::spawn(async move {
-                let _ = serve_conn(stream, flag, scope).await;
+                let _ = serve_conn(stream, flag, scope, limited).await;
             });
         }
     });
@@ -286,6 +292,7 @@ async fn spawn_mock_github() -> MockGithub {
         base_uri: format!("http://127.0.0.1:{port}"),
         authorize,
         gist_scope,
+        rate_limited,
     }
 }
 
@@ -295,6 +302,7 @@ async fn serve_conn(
     mut stream: TcpStream,
     authorize: Arc<AtomicBool>,
     gist_scope: Arc<AtomicBool>,
+    rate_limited: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -349,6 +357,14 @@ async fn serve_conn(
         } else {
             json!({ "error": "authorization_pending" })
         }
+    } else if rate_limited.load(Ordering::SeqCst) {
+        // GitHub's primary quota exhaustion: 403 (not 429) with the
+        // documented body text as the only discriminator.
+        status = 403;
+        json!({
+            "message": "API rate limit exceeded for user ID 1.",
+            "documentation_url": "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api",
+        })
     } else if method == "GET" && path == "/user" {
         let scopes = if gist_scope.load(Ordering::SeqCst) {
             "repo, read:org, workflow, gist"
@@ -469,13 +485,23 @@ async fn github_device_flow_full_lifecycle_over_wss() {
     );
     assert_eq!(r["interval"], json!(1));
     assert!(r["expiresIn"].as_u64().expect("expiresIn") > 0);
+    // `flowId` is the opaque cancel handle: a non-empty string that is
+    // neither the device code nor the user code.
+    let flow_id = r["flowId"]
+        .as_str()
+        .expect("flowId is a string")
+        .to_string();
+    assert!(!flow_id.is_empty());
+    assert_ne!(flow_id, "e2e-device-code-opaque");
+    assert_ne!(flow_id, USER_CODE);
     // 🔒 Never the device code or a token on the wire.
     assert!(r.get("deviceCode").is_none());
     assert!(r.get("accessToken").is_none());
 
-    // 2. connect again while pending → the SAME codes (idempotent).
+    // 2. connect again while pending → the SAME codes and flowId (idempotent).
     let v = wss_rpc(&mut rpc, 11, "github.connect", json!({})).await;
     assert_eq!(v["result"]["userCode"], json!(USER_CODE));
+    assert_eq!(v["result"]["flowId"], json!(flow_id));
 
     // 3. authStatus while pending → deviceFlow.status == "pending" and the
     //    verification uri doubles as oauthUrl for existing FE consumers.
@@ -530,9 +556,12 @@ async fn github_device_flow_full_lifecycle_over_wss() {
     assert_eq!(v["result"]["cancelled"], json!(false));
 }
 
-/// Cancelling a pending flow stops the background poll: `cancelAuth` reports
-/// `cancelled: true`, authStatus drops back to `deviceFlow: null`, and a
-/// LATER authorize on the mock must NOT mint a token (the poll task is gone).
+/// Cancelling a pending flow stops the background poll: a `cancelAuth` scoped
+/// to a `flowId` that is not the pending flow's is a no-op (`cancelled:
+/// false`, the flow keeps polling), one scoped to the connect-issued `flowId`
+/// reports `cancelled: true`, authStatus drops back to `deviceFlow: null`,
+/// and a LATER authorize on the mock must NOT mint a token (the poll task is
+/// gone).
 #[tokio::test]
 async fn github_cancel_auth_stops_the_background_poll_over_wss() {
     let mock = spawn_mock_github().await;
@@ -562,12 +591,51 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
 
     let v = wss_rpc(&mut rpc, 10, "github.connect", json!({})).await;
     assert_eq!(v["result"]["ok"], json!(true));
+    let flow_id = v["result"]["flowId"]
+        .as_str()
+        .expect("flowId is a string")
+        .to_string();
 
-    let v = wss_rpc(&mut rpc, 11, "github.cancelAuth", json!({})).await;
+    // A cancel scoped to some other flow's id must not touch this flow.
+    let stale = format!("{flow_id}-stale");
+    let v = wss_rpc(
+        &mut rpc,
+        11,
+        "github.cancelAuth",
+        json!({ "flowId": stale }),
+    )
+    .await;
+    assert_eq!(v["result"]["ok"], json!(true));
+    assert_eq!(v["result"]["cancelled"], json!(false));
+    let v = wss_rpc(&mut rpc, 12, "github.authStatus", json!({})).await;
+    assert_eq!(v["result"]["deviceFlow"]["status"], json!("pending"));
+
+    // A present non-string flowId — an explicit null included — is invalid
+    // params, never a widened cancel: the flow is still pending afterwards.
+    let v = wss_rpc(&mut rpc, 13, "github.cancelAuth", json!({ "flowId": 7 })).await;
+    assert_eq!(v["error"]["code"], json!(-32602));
+    let v = wss_rpc(
+        &mut rpc,
+        14,
+        "github.cancelAuth",
+        json!({ "flowId": Value::Null }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602));
+    let v = wss_rpc(&mut rpc, 15, "github.authStatus", json!({})).await;
+    assert_eq!(v["result"]["deviceFlow"]["status"], json!("pending"));
+
+    let v = wss_rpc(
+        &mut rpc,
+        16,
+        "github.cancelAuth",
+        json!({ "flowId": flow_id }),
+    )
+    .await;
     assert_eq!(v["result"]["ok"], json!(true));
     assert_eq!(v["result"]["cancelled"], json!(true));
 
-    let v = wss_rpc(&mut rpc, 12, "github.authStatus", json!({})).await;
+    let v = wss_rpc(&mut rpc, 17, "github.authStatus", json!({})).await;
     assert_eq!(v["result"]["deviceFlow"], Value::Null);
 
     // Authorize AFTER the cancel: the aborted poll task must never mint the
@@ -747,4 +815,108 @@ async fn github_identity_proof_create_and_delete_over_wss() {
     .await;
     assert_eq!(v["error"]["code"], json!(-32603), "not-connected: {v}");
     assert_eq!(v["error"]["data"]["code"], json!("github-not-connected"));
+}
+
+/// A GitHub rate limit over WSS (intent-hq/intent#5627): with a stored token
+/// and the API host answering `403` + "API rate limit exceeded" (one of the
+/// causes the source-control layer classifies as `RateLimited`),
+/// `github.identityProof.create`, `github.identityProof.delete` and
+/// `github.getUser` all answer `-32603` with the unchanged
+/// `source control rate limited: <detail>` message and
+/// `error.data = { code: "rate-limited" }` — never `github-not-connected`,
+/// so the invite flow can tell "wait" from "sign in". Once the limit resets
+/// the same calls succeed without any re-auth.
+#[tokio::test]
+async fn github_rate_limited_surfaces_data_code_over_wss() {
+    let mock = spawn_mock_github().await;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let secrets_file = data_dir.join("secrets.json");
+    std::fs::write(
+        &secrets_file,
+        json!({ "sourceControl.github.token": ACCESS_TOKEN }).to_string(),
+    )
+    .expect("seed secrets file");
+    let secrets_s = secrets_file.to_string_lossy().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_SECRETS_FILE", &secrets_s),
+        ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
+        ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    mock.rate_limited.store(true, Ordering::SeqCst);
+
+    let assert_rate_limited = |v: &Value, what: &str| {
+        assert_eq!(v["error"]["code"], json!(-32603), "{what}: {v}");
+        assert_eq!(
+            v["error"]["data"],
+            json!({ "code": "rate-limited" }),
+            "{what}: {v}"
+        );
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("source control rate limited: ")
+                && message.contains("API rate limit exceeded"),
+            "{what}: {v}"
+        );
+        assert!(!v.to_string().contains(ACCESS_TOKEN), "{what}: {v}");
+    };
+
+    // 1. create: the preflight `GET /user` hits the quota → `rate-limited`.
+    let v = wss_rpc(
+        &mut rpc,
+        40,
+        "github.identityProof.create",
+        json!({ "nonce": "n0nce-e2e", "hostLabel": "Host E2E" }),
+    )
+    .await;
+    assert_rate_limited(&v, "create");
+
+    // 2. delete: same preflight, same class (before any gist read).
+    let v = wss_rpc(
+        &mut rpc,
+        41,
+        "github.identityProof.delete",
+        json!({ "gistId": GIST_ID }),
+    )
+    .await;
+    assert_rate_limited(&v, "delete");
+
+    // 3. getUser: the plain identity read carries the same discriminator.
+    let v = wss_rpc(&mut rpc, 42, "github.getUser", json!({})).await;
+    assert_rate_limited(&v, "getUser");
+
+    // 4. The quota window passes: the very same token works again — no
+    //    sign-in was ever needed.
+    mock.rate_limited.store(false, Ordering::SeqCst);
+    let v = wss_rpc(&mut rpc, 43, "github.getUser", json!({})).await;
+    assert!(v.get("error").is_none(), "getUser after reset: {v}");
+    assert_eq!(v["result"]["user"]["login"], json!("octocat"));
+    let v = wss_rpc(
+        &mut rpc,
+        44,
+        "github.identityProof.create",
+        json!({ "nonce": "n0nce-e2e", "hostLabel": "Host E2E" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "create after reset: {v}");
+    assert_eq!(
+        v["result"],
+        json!({ "gistId": GIST_ID, "login": "octocat" })
+    );
 }

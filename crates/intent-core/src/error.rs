@@ -89,6 +89,17 @@ pub enum Error {
     )]
     ListenerDown,
 
+    /// The tunnel is not running, so `workspace.invite.create` has no `tc`
+    /// address to embed in the (tunnel-only) invite link. Surfaces as
+    /// `-32603` with machine-readable `error.data = { code: "tunnel-down" }`
+    /// so clients route it without matching on prose. Distinct from
+    /// [`Error::ListenerDown`]: the WSS listener IS up here.
+    #[error(
+        "tunnel is not running — invite links are tunnel-only; enable the tunnel \
+         (server.tunnel.enabled) and wait for it to come up before inviting"
+    )]
+    TunnelDown,
+
     /// A `repo.warmCache` request was rejected because an opportunistic warm
     /// is already in flight (global single-flight — at most one warm
     /// daemon-wide). Surfaces as `-32603` with machine-readable
@@ -249,6 +260,11 @@ pub enum InviteErrorKind {
     /// guest: no per-principal credential is ever minted for the primary
     /// row, and the invite stays open.
     OwnerSelfJoin,
+    /// The workspace is archived: archiving detaches every guest and closes
+    /// every open invite, so no invite is minted, no member is added and no
+    /// join is committed against it until it is unarchived. Nothing was
+    /// written.
+    WorkspaceArchived,
 }
 
 impl InviteErrorKind {
@@ -272,6 +288,7 @@ impl InviteErrorKind {
             InviteErrorKind::ProofExpired => "proof-expired",
             InviteErrorKind::GithubUnreachable => "github-unreachable",
             InviteErrorKind::OwnerSelfJoin => "owner-self-join",
+            InviteErrorKind::WorkspaceArchived => "workspace-archived",
         }
     }
 
@@ -326,6 +343,10 @@ impl InviteErrorKind {
                 "invalid params: this GitHub account owns the host; open it from your \
                  paired daemons instead of joining as a guest"
             }
+            InviteErrorKind::WorkspaceArchived => {
+                "invalid params: this workspace is archived; unarchive it before inviting \
+                 or adding members"
+            }
         }
     }
 
@@ -344,7 +365,8 @@ impl InviteErrorKind {
             | InviteErrorKind::CredentialInvalid
             | InviteErrorKind::ProofInvalid
             | InviteErrorKind::ProofExpired
-            | InviteErrorKind::OwnerSelfJoin => -32602,
+            | InviteErrorKind::OwnerSelfJoin
+            | InviteErrorKind::WorkspaceArchived => -32602,
             InviteErrorKind::GithubIdentityRequired
             | InviteErrorKind::IdentityLocked
             | InviteErrorKind::FlowBusy
@@ -423,6 +445,7 @@ impl Error {
             Error::Internal(_)
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
+            | Error::TunnelDown
             | Error::WarmInFlight { .. }
             | Error::AdapterBusy { .. }
             | Error::RateLimited(_)

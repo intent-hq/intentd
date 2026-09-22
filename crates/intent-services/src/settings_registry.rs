@@ -129,6 +129,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "prMonitor.pollSeconds",
     "prMonitor.hourlyRequestBudget",
     "prMonitor.quotaSharePercent",
+    "prCache.maxAgeSeconds",
     "updates.checkOnIdle",
     "updates.idleCheckIntervalMinutes",
     "updates.idleGraceSeconds",

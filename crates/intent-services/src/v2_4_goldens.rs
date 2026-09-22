@@ -139,6 +139,8 @@ const COMPARED_SURFACES: &[&str] = &[
     "agent_naming_tool_reference",
     "naming_nudge",
     "role_reminder_prefix",
+    "setup_in_progress_notice",
+    "setup_failed_notice",
     "compose_turn_prompt",
     "stale_redrive_note",
     "dequeue_wait_note",
@@ -182,6 +184,7 @@ const COMPARED_SURFACES: &[&str] = &[
     "pr_monitor_cancelled_from_app_notice",
     "pr_monitor_cancelled_workspace_archived_notice",
     "pr_monitor_transferred_to_parent_notice",
+    "workspace_archived_watches_cancelled_notice",
     "delegation_first_message",
     "questions_dismissed_notice",
     "proposal_applied_notice",
@@ -292,9 +295,13 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(naming_nudge(None, Some("ws-ref")));
     same!(naming_nudge(None, None));
     same!(role_reminder_prefix("Implementor", "Stay in scope."));
+    same!(setup_in_progress_notice("Setup Script"));
+    same!(setup_failed_notice(Some(3), "Setup Script"));
+    same!(setup_failed_notice(None, "Setup Script"));
     let full = TurnEnvelopeParams {
         first_turn_prepend: Some("<system>prepend</system>"),
         snapshot_line: Some("current ws.agent.snapshot() => {}"),
+        setup_notice: Some("[System: setup]"),
         stdin_context: Some("ctx"),
         naming_nudge: Some("<system>name it</system>"),
         role_reminder: Some("[Role Reminder: x]"),
@@ -303,6 +310,7 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     let bare = TurnEnvelopeParams {
         first_turn_prepend: None,
         snapshot_line: None,
+        setup_notice: None,
         stdin_context: None,
         naming_nudge: None,
         role_reminder: None,
@@ -469,6 +477,16 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(pr_monitor_transferred_to_parent_notice(
         "o/r#42",
         "agent-parent"
+    ));
+
+    // --- Workspace archive notices ---
+    same!(workspace_archived_watches_cancelled_notice(
+        &[("pr-watch", "hook-1")],
+        &["o/r#42"]
+    ));
+    same!(workspace_archived_watches_cancelled_notice(
+        &[],
+        &["o/r#42"]
     ));
 
     // --- Other conversation-reaching strings ---

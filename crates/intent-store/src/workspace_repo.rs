@@ -124,18 +124,29 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace, preserving `branch`, `id` and the
-    /// guarded `last_activity`, or return `NotFound`. Returns the stored branch.
+    /// Update an existing workspace, preserving `branch`, `id`, the
+    /// guarded `last_activity` and archive lifecycle columns, or return
+    /// `NotFound`. Returns the stored branch.
     /// `activity` is derived and never persisted (§9.9).
     ///
     /// Explicit branch changes use [`Self::update_workspace_with_branch`].
-    /// `last_activity` is another exception to the full-row replace
+    /// `last_activity` is one exception to the full-row replace
     /// (monorepo#1585): it goes through the same monotonic guard as
     /// [`Self::bump_workspace_last_activity`] — the candidate writes only when
     /// it parses AND the stored value is NULL, unparseable, or strictly older.
     /// Otherwise the stored column holds, so a get → mutate → write flow whose
     /// read predated a concurrent bump can never silently revert it (the
     /// `attention` clobber shape fixed by #1481).
+    ///
+    /// The archive lifecycle is another exception: `archived` /
+    /// `archived_at` are NEVER written here, and `status` holds whenever the
+    /// row is archived or the candidate is `Archived`. Those columns move
+    /// only through the scoped, fenced flips
+    /// ([`Self::archive_workspace_detaching_guests`] /
+    /// [`Self::unarchive_workspace_if_archived`]), so a full-row write from a
+    /// snapshot read before a concurrent archive can never resurrect the
+    /// workspace behind the archive's guest sweep (the `workspace.archive`
+    /// fence relies on this — see `ArchiveFence` in `intent-services`).
     ///
     /// # Errors
     ///
@@ -154,12 +165,14 @@ impl Store {
         ws: &Workspace,
         branch: Option<&str>,
     ) -> Result<String> {
+        let status = enum_to_db(&ws.status)?;
         let row = sqlx::query(
-            "UPDATE workspace SET title=?, branch=COALESCE(?, branch), base_ref=?, base_commit_sha=?, status=?, \
+            "UPDATE workspace SET title=?, branch=COALESCE(?, branch), base_ref=?, base_commit_sha=?, \
+             status=CASE WHEN archived = 1 OR ? = ? THEN status ELSE ? END, \
              status_message=?, status_image_asset_id=?, attention=?, path=?, repository_path=?, \
              repository_owner=?, repository_name=?, worktree_path=?, scope=?, skip_worktree=?, \
              is_remote=?, default_model=?, pr_number=?, pr_url=?, pr_status=?, \
-             active_pull_request=?, pull_requests=?, context_links=?, archived=?, archived_at=?, \
+             active_pull_request=?, pull_requests=?, context_links=?, \
              tags=?, created_at=?, updated_at=?, \
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
@@ -170,7 +183,9 @@ impl Store {
         .bind(branch)
         .bind(&ws.base_ref)
         .bind(&ws.base_commit_sha)
-        .bind(enum_to_db(&ws.status)?)
+        .bind(&status)
+        .bind(enum_to_db(&WorkspaceStatus::Archived)?)
+        .bind(&status)
         .bind(&ws.status_message)
         .bind(&ws.status_image_asset_id)
         .bind(enum_to_db(&ws.attention)?)
@@ -189,8 +204,6 @@ impl Store {
         .bind(active_pr_to_db(ws)?)
         .bind(pull_requests_to_db(ws)?)
         .bind(context_links_to_db(ws)?)
-        .bind(i64::from(ws.archived))
-        .bind(&ws.archived_at)
         .bind(tags_to_db(&ws.tags)?)
         .bind(&ws.created_at)
         .bind(&ws.updated_at)
@@ -252,24 +265,175 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_pr_linkage(&self, ws: &Workspace) -> Result<()> {
-        let res = sqlx::query(
-            "UPDATE workspace SET pr_number=?, pr_url=?, pr_status=?, \
-             active_pull_request=?, pull_requests=?, updated_at=? WHERE id=?",
-        )
-        .bind(ws.pr_number.map(u64::cast_signed))
-        .bind(&ws.pr_url)
-        .bind(pr_status_to_db(ws)?)
-        .bind(active_pr_to_db(ws)?)
-        .bind(pull_requests_to_db(ws)?)
-        .bind(&ws.updated_at)
-        .bind(&ws.id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("update workspace pr linkage failed: {e}")))?;
+        let res = pr_linkage_update(ws)?
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("update workspace pr linkage failed: {e}")))?;
         if res.rows_affected() == 0 {
             return Err(Error::NotFound(format!("workspace {}", ws.id)));
         }
         Ok(())
+    }
+
+    /// [`Self::update_workspace_pr_linkage`] rebased on the row at write
+    /// time (intent-hq/intent#5654): inside ONE `BEGIN IMMEDIATE` write-pool
+    /// transaction, read the stored `pull_requests`, hand it to the caller's
+    /// synchronous `rebase` closure together with the entity about to be
+    /// written, then perform the same scoped PR-columns `UPDATE` from the
+    /// (possibly amended) entity. The REST-only PR refreshes build their
+    /// list from a row read that predates the forge round trip, so a
+    /// signal-bearing fold landing in between would otherwise be clobbered;
+    /// the closure (intent-services owns the merge rule) re-derives the
+    /// `is_in_merge_queue` carry against the current row instead. Same
+    /// envelope and layering as [`Self::update_workspace_token_usage`];
+    /// a malformed stored list decodes to `None` (the closure then keeps
+    /// the entity's list). `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_workspace_pr_linkage_rebased<F>(
+        &self,
+        ws: &mut Workspace,
+        rebase: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut Workspace, Option<Vec<PullRequestInfo>>),
+    {
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!("update workspace pr linkage acquire failed: {e}"))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("update workspace pr linkage begin failed: {e}"))
+            })?;
+
+        let body_result = async {
+            let row = sqlx::query("SELECT pull_requests FROM workspace WHERE id = ?")
+                .bind(&ws.id.0)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("update workspace pr linkage read failed: {e}"))
+                })?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace {}", ws.id)));
+            };
+            let persisted = row
+                .get::<Option<String>, _>("pull_requests")
+                .and_then(|s| serde_json::from_str::<Vec<PullRequestInfo>>(&s).ok());
+            rebase(ws, persisted);
+            let res = pr_linkage_update(ws)?
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("update workspace pr linkage failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {}", ws.id)));
+            }
+            Ok(())
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "update workspace pr linkage commit failed",
+        )
+        .await
+    }
+
+    /// Project onto a workspace's persisted PR snapshots atomically
+    /// (intent-hq/intent#5654, the cache-hit fold): inside ONE
+    /// `BEGIN IMMEDIATE` write-pool transaction, read the stored
+    /// `pull_requests` and `active_pull_request`, hand both to the caller's
+    /// synchronous `project` closure, and — when it returns `true` — write
+    /// back ONLY those two columns plus `updated_at`. The closure never
+    /// sees a pre-read entity, so a REST refresh that committed between
+    /// the caller's row lookup and this write is what gets projected onto,
+    /// never rolled back; the linked scalars (`pr_number`, `pr_url`,
+    /// `pr_status`) are untouched. Returns the written pair on a committed
+    /// write, `None` when the closure declined. `NotFound` when the
+    /// workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails or a stored snapshot is malformed.
+    pub async fn project_workspace_pr_snapshots<F>(
+        &self,
+        id: &WorkspaceId,
+        updated_at: &str,
+        project: F,
+    ) -> Result<Option<(Option<Vec<PullRequestInfo>>, Option<PullRequestInfo>)>>
+    where
+        F: FnOnce(&mut Option<Vec<PullRequestInfo>>, &mut Option<PullRequestInfo>) -> bool,
+    {
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "project workspace pr snapshots acquire failed: {e}"
+            ))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("project workspace pr snapshots begin failed: {e}"))
+            })?;
+
+        let body_result = async {
+            let row = sqlx::query(
+                "SELECT pull_requests, active_pull_request FROM workspace WHERE id = ?",
+            )
+            .bind(&id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("project workspace pr snapshots read failed: {e}"))
+            })?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            };
+            let mut pool = pull_requests_from_db(row.get::<Option<String>, _>("pull_requests"))?;
+            let mut active =
+                active_pr_from_db(row.get::<Option<String>, _>("active_pull_request"))?;
+            if !project(&mut pool, &mut active) {
+                return Ok(None);
+            }
+            let pool_json = pool
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| Error::Internal(format!("encode pull_requests failed: {e}")))?;
+            let active_json = active
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| Error::Internal(format!("encode active_pull_request failed: {e}")))?;
+            let res = sqlx::query(
+                "UPDATE workspace SET pull_requests=?, active_pull_request=?, updated_at=? \
+                 WHERE id=?",
+            )
+            .bind(pool_json)
+            .bind(active_json)
+            .bind(updated_at)
+            .bind(&id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("project workspace pr snapshots failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            }
+            Ok(Some((pool, active)))
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "project workspace pr snapshots commit failed",
+        )
+        .await
     }
 
     /// Recompute-and-store a workspace's `token_usage` snapshot atomically
@@ -856,6 +1020,25 @@ fn active_pr_from_db(s: Option<String>) -> Result<Option<PullRequestInfo>> {
             .map_err(|e| Error::Internal(format!("decode active_pull_request failed: {e}")))
     })
     .transpose()
+}
+
+/// The scoped PR-columns `UPDATE` (PR columns + `updated_at`, never a
+/// full-row replace) shared by [`Store::update_workspace_pr_linkage`] and
+/// [`Store::update_workspace_pr_linkage_rebased`].
+fn pr_linkage_update(
+    ws: &Workspace,
+) -> Result<sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'_>>> {
+    Ok(sqlx::query(
+        "UPDATE workspace SET pr_number=?, pr_url=?, pr_status=?, \
+         active_pull_request=?, pull_requests=?, updated_at=? WHERE id=?",
+    )
+    .bind(ws.pr_number.map(u64::cast_signed))
+    .bind(&ws.pr_url)
+    .bind(pr_status_to_db(ws)?)
+    .bind(active_pr_to_db(ws)?)
+    .bind(pull_requests_to_db(ws)?)
+    .bind(&ws.updated_at)
+    .bind(&ws.id.0))
 }
 
 /// Encode the optional `pull_requests` snapshot list to a JSON TEXT column.

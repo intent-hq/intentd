@@ -7883,6 +7883,7 @@ mod wsapi3_bindings_tests {
                     updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                     skipped: None,
                     reason: None,
+                    rev: Some(1),
                 })
             })
         }
@@ -9909,6 +9910,7 @@ mod wsapi4_bindings_tests {
                 match &scope {
                     AgentListRowScope::Delegated {
                         parent_agent_id: Some(p),
+                        ..
                     } => Some(p.as_str().to_string()),
                     _ => None,
                 },
@@ -9923,7 +9925,14 @@ mod wsapi4_bindings_tests {
                         AgentListRowScope::TopLevel => {
                             r.parent_agent_id.is_none() && !r.metadata.is_background
                         }
-                        AgentListRowScope::Delegated { parent_agent_id } => {
+                        AgentListRowScope::Delegated {
+                            parent_agent_id,
+                            orphaned_only,
+                        } => {
+                            assert!(
+                                !orphaned_only,
+                                "the MCP binding never issues the orphanedOnly read"
+                            );
                             r.parent_agent_id.is_some()
                                 && parent_agent_id
                                     .as_ref()

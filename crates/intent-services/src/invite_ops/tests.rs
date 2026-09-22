@@ -874,7 +874,7 @@ async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
 }
 
 /// Without a builder, or with one that cannot build a link right now
-/// (listener down, no dialable route), `create` and `list` still answer —
+/// (listener down, tunnel down), `create` and `list` still answer —
 /// their rows simply carry no `url`.
 #[tokio::test]
 async fn invite_list_omits_the_url_when_no_link_can_be_built() {
@@ -2400,6 +2400,52 @@ async fn guest_summary(f: &Fixture) -> (u64, u64) {
         v["guestCount"].as_u64().expect("guestCount"),
         v["guestLimit"].as_u64().expect("guestLimit"),
     )
+}
+
+/// `workspace.invite.create` on an archived workspace is
+/// `-32602 { code: "workspace-archived" }` with no row written: the check
+/// rides the insert's own write transaction, so a mint racing the archive
+/// either lands before the sweep (and is revoked by it) or is refused.
+/// Unarchiving admits the next mint.
+#[tokio::test]
+async fn invite_create_refuses_an_archived_workspace() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    f.store
+        .archive_workspace_detaching_guests(&f.ws, &now_iso())
+        .await
+        .expect("archive");
+
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_invite_create_op(&f.ws, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::WorkspaceArchived);
+    assert_eq!(r.unwrap_err().code(), -32602);
+    assert!(
+        f.store
+            .list_open_workspace_invites(&f.ws)
+            .await
+            .expect("list")
+            .is_empty(),
+        "a refused mint leaves no row"
+    );
+
+    assert!(f
+        .store
+        .unarchive_workspace_if_archived(&f.ws, &now_iso())
+        .await
+        .expect("unarchive"));
+    f.create_invite(None).await;
+    assert_eq!(
+        f.store
+            .list_open_workspace_invites(&f.ws)
+            .await
+            .expect("list")
+            .len(),
+        1
+    );
 }
 
 /// `workspace.invite.create` spends the cap on collaborators PLUS open

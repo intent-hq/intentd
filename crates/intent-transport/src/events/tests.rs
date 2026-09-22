@@ -181,9 +181,13 @@ mod collaborator_fan_out {
     use std::time::Duration;
 
     use futures::future::BoxFuture;
-    use intent_core::events::{CLIENT_CONNECTED, NOTE_UPDATED, TERMINAL_DATA, WORKSPACE_UPDATED};
+    use intent_core::events::{
+        AGENT_QUEUE_PROCESSING, AGENT_QUEUE_UPDATED, CLIENT_CONNECTED, NOTE_UPDATED, TERMINAL_DATA,
+        WORKSPACE_UPDATED,
+    };
     use intent_core::{
-        ActorType, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi, WorkspaceId,
+        ActorType, AgentId, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi,
+        WorkspaceId, FROM_PRINCIPAL_ID_KEY, QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY,
     };
     use intent_services::EventBus;
     use intent_store::{NewEvent, Store};
@@ -538,6 +542,200 @@ mod collaborator_fan_out {
         );
     }
 
+    /// A mixed-author `agent:queue:updated` payload as the publisher emits
+    /// it (`author` attached; a `null` author for an agent-sent entry whose
+    /// `messageMetadata` names the agent, no `author` key and no metadata
+    /// for a legacy human entry the workspace could not attribute).
+    fn mixed_queue(own: &PrincipalId) -> Value {
+        json!([
+            { "id": "m-own", "content": "mine", "position": 0,
+              "author": { "principalId": own.as_str(), "login": "me" } },
+            { "id": "m-other", "content": "theirs", "position": 1,
+              "author": { "principalId": "p-other", "login": "them" } },
+            { "id": "m-agent", "content": "agent", "position": 2, "author": null,
+              "messageMetadata": { "type": "agent_message", "fromAgentId": "agent-9" } },
+            { "id": "m-legacy", "content": "legacy", "position": 3 },
+        ])
+    }
+
+    /// Subscribe to `agent:queue:updated` under `caller`, publish one
+    /// mixed-author queue event on `ws-1`, and return the `data` of every
+    /// delivered frame.
+    async fn queue_frames_for(caller: Caller, own: &PrincipalId) -> Vec<Value> {
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            json!({"eventTypes":[AGENT_QUEUE_UPDATED]}),
+        )
+        .await;
+        h.bus
+            .publish(&event_with(
+                AGENT_QUEUE_UPDATED,
+                "ws-1",
+                json!({ "agentId": "agent-1", "queue": mixed_queue(own) }),
+            ))
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), h.rx.bulk.recv()).await
+        {
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["params"]["event"]["type"], AGENT_QUEUE_UPDATED);
+            out.push(v["params"]["event"]["data"].clone());
+        }
+        drop(h.subs);
+        out
+    }
+
+    fn queue_ids(data: &Value) -> Vec<&str> {
+        data["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect()
+    }
+
+    /// A guest's `agent:queue:updated` frame carries only its own entries
+    /// plus unattributed (agent-sent) ones; the other member's entry AND the
+    /// unattributable legacy human entry never reach its connection, and the
+    /// surviving entries keep their `position`.
+    #[tokio::test]
+    async fn guest_queue_updated_frames_are_projected_to_the_principal() {
+        let principal_id = PrincipalId::new();
+        let guest = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        let frames = queue_frames_for(guest, &principal_id).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["agentId"], "agent-1");
+        assert_eq!(queue_ids(&frames[0]), vec!["m-own", "m-agent"]);
+        assert_eq!(frames[0]["queue"][1]["position"], 2, "no renumbering");
+    }
+
+    /// The administrator's and non-wire callers' frames are the publisher's
+    /// payload, untouched.
+    #[tokio::test]
+    async fn administrator_and_internal_queue_updated_frames_are_unchanged() {
+        let principal_id = PrincipalId::new();
+        let owner = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: true,
+        };
+        let agent = Caller::Agent {
+            agent_id: AgentId::from("agent-9"),
+        };
+        for caller in [owner, agent, Caller::Daemon] {
+            let frames = queue_frames_for(caller.clone(), &principal_id).await;
+            assert_eq!(frames.len(), 1, "{caller:?}: {frames:?}");
+            assert_eq!(frames[0]["queue"], mixed_queue(&principal_id), "{caller:?}");
+        }
+    }
+
+    /// The `messageId`s [`processing_frames_for`] publishes, in the order it
+    /// returns them: stamped by the subscriber, stamped by another principal,
+    /// an unattributable human entry (the unknown-human marker), unstamped.
+    const PROCESSING_IDS: [&str; 4] = ["m-own", "m-other", "m-unknown", "m-agent"];
+
+    /// Subscribe to `agent:queue:processing` under `caller`, publish one
+    /// frame per attribution ([`PROCESSING_IDS`]), and return the delivered
+    /// `data` payloads in that order.
+    async fn processing_frames_for(caller: Caller, own: &PrincipalId) -> Vec<Value> {
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            json!({"eventTypes":[AGENT_QUEUE_PROCESSING]}),
+        )
+        .await;
+        for (id, metadata) in [
+            (
+                "m-own",
+                Some(json!({ FROM_PRINCIPAL_ID_KEY: own.as_str() })),
+            ),
+            ("m-other", Some(json!({ FROM_PRINCIPAL_ID_KEY: "p-other" }))),
+            (
+                "m-unknown",
+                Some(json!({ QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY: true })),
+            ),
+            ("m-agent", None),
+        ] {
+            let mut ev = event_with(
+                AGENT_QUEUE_PROCESSING,
+                "ws-1",
+                json!({ "agentId": "agent-1", "messageId": id, "content": format!("text of {id}"), "turnId": id }),
+            );
+            ev.metadata = metadata;
+            h.bus.publish(&ev).await.unwrap();
+        }
+        let mut out = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), h.rx.bulk.recv()).await
+        {
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["params"]["event"]["type"], AGENT_QUEUE_PROCESSING);
+            out.push(v["params"]["event"]["data"].clone());
+        }
+        drop(h.subs);
+        let rank = |d: &Value| {
+            PROCESSING_IDS
+                .iter()
+                .position(|id| Some(*id) == d["messageId"].as_str())
+                .unwrap_or(PROCESSING_IDS.len())
+        };
+        out.sort_by_key(rank);
+        out
+    }
+
+    /// A guest's `agent:queue:processing` frame for an entry it may not see
+    /// — another member's, or a human-origin entry the workspace could not
+    /// attribute — keeps the ids the FE keys the turn on but loses
+    /// `content`; its own and unattributed entries arrive whole.
+    #[tokio::test]
+    async fn guest_queue_processing_frames_drop_foreign_content() {
+        let principal_id = PrincipalId::new();
+        let guest = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: false,
+        };
+        let frames = processing_frames_for(guest, &principal_id).await;
+        assert_eq!(frames.len(), 4, "{frames:?}");
+        assert_eq!(frames[0]["content"], "text of m-own", "{frames:?}");
+        assert_eq!(
+            frames[1],
+            json!({ "agentId": "agent-1", "messageId": "m-other", "turnId": "m-other" }),
+            "foreign entry: ids only"
+        );
+        assert_eq!(
+            frames[2],
+            json!({ "agentId": "agent-1", "messageId": "m-unknown", "turnId": "m-unknown" }),
+            "unknown-human entry: ids only"
+        );
+        assert_eq!(frames[3]["content"], "text of m-agent", "{frames:?}");
+    }
+
+    /// The administrator's and non-wire callers' processing frames carry the
+    /// publisher's `content` whoever authored the entry.
+    #[tokio::test]
+    async fn administrator_and_internal_queue_processing_frames_are_unchanged() {
+        let principal_id = PrincipalId::new();
+        let owner = Caller::Wire {
+            principal_id: principal_id.clone(),
+            is_administrator: true,
+        };
+        let agent = Caller::Agent {
+            agent_id: AgentId::from("agent-9"),
+        };
+        for caller in [owner, agent, Caller::Daemon] {
+            let frames = processing_frames_for(caller.clone(), &principal_id).await;
+            assert_eq!(frames.len(), 4, "{caller:?}: {frames:?}");
+            for (frame, id) in frames.iter().zip(PROCESSING_IDS) {
+                assert_eq!(frame["content"], format!("text of {id}"), "{caller:?}");
+            }
+        }
+    }
+
     /// The reverse registry's transition → event-type mapping resolves to
     /// taxonomy members that the allowlist refuses, so the exhaustive golden
     /// in `intent-core/tests/events.rs` covers the transport's own emits.
@@ -563,6 +761,283 @@ mod collaborator_fan_out {
             let ty = transition.event_type();
             assert!(intent_core::events::is_known_event_type(ty), "{ty}");
             assert!(!intent_core::events::is_collaborator_event_type(ty), "{ty}");
+        }
+    }
+}
+
+/// The transport half of the per-user queue visibility contract
+/// (`intent_core::queue_visibility_contract`): every `Harness::Transport`
+/// cell — `agent:queue:updated` (`data.queue` projection) and
+/// `agent:queue:processing` (`data.content` redaction) — is driven through
+/// [`crate::events::project_queue_event_for_current_caller`] under the cell's
+/// caller bound the way the forwarder spawn binds a subscriber's
+/// (`with_request_context`), and its outcome checked against `expected`.
+///
+/// The `agent:queue:updated` fixture is the wire shape
+/// `principal_ops::attach_queue` serves — `author` on EVERY entry: a stamped
+/// entry's principal profile beside its `messageMetadata` stamp, an explicit
+/// `null` for the author-less unknown-human legacy row (no metadata) and for
+/// the agent-sent one (metadata naming the agent) — with one entry per tier
+/// in the same snapshot, so a cell only passes when the projection picks its
+/// entry apart from the neighbours. The `agent:queue:processing` fixture's
+/// `metadata` is what the publisher stamps via
+/// [`intent_core::queue_processing_event_metadata`] for the cell's
+/// attribution.
+///
+/// Mutation check: removing the `data.remove("content")` branch of the
+/// projection fails exactly the three guest `QueueProcessingEvent` cells
+/// that expect `ContentRedacted` (`AuthorGuest` × `UnknownHuman`,
+/// `ForeignGuest` × `PrincipalStamped` / `UnknownHuman`); dropping the
+/// `project_queue_for_caller` call fails the `Hidden` cells.
+mod queue_visibility_contract {
+    use std::collections::HashSet;
+
+    use intent_core::events::{AGENT_QUEUE_PROCESSING, AGENT_QUEUE_UPDATED};
+    use intent_core::queue_visibility_contract::{
+        AttributionTier, CallerClass, Cell, Expected, Harness, QueueSurface, AGENT_CALLER,
+        QUEUE_VISIBILITY_CONTRACT,
+    };
+    use intent_core::{
+        queue_entry_attribution, queue_processing_event_metadata, ActorType, Event, EventActor,
+        QueueAttribution, WorkspaceId, FROM_PRINCIPAL_ID_KEY,
+    };
+    use serde_json::{json, Value};
+
+    use crate::events::project_queue_event_for_current_caller;
+
+    const AGENT_ID: &str = "agent-1";
+    const MESSAGE_ID: &str = "q-drained";
+    const TURN_ID: &str = "turn-1";
+
+    fn event(event_type: &str, metadata: Option<Value>, data: Value) -> Event {
+        Event {
+            id: "evt-1".to_string(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            timestamp: "2026-09-22T00:00:00.000Z".to_string(),
+            event_type: event_type.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::System,
+                id: Some("system".to_string()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata,
+            data,
+        }
+    }
+
+    /// The `agent:queue:updated` entry id for `tier`.
+    fn entry_id(tier: AttributionTier) -> &'static str {
+        match tier {
+            AttributionTier::PrincipalStamped => "q-stamped",
+            AttributionTier::UnknownHuman => "q-unknown-human",
+            AttributionTier::Unattributed => "q-agent",
+        }
+    }
+
+    /// One wire-shaped queue entry per tier, as `attach_queue` renders it for
+    /// the attribution the cell's caller class sees on that tier.
+    fn queue_entry(tier: AttributionTier, caller: CallerClass) -> Value {
+        let id = entry_id(tier);
+        let position = AttributionTier::ALL
+            .iter()
+            .position(|t| *t == tier)
+            .expect("tier is in ALL");
+        match tier.attribution(caller) {
+            QueueAttribution::Principal(author) => json!({
+                "id": id, "content": "stamped text", "position": position,
+                "queuedAt": "2026-09-22T00:00:00.000Z",
+                "messageMetadata": { FROM_PRINCIPAL_ID_KEY: author.0 },
+                "author": { "principalId": author.0, "login": "author",
+                            "displayName": "Author", "avatarUrl": Value::Null },
+            }),
+            QueueAttribution::UnknownHuman => json!({
+                "id": id, "content": "legacy text", "position": position,
+                "queuedAt": "2026-09-22T00:00:00.000Z",
+                "author": Value::Null,
+            }),
+            QueueAttribution::Unattributed => json!({
+                "id": id, "content": "agent text", "position": position,
+                "queuedAt": "2026-09-22T00:00:00.000Z",
+                "messageMetadata": { "type": "agent_message", "fromAgentId": AGENT_CALLER },
+                "author": Value::Null,
+            }),
+        }
+    }
+
+    /// The whole snapshot the publisher emits for `caller`'s view of the
+    /// three tiers, in tier order.
+    fn queue_snapshot(caller: CallerClass) -> Vec<Value> {
+        AttributionTier::ALL
+            .iter()
+            .map(|tier| queue_entry(*tier, caller))
+            .collect()
+    }
+
+    fn processing_data() -> Value {
+        json!({
+            "agentId": AGENT_ID,
+            "messageId": MESSAGE_ID,
+            "turnId": TURN_ID,
+            "content": "drained text",
+        })
+    }
+
+    /// Run the projection on `event` under the cell's caller, the way the
+    /// forwarder spawn re-establishes a subscriber's context.
+    async fn project_under(cell: &Cell, mut event: Event) -> Event {
+        crate::context::with_request_context(true, cell.caller(), async move {
+            project_queue_event_for_current_caller(&mut event);
+            event
+        })
+        .await
+    }
+
+    /// Drive one cell; `Some(reason)` when the surface did not honour it.
+    async fn drive(cell: &Cell) -> Option<String> {
+        let name = cell.name();
+        match cell.surface {
+            QueueSurface::QueueUpdatedEvent => {
+                let snapshot = queue_snapshot(cell.caller);
+                let target = queue_entry(cell.tier, cell.caller);
+                let fixture_attribution = queue_entry_attribution(&target);
+                if fixture_attribution != cell.attribution() {
+                    return Some(format!(
+                        "{name}: fixture reads as {fixture_attribution:?}, cell expects {:?}",
+                        cell.attribution()
+                    ));
+                }
+                let projected = project_under(
+                    cell,
+                    event(
+                        AGENT_QUEUE_UPDATED,
+                        None,
+                        json!({ "agentId": AGENT_ID, "queue": snapshot }),
+                    ),
+                )
+                .await;
+                if projected.data["agentId"] != AGENT_ID {
+                    return Some(format!("{name}: agentId altered: {}", projected.data));
+                }
+                let Some(served) = projected.data["queue"].as_array() else {
+                    return Some(format!(
+                        "{name}: data.queue is not an array: {}",
+                        projected.data
+                    ));
+                };
+                let found = served.iter().find(|e| e["id"] == entry_id(cell.tier));
+                match (cell.expected, found) {
+                    (Expected::Visible, Some(entry)) if *entry == target => None,
+                    (Expected::Visible, Some(entry)) => Some(format!(
+                        "{name}: entry altered: {entry} (expected {target})"
+                    )),
+                    (Expected::Visible, None) => {
+                        Some(format!("{name}: entry dropped from {}", json!(served)))
+                    }
+                    (Expected::Hidden, None) => None,
+                    (Expected::Hidden, Some(entry)) => {
+                        Some(format!("{name}: hidden entry served: {entry}"))
+                    }
+                    (other, _) => Some(format!(
+                        "{name}: {other:?} is not a QueueUpdatedEvent outcome"
+                    )),
+                }
+            }
+            QueueSurface::QueueProcessingEvent => {
+                let metadata = queue_processing_event_metadata(&cell.attribution());
+                let projected = project_under(
+                    cell,
+                    event(AGENT_QUEUE_PROCESSING, metadata, processing_data()),
+                )
+                .await;
+                match cell.expected {
+                    Expected::Visible if projected.data == processing_data() => None,
+                    Expected::Visible => Some(format!("{name}: frame altered: {}", projected.data)),
+                    Expected::ContentRedacted => {
+                        let redacted = json!({
+                            "agentId": AGENT_ID,
+                            "messageId": MESSAGE_ID,
+                            "turnId": TURN_ID,
+                        });
+                        (projected.data != redacted).then(|| {
+                            format!(
+                                "{name}: expected redacted frame {redacted}, got {}",
+                                projected.data
+                            )
+                        })
+                    }
+                    other => Some(format!(
+                        "{name}: {other:?} is not a QueueProcessingEvent outcome"
+                    )),
+                }
+            }
+            QueueSurface::GetQueue
+            | QueueSurface::EditQueuedMessage
+            | QueueSurface::RemoveQueuedMessage
+            | QueueSurface::SendQueuedMessageNow
+            | QueueSurface::Diagnostics => {
+                unreachable!("{name}: services-owned surface reached the transport harness")
+            }
+        }
+    }
+
+    /// Every `Harness::Transport` cell holds under the projection, and both
+    /// transport surfaces were exercised.
+    #[tokio::test]
+    async fn every_transport_cell_holds() {
+        let cells: Vec<&Cell> = QUEUE_VISIBILITY_CONTRACT
+            .iter()
+            .filter(|c| c.surface.owner() == Harness::Transport)
+            .collect();
+        let transport_surfaces: HashSet<QueueSurface> = QueueSurface::all()
+            .iter()
+            .copied()
+            .filter(|s| s.owner() == Harness::Transport)
+            .collect();
+        assert_eq!(
+            cells.len(),
+            CallerClass::ALL.len() * AttributionTier::ALL.len() * transport_surfaces.len(),
+            "one cell per (caller class, tier, transport surface)"
+        );
+
+        let mut failures = Vec::new();
+        let mut exercised = HashSet::new();
+        for cell in &cells {
+            exercised.insert(cell.surface);
+            if let Some(reason) = drive(cell).await {
+                failures.push(reason);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} transport cell(s) violated the contract:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+        assert_eq!(
+            exercised, transport_surfaces,
+            "every transport-owned surface must be exercised"
+        );
+    }
+
+    /// The fixtures are not vacuous: each tier's entry resolves to the
+    /// attribution the table assigns it for every caller class, and a
+    /// stamped entry's stamp names the caller only for `AuthorGuest`.
+    #[test]
+    fn fixtures_resolve_to_the_table_attribution() {
+        for caller in CallerClass::ALL {
+            for tier in AttributionTier::ALL {
+                let entry = queue_entry(*tier, *caller);
+                assert_eq!(
+                    queue_entry_attribution(&entry),
+                    tier.attribution(*caller),
+                    "({}, {}): {entry}",
+                    caller.label(),
+                    tier.label()
+                );
+            }
         }
     }
 }

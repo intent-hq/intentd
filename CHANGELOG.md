@@ -2,6 +2,102 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.99] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- *(agent)* Reject self-targeted ws.agent.send / sendToTask ([#2084](https://github.com/intent-hq/intentd/pull/2084))
+
+### 🧪 Testing
+
+- *(intentd)* Mid tool-call interrupt settles and drains the queue ([#5669](https://github.com/intent-hq/intentd/pull/5669)) ([#2086](https://github.com/intent-hq/intentd/pull/2086))
+
+
+## [0.9.98] - 2026-09-22
+
+### 🚀 Features
+
+- *(github)* Expose flowId on connect and scope cancelAuth to it ([#2082](https://github.com/intent-hq/intentd/pull/2082))
+
+
+## [0.9.97] - 2026-09-22
+
+### 🚀 Features
+
+- *(workspace)* Surface setup-script state to agents ([#2075](https://github.com/intent-hq/intentd/pull/2075))
+
+### 🐛 Bug Fixes
+
+- *(pr)* Derive the pool-path pr_queued from a persisted isInMergeQueue ([#2079](https://github.com/intent-hq/intentd/pull/2079))
+
+### 🔧 Refactor
+
+- Share source-lint scaffolding across *_lint.rs tests ([#2078](https://github.com/intent-hq/intentd/pull/2078))
+
+### 🧪 Testing
+
+- *(agent)* Table-driven queue visibility contract and egress lint ([#2081](https://github.com/intent-hq/intentd/pull/2081))
+- *(e2e)* Make uds_integration and the WSS tool-result-ids suite hermetic to host GitHub identity ([#2077](https://github.com/intent-hq/intentd/pull/2077))
+- *(e2e)* Decouple spawn-retry WSS suite from host Node startup latency ([#2080](https://github.com/intent-hq/intentd/pull/2080))
+
+
+## [0.9.96] - 2026-09-22
+
+### 🚀 Features
+
+- *(agent)* Hide other members' queued chats from guests in shared workspaces ([#2068](https://github.com/intent-hq/intentd/pull/2068))
+- *(agents)* Serve delegatedCounts.orphaned and orphanedOnly on agent.list ([#2072](https://github.com/intent-hq/intentd/pull/2072))
+- Image dimension sidecar (protocol 10.7) ([#2069](https://github.com/intent-hq/intentd/pull/2069))
+
+### 🐛 Bug Fixes
+
+- *(github)* Surface Error::RateLimited with data.code "rate-limited" ([#2071](https://github.com/intent-hq/intentd/pull/2071))
+- *(archive)* One consolidated post-unarchive notice for cancelled hooks and PR monitors ([#2074](https://github.com/intent-hq/intentd/pull/2074))
+- *(pr-monitor)* Replace PrMonitorFetchCache with a shared PrCache every PR read can use ([#2064](https://github.com/intent-hq/intentd/pull/2064))
+
+### ⚡ Performance
+
+- *(agent)* Batch the agent.listActive session lookup into one statement ([#2070](https://github.com/intent-hq/intentd/pull/2070))
+
+### 🧪 Testing
+
+- *(core)* Source lint for re-implemented running-turn status rule ([#2073](https://github.com/intent-hq/intentd/pull/2073))
+
+
+## [0.9.95] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Register and defer the baseline under a GitHub rate limit ([#2060](https://github.com/intent-hq/intentd/pull/2060))
+
+### 🧪 Testing
+
+- *(intentd)* Stable conversation fingerprint for WSS E2E no-wake assertions ([#2062](https://github.com/intent-hq/intentd/pull/2062))
+
+
+## [0.9.94] - 2026-09-22
+
+### 🚀 Features
+
+- Require the tunnel for invite links and emit tc only ([#2057](https://github.com/intent-hq/intentd/pull/2057))
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Document and test the startup-failure completion path; gate the non-UTF-8 ref test to Linux ([#2054](https://github.com/intent-hq/intentd/pull/2054))
+- *(notes)* Note.update / note.updateMetadata return the committed revision ([#2056](https://github.com/intent-hq/intentd/pull/2056))
+
+### 🔧 Refactor
+
+- *(core)* Single source for the running-turn status rule ([#2058](https://github.com/intent-hq/intentd/pull/2058))
+
+
+## [0.9.93] - 2026-09-21
+
+### 🚀 Features
+
+- *(acp)* Spawn agent children at reduced scheduling priority ([#2049](https://github.com/intent-hq/intentd/pull/2049))
+
+
 ## [0.9.92] - 2026-09-21
 
 ### 🚀 Features
