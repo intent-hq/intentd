@@ -13588,6 +13588,7 @@ async fn queue_mutations_enforce_entry_ownership() {
     let owner_entry = queue_as(as_admin.clone(), "from owner").await;
     let guest_entry = queue_as(as_guest.clone(), "from guest").await;
     let guest_entry_2 = queue_as(as_guest.clone(), "from guest 2").await;
+    let guest_entry_3 = queue_as(as_guest.clone(), "from guest 3").await;
     let agent_entry = svc
         .agent_queue_message_op(
             id.clone(),
@@ -13691,16 +13692,8 @@ async fn queue_mutations_enforce_entry_ownership() {
         }
         let after = entry(mid).unwrap_or_else(|| panic!("entry {mid}"));
         assert_eq!(
-            after["content"], before["content"],
-            "{label}: a refused edit leaves the content untouched"
-        );
-        assert_eq!(
-            after["messageMetadata"], before["messageMetadata"],
-            "{label}: a refused edit does not restamp the metadata"
-        );
-        assert_eq!(
-            after["editing"], before["editing"],
-            "{label}: a refused edit leaves the editing flag untouched"
+            after, before,
+            "{label}: a refused edit leaves the whole entry untouched (content, metadata stamp, editing)"
         );
     }
     edit_as(as_guest.clone(), &guest_entry, "from guest (edited)")
@@ -13792,6 +13785,14 @@ async fn queue_mutations_enforce_entry_ownership() {
     assert!(entry(&guest_entry).is_none());
 
     // The administrator and an agent caller remove anything.
+    let removed = remove_as(as_admin.clone(), &guest_entry_3)
+        .await
+        .expect("administrator removes the guest's entry");
+    assert_eq!(removed["success"], true, "{removed}");
+    assert!(
+        entry(&guest_entry_3).is_none(),
+        "the administrator's remove of a foreign entry drops it"
+    );
     remove_as(as_admin, &legacy_entry)
         .await
         .expect("administrator removes the legacy entry");
