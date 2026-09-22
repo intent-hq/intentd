@@ -1750,6 +1750,9 @@ fn chunk_delta_forwards_media_by_encoding() {
         "docs/b.png": { "width": 8, "height": 9 },
     });
 
+    // §7.1: in BOTH encodings a chunk delta carries only the entries that
+    // chunk resolved — never the accumulated map — even though full mode
+    // carries the full accumulated text.
     let mut full = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = full
         .chunk_delta(&chunk_event("m", "m:0", "text", &json!("See ")))
@@ -1762,13 +1765,20 @@ fn chunk_delta_forwards_media_by_encoding() {
     let d = full
         .chunk_delta(&with_media("m", "m:0", " ![b](docs/b.png)", b.clone()))
         .unwrap();
-    assert_eq!(d["updated"][0]["block"]["media"], union, "full mode: union");
+    assert_eq!(
+        d["updated"][0]["block"]["text"],
+        json!("See ![a](a.png) ![b](docs/b.png)")
+    );
+    assert_eq!(
+        d["updated"][0]["block"]["media"], b,
+        "full mode: only the chunk's own entries travel: {d}"
+    );
     let d = full
         .chunk_delta(&chunk_event("m", "m:0", "text", &json!(" tail")))
         .unwrap();
-    assert_eq!(
-        d["updated"][0]["block"]["media"], union,
-        "full mode keeps carrying the union on media-less chunks: {d}"
+    assert!(
+        d["updated"][0]["block"].get("media").is_none(),
+        "full mode omits media on chunks that resolved nothing: {d}"
     );
     let d = full
         .chunk_delta(&chunk_event("m", "m:1", "text", &json!("next")))
@@ -1776,6 +1786,11 @@ fn chunk_delta_forwards_media_by_encoding() {
     assert!(
         d["added"][0]["block"].get("media").is_none(),
         "media is per block: {d}"
+    );
+    assert_eq!(
+        full.media_acc.get("m:0").map(|m| Value::Object(m.clone())),
+        Some(union.clone()),
+        "the accumulator still holds the union for the terminal frame"
     );
 
     let mut inc = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
@@ -1822,10 +1837,19 @@ fn chat_seed_from_snapshot_primes_media() {
     let d = s.chunk_delta(&ev).expect("post-seed chunk");
     assert_eq!(
         d["updated"][0]["block"]["media"],
-        json!({
+        json!({ "b.png": { "width": 3, "height": 4 } }),
+        "the delta carries only what this chunk resolved (§7.1); the seeded entry \
+         already reached the client in the snapshot"
+    );
+    assert_eq!(
+        s.media_acc
+            .get("msg-live:0")
+            .map(|m| Value::Object(m.clone())),
+        Some(json!({
             "a.png": { "width": 1, "height": 2 },
             "b.png": { "width": 3, "height": 4 },
-        })
+        })),
+        "the seeded entry primes the accumulator so the terminal frame carries the union"
     );
 }
 

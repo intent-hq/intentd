@@ -1373,10 +1373,10 @@ impl ChatDeltaState {
     ///
     /// A text chunk's `media` (§7.1 image dimension sidecar — the entries the
     /// chunk's completed Markdown image references resolved) is unioned into
-    /// [`Self::media_acc`]; the emitted block carries the UNION in full mode
-    /// (full block state) and only the chunk's own entries in incremental
-    /// mode (the client unions, like `textDelta` fragments). Absent when the
-    /// chunk resolved nothing (incremental) / nothing resolved yet (full).
+    /// [`Self::media_acc`] for the terminal frame; the emitted block carries
+    /// ONLY the chunk's own entries in BOTH encodings (§7.1's second
+    /// exception to full-current-block: the client unions them into the
+    /// in-flight block). Absent when the chunk resolved nothing.
     fn chunk_delta(&mut self, event: &Event) -> Option<Value> {
         let d = &event.data;
         let block_id = d.get("blockId").and_then(Value::as_str)?.to_string();
@@ -1397,12 +1397,7 @@ impl ChatDeltaState {
             }
             let mut block = match self.encoding {
                 DeltaEncoding::Full => {
-                    let mut block =
-                        json!({ "type": block_type, "id": block_id, "text": acc.clone() });
-                    if let Some(media) = self.media_acc.get(&block_id) {
-                        block["media"] = Value::Object(media.clone());
-                    }
-                    block
+                    json!({ "type": block_type, "id": block_id, "text": acc.clone() })
                 }
                 // Only the fragment travels — per-chunk wire cost is
                 // O(chunk), not O(accumulated text). The accumulation above
@@ -1412,7 +1407,7 @@ impl ChatDeltaState {
                     json!({ "type": block_type, "id": block_id, "textDelta": chunk })
                 }
             };
-            if let (DeltaEncoding::Incremental, Some(media)) = (self.encoding, chunk_media) {
+            if let Some(media) = chunk_media {
                 block["media"] = Value::Object(media.clone());
             }
             // A marker only — the full text lives once in `text_acc` and the

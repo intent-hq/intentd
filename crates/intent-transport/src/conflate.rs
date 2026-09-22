@@ -33,7 +33,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use intent_core::events::{AGENT_STREAM_ACTIVITY, CHAT_STREAM_DELTA, FILE_PREFIX, TERMINAL_DATA};
 use intent_core::Event;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
 use crate::events;
@@ -412,29 +412,48 @@ impl Conflate for ChatItem {
                 if let Some(Value::Object(media)) =
                     newer.entity.get("block").and_then(|b| b.get("media"))
                 {
-                    if let Some(Value::Object(block)) = self.entity.get_mut("block") {
-                        match block.get_mut("media") {
-                            Some(Value::Object(acc)) => {
-                                acc.extend(media.iter().map(|(k, v)| (k.clone(), v.clone())));
-                            }
-                            _ => {
-                                block.insert("media".to_string(), Value::Object(media.clone()));
-                            }
-                        }
-                    }
+                    union_media_into(&mut self.entity, media);
                 }
                 None
             }
             // Full-text encoding: latest entity wins (each carries the FULL
             // accumulated text, CS-0 D2); the bucket of the first pending
-            // delta is preserved.
+            // delta is preserved. `media` is the one per-chunk field in this
+            // encoding (§7.1: each delta carries only what it resolved), so
+            // the pending entries are carried over under the newer ones.
             (None, None) => {
+                let pending_media = match self.entity.get("block").and_then(|b| b.get("media")) {
+                    Some(Value::Object(media)) => Some(media.clone()),
+                    _ => None,
+                };
                 self.entity = newer.entity;
+                if let Some(media) = pending_media {
+                    union_media_into(&mut self.entity, &media);
+                }
                 None
             }
             // Mixed shapes never occur within one subscription (the encoding
             // is fixed at subscribe time); refuse defensively.
             _ => Some(newer),
+        }
+    }
+}
+
+/// Union `media` entries into a chat delta entity's `block.media`; entries
+/// already present in the block win on a key collision (the pending state is
+/// the newer one whenever the caller carries older entries over).
+fn union_media_into(entity: &mut Value, media: &Map<String, Value>) {
+    let Some(Value::Object(block)) = entity.get_mut("block") else {
+        return;
+    };
+    match block.get_mut("media") {
+        Some(Value::Object(acc)) => {
+            for (k, v) in media {
+                acc.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        _ => {
+            block.insert("media".to_string(), Value::Object(media.clone()));
         }
     }
 }

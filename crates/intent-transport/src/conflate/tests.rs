@@ -423,6 +423,46 @@ fn incremental_chat_blocks_union_media_across_merged_fragments() {
 }
 
 #[test]
+fn full_chat_blocks_union_media_across_replaced_entities() {
+    let with_media = |added: bool, text: &str, media: Value| {
+        let mut d = chunk_delta(added, "m-1:0", text);
+        let bucket = if added { "added" } else { "updated" };
+        d[bucket][0]["block"]["media"] = media;
+        d
+    };
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    for delta in [
+        chunk_delta(true, "m-1:0", "See "),
+        with_media(
+            false,
+            "See ![a](a.png)",
+            json!({ "a.png": { "width": 1, "height": 2 } }),
+        ),
+        chunk_delta(false, "m-1:0", "See ![a](a.png) and "),
+        with_media(
+            false,
+            "See ![a](a.png) and ![b](b.png)",
+            json!({ "b.png": { "width": 3, "height": 4 } }),
+        ),
+    ] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    let only = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    let block = &only["added"][0]["block"];
+    assert_eq!(block["text"], json!("See ![a](a.png) and ![b](b.png)"));
+    assert_eq!(
+        block["media"],
+        json!({
+            "a.png": { "width": 1, "height": 2 },
+            "b.png": { "width": 3, "height": 4 },
+        }),
+        "the latest full entity wins but the earlier chunks' media survives the replace"
+    );
+}
+
+#[test]
 fn oversized_incremental_merge_seals_the_entry_and_starts_a_new_one() {
     let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
     let big = "a".repeat(CHAT_TEXT_CONCAT_CAP_BYTES - 1);
