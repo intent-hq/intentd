@@ -30,7 +30,23 @@
 //!   string value starts with `agent:queue:` — so a new `agent:queue:*`
 //!   constant is watched the moment it is defined, with no edit here. The
 //!   publish is claimed when the const is named by a `Key::Event` row.
-//!   Comparisons (`event_type == …`) are not publishes.
+//! - **Queue-event reference**: any other identifier naming a watched const
+//!   in a file other than `events.rs` — a helper argument
+//!   (`publish_agent_event(…, AGENT_QUEUE_UPDATED, …)`), a local binding
+//!   (`let t = AGENT_QUEUE_UPDATED;`), a `json!` value
+//!   (`json!({ "event_type": AGENT_QUEUE_UPDATED })`), a comparison
+//!   (`event_type == AGENT_QUEUE_UPDATED`). Its definition (`const NAME`)
+//!   and `use` items are not references. Like a snapshot call it is claimed
+//!   by its enclosing fn being named by a `Key::Fn` row — never by a
+//!   `Key::Event` row, or a publish through a helper in a new fn would pass
+//!   on the strength of the existing const. A consumer that merely matches on
+//!   the type (a retention sweep, a subscription filter) opts out with a
+//!   reason; the transport projection that rewrites the event before it
+//!   leaves the daemon is registered as a fn.
+//! - **Queue-event literal**: a string literal starting with `agent:queue:`
+//!   in a file other than `events.rs` (a publish that bypasses the consts, or
+//!   a second const defined outside `events.rs` that the derived set would
+//!   not watch). Claimed like a reference, by its enclosing fn.
 //!
 //! Table coherence, checked every run: each `QueueSurface` variant (parsed
 //! from the enum body in the contract file) must be claimed by at least one
@@ -54,11 +70,19 @@
 //!
 //! Limits (textual heuristic, no parser): the enclosing fn is the last `fn`
 //! definition in the file before the hit, so a call inside a nested `fn` item
-//! is attributed to that item; a fn name registered once claims a same-named
-//! fn in any scanned file; a publish whose `event_type` value is bound to a
-//! local first (`let t = AGENT_QUEUE_UPDATED; … event_type: t`) is not seen;
-//! entries serialized via `QueuedMessage::to_value` outside `queue_snapshot`
-//! (the enqueue echoes) are out of scope.
+//! is attributed to that item, and a reference or literal at module level
+//! (a const table of event types) has no fn to claim it and must opt out; a
+//! fn name registered once claims a same-named fn in any scanned file; a
+//! `Key::Fn` row claims every reference inside that fn, so a registered fn may
+//! grow a second publish path unnoticed; a publish whose `event_type` value
+//! is bound to a local is seen only at the binding (`let t =
+//! AGENT_QUEUE_UPDATED`), not at `event_type: t`, and `json!({ "event_type":
+//! CONST })` is seen as a reference to `CONST`, not as a publish (the key is a
+//! literal, blanked before scanning) — both are caught, but as references
+//! claimed by fn rather than publishes claimed by const; a type built by
+//! concatenation (`format!("agent:{}", "queue:x")`) is not seen; entries
+//! serialized via `QueuedMessage::to_value` outside `queue_snapshot` (the
+//! enqueue echoes) are out of scope.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -104,7 +128,15 @@ const REGISTERED_EGRESS: &[(&str, Key)] = &[
     ("GetQueue", Key::Fn("agent_get_queue_op")),
     ("QueueUpdatedEvent", Key::Fn("publish_queue_event")),
     ("QueueUpdatedEvent", Key::Event("AGENT_QUEUE_UPDATED")),
+    (
+        "QueueUpdatedEvent",
+        Key::Fn("project_queue_event_for_current_caller"),
+    ),
     ("QueueProcessingEvent", Key::Event("AGENT_QUEUE_PROCESSING")),
+    (
+        "QueueProcessingEvent",
+        Key::Fn("project_queue_event_for_current_caller"),
+    ),
     ("EditQueuedMessage", Key::Fn("agent_edit_queued_message_op")),
     (
         "RemoveQueuedMessage",
@@ -124,6 +156,17 @@ enum Egress {
     },
     /// `event_type: <const>`.
     Publish { event: String },
+    /// Any other identifier naming a watched const, inside `enclosing`.
+    Reference {
+        event: String,
+        enclosing: Option<String>,
+    },
+    /// A string literal starting with [`QUEUE_EVENT_PREFIX`], inside
+    /// `enclosing`.
+    Literal {
+        value: String,
+        enclosing: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,10 +204,18 @@ struct LineComment {
 }
 
 /// Source text with comments/literals blanked, plus the line comments the
-/// lexer passed over on the way.
+/// lexer passed over on the way and every string literal whose value starts
+/// with [`QUEUE_EVENT_PREFIX`] (`(char index of the opening quote, value)`).
 struct Stripped {
     text: String,
     line_comments: Vec<LineComment>,
+    queue_literals: Vec<(usize, String)>,
+}
+
+/// Text with every `#[cfg(test)]` item blanked, plus the char ranges blanked.
+struct CfgTestBlanked {
+    text: String,
+    ranges: Vec<std::ops::Range<usize>>,
 }
 
 /// Marker state of one line comment's text: `Absent` unless it starts with
@@ -243,11 +294,18 @@ fn raw_string_hashes(chars: &[char], i: usize) -> Option<usize> {
 /// Replaces every comment, string literal, and char literal with spaces
 /// (newlines preserved) so neither their contents nor their delimiters take
 /// part in scanning. Every `//` line comment the lexer consumes is also
-/// reported, since only those may carry the opt-out marker.
+/// reported, since only those may carry the opt-out marker, as is every
+/// string literal whose value starts with [`QUEUE_EVENT_PREFIX`].
 fn blank_literals_and_comments(src: &str) -> Stripped {
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut line_comments = Vec::new();
+    let mut queue_literals = Vec::new();
+    let mut note_literal = |quote: usize, value: String| {
+        if value.starts_with(QUEUE_EVENT_PREFIX) {
+            queue_literals.push((quote, value));
+        }
+    };
     let mut line = 1usize;
     let mut line_start = 0usize;
     let mut counted_upto = 0usize;
@@ -297,6 +355,7 @@ fn blank_literals_and_comments(src: &str) -> Stripped {
                 out.push(' ');
                 i += 1;
             }
+            let quote = i;
             out.push(' ');
             i += 1;
             while i < chars.len() {
@@ -305,12 +364,15 @@ fn blank_literals_and_comments(src: &str) -> Stripped {
                 push_blank(&mut out, chars[i]);
                 i += 1;
                 if closing {
+                    note_literal(quote, chars[quote + 1..i - 1].iter().collect());
                     out.push_str(&" ".repeat(hashes));
                     i += hashes;
                     break;
                 }
             }
         } else if c == '"' {
+            let quote = i;
+            let mut value = String::new();
             out.push(' ');
             i += 1;
             while i < chars.len() {
@@ -320,10 +382,14 @@ fn blank_literals_and_comments(src: &str) -> Stripped {
                 if d == '\\' {
                     if let Some(&escaped) = chars.get(i) {
                         push_blank(&mut out, escaped);
+                        value.push(escaped);
                         i += 1;
                     }
                 } else if d == '"' {
+                    note_literal(quote, value);
                     break;
+                } else {
+                    value.push(d);
                 }
             }
         } else if c == '\'' {
@@ -360,6 +426,7 @@ fn blank_literals_and_comments(src: &str) -> Stripped {
     Stripped {
         text: out,
         line_comments,
+        queue_literals,
     }
 }
 
@@ -475,9 +542,10 @@ fn cfg_test_item_ends_at_semicolon(chars: &[char], mut j: usize) -> bool {
 /// Blanks every `#[cfg(test)]` attribute together with the whole item that
 /// follows it. Runs on already-blanked text, so the attribute cannot hide
 /// inside a string or comment.
-fn blank_cfg_test_items(text: &str) -> String {
+fn blank_cfg_test_items(text: &str) -> CfgTestBlanked {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
+    let mut ranges = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         if !starts_with_cfg_test(&chars, i) {
@@ -486,6 +554,7 @@ fn blank_cfg_test_items(text: &str) -> String {
             continue;
         }
         let ends_at_semicolon = cfg_test_item_ends_at_semicolon(&chars, i);
+        let start = i;
         let mut depth = 0usize;
         while i < chars.len() {
             let c = chars[i];
@@ -503,8 +572,9 @@ fn blank_cfg_test_items(text: &str) -> String {
                 _ => {}
             }
         }
+        ranges.push(start..i);
     }
-    out
+    CfgTestBlanked { text: out, ranges }
 }
 
 /// An ASCII identifier token (`[A-Za-z_][A-Za-z0-9_]*`) in blanked text, by
@@ -577,9 +647,10 @@ fn excerpt(chars: &[char], at: usize) -> String {
 }
 
 /// The identifier that `event_type:` at token `idx` is initialized with,
-/// after any `path::` prefix; `None` when the token is not such an
-/// initializer (a comparison, a type annotation reached through `&`, …).
-fn event_initializer(chars: &[char], toks: &[Token], idx: usize) -> Option<String> {
+/// after any `path::` prefix, and its token index; `None` when the token is
+/// not such an initializer (a comparison, a type annotation reached through
+/// `&`, …).
+fn event_initializer(chars: &[char], toks: &[Token], idx: usize) -> Option<(String, usize)> {
     let colon = skip_whitespace(chars, toks[idx].end);
     if chars.get(colon) != Some(&':') || chars.get(colon + 1) == Some(&':') {
         return None;
@@ -597,7 +668,7 @@ fn event_initializer(chars: &[char], toks: &[Token], idx: usize) -> Option<Strin
             k += 1;
             continue;
         }
-        return Some(tok.word.clone());
+        return Some((tok.word.clone(), k));
     }
 }
 
@@ -607,7 +678,7 @@ fn event_initializer(chars: &[char], toks: &[Token], idx: usize) -> Option<Strin
 /// `agent:queue:*` constant needs no edit here to be caught.
 fn queue_event_consts(events_src: &str) -> Result<BTreeSet<String>, String> {
     let raw: Vec<char> = events_src.chars().collect();
-    let blanked = blank_cfg_test_items(&blank_literals_and_comments(events_src).text);
+    let blanked = blank_cfg_test_items(&blank_literals_and_comments(events_src).text).text;
     let chars: Vec<char> = blanked.chars().collect();
     let toks = tokens(&chars);
     let mut out = BTreeSet::new();
@@ -653,14 +724,18 @@ fn queue_event_consts(events_src: &str) -> Result<BTreeSet<String>, String> {
 /// defines outside test code. `queue_events` is the watched const set from
 /// [`queue_event_consts`].
 fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
+    let raw: Vec<char> = src.chars().collect();
     let stripped = blank_literals_and_comments(src);
     let markers = markers_by_line(src, &stripped.line_comments);
-    let blanked = blank_cfg_test_items(&stripped.text);
-    let chars: Vec<char> = blanked.chars().collect();
+    let untested = blank_cfg_test_items(&stripped.text);
+    let chars: Vec<char> = untested.text.chars().collect();
     let toks = tokens(&chars);
     let mut scan = Scan::default();
     let mut enclosing: Option<String> = None;
+    let mut fn_defs: Vec<(usize, String)> = Vec::new();
     let mut raw_hits: Vec<(usize, Egress)> = Vec::new();
+    let mut use_until = 0usize;
+    let mut publish_tok: Option<usize> = None;
 
     for (idx, tok) in toks.iter().enumerate() {
         let prev = idx.checked_sub(1).map(|p| toks[p].word.as_str());
@@ -671,7 +746,14 @@ fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
                 if let Some(name) = next_tok.filter(|t| directly_next(t)) {
                     scan.fns.insert(name.word.clone());
                     enclosing = Some(name.word.clone());
+                    fn_defs.push((name.start, name.word.clone()));
                 }
+            }
+            "use" => {
+                use_until = chars[tok.end..]
+                    .iter()
+                    .position(|c| *c == ';')
+                    .map_or(chars.len(), |p| tok.end + p);
             }
             "const" | "static" => {
                 if let Some(name) = next_tok
@@ -694,15 +776,47 @@ fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
                 }
             }
             EVENT_FIELD => {
-                if let Some(event) =
-                    event_initializer(&chars, &toks, idx).filter(|e| queue_events.contains(e))
+                if let Some((event, k)) =
+                    event_initializer(&chars, &toks, idx).filter(|(e, _)| queue_events.contains(e))
                 {
+                    publish_tok = Some(k);
                     raw_hits.push((tok.start, Egress::Publish { event }));
+                }
+            }
+            w if queue_events.contains(w) => {
+                let definition = matches!(prev, Some("const" | "static"));
+                if !definition && tok.start >= use_until && publish_tok != Some(idx) {
+                    raw_hits.push((
+                        tok.start,
+                        Egress::Reference {
+                            event: w.to_string(),
+                            enclosing: enclosing.clone(),
+                        },
+                    ));
                 }
             }
             _ => {}
         }
     }
+
+    for (quote, value) in &stripped.queue_literals {
+        if untested.ranges.iter().any(|r| r.contains(quote)) {
+            continue;
+        }
+        let enclosing = fn_defs
+            .iter()
+            .rev()
+            .find(|(start, _)| start < quote)
+            .map(|(_, name)| name.clone());
+        raw_hits.push((
+            *quote,
+            Egress::Literal {
+                value: value.clone(),
+                enclosing,
+            },
+        ));
+    }
+    raw_hits.sort_by_key(|(at, _)| *at);
 
     for (at, egress) in raw_hits {
         let line = line_of_index(&chars, at);
@@ -712,10 +826,15 @@ fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
         if states.contains(&Some(Marker::WithReason)) {
             continue;
         }
+        let excerpt_chars = if matches!(egress, Egress::Literal { .. }) {
+            &raw
+        } else {
+            &chars
+        };
         scan.hits.push(Hit {
             line,
             egress,
-            excerpt: excerpt(&chars, at),
+            excerpt: excerpt(excerpt_chars, at),
             marker_malformed: states.contains(&Some(Marker::Malformed)),
         });
     }
@@ -824,26 +943,34 @@ fn check(
             Key::Fn(_) => None,
         })
         .collect();
+    let by_fn = |what: &str, enclosing: &Option<String>| {
+        (
+            enclosing
+                .as_deref()
+                .is_some_and(|f| claimed_fns.contains(f)),
+            match enclosing {
+                Some(f) => format!("{what} in fn `{f}`: `{f}` is named by no `Key::Fn` row"),
+                None => format!("{what} outside any fn: no `Key::Fn` row can claim it"),
+            },
+        )
+    };
     for (rel, scan) in &scans {
         for hit in &scan.hits {
             let (claimed, what) = match &hit.egress {
-                Egress::Call { callee, enclosing } => (
-                    enclosing
-                        .as_deref()
-                        .is_some_and(|f| claimed_fns.contains(f)),
-                    match enclosing {
-                        Some(f) => {
-                            format!("`{callee}(` in fn `{f}`: `{f}` is named by no `Key::Fn` row")
-                        }
-                        None => {
-                            format!("`{callee}(` outside any fn: no `Key::Fn` row can claim it")
-                        }
-                    },
-                ),
+                Egress::Call { callee, enclosing } => by_fn(&format!("`{callee}(`"), enclosing),
                 Egress::Publish { event } => (
                     claimed_events.contains(event.as_str()),
                     format!("publish of `{event}`: it is named by no `Key::Event` row"),
                 ),
+                Egress::Reference { .. } | Egress::Literal { .. } if *rel == EVENTS_FILE => {
+                    continue;
+                }
+                Egress::Reference { event, enclosing } => {
+                    by_fn(&format!("reference to `{event}`"), enclosing)
+                }
+                Egress::Literal { value, enclosing } => {
+                    by_fn(&format!("literal `\"{value}\"`"), enclosing)
+                }
             };
             if claimed {
                 continue;
@@ -941,13 +1068,16 @@ fn every_queue_entry_egress_is_registered_in_the_contract_table() {
     assert!(
         report.is_empty(),
         "queue-entry egress is out of step with the visibility contract table:\n\n{}\n\n\
-         Every production `queue_snapshot()` / `queue_snapshot_preview()` call and every \
+         Every production `queue_snapshot()` / `queue_snapshot_preview()` call, every \
          `event_type:` publish of an `{QUEUE_EVENT_PREFIX}*` const from {EVENTS_FILE} \
-         (currently: {}) must be claimed by a `{TABLE_CONST}` row in \
-         {SELF_FILE} naming the `{SURFACE_ENUM}` variant it serves ({CONTRACT_FILE}; add the \
-         variant and its contract cells when the surface is new, so the harnesses drive it). \
-         A call that lets no entry leave the daemon may opt out with \
-         `// queue-egress: allow — <reason>` on the line immediately above the call or its \
+         (currently: {}), and — outside {EVENTS_FILE} — every other reference to one of \
+         those consts or `\"{QUEUE_EVENT_PREFIX}*\"` literal must be claimed by a \
+         `{TABLE_CONST}` row in {SELF_FILE} naming the `{SURFACE_ENUM}` variant it serves \
+         ({CONTRACT_FILE}; add the variant and its contract cells when the surface is new, so \
+         the harnesses drive it): a publish by its `Key::Event` const, anything else by a \
+         `Key::Fn` row naming its enclosing fn. A call or reference that lets no entry leave \
+         the daemon (a consumer matching on the type) may opt out with \
+         `// queue-egress: allow — <reason>` on the line immediately above it or its \
          statement; the reason is required.",
         report.join("\n"),
         queue_events
@@ -1014,9 +1144,10 @@ impl QueueSurface {
 ";
 
 /// The production shapes: a handler serving the snapshot, the publish choke
-/// point, and the event const definition.
+/// point (the event const itself is defined in [`EVENTS_FIXTURE`]), and a
+/// `use` import that is not a reference.
 const PRODUCTION_FIXTURE: &str = r#"
-pub const AGENT_QUEUE_UPDATED: &str = "agent:queue:updated";
+use intent_core::events::{AGENT_QUEUE_UPDATED, AGENT_STARTED};
 
 impl Services {
     pub(crate) async fn agent_get_queue_op(&self, agent_id: AgentId) -> Result<Value> {
@@ -1088,14 +1219,14 @@ fn new_queue_event_const_is_watched_without_editing_the_lint() {
         "{watched:?}"
     );
 
-    let src = "pub const AGENT_QUEUE_VERIFIER_PROBE: &str = \"agent:queue:verifier-probe\";\nfn probe(&self) {\n    let event = NewEvent {\n        event_type: AGENT_QUEUE_VERIFIER_PROBE.to_string(),\n        data: json!({ \"queue\": self.queue_rows() }),\n    };\n}\n";
-    let files = [("crates/x/src/lib.rs", src)];
+    let src = "fn probe(&self) {\n    let event = NewEvent {\n        event_type: AGENT_QUEUE_VERIFIER_PROBE.to_string(),\n        data: json!({ \"queue\": self.queue_rows() }),\n    };\n}\n";
+    let files = [(EVENTS_FILE, events.as_str()), ("crates/x/src/lib.rs", src)];
 
     let unregistered = check(&labels(&[]), &[], &files, &watched);
     assert_eq!(unregistered.len(), 1, "{unregistered:#?}");
     assert!(
         unregistered[0]
-            .starts_with("crates/x/src/lib.rs:4: publish of `AGENT_QUEUE_VERIFIER_PROBE`"),
+            .starts_with("crates/x/src/lib.rs:3: publish of `AGENT_QUEUE_VERIFIER_PROBE`"),
         "{}",
         unregistered[0]
     );
@@ -1125,14 +1256,17 @@ fn registered_production_shapes_pass() {
     let failures = check(
         &fixture_labels,
         PRODUCTION_ROWS,
-        &[("crates/x/src/lib.rs", PRODUCTION_FIXTURE)],
+        &[
+            (EVENTS_FILE, EVENTS_FIXTURE),
+            ("crates/x/src/lib.rs", PRODUCTION_FIXTURE),
+        ],
         &queue_events(),
     );
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]
-fn definitions_and_persist_call_are_not_hits() {
+fn definitions_use_items_and_persist_call_are_not_hits() {
     let scan = scan_source(PRODUCTION_FIXTURE, &queue_events());
     let lines: Vec<usize> = scan.hits.iter().map(|h| h.line).collect();
     assert_eq!(
@@ -1149,9 +1283,36 @@ fn definitions_and_persist_call_are_not_hits() {
             line_of(PRODUCTION_FIXTURE, "event_type: AGENT_QUEUE_UPDATED"),
         ]
     );
+    assert_eq!(
+        scan.hits[2].egress,
+        Egress::Publish {
+            event: "AGENT_QUEUE_UPDATED".into()
+        },
+        "the initializer is a publish, not also a reference"
+    );
     assert!(scan.fns.contains("queue_snapshot"));
     assert!(scan.fns.contains("persist_queue_snapshot"));
-    assert!(scan.consts.contains("AGENT_QUEUE_UPDATED"));
+
+    let events = scan_source(EVENTS_FIXTURE, &queue_events());
+    assert!(events.consts.contains("AGENT_QUEUE_UPDATED"));
+    assert!(
+        events
+            .hits
+            .iter()
+            .all(|h| matches!(h.egress, Egress::Reference { .. } | Egress::Literal { .. })),
+        "{:#?}",
+        events.hits
+    );
+    assert!(
+        check(
+            &labels(&[]),
+            &[],
+            &[(EVENTS_FILE, EVENTS_FIXTURE)],
+            &queue_events()
+        )
+        .is_empty(),
+        "the definitions and `ALL_EVENT_TYPES` in the events file are not egress"
+    );
 }
 
 #[test]
@@ -1185,9 +1346,179 @@ fn unregistered_publish_fails_naming_the_const() {
 }
 
 #[test]
-fn event_type_comparisons_and_annotations_are_not_publishes() {
+fn event_type_comparisons_and_annotations_are_references_not_publishes() {
     let src = "fn f(e: &Event) -> bool {\n    let t: &str = AGENT_QUEUE_UPDATED;\n    e.event_type == AGENT_QUEUE_UPDATED\n        || matches!(e, Event { event_type, .. } if event_type == AGENT_QUEUE_PROCESSING)\n}\nstruct Row { event_type: String }\n";
-    assert!(hit_lines(src).is_empty());
+    let scan = scan_source(src, &queue_events());
+    let lines: Vec<usize> = scan.hits.iter().map(|h| h.line).collect();
+    assert_eq!(lines, vec![2, 3, 4], "{:#?}", scan.hits);
+    assert!(
+        scan.hits.iter().all(|h| matches!(
+            &h.egress,
+            Egress::Reference { enclosing: Some(f), .. } if f == "f"
+        )),
+        "{:#?}",
+        scan.hits
+    );
+
+    let files = [("crates/x/src/lib.rs", src)];
+    let unregistered = check(&labels(&[]), &[], &files, &queue_events());
+    assert_eq!(unregistered.len(), 3, "{unregistered:#?}");
+    assert!(
+        unregistered[1].starts_with(
+            "crates/x/src/lib.rs:3: reference to `AGENT_QUEUE_UPDATED` in fn `f`: `f` is named by no `Key::Fn` row"
+        ),
+        "{}",
+        unregistered[1]
+    );
+    let registered = check(
+        &labels(&["QueueUpdatedEvent"]),
+        &[("QueueUpdatedEvent", Key::Fn("f"))],
+        &files,
+        &queue_events(),
+    );
+    assert!(registered.is_empty(), "{registered:#?}");
+}
+
+#[test]
+fn helper_arg_and_local_binding_publishes_are_references_claimed_by_fn_only() {
+    let helper_arg = "fn notify(&self, ws: &WorkspaceId) {\n    publish_agent_event(self, ws, AGENT_QUEUE_PROCESSING, json!({}));\n}\n";
+    let local_binding = "fn notify(&self, ws: &WorkspaceId) {\n    let t = AGENT_QUEUE_PROCESSING;\n    let event = NewEvent { event_type: t.to_string(), data: json!({}) };\n}\n";
+    for src in [helper_arg, local_binding] {
+        let files = [("crates/x/src/lib.rs", src)];
+        let unregistered = check(&labels(&[]), &[], &files, &queue_events());
+        assert_eq!(unregistered.len(), 1, "{src}\n{unregistered:#?}");
+        assert!(
+            unregistered[0].starts_with(
+                "crates/x/src/lib.rs:2: reference to `AGENT_QUEUE_PROCESSING` in fn `notify`"
+            ),
+            "{}",
+            unregistered[0]
+        );
+
+        let const_only = check(
+            &labels(&["QueueProcessingEvent"]),
+            &[("QueueProcessingEvent", Key::Event("AGENT_QUEUE_PROCESSING"))],
+            &[(EVENTS_FILE, EVENTS_FIXTURE), files[0]],
+            &queue_events(),
+        );
+        assert_eq!(
+            const_only.len(),
+            1,
+            "a `Key::Event` row must not claim a reference\n{const_only:#?}"
+        );
+
+        let registered = check(
+            &labels(&["QueueProcessingEvent"]),
+            &[("QueueProcessingEvent", Key::Fn("notify"))],
+            &files,
+            &queue_events(),
+        );
+        assert!(registered.is_empty(), "{src}\n{registered:#?}");
+    }
+}
+
+#[test]
+fn json_key_publish_is_seen_as_a_reference_or_a_literal() {
+    let by_const = "fn emit(&self) -> Value {\n    json!({ \"event_type\": AGENT_QUEUE_UPDATED, \"data\": { \"queue\": self.queue_rows() } })\n}\n";
+    let by_literal = "fn emit(&self) -> Value {\n    json!({ \"event_type\": \"agent:queue:updated\", \"data\": {} })\n}\n";
+    let files = [
+        ("crates/x/src/a.rs", by_const),
+        ("crates/x/src/b.rs", by_literal),
+    ];
+    let unregistered = check(&labels(&[]), &[], &files, &queue_events());
+    assert_eq!(unregistered.len(), 2, "{unregistered:#?}");
+    assert!(
+        unregistered[0]
+            .starts_with("crates/x/src/a.rs:2: reference to `AGENT_QUEUE_UPDATED` in fn `emit`"),
+        "{}",
+        unregistered[0]
+    );
+    assert!(
+        unregistered[1].starts_with(
+            "crates/x/src/b.rs:2: literal `\"agent:queue:updated\"` in fn `emit`: `emit` is named by no `Key::Fn` row"
+        ),
+        "{}",
+        unregistered[1]
+    );
+    assert!(
+        unregistered[1].contains("json!({ \"event_type\": \"agent:queue:updated\""),
+        "the literal excerpt comes from the raw line: {}",
+        unregistered[1]
+    );
+    let registered = check(
+        &labels(&["QueueUpdatedEvent"]),
+        &[("QueueUpdatedEvent", Key::Fn("emit"))],
+        &files,
+        &queue_events(),
+    );
+    assert!(registered.is_empty(), "{registered:#?}");
+}
+
+#[test]
+fn queue_literals_outside_the_events_file_are_hits_unless_test_or_comment() {
+    let src = "// \"agent:queue:in-a-comment\"\n/// doc: `agent:queue:*`\npub const MY_QUEUE_EVENT: &str = \"agent:queue:shadow\";\nfn raw() -> &'static str {\n    r#\"agent:queue:raw\"#\n}\n#[cfg(test)]\nmod tests {\n    const T: &str = \"agent:queue:test-only\";\n}\n";
+    let scan = scan_source(src, &queue_events());
+    assert_eq!(
+        scan.hits
+            .iter()
+            .map(|h| (h.line, h.egress.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                3,
+                Egress::Literal {
+                    value: "agent:queue:shadow".into(),
+                    enclosing: None,
+                }
+            ),
+            (
+                5,
+                Egress::Literal {
+                    value: "agent:queue:raw".into(),
+                    enclosing: Some("raw".into()),
+                }
+            ),
+        ],
+        "{:#?}",
+        scan.hits
+    );
+    let failures = check(
+        &labels(&[]),
+        &[],
+        &[("crates/x/src/lib.rs", src)],
+        &queue_events(),
+    );
+    assert_eq!(failures.len(), 2, "{failures:#?}");
+    assert!(
+        failures[0].starts_with(
+            "crates/x/src/lib.rs:3: literal `\"agent:queue:shadow\"` outside any fn: no `Key::Fn` row can claim it"
+        ),
+        "{}",
+        failures[0]
+    );
+}
+
+#[test]
+fn module_level_reference_needs_an_opt_out() {
+    let table = "pub const SWEPT: &[&str] = &[AGENT_STARTED, AGENT_QUEUE_UPDATED];\n";
+    let failures = check(
+        &labels(&[]),
+        &[],
+        &[("crates/x/src/lib.rs", table)],
+        &queue_events(),
+    );
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].starts_with(
+            "crates/x/src/lib.rs:1: reference to `AGENT_QUEUE_UPDATED` outside any fn: no `Key::Fn` row can claim it"
+        ),
+        "{}",
+        failures[0]
+    );
+    let opted_out = "// queue-egress: allow — retention sweep, deletes by type\npub const SWEPT: &[&str] = &[AGENT_STARTED, AGENT_QUEUE_UPDATED];\n";
+    assert!(hit_lines(opted_out).is_empty());
+    let comparison = "fn keep(e: &Event) -> bool {\n    // queue-egress: allow — subscription filter matches on the type only\n    e.event_type != AGENT_QUEUE_PROCESSING\n}\n";
+    assert!(hit_lines(comparison).is_empty());
 }
 
 #[test]
