@@ -4251,8 +4251,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.connect`: start (or return the still-pending) GitHub OAuth
-    /// device flow → `{ ok, userCode, verificationUri, expiresIn, interval }`.
-    /// The daemon polls GitHub in the background and emits
+    /// device flow → `{ ok, flowId, userCode, verificationUri, expiresIn,
+    /// interval }`. `flowId` is the opaque handle `github.cancelAuth` scopes
+    /// to. The daemon polls GitHub in the background and emits
     /// `github:auth-changed` on terminal transitions; the token is persisted
     /// server-side and never crosses the wire.
     fn github_connect(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -4265,7 +4266,15 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.cancelAuth`: abort the in-flight device flow, if any →
     /// `{ ok, cancelled }` (`cancelled: false` when nothing was pending).
-    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+    /// With `flow_id` (the `flowId` a `github.connect` returned) only that
+    /// flow is cancelled: any other pending flow is left untouched and the
+    /// call answers `cancelled: false`. `None` cancels whichever flow is
+    /// pending.
+    fn github_cancel_auth(
+        &self,
+        flow_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = flow_id;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_cancel_auth not implemented".to_string(),

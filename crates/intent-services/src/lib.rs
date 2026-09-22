@@ -30741,7 +30741,10 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn github_cancel_auth(
+        &self,
+        flow_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let state = self.github_auth_flow.clone();
         Box::pin(async move {
             Self::require_administrator("github.cancelAuth")?;
@@ -30752,8 +30755,14 @@ impl WorkspaceApi for Services {
             // slot orphans the poll task, which exits cooperatively at its
             // next tick (and reconciles a raced authorize by deleting the
             // just-persisted token — see `github_auth_ops::FlowSlot`).
+            // A `flowId` scopes the cancel to the flow that connect handed
+            // out: a stale id (a newer connect replaced that flow) is a
+            // no-op, so one caller can never cancel another caller's flow.
             let cancelled = match slot.as_ref() {
-                Some(s) if s.phase == github_auth_ops::FlowPhase::Pending => {
+                Some(s)
+                    if s.phase == github_auth_ops::FlowPhase::Pending
+                        && flow_id.as_deref().is_none_or(|id| id == s.wire_id()) =>
+                {
                     *slot = None;
                     true
                 }

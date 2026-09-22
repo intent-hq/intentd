@@ -3063,7 +3063,13 @@ async fn dispatch(
             Ok(r)
         }
         "github.cancelAuth" => {
-            let r = api.github_cancel_auth().await.map_err(domain_to_rpc)?;
+            // Strict: a non-string `flowId` must not silently widen the
+            // cancel to "whichever flow is pending".
+            let flow_id = opt_str_strict(params, "flowId")?;
+            let r = api
+                .github_cancel_auth(flow_id)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "github.revoke" => {
