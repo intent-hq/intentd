@@ -511,8 +511,11 @@
 //! `workspace.invite.list` rows (and the `invite` of `workspace.invite.create`)
 //! carry the additive `url` — the open invite's `intent://invite?…` link
 //! rebuilt from the stored secret — omitted when the row predates the
-//! stored secret or no link can be built right now (listener down, no
-//! dialable route); the secret itself never appears as a field. Also within
+//! stored secret or no link can be built right now (listener down, tunnel
+//! down — invite links are tunnel-only: `workspace.invite.create` refuses
+//! with `error.data.code` `tunnel-down` without a tunnel address, and the
+//! link carries `tc` but no `host`); the secret itself never appears as a
+//! field. Also within
 //! 10.3, guest caps: `workspace.invite.create` refuses with
 //! `error.data.code` `guest-limit` once a workspace's collaborators plus
 //! open invites reach `sharing.maxGuestsPerWorkspace`, the join refuses with

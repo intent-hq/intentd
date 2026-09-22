@@ -1875,6 +1875,11 @@ pub struct NoteUpdateMetadataResult {
     pub skipped: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The note's `rev` after the write: the base a follow-up conditional
+    /// write should send as `expectedVersion`. Absent on the `skipped` arm,
+    /// which writes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<i64>,
 }
 
 /// Result of `note.delete`.
@@ -2644,6 +2649,44 @@ pub enum AgentStatus {
     Completed,
     #[serde(rename = "Processing")]
     Processing,
+}
+
+impl AgentStatus {
+    /// Every variant in declaration order — the enumeration behind the
+    /// running-turn golden and the store's SQL status lists. Completeness is
+    /// pinned against serde's derived variant inventory
+    /// (`agent_status_all_matches_serde_variant_inventory`), so a variant
+    /// added to the enum but not here fails the suite.
+    pub const ALL: [Self; 9] = [
+        Self::Pending,
+        Self::Active,
+        Self::RuntimeIdle,
+        Self::Error,
+        Self::Deleted,
+        Self::Idle,
+        Self::Waiting,
+        Self::Completed,
+        Self::Processing,
+    ];
+
+    /// Whether a session persisted in this status is running a turn: `pending`,
+    /// `active`, or the legacy capitalized `Processing`. The single definition
+    /// of the rule behind the §5.5 retire guard, the §5.19 agent-lock liveness
+    /// test, the transfer export "agents-running" warning, and the
+    /// `delegatedCounts.running` SQL aggregate on `agent.list`. Exhaustive so a
+    /// new variant fails to compile until it is classified.
+    #[must_use]
+    pub const fn is_running_turn(self) -> bool {
+        match self {
+            Self::Pending | Self::Active | Self::Processing => true,
+            Self::RuntimeIdle
+            | Self::Error
+            | Self::Deleted
+            | Self::Idle
+            | Self::Waiting
+            | Self::Completed => false,
+        }
+    }
 }
 
 /// Per-session credit/message/tool stats (§9.1 / §19.2). A derived snapshot
@@ -6830,6 +6873,80 @@ mod tests {
             assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
             assert_eq!(serde_json::from_str::<AgentStatus>(wire).unwrap(), variant);
         }
+    }
+
+    /// Golden for the running-turn rule (PROTOCOL §5.5 `agent.list`
+    /// `delegatedCounts` "running rule"): exactly `pending`, `active` and the
+    /// legacy capitalized `Processing` count as running, keyed by the persisted
+    /// wire name so the docs prose has one authoritative counterpart.
+    /// `AgentStatus::ALL` must enumerate every variant exactly once.
+    #[test]
+    fn agent_status_running_turn_golden() {
+        let expected = [
+            ("pending", true),
+            ("active", true),
+            ("idle", false),
+            ("error", false),
+            ("deleted", false),
+            ("Idle", false),
+            ("Waiting", false),
+            ("Completed", false),
+            ("Processing", true),
+        ];
+        assert_eq!(AgentStatus::ALL.len(), expected.len());
+        for (status, (wire, running)) in AgentStatus::ALL.into_iter().zip(expected) {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{wire}\""),
+                "ALL order must match the golden"
+            );
+            assert_eq!(
+                status.is_running_turn(),
+                running,
+                "running-turn classification of {wire}"
+            );
+        }
+        assert_eq!(
+            AgentStatus::ALL
+                .iter()
+                .filter(|s| s.is_running_turn())
+                .map(|s| serde_json::to_value(s).unwrap())
+                .collect::<Vec<_>>(),
+            vec![json!("pending"), json!("active"), json!("Processing")]
+        );
+    }
+
+    /// `AgentStatus::ALL` is complete: serde's derive generates the variant
+    /// inventory from the enum itself and lists it in the unknown-variant
+    /// error ("expected one of `a`, `b`, …"), so a variant added to the
+    /// enum — and classified in the exhaustive `is_running_turn` match — but
+    /// left out of `ALL` fails here instead of silently dropping out of the
+    /// store's generated SQL status list.
+    #[test]
+    fn agent_status_all_matches_serde_variant_inventory() {
+        let err = serde_json::from_str::<AgentStatus>("\"__not_a_status__\"")
+            .unwrap_err()
+            .to_string();
+        let (_, listed) = err
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("serde unknown-variant error shape changed: {err}"));
+        let mut inventory: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+        inventory.sort_unstable();
+        let mut all: Vec<String> = AgentStatus::ALL
+            .iter()
+            .map(|s| {
+                serde_json::to_value(s)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        all.sort_unstable();
+        assert_eq!(
+            all, inventory,
+            "AgentStatus::ALL must list every variant exactly once"
+        );
     }
 
     /// `WorkspaceStatus` serializes to the `PascalCase` TS `WorkspaceStatus` string

@@ -89,6 +89,17 @@ pub enum Error {
     )]
     ListenerDown,
 
+    /// The tunnel is not running, so `workspace.invite.create` has no `tc`
+    /// address to embed in the (tunnel-only) invite link. Surfaces as
+    /// `-32603` with machine-readable `error.data = { code: "tunnel-down" }`
+    /// so clients route it without matching on prose. Distinct from
+    /// [`Error::ListenerDown`]: the WSS listener IS up here.
+    #[error(
+        "tunnel is not running — invite links are tunnel-only; enable the tunnel \
+         (server.tunnel.enabled) and wait for it to come up before inviting"
+    )]
+    TunnelDown,
+
     /// A `repo.warmCache` request was rejected because an opportunistic warm
     /// is already in flight (global single-flight — at most one warm
     /// daemon-wide). Surfaces as `-32603` with machine-readable
@@ -441,6 +452,7 @@ impl Error {
             Error::Internal(_)
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
+            | Error::TunnelDown
             | Error::WarmInFlight { .. }
             | Error::AdapterBusy { .. }
             | Error::DeviceGrantUnsupported { .. }

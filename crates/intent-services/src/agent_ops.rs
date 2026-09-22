@@ -88,16 +88,6 @@ enum AgentListScope {
     Scoped(AgentListRowScope),
 }
 
-/// "Running a turn" statuses for the retire guard (§5.5, confirmed
-/// decision): a descendant in `pending`/`active`/`Processing` blocks
-/// `ws.agent.retire`; idle/waiting/settled children are cascade-retired.
-fn is_running_turn(status: AgentStatus) -> bool {
-    matches!(
-        status,
-        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing
-    )
-}
-
 /// Terminal statuses the retire cascade never touches (the same set
 /// `count_child_agents` treats as terminal). Also the "owner can no longer
 /// receive wakes" test behind PR-monitor adoption (intent-hq/intent#5079).
@@ -2749,7 +2739,7 @@ impl Services {
 
     /// `delegatedCounts` (PROTOCOL §5.5): per-parent counts of the
     /// workspace's non-retired delegated sessions (total and running, the
-    /// [`is_running_turn`] rule on the persisted status) — one grouped SQL
+    /// [`AgentStatus::is_running_turn`] rule on the persisted status) — one grouped SQL
     /// aggregate attached to every `agent.list` response variant by the
     /// router, next to `scopeCounts`.
     pub(crate) async fn agent_delegated_counts_op(
@@ -5034,7 +5024,7 @@ impl Services {
         let descendants = self.collect_retire_descendants(&agent_id).await?;
         let active: Vec<String> = descendants
             .iter()
-            .filter(|c| c.retired_at.is_none() && is_running_turn(c.status))
+            .filter(|c| c.retired_at.is_none() && c.status.is_running_turn())
             .map(|c| format!("{} ({})", c.name, c.id.0))
             .collect();
         if !active.is_empty() {
@@ -5081,7 +5071,7 @@ impl Services {
             };
             if fresh.retired_at.is_some()
                 || is_terminal_status(fresh.status)
-                || is_running_turn(fresh.status)
+                || fresh.status.is_running_turn()
             {
                 continue;
             }

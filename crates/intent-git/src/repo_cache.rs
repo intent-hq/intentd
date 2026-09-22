@@ -4053,7 +4053,14 @@ mod tests {
     /// name is not valid UTF-8 (`git check-ref-format` accepts such names, and
     /// `git_remote_delete` removes them): it matches and deletes on the raw
     /// name bytes, still leaving an unrelated ref intact.
-    #[cfg(unix)]
+    ///
+    /// Linux-only (intent-hq/intent#5585): the fixture writes the ref as a
+    /// loose file whose name carries the raw `\xff` byte, and macOS's APFS
+    /// enforces UTF-8 file names, so `git update-ref` fails there with
+    /// `Illegal byte sequence` before any production code runs. The raw-name
+    /// behaviour under test is filesystem-independent; Linux keeps the
+    /// coverage.
+    #[cfg(target_os = "linux")]
     #[test]
     fn remove_remote_local_only_deletes_non_utf8_ref_names() {
         use std::ffi::OsStr;

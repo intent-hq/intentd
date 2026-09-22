@@ -79,9 +79,9 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-invite-")
 }
 
-/// A fake `tailcat` sidecar so the daemon reports a tunnel address: the
-/// loopback-default bind advertises no LAN host, and an invite link needs at
-/// least one dialable route (same seam as the pairing e2e).
+/// A fake `tailcat` sidecar so the daemon reports a tunnel address: an
+/// invite link is tunnel-only, so `workspace.invite.create` is refused
+/// (`tunnel-down`) until the daemon has one (same seam as the pairing e2e).
 fn write_fake_tailcat(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("fake-tailcat.sh");
@@ -710,8 +710,9 @@ async fn invite_link_identity_join_and_removal_over_wss() {
 
     // 1. workspace.invite.create pinned to the guest's login: the pin is
     //    resolved to the account id through the (mock) API host, the link
-    //    carries the pair envelope minus the bearer token plus inviteId /
-    //    secret, and the secret appears here exactly once.
+    //    is tunnel-only (port / fingerprint / tc, no `host` parameter, never
+    //    the bearer token) plus inviteId / secret, and the secret appears
+    //    here exactly once.
     let v = wss_rpc(
         &mut owner,
         10,
@@ -735,10 +736,14 @@ async fn invite_link_identity_join_and_removal_over_wss() {
     let tc = r["tcAddress"].as_str().expect("tcAddress");
     assert!(tc.starts_with("tc-"), "fake sidecar address: {tc}");
     let url = r["url"].as_str().expect("url");
-    assert!(url.starts_with("intent://invite?v=1&host=&port="), "{url}");
+    assert!(
+        url.starts_with(&format!("intent://invite?v=1&port={port}&fp=")),
+        "{url}"
+    );
+    assert!(!url.contains("host="), "tunnel-only link: {url}");
     assert!(url.contains(&format!("&inviteId={invite_id}")), "{url}");
     assert!(url.contains(&format!("&secret={secret}")), "{url}");
-    assert!(url.contains(&format!("&tc={tc}")), "{url}");
+    assert!(url.ends_with(&format!("&tc={tc}")), "{url}");
     assert!(
         !url.contains("token="),
         "no bearer token in the link: {url}"
@@ -1736,6 +1741,34 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
         .as_str()
         .expect("workspace id")
         .to_string();
+
+    // This daemon has no tunnel sidecar (no INTENTD_TAILCAT_BIN), so an
+    // invite link is not mintable: `workspace.invite.create` is refused with
+    // the dedicated `tunnel-down` error and nothing is stored. This is NOT
+    // the listener-down error (the listener IS up — we are talking to it).
+    let v = wss_rpc(
+        &mut owner,
+        20,
+        "workspace.invite.create",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(v["jsonrpc"], json!("2.0"));
+    assert_eq!(v["id"], json!(20));
+    assert!(v.get("result").is_none(), "invite.create must fail: {v}");
+    assert_eq!(v["error"]["code"], json!(-32603), "{v}");
+    assert_eq!(v["error"]["data"]["code"], json!("tunnel-down"), "{v}");
+    let msg = v["error"]["message"].as_str().expect("error message");
+    assert!(msg.contains("tunnel"), "message names the tunnel: {msg}");
+    let v = wss_rpc(
+        &mut owner,
+        21,
+        "workspace.invite.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "workspace.invite.list: {v}");
+    assert_eq!(v["result"]["invites"], json!([]), "nothing minted: {v}");
 
     let v = wss_rpc(
         &mut owner,
