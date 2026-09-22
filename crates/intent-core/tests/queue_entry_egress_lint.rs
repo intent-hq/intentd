@@ -15,6 +15,8 @@
 //! by a brace-bodied item is blanked to its closing `}`, a `mod x;` / `const` /
 //! `use` item to its `;`). Comments, string and char literals are blanked
 //! before scanning, so a mention in a doc comment or a literal is never a hit.
+//! Lexing, marker classification, and `#[cfg(test)]` blanking come from
+//! `intentd_test_support::source_lint`.
 //!
 //! An egress is one of:
 //!
@@ -88,17 +90,23 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use intentd_test_support::source_lint::{
+    blank_cfg_test_items, cfg_test_item_ranges, lex, markers_by_line, skip_whitespace,
+    statement_line, word_at, Marker,
+};
+
 const SELF_FILE: &str = "crates/intent-core/tests/queue_entry_egress_lint.rs";
 const CONTRACT_FILE: &str = "crates/intent-core/src/queue_visibility_contract.rs";
 const EVENTS_FILE: &str = "crates/intent-core/src/events.rs";
 const SURFACE_ENUM: &str = "QueueSurface";
 const TABLE_CONST: &str = "REGISTERED_EGRESS";
-const OPT_OUT_MARKER: &str = "// queue-egress: allow";
+const OPT_OUT_TAG: &str = "queue-egress";
 const SNAPSHOT_CALLS: &[&str] = &["queue_snapshot", "queue_snapshot_preview"];
 const EVENT_FIELD: &str = "event_type";
 const QUEUE_EVENT_PREFIX: &str = "agent:queue:";
-const CFG_TEST_TOKENS: &[&str] = &["#", "[", "cfg", "(", "test", ")", "]"];
 const EXCERPT_CHARS: usize = 120;
+/// Qualifiers that turn `const` into `const fn` / `const unsafe fn` / ….
+const FN_QUALIFIERS: &[&str] = &["fn", "unsafe", "extern", "async"];
 
 /// What a [`REGISTERED_EGRESS`] row points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,295 +195,6 @@ struct Scan {
     consts: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Marker {
-    Absent,
-    WithReason,
-    Malformed,
-}
-
-/// A real `//` line comment found by the lexer (never one nested inside a
-/// block comment or a string literal).
-struct LineComment {
-    line: usize,
-    /// Only whitespace precedes the `//` on its line.
-    standalone: bool,
-    text: String,
-}
-
-/// Source text with comments/literals blanked, plus the line comments the
-/// lexer passed over on the way and every string literal whose value starts
-/// with [`QUEUE_EVENT_PREFIX`] (`(char index of the opening quote, value)`).
-struct Stripped {
-    text: String,
-    line_comments: Vec<LineComment>,
-    queue_literals: Vec<(usize, String)>,
-}
-
-/// Text with every `#[cfg(test)]` item blanked, plus the char ranges blanked.
-struct CfgTestBlanked {
-    text: String,
-    ranges: Vec<std::ops::Range<usize>>,
-}
-
-/// Marker state of one line comment's text: `Absent` unless it starts with
-/// the marker prefix; `WithReason` only when the token is exactly the marker
-/// (not a longer word such as `allowance`) followed by whitespace, a dash,
-/// and a nonempty reason; anything else that starts like the marker is
-/// `Malformed`.
-fn classify_marker(comment: &str) -> Marker {
-    let Some(rest) = comment.strip_prefix(OPT_OUT_MARKER) else {
-        return Marker::Absent;
-    };
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Marker::Malformed;
-    }
-    let after_space = rest.trim_start();
-    if after_space.len() == rest.len() && !rest.is_empty() {
-        return Marker::Malformed;
-    }
-    let Some(reason) = after_space
-        .strip_prefix('—')
-        .or_else(|| after_space.strip_prefix('-'))
-    else {
-        return Marker::Malformed;
-    };
-    if reason.trim().is_empty() {
-        Marker::Malformed
-    } else {
-        Marker::WithReason
-    }
-}
-
-/// Opt-out marker state per line; index 0 is a placeholder so the vector is
-/// addressed by 1-based line number. Only a standalone `//` line comment can
-/// carry the marker.
-fn markers_by_line(src: &str, line_comments: &[LineComment]) -> Vec<Marker> {
-    let mut out = vec![Marker::Absent; src.lines().count() + 1];
-    for comment in line_comments.iter().filter(|c| c.standalone) {
-        if let Some(slot) = out.get_mut(comment.line) {
-            *slot = classify_marker(&comment.text);
-        }
-    }
-    out
-}
-
-fn push_blank(out: &mut String, c: char) {
-    out.push(if c == '\n' { '\n' } else { ' ' });
-}
-
-/// `Some(hashes)` when a raw string literal (`r"`, `r#"`, `br"`, `cr#"`, …)
-/// starts at `i`; `None` otherwise.
-fn raw_string_hashes(chars: &[char], i: usize) -> Option<usize> {
-    let preceded_by_ident = i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
-    if preceded_by_ident {
-        return None;
-    }
-    let mut j = i;
-    if matches!(chars.get(j), Some('b' | 'c')) {
-        j += 1;
-    }
-    if chars.get(j) != Some(&'r') {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0;
-    while chars.get(j) == Some(&'#') {
-        hashes += 1;
-        j += 1;
-    }
-    (chars.get(j) == Some(&'"')).then_some(hashes)
-}
-
-/// Replaces every comment, string literal, and char literal with spaces
-/// (newlines preserved) so neither their contents nor their delimiters take
-/// part in scanning. Every `//` line comment the lexer consumes is also
-/// reported, since only those may carry the opt-out marker, as is every
-/// string literal whose value starts with [`QUEUE_EVENT_PREFIX`].
-fn blank_literals_and_comments(src: &str) -> Stripped {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut line_comments = Vec::new();
-    let mut queue_literals = Vec::new();
-    let mut note_literal = |quote: usize, value: String| {
-        if value.starts_with(QUEUE_EVENT_PREFIX) {
-            queue_literals.push((quote, value));
-        }
-    };
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    let mut counted_upto = 0usize;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if c == '/' && next == Some('/') {
-            let start = i;
-            for (offset, ch) in chars[counted_upto..start].iter().enumerate() {
-                if *ch == '\n' {
-                    line += 1;
-                    line_start = counted_upto + offset + 1;
-                }
-            }
-            counted_upto = start;
-            while i < chars.len() && chars[i] != '\n' {
-                out.push(' ');
-                i += 1;
-            }
-            line_comments.push(LineComment {
-                line,
-                standalone: chars[line_start..start].iter().all(|c| c.is_whitespace()),
-                text: chars[start..i].iter().collect(),
-            });
-        } else if c == '/' && next == Some('*') {
-            let mut depth = 0usize;
-            while i < chars.len() {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    out.push_str("  ");
-                    i += 2;
-                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    out.push_str("  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    push_blank(&mut out, chars[i]);
-                    i += 1;
-                }
-            }
-        } else if let Some(hashes) = raw_string_hashes(&chars, i) {
-            while chars[i] != '"' {
-                out.push(' ');
-                i += 1;
-            }
-            let quote = i;
-            out.push(' ');
-            i += 1;
-            while i < chars.len() {
-                let closing =
-                    chars[i] == '"' && (1..=hashes).all(|k| chars.get(i + k) == Some(&'#'));
-                push_blank(&mut out, chars[i]);
-                i += 1;
-                if closing {
-                    note_literal(quote, chars[quote + 1..i - 1].iter().collect());
-                    out.push_str(&" ".repeat(hashes));
-                    i += hashes;
-                    break;
-                }
-            }
-        } else if c == '"' {
-            let quote = i;
-            let mut value = String::new();
-            out.push(' ');
-            i += 1;
-            while i < chars.len() {
-                let d = chars[i];
-                push_blank(&mut out, d);
-                i += 1;
-                if d == '\\' {
-                    if let Some(&escaped) = chars.get(i) {
-                        push_blank(&mut out, escaped);
-                        value.push(escaped);
-                        i += 1;
-                    }
-                } else if d == '"' {
-                    note_literal(quote, value);
-                    break;
-                } else {
-                    value.push(d);
-                }
-            }
-        } else if c == '\'' {
-            // `'\…'` and `'x'` are char literals; anything else is a lifetime
-            // or loop label.
-            if next == Some('\\') {
-                let start = i;
-                i += 2;
-                if chars.get(i) == Some(&'u') {
-                    while i < chars.len() && chars[i] != '}' {
-                        i += 1;
-                    }
-                }
-                i += 1;
-                if chars.get(i) == Some(&'\'') {
-                    i += 1;
-                }
-                i = i.min(chars.len());
-                for &d in &chars[start..i] {
-                    push_blank(&mut out, d);
-                }
-            } else if chars.get(i + 2) == Some(&'\'') {
-                out.push_str("   ");
-                i += 3;
-            } else {
-                out.push(' ');
-                i += 1;
-            }
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    Stripped {
-        text: out,
-        line_comments,
-        queue_literals,
-    }
-}
-
-/// Whether the `#[cfg(test)]` token sequence starts at `i`, ignoring any
-/// whitespace between tokens.
-fn starts_with_cfg_test(chars: &[char], i: usize) -> bool {
-    if chars.get(i) != Some(&'#') {
-        return false;
-    }
-    let mut j = i;
-    for token in CFG_TEST_TOKENS {
-        while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-            j += 1;
-        }
-        for want in token.chars() {
-            if chars.get(j) != Some(&want) {
-                return false;
-            }
-            j += 1;
-        }
-    }
-    true
-}
-
-/// Items whose body is a brace block; they end at the `}` closing it (or at a
-/// `;` at depth 0 seen first).
-const BODY_ITEM_KEYWORDS: &[&str] = &[
-    "fn",
-    "mod",
-    "impl",
-    "struct",
-    "enum",
-    "union",
-    "trait",
-    "macro_rules",
-];
-/// Items that end at the first `;` at depth 0, whatever blocks their
-/// initializer contains.
-const SEMICOLON_ITEM_KEYWORDS: &[&str] = &["const", "static", "type", "use"];
-/// Qualifiers that turn `const` into `const fn` / `const unsafe fn` / ….
-const FN_QUALIFIERS: &[&str] = &["fn", "unsafe", "extern", "async"];
-
-fn skip_whitespace(chars: &[char], mut j: usize) -> usize {
-    while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-        j += 1;
-    }
-    j
-}
-
 /// Index just past the delimiter group (`(…)` or `[…]`) opening at `j`.
 fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
     let mut depth = 0usize;
@@ -491,90 +210,6 @@ fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
         }
     }
     j
-}
-
-/// `(word, index past it)` for the identifier starting at `j`, if any.
-fn word_at(chars: &[char], j: usize) -> Option<(String, usize)> {
-    let mut k = j;
-    while chars
-        .get(k)
-        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
-    {
-        k += 1;
-    }
-    (k > j).then(|| (chars[j..k].iter().collect(), k))
-}
-
-/// Whether the item introduced after the attribute(s) starting at `j` ends at
-/// a `;` at brace depth 0 rather than at the `}` closing its body.
-fn cfg_test_item_ends_at_semicolon(chars: &[char], mut j: usize) -> bool {
-    loop {
-        j = skip_whitespace(chars, j);
-        match chars.get(j) {
-            Some('#') => {
-                j += 1;
-                if chars.get(j) == Some(&'!') {
-                    j += 1;
-                }
-                j = skip_group(chars, j, '[', ']');
-            }
-            Some('(') => j = skip_group(chars, j, '(', ')'),
-            Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
-                let (word, next) = word_at(chars, j).expect("identifier start");
-                j = next;
-                if BODY_ITEM_KEYWORDS.contains(&word.as_str()) {
-                    return false;
-                }
-                if word == "const" {
-                    let after = skip_whitespace(chars, j);
-                    return !word_at(chars, after)
-                        .is_some_and(|(w, _)| FN_QUALIFIERS.contains(&w.as_str()));
-                }
-                if SEMICOLON_ITEM_KEYWORDS.contains(&word.as_str()) {
-                    return true;
-                }
-            }
-            _ => return false,
-        }
-    }
-}
-
-/// Blanks every `#[cfg(test)]` attribute together with the whole item that
-/// follows it. Runs on already-blanked text, so the attribute cannot hide
-/// inside a string or comment.
-fn blank_cfg_test_items(text: &str) -> CfgTestBlanked {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut ranges = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if !starts_with_cfg_test(&chars, i) {
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-        let ends_at_semicolon = cfg_test_item_ends_at_semicolon(&chars, i);
-        let start = i;
-        let mut depth = 0usize;
-        while i < chars.len() {
-            let c = chars[i];
-            push_blank(&mut out, c);
-            i += 1;
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 && !ends_at_semicolon {
-                        break;
-                    }
-                }
-                ';' if depth == 0 => break,
-                _ => {}
-            }
-        }
-        ranges.push(start..i);
-    }
-    CfgTestBlanked { text: out, ranges }
 }
 
 /// An ASCII identifier token (`[A-Za-z_][A-Za-z0-9_]*`) in blanked text, by
@@ -619,16 +254,6 @@ fn line_of_index(chars: &[char], at: usize) -> usize {
         .iter()
         .filter(|c| **c == '\n')
         .count()
-}
-
-/// 1-based line of the first non-whitespace char of the statement containing
-/// `at`: the text back to the nearest `;`, `{` or `}`.
-fn statement_line(chars: &[char], at: usize) -> usize {
-    let mut start = at;
-    while start > 0 && !matches!(chars[start - 1], ';' | '{' | '}') {
-        start -= 1;
-    }
-    line_of_index(chars, skip_whitespace(chars, start))
 }
 
 fn excerpt(chars: &[char], at: usize) -> String {
@@ -678,7 +303,7 @@ fn event_initializer(chars: &[char], toks: &[Token], idx: usize) -> Option<(Stri
 /// `agent:queue:*` constant needs no edit here to be caught.
 fn queue_event_consts(events_src: &str) -> Result<BTreeSet<String>, String> {
     let raw: Vec<char> = events_src.chars().collect();
-    let blanked = blank_cfg_test_items(&blank_literals_and_comments(events_src).text).text;
+    let blanked = blank_cfg_test_items(&lex(events_src).blanked);
     let chars: Vec<char> = blanked.chars().collect();
     let toks = tokens(&chars);
     let mut out = BTreeSet::new();
@@ -725,10 +350,11 @@ fn queue_event_consts(events_src: &str) -> Result<BTreeSet<String>, String> {
 /// [`queue_event_consts`].
 fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
     let raw: Vec<char> = src.chars().collect();
-    let stripped = blank_literals_and_comments(src);
-    let markers = markers_by_line(src, &stripped.line_comments);
-    let untested = blank_cfg_test_items(&stripped.text);
-    let chars: Vec<char> = untested.text.chars().collect();
+    let lexed = lex(src);
+    let markers = markers_by_line(src, &lexed.line_comments, OPT_OUT_TAG);
+    let blanked: Vec<char> = lexed.blanked.chars().collect();
+    let untested = cfg_test_item_ranges(&blanked);
+    let chars: Vec<char> = blank_cfg_test_items(&lexed.blanked).chars().collect();
     let toks = tokens(&chars);
     let mut scan = Scan::default();
     let mut enclosing: Option<String> = None;
@@ -799,22 +425,21 @@ fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
         }
     }
 
-    for (quote, value) in &stripped.queue_literals {
-        if untested.ranges.iter().any(|r| r.contains(quote)) {
+    for lit in &lexed.literals {
+        let value = lit.cooked();
+        if !value.starts_with(QUEUE_EVENT_PREFIX)
+            || untested
+                .iter()
+                .any(|&(start, end)| (start..end).contains(&lit.offset))
+        {
             continue;
         }
         let enclosing = fn_defs
             .iter()
             .rev()
-            .find(|(start, _)| start < quote)
+            .find(|(start, _)| *start < lit.offset)
             .map(|(_, name)| name.clone());
-        raw_hits.push((
-            *quote,
-            Egress::Literal {
-                value: value.clone(),
-                enclosing,
-            },
-        ));
+        raw_hits.push((lit.offset, Egress::Literal { value, enclosing }));
     }
     raw_hits.sort_by_key(|(at, _)| *at);
 
@@ -843,8 +468,7 @@ fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
 
 /// The variant names of `enum QueueSurface { … }` in the contract source.
 fn surface_labels(contract_src: &str) -> Result<Vec<String>, String> {
-    let blanked = blank_literals_and_comments(contract_src).text;
-    let chars: Vec<char> = blanked.chars().collect();
+    let chars: Vec<char> = lex(contract_src).blanked.chars().collect();
     let toks = tokens(&chars);
     let Some(idx) = toks
         .windows(2)
