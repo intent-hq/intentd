@@ -276,7 +276,7 @@ API:
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
   ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings. `status` is `idle` | `starting` | `running` | `restarting` | `exited`. The settled condition is exactly `status === "exited"`; `starting` / `running` / `restarting` are live (a poll mid-launch or mid-restart must keep waiting), and `idle` after a start means a `ws.script.stop` aborted the launch. Every `exited` carries an `exitCode`: the real code when a process ran (0 success, non-zero failure; `error` absent), or the sentinel `-1` when no code could be observed. A startup failure (PTY allocation, a cwd escaping the workspace root, a spawn error) never ran a process, so it settles as `exited` with `exitCode: -1`, `error` = the original failure text (kept verbatim — no success code is invented) and `stoppedAt`. Never gate completion on `exitCode` alone and never read `-1` as a real code: check `status`, then `error`.
-    Canonical completion hook — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\n" + out };' })`.
+    Canonical completion hook for command-mode scripts — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\\n" + out };' })` — the `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile. A service-mode script publishes `exited` for an instant before flipping to `restarting` on an auto-restart, so a service watcher must see `exited` on two consecutive polls (carry the first sighting in `hookState`) before dispatching.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
     `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with the completion hook documented under `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
@@ -531,7 +531,7 @@ API:
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
   ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings. `status` is `idle` | `starting` | `running` | `restarting` | `exited`. The settled condition is exactly `status === "exited"`; `starting` / `running` / `restarting` are live (a poll mid-launch or mid-restart must keep waiting), and `idle` after a start means a `ws.script.stop` aborted the launch. Every `exited` carries an `exitCode`: the real code when a process ran (0 success, non-zero failure; `error` absent), or the sentinel `-1` when no code could be observed. A startup failure (PTY allocation, a cwd escaping the workspace root, a spawn error) never ran a process, so it settles as `exited` with `exitCode: -1`, `error` = the original failure text (kept verbatim — no success code is invented) and `stoppedAt`. Never gate completion on `exitCode` alone and never read `-1` as a real code: check `status`, then `error`.
-    Canonical completion hook — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\n" + out };' })`.
+    Canonical completion hook for command-mode scripts — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\\n" + out };' })` — the `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile. A service-mode script publishes `exited` for an instant before flipping to `restarting` on an auto-restart, so a service watcher must see `exited` on two consecutive polls (carry the first sighting in `hookState`) before dispatching.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
     `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with the completion hook documented under `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
@@ -715,7 +715,17 @@ const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
 /// `agentFeatures.backgroundHooks` is off so the surviving script docs never
 /// advertise a pruned method (a unit test guards the needle verbatim in both
 /// variants).
-const SCRIPT_COMPLETION_HOOK_LINE: &str = "    Canonical completion hook — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: \"script <id> done\", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status(\"<id>\"); if (s.status !== \"exited\") return { dispatch: false }; const out = await ws.script.output(\"<id>\", 200); const outcome = s.error ? \"failed: \" + s.error : s.exitCode === 0 ? \"succeeded\" : \"exited with code \" + s.exitCode; return { dispatch: true, message: \"script <id> \" + outcome + \"\\n\" + out };' })`.\n";
+const SCRIPT_COMPLETION_HOOK_LINE: &str = r#"    Canonical completion hook for command-mode scripts — settles on success, non-zero exit AND startup failure, and keeps waiting through `starting` / `running` / `restarting`: `ws.hook.schedule({ name: "script <id> done", delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const s = await ws.script.status("<id>"); if (s.status !== "exited") return { dispatch: false }; const out = await ws.script.output("<id>", 200); const outcome = s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script <id> " + outcome + "\\n" + out };' })` — the `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile. A service-mode script publishes `exited` for an instant before flipping to `restarting` on an auto-restart, so a service watcher must see `exited` on two consecutive polls (carry the first sighting in `hookState`) before dispatching.
+"#;
+/// The `ws.script.start` / `ws.script.run` clauses pointing at that recipe;
+/// scrubbed (or rewritten to plain status polling) alongside it so the
+/// surviving script docs never reference a recipe that is no longer there.
+const SCRIPT_START_RECIPE_XREF: &str =
+    "; watch it with the completion recipe under `ws.script.status`";
+const SCRIPT_RUN_RECIPE_XREF: &str =
+    "wait with the completion hook documented under `ws.script.status(scriptId)`";
+const SCRIPT_RUN_RECIPE_XREF_OFF: &str =
+    "poll `ws.script.status(scriptId)` until `status === \"exited\"`";
 
 /// Task-graph teaching scrubbed from the assembled description when
 /// `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). Docs only —
@@ -831,7 +841,10 @@ pub fn workspace_api_description(
     // completion recipe is a `ws.hook.schedule` call on its own continuation
     // line, which method-line pruning cannot reach.
     if !features.background_hooks {
-        out = out.replacen(SCRIPT_COMPLETION_HOOK_LINE, "", 1);
+        out = out
+            .replacen(SCRIPT_COMPLETION_HOOK_LINE, "", 1)
+            .replacen(SCRIPT_START_RECIPE_XREF, "", 1)
+            .replacen(SCRIPT_RUN_RECIPE_XREF, SCRIPT_RUN_RECIPE_XREF_OFF, 1);
     }
     // Cross-reference scrub for `prMonitor`: the three monitor doc lines are
     // pruned above, but the surviving `ws.pr.*` index entry, hook steer and
@@ -1261,7 +1274,8 @@ mod tests {
         HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT,
         PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF,
         PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
-        SCRIPT_COMPLETION_HOOK_LINE, TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR,
+        SCRIPT_COMPLETION_HOOK_LINE, SCRIPT_RUN_RECIPE_XREF, SCRIPT_RUN_RECIPE_XREF_OFF,
+        SCRIPT_START_RECIPE_XREF, TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR,
         TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF, TASK_GRAPH_UNBLOCKED_WAKE_XREF,
         WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
         WORKSPACE_API_SYSTEM_PROMPT_HEADING,
@@ -2627,6 +2641,8 @@ mod tests {
     fn script_completion_recipe_matches_both_variants_and_follows_hook_gate() {
         for base in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
             assert!(base.contains(SCRIPT_COMPLETION_HOOK_LINE));
+            assert!(base.contains(SCRIPT_START_RECIPE_XREF));
+            assert!(base.contains(SCRIPT_RUN_RECIPE_XREF));
             assert!(base.contains("The settled condition is exactly `status === \"exited\"`"));
             assert!(base.contains(
                 "settles as `exited` with `exitCode: -1`, `error` = the original failure text"
@@ -2641,6 +2657,14 @@ mod tests {
             assert!(
                 !pruned.contains("Canonical completion hook"),
                 "chief={is_chief}: the hook recipe survived disabling backgroundHooks"
+            );
+            assert!(
+                !pruned.contains("completion recipe") && !pruned.contains("completion hook"),
+                "chief={is_chief}: a dangling recipe cross-reference survived disabling backgroundHooks"
+            );
+            assert!(
+                pruned.contains(SCRIPT_RUN_RECIPE_XREF_OFF),
+                "chief={is_chief}: the ws.script.run clause was not rewritten to plain polling"
             );
             assert!(
                 pruned.contains("The settled condition is exactly `status === \"exited\"`"),
