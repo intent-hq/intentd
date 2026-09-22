@@ -215,9 +215,9 @@ pub(crate) fn scope_counts_sql() -> &'static str {
 /// set is derived from [`AgentStatus::is_running_turn`] over
 /// [`AgentStatus::ALL`] (the serde names, which is how the column is
 /// written), so the aggregate cannot drift from the daemon's rule. Same
-/// `idx_agent_workspace` search as [`scope_counts_sql`] (the join is a
-/// primary-key probe per group), so `SUM(total)` over the result always
-/// equals `scopeCounts.delegated`.
+/// `idx_agent_workspace` search as [`scope_counts_sql`] (the join is one
+/// primary-key probe per candidate child row, no extra statement), so
+/// `SUM(total)` over the result always equals `scopeCounts.delegated`.
 pub(crate) fn delegated_counts_sql() -> String {
     let running = AgentStatus::ALL
         .iter()
