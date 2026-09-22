@@ -14,7 +14,8 @@ use std::time::Duration;
 use intent_core::{
     AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, GitAgentCommitResult, NoteId,
     Result, SaveAssetResult, ScriptCreateParams, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate, CHIEF_WORKSPACE_ID,
+    WorkspaceAttention, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
+    WorkspaceUpdate, CHIEF_WORKSPACE_ID,
 };
 use serde_json::{json, Value};
 
@@ -62,6 +63,9 @@ struct FakeApi {
     /// Recorded `git_root_unregister` calls: path.
     git_root_unregister_calls: Mutex<Vec<String>>,
     git_root_list_calls: Mutex<u32>,
+    /// `workspace_setup_status` override; `None` leaves the trait default
+    /// (`unknown`) in place.
+    setup_status: Mutex<Option<WorkspaceSetupStatus>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -141,6 +145,14 @@ impl WorkspaceApi for FakeApi {
             };
             Ok(json!({ "path": path, "value": value }))
         })
+    }
+
+    fn workspace_setup_status(&self, _id: &WorkspaceId) -> WorkspaceSetupStatus {
+        self.setup_status
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(WorkspaceSetupStatus::unknown)
     }
 
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
@@ -550,6 +562,8 @@ async fn workspace_details_returns_reference_shape() {
     assert_eq!(v["branch"], json!("main"));
     assert_eq!(v["repositoryName"], json!("intentd"));
     assert_eq!(v["tags"], json!(["red"]));
+    // No setup record (the trait default): `unknown`, optional fields omitted.
+    assert_eq!(v["setupStatus"], json!({ "state": "unknown" }));
 }
 
 #[tokio::test]
@@ -561,6 +575,54 @@ async fn workspace_details_not_found_returns_defaults() {
     let v = body(&resp);
     assert_eq!(v["hasTitle"], json!(false));
     assert_eq!(v["title"], json!("(untitled)"));
+    assert_eq!(v["setupStatus"], json!({ "state": "unknown" }));
+}
+
+/// `details().setupStatus` surfaces the daemon-owned setup state verbatim:
+/// a `running` record carries `terminalId` / `startedAt` and omits the
+/// terminal-only fields; a `failed` record carries the exit code and
+/// `finishedAt`. No field is ever emitted as `null`.
+#[tokio::test]
+async fn workspace_details_surfaces_setup_status() {
+    let (srv, api) = server();
+    let mut running = WorkspaceSetupStatus::new(WorkspaceSetupState::Running);
+    running.terminal_id = Some("term-7".to_string());
+    running.started_at = Some("2026-01-01T00:00:00Z".to_string());
+    *api.setup_status.lock().unwrap() = Some(running);
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let v = body(&resp);
+    assert_eq!(
+        v["setupStatus"],
+        json!({
+            "state": "running",
+            "terminalId": "term-7",
+            "startedAt": "2026-01-01T00:00:00Z",
+        })
+    );
+
+    let mut failed = WorkspaceSetupStatus::new(WorkspaceSetupState::Failed);
+    failed.exit_code = Some(3);
+    failed.terminal_id = Some("term-7".to_string());
+    failed.started_at = Some("2026-01-01T00:00:00Z".to_string());
+    failed.finished_at = Some("2026-01-01T00:00:05Z".to_string());
+    *api.setup_status.lock().unwrap() = Some(failed);
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    let v = body(&resp);
+    assert_eq!(v["setupStatus"]["state"], json!("failed"));
+    assert_eq!(v["setupStatus"]["exitCode"], json!(3));
+    assert_eq!(
+        v["setupStatus"]["finishedAt"],
+        json!("2026-01-01T00:00:05Z")
+    );
+
+    // The field also rides the not-found fallback shape.
+    *api.setup_status.lock().unwrap() =
+        Some(WorkspaceSetupStatus::new(WorkspaceSetupState::Pending));
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::NotFound;
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    let v = body(&resp);
+    assert_eq!(v["setupStatus"], json!({ "state": "pending" }));
 }
 
 #[tokio::test]

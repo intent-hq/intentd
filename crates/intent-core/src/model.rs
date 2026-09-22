@@ -95,6 +95,16 @@ pub struct PullRequestInfo {
     pub mergeable_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_draft: Option<bool>,
+    /// The PR sits in the host's merge queue (GitHub GraphQL
+    /// `isInMergeQueue`). Presence-detected: `Some(true)` exactly when a
+    /// signal-bearing read (the `github.pulls.get` fold, §5.27) reported the
+    /// PR queued, `None` otherwise — a REST read carries no queue signal (a
+    /// queued PR reads `mergeable_state: "clean"`), so the REST-only refresh
+    /// paths inherit a persisted `Some(true)` instead of erasing it
+    /// (`pr_ops::carry_merge_queue_signal`). Rows persisted before the field
+    /// existed read `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_in_merge_queue: Option<bool>,
 }
 
 impl PullRequestInfo {
@@ -103,9 +113,10 @@ impl PullRequestInfo {
     /// [`Workspace::slim_for_list`]. The list-context readers (sidebar PR
     /// dropdown, card status, delete warning) need `number` / `url` /
     /// `title` / `status` / `isDraft` plus the timestamps used for ordering,
-    /// and `mergeable` / `mergeableState` — the FE derives the PR lifecycle
-    /// display status from them on list rows, so both stay. `headSha` and
-    /// `author` feed hover tooltips only, so they are `workspace.get`-only.
+    /// and `mergeable` / `mergeableState` / `isInMergeQueue` — the FE derives
+    /// the PR lifecycle display status from them on list rows, so all three
+    /// stay. `headSha` and `author` feed hover tooltips only, so they are
+    /// `workspace.get`-only.
     pub fn slim_for_list(&mut self) {
         self.head_sha = None;
         self.author = None;
@@ -952,6 +963,65 @@ pub struct SetupScript {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_by: Option<SetupScriptGeneratedBy>,
+}
+
+/// Lifecycle state of a workspace's setup stage (§6.5 `workspace:setup:*`),
+/// as tracked in the daemon's in-memory per-workspace map and surfaced to
+/// agents through `ws.workspace.details().setupStatus`. Never persisted: a
+/// workspace with no record (created before the daemon booted) reads
+/// [`Unknown`](Self::Unknown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceSetupState {
+    /// The worktree exists; the effective setup script is not yet resolved.
+    Pending,
+    /// A setup script was resolved and its terminal spawned.
+    Running,
+    /// The script exited `0`.
+    Completed,
+    /// The script exited non-zero, or failed before/at spawn (no exit code).
+    Failed,
+    /// No effective script (or no worktree): the stage never ran.
+    Skipped,
+    /// No record for this workspace in the current daemon lifetime.
+    Unknown,
+}
+
+/// Snapshot of a workspace's setup stage: the [`WorkspaceSetupState`] plus
+/// the details known at that point. Optional fields are omitted (never
+/// `null`) when not applicable to the state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSetupStatus {
+    pub state: WorkspaceSetupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+impl WorkspaceSetupStatus {
+    /// The bare status for `state` with every optional detail omitted.
+    #[must_use]
+    pub fn new(state: WorkspaceSetupState) -> Self {
+        Self {
+            state,
+            exit_code: None,
+            terminal_id: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// The status of a workspace with no record: `state: "unknown"`.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::new(WorkspaceSetupState::Unknown)
+    }
 }
 
 /// Script mode for repo scripts (service = long-running, command = run-once).
@@ -6083,6 +6153,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         }
     }
 

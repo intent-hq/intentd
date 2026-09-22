@@ -29,6 +29,8 @@ pub mod git_remote_url;
 pub mod ids;
 pub mod model;
 pub mod path_utils;
+#[doc(hidden)]
+pub mod queue_visibility_contract;
 pub mod replay_preview;
 pub mod repo_ref;
 pub mod secrets;
@@ -118,8 +120,9 @@ pub use model::{
     TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, Workspace, WorkspaceActivity,
     WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
     WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus,
-    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
+    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceSetupState,
+    WorkspaceSetupStatus, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{

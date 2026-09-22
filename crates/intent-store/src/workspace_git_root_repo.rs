@@ -29,6 +29,24 @@ fn agent_ids_from_db(s: &str) -> Result<Vec<AgentId>> {
         .map_err(|e| Error::Internal(format!("decode registered_by_agent_ids failed: {e}")))
 }
 
+/// The scoped PR-columns `UPDATE` shared by
+/// [`Store::update_workspace_git_root_pr`] and
+/// [`Store::update_workspace_git_root_pr_rebased`].
+fn root_pr_update(
+    root: &WorkspaceGitRoot,
+) -> Result<sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'_>>> {
+    Ok(sqlx::query(
+        "UPDATE workspace_git_root SET pr_number = ?, pr_url = ?, pr_status = ?, \
+         pull_requests = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(root.pr_number.map(u64::cast_signed))
+    .bind(&root.pr_url)
+    .bind(root.pr_status.map(|s| enum_to_db(&s)).transpose()?)
+    .bind(pull_requests_to_db(root.pull_requests.as_ref())?)
+    .bind(&root.updated_at)
+    .bind(&root.id.0))
+}
+
 /// Encode the optional `pull_requests` snapshot list to a JSON TEXT column.
 fn pull_requests_to_db(prs: Option<&Vec<PullRequestInfo>>) -> Result<Option<String>> {
     prs.map(|prs| {
@@ -356,23 +374,154 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_git_root_pr(&self, root: &WorkspaceGitRoot) -> Result<()> {
-        let res = sqlx::query(
-            "UPDATE workspace_git_root SET pr_number = ?, pr_url = ?, pr_status = ?, \
-             pull_requests = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(root.pr_number.map(u64::cast_signed))
-        .bind(&root.pr_url)
-        .bind(root.pr_status.map(|s| enum_to_db(&s)).transpose()?)
-        .bind(pull_requests_to_db(root.pull_requests.as_ref())?)
-        .bind(&root.updated_at)
-        .bind(&root.id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("update workspace git root pr failed: {e}")))?;
+        let res = root_pr_update(root)?
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("update workspace git root pr failed: {e}")))?;
         if res.rows_affected() == 0 {
             return Err(Error::NotFound(format!("workspace git root {}", root.id)));
         }
         Ok(())
+    }
+
+    /// [`Self::update_workspace_git_root_pr`] rebased on the row at write
+    /// time — the git-root sibling of
+    /// [`Store::update_workspace_pr_linkage_rebased`]
+    /// (intent-hq/intent#5654): inside ONE `BEGIN IMMEDIATE` write-pool
+    /// transaction, read the stored `pull_requests`, hand it to the caller's
+    /// synchronous `rebase` closure with the entity about to be written,
+    /// then perform the same scoped `UPDATE` from the (possibly amended)
+    /// entity. A malformed stored list decodes to `None`. `NotFound` when
+    /// the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_workspace_git_root_pr_rebased<F>(
+        &self,
+        root: &mut WorkspaceGitRoot,
+        rebase: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut WorkspaceGitRoot, Option<Vec<PullRequestInfo>>),
+    {
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!("update workspace git root pr acquire failed: {e}"))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("update workspace git root pr begin failed: {e}"))
+            })?;
+
+        let body_result = async {
+            let row = sqlx::query("SELECT pull_requests FROM workspace_git_root WHERE id = ?")
+                .bind(&root.id.0)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("update workspace git root pr read failed: {e}"))
+                })?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace git root {}", root.id)));
+            };
+            let persisted = row
+                .get::<Option<String>, _>("pull_requests")
+                .and_then(|s| serde_json::from_str::<Vec<PullRequestInfo>>(&s).ok());
+            rebase(root, persisted);
+            let res = root_pr_update(root)?
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("update workspace git root pr failed: {e}"))
+                })?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace git root {}", root.id)));
+            }
+            Ok(())
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "update workspace git root pr commit failed",
+        )
+        .await
+    }
+
+    /// Project onto a git root's persisted `pull_requests` atomically — the
+    /// git-root sibling of [`Store::project_workspace_pr_snapshots`]
+    /// (intent-hq/intent#5654, the cache-hit fold): inside ONE
+    /// `BEGIN IMMEDIATE` write-pool transaction, read the stored pool, hand
+    /// it to the caller's synchronous `project` closure, and — when it
+    /// returns `true` — write back ONLY `pull_requests` plus `updated_at`;
+    /// the linked scalars are untouched and no pre-read entity is ever
+    /// reserialized. Returns the written pool on a committed write, `None`
+    /// when the closure declined. `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails or the stored pool is malformed.
+    pub async fn project_workspace_git_root_pull_requests<F>(
+        &self,
+        id: &WorkspaceGitRootId,
+        updated_at: &str,
+        project: F,
+    ) -> Result<Option<Option<Vec<PullRequestInfo>>>>
+    where
+        F: FnOnce(&mut Option<Vec<PullRequestInfo>>) -> bool,
+    {
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "project workspace git root pool acquire failed: {e}"
+            ))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("project workspace git root pool begin failed: {e}"))
+            })?;
+
+        let body_result = async {
+            let row = sqlx::query("SELECT pull_requests FROM workspace_git_root WHERE id = ?")
+                .bind(&id.0)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("project workspace git root pool read failed: {e}"))
+                })?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace git root {id}")));
+            };
+            let mut pool = pull_requests_from_db(row.get::<Option<String>, _>("pull_requests"))?;
+            if !project(&mut pool) {
+                return Ok(None);
+            }
+            let res = sqlx::query(
+                "UPDATE workspace_git_root SET pull_requests = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(pull_requests_to_db(pool.as_ref())?)
+            .bind(updated_at)
+            .bind(&id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("project workspace git root pool failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace git root {id}")));
+            }
+            Ok(Some(pool))
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "project workspace git root pool commit failed",
+        )
+        .await
     }
 
     /// Stamp a git root's `registered_commit_sha` ONLY when it is currently
@@ -817,6 +966,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         }]);
         root.updated_at = now_iso();
         store

@@ -602,6 +602,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         mergeable: Some(true),
         mergeable_state: Some("clean".to_string()),
         is_draft: Some(false),
+        is_in_merge_queue: None,
     };
     let with_detail_fields = |ws: &mut Workspace| {
         ws.setup_script = Some(SetupScript {
@@ -858,6 +859,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
         mergeable: Some(true),
         mergeable_state: Some("blocked".to_string()),
         is_draft: Some(false),
+        is_in_merge_queue: None,
     };
 
     let ws = WorkspaceId::new();
@@ -1184,6 +1186,7 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     let numbers = |ws: &Workspace| -> Vec<u64> {
         ws.pull_requests
@@ -1466,6 +1469,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
             mergeable: None,
             mergeable_state: None,
             is_draft: Some(false),
+            is_in_merge_queue: None,
         }]);
         // Fat persisted rollup: 8 agents + 3 models per workspace (the field
         // list rows must no longer carry).
@@ -2023,6 +2027,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     let git_root = |ws: &WorkspaceId, path: &str, prs: Vec<PullRequestInfo>| {
         let ts = now_iso();
@@ -2380,6 +2385,7 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
                 mergeable: None,
                 mergeable_state: None,
                 is_draft: None,
+                is_in_merge_queue: None,
             }]),
             created_at: ts.clone(),
             updated_at: ts,
@@ -2523,6 +2529,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     let ready = |title: &str, mergeable_state: &str, updated_at: &str, is_draft: bool| {
         let mut info = pr(
@@ -2850,6 +2857,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         };
     let monitor =
         |ws: &WorkspaceId, number: i64, state: PrMonitorState, snapshot: Option<String>| {
@@ -17457,6 +17465,20 @@ pub(crate) mod pr {
         /// (`add_permits(1)`): the caller proves the read it triggered from
         /// returned while `GET /user` was still in flight.
         pub(crate) get_user_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        /// When set, the FIRST `get_pr` signals `entered` and holds until
+        /// `release` is notified, so a test can land a concurrent
+        /// signal-bearing fold while a REST refresh's read is in flight
+        /// (intent-hq/intent#5654).
+        pub(crate) get_pr_park: Option<std::sync::Arc<GetPrPark>>,
+    }
+
+    /// One-shot park for [`StubForge::get_pr`]: `entered` fires when the
+    /// held read begins, `release` lets it return.
+    #[derive(Default)]
+    pub(crate) struct GetPrPark {
+        claimed: std::sync::atomic::AtomicBool,
+        pub(crate) entered: tokio::sync::Notify,
+        pub(crate) release: tokio::sync::Notify,
     }
 
     impl StubForge {
@@ -17736,6 +17758,12 @@ pub(crate) mod pr {
             if self.hang_get_pr == Some(number) {
                 // A TCP connection that went dark: the future never resolves.
                 std::future::pending::<()>().await;
+            }
+            if let Some(park) = &self.get_pr_park {
+                if !park.claimed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
             }
             if self.missing_pr == Some(number) {
                 return Err(ScError::NotFound("no such PR".into()));
@@ -19445,6 +19473,104 @@ pub(crate) mod pr {
             .await
             .unwrap();
         assert_eq!(evs2.len(), 1);
+    }
+
+    /// Linked workspace whose persisted pool holds the sample PR with the
+    /// given queue signal and no `activePullRequest`, so a refresh's
+    /// snapshot compare always writes; the forge parks its first `get_pr`.
+    async fn parked_refresh_setup(
+        signal: Option<bool>,
+    ) -> (TempDb, Services, WorkspaceId, Arc<GetPrPark>) {
+        let park = Arc::new(GetPrPark::default());
+        let forge = StubForge {
+            get_pr_park: Some(park.clone()),
+            ..Default::default()
+        };
+        let (t, svc, ws_id) = refresh_setup(forge, "feature", Some(42), false).await;
+        let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+        ws.pull_requests = Some(vec![crate::pr_ops::build_pr_info_with_merge_queue(
+            &sample_pr(),
+            signal,
+        )]);
+        svc.store().update_workspace_pr_linkage(&ws).await.unwrap();
+        (t, svc, ws_id, park)
+    }
+
+    /// A REST refresh whose row read predates a signal-bearing fold must not
+    /// erase the enqueue the fold persisted (intent-hq/intent#5654): the
+    /// read is held in flight, the fold writes `Some(true)` on the same
+    /// head, and the refresh's persist re-derives the carry against the
+    /// row at write time instead of its stale snapshot.
+    #[tokio::test]
+    async fn rest_refresh_keeps_a_queue_signal_folded_while_its_read_was_in_flight() {
+        let (_t, svc, ws_id, park) = parked_refresh_setup(None).await;
+        let refresh = svc.refresh_workspace_pr(&ws_id);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true), true)
+                .await
+                .expect("fold");
+            let mid = svc.store().get_workspace(&ws_id).await.unwrap();
+            assert_eq!(
+                mid.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+                Some(true),
+                "the fold landed while the REST read was held"
+            );
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.expect("refresh"), crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        let pooled = &after.pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.is_in_merge_queue, Some(true));
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            Some(true),
+            "activePullRequest mirrors the rebased pool entry"
+        );
+    }
+
+    /// The mirror image: the refresh's snapshot still carries `Some(true)`
+    /// when a fold observes the PR dequeued; the persist must not resurrect
+    /// the cleared signal from that snapshot (intent-hq/intent#5654).
+    #[tokio::test]
+    async fn rest_refresh_does_not_resurrect_a_queue_signal_a_fold_cleared_mid_read() {
+        let (_t, svc, ws_id, park) = parked_refresh_setup(Some(true)).await;
+        let refresh = svc.refresh_workspace_pr(&ws_id);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false), true)
+                .await
+                .expect("fold");
+            let mid = svc.store().get_workspace(&ws_id).await.unwrap();
+            assert_eq!(
+                mid.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+                None,
+                "the fold cleared the signal while the REST read was held"
+            );
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.expect("refresh"), crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None
+        );
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            None
+        );
     }
 
     #[tokio::test]
@@ -21367,6 +21493,90 @@ pub(crate) mod pr {
         assert!(list.iter().any(|p| p.number == 77));
     }
 
+    /// Linked root (branch `feature` = the sample PR head) whose persisted
+    /// pool holds the sample PR with the given queue signal and no
+    /// `pr_status`, so the refresh always persists; the forge parks its
+    /// first `get_pr`.
+    async fn parked_root_setup(
+        signal: Option<bool>,
+    ) -> (
+        TempDb,
+        Services,
+        intent_core::Workspace,
+        intent_core::WorkspaceGitRoot,
+        Arc<GetPrPark>,
+        SweepRepo,
+        SweepRepo,
+    ) {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pull_requests = Some(vec![crate::pr_ops::build_pr_info_with_merge_queue(
+            &sample_pr(),
+            signal,
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let park = Arc::new(GetPrPark::default());
+        (t, svc, ws, root, park, primary, secondary)
+    }
+
+    /// Git-root analogue of the workspace enqueue race: the root refresh's
+    /// snapshot predates a fold that enqueued the pooled PR; the persist
+    /// keeps the fold's `Some(true)` (intent-hq/intent#5654).
+    #[tokio::test]
+    async fn root_refresh_keeps_a_queue_signal_folded_while_its_read_was_in_flight() {
+        let (_t, svc, ws, root, park, _p, _s) = parked_root_setup(None).await;
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            get_pr_park: Some(park.clone()),
+            ..Default::default()
+        });
+        let refresh = svc.refresh_git_root_pr(root, &sc);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true), true)
+                .await
+                .expect("fold");
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.unwrap(), crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let pooled = &roots[0].pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.number, 42);
+        assert_eq!(pooled.is_in_merge_queue, Some(true));
+    }
+
+    /// Git-root analogue of the workspace dequeue race: the snapshot still
+    /// carries `Some(true)` after a fold cleared it; the persist does not
+    /// resurrect it (intent-hq/intent#5654).
+    #[tokio::test]
+    async fn root_refresh_does_not_resurrect_a_queue_signal_a_fold_cleared_mid_read() {
+        let (_t, svc, ws, root, park, _p, _s) = parked_root_setup(Some(true)).await;
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            get_pr_park: Some(park.clone()),
+            ..Default::default()
+        });
+        let refresh = svc.refresh_git_root_pr(root, &sc);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false), true)
+                .await
+                .expect("fold");
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.unwrap(), crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let pooled = &roots[0].pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.number, 42);
+        assert_eq!(pooled.is_in_merge_queue, None);
+    }
+
     /// A spec-child task note in `status`, so it counts into the workspace's
     /// `taskStats` for the displayStatus derivation.
     fn sweep_task_note(ws_id: &WorkspaceId, status: intent_core::TaskStatus) -> intent_core::Note {
@@ -22290,16 +22500,17 @@ pub(crate) mod pr {
         );
     }
 
-    /// Regression (intent-hq/intentd#2064 review): the fold runs only when
-    /// `github.pulls.get`'s own read fetched the record. A concurrent fill
-    /// landing between the read's preflight cache miss and the shared path's
-    /// authoritative lookup makes that lookup a hit: the hover answers the
-    /// concurrently stored record with no forge request of its own, and the
-    /// linked workspace is never folded (persisted Open stays Open, no
-    /// `pr:updated`, no displayStatus transition). A later read that does
-    /// fetch — the entry aged past `max_age` — folds as usual.
+    /// Regression (intent-hq/intentd#2064 review, revised for
+    /// intent-hq/intent#5654): a concurrent fill landing between the read's
+    /// preflight cache miss and the shared path's authoritative lookup makes
+    /// that lookup a hit. The hover answers the concurrently stored record
+    /// with no forge request of its own — the cache contract — and, the hit
+    /// being a queue-signal projection, the served Merged status does NOT
+    /// fold (persisted Open stays Open, no `pr:updated`, no displayStatus
+    /// transition). A later read that fetches — the entry aged past
+    /// `max_age` — folds the record whole.
     #[intent_test_macros::daemon_test]
-    async fn pulls_get_never_folds_when_a_concurrent_fill_serves_the_read() {
+    async fn pulls_get_hit_on_a_concurrent_fill_projects_nothing_but_the_queue_signal() {
         let park = Arc::new(crate::CompletionClassifyPark::default());
         let forge = Arc::new(StubForge {
             merged_linked: true,
@@ -22359,7 +22570,7 @@ pub(crate) mod pr {
         assert_eq!(
             after.pr_status,
             Some(intent_core::PullRequestStatus::Open),
-            "a read served from the cache never folds"
+            "a hit projects only the queue signal: a differing status does not fold"
         );
         assert_eq!(
             after.pull_requests.as_ref().expect("pull_requests")[0].status,
@@ -22373,24 +22584,607 @@ pub(crate) mod pr {
             .is_empty());
         assert!(display_status_events(&svc, &ws_id).await.is_empty());
 
-        // Aged past max_age, the next read fetches — and that one folds.
-        // (The still-armed park is released ahead of the read.)
+        // Aged past max_age, the next read fetches — and that one folds the
+        // record whole. (The still-armed park is released ahead of the read.)
         svc.backdate_pr_cache(std::time::Duration::from_secs(61));
         park.release.notify_one();
         svc.github_pulls_get("o".into(), "r".into(), 42)
             .await
             .expect("pulls.get after expiry");
         assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42, 42]);
-        let folded = svc.store().get_workspace(&ws_id).await.unwrap();
+        let again = svc.store().get_workspace(&ws_id).await.unwrap();
         assert_eq!(
-            folded.pr_status,
-            Some(intent_core::PullRequestStatus::Merged),
-            "a read that fetched folds"
+            again.pr_status,
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+        assert_eq!(
+            again.pull_requests.as_ref().expect("pull_requests")[0].status,
+            intent_core::PullRequestStatus::Merged
+        );
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
         assert_eq!(
             display_status_events(&svc, &ws_id).await,
             vec![json!("pr_merged")]
         );
+    }
+
+    /// The forge for the cache-hit fold regressions: an open #42 whose
+    /// merge-requirements probe reports the given queue state, so a full
+    /// read composes `merge_queue_reported == Some(queued)`.
+    fn queue_signal_forge(queued: bool) -> Arc<StubForge> {
+        Arc::new(StubForge {
+            merge_signals: Some(MergeRequirementSignals {
+                is_in_merge_queue: Some(queued),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Linked #42 (Open, pooled + `activePullRequest`) persisted with the
+    /// given queue signal, under a 60s cache TTL.
+    async fn cached_hover_setup(
+        forge: Arc<StubForge>,
+        signal: Option<bool>,
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        cached_hover_setup_with(forge, |open| open.is_in_merge_queue = signal).await
+    }
+
+    /// [`cached_hover_setup`] with the persisted #42 entry shaped by `seed`
+    /// (the pooled and linked copies are the same entry).
+    async fn cached_hover_setup_with(
+        forge: Arc<StubForge>,
+        seed: impl FnOnce(&mut intent_core::PullRequestInfo),
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        let mut open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        seed(&mut open);
+        let (t, root, svc, ws_id) = fold_setup_with(forge, |ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        (t, root, svc.with_pr_cache_max_age_seconds(60), ws_id)
+    }
+
+    /// A cache fill that is NOT a serve — a monitor poll or another reader
+    /// storing #42 — so the entry sits in the cache without any fold.
+    async fn fill_pr_cache(forge: &StubForge, svc: &Services) {
+        crate::pr_monitor::read_pr_via(
+            forge,
+            &RepoRef::new("o", "r"),
+            42,
+            &svc.pr_cache,
+            crate::pr_monitor::PrReadPolicy::REFRESH,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("cache fill");
+    }
+
+    /// Regression (intent-hq/intent#5654, intentd#2079 review): the queue
+    /// signal seeded into the shared cache by another reader — a
+    /// `ws.pr.snapshot`, a monitor poll — must land on the pool at the next
+    /// hover even though that hover is a cache hit. Persisted `None`, cache
+    /// filled with `isInMergeQueue: true`, hover within the TTL: no forge
+    /// request, the pooled and linked copies flip to `Some(true)`, one
+    /// `pr:updated`, and `displayStatus` moves `pr_ready` → `pr_queued`. A
+    /// repeat hit that agrees with the pool writes nothing.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_folds_a_queue_signal_served_from_the_cache() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        let filled = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            filled.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None,
+            "a bare cache fill folds nothing"
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["isInMergeQueue"], true);
+        assert_eq!(
+            *forge.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "the hover is a hit: no forge request"
+        );
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            Some(true),
+            "the served signal folded on a cache hit"
+        );
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            Some(true)
+        );
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Open),
+            "the passive fold keeps the link and status"
+        );
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+
+        // A repeat hit agrees with the pool: nothing persists, nothing emits.
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get again");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        let again = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(again.updated_at, after.updated_at);
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(display_status_events(&svc, &ws_id).await.len(), 1);
+    }
+
+    /// The inverse of [`pulls_get_folds_a_queue_signal_served_from_the_cache`]:
+    /// the pool holds `Some(true)` (`pr_queued`), the cached read observed
+    /// the PR dequeued (`isInMergeQueue: false`, same head, still open) —
+    /// the cache-hit hover clears the signal on the pooled and linked copies
+    /// and `displayStatus` falls back to `pr_ready`, again without a forge
+    /// request.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_clears_a_queue_signal_the_cache_reports_lapsed() {
+        let forge = queue_signal_forge(false);
+        let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), Some(true)).await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrQueued)
+        );
+
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        assert_eq!(
+            svc.store()
+                .get_workspace(&ws_id)
+                .await
+                .unwrap()
+                .pull_requests
+                .as_ref()
+                .unwrap()[0]
+                .is_in_merge_queue,
+            Some(true),
+            "a bare cache fill folds nothing"
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["isInMergeQueue"], false);
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None,
+            "the cached dequeue cleared the persisted signal"
+        );
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            None
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_ready")]
+        );
+    }
+
+    /// The cache-hit fold is a projection (intent-hq/intent#5654): a REST
+    /// sweep refreshed the pool (newer `updatedAt`, title, `mergeableState`)
+    /// after the cache was filled, so the cached record is the older one.
+    /// The hit lands the differing queue signal on the same head and leaves
+    /// every other pooled field as the sweep wrote it — nothing rolls back.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_hit_writes_only_the_queue_signal_over_fresher_rest_fields() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup_with(forge.clone(), |open| {
+            open.is_in_merge_queue = None;
+            open.title = "renamed by the sweep".into();
+            open.updated_at = "2099-01-01T00:00:00Z".into();
+            open.mergeable_state = Some("blocked".into());
+        })
+        .await;
+        seed_display_status(&svc, &ws_id).await;
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        let filled = svc.store().get_workspace(&ws_id).await.unwrap();
+        let before = filled.pull_requests.as_ref().unwrap()[0].clone();
+        assert_ne!(
+            before.title,
+            sample_pr().title,
+            "the cached record is older than the pool"
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["title"], sample_pr().title, "answers the cache");
+        assert_eq!(
+            *forge.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "the hover is a hit: no forge request"
+        );
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        let pooled = &after.pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.is_in_merge_queue, Some(true), "the signal landed");
+        let mut expected = before.clone();
+        expected.is_in_merge_queue = Some(true);
+        assert_eq!(*pooled, expected, "only is_in_merge_queue changed");
+        let active = after.active_pull_request.as_ref().unwrap();
+        assert_eq!(
+            *active, expected,
+            "the linked copy took the same projection"
+        );
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// A cached queue signal for a head the pool has left is not the pool's
+    /// signal (intent-hq/intent#5654): the persisted copy is on a newer
+    /// `headSha` than the cached record, so the hit writes nothing — no
+    /// persist, no `pr:updated`, no displayStatus transition.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_hit_on_a_different_head_writes_nothing() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup_with(forge.clone(), |open| {
+            open.is_in_merge_queue = None;
+            open.head_sha = Some("moved-past-the-cached-head".into());
+        })
+        .await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        let before = svc.store().get_workspace(&ws_id).await.unwrap();
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(
+            v["pull"]["isInMergeQueue"], true,
+            "the hit still answers the cache"
+        );
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.updated_at, before.updated_at, "nothing persisted");
+        assert_eq!(after.pull_requests, before.pull_requests);
+        assert_eq!(after.active_pull_request, before.active_pull_request);
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+    }
+
+    /// `ws.pr.snapshot` (`pr.state`) reads through the same serve and folds
+    /// identically to the hover: a cached queue signal lands on the pool
+    /// from a snapshot too (intent-hq/intent#5654).
+    #[intent_test_macros::daemon_test]
+    async fn pr_state_folds_a_queue_signal_served_from_the_cache() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+        fill_pr_cache(forge.as_ref(), &svc).await;
+
+        let v = svc
+            .pr_state(ws_id.clone(), 42, None)
+            .await
+            .expect("snapshot");
+        assert_eq!(v["requirements"]["isInMergeQueue"], true, "{v}");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            Some(true)
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// The hit projection is atomic with the row (intent-hq/intent#5654,
+    /// intentd#2079 re-verification): a REST refresh commits fresher
+    /// same-head fields (title, `updatedAt`, `mergeableState`) and a second
+    /// pool entry AFTER the fold's referencing-rows lookup but BEFORE its
+    /// write. The projection reads the row at write time, so the fresher
+    /// fields survive, the added entry stays, only `is_in_merge_queue`
+    /// changes, and the linked scalars are never reserialized.
+    #[intent_test_macros::daemon_test]
+    async fn hit_projection_lands_on_a_same_head_refresh_committed_mid_window() {
+        let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let svc = svc.with_fold_hit_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+            let mut fresher = ws.pull_requests.as_ref().unwrap()[0].clone();
+            fresher.title = "renamed by the sweep".into();
+            fresher.updated_at = "2099-01-01T00:00:00Z".into();
+            fresher.mergeable_state = Some("blocked".into());
+            let other = pool_entry(43, intent_core::PullRequestStatus::Open, "");
+            ws.pull_requests = Some(vec![fresher.clone(), other.clone()]);
+            ws.active_pull_request = Some(fresher.clone());
+            svc.store().update_workspace_pr_linkage(&ws).await.unwrap();
+            park.release.notify_one();
+            (fresher, other)
+        };
+        let (outcome, (fresher, other)) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        let mut expected = fresher;
+        expected.is_in_merge_queue = Some(true);
+        assert_eq!(
+            after.pull_requests,
+            Some(vec![expected.clone(), other]),
+            "the refresh's fields and entry survive; only the signal changed"
+        );
+        assert_eq!(after.active_pull_request, Some(expected));
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_url.as_deref(), Some(sample_pr().url.as_str()));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// A REST refresh moves the pooled copy to a newer head inside the hit's
+    /// lookup → write window (intent-hq/intent#5654): the cached signal
+    /// describes the head the pool has left, so the projection — evaluated
+    /// against the row at write time, not the pre-read copy — writes
+    /// nothing: no persist, no `pr:updated`, no displayStatus transition,
+    /// and the refresh's record stands untouched.
+    #[intent_test_macros::daemon_test]
+    async fn hit_projection_writes_nothing_when_the_head_moved_mid_window() {
+        let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let svc = svc.with_fold_hit_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+            let mut moved = ws.pull_requests.as_ref().unwrap()[0].clone();
+            moved.head_sha = Some("moved-past-the-cached-head".into());
+            moved.title = "renamed by the sweep".into();
+            ws.pull_requests = Some(vec![moved.clone()]);
+            ws.active_pull_request = Some(moved);
+            ws.updated_at = "2099-01-01T00:00:00Z".into();
+            svc.store().update_workspace_pr_linkage(&ws).await.unwrap();
+            park.release.notify_one();
+            ws
+        };
+        let (outcome, refreshed) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.updated_at, refreshed.updated_at, "nothing persisted");
+        assert_eq!(after.pull_requests, refreshed.pull_requests);
+        assert_eq!(after.active_pull_request, refreshed.active_pull_request);
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+    }
+
+    /// A pool-only git root whose #42 entry the fold reaches as a hit, with
+    /// the fold parked between its root lookup and its projection.
+    async fn parked_root_hit_setup() -> (
+        TempDb,
+        super::WorkspacesRoot,
+        Services,
+        WorkspaceId,
+        Arc<crate::script_ops::SupervisePark>,
+        SweepRepo,
+    ) {
+        let (t, wsroot, svc, ws_id) = fold_setup_with(queue_signal_forge(true), |_| {}).await;
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let mut root = sweep_root(&ws_id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            42,
+            intent_core::PullRequestStatus::Open,
+            "",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let svc = svc.with_fold_hit_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+        (t, wsroot, svc, ws_id, park, secondary)
+    }
+
+    /// Git-root analogue of the same-head race: the root sweep commits
+    /// fresher fields and a second entry inside the hit's window; the
+    /// projection lands only the signal on the refreshed row and keeps the
+    /// root's linked scalars as they were.
+    #[intent_test_macros::daemon_test]
+    async fn root_hit_projection_lands_on_a_same_head_refresh_committed_mid_window() {
+        let (_t, _root, svc, ws_id, park, _s) = parked_root_hit_setup().await;
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut root = svc
+                .store()
+                .list_workspace_git_roots(&ws_id)
+                .await
+                .unwrap()
+                .remove(0);
+            let mut fresher = root.pull_requests.as_ref().unwrap()[0].clone();
+            fresher.title = "renamed by the sweep".into();
+            fresher.updated_at = "2099-01-01T00:00:00Z".into();
+            fresher.mergeable_state = Some("blocked".into());
+            let other = pool_entry(43, intent_core::PullRequestStatus::Open, "");
+            root.pull_requests = Some(vec![fresher.clone(), other.clone()]);
+            svc.store()
+                .update_workspace_git_root_pr(&root)
+                .await
+                .unwrap();
+            park.release.notify_one();
+            (fresher, other)
+        };
+        let (outcome, (fresher, other)) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+        let mut expected = fresher;
+        expected.is_in_merge_queue = Some(true);
+        assert_eq!(roots[0].pull_requests, Some(vec![expected, other]));
+        assert_eq!(roots[0].pr_number, None, "passive fold never links");
+        assert_eq!(roots[0].pr_status, None);
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "gitRoot:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// Git-root analogue of the moved-head race: the root sweep moves the
+    /// entry to a newer head inside the hit's window, so the projection
+    /// writes nothing and the sweep's record stands.
+    #[intent_test_macros::daemon_test]
+    async fn root_hit_projection_writes_nothing_when_the_head_moved_mid_window() {
+        let (_t, _root, svc, ws_id, park, _s) = parked_root_hit_setup().await;
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut root = svc
+                .store()
+                .list_workspace_git_roots(&ws_id)
+                .await
+                .unwrap()
+                .remove(0);
+            let mut moved = root.pull_requests.as_ref().unwrap()[0].clone();
+            moved.head_sha = Some("moved-past-the-cached-head".into());
+            moved.title = "renamed by the sweep".into();
+            root.pull_requests = Some(vec![moved]);
+            root.updated_at = "2099-01-01T00:00:00Z".into();
+            svc.store()
+                .update_workspace_git_root_pr(&root)
+                .await
+                .unwrap();
+            park.release.notify_one();
+            root
+        };
+        let (outcome, refreshed) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+        assert_eq!(
+            roots[0].updated_at, refreshed.updated_at,
+            "nothing persisted"
+        );
+        assert_eq!(roots[0].pull_requests, refreshed.pull_requests);
+        assert_eq!(
+            roots[0].pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "gitRoot:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
     }
 
     /// Unlinking on a branch mismatch still refreshes an existing pool entry
@@ -22590,15 +23384,20 @@ pub(crate) mod pr {
                 "2026-01-03T00:00:00Z",
             ),
         ]);
+        let mut fetched_fresh = Vec::new();
         let (changed, rate_limited) = crate::pr_ops::refresh_stale_pool_entries(
             &sc,
             &repo,
             &mut list,
-            &[],
+            &mut fetched_fresh,
             std::time::Duration::from_secs(1),
         )
         .await;
         assert!(!changed);
+        assert!(
+            fetched_fresh.is_empty(),
+            "a rate-limited re-fetch is not fresh"
+        );
         assert!(
             rate_limited.is_some_and(|d| d.contains("rate limit")),
             "the limit surfaces to the caller"
@@ -33408,12 +34207,30 @@ mod setup_lifecycle_events {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use intent_core::{WorkspaceApi, WorkspaceCreate};
+    use intent_core::{
+        WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceSetupState,
+    };
     use intent_store::Store;
+    #[cfg(unix)]
+    use intentd_test_support::Barrier;
     use serde_json::{json, Value};
 
-    use super::{test_tempdir, TempDb};
+    use super::{test_registry_with_default_provider, test_tempdir, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    /// Wait until the setup script has reached its barrier (proving the
+    /// spawn succeeded and the script is parked there).
+    #[cfg(unix)]
+    async fn wait_for_barrier(barrier: &Barrier) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !barrier.entered() {
+                // timing-guard: poll interval for the barrier's arrival file
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("setup script reached the barrier");
+    }
 
     /// Temp directory tree swept on drop (see [`test_tempdir`]).
     struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
@@ -33482,7 +34299,9 @@ mod setup_lifecycle_events {
     }
 
     /// Script runs to a zero exit: `started` then `completed` with
-    /// `ranScript: true` and `exitCode: 0`.
+    /// `ranScript: true` and `exitCode: 0`. The script parks on a barrier
+    /// so the `running` snapshot (state + `terminalId` in one write) can be
+    /// asserted without racing the script's exit.
     #[cfg(unix)]
     #[intent_test_macros::daemon_test]
     async fn script_success_emits_started_then_completed_exit_zero() {
@@ -33490,13 +34309,18 @@ mod setup_lifecycle_events {
         let root = unique_dir("intentd-setupev-ok-root");
         let (svc, bus, _tmp) = services(root.0.clone()).await;
         let mut sub = subscribe_setup(&bus);
+        let barrier = Barrier::new(&root.0, "setup");
 
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
                     repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
                     base_ref: Some(head_branch),
-                    setup_script: Some("exit 0".to_string()),
+                    setup_script: Some(format!(
+                        "{}\n{}\nexit 0",
+                        barrier.sh_arrive(),
+                        barrier.sh_wait()
+                    )),
                     ..Default::default()
                 },
                 None,
@@ -33509,6 +34333,26 @@ mod setup_lifecycle_events {
         assert_eq!(ev["type"], "workspace:setup:started");
         assert_eq!(ev["workspaceId"], ws.id.0);
         assert_eq!(ev["data"], json!({ "workspaceId": ws.id.0 }));
+        // `started` precedes the spawn attempt, so the record is still
+        // `pending` or already `running`; once the script has reached the
+        // barrier the spawn succeeded and the snapshot is `running` with
+        // its terminal attached.
+        let early = svc.workspace_setup_status(&ws.id);
+        assert!(
+            matches!(
+                early.state,
+                WorkspaceSetupState::Pending | WorkspaceSetupState::Running
+            ),
+            "after started: {early:?}"
+        );
+        wait_for_barrier(&barrier).await;
+        let running = svc.workspace_setup_status(&ws.id);
+        assert_eq!(running.state, WorkspaceSetupState::Running);
+        assert!(running.terminal_id.is_some(), "running carries terminalId");
+        assert!(running.started_at.is_some(), "running carries startedAt");
+        assert_eq!(running.exit_code, None);
+        assert_eq!(running.finished_at, None);
+        barrier.release();
 
         let ev = recv_setup(&mut sub).await;
         assert_eq!(ev["type"], "workspace:setup:completed");
@@ -33516,6 +34360,12 @@ mod setup_lifecycle_events {
         assert_eq!(ev["data"]["workspaceId"], ws.id.0);
         assert_eq!(ev["data"]["ranScript"], json!(true));
         assert_eq!(ev["data"]["exitCode"], json!(0));
+        let done = svc.workspace_setup_status(&ws.id);
+        assert_eq!(done.state, WorkspaceSetupState::Completed);
+        assert_eq!(done.exit_code, Some(0));
+        assert!(done.terminal_id.is_some(), "completed keeps the terminalId");
+        assert_eq!(done.started_at, running.started_at);
+        assert!(done.finished_at.is_some(), "completed carries finishedAt");
 
         assert_quiet(&mut sub).await;
     }
@@ -33553,6 +34403,10 @@ mod setup_lifecycle_events {
         assert_eq!(ev["type"], "workspace:setup:completed");
         assert_eq!(ev["data"]["ranScript"], json!(true));
         assert_eq!(ev["data"]["exitCode"], json!(7));
+        let failed = svc.workspace_setup_status(&ws.id);
+        assert_eq!(failed.state, WorkspaceSetupState::Failed);
+        assert_eq!(failed.exit_code, Some(7));
+        assert!(failed.finished_at.is_some());
 
         assert_quiet(&mut sub).await;
     }
@@ -33588,6 +34442,10 @@ mod setup_lifecycle_events {
             json!({ "workspaceId": ws.id.0, "ranScript": false }),
             "no exitCode key when no script ran"
         );
+        let skipped = svc.workspace_setup_status(&ws.id);
+        assert_eq!(skipped.state, WorkspaceSetupState::Skipped);
+        assert_eq!(skipped.exit_code, None);
+        assert_eq!(skipped.terminal_id, None);
 
         assert_quiet(&mut sub).await;
     }
@@ -33622,8 +34480,141 @@ mod setup_lifecycle_events {
             ev["data"],
             json!({ "workspaceId": ws.id.0, "ranScript": false })
         );
+        assert_eq!(
+            svc.workspace_setup_status(&ws.id).state,
+            WorkspaceSetupState::Skipped
+        );
 
         assert_quiet(&mut sub).await;
+    }
+
+    /// An infrastructure failure persisting the `initialAgent` returns from
+    /// the create after the workspace row (and its `pending` record) exist
+    /// but before the setup stage is scheduled, so nothing would ever settle
+    /// that record: the row must read `skipped`, never a permanent `pending`.
+    #[intent_test_macros::daemon_test]
+    async fn initial_agent_persist_failure_settles_setup_state_skipped() {
+        let (repo_dir, head_branch) = seed_repo("intentd-setupev-agentfail-repo");
+        let root = unique_dir("intentd-setupev-agentfail-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
+        // The workspace row lands in `workspace`; the agent row insert is the
+        // first store write that touches `agent_session`.
+        sqlx::query("DROP TABLE agent_session")
+            .execute(store.write_pool())
+            .await
+            .expect("drop agent_session table");
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    setup_script: Some("exit 0".to_string()),
+                    initial_agent: Some(WorkspaceCreateInitialAgent {
+                        prompt: Some("inspect the workspace".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("agent persist failure surfaces");
+        assert!(
+            matches!(err, crate::Error::Internal(_)),
+            "infrastructure failure is -32603, got {err:?}"
+        );
+
+        let rows = store.list_workspaces(true).await.expect("workspaces");
+        assert_eq!(rows.len(), 1, "the workspace row was inserted first");
+        assert!(
+            rows[0]
+                .worktree_path
+                .as_deref()
+                .is_some_and(|p| !p.is_empty()),
+            "a worktree was provisioned, so the record started `pending`: {rows:?}"
+        );
+        let status = svc.workspace_setup_status(&rows[0].id);
+        assert_eq!(
+            status.state,
+            WorkspaceSetupState::Skipped,
+            "no setup stage runs for this create: {status:?}"
+        );
+    }
+
+    /// The setup state map's transitions, driven directly: `pending` →
+    /// `running` (state + terminal in one write) → `completed` / `failed`;
+    /// a `started` stage whose spawn failed (`ranScript: false`) goes
+    /// straight from `pending` to `failed` with no exit code; an unrecorded
+    /// workspace reads `unknown`; the wire shape omits absent optional
+    /// fields instead of emitting `null`.
+    #[test]
+    fn setup_state_transitions_and_unknown_default() {
+        use crate::{
+            record_setup_finished, record_setup_pending, record_setup_running,
+            record_setup_skipped, WorkspaceSetupStates,
+        };
+        use intent_core::WorkspaceId;
+
+        let states = WorkspaceSetupStates::default();
+        let read = |id: &WorkspaceId| states.get(id);
+
+        let unrecorded = WorkspaceId::new();
+        let unknown = read(&unrecorded);
+        assert_eq!(unknown.state, WorkspaceSetupState::Unknown);
+        assert_eq!(
+            serde_json::to_value(&unknown).unwrap(),
+            json!({ "state": "unknown" }),
+            "optional fields are omitted, never null"
+        );
+
+        let ok = WorkspaceId::new();
+        record_setup_pending(&states, &ok);
+        assert_eq!(
+            serde_json::to_value(read(&ok)).unwrap(),
+            json!({ "state": "pending" })
+        );
+        record_setup_running(&states, &ok, "term-1");
+        let running = read(&ok);
+        assert_eq!(running.state, WorkspaceSetupState::Running);
+        assert!(running.started_at.is_some());
+        assert_eq!(running.terminal_id.as_deref(), Some("term-1"));
+        record_setup_finished(&states, &ok, true, Some(0));
+        let done = read(&ok);
+        assert_eq!(done.state, WorkspaceSetupState::Completed);
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(done.terminal_id.as_deref(), Some("term-1"));
+        assert_eq!(done.started_at, running.started_at);
+        assert!(done.finished_at.is_some());
+
+        let nonzero = WorkspaceId::new();
+        record_setup_running(&states, &nonzero, "term-2");
+        record_setup_finished(&states, &nonzero, true, Some(3));
+        let failed = read(&nonzero);
+        assert_eq!(failed.state, WorkspaceSetupState::Failed);
+        assert_eq!(failed.exit_code, Some(3));
+        assert_eq!(failed.terminal_id.as_deref(), Some("term-2"));
+
+        let spawn_failed = WorkspaceId::new();
+        record_setup_pending(&states, &spawn_failed);
+        record_setup_finished(&states, &spawn_failed, false, None);
+        let failed = read(&spawn_failed);
+        assert_eq!(failed.state, WorkspaceSetupState::Failed);
+        assert_eq!(failed.exit_code, None);
+        assert_eq!(failed.terminal_id, None);
+        assert!(failed.finished_at.is_some());
+
+        let skipped = WorkspaceId::new();
+        record_setup_pending(&states, &skipped);
+        record_setup_skipped(&states, &skipped);
+        let skipped = read(&skipped);
+        assert_eq!(skipped.state, WorkspaceSetupState::Skipped);
+        assert!(skipped.finished_at.is_some());
+        assert_eq!(skipped.exit_code, None);
     }
 
     /// `workspace.duplicate` runs no setup script: exactly one immediate
@@ -33659,6 +34650,10 @@ mod setup_lifecycle_events {
             ev["data"],
             json!({ "workspaceId": dup.id.0, "ranScript": false })
         );
+        assert_eq!(
+            svc.workspace_setup_status(&dup.id).state,
+            WorkspaceSetupState::Skipped
+        );
 
         assert_quiet(&mut sub).await;
     }
@@ -33666,25 +34661,31 @@ mod setup_lifecycle_events {
     /// `publish_workspace_created` (the out-of-`Services` insert path used by
     /// the legacy importer) pairs its `workspace:created` with an immediate
     /// `completed { ranScript: false }` — imports run no setup stage, so the
-    /// watcher registry must not hold their watcher start until the backstop.
+    /// watcher registry must not hold their watcher start until the backstop
+    /// — and records `skipped` in the shared setup-state map, so a workspace
+    /// row the importer wrote directly through `Store` reads `skipped` (not
+    /// `unknown`) from `workspace_setup_status`.
     #[intent_test_macros::daemon_test]
     async fn publish_workspace_created_emits_immediate_completed() {
-        let root = unique_dir("intentd-setupev-legacy-root");
-        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        use crate::WorkspaceSetupStates;
 
-        let ws = svc
-            .create_workspace(
-                WorkspaceCreate {
-                    title: Some("Imported".to_string()),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .expect("create")
-            .workspace;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let states = WorkspaceSetupStates::default();
+        let svc = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspace_setup_states(states.clone());
 
-        // Subscribe after the create so only the re-publish is in scope.
+        // Insert directly through `Store`, as the importer does: no
+        // `create_workspace`, so nothing has pre-seeded the map.
+        let ws = super::workspace(&intent_core::WorkspaceId::new());
+        store.insert_workspace(&ws).await.expect("insert");
+        assert_eq!(
+            svc.workspace_setup_status(&ws.id).state,
+            WorkspaceSetupState::Unknown
+        );
+
         let mut sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![
                 "workspace:created".to_string(),
@@ -33692,7 +34693,7 @@ mod setup_lifecycle_events {
             ],
             ..Default::default()
         });
-        crate::publish_workspace_created(&bus, &ws).await;
+        crate::publish_workspace_created(&bus, Some(&states), &ws).await;
 
         let ev = recv_setup(&mut sub).await;
         assert_eq!(ev["type"], "workspace:created");
@@ -33705,6 +34706,9 @@ mod setup_lifecycle_events {
             ev["data"],
             json!({ "workspaceId": ws.id.0, "ranScript": false })
         );
+        let skipped = svc.workspace_setup_status(&ws.id);
+        assert_eq!(skipped.state, WorkspaceSetupState::Skipped);
+        assert!(skipped.finished_at.is_some());
 
         assert_quiet(&mut sub).await;
     }

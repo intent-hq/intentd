@@ -29,6 +29,13 @@
 //! edit/remove of the owner's entry are refused (`-32602`) — and the flush
 //! still drains BOTH entries in one combined turn.
 //!
+//! Case 5 (`agent.diagnostics`, two members + one agent-sent entry): the
+//! `queues[]` view is projected per caller exactly like `agent.getQueue`.
+//! Over the wire only the administrator reaches it — the guest's call is
+//! refused by the collaborator allowlist (`-32003`) — and the owner's
+//! diagnostics list all three entries with `queueLength` and
+//! `summary.queuedAgents` following the projected entries.
+//!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
 #![cfg(unix)]
@@ -61,6 +68,8 @@ const QUEUED_TWO: &str = "queued flush two";
 const OWNER_QUEUED: &str = "queued by owner";
 const GUEST_QUEUED: &str = "queued by guest";
 const GUEST_PREAMBLE: &str = "Message from @guest";
+const AGENT_QUEUED: &str = "queued by a sibling agent";
+const RELAY_MARKER: &str = "relay to the busy target";
 const FLUSH_HEADER: &str = "2 queued messages while you were working";
 const WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
 
@@ -447,19 +456,26 @@ struct Booted {
 /// `kickoff_release`: when set, the mock ALSO holds the kick-off turn
 /// (`KICKOFF_MSG`) open until this file exists — a barrier the test releases
 /// once its busy-window work is provably done, instead of a timer that host
-/// scheduling can outrun.
+/// scheduling can outrun. `extra_rules` are appended to the mock's
+/// prompt-matched `rules` after the kick-off barrier.
 async fn boot_daemon(
     data_dir: &Path,
     script: &str,
     first_turn_delay_ms: u64,
     kickoff_release: Option<&Path>,
+    extra_rules: &[Value],
 ) -> Booted {
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let mut behavior =
         json!({ "response": "flush reply", "firstTurnDelayMs": first_turn_delay_ms });
+    let mut rules: Vec<Value> = Vec::new();
     if let Some(release) = kickoff_release {
-        behavior["rules"] = json!([{ "ifPromptContains": KICKOFF_MSG, "releaseFile": release }]);
+        rules.push(json!({ "ifPromptContains": KICKOFF_MSG, "releaseFile": release }));
+    }
+    rules.extend(extra_rules.iter().cloned());
+    if !rules.is_empty() {
+        behavior["rules"] = Value::Array(rules);
     }
     let behavior = behavior.to_string();
     let env: [(&str, &str); 5] = [
@@ -501,7 +517,7 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
         port,
         cfg,
         prompt_log,
-    } = boot_daemon(data_dir, script, 2000, None).await;
+    } = boot_daemon(data_dir, script, 2000, None, &[]).await;
 
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_resp = wss_rpc(
@@ -1239,7 +1255,7 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
         port,
         cfg,
         prompt_log,
-    } = boot_daemon(&data_dir, &script, 0, Some(&kickoff_release)).await;
+    } = boot_daemon(&data_dir, &script, 0, Some(&kickoff_release), &[]).await;
 
     // Both members subscribe to `agent:*` BEFORE the kick-off send.
     let mut owner_sub = connect_ws(port, cfg.clone()).await;
@@ -1723,4 +1739,230 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
             "queue empty after flush: {queue}"
         );
     }
+}
+
+/// Entry ids of one `agent.diagnostics` `queues[]` row, in drain order.
+fn diagnostics_entry_ids(queue_row: &Value) -> Vec<String> {
+    queue_ids(&queue_row["entries"])
+}
+
+/// FLUSH-5 (`agent.diagnostics`, two members): the owner (administrator)
+/// and a collaborator (`guest`) each queue ONE entry behind the target's
+/// busy turn, and a sibling agent queues a third via `ws.agent.send(…,
+/// 'queue')` — the agent-sent tier no wire caller can forge. `queues[]` is
+/// projected to the bound caller exactly like `agent.getQueue`
+/// (`intent_core::project_queue_for_caller`), and the wire reaches it only
+/// for the administrator:
+///
+/// 1. As the guest: `agent.diagnostics` is outside the collaborator
+///    allowlist (`COLLABORATOR_METHODS`), so the envelope is
+///    `{ jsonrpc: "2.0", id, error: { code: -32003, message: "Forbidden" } }`
+///    with no `result` — the transport refuses before the router runs. The
+///    guest-side projection (own + agent-sent entries, owner's hidden) is
+///    the services harness's cell, not a WSS-observable one.
+/// 2. As the owner: `{ jsonrpc: "2.0", id, result }` (no `error`),
+///    `result.ok` is true, `queues` holds ONE row for the target whose
+///    `entries` are all three in drain order (`[owner, guest, agent-sent]`)
+///    with each entry's attribution intact, `queueLength` 3 and
+///    `summary.queuedAgents` 1.
+#[tokio::test]
+async fn diagnostics_projects_queues_per_caller_over_wss() {
+    let Some(script) = gate("WSS agent.diagnostics queue projection E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, guest) = seed_workspace_with_guest(&data_dir).await;
+    // The target's kick-off turn is a barrier (released at the end) so all
+    // three enqueues and both diagnostics reads land inside the busy window.
+    let kickoff_release = data_dir.join("release-kickoff");
+    let relay_code = format!(
+        "const agents = await ws.agent.list(true); \
+         const target = agents.find(a => a.name === 'WSS-DIAG-TARGET'); \
+         return await ws.agent.send(target.id, '{AGENT_QUEUED}', 'queue');"
+    );
+    let relay_rule = json!({
+        "ifPromptContains": RELAY_MARKER,
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": relay_code, "summary": "sibling queues on the busy target" }
+        },
+        "response": "relay dispatched"
+    });
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log: _,
+    } = boot_daemon(&data_dir, &script, 0, Some(&kickoff_release), &[relay_rule]).await;
+
+    // The owner's subscription observes the target's queue growing so the
+    // diagnostics reads run only once all three entries are parked.
+    let mut owner_sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut owner_sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "owner subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut guest_rpc = connect_ws_as(port, cfg.clone(), GUEST_TOKEN).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-DIAG-TARGET", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let target_id = created["agent"]["id"]
+        .as_str()
+        .expect("target agent id")
+        .to_string();
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-DIAG-SENDER", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let sender_id = created["agent"]["id"]
+        .as_str()
+        .expect("sender agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": target_id, "content": KICKOFF_MSG }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    assert_eq!(
+        sent["queued"], false,
+        "kick-off streams, not queued: {sent}"
+    );
+
+    // (a) owner-stamped, (b) guest-stamped, (c) agent-sent — in that order.
+    let owner_q = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.queueMessage",
+        json!({ "workspaceId": ws_id, "agentId": target_id, "content": OWNER_QUEUED }),
+    )
+    .await;
+    assert_eq!(owner_q["success"], true, "owner queue: {owner_q}");
+    let owner_id = owner_q["queuedMessage"]["id"]
+        .as_str()
+        .expect("owner entry id")
+        .to_string();
+    let guest_q = wss_rpc(
+        &mut guest_rpc,
+        100,
+        "agent.queueMessage",
+        json!({ "workspaceId": ws_id, "agentId": target_id, "content": GUEST_QUEUED }),
+    )
+    .await;
+    assert_eq!(guest_q["success"], true, "guest queue: {guest_q}");
+    let guest_id = guest_q["queuedMessage"]["id"]
+        .as_str()
+        .expect("guest entry id")
+        .to_string();
+    let relayed = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": sender_id, "content": RELAY_MARKER }),
+    )
+    .await;
+    assert_eq!(relayed["success"], true, "sender kick-off ok: {relayed}");
+    let grown =
+        await_queue_snapshots(&mut owner_sub, &target_id, |q| queue_ids(q).len() == 3).await;
+    let full = grown.last().expect("three-entry snapshot");
+    let full_ids = queue_ids(full);
+    assert_eq!(
+        &full_ids[..2],
+        [owner_id.clone(), guest_id.clone()],
+        "{full}"
+    );
+    let agent_entry_id = full_ids[2].clone();
+    assert_eq!(
+        full[2]["messageMetadata"]["fromAgentId"],
+        json!(sender_id),
+        "third entry is the sibling's agent-sent one: {full}"
+    );
+    assert!(
+        full[2]["messageMetadata"].get("fromPrincipalId").is_none(),
+        "agent-sent entry carries no principal stamp: {full}"
+    );
+
+    let diagnostics_params = json!({ "workspaceId": ws_id, "agentId": target_id });
+
+    // (1) Guest: refused at the transport — `agent.diagnostics` is not a
+    // collaborator method, so no projected view ever reaches the wire.
+    let guest_env = wss_rpc_envelope(
+        &mut guest_rpc,
+        101,
+        "agent.diagnostics",
+        diagnostics_params.clone(),
+    )
+    .await;
+    assert_eq!(guest_env["jsonrpc"], "2.0", "{guest_env}");
+    assert_eq!(guest_env["id"], json!(101), "{guest_env}");
+    assert!(guest_env.get("result").is_none(), "{guest_env}");
+    assert_eq!(
+        guest_env["error"],
+        json!({ "code": -32003, "message": "Forbidden" }),
+        "collaborator allowlist refuses agent.diagnostics: {guest_env}"
+    );
+
+    // (2) Owner: all three, in drain order, attribution intact.
+    let owner_env = wss_rpc_envelope(&mut rpc, 15, "agent.diagnostics", diagnostics_params).await;
+    assert_eq!(owner_env["jsonrpc"], "2.0", "{owner_env}");
+    assert_eq!(owner_env["id"], json!(15), "{owner_env}");
+    assert!(owner_env.get("error").is_none(), "{owner_env}");
+    let result = &owner_env["result"];
+    assert_eq!(result["ok"], true, "{result}");
+    let queues = result["diagnostics"]["queues"]
+        .as_array()
+        .unwrap_or_else(|| panic!("queues array: {result}"));
+    assert_eq!(queues.len(), 1, "one queued agent in scope: {result}");
+    let owner_row = &queues[0];
+    assert_eq!(owner_row["agentId"], json!(target_id), "{result}");
+    assert_eq!(owner_row["agentName"], json!("WSS-DIAG-TARGET"), "{result}");
+    assert_eq!(
+        result["diagnostics"]["summary"]["queuedAgents"],
+        json!(1),
+        "{result}"
+    );
+    assert_eq!(
+        diagnostics_entry_ids(owner_row),
+        vec![owner_id, guest_id, agent_entry_id],
+        "owner sees the full queue: {owner_row}"
+    );
+    assert_eq!(owner_row["queueLength"], json!(3), "{owner_row}");
+    let entries = owner_row["entries"].as_array().expect("entries array");
+    assert!(
+        entries[0]["messageMetadata"]["fromPrincipalId"]
+            .as_str()
+            .is_some_and(|p| p != guest.id.0),
+        "owner entry is stamped with the administrator's principal: {owner_row}"
+    );
+    assert_eq!(
+        entries[1]["messageMetadata"]["fromPrincipalId"],
+        json!(guest.id.0),
+        "guest entry keeps its principal stamp: {owner_row}"
+    );
+    assert_eq!(
+        entries[2]["messageMetadata"]["fromAgentId"],
+        json!(sender_id),
+        "agent-sent entry keeps its agent stamp: {owner_row}"
+    );
+
+    std::fs::write(&kickoff_release, b"go").expect("write kick-off release file");
 }

@@ -589,6 +589,29 @@ pub fn serve_command_fixed_port() -> std::process::Command {
     cmd
 }
 
+/// Cut a spawned daemon off from the HOST's GitHub identity so its boot-time
+/// primary-identity refresh resolves no token and hydrates no `login` /
+/// `displayName` / `avatarUrl` onto the primary principal (intent-hq/intent#5645).
+/// The daemon's token resolution falls back from the secrets store to
+/// `GITHUB_TOKEN` / `GH_TOKEN` and then to `gh auth token`, so a test that
+/// asserts anonymous author shapes is otherwise a race against the developer's
+/// own `gh auth login` — green on CI and on a logged-out machine, red on a
+/// logged-in one. Removes both env tokens and points `GH_CONFIG_DIR` at an
+/// empty directory under `data_dir` (no `hosts.yml` → `gh auth token` fails
+/// without consulting the keyring). This covers only the env and `gh` rungs:
+/// the caller must ALSO isolate the secrets store (`INTENTD_SECRETS_FILE`
+/// under the test dir, as every spawn helper here already does) or a stored
+/// device-flow token on the host still wins. Callers that seed their own
+/// token / secrets file / API-base mock still layer those on top via later
+/// `.env(..)`.
+pub fn hermetic_github_identity(cmd: &mut std::process::Command, data_dir: &Path) {
+    let gh_config_dir = data_dir.join("gh-config");
+    std::fs::create_dir_all(&gh_config_dir).expect("mkdir empty gh config dir");
+    cmd.env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env("GH_CONFIG_DIR", &gh_config_dir);
+}
+
 /// Enable the WSS/TCP listener for a daemon booted from `data_dir` by seeding
 /// `config.toml` with `[server.wsApi] enabled = true` plus an OS-assigned free
 /// port (the config-driven replacement for the retired `serve --listen both`

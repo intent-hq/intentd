@@ -26,7 +26,7 @@ use crate::model::{
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
     TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceTask, WorkspaceUpdate,
+    WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -78,6 +78,18 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::get_workspace not implemented".to_string(),
             ))
         })
+    }
+
+    /// The daemon-owned, in-memory setup-stage state for `id` (§6.5
+    /// lifecycle: `pending` → `running` → `completed` | `failed`, or
+    /// `skipped`), backing `ws.workspace.details().setupStatus` and the
+    /// turn-start setup notice. Synchronous (no I/O); a workspace with no
+    /// record in this daemon lifetime — including every workspace created
+    /// before boot — reads `state: "unknown"`, which is also the default so
+    /// non-services `WorkspaceApi` impls need not implement it.
+    fn workspace_setup_status(&self, id: &WorkspaceId) -> WorkspaceSetupStatus {
+        let _ = id;
+        WorkspaceSetupStatus::unknown()
     }
 
     /// `workspace.diskUsage`: on-demand cached physical footprint of the

@@ -864,7 +864,10 @@ pub(crate) struct MonitorPrSignals {
 ///    plus the PRs persisted on the workspace's secondary git roots,
 ///    `git_root_prs`, folded in by [`fold_git_root_prs`]) — yields
 ///    `pr_queued` when the PR sits in the forge's merge queue
-///    (`mergeable_state == "queued"`, not draft), `pr_ready` only when truly
+///    (`is_in_merge_queue == Some(true)` — the signal the `github.pulls.get`
+///    fold persists, since GitHub's REST `mergeable_state` reads `"clean"`
+///    for a queued PR — or a host-reported `mergeable_state == "queued"`;
+///    not draft), `pr_ready` only when truly
 ///    mergeable (`mergeable == Some(true)` AND `mergeable_state == "clean"`,
 ///    not draft), else `pr_open`. GitHub's `mergeable` flag alone only means
 ///    "no merge conflicts" — a PR blocked by required checks or reviews
@@ -974,18 +977,27 @@ pub(crate) fn upgrade_pr_lifecycle(present: &mut PullRequestInfo, candidate: &Pu
     }
 }
 
+/// Step 4's merge-queue predicate: the persisted `isInMergeQueue: true`
+/// signal (the `github.pulls.get` fold, intent-hq/intent#5654), or a host
+/// that does report `mergeableState: "queued"` (GitHub's REST never does — a
+/// queued PR reads `"clean"` there).
+fn pr_in_merge_queue(info: &PullRequestInfo) -> bool {
+    info.is_in_merge_queue == Some(true) || info.mergeable_state.as_deref() == Some("queued")
+}
+
 /// Step-4 readiness rung of a same-URL copy, the tie-break behind
 /// [`pr_lifecycle_key`] for copies of equal (rank, `updated_at`). Mirrors
 /// the `pr_queued > pr_ready > pr_open` precedence of
 /// [`rollup_over_pr_pool`] with the same predicates: a non-draft
-/// `mergeableState: "queued"` copy ranks highest, then a non-draft
+/// merge-queued copy ([`pr_in_merge_queue`]: `isInMergeQueue: true` or
+/// `mergeableState: "queued"`) ranks highest, then a non-draft
 /// `mergeable: true` + `"clean"` copy, then any other `mergeable: true`,
 /// then unknown mergeability (`None`), then `mergeable: false` lowest; a
 /// draft copy never ranks as queued/ready (step 4 reads it `pr_open`).
 fn pr_readiness_rank(info: &PullRequestInfo) -> u8 {
     let draft = info.status == PullRequestStatus::Draft || info.is_draft == Some(true);
     let state = info.mergeable_state.as_deref();
-    if !draft && state == Some("queued") {
+    if !draft && pr_in_merge_queue(info) {
         5
     } else if !draft && info.mergeable == Some(true) && state == Some("clean") {
         4
@@ -999,12 +1011,14 @@ fn pr_readiness_rank(info: &PullRequestInfo) -> u8 {
 }
 
 /// [`pr_lifecycle_key`]'s shape: (rank, `updated_at`, readiness rank,
-/// non-draft, `mergeableState`, `mergeable`, `isDraft`, status-not-draft).
+/// non-draft, `isInMergeQueue`, `mergeableState`, `mergeable`, `isDraft`,
+/// status-not-draft).
 type PrLifecycleKey<'a> = (
     u8,
     &'a str,
     u8,
     bool,
+    Option<bool>,
     Option<&'a str>,
     Option<bool>,
     Option<bool>,
@@ -1018,10 +1032,10 @@ type PrLifecycleKey<'a> = (
 /// on (rank, `updated_at`) — two open copies of one PR read at the same
 /// instant with different mergeability — resolve by readiness
 /// ([`pr_readiness_rank`]: queued > ready > open, mirroring step 4), then
-/// non-draft over draft, then the raw `mergeableState` / `mergeable` /
-/// `isDraft` / `status` fields so the order is total over every lifecycle
-/// field: equal keys mean identical lifecycle snapshots, and the selected
-/// copy never depends on the order the copies are visited in.
+/// non-draft over draft, then the raw `isInMergeQueue` / `mergeableState` /
+/// `mergeable` / `isDraft` / `status` fields so the order is total over
+/// every lifecycle field: equal keys mean identical lifecycle snapshots, and
+/// the selected copy never depends on the order the copies are visited in.
 fn pr_lifecycle_key(info: &PullRequestInfo) -> PrLifecycleKey<'_> {
     let draft = info.status == PullRequestStatus::Draft || info.is_draft == Some(true);
     (
@@ -1029,6 +1043,7 @@ fn pr_lifecycle_key(info: &PullRequestInfo) -> PrLifecycleKey<'_> {
         info.updated_at.as_str(),
         pr_readiness_rank(info),
         !draft,
+        info.is_in_merge_queue,
         info.mergeable_state.as_deref(),
         info.mergeable,
         info.is_draft,
@@ -1041,7 +1056,7 @@ fn pr_lifecycle_key(info: &PullRequestInfo) -> PrLifecycleKey<'_> {
 /// equal-ranked `canonical` with a newer `updated_at` advances the
 /// timestamp too; equal (rank, `updated_at`) copies converge on the
 /// readier one ([`pr_lifecycle_key`]). The readiness fields (`isDraft`,
-/// `mergeable`, `mergeableState`) travel with the selected snapshot, so
+/// `mergeable`, `mergeableState`, `isInMergeQueue`) travel with the selected snapshot, so
 /// `present` reads as one coherent copy — the one chosen by the key —
 /// rather than a newer status over whichever copy's mergeability the fold
 /// visited first (step 4's `pr_ready` / `pr_queued` would otherwise depend
@@ -1061,6 +1076,7 @@ pub(crate) fn canonicalize_pr_lifecycle(
         present
             .mergeable_state
             .clone_from(&canonical.mergeable_state);
+        present.is_in_merge_queue = canonical.is_in_merge_queue;
     }
 }
 
@@ -1276,9 +1292,11 @@ fn rollup_over_pr_pool(
     });
     if let Some(pr) = open_pr {
         let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
-        // GitHub reports `mergeable_state: "queued"` for a PR sitting in
-        // the merge queue — it is beyond "ready", the queue is handling it.
-        let queued = pr.mergeable_state.as_deref() == Some("queued");
+        // A PR sitting in the merge queue is beyond "ready" — the queue is
+        // handling it. The signal is the fold-persisted `isInMergeQueue`
+        // (GitHub's REST `mergeable_state` reads `"clean"` for a queued PR)
+        // or a host that does report `mergeable_state: "queued"`.
+        let queued = pr_in_merge_queue(pr);
         // `mergeable` alone only rules out conflicts; only a "clean"
         // `mergeable_state` means the forge would actually accept the merge
         // (blocked/behind/dirty/unstable/unknown/absent all read `pr_open`).
@@ -1509,6 +1527,7 @@ mod display_status {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         }
     }
 
@@ -1836,6 +1855,78 @@ mod display_status {
         // Attention axes and a running agent still outrank a queued PR.
         let mut queued = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         queued.mergeable_state = Some("queued".into());
+        assert_eq!(
+            compute_display_status(sig(true), false, Some(&queued), &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            compute_display_status(sig(false), true, Some(&queued), &[], None, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    /// The pool path keys `pr_queued` on the fold-persisted
+    /// `isInMergeQueue: true` (intent-hq/intent#5654): GitHub's REST never
+    /// reports `mergeable_state: "queued"` — a queued PR reads `"clean"` —
+    /// so a pooled open PR carrying `is_in_merge_queue: Some(true)` over a
+    /// `clean` mergeability reads `pr_queued` with no monitor, linked or
+    /// found via the `pullRequests` scan, whatever `mergeable` says; a draft
+    /// never reads queued; `Some(false)` / `None` keep the `clean` →
+    /// `pr_ready` mapping.
+    #[test]
+    fn open_pr_with_is_in_merge_queue_is_pr_queued_without_a_monitor() {
+        let queued_clean = |mergeable: Option<bool>| {
+            let mut info = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+            info.mergeable = mergeable;
+            info.mergeable_state = Some("clean".into());
+            info.is_in_merge_queue = Some(true);
+            info
+        };
+        for mergeable in [Some(true), Some(false), None] {
+            let queued = queued_clean(mergeable);
+            assert_eq!(
+                compute_display_status(
+                    sig(false),
+                    false,
+                    Some(&queued),
+                    &[],
+                    None,
+                    Some(&stats(2, 2, 0))
+                ),
+                WorkspaceDisplayStatus::PrQueued,
+                "linked, mergeable {mergeable:?}"
+            );
+            assert_eq!(
+                compute_display_status(sig(false), false, None, &[queued], None, None),
+                WorkspaceDisplayStatus::PrQueued,
+                "pooled, mergeable {mergeable:?}"
+            );
+        }
+        // Not queued (reported false or unknown): the REST mapping applies.
+        for not_queued in [Some(false), None] {
+            let mut clean = queued_clean(Some(true));
+            clean.is_in_merge_queue = not_queued;
+            assert_eq!(
+                compute_display_status(sig(false), false, Some(&clean), &[], None, None),
+                WorkspaceDisplayStatus::PrReady,
+                "is_in_merge_queue {not_queued:?}"
+            );
+        }
+        // Drafts never read queued.
+        let mut draft = queued_clean(Some(true));
+        draft.status = PullRequestStatus::Draft;
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&draft), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut flagged = queued_clean(Some(true));
+        flagged.is_draft = Some(true);
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&flagged), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        // Attention axes and a running agent still outrank a queued PR.
+        let queued = queued_clean(Some(true));
         assert_eq!(
             compute_display_status(sig(true), false, Some(&queued), &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
@@ -3084,6 +3175,80 @@ mod display_status {
         }
     }
 
+    /// The readiness rank keys on the same merge-queue predicate as step 4
+    /// (intent-hq/intent#5654): an `isInMergeQueue: true` copy over a `clean`
+    /// mergeability ranks as queued — above a plain `clean` copy of the same
+    /// timestamp in either root order — and the field travels with the
+    /// selected snapshot, so the canonical pooled copy carries it (a lower
+    /// key never moves it onto a readier copy); a draft copy never ranks
+    /// queued.
+    #[test]
+    fn equal_timestamp_same_url_copies_prefer_the_is_in_merge_queue_copy() {
+        const AT: &str = "2026-01-02T00:00:00Z";
+        let clean = open_pr("clean", AT);
+        let mut queued = open_pr("clean", AT);
+        queued.is_in_merge_queue = Some(true);
+        for roots in [
+            [clean.clone(), queued.clone()],
+            [queued.clone(), clean.clone()],
+        ] {
+            let order: Vec<_> = roots.iter().map(|p| p.is_in_merge_queue).collect();
+            assert_eq!(
+                with_git_root_prs(None, &[], &roots, None),
+                WorkspaceDisplayStatus::PrQueued,
+                "roots {order:?}"
+            );
+            let folded = super::fold_git_root_prs(None, &[], &roots, None);
+            assert_eq!(
+                folded
+                    .pool
+                    .iter()
+                    .map(|p| (p.status, p.mergeable_state.as_deref(), p.is_in_merge_queue))
+                    .collect::<Vec<_>>(),
+                vec![(PullRequestStatus::Open, Some("clean"), Some(true))],
+                "roots {order:?}"
+            );
+        }
+        // The same for a workspace-owned pooled copy: the stale `None` pool
+        // entry adopts the root copy's signal and keeps its identity.
+        let pool = [clean.clone()];
+        let folded = super::fold_git_root_prs(None, &pool, &[queued.clone()], Some(PR_URL));
+        assert_eq!(
+            folded
+                .pool
+                .iter()
+                .map(|p| (p.id.as_str(), p.is_in_merge_queue))
+                .collect::<Vec<_>>(),
+            vec![(pool[0].id.as_str(), Some(true))]
+        );
+        assert_eq!(
+            with_git_root_prs(None, &pool, &[queued.clone()], None),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        // A draft copy never ranks queued: the non-draft clean copy wins.
+        let mut draft_queued = queued.clone();
+        draft_queued.status = PullRequestStatus::Draft;
+        draft_queued.is_draft = Some(true);
+        for roots in [
+            [clean.clone(), draft_queued.clone()],
+            [draft_queued.clone(), clean.clone()],
+        ] {
+            assert_eq!(
+                with_git_root_prs(None, &[], &roots, None),
+                WorkspaceDisplayStatus::PrReady
+            );
+            let folded = super::fold_git_root_prs(None, &[], &roots, None);
+            assert_eq!(
+                folded
+                    .pool
+                    .iter()
+                    .map(|p| (p.status, p.is_in_merge_queue))
+                    .collect::<Vec<_>>(),
+                vec![(PullRequestStatus::Open, None)]
+            );
+        }
+    }
+
     /// The same tie rule across a workspace's own copies: a linked
     /// `open(blocked)` and a pooled `open(clean)` of one URL at the same
     /// timestamp, plus an older same-URL root copy (and a same-timestamp
@@ -4172,6 +4337,7 @@ mod display_status_events {
                     mergeable: None,
                     mergeable_state: None,
                     is_draft: None,
+                    is_in_merge_queue: None,
                 }]),
                 created_at: ts.clone(),
                 updated_at: ts,
