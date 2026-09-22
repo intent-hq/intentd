@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.99] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- *(agent)* Reject self-targeted ws.agent.send / sendToTask ([#2084](https://github.com/intent-hq/intentd/pull/2084))
+
+### 🧪 Testing
+
+- *(intentd)* Mid tool-call interrupt settles and drains the queue ([#5669](https://github.com/intent-hq/intentd/pull/5669)) ([#2086](https://github.com/intent-hq/intentd/pull/2086))
+
+
 ## [0.9.98] - 2026-09-22
 
 ### 🚀 Features
