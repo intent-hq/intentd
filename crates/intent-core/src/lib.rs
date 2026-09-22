@@ -46,7 +46,10 @@ pub use agent_logs::{
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
 };
 pub use caller::{
-    current_caller, project_queue_for_caller, queue_visible_to, spawn_daemon, with_caller, Caller,
+    current_caller, is_human_authored_metadata, project_queue_for_caller,
+    queue_attribution_visible_to, queue_attribution_with, queue_entry_attribution,
+    queue_processing_event_attribution, queue_processing_event_metadata, queue_visible_to,
+    spawn_daemon, with_caller, Caller, QueueAttribution, QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY,
 };
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd};
 pub use clock::{

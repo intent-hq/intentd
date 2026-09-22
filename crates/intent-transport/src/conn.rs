@@ -1070,7 +1070,9 @@ async fn forward_subscription(
                             continue;
                         }
                         // A gated (non-administrator) connection sees only
-                        // its own queue entries in `agent:queue:updated`.
+                        // its own queue entries in `agent:queue:updated`, and
+                        // no `content` in `agent:queue:processing` for a
+                        // foreign entry.
                         events::project_queue_event_for_current_caller(&mut event);
                     }
                     if let Some(key) = conflate::event_key(&event) {

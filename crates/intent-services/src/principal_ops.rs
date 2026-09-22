@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::{
-    current_caller, lift_from_principal_id, now_iso, Caller, Error, InviteErrorKind, Principal,
-    PrincipalId, Result, Workspace, WorkspaceId, FROM_PRINCIPAL_ID_KEY,
+    current_caller, is_human_authored_metadata, lift_from_principal_id, now_iso, Caller, Error,
+    InviteErrorKind, Principal, PrincipalId, Result, Workspace, WorkspaceId, FROM_PRINCIPAL_ID_KEY,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -147,31 +147,6 @@ pub(crate) fn stamp_principal_attribution(
 /// through `deliver_wake_message` is enqueued as `Automatic`, yet stamped).
 pub(crate) fn carries_principal_stamp(message_metadata: Option<&Value>) -> bool {
     lift_from_principal_id(message_metadata).is_some()
-}
-
-/// `true` when an unstamped queue entry's `messageMetadata` still reads as
-/// human-authored — the same rule the fe applies to transcript rows: an
-/// entry is agent/automatic origin iff its metadata is an object with a
-/// string `type` (other than the user-authored `question_answers` wizard
-/// tag), a non-empty `fromAgentId`, or `source == "system"`. Absent or
-/// non-object metadata fails open (human).
-fn is_human_authored_metadata(message_metadata: Option<&Value>) -> bool {
-    let Some(Value::Object(obj)) = message_metadata else {
-        return true;
-    };
-    match obj.get("type").and_then(Value::as_str) {
-        Some("question_answers") => return true,
-        Some(_) => return false,
-        None => {}
-    }
-    if obj
-        .get("fromAgentId")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.trim().is_empty())
-    {
-        return false;
-    }
-    obj.get("source").and_then(Value::as_str) != Some("system")
 }
 
 /// Strip a client-supplied [`FROM_PRINCIPAL_ID_KEY`] without stamping — for
@@ -445,7 +420,10 @@ impl<'a> MessageAuthorResolver<'a> {
         }
     }
 
-    async fn fallback_principal_id(&self) -> Option<PrincipalId> {
+    /// The workspace fallback author for unstamped human rows (the legacy
+    /// author, else the owner); `None` when the workspace has none or the
+    /// read fails. Cached for the resolver's lifetime.
+    pub(crate) async fn fallback_principal_id(&self) -> Option<PrincipalId> {
         self.fallback
             .get_or_init(|| async {
                 match self
@@ -467,7 +445,12 @@ impl<'a> MessageAuthorResolver<'a> {
     }
 
     /// The `author` value for a user row with `metadata`; `None` when nothing
-    /// resolves (no stamp and a workspace without principal columns).
+    /// resolves (no stamp and a workspace without principal columns). A
+    /// failed principal-table read keeps the identity and drops only the
+    /// profile fields (`principalId` set, `login` / `displayName` /
+    /// `avatarUrl` null): the per-principal queue visibility keys on
+    /// `author.principalId`, so a transient store fault must never render a
+    /// stamped entry as author-less (which would expose it to every guest).
     pub(crate) async fn resolve(&mut self, metadata: Option<&Value>) -> Option<Value> {
         let principal_id = match lift_from_principal_id(metadata) {
             Some(id) => id,
@@ -483,7 +466,7 @@ impl<'a> MessageAuthorResolver<'a> {
                 Err(Error::NotFound(_)) => None,
                 Err(e) => {
                     tracing::debug!(error = %e, principal = %principal_id, "message author: principal read failed");
-                    return None;
+                    return Some(author_to_wire(&principal_id, None));
                 }
             };
             self.principals.insert(principal_id.clone(), loaded);
@@ -494,33 +477,23 @@ impl<'a> MessageAuthorResolver<'a> {
         ))
     }
 
-    /// The principal a queue entry with `metadata` resolves to under the
-    /// [`Self::attach_queue`] rule: its stamp, else the workspace fallback
-    /// for an unstamped entry whose metadata still reads as human-authored;
-    /// `None` for agent-sent / automatic entries and anything the workspace
-    /// cannot resolve. No principal-table read — the identity alone.
-    pub(crate) async fn queue_author_principal_id(
-        &self,
-        metadata: Option<&Value>,
-    ) -> Option<PrincipalId> {
-        match lift_from_principal_id(metadata) {
-            Some(id) => Some(id),
-            None if is_human_authored_metadata(metadata) => self.fallback_principal_id().await,
-            None => None,
-        }
-    }
-
     /// Set `author` on EVERY entry of a queue snapshot (`agent.getQueue` /
     /// `agent:queue:updated`): the key is always present so a client can
     /// treat it as authoritative — the projection resolved from the entry's
     /// `messageMetadata` in the same order as a transcript user row (stamp,
     /// else workspace fallback) and the same batched shape, or an explicit
     /// `null`. A stamped entry always resolves (the stamp is the daemon's own
-    /// "a person submitted this" marker); an unstamped entry gets the
-    /// workspace fallback only when its metadata still reads as
-    /// human-authored ([`is_human_authored_metadata`]) — agent-sent and
-    /// automatic (hook / monitor / system) entries are `null`, as is anything
-    /// the workspace cannot resolve.
+    /// "a person submitted this" marker) — with null profile fields when the
+    /// principal row is unreadable, never as `null` author, since the
+    /// per-principal visibility ([`intent_core::queue_visible_to`]) keys on
+    /// `author.principalId`; an unstamped entry gets the workspace fallback
+    /// only when its metadata still reads as human-authored
+    /// ([`is_human_authored_metadata`]) — agent-sent and automatic (hook /
+    /// monitor / system) entries are `null`, as is a human-origin entry the
+    /// workspace cannot resolve. That last case is NOT public: the
+    /// visibility predicate re-reads a `null`-author entry's own
+    /// `messageMetadata` ([`intent_core::queue_entry_attribution`]) and
+    /// withholds an unattributable human entry from every guest.
     pub(crate) async fn attach_queue(&mut self, entries: &mut [Value]) {
         let candidates: Vec<(usize, Option<PrincipalId>)> = entries
             .iter()

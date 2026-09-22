@@ -13519,7 +13519,7 @@ async fn get_queue_is_projected_to_the_calling_principal() {
 }
 
 /// Shared workspace — the per-id queue mutations respect the entry's author
-/// ([`Services::require_queue_entry_ownership`]). `agent.editQueuedMessage`
+/// ([`Services::queue_entry_gate`]). `agent.editQueuedMessage`
 /// is author-only for every wire caller, the administrator included; a
 /// guest collaborator may `agent.removeQueuedMessage` /
 /// `agent.sendQueuedMessageNow` only the entries its `agent.getQueue` shows
@@ -13800,6 +13800,645 @@ async fn queue_mutations_enforce_entry_ownership() {
         .await
         .expect("agent caller removes the owner's entry");
     assert!(svc.queue_snapshot(&id).is_empty());
+}
+
+/// Shared-workspace test fixture: the administrator (primary principal) and
+/// one guest collaborator of `ws`, as wire callers.
+async fn owner_and_guest_callers(
+    svc: &Services,
+    ws: &WorkspaceId,
+) -> (intent_core::Caller, intent_core::Caller) {
+    use intent_core::{Caller, Principal, PrincipalId};
+
+    let owner = svc
+        .store()
+        .get_primary_principal()
+        .await
+        .expect("primary principal")
+        .id;
+    let guest = PrincipalId::new();
+    svc.store()
+        .upsert_principal(&Principal {
+            id: guest.clone(),
+            github_user_id: None,
+            login: Some("guest".into()),
+            display_name: Some("Guest User".into()),
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("principal");
+    svc.store()
+        .add_workspace_member(ws, &guest, intent_core::WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    (
+        Caller::Wire {
+            principal_id: owner,
+            is_administrator: true,
+        },
+        Caller::Wire {
+            principal_id: guest,
+            is_administrator: false,
+        },
+    )
+}
+
+/// intentd#2068 review (P1): the ownership check is evaluated INSIDE the
+/// mutation's critical section against the entry actually found there, not
+/// against a pre-read of the live queue. The former pre-read passed an id
+/// absent from `agent_queues`, which a foreign entry provisionally popped
+/// for the owner's `sendQueuedMessageNow` is; the guest op then awaited
+/// (preamble / session reads), the owner's send lost its slot and
+/// `requeue_front` restored the same id, and the mutation landed on a
+/// foreign entry unchecked. Reproduced deterministically with the
+/// `queue_mutation_gate_park` seam for edit, remove and send-now: the
+/// entry is parked in the draining overlay, the guest op is started and
+/// held in the window, the id is restored, and the released mutation must
+/// be refused with `-32602 queued message not found`, leaving the entry
+/// (author stamp, content, position) and the queue untouched. The owner's
+/// own mutation of the restored entry still succeeds.
+#[tokio::test]
+async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() {
+    use intent_core::{with_caller, Caller};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let svc = Services::new(store)
+        .with_settings_registry(test_registry_with_default_provider(&tmp))
+        .with_queue_mutation_gate_park(Arc::clone(&park));
+    let id = create_agent(&svc, &ws, "Shared").await;
+    let (as_admin, as_guest) = owner_and_guest_callers(&svc, &ws).await;
+
+    let entry = |mid: &str| svc.queue_snapshot(&id).into_iter().find(|q| q["id"] == mid);
+    for op in ["edit", "remove", "sendNow"] {
+        // The owner's stamped entry — foreign to the guest.
+        let owner_entry = with_caller(as_admin.clone(), async {
+            svc.agent_queue_message(id.clone(), format!("from owner ({op})"), None, None, None)
+                .await
+        })
+        .await
+        .expect("owner queueMessage")["queuedMessage"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before = entry(&owner_entry).expect("owner entry queued");
+        assert_eq!(
+            before["messageMetadata"]["fromPrincipalId"],
+            as_admin.principal_id().unwrap().0
+        );
+
+        // The owner's force-send pops it provisionally: gone from the live
+        // queue, listed only through the draining overlay.
+        let popped = svc
+            .take_queued_message(&id, &owner_entry)
+            .expect("live entry");
+        let draining = svc.mark_draining(&id, std::slice::from_ref(&popped));
+        assert!(
+            svc.find_queued_message(&id, &owner_entry).is_none(),
+            "{op}: absent from the live queue while draining"
+        );
+        assert!(
+            entry(&owner_entry).is_some(),
+            "{op}: still listed via the draining overlay"
+        );
+
+        // The guest's mutation starts and parks in the window between its
+        // ownership pre-resolution and the locked mutation.
+        let guest_op = {
+            let svc = svc.clone();
+            let (id, ws, mid) = (id.clone(), ws.clone(), owner_entry.clone());
+            let caller: Caller = as_guest.clone();
+            tokio::spawn(with_caller(caller, async move {
+                match op {
+                    "edit" => {
+                        svc.agent_edit_queued_message(id, mid, "hijacked".into(), None)
+                            .await
+                    }
+                    "remove" => svc.agent_remove_queued_message(id, mid).await,
+                    _ => svc.agent_send_queued_message_now(ws, id, mid).await,
+                }
+            }))
+        };
+        timeout(Duration::from_secs(10), park.entered.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{op}: the guest op never reached the mutation window"));
+
+        // The owner's send loses its slot (or its persist fails): the entry
+        // is restored at the front of the live queue and leaves the overlay.
+        svc.requeue_front(&id, popped);
+        drop(draining);
+        park.release.notify_one();
+
+        let result = timeout(Duration::from_secs(10), guest_op)
+            .await
+            .unwrap_or_else(|_| panic!("{op}: the guest op never completed"))
+            .expect("guest op task");
+        let err = match result {
+            Ok(v) => panic!(
+                "{op}: a guest mutation of the restored foreign entry must be refused, got {v}"
+            ),
+            Err(e) => e,
+        };
+        match err {
+            Error::InvalidParams(msg) => assert_eq!(
+                msg,
+                format!("queued message not found: {owner_entry}"),
+                "{op}"
+            ),
+            other => panic!("{op}: expected -32602, got {other:?}"),
+        }
+        let after = entry(&owner_entry).expect("entry still queued");
+        assert_eq!(
+            after, before,
+            "{op}: the refused mutation leaves the entry untouched (author stamp, content, position)"
+        );
+        assert_eq!(
+            svc.queue_snapshot(&id).len(),
+            1,
+            "{op}: the queue holds exactly the restored entry"
+        );
+        assert_eq!(
+            svc.store()
+                .get_agent_session(&id)
+                .await
+                .expect("session")
+                .messages
+                .len(),
+            0,
+            "{op}: nothing reached the transcript"
+        );
+
+        // The owner's own mutation of the restored entry is unaffected.
+        let removed = with_caller(as_admin.clone(), async {
+            svc.agent_remove_queued_message(id.clone(), owner_entry.clone())
+                .await
+        })
+        .await
+        .expect("owner removes its restored entry");
+        assert_eq!(removed["success"], true, "{removed}");
+        assert!(svc.queue_snapshot(&id).is_empty(), "{op}");
+    }
+}
+
+/// intentd#2068 review (fail-closed visibility): a stamped foreign entry
+/// stays hidden from a guest even when the principal profile lookup fails.
+/// The `author` projection then carries the identity from the stamp with
+/// null profile fields (`principalId` set; `login` / `displayName` /
+/// `avatarUrl` null) instead of collapsing to `author: null`, which the
+/// visibility predicate treats as author-less — so `agent.getQueue` and the
+/// `agent:queue:updated` payload (the transport projection's input) keep
+/// filtering it, the administrator still sees everything, and the mutation
+/// gate (stamp-keyed, no principal read) keeps refusing it.
+#[tokio::test]
+async fn stamped_entries_stay_hidden_from_guests_when_the_principal_lookup_fails() {
+    use intent_core::{with_caller, Caller};
+    use serde_json::Value;
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Shared").await;
+    let (as_admin, as_guest) = owner_and_guest_callers(&svc, &ws).await;
+    let owner = as_admin.principal_id().unwrap().0.clone();
+    let guest = as_guest.principal_id().unwrap().0.clone();
+
+    let queue_as = |caller: Caller, text: &str| {
+        let svc = &svc;
+        let id = id.clone();
+        let text = text.to_string();
+        async move {
+            with_caller(caller, async move {
+                svc.agent_queue_message(id, text, None, None, None).await
+            })
+            .await
+            .expect("queueMessage")["queuedMessage"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let owner_entry = queue_as(as_admin.clone(), "from owner").await;
+    let guest_entry = queue_as(as_guest.clone(), "from guest").await;
+
+    // Every principal read fails from here on (the table is gone); the
+    // stamps on the entries are untouched.
+    sqlx::query("ALTER TABLE principal RENAME TO principal_offline")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("take the principal table offline");
+    assert!(
+        svc.store()
+            .get_principal(&intent_core::PrincipalId(owner.clone()))
+            .await
+            .is_err(),
+        "principal lookups fail"
+    );
+
+    let read_as = |caller: Caller| {
+        let svc = &svc;
+        let id = id.clone();
+        let ws = ws.clone();
+        async move {
+            with_caller(
+                caller,
+                async move { svc.agent_get_queue_op(id, Some(ws)).await },
+            )
+            .await
+            .expect("getQueue")["queue"]
+                .as_array()
+                .expect("queue array")
+                .clone()
+        }
+    };
+    let ids = |queue: &[Value]| -> Vec<String> {
+        queue
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let bare_author = |principal: &str| {
+        json!({
+            "principalId": principal,
+            "login": Value::Null,
+            "displayName": Value::Null,
+            "avatarUrl": Value::Null,
+        })
+    };
+
+    let guest_view = read_as(as_guest.clone()).await;
+    assert_eq!(
+        ids(&guest_view),
+        vec![guest_entry.clone()],
+        "guest: the owner's stamped entry stays hidden when its profile is unreadable: {}",
+        json!(guest_view)
+    );
+    assert_eq!(
+        guest_view[0]["author"],
+        bare_author(&guest),
+        "{}",
+        guest_view[0]
+    );
+
+    let owner_view = read_as(as_admin.clone()).await;
+    assert_eq!(
+        ids(&owner_view),
+        vec![owner_entry.clone(), guest_entry.clone()],
+        "administrator: full queue: {}",
+        json!(owner_view)
+    );
+    assert_eq!(
+        owner_view[0]["author"],
+        bare_author(&owner),
+        "{}",
+        owner_view[0]
+    );
+    assert_eq!(
+        owner_view[1]["author"],
+        bare_author(&guest),
+        "{}",
+        owner_view[1]
+    );
+
+    // The `agent:queue:updated` payload (what the transport projects per
+    // subscriber) carries the same identity-bearing authors.
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_queue_message_op(
+        id.clone(),
+        "from agent".into(),
+        None,
+        None,
+        Some(json!({ "fromAgentId": "agent-peer", "fromAgentName": "Peer" })),
+    )
+    .await
+    .expect("agent-sent queueMessage");
+    let mut event_queue = None;
+    while let Ok(Some(batch)) = timeout(Duration::from_secs(5), sub.recv()).await {
+        for evt in batch
+            .iter()
+            .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        {
+            event_queue = Some(evt.data["queue"].clone());
+        }
+        if event_queue.is_some() {
+            break;
+        }
+    }
+    let event_queue = event_queue.expect("queue:updated emitted");
+    let event_queue = event_queue.as_array().expect("queue array");
+    assert_eq!(event_queue.len(), 3, "{event_queue:?}");
+    assert_eq!(
+        event_queue[0]["author"],
+        bare_author(&owner),
+        "{}",
+        event_queue[0]
+    );
+    assert_eq!(
+        event_queue[1]["author"],
+        bare_author(&guest),
+        "{}",
+        event_queue[1]
+    );
+    assert_eq!(event_queue[2]["author"], Value::Null, "{}", event_queue[2]);
+    assert_eq!(
+        ids(&intent_core::project_queue_for_caller(
+            Some(&as_guest),
+            event_queue.clone()
+        )),
+        vec![
+            guest_entry.clone(),
+            event_queue[2]["id"].as_str().unwrap().to_string()
+        ],
+        "the per-subscriber projection drops the owner's entry"
+    );
+
+    // The mutation gate keys on the stamp too: the foreign entry is refused.
+    let err = with_caller(as_guest.clone(), async {
+        svc.agent_remove_queued_message_op(id.clone(), owner_entry.clone())
+            .await
+    })
+    .await
+    .expect_err("guest removes the owner's entry");
+    assert!(
+        matches!(&err, Error::InvalidParams(m) if *m == format!("queued message not found: {owner_entry}")),
+        "{err:?}"
+    );
+    assert!(svc.find_queued_message(&id, &owner_entry).is_some());
+    with_caller(as_admin, async {
+        svc.agent_remove_queued_message_op(id.clone(), owner_entry.clone())
+            .await
+    })
+    .await
+    .expect("administrator removes the owner's entry");
+    assert!(svc.find_queued_message(&id, &owner_entry).is_none());
+}
+
+/// intentd#2068 review: an UNSTAMPED human-origin entry (a legacy
+/// pre-attribution row) whose workspace fallback cannot be resolved is not
+/// "author-less and public" — it fails closed as an unknown human. With the
+/// workspace's `legacy_author_principal_id` and `owner_principal_id` both
+/// cleared (the deterministic `Ok(None)` of the fallback read; a failed read
+/// resolves to the same `None`), the guest's `agent.getQueue` and projected
+/// `agent:queue:updated` omit the entry, its `agent:queue:processing` frame
+/// is marked for redaction, and every per-id mutation reads it as absent —
+/// while the administrator still sees it with an explicit `author: null`.
+/// A genuinely unattributed (agent-sent) entry stays public to the guest.
+#[tokio::test]
+async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
+    use intent_core::{with_caller, Caller, QueueAttribution};
+    use serde_json::Value;
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Shared").await;
+    let (as_admin, as_guest) = owner_and_guest_callers(&svc, &ws).await;
+
+    let (legacy, _) = svc.enqueue_message(
+        &id,
+        "legacy human text".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    let (from_agent, _) = svc.enqueue_message(
+        &id,
+        "from agent".into(),
+        None,
+        None,
+        Some(json!({ "fromAgentId": "agent-peer", "fromAgentName": "Peer" })),
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
+    let guest_entry = with_caller(as_guest.clone(), async {
+        svc.agent_queue_message(id.clone(), "from guest".into(), None, None, None)
+            .await
+    })
+    .await
+    .expect("queueMessage")["queuedMessage"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        intent_core::lift_from_principal_id(legacy.message_metadata.as_ref()).is_none(),
+        "the legacy entry carries no stamp: {:?}",
+        legacy.message_metadata
+    );
+
+    // The workspace resolves no fallback author from here on.
+    sqlx::query(
+        "UPDATE workspace SET legacy_author_principal_id = NULL, owner_principal_id = NULL WHERE id = ?",
+    )
+    .bind(&ws.0)
+    .execute(svc.store().write_pool())
+    .await
+    .expect("clear the workspace author fallback");
+    assert_eq!(
+        crate::principal_ops::MessageAuthorResolver::new(&svc, &ws)
+            .fallback_principal_id()
+            .await,
+        None,
+        "the fallback read resolves nothing"
+    );
+
+    let read_as = |caller: Caller| {
+        let svc = &svc;
+        let id = id.clone();
+        let ws = ws.clone();
+        async move {
+            with_caller(
+                caller,
+                async move { svc.agent_get_queue_op(id, Some(ws)).await },
+            )
+            .await
+            .expect("getQueue")["queue"]
+                .as_array()
+                .expect("queue array")
+                .clone()
+        }
+    };
+    let ids = |queue: &[Value]| -> Vec<String> {
+        queue
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let guest_view = read_as(as_guest.clone()).await;
+    assert_eq!(
+        ids(&guest_view),
+        vec![from_agent.id.clone(), guest_entry.clone()],
+        "guest: the unattributable human entry is withheld, the agent-sent one is not: {}",
+        json!(guest_view)
+    );
+    let owner_view = read_as(as_admin.clone()).await;
+    assert_eq!(
+        ids(&owner_view),
+        vec![
+            legacy.id.clone(),
+            from_agent.id.clone(),
+            guest_entry.clone()
+        ],
+        "administrator: full queue: {}",
+        json!(owner_view)
+    );
+    assert_eq!(
+        owner_view[0]["author"],
+        Value::Null,
+        "the unattributable entry is served with an explicit null author: {}",
+        owner_view[0]
+    );
+    assert_eq!(
+        intent_core::queue_entry_attribution(&owner_view[0]),
+        QueueAttribution::UnknownHuman
+    );
+    assert_eq!(
+        intent_core::queue_entry_attribution(&owner_view[1]),
+        QueueAttribution::Unattributed
+    );
+
+    // The `agent:queue:updated` payload projects the same way per subscriber.
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_queue_message_op(
+        id.clone(),
+        "second from agent".into(),
+        None,
+        None,
+        Some(json!({ "fromAgentId": "agent-peer", "fromAgentName": "Peer" })),
+    )
+    .await
+    .expect("agent-sent queueMessage");
+    let mut event_queue = None;
+    while let Ok(Some(batch)) = timeout(Duration::from_secs(5), sub.recv()).await {
+        for evt in batch
+            .iter()
+            .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        {
+            event_queue = Some(evt.data["queue"].clone());
+        }
+        if event_queue.is_some() {
+            break;
+        }
+    }
+    let event_queue = event_queue.expect("queue:updated emitted");
+    let event_queue = event_queue.as_array().expect("queue array").clone();
+    assert_eq!(event_queue.len(), 4, "{event_queue:?}");
+    assert_eq!(event_queue[0]["id"], legacy.id, "{event_queue:?}");
+    assert_eq!(event_queue[0]["author"], Value::Null, "{}", event_queue[0]);
+    let projected = intent_core::project_queue_for_caller(Some(&as_guest), event_queue.clone());
+    assert_eq!(
+        ids(&projected),
+        vec![
+            from_agent.id.clone(),
+            guest_entry.clone(),
+            event_queue[3]["id"].as_str().unwrap().to_string()
+        ],
+        "the per-subscriber projection drops the unattributable entry: {}",
+        json!(projected)
+    );
+    assert_eq!(
+        intent_core::project_queue_for_caller(Some(&as_admin), event_queue.clone()),
+        event_queue,
+        "the administrator's projection is the full payload"
+    );
+
+    // The drain-start signal marks the entry as an unknown human, which the
+    // transport redacts for the guest and passes whole to the administrator.
+    let mut processing = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_PROCESSING.to_string()],
+        ..Default::default()
+    });
+    svc.publish_queue_processing(&id, &ws, &legacy).await;
+    let mut processing_event = None;
+    while let Ok(Some(batch)) = timeout(Duration::from_secs(5), processing.recv()).await {
+        for evt in batch
+            .iter()
+            .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_PROCESSING)
+        {
+            processing_event = Some(evt.clone());
+        }
+        if processing_event.is_some() {
+            break;
+        }
+    }
+    let processing_event = processing_event.expect("queue:processing emitted");
+    assert_eq!(processing_event.data["messageId"], legacy.id);
+    assert_eq!(processing_event.data["content"], "legacy human text");
+    let attribution =
+        intent_core::queue_processing_event_attribution(processing_event.metadata.as_ref());
+    assert_eq!(
+        attribution,
+        QueueAttribution::UnknownHuman,
+        "{:?}",
+        processing_event.metadata
+    );
+    assert!(
+        !intent_core::queue_attribution_visible_to(&as_guest, &attribution),
+        "the guest's frame is redacted"
+    );
+    assert!(
+        intent_core::queue_attribution_visible_to(&as_admin, &attribution),
+        "the administrator's frame is not"
+    );
+
+    // Every per-id mutation reads the entry as absent for the guest.
+    let not_found = |err: &Error| matches!(err, Error::InvalidParams(m) if *m == format!("queued message not found: {}", legacy.id));
+    let err = with_caller(as_guest.clone(), async {
+        svc.agent_edit_queued_message_op(id.clone(), legacy.id.clone(), "hijack".into(), None)
+            .await
+    })
+    .await
+    .expect_err("guest edits the unattributable entry");
+    assert!(not_found(&err), "{err:?}");
+    let err = with_caller(as_guest.clone(), async {
+        svc.agent_send_queued_message_now_op(id.clone(), legacy.id.clone())
+            .await
+    })
+    .await
+    .expect_err("guest force-sends the unattributable entry");
+    assert!(not_found(&err), "{err:?}");
+    let err = with_caller(as_guest.clone(), async {
+        svc.agent_remove_queued_message_op(id.clone(), legacy.id.clone())
+            .await
+    })
+    .await
+    .expect_err("guest removes the unattributable entry");
+    assert!(not_found(&err), "{err:?}");
+    let untouched = svc
+        .find_queued_message(&id, &legacy.id)
+        .expect("the entry is still queued");
+    assert_eq!(untouched.content, "legacy human text");
+    assert_eq!(untouched.message_metadata, legacy.message_metadata);
+
+    // The administrator is unaffected (nobody else can be its author).
+    with_caller(as_admin.clone(), async {
+        svc.agent_edit_queued_message_op(id.clone(), legacy.id.clone(), "owner edit".into(), None)
+            .await
+    })
+    .await
+    .expect("administrator edits the unattributable entry");
+    assert_eq!(
+        svc.find_queued_message(&id, &legacy.id).unwrap().content,
+        "owner edit"
+    );
+    with_caller(as_admin, async {
+        svc.agent_remove_queued_message_op(id.clone(), legacy.id.clone())
+            .await
+    })
+    .await
+    .expect("administrator removes the unattributable entry");
+    assert!(svc.find_queued_message(&id, &legacy.id).is_none());
 }
 
 /// `agent.getQueue` never omits `author`: an unscoped read whose session

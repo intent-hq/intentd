@@ -640,9 +640,12 @@ fn user_row_texts(conv: &Value) -> Vec<String> {
 /// kick-off send's echo carries its own turn's id, so it appears first),
 /// plus each user-row echo's drain identity link `queuedMessageId`
 /// (intentd#1783; `None` for the direct-send kick-off echo).
+/// `processing_frames` keeps each `agent:queue:processing` `data` payload
+/// whole, for the per-subscriber `content` projection.
 struct DrainObservation {
     queue_lengths: Vec<usize>,
     processing_turn_ids: Vec<String>,
+    processing_frames: Vec<Value>,
     user_row_turn_ids: Vec<String>,
     user_row_queued_message_ids: Vec<Option<String>>,
 }
@@ -654,6 +657,7 @@ async fn observe_drain(
 ) -> DrainObservation {
     let mut queue_lengths = Vec::new();
     let mut processing_turn_ids = Vec::new();
+    let mut processing_frames = Vec::new();
     let mut user_row_turn_ids = Vec::new();
     let mut user_row_queued_message_ids = Vec::new();
     let mut stream_ends = 0usize;
@@ -675,6 +679,7 @@ async fn observe_drain(
                         .expect("queue:processing carries a turnId")
                         .to_string(),
                 );
+                processing_frames.push(event["data"].clone());
             }
             Some("agent:message") => {
                 if event["data"]["role"] == "user" {
@@ -704,6 +709,7 @@ async fn observe_drain(
     DrainObservation {
         queue_lengths,
         processing_turn_ids,
+        processing_frames,
         user_row_turn_ids,
         user_row_queued_message_ids,
     }
@@ -1590,6 +1596,27 @@ async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
         "the guest observes the same single combined turn"
     );
     let combined_turn_id = &owner_obs.processing_turn_ids[0];
+    // The drain-start frame is keyed on the batch head — the owner's entry.
+    // The owner's frame carries its content; the guest's is projected to
+    // ids only (the entry is hidden from the guest's queue), while the
+    // batch still flushes as one turn below.
+    let owner_processing = &owner_obs.processing_frames[0];
+    assert_eq!(
+        owner_processing["messageId"],
+        json!(owner_id),
+        "processing keys on the head entry: {owner_processing}"
+    );
+    assert!(
+        owner_processing["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with(OWNER_QUEUED)),
+        "the owner sees its own entry's content (plus the dequeue-wait note): {owner_processing}"
+    );
+    assert_eq!(
+        guest_obs.processing_frames[0],
+        json!({ "agentId": agent_id, "messageId": owner_id, "turnId": combined_turn_id }),
+        "the guest's processing frame for the owner's entry carries no content"
+    );
     for obs in [&owner_obs, &guest_obs] {
         let linked: Vec<&String> = obs.user_row_queued_message_ids.iter().flatten().collect();
         assert_eq!(

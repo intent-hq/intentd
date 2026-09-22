@@ -19,9 +19,9 @@ use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentDelegatedCounts, AgentId,
     AgentListRowScope, AgentLite, AgentMessage, AgentScopeCounts, AgentSession, AgentStatus,
     AgentWakeCreateOptions, AgentWakeOrCreateInput, ConversationProjection, Error, Event,
-    EventActor, MessageOrigin, NoteId, PullRequestInfo, PullRequestStatus, Result, SessionStats,
-    TaskStatus, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, PROPOSAL_OUTCOME_APPLIED,
-    PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
+    EventActor, MessageOrigin, NoteId, PrincipalId, PullRequestInfo, PullRequestStatus, Result,
+    SessionStats, TaskStatus, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
 };
 use intent_sourcecontrol::RepoRef;
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
@@ -1079,6 +1079,58 @@ pub(crate) enum RecoverySendClaim {
 enum PopCommit {
     Delivery,
     Provisional,
+}
+
+/// A restricted wire caller's ownership check for one per-id queue mutation
+/// (multiplayer), built by [`Services::queue_entry_gate`] with its async
+/// inputs pre-resolved. Visibility applies FIRST, through the shared
+/// [`intent_core::queue_attribution_visible_to`] predicate over the entry's
+/// attribution — the same three-tier resolution as `agent.getQueue`
+/// ([`intent_core::queue_attribution_with`]: stamp, else workspace fallback
+/// for a human-origin entry — an unknown human when that fallback is
+/// missing — else unattributed): an entry the caller's `agent.getQueue`
+/// hides reads as absent for every mutation — `-32602 queued message not
+/// found`, no side effects. Then `author_only` (`agent.editQueuedMessage`)
+/// refuses a VISIBLE entry another principal authored — this only ever
+/// reaches the administrator, who sees the whole queue, and who is
+/// unaffected by an unknown-human entry (nobody else can be its author).
+/// An entry with no human author passes.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueEntryGate {
+    principal_id: PrincipalId,
+    is_administrator: bool,
+    author_only: bool,
+    fallback: Option<PrincipalId>,
+}
+
+impl QueueEntryGate {
+    /// Whether the caller may perform its mutation on `entry`; synchronous so
+    /// it runs under the same lock as the mutation.
+    pub(crate) fn check(&self, entry: &QueuedMessage) -> Result<()> {
+        let attribution = intent_core::queue_attribution_with(
+            entry.message_metadata.as_ref(),
+            self.fallback.as_ref(),
+        );
+        let caller = intent_core::Caller::Wire {
+            principal_id: self.principal_id.clone(),
+            is_administrator: self.is_administrator,
+        };
+        if !intent_core::queue_attribution_visible_to(&caller, &attribution) {
+            return Err(Error::InvalidParams(format!(
+                "queued message not found: {}",
+                entry.id
+            )));
+        }
+        if let intent_core::QueueAttribution::Principal(author) = &attribution {
+            if self.author_only && *author != self.principal_id {
+                return Err(Error::InvalidParams(format!(
+                    "queued message {} can only be edited by its author",
+                    entry.id
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
@@ -6203,8 +6255,10 @@ impl Services {
     /// finds no session to resolve against, entries keep the `null` default
     /// from [`QueuedMessage::to_value`]. The snapshot is then projected to the
     /// bound caller ([`intent_core::project_queue_for_caller`]): a guest
-    /// collaborator sees only its own entries plus null-author ones, while
-    /// the administrator, agents and the daemon see the full queue.
+    /// collaborator sees only its own entries plus unattributed (agent-sent /
+    /// automatic) ones — a human-origin entry the resolver could not
+    /// attribute is withheld, not exposed — while the administrator, agents
+    /// and the daemon see the full queue.
     pub(crate) async fn agent_get_queue_op(
         &self,
         agent_id: AgentId,
@@ -6233,73 +6287,67 @@ impl Services {
         Ok(json!({ "success": true, "queue": queue }))
     }
 
-    /// Ownership gate for the per-id queue mutations (multiplayer). Visibility
-    /// applies FIRST, through the shared [`intent_core::queue_visible_to`]
-    /// predicate over the entry's resolved author — the same resolution as
-    /// `agent.getQueue`
-    /// ([`crate::principal_ops::MessageAuthorResolver::queue_author_principal_id`]):
-    /// an entry the caller's `agent.getQueue` hides reads as absent for every
-    /// mutation — `-32602 queued message not found`, no side effects. Then
-    /// `author_only` (`agent.editQueuedMessage`) refuses a VISIBLE entry
-    /// another principal authored — this only ever reaches the administrator,
-    /// who sees the whole queue. `agent.removeQueuedMessage` /
-    /// `agent.sendQueuedMessageNow` stop at the visibility check. Agents, the
-    /// daemon and unbound callers are unrestricted; an entry with no human
-    /// author, or one that is not in the queue, passes so the op's own
-    /// missing-id contract applies.
-    pub(crate) async fn require_queue_entry_ownership(
+    /// Ownership gate for the per-id queue mutations (multiplayer): `None`
+    /// when the bound caller is unrestricted (agents, the daemon, unbound
+    /// callers, and the administrator unless `author_only`), else a gate
+    /// whose async inputs — the caller and the workspace fallback author —
+    /// are resolved HERE, before any lock, so [`QueueEntryGate::check`] can
+    /// run synchronously inside the mutation's own critical section against
+    /// the entry it is about to touch. Checking before the lock instead is
+    /// the race intentd#2068 closed: an entry provisionally popped for drain
+    /// is absent from the live queue while the check runs, then
+    /// [`Self::requeue_front`] restores it before the mutation lands.
+    pub(crate) async fn queue_entry_gate(
+        &self,
+        agent_id: &AgentId,
+        author_only: bool,
+    ) -> Result<Option<QueueEntryGate>> {
+        let Some(intent_core::Caller::Wire {
+            principal_id,
+            is_administrator,
+        }) = intent_core::current_caller()
+        else {
+            return Ok(None);
+        };
+        if is_administrator && !author_only {
+            return Ok(None);
+        }
+        let workspace_id = self.agent_workspace(agent_id).await?;
+        let fallback = crate::principal_ops::MessageAuthorResolver::new(self, &workspace_id)
+            .fallback_principal_id()
+            .await;
+        Ok(Some(QueueEntryGate {
+            principal_id,
+            is_administrator,
+            author_only,
+            fallback,
+        }))
+    }
+
+    /// Test seam (intentd#2068): park a GATED per-id queue mutation between
+    /// its ownership pre-resolution and the locked mutation — the window a
+    /// concurrent drain pop + requeue can land in — when armed. Unrestricted
+    /// callers (`gate` is `None`) never park.
+    pub(crate) async fn park_queue_mutation_gate(&self, gate: Option<&QueueEntryGate>) {
+        if let (Some(park), Some(_)) = (&self.queue_mutation_gate_park, gate) {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+    }
+
+    /// The live entry `message_id` of `agent_id`, cloned, or `None` when it
+    /// is not in the live queue (absent, or provisionally popped for drain).
+    pub(crate) fn find_queued_message(
         &self,
         agent_id: &AgentId,
         message_id: &str,
-        author_only: bool,
-    ) -> Result<()> {
-        let Some(
-            caller @ intent_core::Caller::Wire {
-                principal_id: _,
-                is_administrator,
-            },
-        ) = intent_core::current_caller()
-        else {
-            return Ok(());
-        };
-        if is_administrator && !author_only {
-            return Ok(());
-        }
-        let metadata = {
-            let guard = self
-                .agent_queues
-                .lock()
-                .expect("agent queue registry poisoned");
-            match guard
-                .get(agent_id)
-                .and_then(|queue| queue.iter().find(|m| m.id == message_id))
-            {
-                Some(entry) => entry.message_metadata.clone(),
-                None => return Ok(()),
-            }
-        };
-        let workspace_id = self.agent_workspace(agent_id).await?;
-        let Some(author) = crate::principal_ops::MessageAuthorResolver::new(self, &workspace_id)
-            .queue_author_principal_id(metadata.as_ref())
-            .await
-        else {
-            return Ok(());
-        };
-        let projected = json!({ "author": { "principalId": author.0 } });
-        if !intent_core::queue_visible_to(&caller, &projected) {
-            return Err(Error::InvalidParams(format!(
-                "queued message not found: {message_id}"
-            )));
-        }
-        let intent_core::Caller::Wire { principal_id, .. } = caller else {
-            return Ok(());
-        };
-        if author_only && author != principal_id {
-            return Err(Error::InvalidParams(format!(
-                "queued message {message_id} can only be edited by its author"
-            )));
-        }
-        Ok(())
+    ) -> Option<QueuedMessage> {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .and_then(|queue| queue.iter().find(|m| m.id == message_id))
+            .cloned()
     }
 
     /// `agent.editQueuedMessage` (PROTOCOL §5.5). Updates the entry's content
@@ -6320,8 +6368,10 @@ impl Services {
     /// the ordinary gate.
     ///
     /// Edits are author-only for every wire caller
-    /// ([`Self::require_queue_entry_ownership`]): an entry another principal
-    /// authored is refused with `-32602` before anything moves.
+    /// ([`Self::queue_entry_gate`]): an entry another principal authored is
+    /// refused with `-32602` before anything moves — checked under the queue
+    /// lock against the entry found there, so a drain pop + requeue racing
+    /// the edit cannot slip a foreign entry past it.
     pub(crate) async fn agent_edit_queued_message_op(
         &self,
         agent_id: AgentId,
@@ -6329,8 +6379,7 @@ impl Services {
         mut content: String,
         editing: Option<bool>,
     ) -> Result<Value> {
-        self.require_queue_entry_ownership(&agent_id, &message_id, true)
-            .await?;
+        let gate = self.queue_entry_gate(&agent_id, true).await?;
         // Principal stamp (multiplayer w2): an edit by a wire caller makes
         // the editor the author of a human-authored entry; an agent /
         // daemon edit leaves the original stamp alone. Human authorship is
@@ -6352,6 +6401,7 @@ impl Services {
         } else {
             None
         };
+        self.park_queue_mutation_gate(gate.as_ref()).await;
         let (edited, was_editing, now_editing) = {
             let mut guard = self
                 .agent_queues
@@ -6364,6 +6414,9 @@ impl Services {
                 .iter()
                 .position(|m| m.id == message_id)
                 .ok_or_else(|| Error::Internal("Queued message not found".to_string()))?;
+            if let Some(gate) = gate.as_ref() {
+                gate.check(&queue[position])?;
+            }
             let was = queue[position].editing;
             let human_authored = queue[position].user_origin
                 || crate::principal_ops::carries_principal_stamp(
@@ -6425,27 +6478,33 @@ impl Services {
     /// (especially after a daemon restart); the original "Queued message not
     /// found" error caused the FE's optimistic delete to roll back, leaving
     /// ghost messages on screen. The one exception is ownership
-    /// ([`Self::require_queue_entry_ownership`]): a guest collaborator may
-    /// remove only the entries its `agent.getQueue` shows it, and a foreign
-    /// entry is refused as `-32602 queued message not found` untouched.
+    /// ([`Self::queue_entry_gate`], checked under the queue lock against the
+    /// entry found there): a guest collaborator may remove only the entries
+    /// its `agent.getQueue` shows it, and a foreign entry is refused as
+    /// `-32602 queued message not found` untouched.
     pub(crate) async fn agent_remove_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
     ) -> Result<Value> {
-        self.require_queue_entry_ownership(&agent_id, &message_id, false)
-            .await?;
+        let gate = self.queue_entry_gate(&agent_id, false).await?;
+        self.park_queue_mutation_gate(gate.as_ref()).await;
         let removed = {
             let mut guard = self
                 .agent_queues
                 .lock()
                 .expect("agent queue registry poisoned");
             match guard.get_mut(&agent_id) {
-                Some(queue) => {
-                    let before = queue.len();
-                    queue.retain(|m| m.id != message_id);
-                    before != queue.len()
-                }
+                Some(queue) => match queue.iter().position(|m| m.id == message_id) {
+                    Some(position) => {
+                        if let Some(gate) = gate.as_ref() {
+                            gate.check(&queue[position])?;
+                        }
+                        queue.remove(position);
+                        true
+                    }
+                    None => false,
+                },
                 None => false,
             }
         };
@@ -6820,7 +6879,10 @@ impl Services {
     /// drain ordering as the runtime path: the shrunk `agent:queue:updated`
     /// is published only after the user row is persisted (and the entry stays
     /// listed in every snapshot until then), and the row carries the
-    /// `queueInfo.queuedMessageId` identity link.
+    /// `queueInfo.queuedMessageId` identity link. Ownership
+    /// ([`Self::queue_entry_gate`]) is checked inside the pop's critical
+    /// section: a guest force-sends only the entries its `agent.getQueue`
+    /// shows it, and a foreign one reads as `-32602 queued message not found`.
     pub(crate) async fn agent_send_queued_message_now_op(
         &self,
         agent_id: AgentId,
@@ -6830,11 +6892,13 @@ impl Services {
         // (monorepo#564).
         let session = self.require_agent_session(&agent_id).await?;
         let workspace_id = session.workspace_id.clone();
+        let gate = self.queue_entry_gate(&agent_id, false).await?;
+        self.park_queue_mutation_gate(gate.as_ref()).await;
         // Atomic dequeue; the entry stays listed in queue snapshots (§6.5
         // drain ordering) until `draining` is dropped right before the shrunk
         // publish below.
         let (mut entry, draining) = self
-            .take_queued_message_draining(&agent_id, &message_id)
+            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
@@ -14422,9 +14486,13 @@ impl Services {
 
     /// Atomically remove and return the queued entry with id `message_id`
     /// (any position, including entries under edit), or `None` when the agent
-    /// has no such entry. Backs `agent.sendQueuedMessageNow` (PROTOCOL §5.5):
-    /// the removal happens under the queue lock so no concurrent drain can
-    /// deliver the same entry twice.
+    /// has no such entry. The removal happens under the queue lock so no
+    /// concurrent drain can deliver the same entry twice. `agent.sendQueuedMessageNow`
+    /// (PROTOCOL §5.5) pops through
+    /// [`Services::take_queued_message_draining_gated`], which adds the
+    /// draining registration and the ownership check; this bare pop is the
+    /// tests' "pop for drain" step.
+    #[cfg(test)]
     pub(crate) fn take_queued_message(
         &self,
         agent_id: &AgentId,
@@ -14798,23 +14866,62 @@ impl Services {
         )
     }
 
-    /// [`Services::take_queued_message`] with the same draining registration
-    /// as [`Services::dequeue_message_draining`] (`agent.sendQueuedMessageNow`).
-    /// The caller pops BEFORE claiming the slot and hands the entry back on
-    /// a lost claim, so the pop is provisional ([`PopCommit::Provisional`]);
-    /// it commits with [`Services::commit_recovery_send_delivery`] once the
-    /// claim succeeds.
+    /// [`Services::take_queued_message_draining_gated`] without a gate — the
+    /// tests' ungated provisional pop.
+    #[cfg(test)]
     pub(crate) fn take_queued_message_draining(
         &self,
         agent_id: &AgentId,
         message_id: &str,
     ) -> Option<(QueuedMessage, DrainingGuard)> {
-        self.pop_draining(
+        self.take_queued_message_draining_gated(agent_id, message_id, None)
+            .ok()
+            .flatten()
+    }
+
+    /// Atomically remove the queued entry with id `message_id` (any position,
+    /// including entries under edit) with the same draining registration as
+    /// [`Services::dequeue_message_draining`] (`agent.sendQueuedMessageNow`,
+    /// PROTOCOL §5.5). The caller pops BEFORE claiming the slot and hands the
+    /// entry back on a lost claim, so the pop is provisional
+    /// ([`PopCommit::Provisional`]); it commits with
+    /// [`Services::commit_recovery_send_delivery`] once the claim succeeds.
+    /// `gate` (a restricted wire caller's [`QueueEntryGate`]) is evaluated
+    /// against the entry INSIDE the pop's critical section (draining overlay
+    /// lock → `agent_queues` lock): a refused entry is left in place untouched
+    /// and the refusal surfaces as `Err`; `Ok(None)` is the ordinary absent
+    /// id. `None` for `gate` pops unconditionally.
+    pub(crate) fn take_queued_message_draining_gated(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        gate: Option<&QueueEntryGate>,
+    ) -> Result<Option<(QueuedMessage, DrainingGuard)>> {
+        let mut refused = None;
+        let popped = self.pop_draining(
             agent_id,
-            |s| s.take_queued_message(agent_id, message_id),
+            |s| {
+                let mut guard = s
+                    .agent_queues
+                    .lock()
+                    .expect("agent queue registry poisoned");
+                let queue = guard.get_mut(agent_id)?;
+                let idx = queue.iter().position(|m| m.id == message_id)?;
+                if let Some(gate) = gate {
+                    if let Err(e) = gate.check(&queue[idx]) {
+                        refused = Some(e);
+                        return None;
+                    }
+                }
+                Some(queue.remove(idx))
+            },
             std::slice::from_ref,
             PopCommit::Provisional,
-        )
+        );
+        match refused {
+            Some(e) => Err(e),
+            None => Ok(popped),
+        }
     }
 
     /// Record already-popped `entries` as draining for `agent_id` (a batch a
@@ -15151,6 +15258,18 @@ impl Services {
     /// keys the turn start off `turnId` here (monorepo#1022). Payload:
     /// `{ agentId, messageId, content, turnId }` (`turnId` omitted only for
     /// legacy entries without one; every enqueue path mints one today).
+    ///
+    /// The event's `metadata` carries the entry's attribution
+    /// ([`intent_core::queue_processing_event_metadata`]) — the same
+    /// three-tier resolution as the entry's `author` in `agent.getQueue`
+    /// ([`intent_core::queue_attribution_with`]): the author principal under
+    /// [`intent_core::FROM_PRINCIPAL_ID_KEY`], the unknown-human marker
+    /// [`intent_core::QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY`] for a human-origin
+    /// entry the workspace cannot attribute, nothing for an entry with no
+    /// human author. The transport projects `content` out of the frame for
+    /// a non-administrator wire subscriber the attribution does not name
+    /// (intentd#2068): the entry is hidden from that member's queue, so its
+    /// text must not leak through the drain-start signal.
     pub(crate) async fn publish_queue_processing(
         &self,
         agent_id: &AgentId,
@@ -15165,6 +15284,14 @@ impl Services {
         if !message.turn_id.is_empty() {
             data["turnId"] = Value::String(message.turn_id.clone());
         }
+        let fallback = crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
+            .fallback_principal_id()
+            .await;
+        let metadata =
+            intent_core::queue_processing_event_metadata(&intent_core::queue_attribution_with(
+                message.message_metadata.as_ref(),
+                fallback.as_ref(),
+            ));
         let event = intent_store::NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),
@@ -15177,7 +15304,7 @@ impl Services {
             session_id: Some(agent_id.0.clone()),
             correlation_id: None,
             parent_event_id: None,
-            metadata: None,
+            metadata,
             data,
         };
         crate::publish_event(self.event_bus.as_ref(), event).await;

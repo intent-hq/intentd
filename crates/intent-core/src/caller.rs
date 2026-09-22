@@ -101,15 +101,83 @@ where
     tokio::spawn(with_caller(Caller::Daemon, f))
 }
 
-/// Whether a queued-message entry (wire shape, `author` already attached)
-/// may be shown to `caller`. A non-administrator wire principal (a guest
-/// collaborator) sees only entries it authored: an entry whose `author` is
-/// an object with a `principalId` other than the caller's is hidden. Entries
-/// with no `author` / `author: null` (agent-sent and automatic entries) stay
-/// visible to everyone; the administrator (workspace owner), agents and the
-/// daemon see the full queue.
+/// Who a queued-message entry is attributed to under the per-user queue
+/// visibility rule (multiplayer): the three tiers of the `agent.getQueue`
+/// contract, resolved by [`queue_attribution_with`] from the entry's
+/// `messageMetadata` plus the workspace author fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueAttribution {
+    /// A person: the entry's principal stamp ([`crate::FROM_PRINCIPAL_ID_KEY`]),
+    /// else the workspace fallback author of an unstamped human-origin entry.
+    Principal(PrincipalId),
+    /// An unstamped entry of human origin (a legacy pre-attribution row)
+    /// whose workspace fallback could not be resolved (no owner / legacy
+    /// author, or the read failed): SOMEONE wrote it, nobody knows who.
+    /// Fails closed — withheld from every non-administrator wire caller,
+    /// never surfaced to a guest as author-less.
+    UnknownHuman,
+    /// No human author at all: an agent-sent or automatic (hook / monitor /
+    /// system) entry. Public to every caller.
+    Unattributed,
+}
+
+/// `true` when an unstamped queue entry's `messageMetadata` still reads as
+/// human-authored — the same rule the fe applies to transcript rows: an
+/// entry is agent/automatic origin iff its metadata is an object with a
+/// string `type` (other than the user-authored `question_answers` wizard
+/// tag), a non-empty `fromAgentId`, or `source == "system"`. Absent or
+/// non-object metadata reads as human (a legacy typed message).
 #[must_use]
-pub fn queue_visible_to(caller: &Caller, entry: &serde_json::Value) -> bool {
+pub fn is_human_authored_metadata(message_metadata: Option<&serde_json::Value>) -> bool {
+    let Some(serde_json::Value::Object(obj)) = message_metadata else {
+        return true;
+    };
+    match obj.get("type").and_then(serde_json::Value::as_str) {
+        Some("question_answers") => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    if obj
+        .get("fromAgentId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return false;
+    }
+    obj.get("source").and_then(serde_json::Value::as_str) != Some("system")
+}
+
+/// The attribution of a queue entry with `metadata`, given the workspace
+/// author `fallback` already resolved (`None` when the workspace has none or
+/// the read failed): its stamp, else `fallback` for an unstamped entry whose
+/// metadata still reads as human-authored ([`is_human_authored_metadata`]) —
+/// [`QueueAttribution::UnknownHuman`] when that fallback is missing — else
+/// [`QueueAttribution::Unattributed`]. Synchronous so a mutation can evaluate
+/// it under the queue lock against the entry it is about to touch.
+#[must_use]
+pub fn queue_attribution_with(
+    metadata: Option<&serde_json::Value>,
+    fallback: Option<&PrincipalId>,
+) -> QueueAttribution {
+    match crate::lift_from_principal_id(metadata) {
+        Some(id) => QueueAttribution::Principal(id),
+        None if is_human_authored_metadata(metadata) => fallback
+            .cloned()
+            .map_or(QueueAttribution::UnknownHuman, QueueAttribution::Principal),
+        None => QueueAttribution::Unattributed,
+    }
+}
+
+/// Whether a queue entry with `attribution` may be shown to `caller`. A
+/// non-administrator wire principal (a guest collaborator) sees only entries
+/// attributed to itself plus [`QueueAttribution::Unattributed`] ones — an
+/// [`QueueAttribution::UnknownHuman`] entry is withheld like a foreign one;
+/// the administrator (workspace owner), agents and the daemon see the full
+/// queue. The one predicate behind `agent.getQueue`, the
+/// `agent:queue:updated` / `agent:queue:processing` projections and the
+/// per-id mutation gate.
+#[must_use]
+pub fn queue_attribution_visible_to(caller: &Caller, attribution: &QueueAttribution) -> bool {
     let Caller::Wire {
         principal_id,
         is_administrator: false,
@@ -117,10 +185,83 @@ pub fn queue_visible_to(caller: &Caller, entry: &serde_json::Value) -> bool {
     else {
         return true;
     };
-    match entry.get("author").and_then(|a| a.get("principalId")) {
-        Some(serde_json::Value::String(author)) => author == &principal_id.0,
-        _ => true,
+    match attribution {
+        QueueAttribution::Principal(author) => author == principal_id,
+        QueueAttribution::UnknownHuman => false,
+        QueueAttribution::Unattributed => true,
     }
+}
+
+/// The attribution of a queued-message entry in wire shape (`author` already
+/// attached by the serve-time resolver): an `author` object with a string
+/// `principalId` is that principal; otherwise the entry is re-read from its
+/// own `messageMetadata` with NO fallback — a stamp still names its
+/// principal, an unstamped human-origin entry the resolver left author-less
+/// (or a malformed `author`) is an unknown human, and only an agent-sent /
+/// automatic entry is unattributed.
+#[must_use]
+pub fn queue_entry_attribution(entry: &serde_json::Value) -> QueueAttribution {
+    if let Some(author) = entry
+        .get("author")
+        .and_then(|a| a.get("principalId"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return QueueAttribution::Principal(PrincipalId(author.to_string()));
+    }
+    queue_attribution_with(entry.get("messageMetadata"), None)
+}
+
+/// [`queue_attribution_visible_to`] over a queued-message entry in wire
+/// shape ([`queue_entry_attribution`]).
+#[must_use]
+pub fn queue_visible_to(caller: &Caller, entry: &serde_json::Value) -> bool {
+    queue_attribution_visible_to(caller, &queue_entry_attribution(entry))
+}
+
+/// `metadata` key of an `agent:queue:processing` event marking the drained
+/// entry as an [`QueueAttribution::UnknownHuman`] (`true`), so the transport
+/// can redact the frame's `content` for a non-administrator wire subscriber
+/// without a principal to stamp; a principal-attributed entry is stamped
+/// under [`crate::FROM_PRINCIPAL_ID_KEY`] instead, an unattributed one
+/// carries neither.
+pub const QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY: &str = "queueAuthorUnknownHuman";
+
+/// The event `metadata` an `agent:queue:processing` publisher stamps for a
+/// drained entry with `attribution` (see [`QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY`]);
+/// `None` for an unattributed entry.
+#[must_use]
+pub fn queue_processing_event_metadata(
+    attribution: &QueueAttribution,
+) -> Option<serde_json::Value> {
+    match attribution {
+        QueueAttribution::Principal(author) => {
+            Some(serde_json::json!({ crate::FROM_PRINCIPAL_ID_KEY: author.0 }))
+        }
+        QueueAttribution::UnknownHuman => {
+            Some(serde_json::json!({ QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY: true }))
+        }
+        QueueAttribution::Unattributed => None,
+    }
+}
+
+/// Inverse of [`queue_processing_event_metadata`]: the drained entry's
+/// attribution read back from an `agent:queue:processing` event's `metadata`.
+#[must_use]
+pub fn queue_processing_event_attribution(
+    metadata: Option<&serde_json::Value>,
+) -> QueueAttribution {
+    if let Some(author) = crate::lift_from_principal_id(metadata) {
+        return QueueAttribution::Principal(author);
+    }
+    if metadata
+        .and_then(|m| m.get(QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return QueueAttribution::UnknownHuman;
+    }
+    QueueAttribution::Unattributed
 }
 
 /// Egress projection of a queue snapshot for `caller`: drops the entries
@@ -149,6 +290,7 @@ pub fn project_queue_for_caller(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FROM_PRINCIPAL_ID_KEY;
     use serde_json::{json, Value};
 
     fn wire(admin: bool) -> Caller {
@@ -162,7 +304,15 @@ mod tests {
         json!({ "id": id, "content": id, "position": position, "author": author })
     }
 
+    fn agent_metadata() -> Value {
+        json!({ "type": "agent_message", "fromAgentId": "agent-1" })
+    }
+
     fn mixed_queue() -> Vec<Value> {
+        let mut agent = entry("agent", 2, &Value::Null);
+        agent["messageMetadata"] = agent_metadata();
+        let mut system = json!({ "id": "system", "content": "no author key", "position": 3 });
+        system["messageMetadata"] = json!({ "source": "system" });
         vec![
             entry("own", 0, &json!({ "principalId": "p-1", "login": "me" })),
             entry(
@@ -170,8 +320,9 @@ mod tests {
                 1,
                 &json!({ "principalId": "p-2", "login": "other" }),
             ),
-            entry("agent", 2, &Value::Null),
-            json!({ "id": "no-key", "content": "no author key", "position": 3 }),
+            agent,
+            system,
+            entry("unknown-human", 4, &Value::Null),
         ]
     }
 
@@ -180,16 +331,26 @@ mod tests {
     }
 
     #[test]
-    fn guest_sees_own_and_unauthored_entries_only() {
+    fn guest_sees_own_and_unattributed_entries_only() {
         let guest = wire(false);
         let queue = mixed_queue();
         assert!(queue_visible_to(&guest, &queue[0]), "own entry");
         assert!(!queue_visible_to(&guest, &queue[1]), "foreign entry");
-        assert!(queue_visible_to(&guest, &queue[2]), "null author");
-        assert!(queue_visible_to(&guest, &queue[3]), "absent author key");
+        assert!(
+            queue_visible_to(&guest, &queue[2]),
+            "agent-sent, null author"
+        );
+        assert!(
+            queue_visible_to(&guest, &queue[3]),
+            "system, absent author key"
+        );
+        assert!(
+            !queue_visible_to(&guest, &queue[4]),
+            "unstamped human entry the resolver could not attribute"
+        );
 
         let projected = project_queue_for_caller(Some(&guest), queue);
-        assert_eq!(ids(&projected), ["own", "agent", "no-key"]);
+        assert_eq!(ids(&projected), ["own", "agent", "system"]);
         let positions: Vec<u64> = projected
             .iter()
             .map(|e| e["position"].as_u64().unwrap())
@@ -218,20 +379,138 @@ mod tests {
     }
 
     #[test]
-    fn malformed_author_is_kept() {
+    fn attribution_resolves_in_three_tiers() {
+        let p1 = PrincipalId("p-1".into());
+        let p2 = PrincipalId("p-2".into());
+        let stamped = json!({ FROM_PRINCIPAL_ID_KEY: "p-2" });
+        assert_eq!(
+            queue_attribution_with(Some(&stamped), Some(&p1)),
+            QueueAttribution::Principal(p2.clone()),
+            "the stamp wins over the fallback"
+        );
+        assert_eq!(
+            queue_attribution_with(None, Some(&p1)),
+            QueueAttribution::Principal(p1),
+            "unstamped human falls back to the workspace author"
+        );
+        assert_eq!(
+            queue_attribution_with(None, None),
+            QueueAttribution::UnknownHuman,
+            "unstamped human with no resolvable fallback fails closed"
+        );
+        let answers = json!({ "type": "question_answers" });
+        assert_eq!(
+            queue_attribution_with(Some(&answers), None),
+            QueueAttribution::UnknownHuman,
+            "the wizard answer tag is user-authored"
+        );
+        for md in [
+            agent_metadata(),
+            json!({ "source": "system" }),
+            json!({ "type": "event_notification" }),
+        ] {
+            assert_eq!(
+                queue_attribution_with(Some(&md), None),
+                QueueAttribution::Unattributed,
+                "{md}"
+            );
+        }
+    }
+
+    #[test]
+    fn attribution_predicate_fails_closed_on_unknown_human() {
         let guest = wire(false);
-        assert!(queue_visible_to(
-            &guest,
-            &json!({ "id": "s", "author": "p-2" })
-        ));
-        assert!(queue_visible_to(
-            &guest,
-            &json!({ "id": "n", "author": { "principalId": 7 } })
-        ));
-        assert!(queue_visible_to(
-            &guest,
-            &json!({ "id": "e", "author": {} })
-        ));
+        let own = QueueAttribution::Principal(PrincipalId("p-1".into()));
+        let foreign = QueueAttribution::Principal(PrincipalId("p-2".into()));
+        assert!(queue_attribution_visible_to(&guest, &own), "own");
+        assert!(!queue_attribution_visible_to(&guest, &foreign), "foreign");
+        assert!(
+            !queue_attribution_visible_to(&guest, &QueueAttribution::UnknownHuman),
+            "unknown human"
+        );
+        assert!(
+            queue_attribution_visible_to(&guest, &QueueAttribution::Unattributed),
+            "unattributed"
+        );
+        for caller in [
+            wire(true),
+            Caller::Agent {
+                agent_id: AgentId("a-1".into()),
+            },
+            Caller::Daemon,
+        ] {
+            assert!(
+                queue_attribution_visible_to(&caller, &foreign),
+                "{caller:?}"
+            );
+            assert!(
+                queue_attribution_visible_to(&caller, &QueueAttribution::UnknownHuman),
+                "{caller:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_author_falls_back_to_the_entry_metadata() {
+        let guest = wire(false);
+        for e in [
+            json!({ "id": "s", "author": "p-2" }),
+            json!({ "id": "n", "author": { "principalId": 7 } }),
+            json!({ "id": "e", "author": {} }),
+            json!({ "id": "b", "author": { "principalId": "" } }),
+        ] {
+            assert!(!queue_visible_to(&guest, &e), "human origin, no stamp: {e}");
+        }
+        assert!(
+            queue_visible_to(
+                &guest,
+                &json!({ "id": "a", "author": {}, "messageMetadata": agent_metadata() })
+            ),
+            "agent-sent stays public whatever `author` reads"
+        );
+        assert!(
+            queue_visible_to(
+                &guest,
+                &json!({ "id": "m", "author": Value::Null,
+                    "messageMetadata": { FROM_PRINCIPAL_ID_KEY: "p-1" } })
+            ),
+            "own stamp on the entry metadata"
+        );
+        assert!(
+            !queue_visible_to(
+                &guest,
+                &json!({ "id": "f", "author": Value::Null,
+                    "messageMetadata": { FROM_PRINCIPAL_ID_KEY: "p-2" } })
+            ),
+            "foreign stamp on the entry metadata"
+        );
+    }
+
+    #[test]
+    fn processing_event_metadata_round_trips_the_attribution() {
+        for attribution in [
+            QueueAttribution::Principal(PrincipalId("p-2".into())),
+            QueueAttribution::UnknownHuman,
+            QueueAttribution::Unattributed,
+        ] {
+            let metadata = queue_processing_event_metadata(&attribution);
+            assert_eq!(
+                queue_processing_event_attribution(metadata.as_ref()),
+                attribution,
+                "{metadata:?}"
+            );
+        }
+        assert_eq!(
+            queue_processing_event_metadata(&QueueAttribution::Unattributed),
+            None
+        );
+        assert_eq!(
+            queue_processing_event_attribution(Some(
+                &json!({ QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY: "yes" })
+            )),
+            QueueAttribution::Unattributed,
+            "only a literal `true` marks an unknown human"
+        );
     }
 
     #[tokio::test]
