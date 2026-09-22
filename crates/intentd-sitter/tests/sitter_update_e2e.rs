@@ -686,20 +686,30 @@ fn update_repairs_current_tailcat_payload_without_replacing_daemon_or_rollback()
 }
 
 #[test]
-fn update_repair_rejects_archive_without_tailcat_and_keeps_installation() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = SitterPaths::from_data_dir(dir.path());
-    preinstall(&paths, "0.9.92");
-    let before = fs::read(paths.daemon_binary("0.9.92")).unwrap();
-    let state_before = fs::read(&paths.state_path).unwrap();
-    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
-    let (base_url, _) = serve_recording(Arc::clone(&routes));
-    publish_stable(&routes, &base_url, "0.9.92", b"replacement daemon");
-    let output = run_sitter(dir.path(), &base_url, &["update"]);
-    assert!(!output.status.success());
-    assert!(stderr_of(&output).contains("cannot repair installation"));
-    assert_eq!(fs::read(paths.daemon_binary("0.9.92")).unwrap(), before);
-    assert_eq!(fs::read(&paths.state_path).unwrap(), state_before);
+fn update_rejects_archive_without_tailcat_and_keeps_installation() {
+    for current in [None, Some("0.9.91"), Some("0.9.92")] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        if let Some(current) = current {
+            preinstall(&paths, current);
+        }
+        let before = current.map(|v| fs::read(paths.daemon_binary(v)).unwrap());
+        let state_before = fs::read(&paths.state_path).ok();
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let (base_url, _) = serve_recording(Arc::clone(&routes));
+        publish_stable(&routes, &base_url, "0.9.92", b"replacement daemon");
+        let output = run_sitter(dir.path(), &base_url, &["update"]);
+        assert!(!output.status.success());
+        assert!(stderr_of(&output).contains("required Tailcat payload"));
+        assert_eq!(
+            current.map(|v| fs::read(paths.daemon_binary(v)).unwrap()),
+            before
+        );
+        assert_eq!(fs::read(&paths.state_path).ok(), state_before);
+        if current != Some("0.9.92") {
+            assert!(!paths.daemon_binary("0.9.92").exists());
+        }
+    }
 }
 
 #[test]

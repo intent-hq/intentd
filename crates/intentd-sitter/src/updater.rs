@@ -397,6 +397,15 @@ impl Updater {
                 reason: format!("archive does not contain a {DAEMON_BIN_NAME} binary"),
             })?;
 
+        if bundles_tailcat(version)
+            && !tailcat_payload_complete(&extracted_bin.parent().unwrap().join("libexec"))
+        {
+            return Err(UpdateError::Archive {
+                asset: entry.asset.clone(),
+                reason: format!("archive lacks the required Tailcat payload for intentd {version}"),
+            });
+        }
+
         let _lock = state::lock(&self.paths.state_path)?;
         // Check again under the cross-process lock, before replacing a binary
         // or pruning a concurrent install. Older sitters lack this lock and
@@ -430,7 +439,7 @@ impl Updater {
             && self.paths.daemon_binary(version).is_file()
             && bundles_tailcat(version)
         {
-            self.repair_payload(version, &extracted_bin, &entry.asset)?;
+            self.repair_payload(version, &extracted_bin)?;
             // Keep the daemon inode, rollback version and scheduling state:
             // a payload repair does not activate a different release.
             return Ok(UpdateOutcome::Installed {
@@ -566,19 +575,8 @@ impl Updater {
 
     /// Restore only the missing payload, without unlinking a running daemon
     /// or pruning its previous release. Each replacement is an atomic rename.
-    fn repair_payload(
-        &self,
-        version: &str,
-        src_bin: &Path,
-        asset: &str,
-    ) -> Result<(), UpdateError> {
+    fn repair_payload(&self, version: &str, src_bin: &Path) -> Result<(), UpdateError> {
         let source = src_bin.parent().unwrap().join("libexec");
-        if !tailcat_payload_complete(&source) {
-            return Err(UpdateError::Archive {
-                asset: asset.into(),
-                reason: "archive lacks the executable Tailcat sidecar or its license; cannot repair installation".into(),
-            });
-        }
         let dest = self.paths.versions_dir.join(version).join("libexec");
         fs::create_dir_all(&dest)?;
         for name in [TAILCAT_BIN_NAME, "tailcat.LICENSE"] {
@@ -854,6 +852,49 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_replaces_existing_empty_payload_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let installed = paths.versions_dir.join("0.9.92");
+        let source = dir.path().join("extracted");
+        for base in [&installed, &source] {
+            fs::create_dir_all(base.join("libexec")).unwrap();
+            fs::write(base.join(DAEMON_BIN_NAME), b"daemon").unwrap();
+            for name in [TAILCAT_BIN_NAME, "tailcat.LICENSE"] {
+                fs::write(base.join("libexec").join(name), b"").unwrap();
+            }
+        }
+        fs::write(source.join("libexec").join(TAILCAT_BIN_NAME), b"sidecar").unwrap();
+        fs::write(source.join("libexec/tailcat.LICENSE"), b"license").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                source.join("libexec").join(TAILCAT_BIN_NAME),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let updater = Updater::with_base_url(paths, "http://127.0.0.1:1").unwrap();
+        updater
+            .repair_payload("0.9.92", &source.join(DAEMON_BIN_NAME))
+            .unwrap();
+        assert!(tailcat_payload_complete(&installed.join("libexec")));
+        assert_eq!(
+            fs::read(installed.join("libexec").join(TAILCAT_BIN_NAME)).unwrap(),
+            b"sidecar"
+        );
+        assert_eq!(
+            fs::read(installed.join("libexec/tailcat.LICENSE")).unwrap(),
+            b"license"
+        );
+        assert_eq!(
+            fs::read(installed.join(DAEMON_BIN_NAME)).unwrap(),
+            b"daemon"
+        );
+    }
 
     #[test]
     fn sibling_payload_copied_preserving_layout_and_exec_bits() {
