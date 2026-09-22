@@ -2023,6 +2023,37 @@ pub(crate) fn annotate_sender_attribution(content: &mut String, message_metadata
     *content = format!("{annotated_head}{content}");
 }
 
+/// Self-targeted send guard (intent-hq/intent#5669): an agent may not message
+/// itself. The sender identity is the daemon-stamped
+/// `messageMetadata.fromAgentId` — never caller-controlled (the wire front
+/// doors strip caller-supplied attribution at the router ingress; the MCP
+/// `ws.agent.send` / `ws.agent.sendToTask` bindings overwrite it with the
+/// real caller) — so user/FE sends and unattributed automatic deliveries
+/// are never affected. An interrupt-priority self-send would preempt the
+/// caller's own in-flight turn while the tool call that issued it is still
+/// awaiting a result, leaving the session `responding` with an undrained
+/// queue. Rejected with `Error::InvalidParams` (→ `-32602`) BEFORE any state
+/// change (same ordering as the monorepo#564 nonexistent-target guard): no
+/// persisted row, no queue entry, no event, no interrupt.
+pub(crate) fn reject_self_targeted_send(
+    method: &str,
+    target: &AgentId,
+    message_metadata: Option<&Value>,
+) -> Result<()> {
+    let from = message_metadata
+        .and_then(|md| md.get("fromAgentId"))
+        .and_then(Value::as_str);
+    if from == Some(target.0.as_str()) {
+        return Err(Error::InvalidParams(format!(
+            "{method}: an agent cannot message itself (target {} is the caller). \
+             Use ws.agent.reportToParent to report progress to your parent, or \
+             record the information in a note instead.",
+            target.0
+        )));
+    }
+    Ok(())
+}
+
 /// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5, v10.0): every
 /// entry must carry a non-empty attachment-registry `attachmentId`
 /// reference. Inline file `data` is no longer accepted: an entry carrying
@@ -6734,6 +6765,9 @@ impl Services {
         file_blocks: Option<Value>,
         message_metadata: Option<Value>,
     ) -> Result<Value> {
+        // intent-hq/intent#5669: an agent may not message itself — rejected
+        // before any state change.
+        reject_self_targeted_send("agent.sendMessage", &agent_id, message_metadata.as_ref())?;
         // Validate message_id length to prevent unbounded storage.
         if let Some(ref id) = message_id {
             if id.len() > MAX_MESSAGE_ID_LEN {
@@ -12465,6 +12499,9 @@ impl Services {
                 json!({ "ok": false, "delivered": false, "error": "No agent assigned to task" }),
             );
         };
+        // intent-hq/intent#5669: the assignee may not be the caller —
+        // rejected before any state change.
+        reject_self_targeted_send("agent.sendToTask", &agent, message_metadata.as_ref())?;
         // DELIV-1: non-interrupt priority MUST also drive a real turn when
         // the runtime is attached — the store-only `agent_send_message_op`
         // fallback would persist the message without ever prompting the
