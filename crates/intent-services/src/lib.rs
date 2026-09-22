@@ -785,6 +785,17 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_task_update_projection_park`.
     task_update_projection_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Per-workspace archive ↔ unarchive fence (see [`ArchiveFence`]);
+    /// shared across [`Services`] clones.
+    archive_fence: Arc<ArchiveFence>,
+    /// Test park seam for the `workspace.archive` post-commit tail: parks
+    /// the detached tail INSIDE the fenced window — after the guest sweep
+    /// committed and its removal deltas went out, before the fence is
+    /// released — so a concurrent unarchive + re-add + enqueue of the same
+    /// principal is deterministically ordered behind it. `None` in
+    /// production wiring; tests inject via the `#[cfg(test)]`-only
+    /// `with_archive_tail_park`.
+    archive_tail_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`); tests inject
@@ -1328,6 +1339,8 @@ impl Services {
             unread_settle_entry_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
+            archive_fence: Arc::new(ArchiveFence::default()),
+            archive_tail_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -2148,6 +2161,17 @@ impl Services {
             park.entered.notify_one();
             park.release.notified().await;
         }
+    }
+
+    /// Test seam: park the `workspace.archive` post-commit tail inside its
+    /// fenced window (guest sweep committed and announced, fence still
+    /// held) so a concurrent unarchive + re-add + enqueue of a detached
+    /// principal is deterministically ordered behind the fence. Production
+    /// wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_archive_tail_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
+        self.archive_tail_park = Some(park);
+        self
     }
 
     /// Test seam: park one selected pending-question marker mutation before it
@@ -14084,6 +14108,73 @@ impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
     }
 }
 
+/// Per-workspace archive ↔ unarchive lifecycle fence. `workspace.archive`
+/// holds a workspace's fence from before its guest-detaching transaction
+/// until the detached collaborators' queued messages are dropped and their
+/// `removedPrincipalId` deltas are out; every unarchive (manual RPC and the
+/// turn-start auto-unarchive) takes the same fence around its conditional
+/// flip. Without it an unarchive + re-add of the same principal + a fresh
+/// queued message could all land between the archive commit and its
+/// post-commit tail, which then dropped the FRESH message and announced the
+/// removal of a CURRENT member. Owned guards ([`tokio::sync::OwnedMutexGuard`])
+/// so the archive tail — a detached task — can carry the hold across its
+/// spawn; an entry is pruned once nobody holds or awaits it.
+#[derive(Default)]
+pub(crate) struct ArchiveFence {
+    locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl ArchiveFence {
+    /// Take `workspace_id`'s fence (FIFO among waiters: tokio's mutex is
+    /// fair, so an unarchive queued behind an archive tail acquires before
+    /// the tail's own re-acquire).
+    async fn acquire(self: &Arc<Self>, workspace_id: &WorkspaceId) -> ArchiveFenceGuard {
+        let lock = self
+            .locks
+            .lock()
+            .expect("archive fence registry poisoned")
+            .entry(workspace_id.clone())
+            .or_default()
+            .clone();
+        let guard = lock.lock_owned().await;
+        ArchiveFenceGuard {
+            fence: Arc::clone(self),
+            key: workspace_id.clone(),
+            guard: Some(guard),
+        }
+    }
+}
+
+/// One hold on an [`ArchiveFence`] entry; releases the lock and prunes the
+/// entry on drop once no other caller holds or awaits it.
+pub(crate) struct ArchiveFenceGuard {
+    fence: Arc<ArchiveFence>,
+    key: WorkspaceId,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for ArchiveFenceGuard {
+    fn drop(&mut self) {
+        let mut locks = self
+            .fence
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Release under the registry mutex (same reasoning as
+        // `KeyedInflightSlot::drop`): the prune check and a concurrent
+        // drop must not both see each other's ref and both skip removal.
+        drop(self.guard.take());
+        // Only the map's ref left = nobody holds or awaits the key (a
+        // pending `lock_owned` future owns its own `Arc` clone).
+        if locks
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.key);
+        }
+    }
+}
+
 /// `(workspace_id, idempotency_key)` — the dedupe identity of one
 /// [`with_idempotency`] call (`workspace_id` is `""` for global methods).
 pub(crate) type IdempotencyIdent = (String, String);
@@ -21374,6 +21465,16 @@ impl WorkspaceApi for Services {
                 return Ok(chief_workspace());
             }
             let mut ws = store.get_workspace(&id).await?;
+            // Archive ↔ unarchive fence (see `ArchiveFence`): held from
+            // before the commit until the detached guests' queued messages
+            // are dropped and their removal deltas are out (the guard moves
+            // into the detached tail below). Every unarchive flips under the
+            // same fence, and `workspace.members.add` refuses while the row
+            // is archived, so no unarchive + re-add + fresh enqueue of a
+            // detached principal can interleave with the tail's drop — the
+            // tail never drops a message a CURRENT member queued nor
+            // announces the removal of a member who is seated again.
+            let fence = this.archive_fence.acquire(&id).await;
             let now = now_iso();
             // Archiving removes guests: the Archived flip, every non-owner
             // membership delete and every open-invite revoke commit in ONE
@@ -21410,8 +21511,16 @@ impl WorkspaceApi for Services {
                 // detached collaborator (queued messages dropped), then one
                 // `{ invites: true }` when an invite was revoked — so the
                 // deltas describe the transaction that just committed and
-                // precede every other archive-tail event.
+                // precede every other archive-tail event. Still under the
+                // fence taken before the commit: released right after, so
+                // a waiting unarchive proceeds only once the drops and the
+                // removal deltas are done.
                 this.publish_archived_guest_deltas(&id, &guest_sweep).await;
+                if let Some(park) = &this.archive_tail_park {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
+                drop(fence);
                 // Gracefully interrupt every in-flight turn in the workspace —
                 // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
                 // turn cancelled over the wire, draining worker aborted, terminal
@@ -21488,18 +21597,42 @@ impl WorkspaceApi for Services {
                 // (`archived`/`status`/`archivedAt`) so subscribers flip state
                 // without a re-read. `archivedAt` is the same timestamp persisted
                 // on the row above.
-                publish_event(
-                    bus.as_ref(),
-                    workspace_updated_event(
-                        &ws.id,
-                        &serde_json::json!({
-                            "archived": true,
-                            "status": ws.status,
-                            "archivedAt": ws.archived_at,
-                        }),
-                    ),
-                )
-                .await;
+                //
+                // Fenced on the archive still being current: the sweeps above
+                // ran outside the fence, so an unarchive may have flipped the
+                // row (and announced `archived: false`) meanwhile — its own
+                // delta is the latest word, and re-announcing THIS call's
+                // archive after it would leave clients on a stale archived
+                // state. Re-read under the fence and publish only when the
+                // row still carries this call's `archivedAt`; the flip and
+                // its delta happen under the same fence, so the two
+                // announcements can never cross.
+                let _fence = this.archive_fence.acquire(&ws.id).await;
+                let still_archived = match store.get_workspace(&ws.id).await {
+                    Ok(row) => row.archived && row.archived_at == ws.archived_at,
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            error = %e,
+                            "workspace.archive: row re-read failed before the archived delta; publishing"
+                        );
+                        true
+                    }
+                };
+                if still_archived {
+                    publish_event(
+                        bus.as_ref(),
+                        workspace_updated_event(
+                            &ws.id,
+                            &serde_json::json!({
+                                "archived": true,
+                                "status": ws.status,
+                                "archivedAt": ws.archived_at,
+                            }),
+                        ),
+                    )
+                    .await;
+                }
                 ws
             });
             // Awaiting the handle keeps the caller-visible contract intact
@@ -32190,10 +32323,19 @@ impl Services {
         // Conditional flip: writes only when the row is currently archived,
         // so two racing unarchivers (concurrent turn starts, or a manual
         // unarchive racing the turn-start auto-unarchive) resolve to
-        // exactly one `flipped = true`.
-        let flipped = store
-            .unarchive_workspace_if_archived(&id, &now_iso())
-            .await?;
+        // exactly one `flipped = true`. Under the archive fence (see
+        // `ArchiveFence`): an in-flight `workspace.archive` holds it until
+        // its detached guests' queued messages are dropped and their
+        // removal deltas are out, so the flip — and every re-add / enqueue
+        // it unlocks — lands strictly after the archive tail's drop, never
+        // inside it. Held only across the flip: the drain kicks below can
+        // re-enter the turn-start auto-unarchive, which takes this fence.
+        let flipped = {
+            let _fence = self.archive_fence.acquire(&id).await;
+            store
+                .unarchive_workspace_if_archived(&id, &now_iso())
+                .await?
+        };
         let mut ws = store.get_workspace(&id).await?;
         // The losing racer on the auto path stops here: the winner (a
         // concurrent turn start or a manual unarchive) already kicked the
