@@ -774,15 +774,24 @@ pub fn workspace_root() -> PathBuf {
     }
 }
 
-/// Every `*.rs` file under `dir` (recursively), sorted. A missing or
-/// unreadable directory yields an empty list.
+/// Every `*.rs` file under `dir` (recursively), sorted.
+///
+/// Fail-fast: a `read_dir` or entry error anywhere in the tree panics naming
+/// the offending directory. A lint must never pass because it could not read
+/// part of the tree — a silently empty subtree would still satisfy a
+/// `!files.is_empty()` guard. Callers scanning an optional directory guard
+/// with `is_dir()` first.
+///
+/// # Panics
+///
+/// When `dir` or any subdirectory cannot be read or listed.
 #[must_use]
 pub fn rust_files(dir: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
+        let entries =
+            fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, out);
@@ -801,14 +810,27 @@ pub fn rust_files(dir: &Path) -> Vec<PathBuf> {
 /// `tests/` directories and files named `tests.rs` are skipped (test code by
 /// convention; `#[cfg(test)]` items inside the remaining files are the
 /// caller's business via [`blank_cfg_test_items`]).
+///
+/// Fail-fast like [`rust_files`]: every directory under `crates/` is a crate
+/// and must have a readable `src/`. Non-directory entries in `crates/`
+/// (stray files) are not crates and are skipped.
+///
+/// # Panics
+///
+/// When `crates/` or any crate's `src/` tree cannot be read or listed.
 #[must_use]
 pub fn crate_src_files(root: &Path) -> Vec<PathBuf> {
-    let Ok(crates) = fs::read_dir(root.join("crates")) else {
-        return Vec::new();
-    };
+    let crates_dir = root.join("crates");
+    let crates = fs::read_dir(&crates_dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()));
     let mut out = Vec::new();
-    for entry in crates.flatten() {
-        let src = entry.path().join("src");
+    for entry in crates {
+        let entry = entry.unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()));
+        let krate = entry.path();
+        if !krate.is_dir() {
+            continue;
+        }
+        let src = krate.join("src");
         out.extend(rust_files(&src).into_iter().filter(|path| {
             let rel = path.strip_prefix(&src).unwrap_or(path);
             path.file_name().is_some_and(|name| name != "tests.rs")
@@ -1135,6 +1157,90 @@ let h = 8;
         let listed = rust_files(&dir);
         assert!(listed.contains(&own) && listed.contains(&dir.join("lib.rs")));
         assert!(listed.windows(2).all(|w| w[0] < w[1]));
-        assert!(rust_files(&root.join("crates/definitely-missing")).is_empty());
+    }
+
+    fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+        let err = std::panic::catch_unwind(f).expect_err("expected a panic");
+        err.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(ToString::to_string))
+            .expect("panic payload is a string")
+    }
+
+    #[test]
+    fn rust_files_panics_naming_an_unreadable_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("not-a-dir");
+        fs::write(&dir, "").expect("write");
+
+        let msg = panic_message(|| {
+            let _ = rust_files(&dir);
+        });
+        assert!(msg.starts_with("read_dir "), "{msg}");
+        assert!(msg.contains(&dir.display().to_string()), "{msg}");
+
+        let missing = tmp.path().join("missing");
+        let msg = panic_message(|| {
+            let _ = rust_files(&missing);
+        });
+        assert!(msg.contains(&missing.display().to_string()), "{msg}");
+    }
+
+    #[test]
+    fn rust_files_walks_nested_directories_and_an_empty_directory_is_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).expect("mkdir");
+        fs::write(src.join("lib.rs"), "").expect("write");
+        fs::write(src.join("notes.md"), "").expect("write");
+        let nested = src.join("nested");
+        fs::create_dir(&nested).expect("mkdir");
+        fs::write(nested.join("a.rs"), "").expect("write");
+
+        assert_eq!(
+            rust_files(&src),
+            vec![src.join("lib.rs"), nested.join("a.rs")]
+        );
+
+        let empty = tmp.path().join("empty");
+        fs::create_dir(&empty).expect("mkdir");
+        assert!(rust_files(&empty).is_empty());
+    }
+
+    #[test]
+    fn crate_src_files_panics_naming_an_unreadable_crate_src() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let good = root.join("crates/good/src");
+        fs::create_dir_all(&good).expect("mkdir");
+        fs::write(good.join("lib.rs"), "").expect("write");
+        fs::write(good.join("tests.rs"), "").expect("write");
+        fs::create_dir(good.join("tests")).expect("mkdir");
+        fs::write(good.join("tests/t.rs"), "").expect("write");
+        fs::write(root.join("crates/.stray-file"), "").expect("write");
+
+        assert_eq!(crate_src_files(root), vec![good.join("lib.rs")]);
+
+        let bad = root.join("crates/bad");
+        fs::create_dir(&bad).expect("mkdir");
+        fs::write(bad.join("src"), "").expect("write");
+        let msg = panic_message(|| {
+            let _ = crate_src_files(root);
+        });
+        assert!(msg.starts_with("read_dir "), "{msg}");
+        assert!(
+            msg.contains(&bad.join("src").display().to_string()),
+            "{msg}"
+        );
+
+        let no_crates = tmp.path().join("no-crates");
+        fs::create_dir(&no_crates).expect("mkdir");
+        let msg = panic_message(|| {
+            let _ = crate_src_files(&no_crates);
+        });
+        assert!(
+            msg.contains(&no_crates.join("crates").display().to_string()),
+            "{msg}"
+        );
     }
 }

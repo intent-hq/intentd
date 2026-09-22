@@ -364,7 +364,10 @@ fn test_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let crates = root.join("crates");
     for entry in fs::read_dir(&crates).expect("crates/ dir").flatten() {
-        out.extend(rust_files(&entry.path().join("tests")));
+        let tests = entry.path().join("tests");
+        if tests.is_dir() {
+            out.extend(rust_files(&tests));
+        }
     }
     let mut rel: Vec<PathBuf> = out
         .into_iter()
