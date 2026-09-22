@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.98] - 2026-09-22
+
+### 🚀 Features
+
+- *(github)* Expose flowId on connect and scope cancelAuth to it ([#2082](https://github.com/intent-hq/intentd/pull/2082))
+
+
 ## [0.9.97] - 2026-09-22
 
 ### 🚀 Features
