@@ -616,6 +616,10 @@ async fn info(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, St
 }
 
 async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
+    // Daemon-owned, in-memory setup-stage state (§6.5): `unknown` when no
+    // record exists in this daemon lifetime. Agent-facing only — never part
+    // of the wire `Workspace` row.
+    let setup_status = api.workspace_setup_status(ws);
     match api.get_workspace(ws.clone()).await {
         Ok(w) => {
             let title = w.title.trim();
@@ -642,6 +646,7 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
                 "branch": w.branch,
                 "repositoryName": w.repository_name,
                 "tags": w.tags,
+                "setupStatus": setup_status,
             }))
         }
         Err(Error::NotFound(_)) => Ok(json!({
@@ -654,6 +659,7 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
             "branch": Value::Null,
             "repositoryName": Value::Null,
             "tags": Vec::<String>::new(),
+            "setupStatus": setup_status,
         })),
         Err(e) => Err(e.to_string()),
     }

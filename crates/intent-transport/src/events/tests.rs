@@ -765,6 +765,283 @@ mod collaborator_fan_out {
     }
 }
 
+/// The transport half of the per-user queue visibility contract
+/// (`intent_core::queue_visibility_contract`): every `Harness::Transport`
+/// cell — `agent:queue:updated` (`data.queue` projection) and
+/// `agent:queue:processing` (`data.content` redaction) — is driven through
+/// [`crate::events::project_queue_event_for_current_caller`] under the cell's
+/// caller bound the way the forwarder spawn binds a subscriber's
+/// (`with_request_context`), and its outcome checked against `expected`.
+///
+/// The `agent:queue:updated` fixture is the wire shape
+/// `principal_ops::attach_queue` serves — `author` on EVERY entry: a stamped
+/// entry's principal profile beside its `messageMetadata` stamp, an explicit
+/// `null` for the author-less unknown-human legacy row (no metadata) and for
+/// the agent-sent one (metadata naming the agent) — with one entry per tier
+/// in the same snapshot, so a cell only passes when the projection picks its
+/// entry apart from the neighbours. The `agent:queue:processing` fixture's
+/// `metadata` is what the publisher stamps via
+/// [`intent_core::queue_processing_event_metadata`] for the cell's
+/// attribution.
+///
+/// Mutation check: removing the `data.remove("content")` branch of the
+/// projection fails exactly the three guest `QueueProcessingEvent` cells
+/// that expect `ContentRedacted` (`AuthorGuest` × `UnknownHuman`,
+/// `ForeignGuest` × `PrincipalStamped` / `UnknownHuman`); dropping the
+/// `project_queue_for_caller` call fails the `Hidden` cells.
+mod queue_visibility_contract {
+    use std::collections::HashSet;
+
+    use intent_core::events::{AGENT_QUEUE_PROCESSING, AGENT_QUEUE_UPDATED};
+    use intent_core::queue_visibility_contract::{
+        AttributionTier, CallerClass, Cell, Expected, Harness, QueueSurface, AGENT_CALLER,
+        QUEUE_VISIBILITY_CONTRACT,
+    };
+    use intent_core::{
+        queue_entry_attribution, queue_processing_event_metadata, ActorType, Event, EventActor,
+        QueueAttribution, WorkspaceId, FROM_PRINCIPAL_ID_KEY,
+    };
+    use serde_json::{json, Value};
+
+    use crate::events::project_queue_event_for_current_caller;
+
+    const AGENT_ID: &str = "agent-1";
+    const MESSAGE_ID: &str = "q-drained";
+    const TURN_ID: &str = "turn-1";
+
+    fn event(event_type: &str, metadata: Option<Value>, data: Value) -> Event {
+        Event {
+            id: "evt-1".to_string(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            timestamp: "2026-09-22T00:00:00.000Z".to_string(),
+            event_type: event_type.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::System,
+                id: Some("system".to_string()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata,
+            data,
+        }
+    }
+
+    /// The `agent:queue:updated` entry id for `tier`.
+    fn entry_id(tier: AttributionTier) -> &'static str {
+        match tier {
+            AttributionTier::PrincipalStamped => "q-stamped",
+            AttributionTier::UnknownHuman => "q-unknown-human",
+            AttributionTier::Unattributed => "q-agent",
+        }
+    }
+
+    /// One wire-shaped queue entry per tier, as `attach_queue` renders it for
+    /// the attribution the cell's caller class sees on that tier.
+    fn queue_entry(tier: AttributionTier, caller: CallerClass) -> Value {
+        let id = entry_id(tier);
+        let position = AttributionTier::ALL
+            .iter()
+            .position(|t| *t == tier)
+            .expect("tier is in ALL");
+        match tier.attribution(caller) {
+            QueueAttribution::Principal(author) => json!({
+                "id": id, "content": "stamped text", "position": position,
+                "queuedAt": "2026-09-22T00:00:00.000Z",
+                "messageMetadata": { FROM_PRINCIPAL_ID_KEY: author.0 },
+                "author": { "principalId": author.0, "login": "author",
+                            "displayName": "Author", "avatarUrl": Value::Null },
+            }),
+            QueueAttribution::UnknownHuman => json!({
+                "id": id, "content": "legacy text", "position": position,
+                "queuedAt": "2026-09-22T00:00:00.000Z",
+                "author": Value::Null,
+            }),
+            QueueAttribution::Unattributed => json!({
+                "id": id, "content": "agent text", "position": position,
+                "queuedAt": "2026-09-22T00:00:00.000Z",
+                "messageMetadata": { "type": "agent_message", "fromAgentId": AGENT_CALLER },
+                "author": Value::Null,
+            }),
+        }
+    }
+
+    /// The whole snapshot the publisher emits for `caller`'s view of the
+    /// three tiers, in tier order.
+    fn queue_snapshot(caller: CallerClass) -> Vec<Value> {
+        AttributionTier::ALL
+            .iter()
+            .map(|tier| queue_entry(*tier, caller))
+            .collect()
+    }
+
+    fn processing_data() -> Value {
+        json!({
+            "agentId": AGENT_ID,
+            "messageId": MESSAGE_ID,
+            "turnId": TURN_ID,
+            "content": "drained text",
+        })
+    }
+
+    /// Run the projection on `event` under the cell's caller, the way the
+    /// forwarder spawn re-establishes a subscriber's context.
+    async fn project_under(cell: &Cell, mut event: Event) -> Event {
+        crate::context::with_request_context(true, cell.caller(), async move {
+            project_queue_event_for_current_caller(&mut event);
+            event
+        })
+        .await
+    }
+
+    /// Drive one cell; `Some(reason)` when the surface did not honour it.
+    async fn drive(cell: &Cell) -> Option<String> {
+        let name = cell.name();
+        match cell.surface {
+            QueueSurface::QueueUpdatedEvent => {
+                let snapshot = queue_snapshot(cell.caller);
+                let target = queue_entry(cell.tier, cell.caller);
+                let fixture_attribution = queue_entry_attribution(&target);
+                if fixture_attribution != cell.attribution() {
+                    return Some(format!(
+                        "{name}: fixture reads as {fixture_attribution:?}, cell expects {:?}",
+                        cell.attribution()
+                    ));
+                }
+                let projected = project_under(
+                    cell,
+                    event(
+                        AGENT_QUEUE_UPDATED,
+                        None,
+                        json!({ "agentId": AGENT_ID, "queue": snapshot }),
+                    ),
+                )
+                .await;
+                if projected.data["agentId"] != AGENT_ID {
+                    return Some(format!("{name}: agentId altered: {}", projected.data));
+                }
+                let Some(served) = projected.data["queue"].as_array() else {
+                    return Some(format!(
+                        "{name}: data.queue is not an array: {}",
+                        projected.data
+                    ));
+                };
+                let found = served.iter().find(|e| e["id"] == entry_id(cell.tier));
+                match (cell.expected, found) {
+                    (Expected::Visible, Some(entry)) if *entry == target => None,
+                    (Expected::Visible, Some(entry)) => Some(format!(
+                        "{name}: entry altered: {entry} (expected {target})"
+                    )),
+                    (Expected::Visible, None) => {
+                        Some(format!("{name}: entry dropped from {}", json!(served)))
+                    }
+                    (Expected::Hidden, None) => None,
+                    (Expected::Hidden, Some(entry)) => {
+                        Some(format!("{name}: hidden entry served: {entry}"))
+                    }
+                    (other, _) => Some(format!(
+                        "{name}: {other:?} is not a QueueUpdatedEvent outcome"
+                    )),
+                }
+            }
+            QueueSurface::QueueProcessingEvent => {
+                let metadata = queue_processing_event_metadata(&cell.attribution());
+                let projected = project_under(
+                    cell,
+                    event(AGENT_QUEUE_PROCESSING, metadata, processing_data()),
+                )
+                .await;
+                match cell.expected {
+                    Expected::Visible if projected.data == processing_data() => None,
+                    Expected::Visible => Some(format!("{name}: frame altered: {}", projected.data)),
+                    Expected::ContentRedacted => {
+                        let redacted = json!({
+                            "agentId": AGENT_ID,
+                            "messageId": MESSAGE_ID,
+                            "turnId": TURN_ID,
+                        });
+                        (projected.data != redacted).then(|| {
+                            format!(
+                                "{name}: expected redacted frame {redacted}, got {}",
+                                projected.data
+                            )
+                        })
+                    }
+                    other => Some(format!(
+                        "{name}: {other:?} is not a QueueProcessingEvent outcome"
+                    )),
+                }
+            }
+            QueueSurface::GetQueue
+            | QueueSurface::EditQueuedMessage
+            | QueueSurface::RemoveQueuedMessage
+            | QueueSurface::SendQueuedMessageNow
+            | QueueSurface::Diagnostics => {
+                unreachable!("{name}: services-owned surface reached the transport harness")
+            }
+        }
+    }
+
+    /// Every `Harness::Transport` cell holds under the projection, and both
+    /// transport surfaces were exercised.
+    #[tokio::test]
+    async fn every_transport_cell_holds() {
+        let cells: Vec<&Cell> = QUEUE_VISIBILITY_CONTRACT
+            .iter()
+            .filter(|c| c.surface.owner() == Harness::Transport)
+            .collect();
+        let transport_surfaces: HashSet<QueueSurface> = QueueSurface::all()
+            .iter()
+            .copied()
+            .filter(|s| s.owner() == Harness::Transport)
+            .collect();
+        assert_eq!(
+            cells.len(),
+            CallerClass::ALL.len() * AttributionTier::ALL.len() * transport_surfaces.len(),
+            "one cell per (caller class, tier, transport surface)"
+        );
+
+        let mut failures = Vec::new();
+        let mut exercised = HashSet::new();
+        for cell in &cells {
+            exercised.insert(cell.surface);
+            if let Some(reason) = drive(cell).await {
+                failures.push(reason);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} transport cell(s) violated the contract:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+        assert_eq!(
+            exercised, transport_surfaces,
+            "every transport-owned surface must be exercised"
+        );
+    }
+
+    /// The fixtures are not vacuous: each tier's entry resolves to the
+    /// attribution the table assigns it for every caller class, and a
+    /// stamped entry's stamp names the caller only for `AuthorGuest`.
+    #[test]
+    fn fixtures_resolve_to_the_table_attribution() {
+        for caller in CallerClass::ALL {
+            for tier in AttributionTier::ALL {
+                let entry = queue_entry(*tier, *caller);
+                assert_eq!(
+                    queue_entry_attribution(&entry),
+                    tier.attribution(*caller),
+                    "({}, {}): {entry}",
+                    caller.label(),
+                    tier.label()
+                );
+            }
+        }
+    }
+}
+
 /// Emit-path taxonomy golden (multiplayer w3). The allowlist is default-deny
 /// at delivery, so a literal emitted outside the taxonomy is silently
 /// owner-only rather than a routing bug — this scan makes the omission fail

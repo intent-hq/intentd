@@ -364,6 +364,7 @@ impl Store {
             intent_core::events::AGENT_SUBSCRIPTIONS_CHANGED,
             intent_core::events::SETTINGS_CHANGED,
             intent_core::events::WORKSPACE_TOKEN_USAGE_CHANGED,
+            // queue-egress: allow — retention sweep deletes rows by type; no entry leaves the daemon
             intent_core::events::AGENT_QUEUE_UPDATED,
         ] {
             removed += self.delete_exact_type_before(event_type, cutoff).await?;

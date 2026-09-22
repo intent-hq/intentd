@@ -141,7 +141,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
     }
 }
 
-async fn setup() -> (TempDb, Services, WorkspaceId) {
+pub(super) async fn setup() -> (TempDb, Services, WorkspaceId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -5623,7 +5623,7 @@ async fn strict_ask_registration_is_durable_before_in_memory_visibility() {
     wait_for_persisted_watches(&svc, 0).await;
 }
 
-async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
+pub(super) async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
     let extra = intent_core::AgentCreateExtra {
         provider: Some("auggie".into()),
         ..Default::default()
@@ -13890,7 +13890,7 @@ async fn queue_mutations_enforce_entry_ownership() {
 
 /// Shared-workspace test fixture: the administrator (primary principal) and
 /// one guest collaborator of `ws`, as wire callers.
-async fn owner_and_guest_callers(
+pub(super) async fn owner_and_guest_callers(
     svc: &Services,
     ws: &WorkspaceId,
 ) -> (intent_core::Caller, intent_core::Caller) {
@@ -43087,6 +43087,7 @@ fn tracked_pr(
         mergeable,
         mergeable_state: mergeable_state.map(str::to_string),
         is_draft,
+        is_in_merge_queue: None,
     }
 }
 

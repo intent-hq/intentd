@@ -44,8 +44,8 @@ use intent_core::{
     TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRoot,
-    WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
-    WorkspaceUpdate,
+    WorkspaceGitRootId, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient};
 use intent_store::{EventQuery, NewEvent, Store};
@@ -509,6 +509,14 @@ pub struct Services {
     /// generation up front and commits the fallback subject. In-memory only,
     /// shared across clones like the other registries.
     auto_commit_cooldowns: Arc<Mutex<HashMap<WorkspaceId, std::time::Instant>>>,
+    /// Per-workspace setup-stage state (§6.5 lifecycle) backing
+    /// [`WorkspaceApi::workspace_setup_status`]: written at every
+    /// `workspace:setup:started` / `workspace:setup:completed` publish site
+    /// (create, duplicate, transfer import, skip-worktree) and set to
+    /// `pending` before the initial agent's first message is sent so a turn
+    /// started at create time can observe it. In-memory only — a workspace
+    /// absent from the map reads `unknown` — shared across clones.
+    workspace_setup_states: WorkspaceSetupStates,
     /// Daemon-global parent→child completion-watch registry (AS-2). One table
     /// for all workspaces: each watch/group carries its own workspace anchors
     /// (parent home + child workspace), so the same code path serves
@@ -776,6 +784,13 @@ pub struct Services {
     /// wiring; tests inject via the `#[cfg(test)]`-only
     /// `with_unread_settle_entry_park`.
     unread_settle_entry_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intent-hq/intent#5654) for the cache-hit fold's
+    /// row lookup → projection window: parks `fold_served_pr` per hit row
+    /// after the referencing-rows read, before the atomic signal
+    /// projection, so a REST refresh committing in between is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_fold_hit_park`.
+    fold_hit_park: Option<Arc<script_ops::SupervisePark>>,
     /// Test park seam (intent-hq/monorepo#2739) for the
     /// `deliver_wake_message` archived-gate read → enqueue window: parks the
     /// wake delivery after the gate observed the workspace archived and
@@ -1349,6 +1364,7 @@ impl Services {
             auto_commit_timeout_ms: None,
             auto_commit_cooldown_ms: None,
             auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            workspace_setup_states: WorkspaceSetupStates::default(),
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
@@ -1387,6 +1403,7 @@ impl Services {
             completion_flip_take_park: None,
             attention_write_park: None,
             unread_settle_entry_park: None,
+            fold_hit_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
             archive_fence: Arc::new(ArchiveFence::default()),
@@ -2212,6 +2229,16 @@ impl Services {
         self
     }
 
+    /// Test seam (intent-hq/intent#5654): park the cache-hit fold per
+    /// referencing row between its row lookup and the atomic queue-signal
+    /// projection, so a REST refresh committing inside that window is
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_fold_hit_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
+        self.fold_hit_park = Some(park);
+        self
+    }
+
     /// Test seam (intent-hq/monorepo#2739): park `deliver_wake_message` in
     /// its archived-gate read → enqueue window so a concurrent
     /// `workspace.unarchive` inside that window is deterministic. Production
@@ -2321,6 +2348,15 @@ impl Services {
     /// (no-op in production wiring).
     async fn park_unread_settle_entry(&self) {
         if let Some(park) = &self.unread_settle_entry_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+    }
+
+    /// Park a cache-hit fold row before its projection when the test seam
+    /// is armed (no-op in production wiring).
+    async fn park_fold_hit(&self) {
+        if let Some(park) = &self.fold_hit_park {
             park.entered.notify_one();
             park.release.notified().await;
         }
@@ -4356,6 +4392,17 @@ impl Services {
         self
     }
 
+    /// Share the per-workspace setup-stage map with the composition root so
+    /// publishers outside this surface (the legacy importer via
+    /// [`publish_workspace_created`]) record into the same map
+    /// [`WorkspaceApi::workspace_setup_status`] reads. Unset, the handle
+    /// owns a private map.
+    #[must_use]
+    pub fn with_workspace_setup_states(mut self, states: WorkspaceSetupStates) -> Self {
+        self.workspace_setup_states = states;
+        self
+    }
+
     /// REV-1: wire the agent-initiated reverse-dispatch seam so
     /// [`WorkspaceApi::browser_exec`] can forward to the shared
     /// first-client-sticky registry the transport listeners populate. The
@@ -4985,8 +5032,12 @@ impl Services {
     /// refresh. This is sweep-time work bounded by the caller's
     /// [`PR_REFRESH_FETCH_TIMEOUT`] wrap, never RPC-time.
     ///
-    /// Persists via the scoped `update_workspace_git_root_pr` and emits
-    /// `gitRoot:updated` once, only on change. A persisted change also routes
+    /// Persists via the scoped `update_workspace_git_root_pr_rebased` —
+    /// the merge-queue signal of every pooled entry is re-derived against
+    /// the row at write time ([`pr_ops::rebase_pool_on_persisted`],
+    /// intent-hq/intent#5654), since this REST-only pass cannot observe the
+    /// queue and its snapshot may predate a `github.pulls.get` fold — and
+    /// emits `gitRoot:updated` once, only on change. A persisted change also routes
     /// through the transition-only displayStatus recompute, so a root PR
     /// merging (or opening) regroups the sidebar live instead of waiting for
     /// the next `workspace.list`.
@@ -5011,8 +5062,10 @@ impl Services {
         .flatten()
         .unwrap_or_default();
         let mut changed = false;
-        // PR numbers fetched fresh this pass (linked / just-discovered);
-        // the stale-pool heal below skips them.
+        // PR numbers fetched fresh this pass (linked / just-discovered /
+        // healed); the stale-pool heal skips the ones already listed, and
+        // the persist rebases only these entries' queue signal (the rest
+        // take their persisted copy).
         let mut fetched_fresh: Vec<u64> = Vec::new();
         // A rate-limited relink discovery is captured here (not swallowed
         // as a generic discovery failure) so it surfaces AFTER the status
@@ -5038,7 +5091,10 @@ impl Services {
                 {
                     // `changed` is set unconditionally below (the unlink
                     // itself persists), so the upsert's flag is redundant.
-                    pr_ops::upsert_pr_info(&mut root.pull_requests, &pr_ops::build_pr_info(&pr));
+                    pr_ops::upsert_pr_info(
+                        &mut root.pull_requests,
+                        &mut pr_ops::build_pr_info(&pr),
+                    );
                 }
                 root.pr_number = None;
                 root.pr_url = None;
@@ -5046,8 +5102,8 @@ impl Services {
                 changed = true;
                 PrRefreshOutcome::Unlinked
             } else {
-                let info = pr_ops::build_pr_info(&pr);
-                changed |= pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                let mut info = pr_ops::build_pr_info(&pr);
+                changed |= pr_ops::upsert_pr_info(&mut root.pull_requests, &mut info);
                 // A merged/closed linked PR stays recorded in `pull_requests`
                 // but no longer blocks discovery: relink to a newer open PR on
                 // the same branch. A discovery failure degrades to the plain
@@ -5088,8 +5144,8 @@ impl Services {
                     };
                     if let Some(open_pr) = discovered {
                         fetched_fresh.push(open_pr.number);
-                        let open_info = pr_ops::build_pr_info(&open_pr);
-                        pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
+                        let mut open_info = pr_ops::build_pr_info(&open_pr);
+                        pr_ops::upsert_pr_info(&mut root.pull_requests, &mut open_info);
                         root.pr_number = Some(open_pr.number);
                         root.pr_url = Some(open_pr.url.clone());
                         root.pr_status = Some(open_info.status);
@@ -5120,8 +5176,8 @@ impl Services {
             match found {
                 Some(pr) => {
                     fetched_fresh.push(pr.number);
-                    let info = pr_ops::build_pr_info(&pr);
-                    pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                    let mut info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut root.pull_requests, &mut info);
                     root.pr_number = Some(pr.number);
                     root.pr_url = Some(pr.url.clone());
                     root.pr_status = Some(info.status);
@@ -5143,7 +5199,7 @@ impl Services {
                 sc.as_ref(),
                 &repo_ref,
                 &mut root.pull_requests,
-                &fetched_fresh,
+                &mut fetched_fresh,
                 self.pr_refresh_fetch_timeout / 10,
             )
             .await;
@@ -5158,7 +5214,15 @@ impl Services {
                 outcome = PrRefreshOutcome::Updated;
             }
             root.updated_at = now_iso();
-            self.store.update_workspace_git_root_pr(&root).await?;
+            self.store
+                .update_workspace_git_root_pr_rebased(&mut root, |root, persisted| {
+                    pr_ops::rebase_pool_on_persisted(
+                        &mut root.pull_requests,
+                        persisted,
+                        &fetched_fresh,
+                    );
+                })
+                .await?;
             publish_event(
                 self.event_bus.as_ref(),
                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
@@ -5229,11 +5293,16 @@ impl Services {
     /// resolves the provider once per cycle and passes each workspace from its
     /// sweep-start `list_workspaces` snapshot (avoiding a redundant per-workspace
     /// point read, intent-hq/monorepo#703). Persistence goes through the
-    /// scoped `update_workspace_pr_linkage` (PR columns + `updated_at` only),
-    /// so a possibly-stale snapshot row never clobbers concurrent mutations of
-    /// other columns (archive, title edit, attention) — the PR columns
-    /// themselves are last-writer-wins, which refreshes tolerate by design
-    /// (idempotent against the forge; the next sweep converges).
+    /// scoped `update_workspace_pr_linkage_rebased` (PR columns +
+    /// `updated_at` only), so a possibly-stale snapshot row never clobbers
+    /// concurrent mutations of other columns (archive, title edit, attention)
+    /// — the plain REST PR fields are last-writer-wins, which refreshes
+    /// tolerate by design (idempotent against the forge; the next sweep
+    /// converges), while the merge-queue signal, which a REST read cannot
+    /// re-observe, is rebased onto the row at write time
+    /// ([`pr_ops::rebase_workspace_pr_pool`], intent-hq/intent#5654) so a
+    /// `github.pulls.get` fold landing mid-refresh is neither erased nor
+    /// resurrected.
     async fn refresh_workspace_pr_with_sc(
         &self,
         mut ws: Workspace,
@@ -5263,14 +5332,27 @@ impl Services {
                 ws.pr_status = None;
                 ws.active_pull_request = None;
                 ws.updated_at = now_iso();
-                self.store.update_workspace_pr_linkage(&ws).await?;
+                // The pool is untouched here, so the rebase takes the
+                // persisted copy of every entry over the snapshot's.
+                self.store
+                    .update_workspace_pr_linkage_rebased(&mut ws, |ws, persisted| {
+                        pr_ops::rebase_workspace_pr_pool(ws, persisted, &[]);
+                    })
+                    .await?;
                 publish_event(self.event_bus.as_ref(), pr_unlinked_event(&ws.id)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
                 return Ok(PrRefreshOutcome::Unlinked);
             }
-            let info = pr_ops::build_pr_info(&pr);
+            let mut info = pr_ops::build_pr_info(&pr);
             // Keep the daemon-owned PR list current on every linked refresh.
-            let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+            // The REST read cannot see the merge queue, so the upsert lends
+            // `info` the pooled entry's `is_in_merge_queue` while the PR
+            // stays open on the same head (intent-hq/intent#5654); the
+            // `activePullRequest` written below is that same carried copy,
+            // and the persist re-derives the carry against the row at write
+            // time (`refreshed` names the entries fetched fresh this pass).
+            let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
+            let mut refreshed = vec![number];
             // A rate-limited relink discovery is captured here (not
             // swallowed as a generic discovery failure) so it surfaces
             // AFTER the status delta persist below and the sweep pauses
@@ -5318,14 +5400,19 @@ impl Services {
                     }
                 };
                 if let Some(open_pr) = discovered {
-                    let open_info = pr_ops::build_pr_info(&open_pr);
-                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
+                    let mut open_info = pr_ops::build_pr_info(&open_pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut open_info);
+                    refreshed.push(open_pr.number);
                     ws.pr_number = Some(open_pr.number);
                     ws.pr_url = Some(open_pr.url.clone());
                     ws.pr_status = Some(open_info.status);
                     ws.active_pull_request = Some(open_info);
                     ws.updated_at = now_iso();
-                    self.store.update_workspace_pr_linkage(&ws).await?;
+                    self.store
+                        .update_workspace_pr_linkage_rebased(&mut ws, |ws, persisted| {
+                            pr_ops::rebase_workspace_pr_pool(ws, persisted, &refreshed);
+                        })
+                        .await?;
                     publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
                     return Ok(PrRefreshOutcome::Linked);
@@ -5340,7 +5427,11 @@ impl Services {
                 ws.pr_url = Some(pr.url.clone());
                 ws.active_pull_request = Some(info);
                 ws.updated_at = now_iso();
-                self.store.update_workspace_pr_linkage(&ws).await?;
+                self.store
+                    .update_workspace_pr_linkage_rebased(&mut ws, |ws, persisted| {
+                        pr_ops::rebase_workspace_pr_pool(ws, persisted, &refreshed);
+                    })
+                    .await?;
                 publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
             }
@@ -5372,14 +5463,18 @@ impl Services {
             .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
-                    let info = pr_ops::build_pr_info(&pr);
-                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                    let mut info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
                     ws.pr_number = Some(pr.number);
                     ws.pr_url = Some(pr.url.clone());
                     ws.pr_status = Some(info.status);
                     ws.active_pull_request = Some(info);
                     ws.updated_at = now_iso();
-                    self.store.update_workspace_pr_linkage(&ws).await?;
+                    self.store
+                        .update_workspace_pr_linkage_rebased(&mut ws, |ws, persisted| {
+                            pr_ops::rebase_workspace_pr_pool(ws, persisted, &[pr.number]);
+                        })
+                        .await?;
                     publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
                     Ok(PrRefreshOutcome::Linked)
@@ -5389,8 +5484,9 @@ impl Services {
         }
     }
 
-    /// Passively fold a PR snapshot fetched on demand (`github.pulls.get`,
-    /// the FE hover card) into the daemon-owned PR state, so the sidebar's
+    /// Passively fold a PR snapshot served on demand (`github.pulls.get`,
+    /// the FE hover card; `ws.pr.snapshot` — every read through
+    /// [`Self::serve_pr`]) into the daemon-owned PR state, so the sidebar's
     /// `displayStatus` grouping reflects the fresh status through the
     /// existing event plumbing instead of waiting for the next sweep.
     ///
@@ -5412,34 +5508,91 @@ impl Services {
     /// writes nothing. Per-row persist failures WARN and continue; only the
     /// lookups themselves surface as `Err`, and the RPC caller treats that
     /// as fail-soft too.
-    pub(crate) async fn fold_fetched_pr(
+    ///
+    /// `merge_queue_reported` is the host's merge-queue state from the same
+    /// full read (`SharedPrSnapshot::merge_queue_reported`): the fold is the
+    /// signal-bearing writer of `PullRequestInfo::is_in_merge_queue`, so a
+    /// reported `true` lands on every folded copy and anything else clears
+    /// a persisted `Some(true)` — the URL-keyed upsert never inherits
+    /// (intent-hq/intent#5654).
+    ///
+    /// `fetched` is whether the serve reached the forge for this record. A
+    /// fetch folds the fresh record whole; a cache hit is a projection
+    /// ([`pr_ops::project_served_queue_signal`]): it writes only
+    /// `is_in_merge_queue`, onto copies on the same known head, and only
+    /// when the signal differs — so a signal another reader's fill
+    /// (`ws.pr.snapshot`, a monitor poll) carried into the cache lands on
+    /// the next hover instead of being skipped as a hit, while the older
+    /// cached REST fields never roll back a sweep that ran since the fill,
+    /// and a hit that agrees with the pool writes nothing. The projection
+    /// runs against the row as persisted at write time
+    /// (`Store::project_workspace_pr_snapshots` /
+    /// `project_workspace_git_root_pull_requests`, one `BEGIN IMMEDIATE`
+    /// each), never against the copies the referencing-rows lookup
+    /// returned: a REST refresh committing a newer head or fresher fields
+    /// between that lookup and the write is what the signal is projected
+    /// onto (or, on a moved head, what is left alone), not what is
+    /// overwritten.
+    pub(crate) async fn fold_served_pr(
         &self,
         repo_ref: &intent_sourcecontrol::RepoRef,
         pr: &intent_sourcecontrol::PullRequest,
+        merge_queue_reported: Option<bool>,
+        fetched: bool,
     ) -> Result<()> {
-        let info = pr_ops::build_pr_info(pr);
+        let info = pr_ops::build_pr_info_with_merge_queue(pr, merge_queue_reported);
         let workspaces = self
             .store
             .list_workspaces_referencing_pr_url(&pr.url)
             .await?;
         for mut ws in workspaces {
-            let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
-            let linked = ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
-            if linked
-                && (ws.pr_status != Some(info.status)
-                    || ws.active_pull_request.as_ref() != Some(&info)
-                    || ws.pr_url.as_deref() != Some(pr.url.as_str()))
-            {
-                ws.pr_status = Some(info.status);
-                ws.pr_url = Some(pr.url.clone());
-                ws.active_pull_request = Some(info.clone());
-                changed = true;
-            }
-            if !changed {
-                continue;
-            }
-            ws.updated_at = now_iso();
-            if let Err(e) = self.store.update_workspace_pr_linkage(&ws).await {
+            let persisted = if fetched {
+                let linked =
+                    ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
+                let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
+                if linked
+                    && (ws.pr_status != Some(info.status)
+                        || ws.active_pull_request.as_ref() != Some(&info)
+                        || ws.pr_url.as_deref() != Some(pr.url.as_str()))
+                {
+                    ws.pr_status = Some(info.status);
+                    ws.pr_url = Some(pr.url.clone());
+                    ws.active_pull_request = Some(info.clone());
+                    changed = true;
+                }
+                if !changed {
+                    continue;
+                }
+                ws.updated_at = now_iso();
+                self.store.update_workspace_pr_linkage(&ws).await
+            } else {
+                self.park_fold_hit().await;
+                let updated_at = now_iso();
+                match self
+                    .store
+                    .project_workspace_pr_snapshots(&ws.id, &updated_at, |pool, active| {
+                        let mut changed = pr_ops::project_pool_queue_signal(pool, &info);
+                        if let Some(active) = active
+                            .as_mut()
+                            .filter(|active| pr_ops::same_pr_url(&active.url, &info.url))
+                        {
+                            changed |= pr_ops::project_served_queue_signal(active, &info);
+                        }
+                        changed
+                    })
+                    .await
+                {
+                    Ok(None) => continue,
+                    Ok(Some((pool, active))) => {
+                        ws.pull_requests = pool;
+                        ws.active_pull_request = active;
+                        ws.updated_at = updated_at;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            if let Err(e) = persisted {
                 tracing::warn!(
                     workspace_id = %ws.id.as_str(),
                     error = %e,
@@ -5455,29 +5608,49 @@ impl Services {
             .list_workspace_git_roots_referencing_pr_url(&pr.url)
             .await?;
         for mut root in roots {
-            let mut changed = false;
-            if root
-                .pull_requests
-                .as_deref()
-                .is_some_and(|items| items.iter().any(|p| pr_ops::same_pr_url(&p.url, &pr.url)))
-            {
-                changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
-            }
-            let linked =
-                root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
-            if linked
-                && (root.pr_status != Some(info.status)
-                    || root.pr_url.as_deref() != Some(pr.url.as_str()))
-            {
-                root.pr_status = Some(info.status);
-                root.pr_url = Some(pr.url.clone());
-                changed = true;
-            }
-            if !changed {
-                continue;
-            }
-            root.updated_at = now_iso();
-            if let Err(e) = self.store.update_workspace_git_root_pr(&root).await {
+            let persisted =
+                if fetched {
+                    let linked =
+                        root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
+                    let mut changed = false;
+                    if root.pull_requests.as_deref().is_some_and(|items| {
+                        items.iter().any(|p| pr_ops::same_pr_url(&p.url, &pr.url))
+                    }) {
+                        changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
+                    }
+                    if linked
+                        && (root.pr_status != Some(info.status)
+                            || root.pr_url.as_deref() != Some(pr.url.as_str()))
+                    {
+                        root.pr_status = Some(info.status);
+                        root.pr_url = Some(pr.url.clone());
+                        changed = true;
+                    }
+                    if !changed {
+                        continue;
+                    }
+                    root.updated_at = now_iso();
+                    self.store.update_workspace_git_root_pr(&root).await
+                } else {
+                    self.park_fold_hit().await;
+                    let updated_at = now_iso();
+                    match self
+                        .store
+                        .project_workspace_git_root_pull_requests(&root.id, &updated_at, |pool| {
+                            pr_ops::project_pool_queue_signal(pool, &info)
+                        })
+                        .await
+                    {
+                        Ok(None) => continue,
+                        Ok(Some(pool)) => {
+                            root.pull_requests = pool;
+                            root.updated_at = updated_at;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+            if let Err(e) = persisted {
                 tracing::warn!(
                     git_root = %root.id.as_str(),
                     error = %e,
@@ -9186,6 +9359,7 @@ impl Services {
         message_id: Option<String>,
     ) -> Result<serde_json::Value> {
         if let Some(id) = message_id.as_deref() {
+            // queue-egress: allow — id-only idempotency probe; no entry leaves the daemon
             let queued = self
                 .queue_snapshot(&parent_agent_id)
                 .iter()
@@ -13170,6 +13344,114 @@ pub(crate) fn workspace_setup_completed_event(
     }
 }
 
+/// Shared per-workspace setup-stage state map backing
+/// [`WorkspaceApi::workspace_setup_status`]. Cloning shares the map. The
+/// composition root builds one and hands it to both
+/// [`Services::with_workspace_setup_states`] and the legacy importer
+/// ([`publish_workspace_created`]), so a workspace row inserted outside the
+/// `Services` surface still records its setup stage.
+#[derive(Clone, Default)]
+pub struct WorkspaceSetupStates(Arc<Mutex<HashMap<WorkspaceId, WorkspaceSetupStatus>>>);
+
+impl WorkspaceSetupStates {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<WorkspaceId, WorkspaceSetupStatus>> {
+        self.0.lock().expect("workspace setup state map poisoned")
+    }
+
+    /// The recorded stage for `workspace_id`, `unknown` when absent.
+    #[must_use]
+    pub fn get(&self, workspace_id: &WorkspaceId) -> WorkspaceSetupStatus {
+        self.lock()
+            .get(workspace_id)
+            .cloned()
+            .unwrap_or_else(WorkspaceSetupStatus::unknown)
+    }
+}
+
+/// Test seam: when set to a path, `workspace.create` pauses before resolving
+/// the effective setup script for as long as that file exists, so a test can
+/// hold a create between `pending` and its resolution (`skipped` / spawn)
+/// deterministically while it drives RPCs over the live socket, then release
+/// it by deleting the file. Unset (the normal case) is a no-op.
+const TEST_SETUP_RESOLVE_HOLD_FILE_ENV: &str = "INTENTD_TEST_SETUP_RESOLVE_HOLD_FILE";
+
+/// Pause while the [`TEST_SETUP_RESOLVE_HOLD_FILE_ENV`] hold file exists.
+async fn test_hold_setup_resolution() {
+    let Some(hold) = std::env::var_os(TEST_SETUP_RESOLVE_HOLD_FILE_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    while hold.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Record `pending` for `workspace_id`: the worktree exists and the setup
+/// stage is about to resolve its effective script. Called synchronously in
+/// `workspace.create` before the initial agent's message is sent.
+pub(crate) fn record_setup_pending(states: &WorkspaceSetupStates, workspace_id: &WorkspaceId) {
+    states.lock().insert(
+        workspace_id.clone(),
+        WorkspaceSetupStatus::new(WorkspaceSetupState::Pending),
+    );
+}
+
+/// Record `skipped` for `workspace_id`: the setup stage never runs (no
+/// effective script, `skipWorktree`, duplicate, transfer import, legacy
+/// import). Pairs with the immediate
+/// `workspace:setup:completed { ranScript: false }` publish.
+pub(crate) fn record_setup_skipped(states: &WorkspaceSetupStates, workspace_id: &WorkspaceId) {
+    let mut record = WorkspaceSetupStatus::new(WorkspaceSetupState::Skipped);
+    record.finished_at = Some(now_iso());
+    states.lock().insert(workspace_id.clone(), record);
+}
+
+/// Record `running` for `workspace_id`: the setup script's terminal was
+/// spawned. State and `terminalId` land in one write, so `running` is never
+/// observable without its terminal; until then the record stays `pending`
+/// (the `workspace:setup:started` publish precedes the spawn attempt and is
+/// not tied to this transition).
+pub(crate) fn record_setup_running(
+    states: &WorkspaceSetupStates,
+    workspace_id: &WorkspaceId,
+    terminal_id: &str,
+) {
+    let mut record = WorkspaceSetupStatus::new(WorkspaceSetupState::Running);
+    record.terminal_id = Some(terminal_id.to_string());
+    record.started_at = Some(now_iso());
+    states.lock().insert(workspace_id.clone(), record);
+}
+
+/// Record the terminal state of a setup stage that was `started`: `completed`
+/// when the script ran to an observed exit `0`, else `failed` (non-zero exit,
+/// unobserved exit, or a spawn / pre-spawn failure — `exit_code` is then
+/// whatever was observed, possibly nothing, and the record moves straight
+/// from `pending`). The `terminalId` / `startedAt`
+/// recorded by [`record_setup_running`] are kept. Pairs with the
+/// `workspace:setup:completed` publish carrying the same `ran_script` /
+/// `exit_code`.
+pub(crate) fn record_setup_finished(
+    states: &WorkspaceSetupStates,
+    workspace_id: &WorkspaceId,
+    ran_script: bool,
+    exit_code: Option<u32>,
+) {
+    let state = if ran_script && exit_code == Some(0) {
+        WorkspaceSetupState::Completed
+    } else {
+        WorkspaceSetupState::Failed
+    };
+    let mut map = states.lock();
+    let record = map
+        .entry(workspace_id.clone())
+        .or_insert_with(|| WorkspaceSetupStatus::new(state));
+    record.state = state;
+    record.exit_code = exit_code;
+    record.finished_at = Some(now_iso());
+}
+
 /// Publish a `workspace:created` event for a workspace row inserted outside
 /// the `Services` surface (the legacy importer writes through `Store`
 /// directly, so `create_workspace`'s own publish never fires). Best-effort
@@ -13179,8 +13461,19 @@ pub(crate) fn workspace_setup_completed_event(
 /// `workspace:setup:completed { ranScript: false }` is published immediately
 /// after — otherwise the watcher registry would hold the workspace's watcher
 /// start pending for the full setup backstop (§6.5 pairs every logical create
-/// with exactly one completion).
-pub async fn publish_workspace_created(bus: &EventBus, ws: &Workspace) {
+/// with exactly one completion). `setup_states` is the daemon's shared
+/// [`WorkspaceSetupStates`] (the one `Services` reads): when present the
+/// workspace is recorded `skipped` before the publish so
+/// `ws.workspace.details().setupStatus` matches the event; `None` (offline
+/// CLI, tests) records nothing.
+pub async fn publish_workspace_created(
+    bus: &EventBus,
+    setup_states: Option<&WorkspaceSetupStates>,
+    ws: &Workspace,
+) {
+    if let Some(states) = setup_states {
+        record_setup_skipped(states, &ws.id);
+    }
     if let Err(e) = bus.publish(&workspace_created_event(ws)).await {
         tracing::warn!(error = %e, "failed to publish workspace:created event");
     }
@@ -18413,6 +18706,10 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn workspace_setup_status(&self, id: &WorkspaceId) -> WorkspaceSetupStatus {
+        self.workspace_setup_states.get(id)
+    }
+
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let this = self.clone();
@@ -20299,6 +20596,67 @@ impl WorkspaceApi for Services {
                     // the stored result instead of re-sending. An empty/missing
                     // prompt persists the row without a message; the FE first
                     // send starts the turn.
+                    //
+                    // Setup state (§6.5): recorded BEFORE the initial agent's
+                    // message is sent so a turn started at create time can
+                    // observe the in-progress stage via
+                    // `ws.workspace.details().setupStatus`. `pending` when a
+                    // worktree exists; `skipped` when the stage never runs
+                    // (skipWorktree / no worktree provisioned).
+                    let setup_worktree = if ws.skip_worktree {
+                        None
+                    } else {
+                        crate::git_ops::worktree_path(&ws)
+                    };
+                    if setup_worktree.is_some() {
+                        record_setup_pending(&services.workspace_setup_states, &ws.id);
+                    } else {
+                        record_setup_skipped(&services.workspace_setup_states, &ws.id);
+                    }
+                    // Resolve the effective setup script (explicit request param
+                    // > worktree repo config > legacy DB row) BEFORE the initial
+                    // send as well: a no-script workspace is `skipped` — never
+                    // transiently `pending` — by the time its first turn starts,
+                    // so that turn carries no in-progress notice. The explicit
+                    // param is execute-only, never persisted (§5.1).
+                    let effective_setup_script = match &setup_worktree {
+                        Some(worktree) => {
+                            test_hold_setup_resolution().await;
+                            match explicit_setup_script {
+                                Some(explicit) => Some(explicit),
+                                None => crate::repo_config::read_repo_config(worktree)
+                                    .await
+                                    .setup_script
+                                    .filter(|s| !s.is_empty())
+                                    .or_else(|| {
+                                        ws.setup_script.as_ref().and_then(|ss| {
+                                            let script = ss.script.trim();
+                                            if script.is_empty() {
+                                                None
+                                            } else {
+                                                Some(script.to_string())
+                                            }
+                                        })
+                                    }),
+                            }
+                        }
+                        None => None,
+                    };
+                    if setup_worktree.is_some() && effective_setup_script.is_none() {
+                        record_setup_skipped(&services.workspace_setup_states, &ws.id);
+                    }
+                    if effective_setup_script.is_none() {
+                        // skipWorktree / no worktree provisioned / no effective
+                        // script: the setup stage never runs (state recorded
+                        // `skipped` above), but the lifecycle still completes
+                        // (§6.5) — before the initial agent exists, so
+                        // `workspace:setup:completed` precedes `agent:created`.
+                        publish_event(
+                            bus.as_ref(),
+                            workspace_setup_completed_event(&ws.id, false, None),
+                        )
+                        .await;
+                    }
                     let mut initial_agent = None;
                     if let Some((mut plan, prompt, image_blocks)) = planned_initial_agent {
                         // Harness-owned commits: same derivation as
@@ -20316,9 +20674,20 @@ impl WorkspaceApi for Services {
                         // `baseRef` (agent.create parity: worktree, else the
                         // repository path).
                         let snapshot_wp = crate::git_ops::worktree_path(&ws);
-                        let created = services
+                        // On that infrastructure failure the create returns
+                        // before the setup task below is scheduled, so the
+                        // already-inserted row would otherwise read `pending`
+                        // forever: the stage never runs — record `skipped`.
+                        let created = match services
                             .persist_agent_create(plan, ws.id.clone(), snapshot_wp)
-                            .await?;
+                            .await
+                        {
+                            Ok(created) => created,
+                            Err(e) => {
+                                record_setup_skipped(&services.workspace_setup_states, &ws.id);
+                                return Err(e.into());
+                            }
+                        };
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
@@ -20356,9 +20725,19 @@ impl WorkspaceApi for Services {
                             // `agent.sendMessage` (an agent / daemon caller
                             // stamps nothing). Stamping an absent payload
                             // cannot fail, so this never strands the row
-                            // persisted above.
+                            // persisted above; the setup record is settled
+                            // defensively all the same.
                             let message_metadata =
-                                crate::principal_ops::stamp_principal_attribution(None)?;
+                                match crate::principal_ops::stamp_principal_attribution(None) {
+                                    Ok(metadata) => metadata,
+                                    Err(e) => {
+                                        record_setup_skipped(
+                                            &services.workspace_setup_states,
+                                            &ws.id,
+                                        );
+                                        return Err(e);
+                                    }
+                                };
                             let options = crate::agent_manager::TurnOptions {
                                 image_blocks: created_image_blocks.clone(),
                                 file_blocks: created_file_blocks.clone(),
@@ -20395,12 +20774,10 @@ impl WorkspaceApi for Services {
                         }
                         initial_agent = created.get("agent").cloned();
                     }
-                    // Execute the workspace setup script (fire-and-forget): after worktree
-                    // provisioning, resolve the effective setup script (explicit request
-                    // param > repo config > legacy DB row) and run it in a "Setup" terminal.
-                    // The explicit param is execute-only — it is never persisted (§5.1).
-                    // Execution is non-blocking (tokio::spawn) and must never fail the create.
-                    // Skipped when skipWorktree or no worktree was provisioned.
+                    // Execute the effective setup script resolved above (fire-and-forget)
+                    // in a "Setup" terminal. Execution is non-blocking (tokio::spawn) and
+                    // must never fail the create. Skipped when skipWorktree, no worktree
+                    // was provisioned, or no effective script resolved.
                     // Lives inside the idempotency closure so a cached response (same idempotencyKey)
                     // returns immediately without re-executing the script.
                     // Setup lifecycle (§6.5): `workspace:setup:started` fires iff an
@@ -20410,14 +20787,11 @@ impl WorkspaceApi for Services {
                     // publish nothing (same as `workspace:created`).
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
-                    let setup_worktree = if ws.skip_worktree {
-                        None
-                    } else {
-                        crate::git_ops::worktree_path(&ws)
-                    };
-                    if let Some(worktree_path_buf) = setup_worktree {
-                        // Spawn background task to read + execute setup script (fire-and-forget).
-                        // Move config IO into the task so workspace.create doesn't block on it.
+                    let setup_states = self.workspace_setup_states.clone();
+                    if let (Some(worktree_path_buf), Some(script)) =
+                        (setup_worktree, effective_setup_script)
+                    {
+                        // Spawn background task to execute the setup script (fire-and-forget).
                         let workspace_id = ws.id.clone();
                         let worktree_path = worktree_path_buf.to_string_lossy().to_string();
                         let repo_path = ws
@@ -20429,45 +20803,16 @@ impl WorkspaceApi for Services {
                             .base_ref
                             .clone()
                             .unwrap_or_default();
-                        let legacy_script = ws.setup_script.clone();
                         let worktree_for_read = worktree_path_buf.clone();
                         intent_core::spawn_daemon(async move {
-                            // Resolve the effective setup script: the explicit param wins
-                            // for this create; an omitted param falls back to the
-                            // worktree-first repo-config read, then the legacy DB row.
-                            let effective_script = match explicit_setup_script {
-                                Some(explicit) => Some(explicit),
-                                None => crate::repo_config::read_repo_config(&worktree_for_read)
-                                    .await
-                                    .setup_script
-                                    .filter(|s| !s.is_empty())
-                                    .or_else(|| {
-                                        legacy_script.as_ref().and_then(|ss| {
-                                            let script = ss.script.trim();
-                                            if script.is_empty() {
-                                                None
-                                            } else {
-                                                Some(script.to_string())
-                                            }
-                                        })
-                                    }),
-                            };
-                            let Some(script) = effective_script else {
-                                // No script to execute: the setup stage is done.
-                                publish_event(
-                                    bus_for_setup.as_ref(),
-                                    workspace_setup_completed_event(&workspace_id, false, None),
-                                )
-                                .await;
-                                return;
-                            };
                             tracing::info!(
                                 workspace = %workspace_id.as_str(),
                                 script_length = script.len(),
                                 worktree = %worktree_path,
                                 "executing setup script in background"
                             );
-                            // A script was resolved and a spawn will be attempted.
+                            // A script was resolved and a spawn will be attempted; the
+                            // setup state stays `pending` until the spawn succeeds.
                             publish_event(
                                 bus_for_setup.as_ref(),
                                 workspace_setup_started_event(&workspace_id),
@@ -20595,6 +20940,11 @@ impl WorkspaceApi for Services {
                                         terminal_id = %terminal_id,
                                         "setup script terminal spawned"
                                     );
+                                    record_setup_running(
+                                        &setup_states,
+                                        &workspace_id,
+                                        &terminal_id,
+                                    );
                                     // Spawn output stream to fan setup script output to event bus
                                     crate::terminal_ops::spawn_output_stream(
                                         pty_for_setup.clone(),
@@ -20627,6 +20977,12 @@ impl WorkspaceApi for Services {
                                 }
                             }
                             };
+                            record_setup_finished(
+                                &setup_states,
+                                &workspace_id,
+                                ran_script,
+                                exit_code,
+                            );
                             publish_event(
                                 bus_for_setup.as_ref(),
                                 workspace_setup_completed_event(
@@ -20637,14 +20993,6 @@ impl WorkspaceApi for Services {
                             )
                             .await;
                         });
-                    } else {
-                        // skipWorktree / no worktree provisioned: the setup stage
-                        // never runs, but the lifecycle still completes.
-                        publish_event(
-                            bus_for_setup.as_ref(),
-                            workspace_setup_completed_event(&ws.id, false, None),
-                        )
-                        .await;
                     }
                     Ok(WorkspaceCreateResult {
                         workspace: ws,
@@ -22396,6 +22744,7 @@ impl WorkspaceApi for Services {
             // `workspace.duplicate` never runs a setup script, but the setup
             // lifecycle (§6.5) still completes so clients waiting on
             // `workspace:setup:completed` converge on every create-shaped flow.
+            record_setup_skipped(&this.workspace_setup_states, &ws.id);
             publish_event(
                 bus.as_ref(),
                 workspace_setup_completed_event(&ws.id, false, None),
@@ -29954,22 +30303,9 @@ impl WorkspaceApi for Services {
             // the entry is younger than `prCache.maxAgeSeconds`, else one
             // full read — the same read the monitor's poll performs — that
             // refreshes the entry the next hover and `ws.pr.snapshot` serve.
-            let (entry, fetched) = self.serve_pr(&repo_ref, number).await?;
-            // The fold rides a REAL fetch only: a hit reports nothing the
-            // daemon-owned state has not already seen. Fail-soft: the hover
-            // card always gets its `{ pull }`; a fold failure only costs the
-            // daemon-owned state its early refresh.
-            if fetched {
-                if let Err(e) = self.fold_fetched_pr(&repo_ref, &entry.pr).await {
-                    tracing::warn!(
-                        owner = %repo_ref.owner,
-                        repo = %repo_ref.name,
-                        pr_number = number,
-                        error = %e,
-                        "github.pulls.get: folding the fetched PR into workspace PR state failed"
-                    );
-                }
-            }
+            // The serve folds the snapshot into the daemon-owned PR state
+            // (`fold_served_pr`, fail-soft), hit or miss.
+            let (entry, _) = self.serve_pr(&repo_ref, number).await?;
             Ok(serde_json::json!({
                 "pull": github_ops::pull_to_json_with_merge_queue(
                     &entry.pr,
@@ -33632,8 +33968,8 @@ impl Services {
             .await
             .map_err(pr_ops::map_sc_err)?;
 
-        let info = pr_ops::build_pr_info(&pr);
-        pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+        let mut info = pr_ops::build_pr_info(&pr);
+        pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
         ws.pr_number = Some(pr.number);
         ws.pr_url = Some(pr.url.clone());
         ws.pr_status = Some(info.status);
@@ -33673,11 +34009,12 @@ impl Services {
                 ws.pr_status = Some(intent_core::PullRequestStatus::Merged);
                 if let Some(info) = ws.active_pull_request.as_mut() {
                     info.status = intent_core::PullRequestStatus::Merged;
+                    info.is_in_merge_queue = None;
                 }
                 // Mirror the merged status into the daemon-owned list so the
                 // pr:updated payload below is internally consistent.
-                if let Some(info) = ws.active_pull_request.clone() {
-                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                if let Some(mut info) = ws.active_pull_request.clone() {
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
                 }
                 ws.updated_at = now_iso();
                 let _ = self.store.update_workspace(&ws).await;

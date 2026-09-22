@@ -1438,6 +1438,7 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
         mergeable: m.snapshot_mergeable,
         mergeable_state: None,
         is_draft: m.snapshot_is_draft,
+        is_in_merge_queue: None,
     }
 }
 
@@ -1662,9 +1663,17 @@ impl Services {
 
     /// [`Self::read_pr_with_fetched`] under the on-demand readers' policy —
     /// `Serve` at `prCache.maxAgeSeconds` ([`Self::pr_cache_max_age`]). The
-    /// flag is exact: `false` whenever the cached entry was served (a caller
-    /// with a side effect keyed on a real fetch, `github.pulls.get`'s fold,
-    /// skips it), `true` only when this read fetched the record itself.
+    /// flag is exact: `false` whenever the cached entry was served, `true`
+    /// only when this read fetched the record itself.
+    ///
+    /// Every successful serve passively folds the served snapshot into the
+    /// daemon-owned PR state ([`Services::fold_served_pr`]) so
+    /// `github.pulls.get` and `ws.pr.snapshot` behave identically: a fetch
+    /// folds the fresh record whole, a hit projects only the queue signal
+    /// onto same-head copies whose signal differs — a hit costs no forge
+    /// call either way (intent-hq/intent#5654). The fold is fail-soft: the
+    /// caller always gets its entry, a fold failure only costs the
+    /// daemon-owned state its early refresh.
     ///
     /// # Errors
     ///
@@ -1675,8 +1684,28 @@ impl Services {
         number: u64,
     ) -> Result<(PrCacheEntry, bool)> {
         let max_age = self.pr_cache_max_age();
-        self.read_pr_with_fetched(repo_ref, number, PrReadPolicy::Serve { max_age })
+        let (entry, fetched) = self
+            .read_pr_with_fetched(repo_ref, number, PrReadPolicy::Serve { max_age })
+            .await?;
+        if let Err(e) = self
+            .fold_served_pr(
+                repo_ref,
+                &entry.pr,
+                entry.snapshot.merge_queue_reported,
+                fetched,
+            )
             .await
+        {
+            tracing::warn!(
+                owner = %repo_ref.owner,
+                repo = %repo_ref.name,
+                pr_number = number,
+                fetched,
+                error = %e,
+                "pr serve: folding the served PR into workspace PR state failed"
+            );
+        }
+        Ok((entry, fetched))
     }
 
     /// The PRs under an active monitor, for the cache's retention pass
@@ -11369,6 +11398,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         };
 
         // T3: a failed poll advances `last_polled_at` past T2 with an error.
@@ -12416,6 +12446,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         };
         let mut polled = mk(
             PrMonitorState::Active,
@@ -12866,6 +12897,7 @@ mod tests {
             mergeable: Some(true),
             mergeable_state: Some("clean".into()),
             is_draft: Some(false),
+            is_in_merge_queue: None,
         });
         svc.store().update_workspace(&row).await.expect("update");
         register(&svc, &ws, &owner).await;

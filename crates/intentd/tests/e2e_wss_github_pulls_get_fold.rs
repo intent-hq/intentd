@@ -14,7 +14,7 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -142,13 +142,14 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 }
 
 /// Stub forge: `get_pr` reports every PR merged (head `feature`) at the
-/// canonical `o/r` URL for its number and counts its calls (the cache
-/// assertions); the probe reports the PR queued so the hover card's
-/// `isInMergeQueue` has a source; the remaining sub-reads of the full PR
-/// read answer empty.
+/// canonical `o/r` URL for its number — or still open and `clean` while
+/// `serve_open` is set — and counts its calls (the cache assertions); the
+/// probe reports the PR queued so the hover card's `isInMergeQueue` has a
+/// source; the remaining sub-reads of the full PR read answer empty.
 #[derive(Default)]
 struct StubForge {
     get_pr_calls: AtomicUsize,
+    serve_open: AtomicBool,
 }
 
 impl StubForge {
@@ -158,12 +159,16 @@ impl StubForge {
 }
 
 fn merged_pr(number: u64) -> PullRequest {
+    forge_pr(number, PrState::Merged)
+}
+
+fn forge_pr(number: u64, state: PrState) -> PullRequest {
     PullRequest {
         number,
         url: format!("https://github.com/o/r/pull/{number}"),
         title: "Add thing".into(),
         body: None,
-        state: PrState::Merged,
+        state,
         draft: false,
         source_branch: "feature".into(),
         target_branch: "main".into(),
@@ -228,6 +233,9 @@ impl SourceControl for StubForge {
     }
     async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
         self.get_pr_calls.fetch_add(1, Ordering::SeqCst);
+        if self.serve_open.load(Ordering::SeqCst) {
+            return Ok(forge_pr(number, PrState::Open));
+        }
         Ok(merged_pr(number))
     }
     async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
@@ -347,6 +355,7 @@ fn open_pr_info() -> PullRequestInfo {
         mergeable: Some(true),
         mergeable_state: Some("clean".into()),
         is_draft: Some(false),
+        is_in_merge_queue: None,
     }
 }
 
@@ -688,8 +697,8 @@ async fn github_pulls_get_folds_fetched_pr_into_workspace_pr_state_over_wss() {
     assert_no_events(&mut sub).await;
 
     // A repeat hover within `prCache.maxAgeSeconds` is served from the
-    // shared cache: the same `{ pull }`, no forge request, and nothing to
-    // fold (no events).
+    // shared cache: the same `{ pull }`, no forge request, and — the served
+    // snapshot agreeing with the pool — nothing to fold (no events).
     let again = wss_rpc(
         &mut rpc,
         5,
@@ -704,4 +713,131 @@ async fn github_pulls_get_folds_fetched_pr_into_workspace_pr_state_over_wss() {
         "a hit within max_age costs no forge request"
     );
     assert_no_events(&mut sub).await;
+}
+
+/// The pool path of intent-hq/intent#5654, with NO PR monitor: hovering a
+/// merge-queued PR that is still open — REST `mergeable_state: "clean"`
+/// (GitHub never reports `"queued"` there), the probe reporting
+/// `isInMergeQueue: true` — folds `isInMergeQueue: true` onto the linked,
+/// pooled and git-root copies, and the workspace's `displayStatus` moves
+/// `pr_ready` → `pr_queued` through the wire events. A following REST-only
+/// `pr.refresh` on the same head (which cannot observe the queue) keeps the
+/// signal, so the sidebar does not flap back to `pr_ready`.
+#[tokio::test]
+async fn github_pulls_get_folds_is_in_merge_queue_and_reads_pr_queued_over_wss() {
+    let fx = boot().await;
+    fx.forge.serve_open.store(true, Ordering::SeqCst);
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+
+    // Baseline: the persisted REST-only snapshot reads `pr_ready` and carries
+    // no `isInMergeQueue` key at all (presence-detected).
+    let before = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(before["workspace"]["displayStatus"], "pr_ready");
+    assert!(
+        before["workspace"]["pullRequests"][0]
+            .get("isInMergeQueue")
+            .is_none(),
+        "seeded pool: {}",
+        before["workspace"]["pullRequests"]
+    );
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["pr:updated", "gitRoot:updated", "workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let hover = wss_rpc(
+        &mut rpc,
+        2,
+        "github.pulls.get",
+        json!({ "owner": "o", "repo": "r", "number": 42 }),
+    )
+    .await;
+    assert_eq!(hover["pull"]["state"], "open");
+    assert_eq!(hover["pull"]["mergeableState"], "clean");
+    assert_eq!(hover["pull"]["isInMergeQueue"], true, "pull: {hover}");
+    assert_eq!(fx.forge.fetches(), 1);
+
+    // The fold: the signal lands on the linked copy and the pool entry, the
+    // rollup moves to `pr_queued`, and the git root's pool copy follows.
+    let events = next_events(&mut sub, 3).await;
+    assert_eq!(events[0]["type"], "pr:updated", "events: {events:?}");
+    assert_eq!(events[0]["data"]["prStatus"], "Open");
+    assert_eq!(
+        events[0]["data"]["activePullRequest"]["isInMergeQueue"], true,
+        "events: {events:?}"
+    );
+    let pooled = events[0]["data"]["pullRequests"]
+        .as_array()
+        .expect("pullRequests array");
+    assert_eq!(pooled.len(), 1, "pool upserted in place: {pooled:?}");
+    assert_eq!(pooled[0]["status"], "Open");
+    assert_eq!(pooled[0]["mergeableState"], "clean");
+    assert_eq!(pooled[0]["isInMergeQueue"], true);
+    assert_eq!(
+        events[1]["type"], "workspace:displayStatus-changed",
+        "events: {events:?}"
+    );
+    assert_eq!(
+        events[1]["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "pr_queued" })
+    );
+    assert_eq!(events[2]["type"], "gitRoot:updated", "events: {events:?}");
+    assert_eq!(
+        events[2]["data"]["gitRoot"]["pullRequests"][0]["isInMergeQueue"], true,
+        "events: {events:?}"
+    );
+
+    let after = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(after["workspace"]["displayStatus"], "pr_queued");
+    assert_eq!(
+        after["workspace"]["activePullRequest"]["isInMergeQueue"],
+        true
+    );
+    assert_eq!(
+        after["workspace"]["pullRequests"][0]["isInMergeQueue"],
+        true
+    );
+
+    // A REST-only refresh on the same open head cannot see the queue; the
+    // persisted signal is carried, so nothing changes and no event fires.
+    let refreshed = wss_rpc(
+        &mut rpc,
+        4,
+        "pr.refresh",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(refreshed["outcome"], "unchanged", "refresh: {refreshed}");
+    assert_eq!(refreshed["pullRequests"][0]["isInMergeQueue"], true);
+    assert_eq!(fx.forge.fetches(), 2, "pr.refresh is one REST read");
+    assert_no_events(&mut sub).await;
+    let still = wss_rpc(
+        &mut rpc,
+        5,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(still["workspace"]["displayStatus"], "pr_queued");
 }
