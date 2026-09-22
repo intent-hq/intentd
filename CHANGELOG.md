@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.100] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- Default Codex ACP to full access ([#2088](https://github.com/intent-hq/intentd/pull/2088))
+
+
 ## [0.9.99] - 2026-09-22
 
 ### 🐛 Bug Fixes
