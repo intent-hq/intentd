@@ -8,25 +8,22 @@ use serde_json::{json, Value};
 
 use super::*;
 
+/// The invite link is tunnel-only: no `host` parameter at all (not even an
+/// empty one), `tc` always present, never the bearer token.
 #[test]
-fn invite_uri_carries_envelope_minus_token_plus_invite_fields() {
-    let uri = build_invite_uri(
-        &["192.168.1.10".to_string(), "10.0.0.5".to_string()],
-        7443,
-        "AB:CD",
-        "inv-1",
-        "s3cret",
-        None,
-    );
+fn invite_uri_is_tunnel_only_without_a_host_parameter() {
+    let uri = build_invite_uri(7443, "AB:CD", "inv-1", "s3cret", "tc-abc");
     assert_eq!(
         uri,
-        "intent://invite?v=1&host=192.168.1.10,10.0.0.5&port=7443&fp=AB:CD&inviteId=inv-1&secret=s3cret"
+        "intent://invite?v=1&port=7443&fp=AB:CD&inviteId=inv-1&secret=s3cret&tc=tc-abc"
     );
+    assert!(!uri.contains("host="), "{uri}");
     assert!(!uri.contains("token="));
-    let with_tc = build_invite_uri(&[], 7443, "AB", "i", "s", Some("tc-abc"));
-    assert!(with_tc.ends_with("&tc=tc-abc"), "{with_tc}");
-    let encoded = build_invite_uri(&[], 1, "AB", "a&b", "x=y", None);
-    assert!(encoded.contains("inviteId=a%26b&secret=x%3Dy"), "{encoded}");
+    let encoded = build_invite_uri(1, "AB", "a&b", "x=y", "tc a");
+    assert!(
+        encoded.contains("inviteId=a%26b&secret=x%3Dy&tc=tc%20a"),
+        "{encoded}"
+    );
 }
 
 #[test]
@@ -690,12 +687,14 @@ fn stub_provider(
 
 /// The services-facing resolver rebuilds exactly the link `create` mints —
 /// same envelope, same formatter — and answers `None` rather than an error
-/// when the listener is down or nothing is dialable (loopback bind, no
-/// tunnel), so `workspace.invite.list` never fails for it.
+/// when the listener is down or the tunnel is not running, so
+/// `workspace.invite.list` never fails for it (a listed invite simply has no
+/// `url` while the tunnel is down).
 #[tokio::test]
-async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
+async fn link_resolver_rebuilds_the_minted_link_and_is_none_without_a_tunnel() {
     let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
     let minted = link_envelope(Some(&provider)).await.expect("envelope");
+    assert_eq!(minted.tc_address, "tc-abc");
     let resolved = InviteLinkResolver::new(provider.clone())
         .invite_link_envelope()
         .await
@@ -705,10 +704,11 @@ async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
     assert_eq!(
         url,
         format!(
-            "intent://invite?v=1&host=&port=7443&fp={}&inviteId=inv-1&secret=s3cret&tc=tc-abc",
+            "intent://invite?v=1&port=7443&fp={}&inviteId=inv-1&secret=s3cret&tc=tc-abc",
             encode_query_value(&minted.fingerprint)
         )
     );
+    assert!(!url.contains("host="), "{url}");
 
     let (down, _dir) = stub_provider(None, Some("tc-abc"));
     assert!(matches!(
@@ -720,15 +720,29 @@ async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
         .await
         .is_none());
 
-    let (undialable, _dir) = stub_provider(Some(7443), None);
+    let (tunnel_down, _dir) = stub_provider(Some(7443), None);
     assert!(matches!(
-        link_envelope(Some(&undialable)).await,
-        Err(Error::Unsupported(_))
+        link_envelope(Some(&tunnel_down)).await,
+        Err(Error::TunnelDown)
     ));
-    assert!(InviteLinkResolver::new(undialable)
+    assert!(InviteLinkResolver::new(tunnel_down)
         .invite_link_envelope()
         .await
         .is_none());
+}
+
+/// The stub snapshot binds loopback only, so this exercises the contract
+/// that the envelope ignores the bind addresses altogether: a LAN bind
+/// address would not make an invite dialable without the tunnel either.
+#[tokio::test]
+async fn link_envelope_never_carries_direct_hosts() {
+    let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
+    let envelope = link_envelope(Some(&provider)).await.expect("envelope");
+    assert_eq!(envelope.port, 7443);
+    assert_eq!(envelope.tc_address, "tc-abc");
+    let url = envelope.invite_url("inv-1", "s3cret");
+    assert!(!url.contains("127.0.0.1"), "{url}");
+    assert!(!url.contains("host="), "{url}");
 }
 
 /// Service half of `workspace.invite.create`: answers `{ invite, secret }`
@@ -755,9 +769,10 @@ impl WorkspaceApi for CreateStub {
 }
 
 /// `create` resolves the envelope once and stamps the one link it formats
-/// as both the top-level `url` and `invite.url`; when no link can be built
-/// (listener down) the create is refused before the service mints anything,
-/// so neither `url` can exist without the other.
+/// as both the top-level `url` and `invite.url`; the result carries
+/// `hosts: []` and the tunnel address; when no link can be built (listener
+/// down, or tunnel down) the create is refused before the service mints
+/// anything, so neither `url` can exist without the other.
 #[tokio::test]
 async fn create_stamps_the_same_link_as_url_and_invite_url() {
     let stub = Arc::new(CreateStub {
@@ -792,6 +807,11 @@ async fn create_stamps_the_same_link_as_url_and_invite_url() {
     );
     assert_eq!(r["secret"], json!("s3cret"));
     assert_eq!(r["invite"]["id"], json!("inv-1"));
+    assert_eq!(r["hosts"], json!([]), "{r}");
+    assert_eq!(r["port"], json!(7443));
+    assert_eq!(r["tcAddress"], json!("tc-abc"), "{r}");
+    assert!(url.contains("&tc=tc-abc"), "{url}");
+    assert!(!url.contains("host="), "{url}");
     assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     let (down, _dir) = stub_provider(None, Some("tc-abc"));
@@ -806,11 +826,32 @@ async fn create_stamps_the_same_link_as_url_and_invite_url() {
         json!("listener-down"),
         "{frame}"
     );
+    assert_eq!(frame["error"]["code"], json!(-32603), "{frame}");
     assert!(frame.get("result").is_none(), "{frame}");
     assert_eq!(
         stub.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "nothing minted without an envelope"
+    );
+
+    let (tunnel_down, _dir) = stub_provider(Some(7443), None);
+    let frame: Value = serde_json::from_str(
+        &handle_create(create_req(), &api, Some(&tunnel_down))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        frame["error"]["data"]["code"],
+        json!("tunnel-down"),
+        "{frame}"
+    );
+    assert_eq!(frame["error"]["code"], json!(-32603), "{frame}");
+    assert!(frame.get("result").is_none(), "{frame}");
+    assert_eq!(
+        stub.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "nothing minted while the tunnel is down"
     );
 }
 

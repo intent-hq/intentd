@@ -4,9 +4,10 @@
 //!
 //! - `workspace.invite.create` — served on every authenticated connection
 //!   (UDS and `/ws`). The service half mints the invite; this half wraps it
-//!   into the `intent://invite?…` link, which is the `intent://pair` envelope
-//!   (hosts / port / fingerprint / optional `tc`) **minus the bearer token**,
-//!   plus `inviteId` and `secret`. It needs the listener's own pairing
+//!   into the tunnel-only `intent://invite?…` link: port / fingerprint /
+//!   `tc` (no `host`, **never the bearer token**) plus `inviteId` and
+//!   `secret`; without a tunnel address the create is refused
+//!   (`tunnel-down`). It needs the listener's own pairing
 //!   snapshot ([`ServerPairingInfo`]), which the JSON-RPC router has no
 //!   access to — hence a fast path, like `pairing.getInfo`.
 //! - `invite.challenge` / `invite.prove` — served on the unauthenticated
@@ -24,7 +25,6 @@
 //!   that credential as proof of identity, answering the same `authorized`
 //!   shape. Nothing else is reachable through `/invite`.
 
-use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ use crate::control::SystemControl;
 use crate::events::{error_frame, error_frame_with_data, success_frame};
 use crate::host_env::HostEnvironment;
 use crate::pairing::encode_query_value;
-use crate::server::{pairing_hosts, ServerPairingInfo};
+use crate::server::ServerPairingInfo;
 use intent_core::{
     Error, InviteErrorKind, InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope,
     Result, WorkspaceApi, WorkspaceId,
@@ -50,33 +50,25 @@ pub(crate) const INVITE_PAYLOAD_VERSION: u32 = 1;
 /// any method other than the invite methods.
 pub(crate) const INVITE_ENDPOINT_ONLY_MESSAGE: &str = "the /invite endpoint serves invite.inspect, invite.accept, invite.challenge and invite.prove only";
 
-/// Build the invite link:
-/// `intent://invite?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&inviteId=<id>&secret=<s>[&tc=<addr>]`.
-/// Same encoding rules as [`crate::pairing::build_pairing_uri`]; never
-/// carries the daemon bearer token.
+/// Build the tunnel-only invite link:
+/// `intent://invite?v=1&port=<p>&fp=<sha256>&inviteId=<id>&secret=<s>&tc=<addr>`.
+/// No `host` parameter (an invite is dialed through the tunnel only); same
+/// encoding rules as [`crate::pairing::build_pairing_uri`]; never carries the
+/// daemon bearer token.
 pub(crate) fn build_invite_uri(
-    hosts: &[String],
     port: u16,
     fingerprint: &str,
     invite_id: &str,
     secret: &str,
-    tc_address: Option<&str>,
+    tc_address: &str,
 ) -> String {
-    let hosts = hosts
-        .iter()
-        .map(|h| encode_query_value(h))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut uri = format!(
-        "intent://invite?v={INVITE_PAYLOAD_VERSION}&host={hosts}&port={port}&fp={}&inviteId={}&secret={}",
+    format!(
+        "intent://invite?v={INVITE_PAYLOAD_VERSION}&port={port}&fp={}&inviteId={}&secret={}&tc={}",
         encode_query_value(fingerprint),
         encode_query_value(invite_id),
-        encode_query_value(secret)
-    );
-    if let Some(tc) = tc_address {
-        let _ = write!(uri, "&tc={}", encode_query_value(tc));
-    }
-    uri
+        encode_query_value(secret),
+        encode_query_value(tc_address)
+    )
 }
 
 /// Which invite fast path a frame names.
@@ -155,6 +147,12 @@ fn respond(req: &InviteRequest, result: Result<Value>) -> Option<String> {
             e.code(),
             &e.to_string(),
             &json!({ "code": "listener-down" }),
+        ),
+        Err(e @ Error::TunnelDown) => error_frame_with_data(
+            &req.id_echo,
+            e.code(),
+            &e.to_string(),
+            &json!({ "code": "tunnel-down" }),
         ),
         Err(e) => error_frame(&req.id_echo, e.code(), &e.to_string()),
     })
@@ -292,27 +290,26 @@ fn opt_u64_param(params: &Value, key: &str) -> Result<Option<u64>> {
     }
 }
 
-/// The link envelope of this listener: hosts, port, fingerprint and the
-/// optional tunnel address every `intent://invite?…` link of the daemon
-/// shares. [`link_envelope`] resolves it; [`InviteLinkEnvelope::invite_url`]
-/// formats one invite's link from it.
+/// The link envelope of this listener: port, fingerprint and the tunnel
+/// address every `intent://invite?…` link of the daemon shares. Invite links
+/// are tunnel-only, so the listener's bind addresses are never part of it.
+/// [`link_envelope`] resolves it; [`InviteLinkEnvelope::invite_url`] formats
+/// one invite's link from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkEnvelope {
-    pub hosts: Vec<String>,
     pub port: u16,
     pub fingerprint: String,
-    pub tc_address: Option<String>,
+    pub tc_address: String,
 }
 
 impl InviteLinkEnvelope for LinkEnvelope {
     fn invite_url(&self, invite_id: &str, secret: &str) -> String {
         build_invite_uri(
-            &self.hosts,
             self.port,
             &self.fingerprint,
             invite_id,
             secret,
-            self.tc_address.as_deref(),
+            &self.tc_address,
         )
     }
 }
@@ -321,36 +318,29 @@ impl InviteLinkEnvelope for LinkEnvelope {
 /// this runs BEFORE the invite is minted so a daemon nobody can dial never
 /// stores an invite that cannot be redeemed: no TCP listener is
 /// [`Error::ListenerDown`] (`error.data.code = "listener-down"`, like
-/// `pairing.getInfo`), and no dialable route at all (loopback-only bind and
-/// no tunnel) is `Unsupported`.
+/// `pairing.getInfo`), and no tunnel address is [`Error::TunnelDown`]
+/// (`error.data.code = "tunnel-down"`) — an invite link is tunnel-only, so a
+/// LAN bind address does not make it dialable.
 async fn link_envelope(provider: Option<&Arc<dyn ServerPairingInfo>>) -> Result<LinkEnvelope> {
     let provider = provider.ok_or_else(|| {
         Error::Unsupported("invite links are unavailable on this listener".to_string())
     })?;
     let snapshot = provider.pairing_snapshot().await;
     let port = snapshot.port.ok_or(Error::ListenerDown)?;
+    let tc_address = snapshot.tc_address.ok_or(Error::TunnelDown)?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
-    let hosts = pairing_hosts(&snapshot);
-    if hosts.is_empty() && snapshot.tc_address.is_none() {
-        return Err(Error::Unsupported(
-            "no dialable route for an invite link: set server.bindAddress to a LAN \
-             address or enable the tunnel (server.tunnel.enabled) before inviting"
-                .to_string(),
-        ));
-    }
     Ok(LinkEnvelope {
-        hosts,
         port,
         fingerprint: cert.fingerprint256,
-        tc_address: snapshot.tc_address,
+        tc_address,
     })
 }
 
 /// The services layer's [`InviteLinkBuilder`] over a listener's pairing
 /// provider: the same [`link_envelope`] `workspace.invite.create` resolves,
 /// so a link rebuilt for `workspace.invite.list` is byte-identical to the
-/// one minted. Resolution failures (listener down, no dialable route) are
-/// `None` here — a read never fails for them.
+/// one minted. Resolution failures (listener down, tunnel down) are `None`
+/// here — a read never fails for them.
 pub struct InviteLinkResolver {
     provider: Arc<dyn ServerPairingInfo>,
 }
@@ -377,9 +367,10 @@ impl InviteLinkBuilder for InviteLinkResolver {
 
 /// Handle a classified `workspace.invite.create`: params
 /// `{ workspaceId, pinLogin?, expiresInSecs? }` → the service result
-/// (`{ invite, secret }`) extended with `url`, `hosts`, `port`,
-/// `fingerprint`, `version` and the additive `tcAddress`. Owner-only in the
-/// service layer (`-32003` otherwise); the secret appears exactly once, here.
+/// (`{ invite, secret }`) extended with `url`, `hosts` (always `[]`: invite
+/// links are tunnel-only; kept for wire compatibility), `port`,
+/// `fingerprint`, `version` and `tcAddress`. Owner-only in the service layer
+/// (`-32003` otherwise); the secret appears exactly once, here.
 /// The envelope is resolved exactly once per create and the one link it
 /// formats is stamped as both the top-level `url` and `invite.url`, so the
 /// two are identical by construction.
@@ -424,13 +415,11 @@ async fn create_json(
         .as_object_mut()
         .ok_or_else(|| Error::Internal("invite result is not an object".to_string()))?;
     obj.insert("url".into(), url.into());
-    obj.insert("hosts".into(), json!(envelope.hosts));
+    obj.insert("hosts".into(), json!([]));
     obj.insert("port".into(), envelope.port.into());
     obj.insert("fingerprint".into(), envelope.fingerprint.into());
     obj.insert("version".into(), INVITE_PAYLOAD_VERSION.into());
-    if let Some(tc) = envelope.tc_address {
-        obj.insert("tcAddress".into(), tc.into());
-    }
+    obj.insert("tcAddress".into(), envelope.tc_address.into());
     Ok(result)
 }
 
