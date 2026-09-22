@@ -299,6 +299,33 @@ pub(crate) async fn discover_matching_open_pr(
     Ok(best)
 }
 
+/// Carry a persisted merge-queue signal onto a REST-only snapshot
+/// (intent-hq/intent#5654). A REST read never observes the merge queue — a
+/// queued PR reads `mergeable_state: "clean"` — so `fresh` arrives with
+/// `is_in_merge_queue: None` whether or not the PR is still queued, and
+/// taking it verbatim would erase the `Some(true)` the last signal-bearing
+/// read ([`build_pr_info_with_merge_queue`], the `github.pulls.get` fold)
+/// persisted. The rule: an incoming `None` inherits the persisted `Some(true)`
+/// while the PR stays **open, non-draft and on the same known `head_sha`**;
+/// it lapses when the PR leaves `Open` (merged / closed / draft), when the
+/// head moves (a new push after a queue ejection), or when either head SHA is
+/// unknown. A signal-bearing read always wins: `fresh` carrying `Some(_)`
+/// (or written through [`upsert_pr_info_by_url`], which never carries) is
+/// taken as reported.
+pub(crate) fn carry_merge_queue_signal(fresh: &mut PullRequestInfo, previous: &PullRequestInfo) {
+    if fresh.is_in_merge_queue.is_some() || previous.is_in_merge_queue != Some(true) {
+        return;
+    }
+    let open = fresh.status == PullRequestStatus::Open && fresh.is_draft != Some(true);
+    let same_head = matches!(
+        (fresh.head_sha.as_deref(), previous.head_sha.as_deref()),
+        (Some(a), Some(b)) if a == b
+    );
+    if open && same_head {
+        fresh.is_in_merge_queue = Some(true);
+    }
+}
+
 /// Upsert a PR snapshot into the daemon-owned `workspace.pull_requests` list
 /// (keyed by PR number), returning `true` when the list actually changed.
 /// Keeps merged/closed PRs recorded alongside the currently-linked one so the
@@ -306,11 +333,20 @@ pub(crate) async fn discover_matching_open_pr(
 /// Pre-existing duplicates for the same number (e.g. written via
 /// `workspace.update` before the daemon owned the list) are collapsed into the
 /// single upserted entry.
+///
+/// This is the REST-only path (branch sweep, git-root sweep, `pr.refresh`,
+/// stale-pool heal), so the entry the snapshot replaces lends it its
+/// merge-queue signal per [`carry_merge_queue_signal`]; `info` is updated in
+/// place so a caller persisting the same snapshot elsewhere
+/// (`activePullRequest`) writes one coherent copy.
 pub(crate) fn upsert_pr_info(
     list: &mut Option<Vec<PullRequestInfo>>,
-    info: &PullRequestInfo,
+    info: &mut PullRequestInfo,
 ) -> bool {
     let items = list.get_or_insert_with(Vec::new);
+    if let Some(previous) = items.iter().find(|p| p.number == info.number) {
+        carry_merge_queue_signal(info, previous);
+    }
     let matches = items.iter().filter(|p| p.number == info.number).count();
     // Unchanged only when exactly one entry for this number exists and it
     // already equals the snapshot.
@@ -350,6 +386,12 @@ pub(crate) fn same_pr_url(a: &str, b: &str) -> bool {
 /// another repository. Pre-existing same-URL duplicates collapse into the
 /// single fetched snapshot at the first duplicate's position, so no stale
 /// copy outlives the fold. Returns `true` when the list actually changed.
+///
+/// The fold rides a signal-bearing full read, so — unlike [`upsert_pr_info`]
+/// — the snapshot's `is_in_merge_queue` is taken as reported and never
+/// inherits the replaced entry's: a `None` here means the read observed the
+/// PR not queued (or the host reported nothing), which clears a persisted
+/// `Some(true)` ([`carry_merge_queue_signal`]).
 pub(crate) fn upsert_pr_info_by_url(
     list: &mut Option<Vec<PullRequestInfo>>,
     info: &PullRequestInfo,
@@ -425,7 +467,7 @@ pub(crate) async fn refresh_stale_pool_entries(
     for (_, number) in candidates {
         match tokio::time::timeout(per_entry_timeout, sc.get_pr(repo_ref, number)).await {
             Ok(Ok(pr)) => {
-                changed |= upsert_pr_info(list, &build_pr_info(&pr));
+                changed |= upsert_pr_info(list, &mut build_pr_info(&pr));
             }
             Ok(Err(intent_sourcecontrol::Error::RateLimited(detail))) => {
                 return (changed, Some(detail));
@@ -462,8 +504,24 @@ pub(crate) fn derive_pr_status(pr: &PullRequest) -> PullRequestStatus {
 
 /// Build the persisted [`PullRequestInfo`] snapshot from a forge PR (§7.6).
 /// Empty strings on optional fields collapse to `None` so absent values are
-/// omitted from the wire, matching the TS `PullRequestInfo` JSON shape.
+/// omitted from the wire, matching the TS `PullRequestInfo` JSON shape. The
+/// REST `PullRequest` carries no merge-queue signal, so `is_in_merge_queue`
+/// is `None`; see [`build_pr_info_with_merge_queue`] for the signal-bearing
+/// read.
 pub(crate) fn build_pr_info(pr: &PullRequest) -> PullRequestInfo {
+    build_pr_info_with_merge_queue(pr, None)
+}
+
+/// [`build_pr_info`] for a signal-bearing read: `merge_queue_reported` is the
+/// host's merge-queue state as reported by the same full read
+/// ([`MergeRequirementsRead::merge_queue_reported`]). Only a reported `true`
+/// is persisted (`Some(true)`); a reported `false` or an unreported state
+/// both land as `None`, matching the presence-only
+/// `MergeRequirements::is_in_merge_queue` (intent-hq/intent#5654).
+pub(crate) fn build_pr_info_with_merge_queue(
+    pr: &PullRequest,
+    merge_queue_reported: Option<bool>,
+) -> PullRequestInfo {
     let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
     PullRequestInfo {
         id: pr.number.to_string(),
@@ -480,6 +538,7 @@ pub(crate) fn build_pr_info(pr: &PullRequest) -> PullRequestInfo {
         mergeable: pr.mergeable,
         mergeable_state: pr.mergeable_state.clone(),
         is_draft: Some(pr.draft),
+        is_in_merge_queue: merge_queue_reported.filter(|&queued| queued),
     }
 }
 
@@ -1612,27 +1671,27 @@ mod tests {
 
     #[test]
     fn upserts_pr_info_by_number() {
-        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
         let mut list: Option<Vec<PullRequestInfo>> = None;
 
         // Insert into an absent list.
-        assert!(upsert_pr_info(&mut list, &open));
+        assert!(upsert_pr_info(&mut list, &mut open));
         assert_eq!(list.as_ref().unwrap().len(), 1);
 
         // Identical snapshot: no change.
-        assert!(!upsert_pr_info(&mut list, &open));
+        assert!(!upsert_pr_info(&mut list, &mut open));
         assert_eq!(list.as_ref().unwrap().len(), 1);
 
         // Same number, different snapshot: replaced in place.
-        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
-        assert!(upsert_pr_info(&mut list, &merged));
+        let mut merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info(&mut list, &mut merged));
         assert_eq!(list.as_ref().unwrap().len(), 1);
         assert_eq!(list.as_ref().unwrap()[0].status, PullRequestStatus::Merged);
 
         // A different number appends.
         let mut second = pr(PrState::Open, false, None, None);
         second.number = 2;
-        assert!(upsert_pr_info(&mut list, &build_pr_info(&second)));
+        assert!(upsert_pr_info(&mut list, &mut build_pr_info(&second)));
         assert_eq!(list.as_ref().unwrap().len(), 2);
 
         // Pre-existing duplicates (e.g. legacy workspace.update writes) are
@@ -1640,12 +1699,143 @@ mod tests {
         let dup = list.as_ref().unwrap()[0].clone();
         list.as_mut().unwrap().push(dup);
         assert_eq!(list.as_ref().unwrap().len(), 3);
-        assert!(upsert_pr_info(&mut list, &merged));
+        assert!(upsert_pr_info(&mut list, &mut merged));
         let items = list.as_ref().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].number, merged.number);
         assert_eq!(items[0].status, PullRequestStatus::Merged);
         assert_eq!(items[1].number, 2);
+    }
+
+    /// A merge-queued open PR as the signal-bearing fold persisted it: REST
+    /// mergeability `clean` (GitHub never reports `queued` there) plus
+    /// `is_in_merge_queue: Some(true)`, on head `sha1`.
+    fn queued_pooled_pr() -> PullRequestInfo {
+        let mut queued = pr(PrState::Open, false, Some(true), Some("clean"));
+        queued.head_sha = Some("sha1".into());
+        build_pr_info_with_merge_queue(&queued, Some(true))
+    }
+
+    /// The signal-bearing builder persists only a reported `true`: `false`
+    /// and unreported both land as `None`, and the REST builder never sets
+    /// the field (intent-hq/intent#5654).
+    #[test]
+    fn build_pr_info_persists_only_a_reported_queued_signal() {
+        let open = pr(PrState::Open, false, Some(true), Some("clean"));
+        assert_eq!(
+            build_pr_info_with_merge_queue(&open, Some(true)).is_in_merge_queue,
+            Some(true)
+        );
+        assert_eq!(
+            build_pr_info_with_merge_queue(&open, Some(false)).is_in_merge_queue,
+            None
+        );
+        assert_eq!(
+            build_pr_info_with_merge_queue(&open, None).is_in_merge_queue,
+            None
+        );
+        assert_eq!(build_pr_info(&open).is_in_merge_queue, None);
+        // Everything else is the plain REST snapshot.
+        let mut with_signal = build_pr_info_with_merge_queue(&open, Some(true));
+        with_signal.is_in_merge_queue = None;
+        assert_eq!(with_signal, build_pr_info(&open));
+    }
+
+    /// The number-keyed (REST-only) upsert carries a persisted
+    /// `is_in_merge_queue: Some(true)` onto a refresh that cannot observe the
+    /// queue, exactly while the PR stays open, non-draft and on the same
+    /// head; the caller's snapshot is updated in place so `activePullRequest`
+    /// and the pool entry agree (intent-hq/intent#5654).
+    #[test]
+    fn upsert_pr_info_keeps_queued_signal_on_a_same_head_rest_refresh() {
+        let mut list = Some(vec![queued_pooled_pr()]);
+        let mut rest = pr(PrState::Open, false, Some(true), Some("clean"));
+        rest.head_sha = Some("sha1".into());
+        rest.updated_at = "2026-01-02T00:00:00Z".into();
+        let mut fresh = build_pr_info(&rest);
+        assert_eq!(fresh.is_in_merge_queue, None);
+
+        assert!(upsert_pr_info(&mut list, &mut fresh));
+        assert_eq!(fresh.is_in_merge_queue, Some(true));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].is_in_merge_queue, Some(true));
+        assert_eq!(items[0].updated_at, "2026-01-02T00:00:00Z");
+        // The carried snapshot is stable: the same refresh again is a no-op.
+        assert!(!upsert_pr_info(&mut list, &mut build_pr_info(&rest)));
+    }
+
+    /// Every transition that lapses the carried signal: the PR leaves
+    /// `Open` (merged, closed, draft), the head moves (a new push after a
+    /// queue ejection), or the head is unknown on either side.
+    #[test]
+    fn upsert_pr_info_drops_queued_signal_when_the_pr_leaves_the_queue_shape() {
+        let cases: [(&str, Box<dyn Fn(&mut PullRequest)>); 6] = [
+            ("merged", Box::new(|p| p.state = PrState::Merged)),
+            ("closed", Box::new(|p| p.state = PrState::Closed)),
+            ("draft", Box::new(|p| p.draft = true)),
+            ("new head", Box::new(|p| p.head_sha = Some("sha2".into()))),
+            ("unknown fresh head", Box::new(|p| p.head_sha = None)),
+            ("unknown persisted head", Box::new(|_| {})),
+        ];
+        for (label, mutate) in cases {
+            let mut persisted = queued_pooled_pr();
+            if label == "unknown persisted head" {
+                persisted.head_sha = None;
+            }
+            let mut list = Some(vec![persisted]);
+            let mut rest = pr(PrState::Open, false, Some(true), Some("clean"));
+            rest.head_sha = Some("sha1".into());
+            mutate(&mut rest);
+            let mut fresh = build_pr_info(&rest);
+            assert!(upsert_pr_info(&mut list, &mut fresh), "{label}");
+            assert_eq!(fresh.is_in_merge_queue, None, "{label}");
+            assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, None, "{label}");
+        }
+    }
+
+    /// A signal-bearing snapshot is taken as reported through either upsert:
+    /// the REST-keyed path never overrides a `Some(_)` it is handed, and the
+    /// fold's URL-keyed path never inherits — a fold that observed the PR
+    /// no longer queued (or a host reporting nothing) clears the persisted
+    /// `Some(true)` even on the same open head.
+    #[test]
+    fn signal_bearing_snapshots_replace_the_queued_signal_as_reported() {
+        let mut queued = pr(PrState::Open, false, Some(true), Some("clean"));
+        queued.head_sha = Some("sha1".into());
+
+        // Fold: same head, not queued any more → cleared.
+        let mut list = Some(vec![queued_pooled_pr()]);
+        let dequeued = build_pr_info_with_merge_queue(&queued, Some(false));
+        assert!(upsert_pr_info_by_url(&mut list, &dequeued));
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, None);
+        // Fold: host reported nothing → cleared too.
+        let mut list = Some(vec![queued_pooled_pr()]);
+        assert!(upsert_pr_info_by_url(
+            &mut list,
+            &build_pr_info_with_merge_queue(&queued, None)
+        ));
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, None);
+        // Fold: queued reported onto a plain REST entry → set.
+        let mut list = Some(vec![build_pr_info(&queued)]);
+        assert!(upsert_pr_info_by_url(
+            &mut list,
+            &build_pr_info_with_merge_queue(&queued, Some(true))
+        ));
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, Some(true));
+
+        // Number-keyed path handed a signal-bearing `Some(true)` on a plain
+        // entry keeps it as reported.
+        let mut list = Some(vec![build_pr_info(&queued)]);
+        let mut fresh = build_pr_info_with_merge_queue(&queued, Some(true));
+        assert!(upsert_pr_info(&mut list, &mut fresh));
+        assert_eq!(list.as_ref().unwrap()[0].is_in_merge_queue, Some(true));
+
+        // No persisted entry → nothing to carry.
+        let mut list: Option<Vec<PullRequestInfo>> = None;
+        let mut fresh = build_pr_info(&queued);
+        assert!(upsert_pr_info(&mut list, &mut fresh));
+        assert_eq!(fresh.is_in_merge_queue, None);
     }
 
     #[test]

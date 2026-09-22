@@ -1438,6 +1438,7 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
         mergeable: m.snapshot_mergeable,
         mergeable_state: None,
         is_draft: m.snapshot_is_draft,
+        is_in_merge_queue: None,
     }
 }
 
@@ -11369,6 +11370,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         };
 
         // T3: a failed poll advances `last_polled_at` past T2 with an error.
@@ -12416,6 +12418,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         };
         let mut polled = mk(
             PrMonitorState::Active,
@@ -12866,6 +12869,7 @@ mod tests {
             mergeable: Some(true),
             mergeable_state: Some("clean".into()),
             is_draft: Some(false),
+            is_in_merge_queue: None,
         });
         svc.store().update_workspace(&row).await.expect("update");
         register(&svc, &ws, &owner).await;

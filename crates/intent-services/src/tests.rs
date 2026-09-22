@@ -602,6 +602,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         mergeable: Some(true),
         mergeable_state: Some("clean".to_string()),
         is_draft: Some(false),
+        is_in_merge_queue: None,
     };
     let with_detail_fields = |ws: &mut Workspace| {
         ws.setup_script = Some(SetupScript {
@@ -858,6 +859,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
         mergeable: Some(true),
         mergeable_state: Some("blocked".to_string()),
         is_draft: Some(false),
+        is_in_merge_queue: None,
     };
 
     let ws = WorkspaceId::new();
@@ -1184,6 +1186,7 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     let numbers = |ws: &Workspace| -> Vec<u64> {
         ws.pull_requests
@@ -1466,6 +1469,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
             mergeable: None,
             mergeable_state: None,
             is_draft: Some(false),
+            is_in_merge_queue: None,
         }]);
         // Fat persisted rollup: 8 agents + 3 models per workspace (the field
         // list rows must no longer carry).
@@ -2023,6 +2027,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     let git_root = |ws: &WorkspaceId, path: &str, prs: Vec<PullRequestInfo>| {
         let ts = now_iso();
@@ -2380,6 +2385,7 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
                 mergeable: None,
                 mergeable_state: None,
                 is_draft: None,
+                is_in_merge_queue: None,
             }]),
             created_at: ts.clone(),
             updated_at: ts,
@@ -2523,6 +2529,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     let ready = |title: &str, mergeable_state: &str, updated_at: &str, is_draft: bool| {
         let mut info = pr(
@@ -2850,6 +2857,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         };
     let monitor =
         |ws: &WorkspaceId, number: i64, state: PrMonitorState, snapshot: Option<String>| {

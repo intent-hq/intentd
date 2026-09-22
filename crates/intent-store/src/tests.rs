@@ -653,6 +653,7 @@ async fn workspace_pull_requests_round_trip_and_clear() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     ws.pull_requests = Some(vec![pr.clone()]);
     store.insert_workspace(&ws).await.expect("insert");

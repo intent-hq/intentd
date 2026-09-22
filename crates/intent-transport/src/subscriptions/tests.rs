@@ -2518,6 +2518,7 @@ mod workspace_delta_list_projection {
             mergeable: Some(true),
             mergeable_state: Some("clean".to_string()),
             is_draft: Some(false),
+            is_in_merge_queue: None,
         }
     }
 

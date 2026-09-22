@@ -4965,7 +4965,10 @@ impl Services {
                 {
                     // `changed` is set unconditionally below (the unlink
                     // itself persists), so the upsert's flag is redundant.
-                    pr_ops::upsert_pr_info(&mut root.pull_requests, &pr_ops::build_pr_info(&pr));
+                    pr_ops::upsert_pr_info(
+                        &mut root.pull_requests,
+                        &mut pr_ops::build_pr_info(&pr),
+                    );
                 }
                 root.pr_number = None;
                 root.pr_url = None;
@@ -4973,8 +4976,8 @@ impl Services {
                 changed = true;
                 PrRefreshOutcome::Unlinked
             } else {
-                let info = pr_ops::build_pr_info(&pr);
-                changed |= pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                let mut info = pr_ops::build_pr_info(&pr);
+                changed |= pr_ops::upsert_pr_info(&mut root.pull_requests, &mut info);
                 // A merged/closed linked PR stays recorded in `pull_requests`
                 // but no longer blocks discovery: relink to a newer open PR on
                 // the same branch. A discovery failure degrades to the plain
@@ -5015,8 +5018,8 @@ impl Services {
                     };
                     if let Some(open_pr) = discovered {
                         fetched_fresh.push(open_pr.number);
-                        let open_info = pr_ops::build_pr_info(&open_pr);
-                        pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
+                        let mut open_info = pr_ops::build_pr_info(&open_pr);
+                        pr_ops::upsert_pr_info(&mut root.pull_requests, &mut open_info);
                         root.pr_number = Some(open_pr.number);
                         root.pr_url = Some(open_pr.url.clone());
                         root.pr_status = Some(open_info.status);
@@ -5047,8 +5050,8 @@ impl Services {
             match found {
                 Some(pr) => {
                     fetched_fresh.push(pr.number);
-                    let info = pr_ops::build_pr_info(&pr);
-                    pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                    let mut info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut root.pull_requests, &mut info);
                     root.pr_number = Some(pr.number);
                     root.pr_url = Some(pr.url.clone());
                     root.pr_status = Some(info.status);
@@ -5195,9 +5198,13 @@ impl Services {
                 self.maybe_emit_display_status_changed(&ws.id).await;
                 return Ok(PrRefreshOutcome::Unlinked);
             }
-            let info = pr_ops::build_pr_info(&pr);
+            let mut info = pr_ops::build_pr_info(&pr);
             // Keep the daemon-owned PR list current on every linked refresh.
-            let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+            // The REST read cannot see the merge queue, so the upsert lends
+            // `info` the pooled entry's `is_in_merge_queue` while the PR
+            // stays open on the same head (intent-hq/intent#5654); the
+            // `activePullRequest` written below is that same carried copy.
+            let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
             // A rate-limited relink discovery is captured here (not
             // swallowed as a generic discovery failure) so it surfaces
             // AFTER the status delta persist below and the sweep pauses
@@ -5245,8 +5252,8 @@ impl Services {
                     }
                 };
                 if let Some(open_pr) = discovered {
-                    let open_info = pr_ops::build_pr_info(&open_pr);
-                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
+                    let mut open_info = pr_ops::build_pr_info(&open_pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut open_info);
                     ws.pr_number = Some(open_pr.number);
                     ws.pr_url = Some(open_pr.url.clone());
                     ws.pr_status = Some(open_info.status);
@@ -5299,8 +5306,8 @@ impl Services {
             .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
-                    let info = pr_ops::build_pr_info(&pr);
-                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                    let mut info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
                     ws.pr_number = Some(pr.number);
                     ws.pr_url = Some(pr.url.clone());
                     ws.pr_status = Some(info.status);
@@ -5339,12 +5346,20 @@ impl Services {
     /// writes nothing. Per-row persist failures WARN and continue; only the
     /// lookups themselves surface as `Err`, and the RPC caller treats that
     /// as fail-soft too.
+    ///
+    /// `merge_queue_reported` is the host's merge-queue state from the same
+    /// full read (`SharedPrSnapshot::merge_queue_reported`): the fold is the
+    /// signal-bearing writer of `PullRequestInfo::is_in_merge_queue`, so a
+    /// reported `true` lands on every folded copy and anything else clears
+    /// a persisted `Some(true)` — the URL-keyed upsert never inherits
+    /// (intent-hq/intent#5654).
     pub(crate) async fn fold_fetched_pr(
         &self,
         repo_ref: &intent_sourcecontrol::RepoRef,
         pr: &intent_sourcecontrol::PullRequest,
+        merge_queue_reported: Option<bool>,
     ) -> Result<()> {
-        let info = pr_ops::build_pr_info(pr);
+        let info = pr_ops::build_pr_info_with_merge_queue(pr, merge_queue_reported);
         let workspaces = self
             .store
             .list_workspaces_referencing_pr_url(&pr.url)
@@ -29702,7 +29717,10 @@ impl WorkspaceApi for Services {
             // card always gets its `{ pull }`; a fold failure only costs the
             // daemon-owned state its early refresh.
             if fetched {
-                if let Err(e) = self.fold_fetched_pr(&repo_ref, &entry.pr).await {
+                if let Err(e) = self
+                    .fold_fetched_pr(&repo_ref, &entry.pr, entry.snapshot.merge_queue_reported)
+                    .await
+                {
                     tracing::warn!(
                         owner = %repo_ref.owner,
                         repo = %repo_ref.name,
@@ -33059,8 +33077,8 @@ impl Services {
             .await
             .map_err(pr_ops::map_sc_err)?;
 
-        let info = pr_ops::build_pr_info(&pr);
-        pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+        let mut info = pr_ops::build_pr_info(&pr);
+        pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
         ws.pr_number = Some(pr.number);
         ws.pr_url = Some(pr.url.clone());
         ws.pr_status = Some(info.status);
@@ -33100,11 +33118,12 @@ impl Services {
                 ws.pr_status = Some(intent_core::PullRequestStatus::Merged);
                 if let Some(info) = ws.active_pull_request.as_mut() {
                     info.status = intent_core::PullRequestStatus::Merged;
+                    info.is_in_merge_queue = None;
                 }
                 // Mirror the merged status into the daemon-owned list so the
                 // pr:updated payload below is internally consistent.
-                if let Some(info) = ws.active_pull_request.clone() {
-                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                if let Some(mut info) = ws.active_pull_request.clone() {
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &mut info);
                 }
                 ws.updated_at = now_iso();
                 let _ = self.store.update_workspace(&ws).await;
