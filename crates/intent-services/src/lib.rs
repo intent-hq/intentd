@@ -9180,6 +9180,7 @@ impl Services {
         message_id: Option<String>,
     ) -> Result<serde_json::Value> {
         if let Some(id) = message_id.as_deref() {
+            // queue-egress: allow — id-only idempotency probe; no entry leaves the daemon
             let queued = self
                 .queue_snapshot(&parent_agent_id)
                 .iter()

@@ -354,6 +354,9 @@ pub(crate) mod ready_delta;
 mod tests;
 
 #[cfg(test)]
+mod queue_visibility_contract_tests;
+
+#[cfg(test)]
 mod tests_stab28;
 
 #[cfg(test)]
@@ -11684,7 +11687,11 @@ impl Services {
     /// in-scope agent with a non-empty queue, each listing its entries in
     /// drain order via [`Services::queue_snapshot_preview`] (content truncated
     /// to [`QUEUE_PREVIEW_MAX_CHARS`] chars, sender attribution preserved in
-    /// `messageMetadata`) — and `summary.queuedAgents` counts those agents.
+    /// `messageMetadata`), projected to the bound caller exactly like
+    /// `agent.getQueue` ([`intent_core::project_queue_for_caller`]: a guest
+    /// collaborator sees only its own entries plus unattributed ones, and a
+    /// queue with nothing left to show it is omitted) — and
+    /// `summary.queuedAgents` counts those agents.
     /// A queue whose ready-to-send entries have sat undelivered past
     /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
     /// responding raises a `stale-queue-entry` stuck-risk
@@ -12076,13 +12083,18 @@ impl Services {
         }
 
         // Real per-agent pending-message queue snapshots (drain order, content
-        // truncated) for every in-scope agent with a non-empty queue.
+        // truncated, projected to the bound caller like `agent.getQueue`) for
+        // every in-scope agent with a non-empty (visible) queue.
+        let caller = intent_core::current_caller();
         let mut queues: Vec<Value> = Vec::new();
         for id in &all_agent_ids {
             if !in_scope(id) {
                 continue;
             }
-            let entries = self.queue_snapshot_preview(&AgentId(id.clone()));
+            let entries = intent_core::project_queue_for_caller(
+                caller.as_ref(),
+                self.queue_snapshot_preview(&AgentId(id.clone())),
+            );
             if entries.is_empty() {
                 continue;
             }
