@@ -28879,6 +28879,14 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
+            // intent-hq/intent#5669: an agent may not message itself. Checked
+            // here as well as in `agent_send_message_op` because the
+            // runtime-manager path below never reaches the op's guard.
+            crate::agent_ops::reject_self_targeted_send(
+                "agent.sendMessage",
+                &agent_id,
+                message_metadata.as_ref(),
+            )?;
             // Principal stamp (multiplayer w2), applied once here so the
             // runtime path (direct persist, busy enqueue, quarantine park,
             // auto-queue) and the store-only fallback persist the same
