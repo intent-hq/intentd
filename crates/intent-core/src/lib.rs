@@ -81,12 +81,12 @@ pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
     cap_json_value, fit_agent_list_frame, format_key_bytes_table, last_tool_use_preview,
     note_list_slim_row, serialized_key_bytes, slim_body_size, slim_heavy_body,
-    AgentDelegatedCounts, AgentListFrameFit, AgentListRowScope, AgentParentDelegatedCounts,
-    AgentScopeCounts, ConversationProjection, NoteListProjection, AGENT_LIST_FRAME_BUDGET_BYTES,
-    AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES,
-    AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES, AGENT_LIST_ROW_KEYS,
-    AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS, SLIM_PAGE_BUDGET_BYTES,
-    SLIM_PROJECTION_BUDGET_BYTES,
+    AgentDelegatedCounts, AgentListFrameFit, AgentListRowScope, AgentOrphanedDelegatedCounts,
+    AgentParentDelegatedCounts, AgentScopeCounts, ConversationProjection, NoteListProjection,
+    AGENT_LIST_FRAME_BUDGET_BYTES, AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES,
+    AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
+    AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS,
+    SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};

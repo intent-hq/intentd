@@ -435,8 +435,10 @@ async fn create_scoped_agent(
 /// agent and a retired session in every bin: each scope returns exactly its
 /// bin, the three bins partition the default (non-retired) read — union
 /// equal, pairwise disjoint — `scopeCounts` matches the bins, retired rows
-/// are in no bin, and `parentAgentId` narrows `delegated` to one parent's
-/// direct sub-agents while `scopeCounts.delegated` stays workspace-wide.
+/// are in no bin, `parentAgentId` narrows `delegated` to one parent's
+/// direct sub-agents while `scopeCounts.delegated` stays workspace-wide, and
+/// `delegatedCounts.orphaned` / the `orphanedOnly` read cover exactly the
+/// children whose parent row is gone.
 #[tokio::test]
 async fn agent_list_scopes_partition_the_non_retired_rows() {
     use intent_core::{AgentListRowScope, AgentScopeCounts};
@@ -476,6 +478,7 @@ async fn agent_list_scopes_partition_the_non_retired_rows() {
             ws.clone(),
             AgentListRowScope::Delegated {
                 parent_agent_id: None,
+                orphaned_only: false,
             },
         )
         .await
@@ -560,6 +563,21 @@ async fn agent_list_scopes_partition_the_non_retired_rows() {
         3,
         "Σ byParent[*].total == scopeCounts.delegated"
     );
+    // Every parent is live here, so the orphaned sub-aggregate is empty and
+    // the orphanedOnly read serves no rows.
+    assert_eq!(
+        delegated_counts.orphaned,
+        intent_core::AgentOrphanedDelegatedCounts::default()
+    );
+    let orphaned_only = AgentListRowScope::Delegated {
+        parent_agent_id: None,
+        orphaned_only: true,
+    };
+    assert!(svc
+        .agent_list_scoped_op(ws.clone(), orphaned_only.clone())
+        .await
+        .expect("orphanedOnly")
+        .is_empty());
 
     // parentAgentId narrows delegated to that parent's direct sub-agents.
     let under_a = svc
@@ -567,6 +585,7 @@ async fn agent_list_scopes_partition_the_non_retired_rows() {
             ws.clone(),
             AgentListRowScope::Delegated {
                 parent_agent_id: Some(top_a.clone()),
+                orphaned_only: false,
             },
         )
         .await
@@ -577,6 +596,7 @@ async fn agent_list_scopes_partition_the_non_retired_rows() {
             ws.clone(),
             AgentListRowScope::Delegated {
                 parent_agent_id: Some(top_b.clone()),
+                orphaned_only: false,
             },
         )
         .await
@@ -591,14 +611,62 @@ async fn agent_list_scopes_partition_the_non_retired_rows() {
             ws.clone(),
             AgentListRowScope::Delegated {
                 parent_agent_id: Some(orphan_bg.clone()),
+                orphaned_only: false,
             },
         )
         .await
         .expect("delegated under a childless parent");
     assert!(under_orphan.is_empty());
 
+    // Deleting top-b (a hard delete — `agent.retire` cascades to the
+    // children instead) leaves its child's `parent_agent_id` dangling, so
+    // the child is an orphan: `orphaned` counts it, the orphanedOnly read
+    // serves exactly it, `byParent` / `scopeCounts` keep their meaning
+    // (the raw parent key stays), and the row is the whole-bin row unchanged.
+    svc.agent_delete_op(top_b.clone(), Some(ws.clone()))
+        .await
+        .expect("delete top-b");
+    let delegated_counts = svc
+        .agent_delegated_counts_op(ws.clone())
+        .await
+        .expect("delegated counts after deleting top-b");
+    assert_eq!(
+        delegated_counts.orphaned,
+        intent_core::AgentOrphanedDelegatedCounts {
+            total: 1,
+            running: 0
+        }
+    );
+    assert_eq!(delegated_counts.by_parent[&top_b].total, 1);
+    let scope_counts = svc
+        .agent_scope_counts_op(ws.clone())
+        .await
+        .expect("scope counts after deleting top-b");
+    assert_eq!(scope_counts.delegated, 3);
+    assert!(delegated_counts.orphaned.total <= scope_counts.delegated);
+    let orphans = svc
+        .agent_list_scoped_op(ws.clone(), orphaned_only)
+        .await
+        .expect("orphanedOnly after deleting top-b");
+    assert_eq!(ids(&orphans), expect(&[&beta_child]));
+    let whole_bin = svc
+        .agent_list_scoped_op(
+            ws.clone(),
+            AgentListRowScope::Delegated {
+                parent_agent_id: None,
+                orphaned_only: false,
+            },
+        )
+        .await
+        .expect("delegated after deleting top-b");
+    assert_eq!(
+        serde_json::to_value(&orphans[0]).unwrap(),
+        serde_json::to_value(whole_bin.iter().find(|a| a.id == beta_child).unwrap()).unwrap(),
+        "orphanedOnly row differs from the whole-bin read's row"
+    );
+
     // Retiring the (childless) orphan background agent moves it out of its
-    // bin and count only.
+    // bin and count only (top-b's delete above already dropped topLevel).
     svc.agent_retire_op(orphan_bg.clone(), Some(ws.clone()), None)
         .await
         .expect("retire orphan-bg");
@@ -612,7 +680,7 @@ async fn agent_list_scopes_partition_the_non_retired_rows() {
             .await
             .expect("scope counts after retire"),
         AgentScopeCounts {
-            top_level: 2,
+            top_level: 1,
             delegated: 3,
             background: 0,
         }
@@ -635,12 +703,17 @@ async fn agent_list_scopes_on_empty_workspace() {
             .await
             .expect("delegated counts"),
         AgentDelegatedCounts::default(),
-        "an empty workspace serves {{ running: 0, byParent: {{}} }}"
+        "an empty workspace serves {{ running: 0, byParent: {{}}, orphaned: {{ total: 0, running: 0 }} }}"
     );
     for scope in [
         AgentListRowScope::TopLevel,
         AgentListRowScope::Delegated {
             parent_agent_id: None,
+            orphaned_only: false,
+        },
+        AgentListRowScope::Delegated {
+            parent_agent_id: None,
+            orphaned_only: true,
         },
         AgentListRowScope::Background,
     ] {
