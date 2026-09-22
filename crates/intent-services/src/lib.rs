@@ -102,6 +102,7 @@ mod history_xml;
 mod hook_manager;
 mod image_dimensions;
 mod invite_ops;
+mod issue_cache;
 mod line_attribution;
 mod linear_ops;
 mod model_catalog;
@@ -1120,12 +1121,29 @@ pub struct Services {
     /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
     /// that acts on each entry; shared across clones.
     pr_monitor_catch_up: pr_monitor::PrMonitorCatchUp,
-    /// Per-PR memory of the sweep's last FULL forge fetch (change
-    /// fingerprint + shared snapshot), so a poll whose `get_pr` reports an
-    /// unchanged fingerprint reuses the previous sub-fetches instead of
-    /// re-issuing them (see [`pr_monitor::PrMonitorFetchCache`]). In-memory
-    /// only; shared across clones.
-    pr_monitor_fetch_cache: pr_monitor::PrMonitorFetchCache,
+    /// The shared PR cache: every PR read's memory of its last full forge
+    /// read (PR record, shared snapshot, change fingerprint), so the
+    /// monitor sweep reuses the previous sub-fetches while the fingerprint
+    /// is unchanged and the on-demand readers are served from the newest
+    /// read within `prCache.maxAgeSeconds` (see [`pr_monitor::PrCache`]).
+    /// In-memory only; shared across clones.
+    pr_cache: pr_monitor::PrCache,
+    /// The issue cache behind `github.issues.get`: each issue's last forge
+    /// read, served within `prCache.maxAgeSeconds` like the PR cache and
+    /// retained under the same unmonitored policy (see
+    /// [`issue_cache::IssueCache`]). In-memory only; shared across clones.
+    issue_cache: issue_cache::IssueCache,
+    /// Explicit override for how old a cached PR (or issue) read may be and
+    /// still be served on demand (seconds). `None` — the production wiring
+    /// — reads `prCache.maxAgeSeconds` live from the settings registry;
+    /// values outside [floor, ceiling] are clamped at read time.
+    pr_cache_max_age_seconds: Option<u64>,
+    /// Test park seam for the on-demand PR read's miss→fetch window: parks
+    /// [`Services::read_pr`] after its preflight cache miss and before the
+    /// shared path's authoritative lookup, so a concurrent fill landing
+    /// inside that window is deterministic. `None` in production wiring;
+    /// tests inject via the `#[cfg(test)]`-only `with_pr_read_park`.
+    pr_read_park: Option<Arc<CompletionClassifyPark>>,
     /// Explicit override for the centralized PR-monitor loop's poll cadence
     /// (seconds). `None` — the production wiring — reads
     /// `prMonitor.pollSeconds` live from the settings registry; values below
@@ -1401,7 +1419,10 @@ impl Services {
             hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
-            pr_monitor_fetch_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_cache: Arc::new(Mutex::new(HashMap::new())),
+            issue_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_cache_max_age_seconds: None,
+            pr_read_park: None,
             pr_monitor_poll_seconds: None,
             pr_monitor_hourly_request_budget: None,
             pr_monitor_quota_share_percent: None,
@@ -1420,6 +1441,23 @@ impl Services {
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
+    }
+
+    /// Pin how old a cached PR read may be and still be served on demand,
+    /// bypassing the live `prCache.maxAgeSeconds` setting (test wiring).
+    /// Values outside [floor, ceiling] are clamped when read.
+    #[cfg(test)]
+    pub(crate) fn with_pr_cache_max_age_seconds(mut self, seconds: u64) -> Self {
+        self.pr_cache_max_age_seconds = Some(seconds);
+        self
+    }
+
+    /// Park the on-demand PR read between its preflight cache miss and the
+    /// shared path's authoritative lookup (test wiring); see `pr_read_park`.
+    #[cfg(test)]
+    pub(crate) fn with_pr_read_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.pr_read_park = Some(park);
+        self
     }
 
     /// Pin the PR-monitor poll cadence, bypassing the live
@@ -29490,7 +29528,6 @@ impl WorkspaceApi for Services {
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
-        let injected = self.source_control.clone();
         let this = self.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
@@ -29506,42 +29543,35 @@ impl WorkspaceApi for Services {
                 None => pr_ops::repo_of(&ws)?,
             };
             let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
-                intent_sourcecontrol::Error::NotFound(_) => {
-                    Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
-                }
-                other => pr_ops::map_sc_err(other),
-            })?;
+            // Served from the shared PR cache (§5.7): the entry is the PR
+            // monitor's own full read — the PR record plus EXACTLY the
+            // checklist the monitor works with — so `ws.pr.snapshot`,
+            // monitor wakes and `prMonitor.list` summaries all describe a
+            // PR with the same object, and a snapshot within
+            // `prCache.maxAgeSeconds` of a hover, a poll or a registration
+            // costs no forge call. A miss is one full read (every sub-read
+            // degrades on its own; only quota exhaustion fails it), stored
+            // for the next reader. This registers nothing and triggers no
+            // monitoring.
+            let (entry, _) = self.serve_pr(&repo_ref, pr_number).await?;
+            let pr = entry.pr;
+            let requirements = entry.snapshot.requirements;
+            let review_comment_count = entry.snapshot.review_comment_count;
             let state = pr_ops::derive_status_state(&pr);
             let mergeable_state = pr
                 .mergeable_state
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-
-            // The one-shot read composes EXACTLY the checklist the PR monitor
-            // works with, so `ws.pr.snapshot`, monitor wakes and
-            // `prMonitor.list` summaries all describe a PR with the same
-            // object — this registers nothing and triggers no monitoring.
-            // Every forge sub-read inside degrades on its own; only quota
-            // exhaustion (`RateLimited`) fails the snapshot, exactly as a
-            // rate-limited `get_pr` above would.
-            let (requirements, review_comment_count, _ejection_known) =
-                pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await?;
             let unresolved_thread_count = requirements.threads.unresolved;
             // The conversation-comment count is not part of the checklist; a
-            // failing read reports zero rather than failing the snapshot.
-            let conversation_count = match sc.list_comments(&repo_ref, pr_number).await {
-                Ok(comments) => i64::try_from(comments.len()).expect("value fits in i64"),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        pr_number,
-                        "pr.snapshot: conversation comments unavailable, reporting zero"
-                    );
-                    0
-                }
-            };
+            // read that degraded reports zero rather than failing the snapshot.
+            let conversation_count = entry.snapshot.conversation_count.unwrap_or_else(|| {
+                tracing::warn!(
+                    pr_number,
+                    "pr.snapshot: conversation comments unavailable, reporting zero"
+                );
+                0
+            });
             // The pre-existing compact blocks stay stable for callers that
             // already read them, but are projected off the checklist rather
             // than computed a second time. `checks.failedNames` lists every
@@ -29660,27 +29690,35 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
         Box::pin(async move {
             Self::require_administrator("github.pullsGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let pr = sc
-                .get_pr(&repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            // Fail-soft: the hover card always gets its `{ pull }`; a fold
-            // failure only costs the daemon-owned state its early refresh.
-            if let Err(e) = self.fold_fetched_pr(&repo_ref, &pr).await {
-                tracing::warn!(
-                    owner = %repo_ref.owner,
-                    repo = %repo_ref.name,
-                    pr_number = number,
-                    error = %e,
-                    "github.pulls.get: folding the fetched PR into workspace PR state failed"
-                );
+            // Served from the shared PR cache (§5.27): no forge call while
+            // the entry is younger than `prCache.maxAgeSeconds`, else one
+            // full read — the same read the monitor's poll performs — that
+            // refreshes the entry the next hover and `ws.pr.snapshot` serve.
+            let (entry, fetched) = self.serve_pr(&repo_ref, number).await?;
+            // The fold rides a REAL fetch only: a hit reports nothing the
+            // daemon-owned state has not already seen. Fail-soft: the hover
+            // card always gets its `{ pull }`; a fold failure only costs the
+            // daemon-owned state its early refresh.
+            if fetched {
+                if let Err(e) = self.fold_fetched_pr(&repo_ref, &entry.pr).await {
+                    tracing::warn!(
+                        owner = %repo_ref.owner,
+                        repo = %repo_ref.name,
+                        pr_number = number,
+                        error = %e,
+                        "github.pulls.get: folding the fetched PR into workspace PR state failed"
+                    );
+                }
             }
-            Ok(serde_json::json!({ "pull": github_ops::pull_to_json(&pr) }))
+            Ok(serde_json::json!({
+                "pull": github_ops::pull_to_json_with_merge_queue(
+                    &entry.pr,
+                    entry.snapshot.merge_queue_reported,
+                ),
+            }))
         })
     }
 
@@ -29910,15 +29948,12 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
         Box::pin(async move {
             Self::require_administrator("github.issuesGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let issue = sc
-                .get_issue(&repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
+            // Served from the issue cache within `prCache.maxAgeSeconds`;
+            // a miss costs one `get_issue` and seeds the next read.
+            let issue = self.read_issue(&repo_ref, number).await?;
             Ok(serde_json::json!({
                 "issue": github_ops::issue_to_json(&issue, &repo_ref.owner, &repo_ref.name)
             }))

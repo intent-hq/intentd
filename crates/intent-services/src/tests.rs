@@ -16459,6 +16459,12 @@ pub(crate) mod pr {
         /// PR numbers `get_pr` was called with, in call order (sweep
         /// stale-pool heal tests assert cap + ordering).
         seen_get_pr: std::sync::Mutex<Vec<u64>>,
+        /// Issue numbers `get_issue` was called with, in call order (the
+        /// issue cache tests assert a hit costs no forge read).
+        seen_get_issue: std::sync::Mutex<Vec<u64>>,
+        /// Issue number whose `get_issue` fails with `NotFound`, exercising
+        /// the issue cache's never-cache-errors rule.
+        missing_issue: Option<u64>,
         /// When true, `get_pr` and `list_prs` fail with `RateLimited`
         /// (exhausted GitHub core quota, monorepo#2961), exercising the
         /// global sweep pause.
@@ -17126,6 +17132,15 @@ pub(crate) mod pr {
             unimplemented!()
         }
         async fn get_issue(&self, _: &RepoRef, number: u64) -> ScResult<Issue> {
+            self.seen_get_issue.lock().unwrap().push(number);
+            if self.rate_limited {
+                return Err(ScError::RateLimited(
+                    "API rate limit exceeded for user ID 526899.".into(),
+                ));
+            }
+            if self.missing_issue == Some(number) {
+                return Err(ScError::NotFound("no such issue".into()));
+            }
             Ok(Issue {
                 number,
                 ..stub_issue()
@@ -18396,11 +18411,14 @@ pub(crate) mod pr {
             "pausedUntil is RFC 3339: {until}"
         );
 
-        // Gate paused at the start, lifted by the last forge read.
+        // Gate paused at the start, lifted by the last forge read — which
+        // only runs if the second snapshot MISSES the shared PR cache the
+        // first one seeded.
         let gate = svc.sweep_rate_limit.clone();
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
             assert!(gate.lift());
         }));
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + std::time::Duration::from_secs(1));
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert!(
             svc.sweep_rate_limit_paused_until().is_none(),
@@ -19716,6 +19734,150 @@ pub(crate) mod pr {
         assert_eq!(issue["comments"], 0);
     }
 
+    /// `github.issues.get` reads through the issue cache under the PR
+    /// cache's `prCache.maxAgeSeconds`: the first read costs one `get_issue`,
+    /// a repeat within the window answers the identical JSON with no forge
+    /// call (case-variant addressing shares the entry), another issue is
+    /// another miss, and an entry aged past the window is re-fetched.
+    #[intent_test_macros::daemon_test]
+    async fn github_issues_get_is_served_from_the_issue_cache_within_max_age() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+
+        let first = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![7]);
+        assert_eq!(svc.issue_cache_len(), 1);
+
+        let again = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(again, first, "a hit answers the cached issue");
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7],
+            "a hit within max_age costs no forge request"
+        );
+
+        // The RepoRef identity is case-insensitive: the same slot is hit,
+        // while the DTO echoes the caller's addressing.
+        let folded = svc
+            .github_issues_get("O".into(), "R".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![7]);
+        assert_eq!(folded["issue"]["owner"], "O");
+        assert_eq!(folded["issue"]["number"], 7);
+
+        svc.github_issues_get("o".into(), "r".into(), 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7, 8],
+            "another issue is another miss"
+        );
+        assert_eq!(svc.issue_cache_len(), 2);
+
+        svc.backdate_issue_cache(std::time::Duration::from_secs(61));
+        svc.github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7, 8, 7],
+            "an entry older than max_age is re-fetched"
+        );
+    }
+
+    /// A failed `get_issue` propagates to the caller and stores nothing: the
+    /// next read reaches the forge again (a `NotFound`, then a rate-limit
+    /// error mapped to `Error::RateLimited`, neither poisons the cache).
+    #[intent_test_macros::daemon_test]
+    async fn github_issues_get_never_caches_errors() {
+        let forge = Arc::new(StubForge {
+            missing_issue: Some(404),
+            ..Default::default()
+        });
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+
+        for _ in 0..2 {
+            let err = svc
+                .github_issues_get("o".into(), "r".into(), 404)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Internal(_)), "{err:?}");
+        }
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![404, 404]);
+        assert_eq!(svc.issue_cache_len(), 0, "a failed read is never cached");
+        assert!(!svc.issue_cached(&RepoRef::new("o", "r"), 404));
+
+        let quota = Arc::new(StubForge {
+            rate_limited: true,
+            ..Default::default()
+        });
+        let (_t2, svc2, _ws2) = setup_with_shared(quota.clone(), false).await;
+        let err = svc2
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::RateLimited(_)), "{err:?}");
+        assert_eq!(svc2.issue_cache_len(), 0);
+    }
+
+    /// Retention mirrors the PR cache's unmonitored policy: the map is
+    /// bounded by [`crate::issue_cache::ISSUE_CACHE_MAX_ENTRIES`] on every
+    /// write (oldest fetch evicted first), and an entry idle past
+    /// [`crate::issue_cache::ISSUE_CACHE_MAX_IDLE`] is dropped by the next
+    /// write.
+    #[intent_test_macros::daemon_test]
+    async fn the_issue_cache_is_bounded_and_expires_idle_entries_on_write() {
+        use crate::issue_cache::{ISSUE_CACHE_MAX_ENTRIES, ISSUE_CACHE_MAX_IDLE};
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let repo = RepoRef::new("o", "r");
+
+        let oldest = 1_000_u64;
+        svc.github_issues_get("o".into(), "r".into(), oldest)
+            .await
+            .unwrap();
+        svc.backdate_issue_cache(std::time::Duration::from_secs(30));
+        let overflow = 8;
+        for written in 1..=ISSUE_CACHE_MAX_ENTRIES + overflow {
+            let number = written as u64;
+            svc.github_issues_get("o".into(), "r".into(), number)
+                .await
+                .unwrap();
+            assert_eq!(
+                svc.issue_cache_len(),
+                (written + 1).min(ISSUE_CACHE_MAX_ENTRIES),
+                "bounded after write #{number}"
+            );
+        }
+        assert!(
+            !svc.issue_cached(&repo, oldest),
+            "the oldest fetch went first"
+        );
+        for number in 1..=overflow as u64 {
+            assert!(
+                !svc.issue_cached(&repo, number),
+                "#{number} was evicted in fetch order"
+            );
+        }
+        assert!(svc.issue_cached(&repo, (ISSUE_CACHE_MAX_ENTRIES + overflow) as u64));
+
+        svc.backdate_issue_cache(ISSUE_CACHE_MAX_IDLE + std::time::Duration::from_secs(1));
+        svc.github_issues_get("o".into(), "r".into(), oldest)
+            .await
+            .unwrap();
+        assert_eq!(svc.issue_cache_len(), 1, "only the fresh write survives");
+        assert!(svc.issue_cached(&repo, oldest));
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_issues_list_and_search_shapes() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
@@ -20766,6 +20928,19 @@ pub(crate) mod pr {
     async fn fold_setup(
         seed: impl FnOnce(&mut intent_core::Workspace),
     ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        let forge = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        fold_setup_with(forge, seed).await
+    }
+
+    /// [`fold_setup`] over a caller-held `forge`, for tests that observe or
+    /// drive its calls directly.
+    async fn fold_setup_with(
+        forge: Arc<StubForge>,
+        seed: impl FnOnce(&mut intent_core::Workspace),
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_id = WorkspaceId::new();
@@ -20784,10 +20959,7 @@ pub(crate) mod pr {
         let svc = Services::new(store)
             .with_event_bus(bus)
             .with_workspaces_root(wsroot.path().to_path_buf())
-            .with_source_control(Arc::new(StubForge {
-                merged_linked: true,
-                ..Default::default()
-            }));
+            .with_source_control(forge);
         (tmp, wsroot, svc, ws_id)
     }
 
@@ -21181,6 +21353,109 @@ pub(crate) mod pr {
         assert_eq!(root_list.len(), 1);
         assert_eq!(root_list[0].url, canonical);
         assert_eq!(root_list[0].status, intent_core::PullRequestStatus::Merged);
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
+    }
+
+    /// Regression (intent-hq/intentd#2064 review): the fold runs only when
+    /// `github.pulls.get`'s own read fetched the record. A concurrent fill
+    /// landing between the read's preflight cache miss and the shared path's
+    /// authoritative lookup makes that lookup a hit: the hover answers the
+    /// concurrently stored record with no forge request of its own, and the
+    /// linked workspace is never folded (persisted Open stays Open, no
+    /// `pr:updated`, no displayStatus transition). A later read that does
+    /// fetch — the entry aged past `max_age` — folds as usual.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_never_folds_when_a_concurrent_fill_serves_the_read() {
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let forge = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        let (_t, _root, svc, ws_id) = fold_setup_with(forge.clone(), |ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        let svc = svc
+            .with_pr_cache_max_age_seconds(60)
+            .with_pr_read_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let parked = intent_core::spawn_daemon({
+            let svc = svc.clone();
+            async move { svc.github_pulls_get("o".into(), "r".into(), 42).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("pulls.get reaches the miss→fetch window");
+        assert!(forge.seen_get_pr.lock().unwrap().is_empty());
+
+        // The concurrent fill (another on-demand reader or a sweep) stores
+        // #42 while the hover's read sits parked past its preflight miss.
+        crate::pr_monitor::read_pr_via(
+            forge.as_ref(),
+            &RepoRef::new("o", "r"),
+            42,
+            &svc.pr_cache,
+            crate::pr_monitor::PrReadPolicy::REFRESH,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("concurrent fill");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        park.release.notify_one();
+
+        let v = parked.await.expect("join").expect("pulls.get");
+        assert_eq!(v["pull"]["number"], 42);
+        assert_eq!(v["pull"]["merged"], true, "answers the concurrent fill");
+        assert_eq!(
+            *forge.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "the parked read costs no forge request of its own"
+        );
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Open),
+            "a read served from the cache never folds"
+        );
+        assert_eq!(
+            after.pull_requests.as_ref().expect("pull_requests")[0].status,
+            intent_core::PullRequestStatus::Open
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+
+        // Aged past max_age, the next read fetches — and that one folds.
+        // (The still-armed park is released ahead of the read.)
+        svc.backdate_pr_cache(std::time::Duration::from_secs(61));
+        park.release.notify_one();
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get after expiry");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42, 42]);
+        let folded = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            folded.pr_status,
+            Some(intent_core::PullRequestStatus::Merged),
+            "a read that fetched folds"
+        );
         assert_eq!(
             display_status_events(&svc, &ws_id).await,
             vec![json!("pr_merged")]

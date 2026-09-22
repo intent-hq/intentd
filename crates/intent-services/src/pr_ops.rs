@@ -1157,7 +1157,9 @@ pub(crate) async fn fetch_merge_requirements(
 /// (title / url / head SHA) and the [`MergeRequirementsRead`] it came with
 /// (review-comment count from the same thread fetch, probe-answered flag,
 /// sub-read completeness) — so a poll never repeats the `get_pr` / thread
-/// reads.
+/// reads. Production reads go through the PR cache's full fetch, which
+/// issues the same sequence with its own `get_pr` error mapping.
+#[cfg(test)]
 pub(crate) async fn fetch_merge_requirements_detailed(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
@@ -1197,6 +1199,7 @@ fn degrade_unless_rate_limited<T>(
 /// ejection signal, so `false` means the checklist's `mergeQueueEjection` is
 /// "unknown", not "no ejection" (the PR monitor keeps its previously
 /// observed event instead of dropping it).
+#[cfg(test)]
 pub(crate) async fn merge_requirements_for_pr(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
@@ -1227,6 +1230,13 @@ pub(crate) struct MergeRequirementsRead {
     /// thread resolution) — so the checklist carries a default in place of a
     /// signal the forge may answer on the next read.
     pub(crate) complete: bool,
+    /// The host's merge-queue state as reported (GitHub GraphQL
+    /// `isInMergeQueue`): `Some(true)` / `Some(false)` exactly when the probe
+    /// carried it, `None` when the host did not report it (no probe, REST-only
+    /// fallback). Unlike the checklist's presence-only
+    /// `MergeRequirements::is_in_merge_queue`, this keeps the reported
+    /// `false` — what `GithubPullRequest.isInMergeQueue` carries.
+    pub(crate) merge_queue_reported: Option<bool>,
 }
 
 /// [`merge_requirements_for_pr`] reporting per-sub-read completeness (see
@@ -1283,12 +1293,14 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
         read_review_thread_tally(sc, repo_ref, number).await?;
     complete &= threads_complete;
 
+    let merge_queue_reported = signals.as_ref().and_then(|s| s.is_in_merge_queue);
     let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
     Ok(MergeRequirementsRead {
         requirements,
         review_comment_count: review_comments,
         ejection_known,
         complete,
+        merge_queue_reported,
     })
 }
 
@@ -1333,12 +1345,14 @@ pub(crate) async fn merge_requirements_from_observation(
     };
     complete &= threads_complete;
 
+    let merge_queue_reported = signals.is_in_merge_queue;
     let requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
     Ok(MergeRequirementsRead {
         requirements,
         review_comment_count: review_comments,
         ejection_known: true,
         complete,
+        merge_queue_reported,
     })
 }
 

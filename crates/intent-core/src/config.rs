@@ -205,6 +205,21 @@ pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
 /// are clamped up at read time.
 pub const MIN_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 10;
 
+/// Default for `prCache.maxAgeSeconds` — how old a cached PR read may be
+/// and still be served to an on-demand reader (`github.pulls.get`,
+/// `ws.pr.snapshot`) without a forge call. The shared PR cache is refreshed
+/// by the PR monitor's polls, so a PR under an active monitor is usually
+/// served from its last poll; an unmonitored PR is re-read once per window.
+pub const DEFAULT_PR_CACHE_MAX_AGE_SECONDS: u64 = 60;
+
+/// Floor for `prCache.maxAgeSeconds` — below this every hover would re-read
+/// the forge. Sub-floor values (notably `0`) are clamped up at read time.
+pub const MIN_PR_CACHE_MAX_AGE_SECONDS: u64 = 10;
+
+/// Ceiling for `prCache.maxAgeSeconds` — the staleness an on-demand reader
+/// may be shown. Over-ceiling values are clamped down at read time.
+pub const MAX_PR_CACHE_MAX_AGE_SECONDS: u64 = 600;
+
 /// Default for `updates.checkOnIdle` — whether the daemon asks the sitter
 /// (via `SIGUSR2`) to check for updates once it has been continuously idle;
 /// on by default.
