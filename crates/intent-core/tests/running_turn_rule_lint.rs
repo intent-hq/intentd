@@ -66,7 +66,9 @@
 //!   the text back to the previous `;` / `{` / `}`).
 //!
 //! Limits: bare imported variants (`use AgentStatus::*; Pending | Active |
-//! Processing`) are not recognized, a `Self::` triple on some other enum
+//! Processing`) are not recognized, nor are alternatives wrapped in
+//! parentheses or a `&` (`(AgentStatus::Pending) | (…)` — each is its own
+//! one-path group), a `Self::` triple on some other enum
 //! with the same variant names is a false positive (opt out with a reason),
 //! a test module file that is not named `tests.rs` and not under a `tests/`
 //! directory is scanned like production code unless its item is
@@ -480,8 +482,10 @@ fn cfg_test_item_ends_at_semicolon(chars: &[char], mut j: usize) -> bool {
 
 /// Char ranges `[start, end)` of every `#[cfg(test)]` attribute together
 /// with the whole item that follows it (see the module doc for where each
-/// kind of item ends). Runs on already-blanked text, so the attribute cannot
-/// hide inside a string or comment.
+/// kind of item ends). Depth counts `(…)` and `[…]` as well as `{…}`, so a
+/// `;` inside an array type (`[&str; 1]`) or a parameter list never ends
+/// the item. Runs on already-blanked text, so the attribute cannot hide
+/// inside a string or comment.
 fn cfg_test_item_ranges(chars: &[char]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -497,7 +501,8 @@ fn cfg_test_item_ranges(chars: &[char]) -> Vec<(usize, usize)> {
             let c = chars[i];
             i += 1;
             match c {
-                '{' => depth += 1,
+                '{' | '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
                 '}' => {
                     depth = depth.saturating_sub(1);
                     if depth == 0 && !ends_at_semicolon {
@@ -1244,6 +1249,93 @@ fn scanned(s: AgentStatus) -> bool {
 }
 
 #[test]
+fn cfg_test_item_survives_semicolons_inside_brackets_and_parens() {
+    // A `;` inside an array type or a parameter list is not an item boundary
+    // (PR #2073 review); the production item after each test item is still
+    // scanned, so the range does not over-extend either.
+    let src = r"
+#[cfg(test)]
+fn fixture(status: AgentStatus, _: [u8; 1]) -> bool {
+    matches!(status, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
+}
+
+fn after_fn(s: AgentStatus) -> bool {
+    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
+}
+
+#[cfg(test)]
+const RUNNING: [fn(AgentStatus) -> bool; 1] =
+    [|s| matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)];
+
+fn after_const(s: AgentStatus) -> bool {
+    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
+}
+
+#[cfg(test)]
+static TABLE: [(AgentStatus, bool); 1] = [(AgentStatus::Active, true)];
+
+fn after_static(s: AgentStatus) -> bool {
+    match s {
+        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing => true,
+        _ => false,
+    }
+}
+
+fn with_test_statement(s: AgentStatus) -> bool {
+    #[cfg(test)]
+    let probe: [u8; 1] = [0];
+    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
+}
+";
+    assert_eq!(
+        hit_lines(src),
+        vec![
+            line_of(src, "fn after_fn") + 1,
+            line_of(src, "fn after_const") + 1,
+            line_of(src, "fn after_static") + 2,
+            line_of(src, "fn with_test_statement") + 3,
+        ]
+    );
+}
+
+#[test]
+fn lexer_edge_cases_and_cfg_qualifiers() {
+    let src = r###"
+/* outer /* nested */ AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing */
+fn a(c: char) -> bool {
+    let quote = '\'';
+    let backslash = '\\';
+    let raw = r##"AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing "# still"##;
+    c == quote || c == backslash || raw.is_empty()
+}
+
+#[cfg(all(test, unix))]
+fn qualified(s: AgentStatus) -> bool {
+    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
+}
+
+#[cfg(test)]
+mod tests {
+    const RUNNING: [AgentStatus; 3] = [AgentStatus::Pending, AgentStatus::Active, AgentStatus::Processing];
+    fn helper(s: AgentStatus) -> bool {
+        matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
+    }
+}
+
+fn scanned(s: AgentStatus) -> bool {
+    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
+}
+"###;
+    assert_eq!(
+        hit_lines(src),
+        vec![
+            line_of(src, "fn qualified") + 1,
+            line_of(src, "fn scanned") + 1,
+        ]
+    );
+}
+
+#[test]
 fn reasoned_marker_suppresses_above_group_or_statement() {
     let src = r"
 fn f(s: AgentStatus) -> bool {
@@ -1446,6 +1538,34 @@ fn scanned() -> &'static str {
 }
 "#;
     assert_eq!(sql_hit_lines(src), vec![line_of(src, "fn scanned") + 1]);
+}
+
+#[test]
+fn sql_rule_cfg_test_item_survives_semicolons_inside_brackets_and_parens() {
+    let src = r#"
+#[cfg(test)]
+const EXPECTED: [&str; 1] = ["status IN ('pending', 'active', 'Processing')"];
+
+fn after_const() -> &'static str {
+    "status IN ('pending', 'active', 'Processing')"
+}
+
+#[cfg(test)]
+fn fixture(_: [u8; 1]) -> &'static str {
+    "status IN ('pending', 'active', 'Processing')"
+}
+
+fn after_fn() -> &'static str {
+    "status IN ('pending', 'active', 'Processing')"
+}
+"#;
+    assert_eq!(
+        sql_hit_lines(src),
+        vec![
+            line_of(src, "fn after_const") + 1,
+            line_of(src, "fn after_fn") + 1,
+        ]
+    );
 }
 
 #[test]
