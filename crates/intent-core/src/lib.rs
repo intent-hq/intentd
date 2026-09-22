@@ -29,6 +29,8 @@ pub mod git_remote_url;
 pub mod ids;
 pub mod model;
 pub mod path_utils;
+#[doc(hidden)]
+pub mod queue_visibility_contract;
 pub mod replay_preview;
 pub mod repo_ref;
 pub mod secrets;
