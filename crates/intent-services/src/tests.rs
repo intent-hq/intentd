@@ -18745,48 +18745,114 @@ pub(crate) mod pr {
         // invalid port-0 base uri would fail the test if `start_at` ran).
         let (_t, svc) = github_svc().await;
         let svc = svc.with_github_login_base_uri("http://127.0.0.1:0");
-        {
-            let mut slot = svc.github_auth_flow.lock().await;
-            *slot = Some(crate::github_auth_ops::FlowSlot {
-                flow_id: crate::github_auth_ops::next_flow_id(),
-                user_code: "WXYZ-9876".into(),
-                verification_uri: "https://github.com/login/device".into(),
-                interval: 5,
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
-                phase: crate::github_auth_ops::FlowPhase::Pending,
-            });
-        }
+        let seeded_wire_id = seed_pending_github_flow(&svc).await;
         let c = svc.github_connect().await.expect("connect");
         assert_eq!(c["ok"], true);
         assert_eq!(c["userCode"], "WXYZ-9876");
+        // The wire flowId is the resident slot's generation — and a further
+        // connect while the flow is live hands out the identical id.
+        let flow_id = c["flowId"]
+            .as_str()
+            .expect("flowId is a string")
+            .to_string();
+        assert_eq!(flow_id, seeded_wire_id);
+        let again = svc.github_connect().await.expect("connect again");
+        assert_eq!(again["flowId"], flow_id.as_str());
         // authStatus surfaces the pending flow and its verification uri.
         let v = svc.github_auth_status().await.expect("auth");
         assert_eq!(v["deviceFlow"]["status"], "pending");
         assert_eq!(v["oauthUrl"], "https://github.com/login/device");
     }
 
+    /// Seed a live pending slot and return its wire `flowId`.
+    async fn seed_pending_github_flow(svc: &Services) -> String {
+        let mut slot = svc.github_auth_flow.lock().await;
+        let seeded = crate::github_auth_ops::FlowSlot {
+            flow_id: crate::github_auth_ops::next_flow_id(),
+            user_code: "WXYZ-9876".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            interval: 5,
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+            phase: crate::github_auth_ops::FlowPhase::Pending,
+        };
+        let id = seeded.wire_id();
+        *slot = Some(seeded);
+        id
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_cancel_auth_clears_the_pending_flow() {
+        // No `flowId` keeps the legacy behaviour: whichever flow is pending
+        // is cancelled.
         let (_t, svc) = github_svc().await;
-        {
-            let mut slot = svc.github_auth_flow.lock().await;
-            *slot = Some(crate::github_auth_ops::FlowSlot {
-                flow_id: crate::github_auth_ops::next_flow_id(),
-                user_code: "WXYZ-9876".into(),
-                verification_uri: "https://github.com/login/device".into(),
-                interval: 5,
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
-                phase: crate::github_auth_ops::FlowPhase::Pending,
-            });
-        }
-        let c = svc.github_cancel_auth().await.expect("cancel");
+        seed_pending_github_flow(&svc).await;
+        let c = svc.github_cancel_auth(None).await.expect("cancel");
         assert_eq!(c["ok"], true);
         assert_eq!(c["cancelled"], true);
         let v = svc.github_auth_status().await.expect("auth");
         assert_eq!(v["deviceFlow"], serde_json::Value::Null);
         // Cancelling again is an idempotent no-op.
-        let c = svc.github_cancel_auth().await.expect("cancel twice");
+        let c = svc.github_cancel_auth(None).await.expect("cancel twice");
         assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], false);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_cancel_auth_with_matching_flow_id_clears_the_pending_flow() {
+        let (_t, svc) = github_svc().await;
+        let flow_id = seed_pending_github_flow(&svc).await;
+        let c = svc
+            .github_cancel_auth(Some(flow_id.clone()))
+            .await
+            .expect("cancel");
+        assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], true);
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"], serde_json::Value::Null);
+        // The id is single-use: once its flow is gone it cancels nothing.
+        let c = svc
+            .github_cancel_auth(Some(flow_id))
+            .await
+            .expect("cancel twice");
+        assert_eq!(c["cancelled"], false);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_cancel_auth_with_stale_flow_id_leaves_the_newer_flow_pending() {
+        // A caller holding the id of an earlier flow (replaced by a newer
+        // connect) must not be able to cancel the flow it did not start.
+        let (_t, svc) = github_svc().await;
+        let stale = seed_pending_github_flow(&svc).await;
+        let current = seed_pending_github_flow(&svc).await;
+        assert_ne!(stale, current);
+        let c = svc
+            .github_cancel_auth(Some(stale))
+            .await
+            .expect("stale cancel");
+        assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], false);
+        // The newer flow is untouched and still reported as pending.
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"]["status"], "pending");
+        assert_eq!(v["deviceFlow"]["userCode"], "WXYZ-9876");
+        assert_eq!(
+            svc.github_auth_flow
+                .lock()
+                .await
+                .as_ref()
+                .map(crate::github_auth_ops::FlowSlot::wire_id),
+            Some(current.clone())
+        );
+        // Nothing pending at all: an id (stale or not) cancels nothing.
+        let c = svc
+            .github_cancel_auth(Some(current.clone()))
+            .await
+            .expect("cancel current");
+        assert_eq!(c["cancelled"], true);
+        let c = svc
+            .github_cancel_auth(Some(current))
+            .await
+            .expect("cancel with nothing pending");
         assert_eq!(c["cancelled"], false);
     }
 
@@ -18807,8 +18873,23 @@ pub(crate) mod pr {
                 phase: crate::github_auth_ops::FlowPhase::Denied,
             });
         }
-        let c = svc.github_cancel_auth().await.expect("cancel");
+        let c = svc.github_cancel_auth(None).await.expect("cancel");
         assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], false);
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"]["status"], "denied");
+        // Even the terminal slot's own id does not make it cancellable.
+        let denied_id = svc
+            .github_auth_flow
+            .lock()
+            .await
+            .as_ref()
+            .map(crate::github_auth_ops::FlowSlot::wire_id)
+            .expect("slot kept");
+        let c = svc
+            .github_cancel_auth(Some(denied_id))
+            .await
+            .expect("cancel by id");
         assert_eq!(c["cancelled"], false);
         let v = svc.github_auth_status().await.expect("auth");
         assert_eq!(v["deviceFlow"]["status"], "denied");

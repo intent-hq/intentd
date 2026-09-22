@@ -3090,7 +3090,19 @@ async fn dispatch(
             Ok(r)
         }
         "github.cancelAuth" => {
-            let r = api.github_cancel_auth().await.map_err(domain_to_rpc)?;
+            // Strict: only an OMITTED `flowId` is the unscoped cancel. Any
+            // present non-string — an explicit `null` included, unlike
+            // `opt_str_strict` — is rejected so it can never silently widen
+            // the cancel to "whichever flow is pending".
+            let flow_id = match params.get("flowId") {
+                None => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(invalid_params("flowId must be a string")),
+            };
+            let r = api
+                .github_cancel_auth(flow_id)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "github.revoke" => {
