@@ -12033,11 +12033,25 @@ mod change_event_parity {
     /// `workspace:updated` with the full applied delta
     /// (`archived`/`status`/`archivedAt`). Verify `archive_workspace` fires
     /// exactly one such event whose `archivedAt` equals the persisted
-    /// timestamp (Audit D C3).
+    /// timestamp (Audit D C3). Precondition: the workspace has no guests —
+    /// the owner is its only member and no invite is open — so the guest
+    /// sweep publishes no membership / invite delta.
     #[intent_test_macros::daemon_test]
     async fn archive_workspace_emits_workspace_updated_once() {
         use intent_core::WorkspaceApi;
         let h = harness().await;
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "owner-only precondition: {members:?}");
+        assert!(h
+            .store
+            .list_open_workspace_invites(&h.ws)
+            .await
+            .expect("invites")
+            .is_empty());
         let mut sub = subscribe(&h);
         let ws = h
             .services
@@ -12063,6 +12077,155 @@ mod change_event_parity {
             quiet.is_err(),
             "archive_workspace must publish exactly one event, got extra: {quiet:?}"
         );
+    }
+
+    /// Archiving removes guests: on a workspace with two collaborators and
+    /// one open invite, `archive_workspace` detaches every collaborator (one
+    /// `{ members, removedPrincipalId, memberCount }` delta each, the
+    /// `members.remove` shape), revokes the invite (one `{ invites: true }`
+    /// delta), then publishes the archived delta last. The response carries
+    /// the post-sweep `memberCount == 1` / `openInviteCount == 0`, only the
+    /// owner row survives, and a following unarchive resurrects nothing.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_detaches_collaborators_and_revokes_open_invites() {
+        use intent_core::{Principal, PrincipalId, WorkspaceApi, WorkspaceInvite, WorkspaceRole};
+        let h = harness().await;
+        let primary = h.store.get_primary_principal().await.expect("primary");
+        let mut guests = Vec::new();
+        for login in ["guest-a", "guest-b"] {
+            let p = Principal {
+                id: PrincipalId::new(),
+                github_user_id: None,
+                login: Some(login.to_string()),
+                display_name: None,
+                avatar_url: None,
+                is_primary: false,
+                created_at: now_iso(),
+                updated_at: now_iso(),
+            };
+            h.store.upsert_principal(&p).await.expect("principal");
+            h.store
+                .add_workspace_member(&h.ws, &p.id, WorkspaceRole::Collaborator)
+                .await
+                .expect("collaborator");
+            guests.push(p.id);
+        }
+        let invite = WorkspaceInvite {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: h.ws.clone(),
+            secret_hash: crate::invite_ops::hash_secret("s"),
+            secret: None,
+            created_by_principal_id: primary.id.clone(),
+            pin_github_user_id: None,
+            pin_login: None,
+            created_at: now_iso(),
+            expires_at: intent_core::iso_ms_from_now(3_600_000),
+            redeemed_at: None,
+            redeemed_by_principal_id: None,
+            revoked_at: None,
+            redemption_count: 0,
+        };
+        h.store
+            .insert_workspace_invite(&invite)
+            .await
+            .expect("open invite");
+        assert_eq!(
+            h.store
+                .workspace_membership_summaries(None, std::slice::from_ref(&h.ws))
+                .await
+                .expect("summary")[&h.ws]
+                .member_count,
+            3
+        );
+
+        let mut sub = subscribe(&h);
+        let ws = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let membership = ws.membership.expect("membership attached");
+        assert_eq!(membership.member_count, 1, "owner only");
+        assert_eq!(membership.open_invite_count, 0, "invite revoked");
+
+        // One removal delta per collaborator, `memberCount` shrinking with
+        // each; then the invite delta; then the archived delta — nothing
+        // else.
+        let mut removed = Vec::new();
+        for expected_count in [2u64, 1] {
+            let ev = recv_one(&mut sub).await;
+            assert_envelope(&ev, &h.ws.0, "workspace:updated");
+            let changes = &ev["data"]["changes"];
+            assert_eq!(changes["members"], true, "{ev}");
+            assert_eq!(changes["memberCount"], expected_count, "{ev}");
+            removed.push(
+                changes["removedPrincipalId"]
+                    .as_str()
+                    .expect("removedPrincipalId")
+                    .to_string(),
+            );
+        }
+        let mut expected: Vec<String> = guests.iter().map(|g| g.0.clone()).collect();
+        expected.sort();
+        removed.sort();
+        assert_eq!(removed, expected);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "changes": { "invites": true } })
+        );
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "archived": true,
+                    "status": "Archived",
+                    "archivedAt": ws.archived_at,
+                }
+            })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
+
+        // Store: only the owner row survives; the invite is closed.
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_eq!(members[0].principal_id, primary.id);
+        assert_eq!(members[0].role, WorkspaceRole::Owner);
+        assert!(h
+            .store
+            .list_open_workspace_invites(&h.ws)
+            .await
+            .expect("invites")
+            .is_empty());
+        let stored = h
+            .store
+            .get_workspace_invite(&invite.id)
+            .await
+            .expect("invite read")
+            .expect("invite row kept");
+        assert!(stored.revoked_at.is_some());
+
+        // Unarchive resurrects nothing.
+        h.services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let summary = h
+            .store
+            .workspace_membership_summaries(None, std::slice::from_ref(&h.ws))
+            .await
+            .expect("summary");
+        assert_eq!(summary[&h.ws].member_count, 1);
+        assert_eq!(summary[&h.ws].open_invite_count, 0);
     }
 
     /// Symmetric to archive: `unarchive_workspace` emits one `workspace:updated`

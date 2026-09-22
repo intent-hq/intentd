@@ -597,6 +597,70 @@ impl Services {
         Ok(removed)
     }
 
+    /// `workspace.archive` guest sweep: detach every collaborator member
+    /// through [`Self::detach_collaborator`] (one `removedPrincipalId`
+    /// `workspace:updated` each) and revoke every open invite, publishing
+    /// ONE `{ invites: true }` `workspace:updated` when at least one row was
+    /// revoked (the `workspace.invite.revoke` delta). The owner row is kept.
+    /// Best-effort: store failures are logged and the archive proceeds.
+    pub(crate) async fn detach_workspace_guests(&self, workspace_id: &WorkspaceId) {
+        match self.store.list_workspace_members(workspace_id).await {
+            Ok(members) => {
+                for member in members
+                    .iter()
+                    .filter(|m| m.role == WorkspaceRole::Collaborator)
+                {
+                    if let Err(e) = self
+                        .detach_collaborator(workspace_id, &member.principal_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            workspace = %workspace_id,
+                            principal = %member.principal_id,
+                            "workspace.archive: collaborator detach failed; membership kept"
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                workspace = %workspace_id,
+                "workspace.archive: member listing failed; collaborators kept"
+            ),
+        }
+        let invites = match self.store.list_open_workspace_invites(workspace_id).await {
+            Ok(invites) => invites,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    workspace = %workspace_id,
+                    "workspace.archive: open invite listing failed; invites kept"
+                );
+                return;
+            }
+        };
+        let mut revoked_any = false;
+        for invite in &invites {
+            match self.store.revoke_workspace_invite(&invite.id).await {
+                Ok(revoked) => revoked_any |= revoked,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    workspace = %workspace_id,
+                    invite = %invite.id,
+                    "workspace.archive: invite revoke failed; invite kept"
+                ),
+            }
+        }
+        if revoked_any {
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                crate::workspace_updated_event(workspace_id, &json!({ "invites": true })),
+            )
+            .await;
+        }
+    }
+
     /// Drop every queued entry stamped with `principal_id` on the agents of
     /// `workspace_id`, republishing `agent:queue:updated` for each queue that
     /// changed (which also persists the shrunk snapshot).

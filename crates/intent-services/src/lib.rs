@@ -21459,6 +21459,15 @@ impl WorkspaceApi for Services {
                 // archived workspace's displayStatus rollup reads
                 // `in_progress` indefinitely off the active-monitor signal.
                 this.cancel_workspace_pr_monitors(&id).await;
+                // Archiving removes guests: detach every collaborator (the
+                // shared `members.remove` teardown — row deleted, queued
+                // messages dropped, `removedPrincipalId` delta published
+                // per member) and revoke every open invite (one
+                // `{ invites: true }` delta when a row changed). The owner
+                // membership stays. Unarchive does NOT restore either; a
+                // guest rejoins by a fresh invite. Best-effort: a listing
+                // failure is logged and the archive still completes.
+                this.detach_workspace_guests(&id).await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,
                 // and persist it through the scoped monotonic write
@@ -21494,7 +21503,7 @@ impl WorkspaceApi for Services {
             // tail runs on. A `JoinError` means the tail itself panicked —
             // the row is already archived, so surface it rather than
             // reporting a bogus success shape.
-            tail.await.map_err(|e| {
+            let mut ws = tail.await.map_err(|e| {
                 // The `JoinError` text names no workspace, so log the id —
                 // otherwise a panicked tail is undiagnosable from daemon logs.
                 tracing::error!(
@@ -21503,7 +21512,12 @@ impl WorkspaceApi for Services {
                     "workspace.archive: post-persist tail task failed; row is archived"
                 );
                 Error::Internal(format!("archive tail task failed: {e}"))
-            })
+            })?;
+            // Membership summary (multiplayer w1) read AFTER the guest
+            // sweep, so the mutation response carries the post-detach
+            // `memberCount` / `openInviteCount`.
+            self.attach_workspace_membership(&mut ws).await;
+            Ok(ws)
         })
     }
 
@@ -32152,6 +32166,11 @@ impl Services {
     /// emitted) but skips the emit entirely on the auto path — the losing
     /// racer must not re-announce a flip it did not perform (the winner's
     /// stamped delta already went out).
+    ///
+    /// Membership is NOT restored: archive detached every collaborator and
+    /// revoked every open invite (`detach_workspace_guests`), and unarchive
+    /// leaves the owner as the sole member — like the cancelled hooks and
+    /// PR monitors, guests come back only through a fresh invite.
     async fn unarchive_workspace_inner(
         &self,
         id: WorkspaceId,
