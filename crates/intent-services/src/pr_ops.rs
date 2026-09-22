@@ -425,34 +425,49 @@ pub(crate) fn upsert_pr_info_by_url(
     true
 }
 
-/// Whether a snapshot served from the shared PR cache — a hit, no forge read
-/// of its own — carries something the persisted pool copy has not seen
-/// (intent-hq/intent#5654). The passive fold runs on every serve, fetched or
-/// cached: a fetch always writes the fresh record, while a hit writes only
-/// when the served **queue signal, head or status** differs from the
-/// persisted entry. Rationale: a `ws.pr.snapshot` (or another reader's
-/// fill) can seed the cache with the queue signal the pool never received,
-/// and the next hover must land it instead of skipping the fold as a hit;
-/// but a hit whose record agrees with the pool on those axes must not
-/// re-persist REST fields a later sweep may already have refreshed.
-pub(crate) fn served_pr_differs(persisted: &PullRequestInfo, served: &PullRequestInfo) -> bool {
-    persisted.is_in_merge_queue != served.is_in_merge_queue
-        || persisted.head_sha != served.head_sha
-        || persisted.status != served.status
-}
-
-/// [`served_pr_differs`] over a pool: `true` when any entry sharing the
-/// served URL ([`same_pr_url`]) differs from it (an absent entry never
-/// differs — a hit never grows a pool).
-pub(crate) fn pool_differs_from_served(
-    pool: Option<&[PullRequestInfo]>,
+/// The cache-hit projection of the passive fold (intent-hq/intent#5654). The
+/// fold runs on every serve, fetched or cached: a fetch writes the fresh
+/// record whole, while a snapshot served from the shared PR cache — a hit,
+/// no forge read of its own — writes **only** `is_in_merge_queue`, and only
+/// onto a persisted copy on the **same known head**. Rationale: a
+/// `ws.pr.snapshot` (or another reader's fill) can seed the cache with the
+/// queue signal the pool never received, and the next hover must land it
+/// instead of skipping the fold as a hit; but a REST sweep may have run
+/// between the fill and the hit, so writing the older cached record back
+/// would roll fresher pool fields (title, `updatedAt`, `mergeableState`,
+/// status) back — the queue signal is the one field only a signal-bearing
+/// read owns. A differing head means the cached signal describes a head the
+/// pool has already left (or an unknown one): nothing is written. Returns
+/// whether `persisted` changed; an agreeing hit writes nothing.
+pub(crate) fn project_served_queue_signal(
+    persisted: &mut PullRequestInfo,
     served: &PullRequestInfo,
 ) -> bool {
-    pool.is_some_and(|items| {
-        items
-            .iter()
-            .any(|p| same_pr_url(&p.url, &served.url) && served_pr_differs(p, served))
-    })
+    let same_known_head = persisted.head_sha.is_some() && persisted.head_sha == served.head_sha;
+    if !same_known_head || persisted.is_in_merge_queue == served.is_in_merge_queue {
+        return false;
+    }
+    persisted.is_in_merge_queue = served.is_in_merge_queue;
+    true
+}
+
+/// [`project_served_queue_signal`] over a pool: every entry sharing the
+/// served URL ([`same_pr_url`]) takes the projection; an absent entry is
+/// never added (a hit never grows a pool). Returns whether any entry changed.
+pub(crate) fn project_pool_queue_signal(
+    pool: &mut Option<Vec<PullRequestInfo>>,
+    served: &PullRequestInfo,
+) -> bool {
+    let Some(items) = pool.as_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for p in items.iter_mut() {
+        if same_pr_url(&p.url, &served.url) {
+            changed |= project_served_queue_signal(p, served);
+        }
+    }
+    changed
 }
 
 /// Rebase a REST-path `pull_requests` list about to be persisted onto the
@@ -1986,53 +2001,72 @@ mod tests {
         assert_eq!(same.is_in_merge_queue, Some(true));
     }
 
-    /// The cache-hit fold guard: a served snapshot differs from the persisted
-    /// copy on the queue signal, the head or the status — never on the plain
-    /// REST fields a later sweep may have refreshed — and a pool differs only
-    /// through an entry sharing the served URL (a same-numbered stranger or an
-    /// absent entry never triggers a hit fold).
+    /// The cache-hit projection: a served snapshot on the same known head
+    /// writes only its queue signal onto the persisted copy — a differing
+    /// signal lands (enqueue and dequeue alike) while title, `updatedAt`,
+    /// `mergeableState` and status stay as persisted; an agreeing signal, a
+    /// moved head or an unknown head on either side writes nothing. Over a
+    /// pool, only entries sharing the served URL take the projection (a
+    /// same-numbered stranger is left alone, a case-variant URL matches, an
+    /// absent entry is never added).
     #[test]
-    fn served_pr_differs_only_on_signal_head_or_status() {
-        let persisted = queued_pooled_pr();
-        let mut served = persisted.clone();
-        assert!(!served_pr_differs(&persisted, &served));
-
-        served.title = "renamed".into();
-        served.updated_at = "2026-02-01T00:00:00Z".into();
-        served.mergeable_state = Some("blocked".into());
-        assert!(
-            !served_pr_differs(&persisted, &served),
-            "REST-only fields never trigger a hit fold"
-        );
-
-        let mut dequeued = persisted.clone();
+    fn project_served_queue_signal_writes_only_the_signal_on_the_same_head() {
+        let queued = queued_pooled_pr();
+        let mut dequeued = queued.clone();
         dequeued.is_in_merge_queue = None;
-        assert!(served_pr_differs(&persisted, &dequeued));
-        let mut moved = persisted.clone();
-        moved.head_sha = Some("sha2".into());
-        assert!(served_pr_differs(&persisted, &moved));
-        let mut merged = persisted.clone();
-        merged.status = PullRequestStatus::Merged;
-        assert!(served_pr_differs(&persisted, &merged));
+        dequeued.title = "renamed by the cached read".into();
+        dequeued.updated_at = "2025-12-31T00:00:00Z".into();
+        dequeued.mergeable_state = Some("blocked".into());
+        dequeued.status = PullRequestStatus::Merged;
 
-        assert!(!pool_differs_from_served(None, &dequeued));
-        assert!(!pool_differs_from_served(Some(&[]), &dequeued));
-        assert!(pool_differs_from_served(
-            Some(std::slice::from_ref(&persisted)),
-            &dequeued
-        ));
+        let mut persisted = queued.clone();
+        assert!(!project_served_queue_signal(&mut persisted, &queued));
+        assert_eq!(persisted, queued, "an agreeing hit writes nothing");
+
+        assert!(project_served_queue_signal(&mut persisted, &dequeued));
+        assert_eq!(persisted.is_in_merge_queue, None, "the dequeue lands");
+        assert_eq!(persisted.title, queued.title, "REST fields stay persisted");
+        assert_eq!(persisted.updated_at, queued.updated_at);
+        assert_eq!(persisted.mergeable_state, queued.mergeable_state);
+        assert_eq!(persisted.status, queued.status, "status stays persisted");
+
+        let mut requeued = persisted.clone();
+        assert!(project_served_queue_signal(&mut requeued, &queued));
+        assert_eq!(requeued.is_in_merge_queue, Some(true), "the enqueue lands");
+
+        let mut moved = dequeued.clone();
+        moved.head_sha = Some("sha2".into());
+        let mut persisted = queued.clone();
+        assert!(!project_served_queue_signal(&mut persisted, &moved));
+        assert_eq!(persisted, queued, "a moved head writes nothing");
+        let mut unknown = dequeued.clone();
+        unknown.head_sha = None;
+        assert!(!project_served_queue_signal(&mut persisted, &unknown));
+        let mut headless = queued.clone();
+        headless.head_sha = None;
+        assert!(!project_served_queue_signal(&mut headless, &unknown));
+        assert_eq!(headless.is_in_merge_queue, Some(true));
+
+        let mut none: Option<Vec<PullRequestInfo>> = None;
+        assert!(!project_pool_queue_signal(&mut none, &dequeued));
+        assert!(none.is_none(), "a hit never grows a pool");
+        let mut empty = Some(Vec::new());
+        assert!(!project_pool_queue_signal(&mut empty, &dequeued));
+        assert_eq!(empty.as_deref(), Some(&[][..]));
+
         let mut stranger = dequeued.clone();
         stranger.url = "https://github.com/fork/repo/pull/1".into();
-        assert!(!pool_differs_from_served(
-            Some(std::slice::from_ref(&persisted)),
-            &stranger
-        ));
+        let mut pool = Some(vec![queued.clone()]);
+        assert!(!project_pool_queue_signal(&mut pool, &stranger));
+        assert_eq!(pool.as_deref().unwrap()[0].is_in_merge_queue, Some(true));
+
         let mut cased = dequeued.clone();
-        cased.url = persisted.url.to_ascii_uppercase();
-        assert!(pool_differs_from_served(
-            Some(std::slice::from_ref(&persisted)),
-            &cased
-        ));
+        cased.url = queued.url.to_ascii_uppercase();
+        assert!(project_pool_queue_signal(&mut pool, &cased));
+        let entry = &pool.as_deref().unwrap()[0];
+        assert_eq!(entry.is_in_merge_queue, None);
+        assert_eq!(entry.url, queued.url, "the persisted URL spelling stays");
+        assert_eq!(entry.title, queued.title);
     }
 
     /// The write-time rebase re-derives a fresh entry's queue signal from the

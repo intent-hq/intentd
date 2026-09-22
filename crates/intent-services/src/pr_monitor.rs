@@ -1669,8 +1669,8 @@ impl Services {
     /// Every successful serve passively folds the served snapshot into the
     /// daemon-owned PR state ([`Services::fold_served_pr`]) so
     /// `github.pulls.get` and `ws.pr.snapshot` behave identically: a fetch
-    /// folds the fresh record, a hit folds only what the persisted copies
-    /// have not seen (queue signal, head, status) — a hit costs no forge
+    /// folds the fresh record whole, a hit projects only the queue signal
+    /// onto same-head copies whose signal differs — a hit costs no forge
     /// call either way (intent-hq/intent#5654). The fold is fail-soft: the
     /// caller always gets its entry, a fold failure only costs the
     /// daemon-owned state its early refresh.

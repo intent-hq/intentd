@@ -5444,13 +5444,14 @@ impl Services {
     /// (intent-hq/intent#5654).
     ///
     /// `fetched` is whether the serve reached the forge for this record. A
-    /// fetch folds unconditionally (the record is fresh); a cache hit folds
-    /// a row only when the served snapshot's queue signal, head or status
-    /// differs from that row's persisted copy
-    /// ([`pr_ops::served_pr_differs`]) — so a signal another reader's fill
+    /// fetch folds the fresh record whole; a cache hit is a projection
+    /// ([`pr_ops::project_served_queue_signal`]): it writes only
+    /// `is_in_merge_queue`, onto copies on the same known head, and only
+    /// when the signal differs — so a signal another reader's fill
     /// (`ws.pr.snapshot`, a monitor poll) carried into the cache lands on
-    /// the next hover instead of being skipped as a hit, while a hit that
-    /// agrees with the pool writes nothing.
+    /// the next hover instead of being skipped as a hit, while the older
+    /// cached REST fields never roll back a sweep that ran since the fill,
+    /// and a hit that agrees with the pool writes nothing.
     pub(crate) async fn fold_served_pr(
         &self,
         repo_ref: &intent_sourcecontrol::RepoRef,
@@ -5465,29 +5466,32 @@ impl Services {
             .await?;
         for mut ws in workspaces {
             let linked = ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
-            // A hit folds only what this row has not seen.
-            let hit_carries_news =
-                pr_ops::pool_differs_from_served(ws.pull_requests.as_deref(), &info)
-                    || (linked
-                        && (ws.pr_status != Some(info.status)
-                            || ws
-                                .active_pull_request
-                                .as_ref()
-                                .is_none_or(|active| pr_ops::served_pr_differs(active, &info))));
-            if !(fetched || hit_carries_news) {
-                continue;
-            }
-            let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
-            if linked
-                && (ws.pr_status != Some(info.status)
-                    || ws.active_pull_request.as_ref() != Some(&info)
-                    || ws.pr_url.as_deref() != Some(pr.url.as_str()))
-            {
-                ws.pr_status = Some(info.status);
-                ws.pr_url = Some(pr.url.clone());
-                ws.active_pull_request = Some(info.clone());
-                changed = true;
-            }
+            let changed = if fetched {
+                let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
+                if linked
+                    && (ws.pr_status != Some(info.status)
+                        || ws.active_pull_request.as_ref() != Some(&info)
+                        || ws.pr_url.as_deref() != Some(pr.url.as_str()))
+                {
+                    ws.pr_status = Some(info.status);
+                    ws.pr_url = Some(pr.url.clone());
+                    ws.active_pull_request = Some(info.clone());
+                    changed = true;
+                }
+                changed
+            } else {
+                let mut changed = pr_ops::project_pool_queue_signal(&mut ws.pull_requests, &info);
+                if linked {
+                    if let Some(active) = ws
+                        .active_pull_request
+                        .as_mut()
+                        .filter(|active| pr_ops::same_pr_url(&active.url, &info.url))
+                    {
+                        changed |= pr_ops::project_served_queue_signal(active, &info);
+                    }
+                }
+                changed
+            };
             if !changed {
                 continue;
             }
@@ -5510,28 +5514,26 @@ impl Services {
         for mut root in roots {
             let linked =
                 root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
-            let hit_carries_news =
-                pr_ops::pool_differs_from_served(root.pull_requests.as_deref(), &info)
-                    || (linked && root.pr_status != Some(info.status));
-            if !(fetched || hit_carries_news) {
-                continue;
-            }
-            let mut changed = false;
-            if root
-                .pull_requests
-                .as_deref()
-                .is_some_and(|items| items.iter().any(|p| pr_ops::same_pr_url(&p.url, &pr.url)))
-            {
-                changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
-            }
-            if linked
-                && (root.pr_status != Some(info.status)
-                    || root.pr_url.as_deref() != Some(pr.url.as_str()))
-            {
-                root.pr_status = Some(info.status);
-                root.pr_url = Some(pr.url.clone());
-                changed = true;
-            }
+            let changed =
+                if fetched {
+                    let mut changed = false;
+                    if root.pull_requests.as_deref().is_some_and(|items| {
+                        items.iter().any(|p| pr_ops::same_pr_url(&p.url, &pr.url))
+                    }) {
+                        changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
+                    }
+                    if linked
+                        && (root.pr_status != Some(info.status)
+                            || root.pr_url.as_deref() != Some(pr.url.as_str()))
+                    {
+                        root.pr_status = Some(info.status);
+                        root.pr_url = Some(pr.url.clone());
+                        changed = true;
+                    }
+                    changed
+                } else {
+                    pr_ops::project_pool_queue_signal(&mut root.pull_requests, &info)
+                };
             if !changed {
                 continue;
             }
