@@ -1091,10 +1091,11 @@ enum PopCommit {
 /// missing — else unattributed): an entry the caller's `agent.getQueue`
 /// hides reads as absent for every mutation — `-32602 queued message not
 /// found`, no side effects. Then `author_only` (`agent.editQueuedMessage`)
-/// refuses a VISIBLE entry another principal authored — this only ever
-/// reaches the administrator, who sees the whole queue, and who is
-/// unaffected by an unknown-human entry (nobody else can be its author).
-/// An entry with no human author passes.
+/// refuses a VISIBLE entry the caller did not author — this only ever
+/// reaches the administrator, who sees the whole queue: another principal's
+/// entry, and an unknown-human entry (a human wrote it, nobody can claim it;
+/// the administrator may still remove or force-send it). An entry with no
+/// human author passes.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntryGate {
     principal_id: PrincipalId,
@@ -1121,8 +1122,13 @@ impl QueueEntryGate {
                 entry.id
             )));
         }
-        if let intent_core::QueueAttribution::Principal(author) = &attribution {
-            if self.author_only && *author != self.principal_id {
+        if self.author_only {
+            let foreign = match &attribution {
+                intent_core::QueueAttribution::Principal(author) => *author != self.principal_id,
+                intent_core::QueueAttribution::UnknownHuman => true,
+                intent_core::QueueAttribution::Unattributed => false,
+            };
+            if foreign {
                 return Err(Error::InvalidParams(format!(
                     "queued message {} can only be edited by its author",
                     entry.id

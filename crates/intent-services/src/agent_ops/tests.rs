@@ -14183,12 +14183,14 @@ async fn stamped_entries_stay_hidden_from_guests_when_the_principal_lookup_fails
 /// pre-attribution row) whose workspace fallback cannot be resolved is not
 /// "author-less and public" — it fails closed as an unknown human. With the
 /// workspace's `legacy_author_principal_id` and `owner_principal_id` both
-/// cleared (the deterministic `Ok(None)` of the fallback read; a failed read
-/// resolves to the same `None`), the guest's `agent.getQueue` and projected
-/// `agent:queue:updated` omit the entry, its `agent:queue:processing` frame
-/// is marked for redaction, and every per-id mutation reads it as absent —
-/// while the administrator still sees it with an explicit `author: null`.
-/// A genuinely unattributed (agent-sent) entry stays public to the guest.
+/// cleared (the `Ok(None)` of the fallback read), and again with the
+/// `workspace` table offline (the read's `Err`), the guest's `agent.getQueue`
+/// and projected `agent:queue:updated` omit the entry, its
+/// `agent:queue:processing` frame is marked for redaction, and every per-id
+/// mutation reads it as absent — while the administrator still sees it with
+/// an explicit `author: null`, may remove or force-send it, but cannot edit
+/// it (an edit restamps; nobody may claim an unknown human's entry). A
+/// genuinely unattributed (agent-sent) entry stays public to the guest.
 #[tokio::test]
 async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
     use intent_core::{with_caller, Caller, QueueAttribution};
@@ -14421,24 +14423,104 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
     assert_eq!(untouched.content, "legacy human text");
     assert_eq!(untouched.message_metadata, legacy.message_metadata);
 
-    // The administrator is unaffected (nobody else can be its author).
-    with_caller(as_admin.clone(), async {
+    // The administrator sees the entry but cannot claim its authorship: an
+    // edit (which restamps) is refused with the entry untouched, while
+    // remove and send-now go through.
+    let author_only = |err: &Error| matches!(err, Error::InvalidParams(m) if *m == format!("queued message {} can only be edited by its author", legacy.id));
+    let err = with_caller(as_admin.clone(), async {
         svc.agent_edit_queued_message_op(id.clone(), legacy.id.clone(), "owner edit".into(), None)
             .await
     })
     .await
-    .expect("administrator edits the unattributable entry");
-    assert_eq!(
-        svc.find_queued_message(&id, &legacy.id).unwrap().content,
-        "owner edit"
+    .expect_err("administrator edits the unattributable entry");
+    assert!(author_only(&err), "{err:?}");
+    let untouched = svc
+        .find_queued_message(&id, &legacy.id)
+        .expect("the entry is still queued");
+    assert_eq!(untouched.content, "legacy human text");
+    assert_eq!(untouched.message_metadata, legacy.message_metadata);
+
+    // The same fail-closed outcome when the fallback READ fails (the
+    // `workspace` row is unreadable, not merely empty): the resolver maps
+    // the error to `None`, and the entry is an unknown human either way.
+    sqlx::query("ALTER TABLE workspace RENAME TO workspace_offline")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("take the workspace table offline");
+    assert!(
+        svc.store()
+            .get_workspace_author_fallback(&ws)
+            .await
+            .is_err(),
+        "the fallback read fails"
     );
-    with_caller(as_admin, async {
+    assert_eq!(
+        crate::principal_ops::MessageAuthorResolver::new(&svc, &ws)
+            .fallback_principal_id()
+            .await,
+        None,
+        "a failed fallback read resolves nothing"
+    );
+    assert_eq!(
+        intent_core::queue_attribution_with(legacy.message_metadata.as_ref(), None),
+        QueueAttribution::UnknownHuman
+    );
+    let err = with_caller(as_guest.clone(), async {
+        svc.agent_edit_queued_message_op(id.clone(), legacy.id.clone(), "hijack".into(), None)
+            .await
+    })
+    .await
+    .expect_err("guest edits the unattributable entry under a failed read");
+    assert!(not_found(&err), "{err:?}");
+    let err = with_caller(as_guest.clone(), async {
         svc.agent_remove_queued_message_op(id.clone(), legacy.id.clone())
             .await
     })
     .await
-    .expect("administrator removes the unattributable entry");
+    .expect_err("guest removes the unattributable entry under a failed read");
+    assert!(not_found(&err), "{err:?}");
+    let err = with_caller(as_admin.clone(), async {
+        svc.agent_edit_queued_message_op(id.clone(), legacy.id.clone(), "owner edit".into(), None)
+            .await
+    })
+    .await
+    .expect_err("administrator edits the unattributable entry under a failed read");
+    assert!(author_only(&err), "{err:?}");
+    let untouched = svc
+        .find_queued_message(&id, &legacy.id)
+        .expect("the entry is still queued");
+    assert_eq!(untouched.content, "legacy human text");
+    assert_eq!(untouched.message_metadata, legacy.message_metadata);
+    sqlx::query("ALTER TABLE workspace_offline RENAME TO workspace")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("restore the workspace table");
+
+    let sent = with_caller(as_admin.clone(), async {
+        svc.agent_send_queued_message_now_op(id.clone(), legacy.id.clone())
+            .await
+    })
+    .await
+    .expect("administrator force-sends the unattributable entry");
+    assert!(sent["messageId"].is_string(), "{sent}");
     assert!(svc.find_queued_message(&id, &legacy.id).is_none());
+    let (legacy_2, _) = svc.enqueue_message(
+        &id,
+        "second legacy human text".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    with_caller(as_admin, async {
+        svc.agent_remove_queued_message_op(id.clone(), legacy_2.id.clone())
+            .await
+    })
+    .await
+    .expect("administrator removes the unattributable entry");
+    assert!(svc.find_queued_message(&id, &legacy_2.id).is_none());
 }
 
 /// `agent.getQueue` never omits `author`: an unscoped read whose session
