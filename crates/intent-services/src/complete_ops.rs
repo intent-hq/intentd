@@ -258,21 +258,32 @@ pub(crate) fn one_shot_launch(
         ..Default::default()
     };
     let args = intent_providers::build_provider_args(provider, &inputs);
-    if let Some(bin) = resolved_bin {
-        return Some(OneShotCommand::binary(bin, args));
-    }
-    if let Some(pkg) = provider.npx_only_package {
-        return npx.map(|npx| OneShotCommand::npx(npx, pkg).args(args));
-    }
-    let pkg = provider.fallback_npx_package?;
-    // The daemon-managed npx fallback: keep a stray env override from
-    // redirecting the adapter (mirrors the codex probe launch, #555).
-    npx.map(|npx| {
-        OneShotCommand::npx(npx, pkg)
+    let via_npx = resolved_bin.is_none();
+    let mut cmd = if let Some(bin) = resolved_bin {
+        OneShotCommand::binary(bin, args)
+    } else if let Some(pkg) = provider.npx_only_package {
+        OneShotCommand::npx(npx?, pkg).args(args)
+    } else {
+        let pkg = provider.fallback_npx_package?;
+        // The daemon-managed npx fallback: keep a stray env override from
+        // redirecting the adapter (mirrors the codex probe launch, #555).
+        OneShotCommand::npx(npx?, pkg)
             .args(args)
             .env_remove("CODEX_PATH")
             .env_remove("CODEX_CONFIG")
-    })
+    };
+    if provider.id == "codex" {
+        // Share persistent-session mode policy without importing unrelated
+        // provider env defaults. Explicit inherited modes remain untouched.
+        if let Some(mode) = intent_providers::build_provider_env_for_spawn(
+            provider, model, None, None, None, via_npx, None,
+        )
+        .remove("INITIAL_AGENT_MODE")
+        {
+            cmd = cmd.env("INITIAL_AGENT_MODE", mode);
+        }
+    }
+    Some(cmd)
 }
 
 /// Resolve the adapter binary a one-shot launch (`agent.completeOnce`, the
@@ -977,7 +988,7 @@ rl.on('line', (line) => {
     send({
       jsonrpc: '2.0',
       method: 'session/update',
-      params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: process.env.CODEX_HOME ?? 'unset' } } },
+      params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify({ home: process.env.CODEX_HOME, mode: process.env.INITIAL_AGENT_MODE }) } } },
     });
     send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
   }
@@ -1008,7 +1019,15 @@ rl.on('line', (line) => {
             .agent_complete_once_op("echo home".into(), None, None, None, None, None)
             .await
             .unwrap();
-        let child_home = v["text"].as_str().expect("adapter echoed CODEX_HOME");
+        let child_env: serde_json::Value =
+            serde_json::from_str(v["text"].as_str().expect("adapter echoed environment")).unwrap();
+        assert_eq!(
+            child_env["mode"],
+            std::env::var("INITIAL_AGENT_MODE").unwrap_or_else(|_| "agent-full-access".into())
+        );
+        let child_home = child_env["home"]
+            .as_str()
+            .expect("adapter echoed CODEX_HOME");
         assert!(
             child_home.contains("intentd-codex-home-"),
             "the one-shot child must see the isolated throwaway CODEX_HOME, got: {child_home}"
@@ -1075,6 +1094,47 @@ rl.on('line', (line) => {
         assert!(one_shot_launch(codex, Some(bin), None, None).is_some());
         assert!(one_shot_launch(codex, None, Some(npx), None).is_some());
         assert!(one_shot_launch(codex, None, None, None).is_none());
+    }
+
+    #[test]
+    fn one_shot_codex_mode_matches_spawn_policy_without_changing_other_env() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        for via_npx in [false, true] {
+            let cmd = one_shot_launch(
+                codex,
+                (!via_npx).then(|| PathBuf::from("/opt/bin/codex-acp")),
+                Some(PathBuf::from("/usr/bin/npx")),
+                None,
+            )
+            .unwrap();
+            // The provider suite covers the explicit-value matrix under its
+            // env lock; do not mutate process-global env in service tests.
+            let expected = std::env::var_os("INITIAL_AGENT_MODE")
+                .is_none()
+                .then(|| ("INITIAL_AGENT_MODE".to_string(), "agent-full-access".into()));
+            assert_eq!(cmd.env_vars(), expected.as_slice());
+            let removed: Vec<_> = cmd.removed_env_vars().iter().map(String::as_str).collect();
+            assert_eq!(
+                removed,
+                if via_npx {
+                    vec!["CODEX_PATH", "CODEX_CONFIG"]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        for id in intent_providers::all_provider_ids()
+            .into_iter()
+            .filter(|id| *id != "codex")
+        {
+            let provider = intent_providers::find_provider(id).unwrap();
+            let cmd = one_shot_launch(provider, Some(PathBuf::from("/mock/adapter")), None, None)
+                .unwrap();
+            assert!(
+                cmd.env_vars().is_empty(),
+                "{id} must not acquire a Codex mode"
+            );
+        }
     }
 
     /// monorepo#4352: an npx-only provider resolves ONLY a valid adapter

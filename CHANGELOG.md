@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.100] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- Default Codex ACP to full access ([#2088](https://github.com/intent-hq/intentd/pull/2088))
+
+
+## [0.9.99] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- *(agent)* Reject self-targeted ws.agent.send / sendToTask ([#2084](https://github.com/intent-hq/intentd/pull/2084))
+
+### 🧪 Testing
+
+- *(intentd)* Mid tool-call interrupt settles and drains the queue ([#5669](https://github.com/intent-hq/intentd/pull/5669)) ([#2086](https://github.com/intent-hq/intentd/pull/2086))
+
+
+## [0.9.98] - 2026-09-22
+
+### 🚀 Features
+
+- *(github)* Expose flowId on connect and scope cancelAuth to it ([#2082](https://github.com/intent-hq/intentd/pull/2082))
+
+
 ## [0.9.97] - 2026-09-22
 
 ### 🚀 Features

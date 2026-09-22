@@ -155,8 +155,8 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
             ),
         ));
     };
-    // Provider env parity with real ACP spawns: `one_shot_launch` only builds
-    // argv, but some providers need their spawn env to launch at all —
+    // Provider env parity with real ACP spawns: `one_shot_launch` builds
+    // argv and the Codex mode, but some providers need more spawn env —
     // cortex's `ELECTRON_RUN_AS_NODE`, opencode's `OPENCODE_CONFIG_CONTENT`,
     // the Node heap cap. No rules file, MCP block, or unsloth endpoint: the
     // probe wants the barest viable session.
