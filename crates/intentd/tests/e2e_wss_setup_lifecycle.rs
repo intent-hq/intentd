@@ -482,6 +482,21 @@ fn last_tool_result(transcript: &Value) -> Value {
         .unwrap_or_else(|| panic!("no tool_result persisted in transcript: {transcript}"))
 }
 
+/// Poll until the setup script has reached `barrier` (proving its spawn
+/// succeeded and it is parked there) or `budget` elapses.
+async fn wait_for_entered(barrier: &Barrier, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    while !barrier.entered() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "setup script never reached {}",
+            barrier.path().display()
+        );
+        // timing-guard: poll interval for the barrier's arrival file
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Drive one turn of `agent_id` (a `workspace_api` call returning
 /// `ws.workspace.details()`), wait for its terminal `agent:stream:end`, and
 /// return the persisted `details()` result.
@@ -667,6 +682,34 @@ async fn setup_status_visible_to_agents_over_mcp() {
             "running carries startedAt + terminalId: {during_status}"
         );
     }
+
+    // Once the script has reached the barrier the spawn succeeded, so a
+    // details read now must be `running` with its terminal attached — the
+    // `running → completed` half of the sequence, held stable by the barrier.
+    wait_for_entered(&barrier, Duration::from_secs(20)).await;
+    let running = details_via_agent_turn(
+        &mut rpc,
+        &mut sub,
+        15,
+        &ws_id,
+        &agent_id,
+        "inspect the workspace while setup runs",
+    )
+    .await;
+    let running_status = &running["setupStatus"];
+    assert_eq!(
+        running_status["state"],
+        json!("running"),
+        "{running_status}"
+    );
+    assert!(
+        running_status["startedAt"].is_string() && running_status["terminalId"].is_string(),
+        "running carries startedAt + terminalId: {running_status}"
+    );
+    assert!(
+        running_status.get("exitCode").is_none() && running_status.get("finishedAt").is_none(),
+        "no terminal details while running: {running_status}"
+    );
 
     // Release the script; the lifecycle completes with exit 0.
     barrier.release();

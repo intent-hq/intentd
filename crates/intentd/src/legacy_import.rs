@@ -68,7 +68,7 @@ use intent_core::{
     CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, Note, NoteId,
     NoteMetadata, NoteVisibility, TaskMetadata, Workspace,
 };
-use intent_services::{publish_workspace_created, EventBus};
+use intent_services::{publish_workspace_created, EventBus, WorkspaceSetupStates};
 use intent_store::Store;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -134,6 +134,11 @@ pub struct Options {
     /// workspaces the importer writes directly through `Store`. `None`
     /// (the CLI path, tests) disables event emission.
     pub event_bus: Option<EventBus>,
+    /// The daemon's shared per-workspace setup-state map, so a freshly
+    /// inserted row is recorded `skipped` alongside its
+    /// `workspace:setup:completed` publish. `None` (the CLI path, tests)
+    /// records nothing.
+    pub setup_states: Option<WorkspaceSetupStates>,
 }
 
 impl fmt::Debug for Options {
@@ -145,6 +150,7 @@ impl fmt::Debug for Options {
             .field("assets_root", &self.assets_root)
             .field("app_dir", &self.app_dir)
             .field("event_bus", &self.event_bus.is_some())
+            .field("setup_states", &self.setup_states.is_some())
             .finish()
     }
 }
@@ -905,7 +911,7 @@ async fn import_one(
     // `WatcherRegistry` registers the workspace's watch roots at runtime.
     if matches!(outcome, Outcome::Imported) && !opts.dry_run {
         if let Some(bus) = &opts.event_bus {
-            publish_workspace_created(bus, &ws).await;
+            publish_workspace_created(bus, opts.setup_states.as_ref(), &ws).await;
         }
     }
     let mut entry = WorkspaceReport::new(id, dir, outcome);
@@ -2165,6 +2171,7 @@ pub async fn run_first_boot_import(
     assets_root: Option<PathBuf>,
     app_dir: Option<PathBuf>,
     event_bus: Option<EventBus>,
+    setup_states: Option<WorkspaceSetupStates>,
     resumed: bool,
 ) {
     tracing::info!(
@@ -2178,6 +2185,7 @@ pub async fn run_first_boot_import(
         assets_root,
         app_dir,
         event_bus,
+        setup_states,
     };
     match run(store, &opts).await {
         Ok(report) => {
@@ -2241,6 +2249,7 @@ pub async fn maybe_import_on_first_boot(
                 roots,
                 assets_root,
                 app_dir,
+                None,
                 None,
                 decision == FirstBootDecision::Resume,
             )
@@ -2991,7 +3000,7 @@ mod tests {
             decide_first_boot_import(&store, true, std::slice::from_ref(&root)).await,
             FirstBootDecision::Resume
         );
-        run_first_boot_import(&store, vec![root.clone()], None, None, None, true).await;
+        run_first_boot_import(&store, vec![root.clone()], None, None, None, None, true).await;
 
         // Both workspaces present (ws-a was skipped as already in DB), the
         // completion marker is written, and the pending marker is cleared.

@@ -32125,12 +32125,28 @@ mod setup_lifecycle_events {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use intent_core::{WorkspaceApi, WorkspaceCreate, WorkspaceSetupState};
+    use intent_core::{
+        WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceSetupState,
+    };
     use intent_store::Store;
+    use intentd_test_support::Barrier;
     use serde_json::{json, Value};
 
-    use super::{test_tempdir, TempDb};
+    use super::{test_registry_with_default_provider, test_tempdir, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    /// Wait until the setup script has reached its barrier (proving the
+    /// spawn succeeded and the script is parked there).
+    async fn wait_for_barrier(barrier: &Barrier) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !barrier.entered() {
+                // timing-guard: poll interval for the barrier's arrival file
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("setup script reached the barrier");
+    }
 
     /// Temp directory tree swept on drop (see [`test_tempdir`]).
     struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
@@ -32199,7 +32215,9 @@ mod setup_lifecycle_events {
     }
 
     /// Script runs to a zero exit: `started` then `completed` with
-    /// `ranScript: true` and `exitCode: 0`.
+    /// `ranScript: true` and `exitCode: 0`. The script parks on a barrier
+    /// so the `running` snapshot (state + `terminalId` in one write) can be
+    /// asserted without racing the script's exit.
     #[cfg(unix)]
     #[intent_test_macros::daemon_test]
     async fn script_success_emits_started_then_completed_exit_zero() {
@@ -32207,13 +32225,18 @@ mod setup_lifecycle_events {
         let root = unique_dir("intentd-setupev-ok-root");
         let (svc, bus, _tmp) = services(root.0.clone()).await;
         let mut sub = subscribe_setup(&bus);
+        let barrier = Barrier::new(&root.0, "setup");
 
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
                     repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
                     base_ref: Some(head_branch),
-                    setup_script: Some("exit 0".to_string()),
+                    setup_script: Some(format!(
+                        "{}\n{}\nexit 0",
+                        barrier.sh_arrive(),
+                        barrier.sh_wait()
+                    )),
                     ..Default::default()
                 },
                 None,
@@ -32226,13 +32249,26 @@ mod setup_lifecycle_events {
         assert_eq!(ev["type"], "workspace:setup:started");
         assert_eq!(ev["workspaceId"], ws.id.0);
         assert_eq!(ev["data"], json!({ "workspaceId": ws.id.0 }));
-        // The state map is written before the publish, so an observer of
-        // `started` already reads `running`.
+        // `started` precedes the spawn attempt, so the record is still
+        // `pending` or already `running`; once the script has reached the
+        // barrier the spawn succeeded and the snapshot is `running` with
+        // its terminal attached.
+        let early = svc.workspace_setup_status(&ws.id);
+        assert!(
+            matches!(
+                early.state,
+                WorkspaceSetupState::Pending | WorkspaceSetupState::Running
+            ),
+            "after started: {early:?}"
+        );
+        wait_for_barrier(&barrier).await;
         let running = svc.workspace_setup_status(&ws.id);
         assert_eq!(running.state, WorkspaceSetupState::Running);
+        assert!(running.terminal_id.is_some(), "running carries terminalId");
         assert!(running.started_at.is_some(), "running carries startedAt");
         assert_eq!(running.exit_code, None);
         assert_eq!(running.finished_at, None);
+        barrier.release();
 
         let ev = recv_setup(&mut sub).await;
         assert_eq!(ev["type"], "workspace:setup:completed");
@@ -32368,28 +32404,80 @@ mod setup_lifecycle_events {
         assert_quiet(&mut sub).await;
     }
 
+    /// An infrastructure failure persisting the `initialAgent` returns from
+    /// the create after the workspace row (and its `pending` record) exist
+    /// but before the setup stage is scheduled, so nothing would ever settle
+    /// that record: the row must read `skipped`, never a permanent `pending`.
+    #[intent_test_macros::daemon_test]
+    async fn initial_agent_persist_failure_settles_setup_state_skipped() {
+        let (repo_dir, head_branch) = seed_repo("intentd-setupev-agentfail-repo");
+        let root = unique_dir("intentd-setupev-agentfail-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
+        // The workspace row lands in `workspace`; the agent row insert is the
+        // first store write that touches `agent_session`.
+        sqlx::query("DROP TABLE agent_session")
+            .execute(store.write_pool())
+            .await
+            .expect("drop agent_session table");
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    setup_script: Some("exit 0".to_string()),
+                    initial_agent: Some(WorkspaceCreateInitialAgent {
+                        prompt: Some("inspect the workspace".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("agent persist failure surfaces");
+        assert!(
+            matches!(err, crate::Error::Internal(_)),
+            "infrastructure failure is -32603, got {err:?}"
+        );
+
+        let rows = store.list_workspaces(true).await.expect("workspaces");
+        assert_eq!(rows.len(), 1, "the workspace row was inserted first");
+        assert!(
+            rows[0]
+                .worktree_path
+                .as_deref()
+                .is_some_and(|p| !p.is_empty()),
+            "a worktree was provisioned, so the record started `pending`: {rows:?}"
+        );
+        let status = svc.workspace_setup_status(&rows[0].id);
+        assert_eq!(
+            status.state,
+            WorkspaceSetupState::Skipped,
+            "no setup stage runs for this create: {status:?}"
+        );
+    }
+
     /// The setup state map's transitions, driven directly: `pending` →
-    /// `running` (+ terminal) → `completed` / `failed`; a `started` stage
-    /// whose spawn failed (`ranScript: false`) is `failed` with no exit code;
-    /// an unrecorded workspace reads `unknown`; the wire shape omits absent
-    /// optional fields instead of emitting `null`.
+    /// `running` (state + terminal in one write) → `completed` / `failed`;
+    /// a `started` stage whose spawn failed (`ranScript: false`) goes
+    /// straight from `pending` to `failed` with no exit code; an unrecorded
+    /// workspace reads `unknown`; the wire shape omits absent optional
+    /// fields instead of emitting `null`.
     #[test]
     fn setup_state_transitions_and_unknown_default() {
         use crate::{
             record_setup_finished, record_setup_pending, record_setup_running,
-            record_setup_skipped, record_setup_terminal, WorkspaceSetupStates,
+            record_setup_skipped, WorkspaceSetupStates,
         };
         use intent_core::WorkspaceId;
 
         let states = WorkspaceSetupStates::default();
-        let read = |id: &WorkspaceId| {
-            states
-                .lock()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .unwrap_or_else(intent_core::WorkspaceSetupStatus::unknown)
-        };
+        let read = |id: &WorkspaceId| states.get(id);
 
         let unrecorded = WorkspaceId::new();
         let unknown = read(&unrecorded);
@@ -32406,13 +32494,10 @@ mod setup_lifecycle_events {
             serde_json::to_value(read(&ok)).unwrap(),
             json!({ "state": "pending" })
         );
-        record_setup_running(&states, &ok);
+        record_setup_running(&states, &ok, "term-1");
         let running = read(&ok);
         assert_eq!(running.state, WorkspaceSetupState::Running);
         assert!(running.started_at.is_some());
-        assert_eq!(running.terminal_id, None);
-        record_setup_terminal(&states, &ok, "term-1");
-        let running = read(&ok);
         assert_eq!(running.terminal_id.as_deref(), Some("term-1"));
         record_setup_finished(&states, &ok, true, Some(0));
         let done = read(&ok);
@@ -32423,18 +32508,20 @@ mod setup_lifecycle_events {
         assert!(done.finished_at.is_some());
 
         let nonzero = WorkspaceId::new();
-        record_setup_running(&states, &nonzero);
+        record_setup_running(&states, &nonzero, "term-2");
         record_setup_finished(&states, &nonzero, true, Some(3));
         let failed = read(&nonzero);
         assert_eq!(failed.state, WorkspaceSetupState::Failed);
         assert_eq!(failed.exit_code, Some(3));
+        assert_eq!(failed.terminal_id.as_deref(), Some("term-2"));
 
         let spawn_failed = WorkspaceId::new();
-        record_setup_running(&states, &spawn_failed);
+        record_setup_pending(&states, &spawn_failed);
         record_setup_finished(&states, &spawn_failed, false, None);
         let failed = read(&spawn_failed);
         assert_eq!(failed.state, WorkspaceSetupState::Failed);
         assert_eq!(failed.exit_code, None);
+        assert_eq!(failed.terminal_id, None);
         assert!(failed.finished_at.is_some());
 
         let skipped = WorkspaceId::new();
@@ -32490,25 +32577,31 @@ mod setup_lifecycle_events {
     /// `publish_workspace_created` (the out-of-`Services` insert path used by
     /// the legacy importer) pairs its `workspace:created` with an immediate
     /// `completed { ranScript: false }` — imports run no setup stage, so the
-    /// watcher registry must not hold their watcher start until the backstop.
+    /// watcher registry must not hold their watcher start until the backstop
+    /// — and records `skipped` in the shared setup-state map, so a workspace
+    /// row the importer wrote directly through `Store` reads `skipped` (not
+    /// `unknown`) from `workspace_setup_status`.
     #[intent_test_macros::daemon_test]
     async fn publish_workspace_created_emits_immediate_completed() {
-        let root = unique_dir("intentd-setupev-legacy-root");
-        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        use crate::WorkspaceSetupStates;
 
-        let ws = svc
-            .create_workspace(
-                WorkspaceCreate {
-                    title: Some("Imported".to_string()),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .expect("create")
-            .workspace;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let states = WorkspaceSetupStates::default();
+        let svc = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspace_setup_states(states.clone());
 
-        // Subscribe after the create so only the re-publish is in scope.
+        // Insert directly through `Store`, as the importer does: no
+        // `create_workspace`, so nothing has pre-seeded the map.
+        let ws = super::workspace(&intent_core::WorkspaceId::new());
+        store.insert_workspace(&ws).await.expect("insert");
+        assert_eq!(
+            svc.workspace_setup_status(&ws.id).state,
+            WorkspaceSetupState::Unknown
+        );
+
         let mut sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![
                 "workspace:created".to_string(),
@@ -32516,7 +32609,7 @@ mod setup_lifecycle_events {
             ],
             ..Default::default()
         });
-        crate::publish_workspace_created(&bus, &ws).await;
+        crate::publish_workspace_created(&bus, Some(&states), &ws).await;
 
         let ev = recv_setup(&mut sub).await;
         assert_eq!(ev["type"], "workspace:created");
@@ -32529,6 +32622,9 @@ mod setup_lifecycle_events {
             ev["data"],
             json!({ "workspaceId": ws.id.0, "ranScript": false })
         );
+        let skipped = svc.workspace_setup_status(&ws.id);
+        assert_eq!(skipped.state, WorkspaceSetupState::Skipped);
+        assert!(skipped.finished_at.is_some());
 
         assert_quiet(&mut sub).await;
     }
