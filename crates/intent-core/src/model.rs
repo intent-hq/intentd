@@ -2648,7 +2648,10 @@ pub enum AgentStatus {
 
 impl AgentStatus {
     /// Every variant in declaration order — the enumeration behind the
-    /// running-turn golden and the store's SQL status lists.
+    /// running-turn golden and the store's SQL status lists. Completeness is
+    /// pinned against serde's derived variant inventory
+    /// (`agent_status_all_matches_serde_variant_inventory`), so a variant
+    /// added to the enum but not here fails the suite.
     pub const ALL: [Self; 9] = [
         Self::Pending,
         Self::Active,
@@ -6824,6 +6827,39 @@ mod tests {
                 .map(|s| serde_json::to_value(s).unwrap())
                 .collect::<Vec<_>>(),
             vec![json!("pending"), json!("active"), json!("Processing")]
+        );
+    }
+
+    /// `AgentStatus::ALL` is complete: serde's derive generates the variant
+    /// inventory from the enum itself and lists it in the unknown-variant
+    /// error ("expected one of `a`, `b`, …"), so a variant added to the
+    /// enum — and classified in the exhaustive `is_running_turn` match — but
+    /// left out of `ALL` fails here instead of silently dropping out of the
+    /// store's generated SQL status list.
+    #[test]
+    fn agent_status_all_matches_serde_variant_inventory() {
+        let err = serde_json::from_str::<AgentStatus>("\"__not_a_status__\"")
+            .unwrap_err()
+            .to_string();
+        let (_, listed) = err
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("serde unknown-variant error shape changed: {err}"));
+        let mut inventory: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+        inventory.sort_unstable();
+        let mut all: Vec<String> = AgentStatus::ALL
+            .iter()
+            .map(|s| {
+                serde_json::to_value(s)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        all.sort_unstable();
+        assert_eq!(
+            all, inventory,
+            "AgentStatus::ALL must list every variant exactly once"
         );
     }
 
