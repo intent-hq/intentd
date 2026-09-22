@@ -785,6 +785,14 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_task_update_projection_park`.
     task_update_projection_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intentd#2068) for the per-id queue mutations
+    /// (`agent.editQueuedMessage` / `removeQueuedMessage` /
+    /// `sendQueuedMessageNow`): parks each between its ownership
+    /// pre-resolution and the locked mutation, so a concurrent drain pop +
+    /// `requeue_front` landing inside that window is deterministic. `None`
+    /// in production wiring; tests inject via the `#[cfg(test)]`-only
+    /// `with_queue_mutation_gate_park`.
+    queue_mutation_gate_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`); tests inject
@@ -1328,6 +1336,7 @@ impl Services {
             unread_settle_entry_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
+            queue_mutation_gate_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -2135,6 +2144,19 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.task_update_projection_park = Some(park);
+        self
+    }
+
+    /// Test seam (intentd#2068): park the per-id queue mutations between
+    /// their ownership pre-resolution and the locked mutation so a
+    /// concurrent drain pop + `requeue_front` inside that window is
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_queue_mutation_gate_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.queue_mutation_gate_park = Some(park);
         self
     }
 
@@ -28316,6 +28338,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
+            // Ownership (multiplayer): a guest collaborator force-sends only
+            // the entries its `agent.getQueue` shows it — checked by each
+            // path below inside its pop's critical section
+            // (`Services::queue_entry_gate`).
             match self.agent_manager() {
                 Some(manager) => {
                     manager
