@@ -1109,12 +1109,18 @@ pub struct Services {
     /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
     /// that acts on each entry; shared across clones.
     pr_monitor_catch_up: pr_monitor::PrMonitorCatchUp,
-    /// Per-PR memory of the sweep's last FULL forge fetch (change
-    /// fingerprint + shared snapshot), so a poll whose `get_pr` reports an
-    /// unchanged fingerprint reuses the previous sub-fetches instead of
-    /// re-issuing them (see [`pr_monitor::PrMonitorFetchCache`]). In-memory
-    /// only; shared across clones.
-    pr_monitor_fetch_cache: pr_monitor::PrMonitorFetchCache,
+    /// The shared PR cache: every PR read's memory of its last full forge
+    /// read (PR record, shared snapshot, change fingerprint), so the
+    /// monitor sweep reuses the previous sub-fetches while the fingerprint
+    /// is unchanged and the on-demand readers are served from the newest
+    /// read within `prCache.maxAgeSeconds` (see [`pr_monitor::PrCache`]).
+    /// In-memory only; shared across clones.
+    pr_cache: pr_monitor::PrCache,
+    /// Explicit override for how old a cached PR read may be and still be
+    /// served on demand (seconds). `None` — the production wiring — reads
+    /// `prCache.maxAgeSeconds` live from the settings registry; values
+    /// outside [floor, ceiling] are clamped at read time.
+    pr_cache_max_age_seconds: Option<u64>,
     /// Explicit override for the centralized PR-monitor loop's poll cadence
     /// (seconds). `None` — the production wiring — reads
     /// `prMonitor.pollSeconds` live from the settings registry; values below
@@ -1389,7 +1395,8 @@ impl Services {
             hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
-            pr_monitor_fetch_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_cache: Arc::new(Mutex::new(HashMap::new())),
+            pr_cache_max_age_seconds: None,
             pr_monitor_poll_seconds: None,
             pr_monitor_hourly_request_budget: None,
             pr_monitor_quota_share_percent: None,
@@ -1408,6 +1415,15 @@ impl Services {
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
+    }
+
+    /// Pin how old a cached PR read may be and still be served on demand,
+    /// bypassing the live `prCache.maxAgeSeconds` setting (test wiring).
+    /// Values outside [floor, ceiling] are clamped when read.
+    #[cfg(test)]
+    pub(crate) fn with_pr_cache_max_age_seconds(mut self, seconds: u64) -> Self {
+        self.pr_cache_max_age_seconds = Some(seconds);
+        self
     }
 
     /// Pin the PR-monitor poll cadence, bypassing the live
