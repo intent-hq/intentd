@@ -2205,6 +2205,7 @@ dependencies = [
  "async-trait",
  "ctor",
  "directories",
+ "intentd-test-support",
  "libc",
  "serde",
  "serde_json",
