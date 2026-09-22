@@ -29460,7 +29460,6 @@ impl WorkspaceApi for Services {
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
-        let injected = self.source_control.clone();
         let this = self.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
@@ -29476,42 +29475,35 @@ impl WorkspaceApi for Services {
                 None => pr_ops::repo_of(&ws)?,
             };
             let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
-                intent_sourcecontrol::Error::NotFound(_) => {
-                    Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
-                }
-                other => pr_ops::map_sc_err(other),
-            })?;
+            // Served from the shared PR cache (§5.7): the entry is the PR
+            // monitor's own full read — the PR record plus EXACTLY the
+            // checklist the monitor works with — so `ws.pr.snapshot`,
+            // monitor wakes and `prMonitor.list` summaries all describe a
+            // PR with the same object, and a snapshot within
+            // `prCache.maxAgeSeconds` of a hover, a poll or a registration
+            // costs no forge call. A miss is one full read (every sub-read
+            // degrades on its own; only quota exhaustion fails it), stored
+            // for the next reader. This registers nothing and triggers no
+            // monitoring.
+            let (entry, _) = self.serve_pr(&repo_ref, pr_number).await?;
+            let pr = entry.pr;
+            let requirements = entry.snapshot.requirements;
+            let review_comment_count = entry.snapshot.review_comment_count;
             let state = pr_ops::derive_status_state(&pr);
             let mergeable_state = pr
                 .mergeable_state
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-
-            // The one-shot read composes EXACTLY the checklist the PR monitor
-            // works with, so `ws.pr.snapshot`, monitor wakes and
-            // `prMonitor.list` summaries all describe a PR with the same
-            // object — this registers nothing and triggers no monitoring.
-            // Every forge sub-read inside degrades on its own; only quota
-            // exhaustion (`RateLimited`) fails the snapshot, exactly as a
-            // rate-limited `get_pr` above would.
-            let (requirements, review_comment_count, _ejection_known) =
-                pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await?;
             let unresolved_thread_count = requirements.threads.unresolved;
             // The conversation-comment count is not part of the checklist; a
-            // failing read reports zero rather than failing the snapshot.
-            let conversation_count = match sc.list_comments(&repo_ref, pr_number).await {
-                Ok(comments) => i64::try_from(comments.len()).expect("value fits in i64"),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        pr_number,
-                        "pr.snapshot: conversation comments unavailable, reporting zero"
-                    );
-                    0
-                }
-            };
+            // read that degraded reports zero rather than failing the snapshot.
+            let conversation_count = entry.snapshot.conversation_count.unwrap_or_else(|| {
+                tracing::warn!(
+                    pr_number,
+                    "pr.snapshot: conversation comments unavailable, reporting zero"
+                );
+                0
+            });
             // The pre-existing compact blocks stay stable for callers that
             // already read them, but are projected off the checklist rather
             // than computed a second time. `checks.failedNames` lists every
@@ -29630,27 +29622,35 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
         Box::pin(async move {
             Self::require_administrator("github.pullsGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let pr = sc
-                .get_pr(&repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            // Fail-soft: the hover card always gets its `{ pull }`; a fold
-            // failure only costs the daemon-owned state its early refresh.
-            if let Err(e) = self.fold_fetched_pr(&repo_ref, &pr).await {
-                tracing::warn!(
-                    owner = %repo_ref.owner,
-                    repo = %repo_ref.name,
-                    pr_number = number,
-                    error = %e,
-                    "github.pulls.get: folding the fetched PR into workspace PR state failed"
-                );
+            // Served from the shared PR cache (§5.27): no forge call while
+            // the entry is younger than `prCache.maxAgeSeconds`, else one
+            // full read — the same read the monitor's poll performs — that
+            // refreshes the entry the next hover and `ws.pr.snapshot` serve.
+            let (entry, fetched) = self.serve_pr(&repo_ref, number).await?;
+            // The fold rides a REAL fetch only: a hit reports nothing the
+            // daemon-owned state has not already seen. Fail-soft: the hover
+            // card always gets its `{ pull }`; a fold failure only costs the
+            // daemon-owned state its early refresh.
+            if fetched {
+                if let Err(e) = self.fold_fetched_pr(&repo_ref, &entry.pr).await {
+                    tracing::warn!(
+                        owner = %repo_ref.owner,
+                        repo = %repo_ref.name,
+                        pr_number = number,
+                        error = %e,
+                        "github.pulls.get: folding the fetched PR into workspace PR state failed"
+                    );
+                }
             }
-            Ok(serde_json::json!({ "pull": github_ops::pull_to_json(&pr) }))
+            Ok(serde_json::json!({
+                "pull": github_ops::pull_to_json_with_merge_queue(
+                    &entry.pr,
+                    entry.snapshot.merge_queue_reported,
+                ),
+            }))
         })
     }
 

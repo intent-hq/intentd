@@ -462,12 +462,12 @@ impl PrMonitorSnapshot {
 /// removed" change from a sibling monitor's baseline.
 #[derive(Debug, Clone)]
 pub struct SharedPrSnapshot {
-    title: String,
-    url: String,
-    head_sha: Option<String>,
-    conversation_count: Option<i64>,
-    review_comment_count: i64,
-    requirements: MergeRequirements,
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) head_sha: Option<String>,
+    pub(crate) conversation_count: Option<i64>,
+    pub(crate) review_comment_count: i64,
+    pub(crate) requirements: MergeRequirements,
     /// Whether the merge-requirements probe answered this poll. The probe is
     /// the only source of `mergeQueueEjection`, so `false` means that field
     /// is "unknown", not "no ejection" (see [`Self::materialize`]).
@@ -477,6 +477,10 @@ pub struct SharedPrSnapshot {
     /// review-decision, check-run or review-thread read leaves a default in
     /// the checklist that the forge may answer on the next read.
     requirements_complete: bool,
+    /// The host's merge-queue state as reported by this read
+    /// ([`pr_ops::MergeRequirementsRead::merge_queue_reported`]) — what
+    /// `github.pulls.get` carries as `isInMergeQueue` (`None` → key absent).
+    pub(crate) merge_queue_reported: Option<bool>,
 }
 
 impl SharedPrSnapshot {
@@ -576,13 +580,15 @@ pub(crate) const PR_MONITOR_MAX_CHEAP_POLLS: u32 = 5;
 /// combine with the poll-count bound into an arbitrarily old checklist.
 pub(crate) const PR_MONITOR_MAX_CHEAP_AGE: Duration = Duration::from_secs(15 * 60);
 
-/// Retention of a cache entry no active monitor keeps alive: it is evicted
-/// by the sweep's retention pass ([`prune_pr_cache`]) once its full fetch
-/// is this old. Entries under an active monitor live as long as the monitor.
+/// Retention of a cache entry no active monitor keeps alive: it is dropped
+/// by the retention pass ([`retain_pr_cache`]) once its full fetch is this
+/// old. Entries under an active monitor live as long as the monitor.
 pub(crate) const PR_CACHE_MAX_IDLE: Duration = Duration::from_secs(10 * 60);
 
-/// Cap on the PRs the cache holds; past it the retention pass evicts
-/// unmonitored entries, oldest full fetch first.
+/// Hard bound on the UNMONITORED entries the cache holds, enforced by the
+/// retention pass on every write ([`retain_pr_cache`]): past it the
+/// unmonitored entries with the oldest full fetch are evicted down to the
+/// cap. Monitored entries never count against it.
 pub(crate) const PR_CACHE_MAX_ENTRIES: usize = 256;
 
 /// How a PR read may use the shared cache ([`Services::read_pr`]).
@@ -677,48 +683,54 @@ pub(crate) struct PrCacheSlot {
 /// like the in-sweep dedupe ([`PrKey`]). Written by the sweep's polls and by
 /// every on-demand read alike, so a monitor poll refreshes what the next
 /// on-demand read serves and an on-demand read on an unmonitored PR seeds
-/// the next one. Retention runs at the top of each sweep
-/// ([`prune_pr_cache`]). In-memory only — a daemon restart starts cold.
-/// Shared across [`Services`] clones.
+/// the next one. Every write ends with the retention pass
+/// ([`retain_pr_cache`]), which the sweep also runs at the top of each tick
+/// to drop the entries of monitors that have since gone. In-memory only — a
+/// daemon restart starts cold. Shared across [`Services`] clones.
 pub(crate) type PrCache = Arc<Mutex<HashMap<PrKey, PrCacheSlot>>>;
 
 /// Store an on-demand full read and bump the slot's generation, so a sweep
 /// poll already in flight for the PR does not overwrite it with its
-/// (possibly older) result.
+/// (possibly older) result. `monitored` is the set of PRs under an active
+/// monitor, for the write's retention pass ([`retain_pr_cache`]).
 fn store_on_demand(
     cache: &PrCache,
     key: PrKey,
     pr: PullRequest,
     snapshot: SharedPrSnapshot,
+    monitored: &HashSet<PrKey>,
 ) -> PrCacheEntry {
-    let entry = PrCacheEntry::new(pr, snapshot, Instant::now());
+    let now = Instant::now();
+    let entry = PrCacheEntry::new(pr, snapshot, now);
     let mut cache = cache.lock().unwrap();
     let slot = cache.entry(key).or_default();
     slot.generation += 1;
     slot.entry = Some(entry.clone());
+    retain_pr_cache(&mut cache, monitored, now);
     entry
 }
 
-/// The sweep's retention pass: entries under an active monitor
-/// (`monitored`) are kept; any other slot is dropped once its full read is
-/// [`PR_CACHE_MAX_IDLE`] old (or it holds none), and past
-/// [`PR_CACHE_MAX_ENTRIES`] the unmonitored entries with the oldest
-/// `fetched_at` are evicted down to the cap. Monitored entries are never
-/// evicted for the cap: their monitors re-read them anyway.
-fn prune_pr_cache(cache: &PrCache, monitored: &HashSet<PrKey>) {
-    let now = Instant::now();
-    let mut cache = cache.lock().unwrap();
+/// The retention pass, run under the cache lock after EVERY write (a
+/// `Serve` miss, a registration / check-now refresh, a sweep poll) and at
+/// the top of each sweep: slots under an active monitor (`monitored`) are
+/// exempt from both rules and kept; any other slot is dropped once its full
+/// read is [`PR_CACHE_MAX_IDLE`] old (or it holds none), and the
+/// unmonitored slots left are then bounded by [`PR_CACHE_MAX_ENTRIES`],
+/// evicting the oldest `fetched_at` first. Running on the write path — not
+/// only in the sweep — is what makes the cap a hard bound: on-demand reads
+/// keep landing while the sweep is skipped by the forge rate-limit pause.
+fn retain_pr_cache(
+    cache: &mut HashMap<PrKey, PrCacheSlot>,
+    monitored: &HashSet<PrKey>,
+    now: Instant,
+) {
     cache.retain(|key, slot| {
         monitored.contains(key)
             || slot.entry.as_ref().is_some_and(|entry| {
                 now.saturating_duration_since(entry.fetched_at) < PR_CACHE_MAX_IDLE
             })
     });
-    let excess = cache.len().saturating_sub(PR_CACHE_MAX_ENTRIES);
-    if excess == 0 {
-        return;
-    }
-    let mut evictable: Vec<(Instant, PrKey)> = cache
+    let mut unmonitored: Vec<(Instant, PrKey)> = cache
         .iter()
         .filter(|(key, _)| !monitored.contains(*key))
         .map(|(key, slot)| {
@@ -728,10 +740,21 @@ fn prune_pr_cache(cache: &PrCache, monitored: &HashSet<PrKey>) {
             )
         })
         .collect();
-    evictable.sort();
-    for (_, key) in evictable.into_iter().take(excess) {
+    let excess = unmonitored.len().saturating_sub(PR_CACHE_MAX_ENTRIES);
+    if excess == 0 {
+        return;
+    }
+    unmonitored.sort();
+    for (_, key) in unmonitored.into_iter().take(excess) {
         cache.remove(&key);
     }
+}
+
+/// The sweep's retention pass: [`retain_pr_cache`] against the active
+/// monitors, so the entries of monitors cancelled or completed since the
+/// last write stop being exempt.
+fn prune_pr_cache(cache: &PrCache, monitored: &HashSet<PrKey>) {
+    retain_pr_cache(&mut cache.lock().unwrap(), monitored, Instant::now());
 }
 
 #[cfg(test)]
@@ -756,6 +779,10 @@ fn pr_cache_len(cache: &PrCache) -> usize {
         .filter(|slot| slot.entry.is_some())
         .count()
 }
+
+/// The "no active monitor" set for cache-level tests of [`read_pr_via`].
+#[cfg(test)]
+static NONE: std::sync::LazyLock<HashSet<PrKey>> = std::sync::LazyLock::new(HashSet::new);
 
 /// Fetch the current state of one PR in full: the PR record plus the shared
 /// snapshot — the merge-requirements checklist (which already degrades
@@ -784,7 +811,17 @@ async fn fetch_pr_full(
     if let Some(observation) = observe_pr(sc, repo_ref, number).await? {
         return shared_snapshot_from_observation(sc, repo_ref, number, observation).await;
     }
-    let (pr, read) = pr_ops::fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
+    // The load-bearing read: a PR the forge does not know is reported by
+    // number and repo (the message `ws.pr.snapshot` documents), the rest
+    // maps as every other forge error.
+    let pr = sc.get_pr(repo_ref, number).await.map_err(|e| match e {
+        intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
+            "PR #{number} not found in {}/{}",
+            repo_ref.owner, repo_ref.name
+        )),
+        other => pr_ops::map_sc_err(other),
+    })?;
+    let read = pr_ops::merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
     finish_shared_snapshot(sc, repo_ref, number, pr, read).await
 }
 
@@ -834,6 +871,7 @@ async fn shared_snapshot_from_observation(
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
+        merge_queue_reported: read.merge_queue_reported,
     };
     Ok((observation.pr, snapshot))
 }
@@ -843,8 +881,9 @@ async fn shared_snapshot_from_observation(
 /// resolved by the caller (the sweep resolves it once per tick).
 ///
 /// `Serve`: a cached entry confirmed within `max_age` is returned with no
-/// forge call; otherwise the PR is fetched fully ([`fetch_pr_full`])
-/// and stored, bumping the slot's generation ([`store_on_demand`]).
+/// forge call ([`cached_pr_within`]); otherwise the PR is fetched fully
+/// ([`fetch_pr_full`]) and stored, bumping the slot's generation
+/// ([`store_on_demand`]).
 ///
 /// `Poll`: the PR record is always read (it is the change detector — the
 /// folded observation where the host has one, else `get_pr`), but the
@@ -856,32 +895,42 @@ async fn shared_snapshot_from_observation(
 /// unless an on-demand read stored a newer one meanwhile (see
 /// [`PrCacheSlot`]); a failed one leaves it untouched (the next poll
 /// decides again from a fresh read).
+///
+/// `monitored` — the PRs under an active monitor — feeds the retention pass
+/// every store runs ([`retain_pr_cache`]).
 pub(crate) async fn read_pr_via(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
     cache: &PrCache,
     policy: PrReadPolicy,
+    monitored: &HashSet<PrKey>,
 ) -> Result<PrCacheEntry> {
     let key = pr_key_for(repo_ref, number.cast_signed());
     let max_age = match policy {
-        PrReadPolicy::Poll => return poll_pr(sc, repo_ref, number, cache, key).await,
+        PrReadPolicy::Poll => return poll_pr(sc, repo_ref, number, cache, key, monitored).await,
         PrReadPolicy::Serve { max_age } => max_age,
     };
-    let now = Instant::now();
-    let hit = cache
-        .lock()
-        .unwrap()
-        .get(&key)
-        .and_then(|slot| slot.entry.as_ref())
-        .filter(|entry| now.saturating_duration_since(entry.refreshed_at) < max_age)
-        .cloned();
-    if let Some(entry) = hit {
+    if let Some(entry) = cached_pr_within(cache, &key, max_age) {
         tracing::trace!(pr_number = number, "pr cache: serving the cached read");
         return Ok(entry);
     }
     let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
-    Ok(store_on_demand(cache, key, pr, snapshot))
+    Ok(store_on_demand(cache, key, pr, snapshot, monitored))
+}
+
+/// The cached entry for `key` when a forge read confirmed it current less
+/// than `max_age` ago — what [`PrReadPolicy::Serve`] returns without a
+/// forge call; `None` when the entry is absent or older.
+fn cached_pr_within(cache: &PrCache, key: &PrKey, max_age: Duration) -> Option<PrCacheEntry> {
+    let now = Instant::now();
+    cache
+        .lock()
+        .unwrap()
+        .get(key)
+        .and_then(|slot| slot.entry.as_ref())
+        .filter(|entry| now.saturating_duration_since(entry.refreshed_at) < max_age)
+        .cloned()
 }
 
 /// [`read_pr_via`] under [`PrReadPolicy::Poll`].
@@ -891,6 +940,7 @@ async fn poll_pr(
     number: u64,
     cache: &PrCache,
     key: PrKey,
+    monitored: &HashSet<PrKey>,
 ) -> Result<PrCacheEntry> {
     let generation = cache
         .lock()
@@ -943,6 +993,7 @@ async fn poll_pr(
             "pr monitor: on-demand read superseded this sweep read; not caching it"
         );
     }
+    retain_pr_cache(&mut cache, monitored, now);
     Ok(entry)
 }
 
@@ -989,6 +1040,7 @@ async fn finish_shared_snapshot(
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
+        merge_queue_reported: read.merge_queue_reported,
     };
     Ok((pr, snapshot))
 }
@@ -1533,8 +1585,68 @@ impl Services {
         number: u64,
         policy: PrReadPolicy,
     ) -> Result<PrCacheEntry> {
+        // A `Serve` hit costs neither a forge call nor a store read.
+        if let PrReadPolicy::Serve { max_age } = policy {
+            let key = pr_key_for(repo_ref, number.cast_signed());
+            if let Some(entry) = cached_pr_within(&self.pr_cache, &key, max_age) {
+                tracing::trace!(pr_number = number, "pr cache: serving the cached read");
+                return Ok(entry);
+            }
+        }
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        read_pr_via(sc.as_ref(), repo_ref, number, &self.pr_cache, policy).await
+        let monitored = self.monitored_pr_keys().await;
+        read_pr_via(
+            sc.as_ref(),
+            repo_ref,
+            number,
+            &self.pr_cache,
+            policy,
+            &monitored,
+        )
+        .await
+    }
+
+    /// [`Self::read_pr`] under the on-demand readers' policy — `Serve` at
+    /// `prCache.maxAgeSeconds` ([`Self::pr_cache_max_age`]) — also reporting
+    /// whether the read went to the forge: `false` when the cached entry was
+    /// served, so a caller with a side effect keyed on a real fetch
+    /// (`github.pulls.get`'s fold) skips it on a hit. Best effort on that
+    /// flag: a concurrent reader storing the PR between the hit check and
+    /// the fetch makes the fetch a hit reported as a fetch, costing at most
+    /// one redundant fold of a fresh record.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_pr`].
+    pub(crate) async fn serve_pr(
+        &self,
+        repo_ref: &RepoRef,
+        number: u64,
+    ) -> Result<(PrCacheEntry, bool)> {
+        let max_age = self.pr_cache_max_age();
+        let key = pr_key_for(repo_ref, number.cast_signed());
+        if let Some(entry) = cached_pr_within(&self.pr_cache, &key, max_age) {
+            tracing::trace!(pr_number = number, "pr cache: serving the cached read");
+            return Ok((entry, false));
+        }
+        let entry = self
+            .read_pr(repo_ref, number, PrReadPolicy::Serve { max_age })
+            .await?;
+        Ok((entry, true))
+    }
+
+    /// The PRs under an active monitor, for the cache's retention pass
+    /// ([`retain_pr_cache`]). A store failure yields the empty set — the
+    /// write then only bounds the cache harder, and the next sweep (which
+    /// loads the same rows) re-exempts the monitored entries.
+    async fn monitored_pr_keys(&self) -> HashSet<PrKey> {
+        match self.store.load_active_pr_monitors().await {
+            Ok(monitors) => monitors.iter().map(pr_key).collect(),
+            Err(e) => {
+                tracing::debug!(error = %e, "pr cache: could not load active monitors");
+                HashSet::new()
+            }
+        }
     }
 
     /// How old a cached PR read may be and still be served to an on-demand
@@ -2529,6 +2641,7 @@ impl Services {
         }
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = monitor.repo();
+        let monitored = self.monitored_pr_keys().await;
         // A full fetch, stored for the sweep and the on-demand readers.
         let shared = match read_pr_via(
             sc.as_ref(),
@@ -2536,6 +2649,7 @@ impl Services {
             monitor.pr_number.cast_unsigned(),
             &self.pr_cache,
             PrReadPolicy::REFRESH,
+            &monitored,
         )
         .await
         {
@@ -2680,10 +2794,8 @@ impl Services {
                 return;
             }
         };
-        prune_pr_cache(
-            &self.pr_cache,
-            &monitors.iter().map(pr_key).collect::<HashSet<_>>(),
-        );
+        let monitored: HashSet<PrKey> = monitors.iter().map(pr_key).collect();
+        prune_pr_cache(&self.pr_cache, &monitored);
         if monitors.is_empty() {
             return;
         }
@@ -2735,6 +2847,7 @@ impl Services {
                             monitor.pr_number.cast_unsigned(),
                             &self.pr_cache,
                             PrReadPolicy::Poll,
+                            &monitored,
                         ),
                     )
                     .await
@@ -3821,6 +3934,9 @@ mod tests {
         /// without a folded read, so every existing test keeps exercising
         /// the per-signal reads.
         folded: Option<FoldedRead>,
+        /// The host's merge-queue report on the probe signals (`None` is
+        /// a host not reporting it).
+        in_merge_queue: Option<bool>,
         /// Stands in for the forge's `updatedAt`: bumped by every
         /// [`StubForge::edit`] (as GitHub bumps it on reviews, comments,
         /// threads and pushes), left alone by [`StubForge::edit_quiet`] (as
@@ -3898,6 +4014,7 @@ mod tests {
                 fail_rate_limit_status: false,
                 updated_at: None,
                 folded: None,
+                in_merge_queue: None,
             }
         }
     }
@@ -3949,7 +4066,7 @@ mod tests {
                 checks: self.checks.clone(),
                 checks_known: true,
                 branch_rules: None,
-                is_in_merge_queue: None,
+                is_in_merge_queue: self.in_merge_queue,
                 merge_queue_removal: self.merge_queue_removal.clone(),
             }
         }
@@ -5082,6 +5199,7 @@ mod tests {
             requirements: s.requirements.clone(),
             ejection_known,
             requirements_complete: ejection_known,
+            merge_queue_reported: s.requirements.is_in_merge_queue,
         }
     }
 
@@ -7647,9 +7765,10 @@ mod tests {
                 key_for_hook.clone(),
                 pr.clone(),
                 snapshot.clone(),
+                &HashSet::new(),
             );
         })));
-        let polled = read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll)
+        let polled = read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)
             .await
             .expect("poll");
         assert_ne!(polled.snapshot.conversation_count, Some(99));
@@ -7844,13 +7963,13 @@ mod tests {
             vec![("pr_observation", 2), ("branch_rules", 1)],
             vec![("pr_observation", 3), ("branch_rules", 1)],
         ] {
-            read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll)
+            read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)
                 .await
                 .expect("fetch");
             assert_eq!(forge_reads(&forge), expected);
         }
         forge.edit(|s| s.conversation_comments += 1);
-        let entry = read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll)
+        let entry = read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)
             .await
             .expect("fetch");
         assert_eq!(
@@ -7878,7 +7997,7 @@ mod tests {
             max_age: Duration::from_secs(60),
         };
 
-        let first = read_pr_via(&forge, &repo, 42, &cache, serve)
+        let first = read_pr_via(&forge, &repo, 42, &cache, serve, &NONE)
             .await
             .expect("cold read");
         assert_eq!(
@@ -7890,7 +8009,7 @@ mod tests {
         assert_eq!(first.pr.number, 42);
 
         forge.edit(|s| s.conversation_comments += 1);
-        let second = read_pr_via(&forge, &repo, 42, &cache, serve)
+        let second = read_pr_via(&forge, &repo, 42, &cache, serve, &NONE)
             .await
             .expect("warm read");
         assert_eq!(
@@ -7904,7 +8023,7 @@ mod tests {
         );
 
         backdate_pr_cache(&cache, Duration::from_secs(61));
-        let third = read_pr_via(&forge, &repo, 42, &cache, serve)
+        let third = read_pr_via(&forge, &repo, 42, &cache, serve, &NONE)
             .await
             .expect("expired read");
         assert_eq!(
@@ -7925,14 +8044,14 @@ mod tests {
         forge.edit(busy_pr);
         forge.edit(|s| s.folded = Some(FoldedRead::default()));
         let cache: PrCache = Arc::default();
-        read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::REFRESH)
+        read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::REFRESH, &NONE)
             .await
             .expect("on-demand read");
         assert_eq!(
             forge_reads(&forge),
             vec![("pr_observation", 1), ("branch_rules", 1)]
         );
-        read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll)
+        read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)
             .await
             .expect("poll");
         assert_eq!(
@@ -8052,52 +8171,90 @@ mod tests {
             .contains_key(&pr_key_for(&repo, 42)));
     }
 
-    /// Retention: past [`PR_CACHE_MAX_ENTRIES`] the sweep evicts the
-    /// unmonitored entries with the oldest full fetch first, down to the
-    /// cap — with no active monitor at all as well as with one.
+    /// Retention: [`PR_CACHE_MAX_ENTRIES`] is a hard bound on the
+    /// UNMONITORED entries, enforced by the write itself with no sweep in
+    /// between — including while the forge rate-limit pause skips the
+    /// sweep entirely — evicting the oldest full fetch first. Monitored
+    /// entries neither count against the cap nor expire: one older than
+    /// [`PR_CACHE_MAX_IDLE`] survives both rules while every unmonitored
+    /// entry of that age is dropped by the next write.
     #[tokio::test]
-    async fn the_cap_evicts_the_oldest_unmonitored_entries() {
-        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    async fn the_cap_bounds_unmonitored_entries_on_every_write() {
+        fn unmonitored_len(svc: &Services, monitored: &PrKey) -> usize {
+            svc.pr_cache
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, slot)| *key != monitored && slot.entry.is_some())
+                .count()
+        }
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
         let repo = RepoRef::new("o", "r");
+        let monitored = 5_000_u64;
+        let monitored_key = pr_key_for(&repo, monitored.cast_signed());
+        svc.pr_monitor_register(&ws, &owner, "o", "r", monitored)
+            .await
+            .expect("register");
+        // No sweep runs from here on: the pause gate is closed by a
+        // rate-limited sweep, and the on-demand reads below do not consult it.
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        svc.poll_pr_monitors().await;
+        assert!(
+            svc.sweep_rate_limit.paused_remaining().is_some(),
+            "the sweep is paused"
+        );
+        forge.edit(|s| s.rate_limit_get_pr = false);
+        forge.take_fetched_numbers();
+
         let oldest = 1_000_u64;
         svc.read_pr(&repo, oldest, PrReadPolicy::REFRESH)
             .await
             .expect("oldest read");
         svc.backdate_pr_cache(Duration::from_secs(30));
-        for number in 1..=PR_CACHE_MAX_ENTRIES as u64 {
+        let overflow = 8;
+        for written in 1..=PR_CACHE_MAX_ENTRIES + overflow {
+            let number = written as u64;
             svc.read_pr(&repo, number, PrReadPolicy::REFRESH)
                 .await
                 .expect("read");
+            assert_eq!(
+                unmonitored_len(&svc, &monitored_key),
+                (written + 1).min(PR_CACHE_MAX_ENTRIES),
+                "bounded after write #{number}"
+            );
         }
-        assert_eq!(svc.pr_cache_len(), PR_CACHE_MAX_ENTRIES + 1);
-
-        svc.poll_pr_monitors().await;
-        assert_eq!(svc.pr_cache_len(), PR_CACHE_MAX_ENTRIES, "capped");
+        {
+            let cache = svc.pr_cache.lock().unwrap();
+            assert_eq!(cache.len(), PR_CACHE_MAX_ENTRIES + 1, "cap + monitored");
+            assert!(
+                !cache.contains_key(&pr_key_for(&repo, oldest.cast_signed())),
+                "the oldest full fetch went first"
+            );
+            for number in 1..=overflow as u64 {
+                assert!(
+                    !cache.contains_key(&pr_key_for(&repo, number.cast_signed())),
+                    "#{number} was evicted in fetch order"
+                );
+            }
+            assert!(cache.contains_key(&monitored_key), "monitored kept");
+        }
         assert!(
-            !svc.pr_cache
-                .lock()
-                .unwrap()
-                .contains_key(&pr_key_for(&repo, oldest.cast_signed())),
-            "the oldest full fetch went first"
+            svc.sweep_rate_limit.paused_remaining().is_some(),
+            "no sweep ran meanwhile"
         );
 
-        // A monitored entry is never evicted for the cap: register on a
-        // PR outside the filled range and age everything else past it.
-        let monitored = 5_000_u64;
-        svc.backdate_pr_cache(Duration::from_secs(30));
-        svc.pr_monitor_register(&ws, &owner, "o", "r", monitored)
-            .await
-            .expect("register");
+        // Idle expiry on the write path: age everything past the idle
+        // window; the next write drops every unmonitored entry but its own
+        // and keeps the monitored one, which is just as old.
+        svc.backdate_pr_cache(PR_CACHE_MAX_IDLE + Duration::from_secs(1));
         svc.read_pr(&repo, oldest, PrReadPolicy::REFRESH)
             .await
             .expect("another read");
-        assert_eq!(svc.pr_cache_len(), PR_CACHE_MAX_ENTRIES + 2);
-        svc.poll_pr_monitors().await;
         let cache = svc.pr_cache.lock().unwrap();
-        assert_eq!(cache.len(), PR_CACHE_MAX_ENTRIES, "capped again");
+        assert_eq!(cache.len(), 2, "the fresh write and the monitored entry");
         assert!(
-            cache.contains_key(&pr_key_for(&repo, monitored.cast_signed())),
-            "monitored kept"
+            cache.contains_key(&monitored_key),
+            "monitored survives expiry"
         );
         assert!(cache.contains_key(&pr_key_for(&repo, oldest.cast_signed())));
     }
@@ -11894,6 +12051,9 @@ mod tests {
         );
 
         forge.edit(|s| s.pr_state = PrState::Merged);
+        // The hover must MISS the cache (registration seeded it) to reach
+        // the forge and fold: age the entry past `prCache.maxAgeSeconds`.
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + Duration::from_secs(1));
         svc.github_pulls_get("o".into(), "r".into(), 42)
             .await
             .expect("pulls.get");
@@ -11974,8 +12134,10 @@ mod tests {
             "the failed attempt is later than the close"
         );
 
-        // T4: the passive fold reads the closed PR straight from the forge.
+        // T4: the passive fold reads the closed PR straight from the forge
+        // — the cached registration read must have aged out first.
         forge.edit(|s| s.fail_get_pr = false);
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + Duration::from_secs(1));
         svc.github_pulls_get("o".into(), "r".into(), 42)
             .await
             .expect("pulls.get");
@@ -11994,6 +12156,170 @@ mod tests {
             "the closed fold outranks the stale open snapshot despite the failed poll: {:?}",
             after.display_status
         );
+    }
+
+    /// `github.pulls.get` is served from the shared PR cache: the first
+    /// hover MISSES (one full read, `isInMergeQueue` carried from the
+    /// monitor's own checklist), a second hover within `prCache.maxAgeSeconds`
+    /// costs no forge call and answers the same object, and once the entry
+    /// ages out the hover re-reads and reflects the forge's merge-queue
+    /// movement.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_serves_the_shared_cache_with_is_in_merge_queue() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        forge.edit_quiet(|s| s.in_merge_queue = Some(true));
+
+        let first = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(first["pull"]["number"], 42);
+        assert_eq!(
+            first["pull"]["isInMergeQueue"],
+            serde_json::json!(true),
+            "the hover carries the checklist's merge-queue report: {first}"
+        );
+        let reads = forge_reads(&forge);
+        assert_eq!(forge.fetches(), 1, "a miss is one PR read: {reads:?}");
+        assert_eq!(svc.pr_cache_len(), 1, "the miss seeded the cache");
+
+        // A hover within the cache window reads nothing from the forge, even
+        // though the forge has since moved (the entry is what it answers).
+        forge.edit_quiet(|s| s.in_merge_queue = Some(false));
+        let second = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get again");
+        assert_eq!(second, first, "a hit answers the cached object");
+        assert_eq!(
+            forge_reads(&forge),
+            reads,
+            "a hit within prCache.maxAgeSeconds costs no forge call"
+        );
+
+        // Aged out: the hover re-reads and carries the movement.
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + Duration::from_secs(1));
+        let third = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get after expiry");
+        assert_eq!(third["pull"]["isInMergeQueue"], serde_json::json!(false));
+        assert_eq!(forge.fetches(), 2, "the expired entry cost one more read");
+    }
+
+    /// Presence detection survives the cache: a host that does not report
+    /// the merge-queue flag on its probe signals (REST-only) yields a hover
+    /// card WITHOUT `isInMergeQueue`, hit or miss — never a fabricated
+    /// `false`.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_omits_is_in_merge_queue_when_the_host_does_not_report_it() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        assert_eq!(forge.state.lock().unwrap().in_merge_queue, None);
+        for pass in ["miss", "hit"] {
+            let v = svc
+                .github_pulls_get("o".into(), "r".into(), 42)
+                .await
+                .expect("pulls.get");
+            assert_eq!(v["pull"]["number"], 42);
+            assert!(
+                v["pull"].get("isInMergeQueue").is_none(),
+                "{pass}: an unreported flag stays absent: {v}"
+            );
+        }
+        assert_eq!(forge.fetches(), 1);
+    }
+
+    /// The cache is one object shared by every reader: a hover, a
+    /// `ws.pr.snapshot`, a registration and a poll all serve and refresh the
+    /// same entry, so a snapshot right after a hover costs no forge call and
+    /// carries the hover's `isInMergeQueue`, a hover right after a poll
+    /// carries the poll's, and the two RPCs describe the same PR object
+    /// (each in its own projection of the merge-queue flag).
+    #[intent_test_macros::daemon_test]
+    async fn snapshot_and_pulls_get_share_one_cache_entry() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit_quiet(|s| s.in_merge_queue = Some(true));
+
+        // Hover seeds; the snapshot is served from the hover's entry.
+        let hover = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(forge.fetches(), 1);
+        let snap = svc
+            .pr_state(ws.clone(), 42, Some("o/r".into()))
+            .await
+            .expect("snapshot");
+        assert_eq!(forge.fetches(), 1, "the snapshot reused the hover's read");
+        assert_eq!(snap["repo"], "o/r");
+        assert_eq!(snap["prNumber"], 42);
+        assert_eq!(
+            snap["requirements"]["isInMergeQueue"],
+            serde_json::json!(true)
+        );
+        assert_eq!(snap["state"], "open");
+        assert_eq!(snap["headSha"], hover["pull"]["headSha"]);
+        assert_eq!(snap["updatedAt"], hover["pull"]["updatedAt"]);
+        assert_eq!(snap["title"], hover["pull"]["title"]);
+
+        // Registration always takes a fresh baseline read (REFRESH) and
+        // writes the same entry: the monitor's stored checklist is the
+        // object the two RPCs answer from now on.
+        let monitor = register(&svc, &ws, &owner).await;
+        assert_eq!(forge.fetches(), 2, "registration re-read the PR");
+        let stored: PrMonitorSnapshot =
+            serde_json::from_str(monitor.last_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(stored.requirements.is_in_merge_queue, Some(true));
+        assert_eq!(
+            serde_json::to_value(&stored.requirements).unwrap(),
+            snap["requirements"],
+            "the snapshot's checklist IS the monitor's"
+        );
+        let snap = svc
+            .pr_state(ws.clone(), 42, Some("o/r".into()))
+            .await
+            .expect("snapshot after registration");
+        assert_eq!(
+            forge.fetches(),
+            2,
+            "the snapshot reused the registration's read"
+        );
+        assert_eq!(
+            snap["requirements"],
+            serde_json::to_value(&stored.requirements).unwrap()
+        );
+
+        // The queue ejects the PR (no `updatedAt` bump); a FULL poll — past
+        // the cheap-poll age bound, so the sub-reads are re-issued —
+        // observes it and rewrites the shared entry, so the next hover and
+        // snapshot carry the ejection without a forge call of their own.
+        forge.edit_quiet(|s| s.in_merge_queue = Some(false));
+        svc.backdate_pr_cache(
+            PR_MONITOR_MAX_CHEAP_AGE.max(svc.pr_cache_max_age()) + Duration::from_secs(1),
+        );
+        svc.poll_pr_monitors().await;
+        let polled = forge.fetches();
+        assert_eq!(polled, 3, "the poll re-read the aged entry");
+        let hover = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get after poll");
+        let snap = svc
+            .pr_state(ws, 42, Some("o/r".into()))
+            .await
+            .expect("snapshot after poll");
+        assert_eq!(forge.fetches(), polled, "both served from the poll's write");
+        // Same entry, two projections: the hover card keeps the reported
+        // `false`; the checklist is presence-only and drops the key.
+        assert_eq!(hover["pull"]["isInMergeQueue"], serde_json::json!(false));
+        assert!(
+            snap["requirements"].get("isInMergeQueue").is_none(),
+            "an ejected PR is no longer queued on the checklist: {snap}"
+        );
+        assert_eq!(snap["headSha"], hover["pull"]["headSha"]);
     }
 
     /// Orthogonality with the PR stages: a workspace whose linked PR reads

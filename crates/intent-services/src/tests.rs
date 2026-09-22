@@ -18027,11 +18027,14 @@ pub(crate) mod pr {
             "pausedUntil is RFC 3339: {until}"
         );
 
-        // Gate paused at the start, lifted by the last forge read.
+        // Gate paused at the start, lifted by the last forge read — which
+        // only runs if the second snapshot MISSES the shared PR cache the
+        // first one seeded.
         let gate = svc.sweep_rate_limit.clone();
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
             assert!(gate.lift());
         }));
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + std::time::Duration::from_secs(1));
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert!(
             svc.sweep_rate_limit_paused_until().is_none(),
