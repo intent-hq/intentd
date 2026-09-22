@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.93] - 2026-09-21
+
+### 🚀 Features
+
+- *(acp)* Spawn agent children at reduced scheduling priority ([#2049](https://github.com/intent-hq/intentd/pull/2049))
+
+
 ## [0.9.92] - 2026-09-21
 
 ### 🚀 Features
