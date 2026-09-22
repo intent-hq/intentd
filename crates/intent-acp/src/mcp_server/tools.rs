@@ -2673,6 +2673,80 @@ mod tests {
         }
     }
 
+    // Regression (intent-hq/intentd#2054 review): the recipe's hook body is a
+    // JavaScript string nested inside the documented `ws.hook.schedule` call,
+    // so its message newline must survive BOTH parsing layers. Evaluate the
+    // outer call exactly as an agent would paste it, then compile and run the
+    // captured `code` against every documented terminal / live status.
+    // Self-skips when `node` is not on PATH (same convention as the intentd
+    // e2e suites).
+    #[test]
+    fn script_completion_recipe_compiles_and_settles_under_node() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let start = SCRIPT_COMPLETION_HOOK_LINE
+            .find("`ws.hook.schedule(")
+            .expect("recipe opens with a ws.hook.schedule call");
+        let rest = &SCRIPT_COMPLETION_HOOK_LINE[start + "`ws.hook.schedule(".len()..];
+        let end = rest
+            .find(")`")
+            .expect("recipe call closes before the backtick");
+        let opts = rest[..end]
+            .replace("<expected runtime + margin>", "60000")
+            .replace("<id>", "abc");
+
+        let script = format!(
+            r#"
+const opts = ({opts});
+if (typeof opts.code !== "string") throw new Error("code is not a string");
+const run = async (s, out) => {{
+  const ws = {{ script: {{ status: async () => s, output: async () => out }} }};
+  return await new Function("ws", "hookState", "return (async () => {{" + opts.code + "}})()")(ws, null);
+}};
+const expect = (cond, msg) => {{ if (!cond) throw new Error(msg); }};
+(async () => {{
+  for (const status of ["starting", "running", "restarting"]) {{
+    const r = await run({{ status }}, "");
+    expect(r.dispatch === false, "live status " + status + " must not dispatch");
+  }}
+  let r = await run({{ status: "exited", exitCode: 0 }}, "l1\nl2");
+  expect(r.dispatch === true && r.message === "script abc succeeded\nl1\nl2", "success: " + JSON.stringify(r));
+  r = await run({{ status: "exited", exitCode: 7 }}, "boom");
+  expect(r.message === "script abc exited with code 7\nboom", "non-zero: " + JSON.stringify(r));
+  r = await run({{ status: "exited", exitCode: -1, error: "spawn failed" }}, "");
+  expect(r.message === "script abc failed: spawn failed\n", "startup failure: " + JSON.stringify(r));
+}})().then(() => process.stdout.write("ok"), (e) => {{ process.stderr.write(String(e && e.stack || e)); process.exit(1); }});
+"#
+        );
+
+        let Ok(mut child) = Command::new("node")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!(
+                "skipping script_completion_recipe_compiles_and_settles_under_node: node not on PATH"
+            );
+            return;
+        };
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(script.as_bytes())
+            .expect("write recipe harness to node");
+        let output = child.wait_with_output().expect("node exits");
+        assert!(
+            output.status.success(),
+            "recipe harness failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+    }
+
     // Guard: every `prMonitor` cross-reference the scrub rewrites still
     // matches both description variants verbatim, so a doc edit cannot
     // silently turn a `replacen` into a no-op.
