@@ -1175,6 +1175,7 @@ async fn list(
                 ws.clone(),
                 intent_core::AgentListRowScope::Delegated {
                     parent_agent_id: filter.parent_agent_id.as_deref().map(AgentId::from),
+                    orphaned_only: false,
                 },
             )
             .await

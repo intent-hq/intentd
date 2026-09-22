@@ -117,14 +117,18 @@ pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
 }
 
 /// SQL predicate fragment (leading ` AND`, unqualified column names so it
-/// applies to both the summary read and the `agent_session s` projection
-/// read) selecting one `agent.list { scope }` bin (§5.5), plus the extra
-/// bind it needs (`parent_agent_id = ?` for a parent-narrowed `delegated`
-/// read). The three bins partition the non-retired rows:
+/// applies to both the summary read and the projection read — both select
+/// `FROM agent_session s`, the alias the orphan fragment's correlated
+/// subquery names) selecting one `agent.list { scope }` bin (§5.5), plus
+/// the extra bind it needs (`parent_agent_id = ?` for a parent-narrowed
+/// `delegated` read). The three bins partition the non-retired rows:
 /// `parent_agent_id IS NULL` splits on `is_background` (`= 0` / `<> 0`,
 /// always written as 0/1), `parent_agent_id IS NOT NULL` is `delegated`.
-/// Every fragment carries `retired_at IS NULL` — retired sessions are their
-/// own bin. Compile-time fragments only, never caller input.
+/// The `orphanedOnly` sub-filter is [`ORPHANED_DELEGATED_PREDICATE`] — the
+/// same parent-liveness rule [`delegated_counts_sql`] joins on, on top of
+/// the delegated predicate. Every fragment carries `retired_at IS NULL` —
+/// retired sessions are their own bin. Compile-time fragments only, never
+/// caller input.
 pub(crate) fn scope_predicate(scope: &AgentListRowScope) -> (&'static str, Option<&str>) {
     match scope {
         AgentListRowScope::TopLevel => (
@@ -133,12 +137,18 @@ pub(crate) fn scope_predicate(scope: &AgentListRowScope) -> (&'static str, Optio
         ),
         AgentListRowScope::Delegated {
             parent_agent_id: None,
+            orphaned_only: false,
         } => (
             " AND parent_agent_id IS NOT NULL AND retired_at IS NULL",
             None,
         ),
         AgentListRowScope::Delegated {
+            parent_agent_id: None,
+            orphaned_only: true,
+        } => (ORPHANED_DELEGATED_PREDICATE, None),
+        AgentListRowScope::Delegated {
             parent_agent_id: Some(parent),
+            ..
         } => (
             " AND parent_agent_id = ? AND retired_at IS NULL",
             Some(parent.as_str()),
@@ -150,12 +160,31 @@ pub(crate) fn scope_predicate(scope: &AgentListRowScope) -> (&'static str, Optio
     }
 }
 
+/// The `orphanedOnly` variant of the `delegated` scope fragment (§5.5,
+/// within 10.6): the delegated predicate plus the orphan rule as a
+/// correlated predicate over the outer `agent_session s` row — no
+/// non-retired `agent_session` row of the SAME workspace has the child's
+/// `parent_agent_id` as its id (the parent was deleted, soft-retired, or
+/// never was a session of this workspace). Decided by the DIRECT parent's
+/// liveness only — a child of a live background parent or of an orphan is
+/// not an orphan. The subquery is a primary-key probe on `p.id`, so it adds
+/// one index lookup per candidate row (plan-shape test below). The same
+/// rule, spelled as a LEFT JOIN, is what [`delegated_counts_sql`]
+/// aggregates into `delegatedCounts.orphaned`.
+pub(crate) const ORPHANED_DELEGATED_PREDICATE: &str =
+    " AND parent_agent_id IS NOT NULL AND retired_at IS NULL \
+    AND NOT EXISTS (\
+    SELECT 1 FROM agent_session p \
+    WHERE p.id = s.parent_agent_id AND p.workspace_id = s.workspace_id \
+    AND p.retired_at IS NULL)";
+
 /// SQL behind [`Store::list_scoped_agent_session_summaries`], extracted so
 /// the plan-shape test runs `EXPLAIN` on the exact production statement.
+/// The `s` alias is what the orphan fragment's correlated subquery names.
 pub(crate) fn scoped_session_summaries_sql(scope: &AgentListRowScope) -> String {
     let (predicate, _) = scope_predicate(scope);
     format!(
-        "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+        "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session s \
          WHERE workspace_id = ?{predicate} ORDER BY created_at"
     )
 }
@@ -176,13 +205,19 @@ pub(crate) fn scope_counts_sql() -> &'static str {
 /// SQL behind [`Store::count_delegated_agent_sessions_by_parent`] — ONE
 /// grouped statement over the workspace's non-retired delegated rows (the
 /// `delegated` predicate of [`scope_predicate`]) yielding `delegatedCounts`
-/// (§5.5): one row per direct parent with the child count and the subset
-/// whose persisted status is running. The running set is derived from
-/// [`AgentStatus::is_running_turn`] over [`AgentStatus::ALL`] (the serde
-/// names, which is how the column is written), so the aggregate cannot
-/// drift from the daemon's rule. Same `idx_agent_workspace` search as
-/// [`scope_counts_sql`], so `SUM(total)` over the result always equals
-/// `scopeCounts.delegated`.
+/// (§5.5): one row per direct parent with the child count, the subset
+/// whose persisted status is running, and whether that parent is NOT a
+/// non-retired session of the same workspace (`orphaned`, the rule
+/// [`ORPHANED_DELEGATED_PREDICATE`] spells for the rows read — here a LEFT JOIN
+/// on the parent row keeping `p.id IS NULL`; every child of one parent
+/// shares its liveness, so the flag is constant per group and the caller
+/// sums the flagged groups into `delegatedCounts.orphaned`). The running
+/// set is derived from [`AgentStatus::is_running_turn`] over
+/// [`AgentStatus::ALL`] (the serde names, which is how the column is
+/// written), so the aggregate cannot drift from the daemon's rule. Same
+/// `idx_agent_workspace` search as [`scope_counts_sql`] (the join is a
+/// primary-key probe per group), so `SUM(total)` over the result always
+/// equals `scopeCounts.delegated`.
 pub(crate) fn delegated_counts_sql() -> String {
     let running = AgentStatus::ALL
         .iter()
@@ -197,12 +232,16 @@ pub(crate) fn delegated_counts_sql() -> String {
         .join(", ");
     format!(
         "SELECT \
-            parent_agent_id, \
+            c.parent_agent_id, \
             COUNT(*) AS total, \
-            COALESCE(SUM(status IN ({running})), 0) AS running \
-         FROM agent_session \
-         WHERE workspace_id = ? AND retired_at IS NULL AND parent_agent_id IS NOT NULL \
-         GROUP BY parent_agent_id"
+            COALESCE(SUM(c.status IN ({running})), 0) AS running, \
+            MAX(p.id IS NULL) AS orphaned \
+         FROM agent_session c \
+         LEFT JOIN agent_session p \
+            ON p.id = c.parent_agent_id AND p.workspace_id = c.workspace_id \
+            AND p.retired_at IS NULL \
+         WHERE c.workspace_id = ? AND c.retired_at IS NULL AND c.parent_agent_id IS NOT NULL \
+         GROUP BY c.parent_agent_id"
     )
 }
 
@@ -1319,12 +1358,14 @@ impl Store {
 
     /// Per-parent counts of the workspace's non-retired delegated sessions —
     /// the `delegatedCounts` field served on every `agent.list` response
-    /// variant (§5.5). One grouped statement ([`delegated_counts_sql`]) over
-    /// the workspace's `idx_agent_workspace` entries — O(delegated rows), the
-    /// same order as the default rows read it accompanies. No rows are
-    /// hydrated. A parent with no non-retired children has no entry; keys
-    /// are the raw `parent_agent_id` values, so a cross-workspace parent
-    /// still appears.
+    /// variant (§5.5), including its `orphaned` sub-aggregate (the groups
+    /// whose parent is not a non-retired session of this workspace). One
+    /// grouped statement ([`delegated_counts_sql`]) over the workspace's
+    /// `idx_agent_workspace` entries — O(delegated rows), the same order as
+    /// the default rows read it accompanies. No rows are hydrated. A parent
+    /// with no non-retired children has no entry; keys are the raw
+    /// `parent_agent_id` values, so a cross-workspace parent still appears
+    /// (and its children count as orphaned).
     ///
     /// # Errors
     ///
@@ -1352,6 +1393,10 @@ impl Store {
                 running: count("running"),
             };
             counts.running += entry.running;
+            if row.get::<i64, _>("orphaned") != 0 {
+                counts.orphaned.total += entry.total;
+                counts.orphaned.running += entry.running;
+            }
             counts.by_parent.insert(parent, entry);
         }
         Ok(counts)
@@ -5484,6 +5529,7 @@ where
 mod tests {
     use super::*;
     use crate::Store;
+    use intent_core::AgentOrphanedDelegatedCounts;
 
     /// A unique temp DB path whose `.db`/`-wal`/`-shm` files are removed on
     /// drop, including on panic (mirrors `crate::tests::TempDb`, which is
@@ -5577,35 +5623,52 @@ mod tests {
     /// the default read visits, and a covering index over
     /// `(workspace_id, retired_at, parent_agent_id, is_background)` would
     /// only trade a row fetch per session for write amplification on every
-    /// session mutation.
+    /// session mutation. The `orphanedOnly` rows read and the
+    /// `delegatedCounts` parent join add a primary-key probe on the parent
+    /// row (`p`) — still a SEARCH, never a SCAN.
     #[tokio::test]
     async fn scoped_reads_use_an_index_search_not_a_scan() {
         let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let parent = AgentId::from("agent-00000000-0000-4000-8000-000000000001");
         let scopes = [
-            AgentListRowScope::TopLevel,
-            AgentListRowScope::Delegated {
-                parent_agent_id: None,
-            },
-            AgentListRowScope::Delegated {
-                parent_agent_id: Some(parent),
-            },
-            AgentListRowScope::Background,
+            (
+                "delegated",
+                AgentListRowScope::Delegated {
+                    parent_agent_id: None,
+                    orphaned_only: false,
+                },
+            ),
+            (
+                "delegated/parent",
+                AgentListRowScope::Delegated {
+                    parent_agent_id: Some(parent),
+                    orphaned_only: false,
+                },
+            ),
+            (
+                "delegated/orphanedOnly",
+                AgentListRowScope::Delegated {
+                    parent_agent_id: None,
+                    orphaned_only: true,
+                },
+            ),
+            ("topLevel", AgentListRowScope::TopLevel),
+            ("background", AgentListRowScope::Background),
         ];
         let mut statements: Vec<(String, String, Option<String>)> = vec![
             ("counts".to_string(), scope_counts_sql().to_string(), None),
             ("delegatedCounts".to_string(), delegated_counts_sql(), None),
         ];
-        for scope in &scopes {
+        for (label, scope) in &scopes {
             let (predicate, bind) = scope_predicate(scope);
             statements.push((
-                format!("rows/{}", scope.wire_name()),
+                format!("rows/{label}"),
                 scoped_session_summaries_sql(scope),
                 bind.map(str::to_string),
             ));
             statements.push((
-                format!("projections/{}", scope.wire_name()),
+                format!("projections/{label}"),
                 session_message_projections_sql(predicate),
                 bind.map(str::to_string),
             ));
@@ -5638,13 +5701,278 @@ mod tests {
 
     /// The `delegatedCounts.running` predicate is generated from
     /// `AgentStatus::is_running_turn`, so the emitted SQL carries exactly the
-    /// golden running set as persisted serde names.
+    /// golden running set as persisted serde names; the `orphaned` flag is
+    /// the parent-liveness LEFT JOIN keeping `p.id IS NULL` — the same rule
+    /// the `orphanedOnly` rows predicate spells as a correlated `NOT EXISTS`.
     #[test]
     fn delegated_counts_sql_running_set_matches_core_rule() {
+        let sql = delegated_counts_sql();
         assert!(
-            delegated_counts_sql().contains("status IN ('pending', 'active', 'Processing')"),
-            "sql: {}",
-            delegated_counts_sql()
+            sql.contains("c.status IN ('pending', 'active', 'Processing')"),
+            "sql: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "LEFT JOIN agent_session p ON p.id = c.parent_agent_id \
+                 AND p.workspace_id = c.workspace_id AND p.retired_at IS NULL"
+            ),
+            "sql: {sql}"
+        );
+        assert!(sql.contains("MAX(p.id IS NULL) AS orphaned"), "sql: {sql}");
+        assert!(
+            ORPHANED_DELEGATED_PREDICATE.contains(
+                "NOT EXISTS (SELECT 1 FROM agent_session p WHERE p.id = s.parent_agent_id \
+                 AND p.workspace_id = s.workspace_id AND p.retired_at IS NULL)"
+            ),
+            "predicate: {ORPHANED_DELEGATED_PREDICATE}"
+        );
+    }
+
+    /// `delegatedCounts.orphaned` and the `orphanedOnly` rows read (§5.5,
+    /// within 10.6) follow the DIRECT parent's liveness only: a child whose
+    /// parent row was deleted, is soft-retired, or belongs to another
+    /// workspace is an orphan; a child of a live standalone background parent
+    /// is not; a child of an orphan is not (its parent is live); retired
+    /// children are excluded; `running` is the `is_running_turn` subset of
+    /// the orphans; `orphaned.total ≤ scopeCounts.delegated`; and the
+    /// `orphanedOnly` rows are exactly the counted set, a subset of the
+    /// whole-bin `delegated` read. Retiring a live parent turns its children
+    /// into orphans on the next read; restoring it turns them back.
+    #[tokio::test]
+    async fn delegated_counts_orphaned_follow_direct_parent_liveness() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-orphaned".to_string());
+        let other_ws = WorkspaceId("ws-other".to_string());
+        for w in [&ws, &other_ws] {
+            insert_test_workspace(&store, w).await;
+        }
+        let ts = "2026-01-01T00:00:00Z";
+        let id = |n: u32| AgentId::from(format!("agent-00000000-0000-4000-8000-{n:012}"));
+        let seed = |agent: AgentId,
+                    ws: &WorkspaceId,
+                    parent: Option<&AgentId>,
+                    status: AgentStatus,
+                    background: bool,
+                    retired: bool| {
+            let mut s = baseline_test_session(&agent, ws, ts, None);
+            s.parent_agent_id = parent.cloned();
+            s.status = status;
+            s.is_background = background;
+            s.retired_at = retired.then(|| ts.to_string());
+            s
+        };
+        let (live_top, live_bg, retired_top, deleted_top, foreign_top) =
+            (id(1), id(2), id(3), id(4), id(5));
+        let sessions = [
+            seed(
+                live_top.clone(),
+                &ws,
+                None,
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            seed(live_bg.clone(), &ws, None, AgentStatus::Idle, true, false),
+            seed(
+                retired_top.clone(),
+                &ws,
+                None,
+                AgentStatus::Idle,
+                false,
+                true,
+            ),
+            // A parent that exists only in ANOTHER workspace.
+            seed(
+                foreign_top.clone(),
+                &other_ws,
+                None,
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // Not orphans: a live foreground parent, a live background parent.
+            seed(
+                id(10),
+                &ws,
+                Some(&live_top),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            seed(
+                id(11),
+                &ws,
+                Some(&live_bg),
+                AgentStatus::Pending,
+                false,
+                false,
+            ),
+            // Orphans: parent retired (running + idle), parent deleted
+            // (never inserted), parent in another workspace.
+            seed(
+                id(20),
+                &ws,
+                Some(&retired_top),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            seed(
+                id(21),
+                &ws,
+                Some(&retired_top),
+                AgentStatus::Idle,
+                true,
+                false,
+            ),
+            seed(
+                id(22),
+                &ws,
+                Some(&deleted_top),
+                AgentStatus::Processing,
+                false,
+                false,
+            ),
+            seed(
+                id(23),
+                &ws,
+                Some(&foreign_top),
+                AgentStatus::Waiting,
+                false,
+                false,
+            ),
+            // A retired orphan is excluded entirely.
+            seed(
+                id(24),
+                &ws,
+                Some(&deleted_top),
+                AgentStatus::Active,
+                false,
+                true,
+            ),
+            // The orphan 20's own child is NOT an orphan (its parent is live).
+            seed(
+                id(30),
+                &ws,
+                Some(&id(20)),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // Another workspace's orphan never leaks in.
+            seed(
+                id(40),
+                &other_ws,
+                Some(&deleted_top),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+        ];
+        for s in &sessions {
+            store.insert_agent_session(s).await.expect("insert session");
+        }
+
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("delegated counts");
+        assert_eq!(
+            counts.orphaned,
+            AgentOrphanedDelegatedCounts {
+                total: 4,
+                running: 2
+            },
+            "orphans: 20 (active), 21 (idle), 22 (Processing), 23 (waiting); counts: {counts:?}"
+        );
+        // byParent is unchanged in meaning: every parent key, orphaned or not
+        // (live_top, live_bg, retired_top, deleted_top, foreign_top, 20).
+        assert_eq!(counts.by_parent.len(), 6);
+        assert_eq!(
+            counts.by_parent[&id(20)].total,
+            1,
+            "the orphan's child counts under it"
+        );
+        let scope_counts = store
+            .count_agent_sessions_by_scope(&ws)
+            .await
+            .expect("scope counts");
+        assert_eq!(scope_counts.delegated, 7);
+        assert!(counts.orphaned.total <= scope_counts.delegated);
+
+        let orphan_scope = AgentListRowScope::Delegated {
+            parent_agent_id: None,
+            orphaned_only: true,
+        };
+        let whole_bin = AgentListRowScope::Delegated {
+            parent_agent_id: None,
+            orphaned_only: false,
+        };
+        let ids = |rows: &[AgentSession]| -> std::collections::BTreeSet<String> {
+            rows.iter().map(|s| s.id.0.clone()).collect()
+        };
+        let orphan_rows = store
+            .list_scoped_agent_session_summaries(&ws, &orphan_scope)
+            .await
+            .expect("orphanedOnly rows");
+        assert_eq!(
+            ids(&orphan_rows),
+            [id(20), id(21), id(22), id(23)]
+                .iter()
+                .map(|a| a.0.clone())
+                .collect()
+        );
+        assert_eq!(orphan_rows.len() as u64, counts.orphaned.total);
+        let bin_rows = store
+            .list_scoped_agent_session_summaries(&ws, &whole_bin)
+            .await
+            .expect("delegated rows");
+        assert!(ids(&orphan_rows).is_subset(&ids(&bin_rows)));
+        assert_eq!(bin_rows.len() as u64, scope_counts.delegated);
+        // The projection read narrows on the same predicate.
+        let orphan_projections = store
+            .get_scoped_agent_session_message_projections(&ws, &orphan_scope)
+            .await
+            .expect("orphanedOnly projections");
+        assert_eq!(
+            orphan_projections
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ids(&orphan_rows)
+        );
+
+        // Retiring the live parent orphans its child; restoring it undoes that.
+        store
+            .set_agent_session_retired_at(&ws, &live_top, Some(ts), ts)
+            .await
+            .expect("retire live_top");
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("counts after retire");
+        assert_eq!(
+            counts.orphaned,
+            AgentOrphanedDelegatedCounts {
+                total: 5,
+                running: 3
+            }
+        );
+        store
+            .set_agent_session_retired_at(&ws, &live_top, None, ts)
+            .await
+            .expect("restore live_top");
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("counts after restore");
+        assert_eq!(
+            counts.orphaned,
+            AgentOrphanedDelegatedCounts {
+                total: 4,
+                running: 2
+            }
         );
     }
 
@@ -5658,7 +5986,7 @@ mod tests {
     /// (cross-workspace delegation); other workspaces' rows never leak in;
     /// the top-level `running` is the sum over parents; and `Σ total` equals
     /// `scopeCounts.delegated` from the same store. An empty workspace
-    /// answers `{ running: 0, byParent: {} }`.
+    /// answers `{ running: 0, byParent: {}, orphaned: { total: 0, running: 0 } }`.
     #[tokio::test]
     async fn delegated_counts_group_non_retired_children_by_parent() {
         let tmp = TempDb::new("test-agent-repo");
@@ -5781,6 +6109,11 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+                // Only the foreign parent's child has no live parent here.
+                orphaned: AgentOrphanedDelegatedCounts {
+                    total: 1,
+                    running: 1
+                },
             }
         );
         assert!(
@@ -5822,7 +6155,7 @@ mod tests {
         assert_eq!(empty, AgentDelegatedCounts::default());
         assert_eq!(
             serde_json::to_value(&empty).unwrap(),
-            serde_json::json!({ "running": 0, "byParent": {} })
+            serde_json::json!({ "running": 0, "byParent": {}, "orphaned": { "total": 0, "running": 0 } })
         );
     }
 
