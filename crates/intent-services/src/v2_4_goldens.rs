@@ -182,6 +182,7 @@ const COMPARED_SURFACES: &[&str] = &[
     "pr_monitor_cancelled_from_app_notice",
     "pr_monitor_cancelled_workspace_archived_notice",
     "pr_monitor_transferred_to_parent_notice",
+    "workspace_archived_watches_cancelled_notice",
     "delegation_first_message",
     "questions_dismissed_notice",
     "proposal_applied_notice",
@@ -469,6 +470,16 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(pr_monitor_transferred_to_parent_notice(
         "o/r#42",
         "agent-parent"
+    ));
+
+    // --- Workspace archive notices ---
+    same!(workspace_archived_watches_cancelled_notice(
+        &[("pr-watch", "hook-1")],
+        &["o/r#42"]
+    ));
+    same!(workspace_archived_watches_cancelled_notice(
+        &[],
+        &["o/r#42"]
     ));
 
     // --- Other conversation-reaching strings ---

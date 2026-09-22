@@ -18898,6 +18898,46 @@ pub(crate) mod pr {
         base
     }
 
+    /// Loopback GitHub API stub whose quota is exhausted: every request is
+    /// answered `403` with GitHub's primary rate-limit body (no
+    /// `X-OAuth-Scopes`), so the identity-proof preflight `GET /user` hits
+    /// the limit before any gist is touched.
+    async fn spawn_rate_limited_api() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let body = r#"{"message":"API rate limit exceeded for user ID 1.","documentation_url":"https://docs.github.com/rest/overview/rate-limits-for-the-rest-api"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        base
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_identity_proof_create_without_a_stored_token_is_not_connected() {
         let (_t, svc) = github_svc().await;
@@ -18981,6 +19021,43 @@ pub(crate) mod pr {
             .await
             .expect_err("scope missing");
         assert_eq!(identity_proof_code(&err), "github-scope-missing");
+        assert_eq!(err.code(), -32603);
+    }
+
+    /// A GitHub rate limit hit on the identity-proof preflight (here an
+    /// exhausted primary quota; any cause classified as `RateLimited` maps
+    /// the same way) surfaces as `Error::RateLimited` (`-32603`, wire
+    /// `data.code = "rate-limited"`) on create and delete alike — never
+    /// `github-not-connected`, whose sign-in remedy would not help
+    /// (intent-hq/intent#5627).
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_under_an_exhausted_quota_is_rate_limited_not_not_connected() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let base = spawn_rate_limited_api().await;
+        let svc = svc.with_secret_store(mem).with_github_api_base_uri(base);
+
+        let err = svc
+            .github_identity_proof_create("nonce-1".into(), "Studio".into())
+            .await
+            .expect_err("rate limited create");
+        assert!(
+            matches!(&err, intent_core::Error::RateLimited(msg) if msg.contains("rate limit")),
+            "create: {err:?}"
+        );
+        assert_eq!(err.code(), -32603);
+        assert!(err.to_string().starts_with("source control rate limited: "));
+
+        let err = svc
+            .github_identity_proof_delete("g1".into())
+            .await
+            .expect_err("rate limited delete");
+        assert!(
+            matches!(&err, intent_core::Error::RateLimited(msg) if msg.contains("rate limit")),
+            "delete: {err:?}"
+        );
         assert_eq!(err.code(), -32603);
     }
 

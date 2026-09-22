@@ -2568,6 +2568,27 @@ fn voice_not_configured_maps_to_structured_error_data() {
 }
 
 #[test]
+fn rate_limited_maps_to_structured_error_data() {
+    // Forge rate limiting (intent-hq/intent#5627) — any cause the
+    // source-control layer classifies as `RateLimited` — keeps the -32603
+    // code and the exact `source control rate limited: <detail>` message,
+    // and carries `error.data = { code: "rate-limited" }` so the invite flow
+    // routes "wait for the limit to reset" instead of a sign-in prompt.
+    let rpc = super::domain_to_rpc(intent_core::Error::RateLimited(
+        "API rate limit exceeded for user ID 1.".to_string(),
+    ));
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.message,
+        "source control rate limited: API rate limit exceeded for user ID 1."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({ "code": "rate-limited" })
+    );
+}
+
+#[test]
 fn adapter_busy_maps_to_structured_error_data() {
     // An `agent.completeOnce` that queued past its own timeout at the
     // daemon-wide ephemeral-adapter bound (PROTOCOL §5.32, monorepo#2062)

@@ -18,6 +18,22 @@
 //! anchor replaces the `NoSubscriber` fallback: every rebuild path now
 //! resolves interest to at least `sometimes`, which forces the per-event
 //! `enabled()` check instead of dropping events at the callsite.
+//!
+//! The anchor is also the crate's SQL statement counter
+//! ([`count_sqlx_statements`]): sqlx-sqlite emits its per-statement
+//! `sqlx::query` event from the connection's worker thread, inside the
+//! caller's span (forwarded with the command), so a thread-local capture on
+//! the test thread never sees it — only the process-global dispatcher does.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
+
+use tracing::Instrument as _;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Registry;
 
 /// Install `capture` as the thread-local default, with the process-global
 /// [`InterestAnchor`] in place first. Use this instead of calling
@@ -27,25 +43,76 @@ pub(crate) fn set_capture_default<S>(capture: S) -> tracing::subscriber::Default
 where
     S: tracing::Subscriber + Send + Sync + 'static,
 {
-    static ANCHOR: std::sync::Once = std::sync::Once::new();
+    install_anchor();
+    tracing::subscriber::set_default(capture)
+}
+
+/// Run `fut` and count the `sqlx::query` statement events sqlx emits while it
+/// runs — one per executed statement, the same signal the daemon's
+/// `rpc_profile` statement budget counts. Attribution is span-scoped: the
+/// future is instrumented with a marker span, sqlx forwards that span to its
+/// worker thread with every command, and only events under the marker are
+/// counted, so concurrent tests in one process never inflate each other. Run
+/// the code path once uncounted first if the pool may still lazy-connect
+/// (the connection-setup PRAGMA batch runs inside the acquiring span).
+///
+/// The calling thread must NOT hold a thread-local capture (the marker span
+/// would then be created by the capture while the worker-thread events reach
+/// the anchor, and the two never meet).
+pub(crate) async fn count_sqlx_statements<F: Future>(fut: F) -> (F::Output, usize) {
+    install_anchor();
+    let span = tracing::trace_span!(STATEMENT_COUNT_SPAN);
+    let id = span
+        .id()
+        .expect("the anchor enables the statement-count marker span")
+        .into_u64();
+    let counter = Arc::new(AtomicUsize::new(0));
+    counters().lock().unwrap().insert(id, counter.clone());
+    // `span` outlives the instrumented clone so the registry cannot recycle
+    // its id before the counter entry is gone.
+    let out = fut.instrument(span.clone()).await;
+    let statements = counter.load(Ordering::SeqCst);
+    counters().lock().unwrap().remove(&id);
+    drop(span);
+    (out, statements)
+}
+
+fn install_anchor() {
+    static ANCHOR: Once = Once::new();
     ANCHOR.call_once(|| {
-        tracing::subscriber::set_global_default(InterestAnchor).expect(
+        tracing::subscriber::set_global_default(Registry::default().with(InterestAnchor)).expect(
             "intent-services tests own this process's global tracing default; \
              a competing set_global_default call would silently re-expose the \
              monorepo#3580 interest-cache race",
         );
     });
-    tracing::subscriber::set_default(capture)
 }
 
-/// Process-global fallback dispatcher that pins every callsite's interest at
-/// `sometimes` so it can never be cached as `never` (see the module docs). It
-/// consumes nothing itself: `enabled()` is always `false`, so threads without
-/// a thread-local capture drop events exactly as they did with no global
-/// default.
+/// Target of sqlx's per-statement event (see `sqlx_core::logger`).
+const SQLX_QUERY_TARGET: &str = "sqlx::query";
+/// Name of the marker span [`count_sqlx_statements`] scopes its count to.
+const STATEMENT_COUNT_SPAN: &str = "intent_services_sqlx_statement_count";
+
+/// Live [`count_sqlx_statements`] counters keyed by marker span id.
+fn counters() -> &'static Mutex<HashMap<u64, Arc<AtomicUsize>>> {
+    static COUNTERS: OnceLock<Mutex<HashMap<u64, Arc<AtomicUsize>>>> = OnceLock::new();
+    COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Process-global fallback layer (over a [`Registry`], which supplies the
+/// span store and `current_span` that sqlx's worker-thread forwarding needs)
+/// that pins every callsite's interest at `sometimes` so it can never be
+/// cached as `never` (see the module docs). It consumes nothing except the
+/// statement-count plumbing: `enabled()` is `true` only for the
+/// [`STATEMENT_COUNT_SPAN`] marker span and the [`SQLX_QUERY_TARGET`]
+/// statement event, so threads without a thread-local capture drop every
+/// other event exactly as they did with no global default.
 struct InterestAnchor;
 
-impl tracing::Subscriber for InterestAnchor {
+impl<S> Layer<S> for InterestAnchor
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
     fn register_callsite(
         &self,
         _: &'static tracing::Metadata<'static>,
@@ -53,17 +120,28 @@ impl tracing::Subscriber for InterestAnchor {
         tracing::subscriber::Interest::sometimes()
     }
 
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        false
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _: Context<'_, S>) -> bool {
+        // The target match deliberately ignores the callsite kind: sqlx
+        // pre-checks with `tracing::enabled!`, whose callsite is a bare
+        // `Kind::HINT` (not an event), and skips the emit when that says no.
+        (metadata.is_span() && metadata.name() == STATEMENT_COUNT_SPAN)
+            || metadata.target() == SQLX_QUERY_TARGET
     }
 
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        if event.metadata().target() != SQLX_QUERY_TARGET {
+            return;
+        }
+        let Some(marker) = ctx
+            .event_span(event)
+            .into_iter()
+            .flat_map(|span| span.scope())
+            .find(|span| span.name() == STATEMENT_COUNT_SPAN)
+        else {
+            return;
+        };
+        if let Some(counter) = counters().lock().unwrap().get(&marker.id().into_u64()) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
     }
-
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, _: &tracing::Event<'_>) {}
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
 }

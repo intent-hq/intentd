@@ -1083,6 +1083,43 @@ impl Store {
         }
     }
 
+    /// Batched `updated_at` projection: the timestamp of every id in `ids`
+    /// in ONE `IN`-list statement (the `agent.listActive` busy-set read —
+    /// intent-hq/intent#5626). Replaces a per-agent
+    /// [`Self::get_agent_session_updated_at`] loop so the caller stays at a
+    /// fixed statement count regardless of how many agents are busy. Ids
+    /// without a session row are simply absent from the map (the caller's
+    /// missing-row skip); an empty `ids` issues no statement. The id list is
+    /// chunked well under `SQLite`'s 32766 bind-variable cap (same defense as
+    /// [`Self::get_agent_statuses`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_agent_session_updated_at_batch(
+        &self,
+        ids: &[AgentId],
+    ) -> Result<std::collections::HashMap<AgentId, String>> {
+        const IDS_PER_STATEMENT: usize = 32_000;
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(IDS_PER_STATEMENT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql =
+                format!("SELECT id, updated_at FROM agent_session WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(&id.0);
+            }
+            let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+                Error::Internal(format!("get agent session updated_at batch failed: {e}"))
+            })?;
+            for row in &rows {
+                out.insert(AgentId(row.get::<String, _>("id")), row.get("updated_at"));
+            }
+        }
+        Ok(out)
+    }
+
     /// Lightweight name-only lookup used by hot paths that just need the
     /// session's display name (e.g. note-version author stamping). Skips the
     /// full message-log fetch that `get_agent_session` performs.
@@ -11689,6 +11726,66 @@ mod tests {
             .get_agent_statuses(&[])
             .await
             .expect("empty id list")
+            .is_empty());
+    }
+
+    /// `get_agent_session_updated_at_batch` returns the `updated_at` of every
+    /// requested id that has a session row in one batched query, omits ids
+    /// without a row, and issues no statement for an empty id list
+    /// (intent-hq/intent#5626 — the `agent.listActive` busy-set read).
+    #[tokio::test]
+    async fn get_agent_session_updated_at_batch_returns_present_ids_only() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-updated-at-batch".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let first = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let second = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&first, &ws_id, &ts, None))
+            .await
+            .expect("insert first session");
+        store
+            .insert_agent_session(&baseline_test_session(&second, &ws_id, &ts, None))
+            .await
+            .expect("insert second session");
+        let first_updated_at = store
+            .get_agent_session_updated_at(&first)
+            .await
+            .expect("first updated_at");
+        let second_updated_at = store
+            .get_agent_session_updated_at(&second)
+            .await
+            .expect("second updated_at");
+
+        let missing = AgentId("agent-missing".to_string());
+        let batch = store
+            .get_agent_session_updated_at_batch(&[first.clone(), missing.clone(), second.clone()])
+            .await
+            .expect("batched updated_at");
+        assert_eq!(
+            batch.len(),
+            2,
+            "missing id is absent, not an error: {batch:?}"
+        );
+        assert_eq!(batch.get(&first), Some(&first_updated_at));
+        assert_eq!(batch.get(&second), Some(&second_updated_at));
+        assert!(!batch.contains_key(&missing));
+
+        // An empty id list must not touch the pool at all: with the pools
+        // closed any statement would fail, so `Ok(empty)` proves none ran.
+        store.close().await;
+        assert!(store
+            .get_agent_session_updated_at_batch(&[])
+            .await
+            .expect("empty id list issues no statement")
             .is_empty());
     }
 

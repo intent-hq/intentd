@@ -353,6 +353,14 @@ impl Harness for V2_4 {
         V1.pr_monitor_transferred_to_parent_notice(label, parent_id)
     }
 
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String {
+        V1.workspace_archived_watches_cancelled_notice(hooks, monitors)
+    }
+
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String {
         V1.delegation_first_message(body, title, note_id)
     }

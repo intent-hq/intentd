@@ -506,6 +506,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_under_an_exhausted_quota_is_rate_limited_not_unauthorized() {
+        // GitHub answers an exhausted primary quota with 403 (not 429) and a
+        // body naming the rate limit; `Error::from` classifies that before
+        // the auth arm, so the proof surfaces `Other(RateLimited)` — never
+        // `Unauthorized`, whose sign-in remedy would not help
+        // (intent-hq/intent#5627).
+        let (base, seen) = spawn_mock(|_| {
+            json_answer(
+                403,
+                &json!({ "message": "API rate limit exceeded for user ID 1." }),
+            )
+        })
+        .await;
+        let err = create_proof_gist("tok", Some(&base), "n", "h")
+            .await
+            .expect_err("rate limited");
+        assert!(
+            matches!(&err, IdentityProofError::Other(Error::RateLimited(msg)) if msg.contains("rate limit")),
+            "{err:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "no gist is posted: {seen:?}");
+        assert_eq!(seen[0].0, "GET /user");
+    }
+
+    #[tokio::test]
     async fn create_against_a_dead_host_is_unreachable() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
