@@ -12616,6 +12616,10 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
         .expect("image block persisted on the user row");
     assert_eq!(image["data"], image_data);
     assert_eq!(image["mimeType"], "image/png");
+    // v10.7 image dimension sidecar: the write path stamps the intrinsic
+    // pixel dimensions of the (1x1) PNG onto the persisted block.
+    assert_eq!(image["width"], 1, "{image}");
+    assert_eq!(image["height"], 1, "{image}");
     let file = blocks
         .iter()
         .find(|b| b["type"] == "file")
