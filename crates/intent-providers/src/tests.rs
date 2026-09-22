@@ -708,6 +708,61 @@ impl Drop for EnvGuard {
     }
 }
 
+#[test]
+fn codex_initial_mode_defaults_to_full_access_without_replacing_explicit_values() {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let _mode_guard = EnvGuard::new("INITIAL_AGENT_MODE");
+    let env_for = |id: &str, via_npx: bool| {
+        args::build_provider_env_for_spawn(
+            find_provider(id).unwrap(),
+            None,
+            None,
+            None,
+            None,
+            via_npx,
+            None,
+        )
+    };
+
+    std::env::remove_var("INITIAL_AGENT_MODE");
+    for via_npx in [false, true] {
+        assert_eq!(
+            env_for("codex", via_npx)
+                .get("INITIAL_AGENT_MODE")
+                .map(String::as_str),
+            Some("agent-full-access")
+        );
+        for id in all_provider_ids().into_iter().filter(|id| *id != "codex") {
+            assert!(
+                !env_for(id, via_npx).contains_key("INITIAL_AGENT_MODE"),
+                "{id} must not receive a Codex mode default"
+            );
+        }
+    }
+
+    let explicit_values = [
+        std::ffi::OsString::from("agent"),
+        std::ffi::OsString::from("read-only"),
+        std::ffi::OsString::from("agent-full-access"),
+        std::ffi::OsString::from(""),
+        std::ffi::OsString::from("invalid-mode"),
+        #[cfg(unix)]
+        std::ffi::OsString::from_vec(vec![0xff]),
+    ];
+    for value in explicit_values {
+        std::env::set_var("INITIAL_AGENT_MODE", &value);
+        for via_npx in [false, true] {
+            assert!(
+                !env_for("codex", via_npx).contains_key("INITIAL_AGENT_MODE"),
+                "explicit mode {value:?} must be inherited unchanged"
+            );
+        }
+    }
+}
+
 /// STAB-50: `NODE_OPTIONS` heap-cap injection for V8-runtime (Node/Electron)
 /// providers. All scenarios run inside one test fn because they mutate
 /// process-global env vars — parallel test threads must not race on

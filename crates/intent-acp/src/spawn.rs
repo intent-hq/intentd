@@ -1151,6 +1151,44 @@ mod build_command_tests {
     }
 
     #[test]
+    fn build_command_codex_initial_mode_default_and_extra_env_precedence() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let provider_binary = PathBuf::from("/custom/codex-acp");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        for via_npx in [false, true] {
+            let mut opts = SpawnOptions::new(provider);
+            opts.provider_binary = (!via_npx).then_some(provider_binary.as_path());
+            opts.npx_fallback_binary = Some(&npx_path);
+            opts.npx_fallback_package = provider.fallback_npx_package;
+            let cmd = build_command(&opts);
+            // Provider tests cover each inherited value hermetically. Here
+            // inspect the real command without mutating process-global env.
+            let expected = std::env::var_os("INITIAL_AGENT_MODE")
+                .is_none()
+                .then_some("agent-full-access");
+            assert_eq!(env_value(&cmd, "INITIAL_AGENT_MODE").as_deref(), expected);
+            assert!(!env_removed(&cmd, "INITIAL_AGENT_MODE"));
+
+            for explicit in [
+                "agent",
+                "read-only",
+                "agent-full-access",
+                "",
+                "invalid-mode",
+            ] {
+                opts.extra_env
+                    .insert("INITIAL_AGENT_MODE".to_string(), explicit.to_string());
+                let cmd = build_command(&opts);
+                assert_eq!(
+                    env_value(&cmd, "INITIAL_AGENT_MODE").as_deref(),
+                    Some(explicit),
+                    "per-spawn mode must win on both launch paths"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn build_command_applies_heap_cap_on_codex_npx_fallback() {
         // codex is declared Native (Rust binary), but the npx-fallback child
         // is Node — the STAB-50 heap cap must apply (intent-hq/monorepo#1661).

@@ -255,6 +255,9 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 ///   untouched — unless the spawn goes through npx, which always runs a Node
 ///   child ([`build_provider_env_for_spawn`]).
 /// - `cortex`: `ELECTRON_RUN_AS_NODE=1` (run the Electron binary as Node).
+/// - `codex`: `INITIAL_AGENT_MODE=agent-full-access` unless explicitly set in
+///   the parent environment. The ACP adapter uses this mode for per-turn
+///   approval and sandbox overrides; config.toml defaults do not win over it.
 /// - `opencode` / `unsloth`: `OPENCODE_CONFIG_CONTENT` with `model` (when
 ///   set), `instructions` (when a rules file path is provided), and `mcp`
 ///   (when a pre-serialized MCP block is provided via `mcp_config_json`).
@@ -348,6 +351,14 @@ pub fn build_provider_env_for_spawn(
         }
     }
     match config.id {
+        "codex" if std::env::var_os("INITIAL_AGENT_MODE").is_none() => {
+            // Preserve even empty, invalid, or non-Unicode explicit values:
+            // the adapter's fallback must not silently become full access.
+            env.insert(
+                "INITIAL_AGENT_MODE".to_string(),
+                "agent-full-access".to_string(),
+            );
+        }
         "cortex" => {
             env.insert("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string());
         }
