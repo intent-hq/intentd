@@ -9521,6 +9521,9 @@ async fn join_workspace_by_invite_enforces_the_guest_cap_in_transaction() {
             crate::InviteJoinOutcome::OwnerSelfJoin => {
                 panic!("a guest account was taken for the primary principal")
             }
+            crate::InviteJoinOutcome::WorkspaceArchived => {
+                panic!("an active workspace was reported archived")
+            }
         }
     }
     assert_eq!((joined, full), (1, 7));
@@ -9673,6 +9676,9 @@ async fn add_workspace_collaborator_within_cap_is_atomic() {
             crate::CollaboratorAddOutcome::NoActiveCredential => {
                 panic!("a credentialed guest was refused for its credential")
             }
+            crate::CollaboratorAddOutcome::WorkspaceArchived => {
+                panic!("an active workspace was reported archived")
+            }
         }
     }
     assert_eq!((added, full), (1, 7));
@@ -9740,6 +9746,129 @@ async fn add_workspace_collaborator_within_cap_is_atomic() {
         },
         "the reusable invite stays open after its winner joined"
     );
+}
+
+/// Every access-granting write transaction checks the archived flag on its
+/// own connection: after `archive_workspace_detaching_guests` committed, a
+/// capped member add, an invite mint and an invite join are each refused as
+/// `WorkspaceArchived` with nothing written — the guard behind the sweep,
+/// so no seat or open link can land on an archived workspace. Unarchiving
+/// lifts all three.
+#[tokio::test]
+async fn archived_workspace_refuses_member_add_invite_mint_and_join() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Archived", false))
+        .await
+        .expect("insert ws");
+    let primary = store.get_primary_principal().await.expect("primary").id;
+    let guest = guest_identity(501);
+    store.upsert_principal(&guest).await.expect("guest");
+    store
+        .insert_principal_credential(&guest.id, "cred-501")
+        .await
+        .expect("guest credential");
+    // An open invite that survives the sweep only because it is inserted
+    // behind the store's back: the join guard must refuse it regardless.
+    let sweep = store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive");
+    assert_eq!(sweep.revoked_invites, 0);
+    assert!(store.get_workspace(&ws).await.expect("ws").archived);
+
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guest.id, 8)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::WorkspaceArchived
+    );
+    assert_eq!(
+        store
+            .get_workspace_member_role(&ws, &guest.id)
+            .await
+            .expect("role"),
+        None,
+        "a refused add leaves no row"
+    );
+    assert_eq!(
+        store
+            .insert_workspace_invite(&guest_invite("late-link", &ws, &primary))
+            .await
+            .expect("insert invite"),
+        crate::InviteInsertOutcome::WorkspaceArchived
+    );
+    assert_eq!(
+        store.get_workspace_invite("late-link").await.expect("get"),
+        None,
+        "a refused mint leaves no row"
+    );
+    sqlx::query(&format!(
+        "INSERT INTO workspace_invite ({}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        crate::principal_repo::INVITE_COLUMNS
+    ))
+    .bind("smuggled")
+    .bind(&ws.0)
+    .bind("hash-smuggled")
+    .bind(Option::<String>::None)
+    .bind(&primary.0)
+    .bind(Option::<i64>::None)
+    .bind(Option::<String>::None)
+    .bind(now_iso())
+    .bind("2999-01-01T00:00:00Z")
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind(0_i64)
+    .execute(store.write_pool())
+    .await
+    .expect("smuggle an open invite");
+    let before = store.count_principals().await.expect("count");
+    assert_eq!(
+        store
+            .join_workspace_by_invite("smuggled", &ws, &guest_identity(502), "cred-502", None, 8)
+            .await
+            .expect("join"),
+        crate::InviteJoinOutcome::WorkspaceArchived
+    );
+    assert_eq!(store.count_principals().await.expect("count"), before);
+    assert_eq!(
+        store
+            .lookup_principal_credential("cred-502")
+            .await
+            .expect("lookup"),
+        None,
+        "a refused join mints nothing"
+    );
+
+    assert!(store
+        .unarchive_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("unarchive"));
+    assert_eq!(
+        store
+            .add_workspace_collaborator_within_cap(&ws, &guest.id, 8)
+            .await
+            .expect("add"),
+        crate::CollaboratorAddOutcome::Added
+    );
+    assert_eq!(
+        store
+            .insert_workspace_invite(&guest_invite("late-link", &ws, &primary))
+            .await
+            .expect("insert invite"),
+        crate::InviteInsertOutcome::Inserted
+    );
+    assert!(matches!(
+        store
+            .join_workspace_by_invite("smuggled", &ws, &guest_identity(502), "cred-502", None, 8)
+            .await
+            .expect("join"),
+        crate::InviteJoinOutcome::Joined(_)
+    ));
 }
 
 /// The active-credential predicate is evaluated inside the same write

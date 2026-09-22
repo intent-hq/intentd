@@ -21375,11 +21375,18 @@ impl WorkspaceApi for Services {
             }
             let mut ws = store.get_workspace(&id).await?;
             let now = now_iso();
+            // Archiving removes guests: the Archived flip, every non-owner
+            // membership delete and every open-invite revoke commit in ONE
+            // `BEGIN IMMEDIATE` transaction (scoped column write — never a
+            // full-row replace of the `get_workspace` read above). A store
+            // failure fails the RPC with the row still active: access
+            // revocation is never best-effort. Unarchive does NOT restore
+            // either; a guest rejoins by a fresh invite.
+            let guest_sweep = store.archive_workspace_detaching_guests(&id, &now).await?;
             ws.status = WorkspaceStatus::Archived;
             ws.archived = true;
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
-            store.update_workspace(&ws).await?;
             // Everything below the persist runs on a DETACHED task
             // (intent-hq/monorepo#1577): the sweeps can cancel this very
             // caller. A background hook whose script calls
@@ -21398,6 +21405,13 @@ impl WorkspaceApi for Services {
             let id_for_log = id.clone();
             let tail = intent_core::spawn_daemon(async move {
                 let mut ws = ws;
+                // Announce the committed guest sweep first — one
+                // `{ members, removedPrincipalId, memberCount }` delta per
+                // detached collaborator (queued messages dropped), then one
+                // `{ invites: true }` when an invite was revoked — so the
+                // deltas describe the transaction that just committed and
+                // precede every other archive-tail event.
+                this.publish_archived_guest_deltas(&id, &guest_sweep).await;
                 // Gracefully interrupt every in-flight turn in the workspace —
                 // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
                 // turn cancelled over the wire, draining worker aborted, terminal
@@ -21459,15 +21473,6 @@ impl WorkspaceApi for Services {
                 // archived workspace's displayStatus rollup reads
                 // `in_progress` indefinitely off the active-monitor signal.
                 this.cancel_workspace_pr_monitors(&id).await;
-                // Archiving removes guests: detach every collaborator (the
-                // shared `members.remove` teardown — row deleted, queued
-                // messages dropped, `removedPrincipalId` delta published
-                // per member) and revoke every open invite (one
-                // `{ invites: true }` delta when a row changed). The owner
-                // membership stays. Unarchive does NOT restore either; a
-                // guest rejoins by a fresh invite. Best-effort: a listing
-                // failure is logged and the archive still completes.
-                this.detach_workspace_guests(&id).await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,
                 // and persist it through the scoped monotonic write
@@ -32168,7 +32173,7 @@ impl Services {
     /// stamped delta already went out).
     ///
     /// Membership is NOT restored: archive detached every collaborator and
-    /// revoked every open invite (`detach_workspace_guests`), and unarchive
+    /// revoked every open invite (`archive_workspace_detaching_guests`), and unarchive
     /// leaves the owner as the sole member — like the cancelled hooks and
     /// PR monitors, guests come back only through a fresh invite.
     async fn unarchive_workspace_inner(

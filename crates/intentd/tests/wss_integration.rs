@@ -5462,8 +5462,10 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
 /// collaborator (the `members.remove` shape), one `{ invites: true }`, then
 /// the `{ archived: true, status, archivedAt }` delta — the response
 /// carries `memberCount: 1` / `openInviteCount: 0`, `workspace.members.list`
-/// keeps only the owner row, both guests' connections read `NotFound`, and
-/// `workspace.unarchive` restores neither membership nor the invite.
+/// keeps only the owner row, both guests' connections read `NotFound`, a
+/// `workspace.members.add` while archived is `-32602 { code:
+/// "workspace-archived" }`, and `workspace.unarchive` restores neither
+/// membership nor the invite — but admits the add again (no late sweep).
 #[tokio::test]
 async fn wss_archive_detaches_collaborators_and_revokes_open_invites() {
     use intent_core::events::WORKSPACE_UPDATED;
@@ -5678,6 +5680,31 @@ async fn wss_archive_detaches_collaborators_and_revokes_open_invites() {
         .expect("invite row kept");
     assert!(stored.revoked_at.is_some(), "{stored:?}");
 
+    // While archived, a direct add is refused as `workspace-archived`
+    // (checked inside the add's write transaction) and seats nobody.
+    let refused = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"workspace.members.add","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            guest_a.principal.id.0
+        ),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["code"], "workspace-archived",
+        "{refused}"
+    );
+    assert_eq!(
+        srv.store
+            .get_workspace_member_role(&ws_typed, &guest_a.principal.id)
+            .await
+            .expect("role"),
+        None,
+        "{refused}"
+    );
+
     // Unarchive resurrects neither the members nor the invite.
     let restored = wss_call(
         srv.port,
@@ -5703,6 +5730,25 @@ async fn wss_archive_detaches_collaborators_and_revokes_open_invites() {
     assert_eq!(
         after["result"]["workspace"]["openInviteCount"], 0,
         "{after}"
+    );
+    // ... and the same add now seats the guest again: no late sweep.
+    let readded = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.members.add","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            guest_a.principal.id.0
+        ),
+    )
+    .await;
+    assert_eq!(readded["result"]["added"], true, "{readded}");
+    assert_eq!(readded["result"]["memberCount"], 2, "{readded}");
+    let back = guest_a
+        .call("workspace.get", json!({ "workspaceId": ws_id }))
+        .await;
+    assert_eq!(
+        back["result"]["workspace"]["myRole"], "collaborator",
+        "{back}"
     );
 
     drop(guest_a);

@@ -49,7 +49,7 @@ use intent_core::{
     current_caller, lift_from_principal_id, AgentId, Caller, Error, PrincipalId, Result, Workspace,
     WorkspaceId, WorkspaceRole,
 };
-use intent_store::CollaboratorAddOutcome;
+use intent_store::{ArchivedGuestSweep, CollaboratorAddOutcome};
 use serde_json::{json, Value};
 
 use crate::Services;
@@ -520,7 +520,8 @@ impl Services {
     /// keeps its own copy: its insert is part of the invite-redemption
     /// transaction). Returns whether a row was inserted; a full workspace is
     /// `guest-limit`, a principal without an active credential (checked
-    /// inside the same transaction) is `InvalidParams`.
+    /// inside the same transaction) is `InvalidParams`, an archived
+    /// workspace (same transaction) is `workspace-archived`.
     pub(crate) async fn attach_collaborator(
         &self,
         workspace_id: &WorkspaceId,
@@ -544,6 +545,11 @@ impl Services {
             }
             CollaboratorAddOutcome::WorkspaceFull => {
                 return Err(Error::Invite(intent_core::InviteErrorKind::GuestLimit));
+            }
+            CollaboratorAddOutcome::WorkspaceArchived => {
+                return Err(Error::Invite(
+                    intent_core::InviteErrorKind::WorkspaceArchived,
+                ));
             }
         };
         if added {
@@ -597,62 +603,41 @@ impl Services {
         Ok(removed)
     }
 
-    /// `workspace.archive` guest sweep: detach every collaborator member
-    /// through [`Self::detach_collaborator`] (one `removedPrincipalId`
-    /// `workspace:updated` each) and revoke every open invite, publishing
-    /// ONE `{ invites: true }` `workspace:updated` when at least one row was
-    /// revoked (the `workspace.invite.revoke` delta). The owner row is kept.
-    /// Best-effort: store failures are logged and the archive proceeds.
-    pub(crate) async fn detach_workspace_guests(&self, workspace_id: &WorkspaceId) {
-        match self.store.list_workspace_members(workspace_id).await {
-            Ok(members) => {
-                for member in members
-                    .iter()
-                    .filter(|m| m.role == WorkspaceRole::Collaborator)
-                {
-                    if let Err(e) = self
-                        .detach_collaborator(workspace_id, &member.principal_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            workspace = %workspace_id,
-                            principal = %member.principal_id,
-                            "workspace.archive: collaborator detach failed; membership kept"
-                        );
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                workspace = %workspace_id,
-                "workspace.archive: member listing failed; collaborators kept"
-            ),
-        }
-        let invites = match self.store.list_open_workspace_invites(workspace_id).await {
-            Ok(invites) => invites,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    workspace = %workspace_id,
-                    "workspace.archive: open invite listing failed; invites kept"
-                );
-                return;
-            }
-        };
-        let mut revoked_any = false;
-        for invite in &invites {
-            match self.store.revoke_workspace_invite(&invite.id).await {
-                Ok(revoked) => revoked_any |= revoked,
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    workspace = %workspace_id,
-                    invite = %invite.id,
-                    "workspace.archive: invite revoke failed; invite kept"
+    /// `workspace.archive` guest teardown AFTER the atomic store sweep
+    /// ([`Store::archive_workspace_detaching_guests`]) committed: for every
+    /// detached collaborator drop its queued messages and publish the
+    /// `members.remove` delta (`{ members, removedPrincipalId, memberCount }`,
+    /// `memberCount` counting down to the committed survivor count), then
+    /// ONE `{ invites: true }` `workspace:updated` when at least one invite
+    /// was revoked (the `workspace.invite.revoke` delta). No store write
+    /// happens here — the access change is already durable, this only
+    /// announces it.
+    pub(crate) async fn publish_archived_guest_deltas(
+        &self,
+        workspace_id: &WorkspaceId,
+        sweep: &ArchivedGuestSweep,
+    ) {
+        let mut member_count = sweep
+            .member_count
+            .saturating_add(u64::try_from(sweep.removed_collaborators.len()).unwrap_or(0));
+        for principal_id in &sweep.removed_collaborators {
+            self.drop_queued_messages_from(workspace_id, principal_id)
+                .await;
+            member_count = member_count.saturating_sub(1);
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                crate::workspace_updated_event(
+                    workspace_id,
+                    &json!({
+                        "members": true,
+                        "removedPrincipalId": principal_id,
+                        "memberCount": member_count,
+                    }),
                 ),
-            }
+            )
+            .await;
         }
-        if revoked_any {
+        if sweep.revoked_invites > 0 {
             crate::publish_event(
                 self.event_bus.as_ref(),
                 crate::workspace_updated_event(workspace_id, &json!({ "invites": true })),

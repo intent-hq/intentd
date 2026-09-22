@@ -12079,43 +12079,41 @@ mod change_event_parity {
         );
     }
 
-    /// Archiving removes guests: on a workspace with two collaborators and
-    /// one open invite, `archive_workspace` detaches every collaborator (one
-    /// `{ members, removedPrincipalId, memberCount }` delta each, the
-    /// `members.remove` shape), revokes the invite (one `{ invites: true }`
-    /// delta), then publishes the archived delta last. The response carries
-    /// the post-sweep `memberCount == 1` / `openInviteCount == 0`, only the
-    /// owner row survives, and a following unarchive resurrects nothing.
-    #[intent_test_macros::daemon_test]
-    async fn archive_workspace_detaches_collaborators_and_revokes_open_invites() {
-        use intent_core::{Principal, PrincipalId, WorkspaceApi, WorkspaceInvite, WorkspaceRole};
-        let h = harness().await;
+    /// Insert a non-primary principal (not yet a member) named `login`.
+    async fn guest_principal(h: &Harness, login: &str) -> intent_core::PrincipalId {
+        let p = intent_core::Principal {
+            id: intent_core::PrincipalId::new(),
+            github_user_id: None,
+            login: Some(login.to_string()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        h.store.upsert_principal(&p).await.expect("principal");
+        p.id
+    }
+
+    /// Seat a fresh `collaborator` named `login` on the harness workspace.
+    async fn seat_collaborator(h: &Harness, login: &str) -> intent_core::PrincipalId {
+        let id = guest_principal(h, login).await;
+        h.store
+            .add_workspace_member(&h.ws, &id, intent_core::WorkspaceRole::Collaborator)
+            .await
+            .expect("collaborator");
+        id
+    }
+
+    /// Mint one open (unpinned, unexpired) invite on the harness workspace.
+    async fn open_invite(h: &Harness) -> intent_core::WorkspaceInvite {
         let primary = h.store.get_primary_principal().await.expect("primary");
-        let mut guests = Vec::new();
-        for login in ["guest-a", "guest-b"] {
-            let p = Principal {
-                id: PrincipalId::new(),
-                github_user_id: None,
-                login: Some(login.to_string()),
-                display_name: None,
-                avatar_url: None,
-                is_primary: false,
-                created_at: now_iso(),
-                updated_at: now_iso(),
-            };
-            h.store.upsert_principal(&p).await.expect("principal");
-            h.store
-                .add_workspace_member(&h.ws, &p.id, WorkspaceRole::Collaborator)
-                .await
-                .expect("collaborator");
-            guests.push(p.id);
-        }
-        let invite = WorkspaceInvite {
+        let invite = intent_core::WorkspaceInvite {
             id: uuid::Uuid::new_v4().to_string(),
             workspace_id: h.ws.clone(),
             secret_hash: crate::invite_ops::hash_secret("s"),
             secret: None,
-            created_by_principal_id: primary.id.clone(),
+            created_by_principal_id: primary.id,
             pin_github_user_id: None,
             pin_login: None,
             created_at: now_iso(),
@@ -12129,6 +12127,26 @@ mod change_event_parity {
             .insert_workspace_invite(&invite)
             .await
             .expect("open invite");
+        invite
+    }
+
+    /// Archiving removes guests: on a workspace with two collaborators and
+    /// one open invite, `archive_workspace` detaches every collaborator (one
+    /// `{ members, removedPrincipalId, memberCount }` delta each, the
+    /// `members.remove` shape), revokes the invite (one `{ invites: true }`
+    /// delta), then publishes the archived delta last. The response carries
+    /// the post-sweep `memberCount == 1` / `openInviteCount == 0`, only the
+    /// owner row survives, and a following unarchive resurrects nothing.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_detaches_collaborators_and_revokes_open_invites() {
+        use intent_core::{WorkspaceApi, WorkspaceRole};
+        let h = harness().await;
+        let primary = h.store.get_primary_principal().await.expect("primary");
+        let mut guests = Vec::new();
+        for login in ["guest-a", "guest-b"] {
+            guests.push(seat_collaborator(&h, login).await);
+        }
+        let invite = open_invite(&h).await;
         assert_eq!(
             h.store
                 .workspace_membership_summaries(None, std::slice::from_ref(&h.ws))
@@ -12226,6 +12244,246 @@ mod change_event_parity {
             .expect("summary");
         assert_eq!(summary[&h.ws].member_count, 1);
         assert_eq!(summary[&h.ws].open_invite_count, 0);
+    }
+
+    /// Access revocation is never best-effort (PR #2066 review): the guest
+    /// detach commits in the archive's own transaction, so an injected
+    /// `BEFORE DELETE` failure on `workspace_member` fails the RPC and rolls
+    /// everything back — the row stays active, the collaborator keeps its
+    /// seat, the invite stays open — and nothing is published.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_fails_closed_when_guest_detach_fails() {
+        use intent_core::{WorkspaceApi, WorkspaceStatus};
+        let h = harness().await;
+        let guest = seat_collaborator(&h, "guest").await;
+        let invite = open_invite(&h).await;
+        sqlx::query(
+            "CREATE TRIGGER archive_detach_fail BEFORE DELETE ON workspace_member \
+             BEGIN SELECT RAISE(ABORT, 'injected detach failure'); END",
+        )
+        .execute(h.store.write_pool())
+        .await
+        .expect("arm trigger");
+
+        let mut sub = subscribe(&h);
+        let err = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect_err("archive must fail when the detach fails");
+        assert!(
+            matches!(err, intent_core::Error::Internal(ref msg) if msg.contains("injected detach failure")),
+            "{err:?}"
+        );
+
+        let ws = h.store.get_workspace(&h.ws).await.expect("ws");
+        assert_eq!(ws.status, WorkspaceStatus::Active);
+        assert!(!ws.archived);
+        assert!(ws.archived_at.is_none());
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert!(
+            members.iter().any(|m| m.principal_id == guest),
+            "collaborator must keep its seat: {members:?}"
+        );
+        let open = h
+            .store
+            .list_open_workspace_invites(&h.ws)
+            .await
+            .expect("invites");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, invite.id);
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a rolled-back archive publishes nothing: {quiet:?}"
+        );
+    }
+
+    /// The sweep runs inside the archive's `BEGIN IMMEDIATE` transaction,
+    /// not off a snapshot read before it (PR #2066 review): a collaborator
+    /// seated by a write transaction that commits while the archive waits
+    /// for the (single) write connection is still detached. The held
+    /// transaction guarantees the ordering — the archive cannot begin until
+    /// it commits — so the test is deterministic without timing.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_sweeps_a_collaborator_seated_by_a_concurrent_write() {
+        use intent_core::{WorkspaceApi, WorkspaceRole};
+        let h = harness().await;
+        let primary = h.store.get_primary_principal().await.expect("primary");
+        let guest = guest_principal(&h, "late-guest").await;
+
+        let mut held = h
+            .store
+            .write_pool()
+            .acquire()
+            .await
+            .expect("hold write conn");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *held)
+            .await
+            .expect("begin held txn");
+        let mut sub = subscribe(&h);
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let archive =
+            intent_core::spawn_daemon(async move { services.archive_workspace(ws_id, None).await });
+
+        // Seat the guest through the held transaction: it commits before
+        // the archive can take the write connection, so the archive's
+        // sweep must observe it.
+        sqlx::query(
+            "INSERT INTO workspace_member (workspace_id, principal_id, role, added_at) \
+             VALUES (?, ?, 'collaborator', ?)",
+        )
+        .bind(&h.ws.0)
+        .bind(&guest.0)
+        .bind(now_iso())
+        .execute(&mut *held)
+        .await
+        .expect("seat via held txn");
+        assert!(
+            !archive.is_finished(),
+            "archive cannot commit past the held write txn"
+        );
+        sqlx::query("COMMIT")
+            .execute(&mut *held)
+            .await
+            .expect("commit held txn");
+        drop(held);
+
+        let ws = archive.await.expect("join").expect("archive");
+        assert_eq!(
+            ws.membership.expect("membership attached").member_count,
+            1,
+            "owner only"
+        );
+
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "members": true,
+                    "removedPrincipalId": guest.0,
+                    "memberCount": 1,
+                }
+            })
+        );
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(ev["data"]["changes"]["archived"], true);
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
+
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_eq!(members[0].principal_id, primary.id);
+        assert_eq!(members[0].role, WorkspaceRole::Owner);
+    }
+
+    /// No late sweep (PR #2066 review): the guest detach commits inside the
+    /// archive's transaction and nothing in the detached tail writes access,
+    /// so archive → unarchive → `members.add` keeps the new member. While
+    /// archived the add is refused as `workspace-archived` (checked inside
+    /// the add's own write transaction) with nothing written; the event
+    /// stream is the archive deltas, the unarchive delta, then the add delta.
+    #[intent_test_macros::daemon_test]
+    async fn archive_then_unarchive_keeps_a_member_added_afterwards() {
+        use intent_core::{InviteErrorKind, WorkspaceApi, WorkspaceRole};
+        let h = harness().await;
+        let early = seat_collaborator(&h, "early-guest").await;
+        let late = guest_principal(&h, "late-guest").await;
+        h.store
+            .insert_principal_credential(&late, &crate::invite_ops::hash_secret("late-token"))
+            .await
+            .expect("late credential");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &late)
+            .await
+            .expect_err("add on an archived workspace is refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.code(), -32602);
+        assert_eq!(
+            h.store
+                .get_workspace_member_role(&h.ws, &late)
+                .await
+                .expect("role"),
+            None,
+            "a refused add leaves no row"
+        );
+
+        h.services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let added = h
+            .services
+            .workspace_members_add_op(&h.ws, &late)
+            .await
+            .expect("add after unarchive");
+        assert_eq!(added["added"], json!(true));
+        assert_eq!(added["memberCount"], json!(2));
+
+        // archive: removal of the early guest, then the archived delta;
+        // unarchive: its delta; add: the addedPrincipalId delta. No late
+        // removal anywhere after the add.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["changes"]["removedPrincipalId"], early.0, "{ev}");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["changes"]["archived"], true, "{ev}");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["changes"]["archived"], false, "{ev}");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "members": true,
+                    "addedPrincipalId": late.0,
+                    "memberCount": 2,
+                }
+            })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
+
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 2, "{members:?}");
+        let late_row = members
+            .iter()
+            .find(|m| m.principal_id == late)
+            .expect("late guest seated");
+        assert_eq!(late_row.role, WorkspaceRole::Collaborator);
+        assert!(members.iter().all(|m| m.principal_id != early));
     }
 
     /// Symmetric to archive: `unarchive_workspace` emits one `workspace:updated`

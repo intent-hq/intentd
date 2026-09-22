@@ -75,7 +75,8 @@ pub use pr_monitor_repo::{
     PR_MONITOR_PAUSE_MARKER,
 };
 pub use principal_repo::{
-    CollaboratorAddOutcome, InviteJoinOutcome, WorkspaceAuthorFallback, WorkspaceGuestCount,
+    ArchivedGuestSweep, CollaboratorAddOutcome, InviteInsertOutcome, InviteJoinOutcome,
+    WorkspaceAuthorFallback, WorkspaceGuestCount,
 };
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
