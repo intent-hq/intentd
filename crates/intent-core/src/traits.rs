@@ -4697,8 +4697,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// serialised `WorkspaceInvite` (secrets never included as fields) plus
     /// the additive `url`, the invite's `intent://invite?…` link rebuilt from
     /// the stored secret; `url` is omitted when the row predates the stored
-    /// secret or no link can be built right now (listener down, no dialable
-    /// route). Owner-only.
+    /// secret or no link can be built right now (listener down, tunnel
+    /// down — invite links are tunnel-only). Owner-only.
     fn workspace_invite_list(
         &self,
         workspace_id: WorkspaceId,
