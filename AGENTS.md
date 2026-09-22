@@ -198,7 +198,9 @@ that contract:
 ## Gates — keep them green
 
 Before opening a submodule PR (and before bumping the monorepo gitlink), the gates must
-pass. Run them from the monorepo root via the top-level `Makefile`:
+pass. Run them from the monorepo root via the top-level `Makefile` (the same targets also
+work from `packages/intentd`, whose `Makefile` forwards them to the monorepo root; in a
+standalone clone they exit 2 and name the monorepo command):
 
 ```bash
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings

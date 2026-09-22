@@ -45,7 +45,7 @@ use intent_core::{
 };
 use intent_sourcecontrol::identity_proof::ProofGistView;
 use intent_sourcecontrol::{SourceControl, UserIdentity};
-use intent_store::InviteJoinOutcome;
+use intent_store::{InviteInsertOutcome, InviteJoinOutcome};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
@@ -376,6 +376,11 @@ impl Services {
         self.require_owner(workspace_id, "workspace.invite.create")
             .await?;
         let ws = self.store.get_workspace(workspace_id).await?;
+        // Early refusal before any forge lookup; the authoritative check is
+        // the one inside the insert's write transaction below.
+        if ws.archived {
+            return Err(Error::Invite(InviteErrorKind::WorkspaceArchived));
+        }
         let ttl = expires_in_secs.unwrap_or(DEFAULT_INVITE_TTL_SECS);
         if ttl == 0 || ttl > MAX_INVITE_TTL_SECS {
             return Err(Error::InvalidParams(format!(
@@ -466,7 +471,14 @@ impl Services {
                         .await?;
                 }
             }
-            self.store.insert_workspace_invite(&invite).await?;
+            // The archived check rides the insert's own write transaction:
+            // an archive that committed first closed every open invite and
+            // must not be followed by a fresh one.
+            if self.store.insert_workspace_invite(&invite).await?
+                == InviteInsertOutcome::WorkspaceArchived
+            {
+                return Err(Error::Invite(InviteErrorKind::WorkspaceArchived));
+            }
         }
         crate::publish_event(
             self.event_bus.as_ref(),
@@ -948,6 +960,9 @@ impl Services {
             }
             InviteJoinOutcome::OwnerSelfJoin => {
                 return Err(Error::Invite(InviteErrorKind::OwnerSelfJoin));
+            }
+            InviteJoinOutcome::WorkspaceArchived => {
+                return Err(Error::Invite(InviteErrorKind::WorkspaceArchived));
             }
         };
         let member_count = self.member_count(&invite.workspace_id).await?;

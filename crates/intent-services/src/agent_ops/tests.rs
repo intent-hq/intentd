@@ -20314,9 +20314,10 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
 
     // An archived workspace affirmatively parks every queue until unarchive:
     // nothing is flagged, user-origin or not.
-    let mut w = svc.store().get_workspace(&ws).await.expect("workspace");
-    w.archived = true;
-    svc.store().update_workspace(&w).await.expect("archive");
+    svc.store()
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive");
     let result = svc
         .agent_diagnostics_op(ws, None, None, None)
         .await

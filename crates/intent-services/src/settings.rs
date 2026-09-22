@@ -1860,6 +1860,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(100.0),
             50.0,
         ),
+        number(
+            "prCache.maxAgeSeconds",
+            "PR cache max age seconds",
+            "How old (in seconds) a cached PR read may be and still be served to an on-demand reader (github.pulls.get, ws.pr.snapshot) without a forge call; PR-monitor polls refresh the shared cache (minimum 10, maximum 600)",
+            "prCache",
+            Some(10.0),
+            Some(600.0),
+            60.0,
+        ),
         boolean(
             "updates.checkOnIdle",
             "Check for updates when idle",
@@ -4503,6 +4512,35 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// `[prCache]` exposes one TOML-backed number: `maxAgeSeconds` (default
+    /// 60, floor 10, max 600), whose catalog range agrees with the read-time
+    /// clamp constants.
+    #[test]
+    fn pr_cache_max_age_is_catalogued() {
+        let path = "prCache.maxAgeSeconds";
+        let def = find_definition(path).expect("prCache.maxAgeSeconds missing");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "prCache");
+        assert!(
+            matches!(
+                def.ty,
+                SettingType::Number {
+                    min: Some(10.0),
+                    max: Some(600.0),
+                    ..
+                }
+            ),
+            "range is [10, 600]: {:?}",
+            def.ty
+        );
+        assert_eq!(def.default_value, Some(json!(60.0)));
+        assert!(KNOWN_PATHS.contains(&path), "must be TOML-backed");
+        assert_eq!(intent_core::config::DEFAULT_PR_CACHE_MAX_AGE_SECONDS, 60);
+        assert_eq!(intent_core::config::MIN_PR_CACHE_MAX_AGE_SECONDS, 10);
+        assert_eq!(intent_core::config::MAX_PR_CACHE_MAX_AGE_SECONDS, 600);
     }
 
     /// `[updates]` exposes one TOML-backed boolean (`checkOnIdle`, default
