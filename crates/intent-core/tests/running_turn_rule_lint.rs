@@ -36,9 +36,12 @@
 //!   — its `}` followed by `.`, `?`, or `else` — is chained: the text before
 //!   its `{` and the text after its `}` form one statement, while the block
 //!   bodies stay their own statements.
-//! - An **or-group** is a maximal run of path tokens (`A::B::C`) joined by
-//!   single `|` inside one statement — `matches!(s, A | B | C)`, an
-//!   `A | B | C =>` match arm, any order, across lines. `||` ends a group.
+//! - An **or-group** is a maximal run of path alternatives (`A::B::C`)
+//!   joined by single `|` inside one statement — `matches!(s, A | B | C)`,
+//!   an `A | B | C =>` match arm, any order, across lines. An alternative
+//!   may carry `&` / `&mut` prefixes and wrapping parentheses
+//!   (`&A | &B | &C`, `(A) | (B) | (C)`): they are transparent, the group's
+//!   variant set comes from the paths alone. `||` ends a group.
 //! - A group is a **hit** when the set of variant names it spells as
 //!   `AgentStatus::<V>` (any path prefix, e.g. `intent_core::AgentStatus::<V>`)
 //!   or `Self::<V>` is exactly `{Pending, Active, Processing}`. Supersets
@@ -66,9 +69,9 @@
 //!   the text back to the previous `;` / `{` / `}`).
 //!
 //! Limits: bare imported variants (`use AgentStatus::*; Pending | Active |
-//! Processing`) are not recognized, nor are alternatives wrapped in
-//! parentheses or a `&` (`(AgentStatus::Pending) | (…)` — each is its own
-//! one-path group), a `Self::` triple on some other enum
+//! Processing`) are not recognized, nor are variants nested in another
+//! constructor (`Some(AgentStatus::Pending) | Some(…) | Some(…)` — each
+//! `Some` is its own one-path group), a `Self::` triple on some other enum
 //! with the same variant names is a false positive (opt out with a reason),
 //! a test module file that is not named `tests.rs` and not under a `tests/`
 //! directory is scanned like production code unless its item is
@@ -613,14 +616,19 @@ fn split_statements(text: &str) -> Vec<Statement> {
     out
 }
 
-/// The tokens an or-group is made of. Everything that is neither a path nor
-/// a `|` is `Other` and ends any group in progress.
+/// The tokens an or-group is made of. Everything that is neither a path, a
+/// `|`, nor one of the alternative wrappers (`&`, `(`, `)`) is `Other` and
+/// ends any group in progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
     /// `A::B::C` (whitespace allowed around `::`), as its segments.
     Path(Vec<String>),
     /// A single `|`; `||` is `Other`.
     Pipe,
+    /// A single `&`; `&&` is `Other`.
+    Amp,
+    LParen,
+    RParen,
     Other,
 }
 
@@ -679,16 +687,22 @@ fn tokenize(text: &str, first_line: usize) -> Vec<(Token, usize)> {
                 i += 1;
             }
             out.push((Token::Other, line));
-        } else if c == '|' {
-            if chars.get(i + 1) == Some(&'|') {
+        } else if c == '|' || c == '&' {
+            if chars.get(i + 1) == Some(&c) {
                 out.push((Token::Other, line));
                 i += 2;
             } else {
-                out.push((Token::Pipe, line));
+                let token = if c == '|' { Token::Pipe } else { Token::Amp };
+                out.push((token, line));
                 i += 1;
             }
         } else {
-            out.push((Token::Other, line));
+            let token = match c {
+                '(' => Token::LParen,
+                ')' => Token::RParen,
+                _ => Token::Other,
+            };
+            out.push((token, line));
             i += 1;
         }
     }
@@ -722,27 +736,61 @@ impl OrGroup {
     }
 }
 
+/// One or-alternative starting at `tokens[i]`: a path, optionally preceded
+/// by any mix of `&` / `&mut` and `(` and followed by exactly as many `)`
+/// as `(` were opened. Returns the path, its line, and the index after the
+/// alternative; `None` when the tokens at `i` do not form one (so a `(`
+/// that wraps a whole group, `(A | B)`, is not an alternative wrapper).
+fn alternative_at(tokens: &[(Token, usize)], i: usize) -> Option<(Vec<String>, usize, usize)> {
+    let mut j = i;
+    let mut parens = 0usize;
+    let (path, line) = loop {
+        match tokens.get(j)? {
+            (Token::LParen, _) => {
+                parens += 1;
+                j += 1;
+            }
+            (Token::Amp, _) => {
+                j += 1;
+                if matches!(tokens.get(j), Some((Token::Path(p), _)) if p == &["mut"]) {
+                    j += 1;
+                }
+            }
+            (Token::Path(p), line) => break (p.clone(), *line),
+            _ => return None,
+        }
+    };
+    j += 1;
+    for _ in 0..parens {
+        if !matches!(tokens.get(j), Some((Token::RParen, _))) {
+            return None;
+        }
+        j += 1;
+    }
+    Some((path, line, j))
+}
+
 fn or_groups(tokens: &[(Token, usize)]) -> Vec<OrGroup> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
-        let (Token::Path(first), line) = &tokens[i] else {
+        let Some((first, line, next)) = alternative_at(tokens, i) else {
             i += 1;
             continue;
         };
-        let mut paths = vec![first.clone()];
-        i += 1;
+        let mut paths = vec![first];
+        i = next;
         while tokens.get(i).is_some_and(|(t, _)| *t == Token::Pipe) {
-            match tokens.get(i + 1) {
-                Some((Token::Path(p), _)) => {
-                    paths.push(p.clone());
-                    i += 2;
+            match alternative_at(tokens, i + 1) {
+                Some((p, _, next)) => {
+                    paths.push(p);
+                    i = next;
                 }
-                _ => break,
+                None => break,
             }
         }
         if paths.len() > 1 {
-            out.push(OrGroup { line: *line, paths });
+            out.push(OrGroup { line, paths });
         }
     }
     out
@@ -1246,6 +1294,64 @@ fn scanned(s: AgentStatus) -> bool {
 }
 "#;
     assert_eq!(hit_lines(src), vec![line_of(src, "fn scanned") + 1]);
+}
+
+#[test]
+fn borrowed_and_parenthesized_alternatives_are_grouped() {
+    let src = r"
+fn by_ref(s: &AgentStatus) -> bool {
+    matches!(s, &AgentStatus::Pending | &AgentStatus::Active | &AgentStatus::Processing)
+}
+
+fn by_ref_arm(s: &AgentStatus) -> bool {
+    match s {
+        &AgentStatus::Pending | &AgentStatus::Active | &AgentStatus::Processing => true,
+        _ => false,
+    }
+}
+
+fn by_mut_ref(s: &mut AgentStatus) -> bool {
+    matches!(s, &mut AgentStatus::Pending | &mut AgentStatus::Active | &mut AgentStatus::Processing)
+}
+
+fn parenthesized(s: AgentStatus) -> bool {
+    matches!(s, (AgentStatus::Pending) | (AgentStatus::Active) | (AgentStatus::Processing))
+}
+
+fn mixed(s: &AgentStatus) -> bool {
+    matches!(s, (&AgentStatus::Pending) | &(AgentStatus::Active) | ((AgentStatus::Processing)))
+}
+
+fn whole_group_parenthesized(s: AgentStatus) -> bool {
+    matches!(s, (AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing))
+}
+
+fn by_ref_superset(s: &AgentStatus) -> bool {
+    matches!(
+        s,
+        &AgentStatus::Pending | &AgentStatus::Active | &AgentStatus::Processing | &AgentStatus::Waiting
+    )
+}
+
+fn by_ref_subset(s: &AgentStatus) -> bool {
+    matches!(s, &AgentStatus::Active | &AgentStatus::Processing)
+}
+
+fn nested_in_some(s: Option<AgentStatus>) -> bool {
+    matches!(s, Some(AgentStatus::Pending) | Some(AgentStatus::Active) | Some(AgentStatus::Processing))
+}
+";
+    assert_eq!(
+        hit_lines(src),
+        vec![
+            line_of(src, "fn by_ref(") + 1,
+            line_of(src, "fn by_ref_arm") + 2,
+            line_of(src, "fn by_mut_ref") + 1,
+            line_of(src, "fn parenthesized") + 1,
+            line_of(src, "fn mixed") + 1,
+            line_of(src, "fn whole_group_parenthesized") + 1,
+        ]
+    );
 }
 
 #[test]
