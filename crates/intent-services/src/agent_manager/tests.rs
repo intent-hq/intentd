@@ -12292,6 +12292,68 @@ async fn list_active_skips_busy_agent_with_missing_session_row() {
     assert_eq!(streams[0]["agentId"], json!(survivor));
 }
 
+/// `agent.listActive` issues a fixed number of SQL statements regardless of
+/// how many agents are busy: the busy set's `updated_at` read is ONE batched
+/// `IN`-list statement, not a per-agent lookup loop (intent-hq/intent#5626 —
+/// a real fan-out tripped the `rpc_profile` statement budget). Counted via
+/// sqlx's per-statement `sqlx::query` event, the same signal the daemon's
+/// `rpc_profile` counts.
+#[intent_test_macros::daemon_test]
+async fn list_active_statement_count_is_constant_in_busy_agents() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 64));
+    services.attach_agent_manager(&mgr);
+
+    const MANY: usize = 30;
+    let mut agents = Vec::with_capacity(MANY);
+    for i in 0..MANY {
+        let ws = WorkspaceId::from(format!("ws-list-active-count-{i}"));
+        let id = AgentId::from(format!("agent-list-active-count-{i}"));
+        seed_agent(&mgr, &ws, &id).await;
+        agents.push((id, ws));
+    }
+
+    // Warm the read pool uncounted so a lazy connect's PRAGMA setup batch
+    // cannot land inside a counted run.
+    services.agent_list_active_op().await.unwrap();
+
+    let (first, ws) = &agents[0];
+    assert!(mgr.try_begin(first, ws).await);
+    let (one, statements_with_one) =
+        crate::test_tracing::count_sqlx_statements(services.agent_list_active_op()).await;
+    assert_eq!(one.unwrap()["streams"].as_array().map(Vec::len), Some(1));
+
+    for (id, ws) in &agents[1..] {
+        assert!(mgr.try_begin(id, ws).await);
+    }
+    let (many, statements_with_many) =
+        crate::test_tracing::count_sqlx_statements(services.agent_list_active_op()).await;
+    assert_eq!(
+        many.unwrap()["streams"].as_array().map(Vec::len),
+        Some(MANY)
+    );
+
+    assert!(
+        statements_with_one >= 1,
+        "the busy-set read must reach SQLite at all (counter wiring): {statements_with_one}"
+    );
+    assert_eq!(
+        statements_with_many, statements_with_one,
+        "agent.listActive must not scale its statement count with the busy set \
+         (1 busy agent: {statements_with_one} statements, {MANY} busy agents: \
+         {statements_with_many})"
+    );
+    assert!(
+        statements_with_many <= 5,
+        "agent.listActive statement count must stay well under the rpc_profile \
+         budget: {statements_with_many}"
+    );
+}
+
 /// `try_begin` persists the runtime `Active` transition and publishes the
 /// self-sufficient `agent:status-changed` event so a hydrated client reflects
 /// the live runtime rather than the stored `Pending` placeholder.

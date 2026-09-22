@@ -2350,6 +2350,7 @@ dependencies = [
  "tokio",
  "toml_edit",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "zip",
 ]
