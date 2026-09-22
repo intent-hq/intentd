@@ -516,15 +516,17 @@ fn block_is_operand(chars: &[char], j: usize) -> bool {
 /// of its first non-whitespace character. The text before a `{` is held back
 /// until the matching `}`: when that `}` is followed by `.`, `?`, or `else`
 /// the held text resumes as the current statement (so an operand block chains
-/// with what surrounds it), otherwise it is emitted as it stood. Statements
-/// come back in source order.
+/// with what surrounds it), otherwise it is emitted as it stood. A chained
+/// statement keeps one newline per source line the block body spanned, so
+/// `tokenize` still reports source lines for the text after the block.
+/// Statements come back in source order.
 fn split_statements(text: &str) -> Vec<Statement> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
     let mut line = 1usize;
     let mut current = String::new();
     let mut start_line: Option<usize> = None;
-    let mut held: Vec<Option<Statement>> = Vec::new();
+    let mut held: Vec<(usize, Option<Statement>)> = Vec::new();
     let take = |current: &mut String, start_line: &mut Option<usize>| {
         let text = std::mem::take(current);
         start_line.take().map(|line| Statement { line, text })
@@ -532,13 +534,14 @@ fn split_statements(text: &str) -> Vec<Statement> {
     for (i, &c) in chars.iter().enumerate() {
         match c {
             ';' => out.extend(take(&mut current, &mut start_line)),
-            '{' => held.push(take(&mut current, &mut start_line)),
+            '{' => held.push((line, take(&mut current, &mut start_line))),
             '}' => {
                 out.extend(take(&mut current, &mut start_line));
-                if let Some(prefix) = held.pop().flatten() {
+                if let Some((open_line, Some(prefix))) = held.pop() {
                     if block_is_operand(&chars, i + 1) {
                         current = prefix.text;
                         current.push(' ');
+                        current.extend(std::iter::repeat_n('\n', line - open_line));
                         start_line = Some(prefix.line);
                     } else {
                         out.push(prefix);
@@ -558,7 +561,7 @@ fn split_statements(text: &str) -> Vec<Statement> {
         }
     }
     out.extend(take(&mut current, &mut start_line));
-    out.extend(held.into_iter().flatten());
+    out.extend(held.into_iter().filter_map(|(_, s)| s));
     out.sort_by_key(|s| s.line);
     out
 }
@@ -860,8 +863,7 @@ fn hit_lines(src: &str) -> Vec<usize> {
 }
 
 /// The retire-guard copy in `crates/intent-services/src/agent_ops.rs` as it
-/// stood before intentd commit e6703788 (#2058); the `agent_locks.rs` copy
-/// was identical.
+/// stood before intentd commit e6703788 (#2058).
 const AGENT_OPS_IS_RUNNING_TURN_PRE_2058: &str = r#"
 /// "Running a turn" statuses for the retire guard (§5.5, confirmed
 /// decision): a descendant in `pending`/`active`/`Processing` blocks
@@ -873,6 +875,19 @@ fn is_running_turn(status: AgentStatus) -> bool {
     )
 }
 "#;
+
+/// The lock-scope copy in `crates/intent-services/src/agent_locks.rs` before
+/// #2058 (the second free fn).
+const AGENT_LOCKS_IS_RUNNING_TURN_PRE_2058: &str = r"
+/// Whether `status` means the session is mid-turn (parity with the retire
+/// guard): `pending` / `active` / legacy `Processing`.
+fn is_running_turn(status: AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing
+    )
+}
+";
 
 /// The transfer export warning in `crates/intent-services/src/transfer.rs`
 /// before #2058: inline, inside a closure block, in a different order.
@@ -902,11 +917,60 @@ fn pre_2058_copies_are_flagged() {
         }]
     );
 
+    let src = AGENT_LOCKS_IS_RUNNING_TURN_PRE_2058;
+    assert_eq!(
+        hit_lines(src),
+        vec![line_of(src, "AgentStatus::Pending | AgentStatus::Active")]
+    );
+
     let src = TRANSFER_RUNNING_PRE_2058;
     assert_eq!(
         hit_lines(src),
         vec![line_of(src, "AgentStatus::Active | AgentStatus::Pending")]
     );
+}
+
+#[test]
+fn text_after_an_operand_block_keeps_its_source_line() {
+    let src = r"
+fn f(s: AgentStatus) -> bool {
+    matches!(
+        {
+            s
+        }.clone(),
+        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing
+    )
+}
+fn g(s: AgentStatus) -> bool {
+    let s = if s.is_active() {
+        s
+    } else {
+        s.parent()
+    }.status();
+    matches!(s, AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing)
+}
+";
+    assert_eq!(
+        hit_lines(src),
+        vec![
+            line_of(src, "        AgentStatus::Pending | AgentStatus::Active"),
+            line_of(src, "    matches!(s, AgentStatus::Pending"),
+        ]
+    );
+
+    // A reasoned marker above the triple suppresses at that (correct) line.
+    let src = r"
+fn f(s: AgentStatus) -> bool {
+    matches!(
+        {
+            s
+        }.clone(),
+        // running-turn: allow — fixture
+        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing
+    )
+}
+";
+    assert!(hit_lines(src).is_empty(), "{:?}", scan_source(src));
 }
 
 #[test]
@@ -958,6 +1022,38 @@ fn f(s: AgentStatus, t: Other) -> bool {
     let f = s == AgentStatus::Pending || s == AgentStatus::Active || s == AgentStatus::Processing;
     let g = s.is_running_turn();
     a || b || c || d || e || f || g
+}
+
+// lib.rs / transfer_export.rs: the live-agent set.
+fn is_live(s: AgentStatus) -> bool {
+    matches!(
+        s,
+        AgentStatus::Active | AgentStatus::Processing | AgentStatus::Waiting
+    )
+}
+
+// bindings/workspace.rs: the archive gate.
+fn blocks_archive(s: AgentStatus) -> bool {
+    matches!(
+        s,
+        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing | AgentStatus::Waiting
+    )
+}
+
+// agent_ops.rs: the wake-reason mapping.
+fn agent_status_wire(status: AgentStatus) -> Option<&'static str> {
+    match status {
+        AgentStatus::Pending | AgentStatus::Waiting => Some(WAITING),
+        AgentStatus::Active | AgentStatus::Processing => Some(RESPONDING),
+        AgentStatus::RuntimeIdle | AgentStatus::Idle => Some(IDLE),
+        AgentStatus::Completed => Some(COMPLETED),
+        AgentStatus::Error => Some(FAILED),
+        AgentStatus::Deleted => None,
+    }
+}
+
+fn is_active(status: AgentStatus) -> bool {
+    matches!(status, AgentStatus::Active)
 }
 ";
     assert!(hit_lines(src).is_empty(), "{:?}", scan_source(src));
