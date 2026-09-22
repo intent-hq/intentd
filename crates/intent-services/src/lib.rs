@@ -956,10 +956,11 @@ pub struct Services {
     /// envelope); unset means no `url` is stamped. Shared across clones.
     invite_links: Arc<OnceLock<Arc<dyn intent_core::InviteLinkBuilder>>>,
     /// In-memory watermark cache for incremental token-usage scanning (finding F2).
-    /// Maps `workspace_id` → `agent_message` count. When the watermark is unchanged
+    /// Maps `workspace_id` → (`agent_message` count, transcript mutation epoch).
+    /// When both are unchanged
     /// since the last scan, the workspace is skipped. A restart rescans once.
     /// Shared across clones so every scan tick observes the same watermark state.
-    token_usage_watermarks: Arc<Mutex<HashMap<WorkspaceId, u64>>>,
+    token_usage_watermarks: Arc<Mutex<HashMap<WorkspaceId, (u64, u64)>>>,
     /// The single in-flight (or last-terminal) GitHub device-flow slot backing
     /// `github.connect` / `github.cancelAuth` / `github.authStatus` (§5.27).
     /// At most one flow exists at a time; a `connect` while one is pending
@@ -5523,11 +5524,16 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<bool> {
-        // Cheap change detection: skip when the watermark is unchanged (finding F2).
-        let current_watermark = self
+        // Reuse the existing per-workspace mutation revision: replacement or
+        // delete+append can change provenance without changing COUNT(*).
+        // Capture BEFORE awaiting reads/recompute. A concurrent invalidation
+        // must remain visible to the next scan, not be consumed by this one.
+        let epoch = self.agent_list_cache.current_epoch(&workspace_id.0);
+        let message_count = self
             .store
             .get_workspace_message_watermark(workspace_id)
             .await?;
+        let current_watermark = (message_count, epoch);
         let last_watermark = self
             .token_usage_watermarks
             .lock()
@@ -5536,7 +5542,7 @@ impl Services {
             .copied();
         if let Some(last) = last_watermark {
             if last == current_watermark {
-                // No messages added/removed since last scan — skip tallying.
+                // No count change or service transcript mutation — skip tallying.
                 return Ok(false);
             }
         }
@@ -5592,49 +5598,124 @@ impl Services {
         workspace_id: &WorkspaceId,
         guard_zero_regression: bool,
     ) -> Result<bool> {
-        let written = self
-            .store
-            .update_workspace_token_usage(workspace_id, |usage_data, current| {
-                // Tally usage without hydrating full message logs (finding F2;
-                // snapshot/baseline-backed sessions arrive with empty contents).
-                let tallies: Vec<token_usage::AgentTokenTally> = usage_data
-                    .iter()
-                    .map(|(agent_id, model, snapshot, baseline, contents)| {
-                        token_usage::agent_token_tally(
+        let written =
+            self.store
+                .update_workspace_token_usage(workspace_id, |usage_data, current| {
+                    // Tally usage without hydrating full message logs (finding F2;
+                    // snapshot/baseline-backed sessions arrive with empty contents).
+                    let mut tallies = Vec::new();
+                    let mut cross_rows = Vec::new();
+                    for (agent_id, model, snapshot, baseline, contents, cells) in usage_data {
+                        let reported =
+                            intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref());
+                        let mut contributed = false;
+                        let has_materialized_totals = cells.iter().any(|cell| {
+                            cell.reported_totals != intent_core::TokenUsageTotals::default()
+                        });
+                        for cell in cells {
+                            let totals = if reported {
+                                cell.reported_totals.clone()
+                            } else {
+                                let mut totals = token_usage::agent_token_tally(
+                                    agent_id,
+                                    Some(&cell.model),
+                                    None,
+                                    None,
+                                    &cell.message_usage,
+                                )
+                                .totals;
+                                totals.cost.clone_from(&cell.reported_totals.cost);
+                                totals
+                            };
+                            if totals != intent_core::TokenUsageTotals::default()
+                                || cell.human_messages != 0
+                                || cell.agent_messages != 0
+                            {
+                                contributed = true;
+                                let model = if cell.model.is_empty() {
+                                    token_usage::UNKNOWN_MODEL.to_string()
+                                } else {
+                                    cell.model.clone()
+                                };
+                                tallies.push(token_usage::AgentTokenTally {
+                                    agent_id: agent_id.clone(),
+                                    model: model.clone(),
+                                    totals: totals.clone(),
+                                });
+                                cross_rows.push(intent_core::TokenUsageCrossFilterRow {
+                                    agent_id: agent_id.clone(),
+                                    model,
+                                    totals,
+                                    human_messages: cell.human_messages,
+                                    agent_messages: cell.agent_messages,
+                                });
+                            }
+                        }
+                        let fallback = token_usage::agent_token_tally(
                             agent_id,
                             model.as_deref(),
                             baseline.as_ref(),
                             snapshot.as_ref(),
                             contents,
-                        )
-                    })
-                    .collect();
-                let mut usage = token_usage::aggregate_token_usage(&tallies);
-                usage.last_scan_at = Some(now_iso());
-
-                if guard_zero_regression
-                    && !usage_data.is_empty()
-                    && usage.totals == intent_core::TokenUsageTotals::default()
-                    && current
-                        .is_some_and(|prev| prev.totals != intent_core::TokenUsageTotals::default())
-                {
-                    // Reconciliation guard: never clobber a fresher live snapshot
-                    // with an all-zero tally while session rows exist (the racing-
-                    // sweep case). An empty workspace (all sessions deleted) has no
-                    // turn to race, so the zero recount above writes through.
-                    return None;
-                }
-                let changed = match current {
-                    Some(prev) => {
-                        prev.by_agent_id != usage.by_agent_id
-                            || prev.by_model != usage.by_model
-                            || prev.totals != usage.totals
+                        );
+                        if reported
+                            && !has_materialized_totals
+                            && fallback.totals != intent_core::TokenUsageTotals::default()
+                        {
+                            if let Some(row) = cross_rows.iter_mut().rev().find(|row| {
+                                row.agent_id == *agent_id && row.model == fallback.model
+                            }) {
+                                row.totals = fallback.totals.clone();
+                            } else {
+                                cross_rows.push(intent_core::TokenUsageCrossFilterRow {
+                                    agent_id: agent_id.clone(),
+                                    model: fallback.model.clone(),
+                                    totals: fallback.totals.clone(),
+                                    human_messages: 0,
+                                    agent_messages: 0,
+                                });
+                            }
+                            tallies.push(fallback.clone());
+                            contributed = true;
+                        }
+                        if !contributed {
+                            tallies.push(fallback);
+                        }
                     }
-                    None => true,
-                };
-                changed.then_some(usage)
-            })
-            .await?;
+                    cross_rows.sort_by(|a, b| {
+                        a.agent_id
+                            .cmp(&b.agent_id)
+                            .then_with(|| a.model.cmp(&b.model))
+                    });
+                    let mut usage = token_usage::aggregate_token_usage(&tallies);
+                    usage.by_agent_model = Some(cross_rows);
+                    usage.last_scan_at = Some(now_iso());
+
+                    if guard_zero_regression
+                        && !usage_data.is_empty()
+                        && usage.totals == intent_core::TokenUsageTotals::default()
+                        && current.is_some_and(|prev| {
+                            prev.totals != intent_core::TokenUsageTotals::default()
+                        })
+                    {
+                        // Reconciliation guard: never clobber a fresher live snapshot
+                        // with an all-zero tally while session rows exist (the racing-
+                        // sweep case). An empty workspace (all sessions deleted) has no
+                        // turn to race, so the zero recount above writes through.
+                        return None;
+                    }
+                    let changed = match current {
+                        Some(prev) => {
+                            prev.by_agent_id != usage.by_agent_id
+                                || prev.by_model != usage.by_model
+                                || prev.by_agent_model != usage.by_agent_model
+                                || prev.totals != usage.totals
+                        }
+                        None => true,
+                    };
+                    changed.then_some(usage)
+                })
+                .await?;
         let Some(usage) = written else {
             return Ok(false);
         };
@@ -9113,28 +9194,28 @@ impl Services {
                 content
             };
             let blocks = serde_json::json!([{ "type": "text", "text": content }]);
-            if let Some(id) = message_id.as_deref() {
-                self.store
-                    .append_agent_message_with_id(
-                        &parent_agent_id,
-                        id,
-                        "user",
-                        &blocks,
-                        message_metadata.as_ref(),
-                        &now_iso(),
-                    )
-                    .await?;
+            let origin = if message_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("fromAgentId"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+            {
+                intent_store::UsageMessageOrigin::Agent
             } else {
-                self.store
-                    .append_agent_message_with_metadata(
-                        &parent_agent_id,
-                        "user",
-                        &blocks,
-                        message_metadata.as_ref(),
-                        &now_iso(),
-                    )
-                    .await?;
-            }
+                intent_store::UsageMessageOrigin::Excluded
+            };
+            let message_id = message_id.unwrap_or_else(crate::agent_ops::new_message_id);
+            self.store
+                .append_agent_message_with_provenance(
+                    &parent_agent_id,
+                    &message_id,
+                    "user",
+                    &blocks,
+                    message_metadata.as_ref(),
+                    &now_iso(),
+                    origin,
+                )
+                .await?;
             self.invalidate_agent_list_cache(workspace_id);
             Ok(serde_json::json!({ "success": true, "queued": false }))
         }
