@@ -328,6 +328,25 @@ fn status_code(response: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// Assert `response` is the guest-cap refusal: `503` carrying
+/// `Retry-After: GUEST_CAP_RETRY_AFTER_SECS` (header name case-insensitive).
+fn assert_guest_cap_refused(response: &str, ctx: &str) {
+    assert_eq!(status_code(response), 503, "{ctx}: {response}");
+    let want = intent_transport::GUEST_CAP_RETRY_AFTER_SECS.to_string();
+    let retry_after = response
+        .split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.trim().to_owned());
+    assert_eq!(
+        retry_after.as_deref(),
+        Some(want.as_str()),
+        "{ctx}: Retry-After header: {response}"
+    );
+}
+
 /// Build a WebSocket upgrade request head with optional Origin / bearer token.
 fn upgrade_req(target: &str, origin: Option<&str>, bearer: Option<&str>) -> String {
     let mut r = format!(
@@ -1484,10 +1503,14 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
 /// orphaned background and a retired session, `scope: "topLevel"` /
 /// `"delegated"` / `"background"` each return exactly their bin, the bins
 /// partition the default read, `parentAgentId` narrows `delegated` to one
-/// parent's direct sub-agents, every variant carries `scopeCounts`
-/// (workspace-wide, non-retired) next to `retiredCount`, the default
-/// response is otherwise byte-identical to `scope: "all"`, and the invalid
-/// combinations are `-32602` with the documented messages.
+/// parent's direct sub-agents, `orphanedOnly` narrows it to the children
+/// whose parent row is gone, every variant carries `scopeCounts`
+/// (workspace-wide, non-retired) and `delegatedCounts` (per direct parent,
+/// with the persisted-status running rule, `Σ total ==
+/// scopeCounts.delegated`, and the always-present `orphaned` sub-aggregate)
+/// next to `retiredCount`, the default response is otherwise byte-identical
+/// to `scope: "all"`, and the invalid combinations are `-32602` with the
+/// documented messages.
 #[intent_test_macros::daemon_test]
 async fn wss_agent_list_scope_bins_and_counts() {
     let srv = start(WsOptions::default()).await;
@@ -1547,6 +1570,59 @@ async fn wss_agent_list_scope_bins_and_counts() {
         )
         .await
         .expect("retire");
+    // A retired child under top-b: excluded from every count.
+    let retired_child = create_agent("retired-under-b", false, 9).await;
+    {
+        let child_id = intent_core::AgentId::from(retired_child.as_str());
+        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        session.parent_agent_id = Some(intent_core::AgentId::from(top_b.as_str()));
+        srv.store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("link retired child");
+        srv.api
+            .agent_retire(child_id, Some(workspace_id.clone()), None)
+            .await
+            .expect("retire child");
+    }
+    // An orphan: a running child whose parent is hard-deleted over the wire
+    // (the `parent_agent_id` dangles — `agent.retire` would cascade instead).
+    let gamma = create_agent("gamma", false, 30).await;
+    let gamma_child = create_agent("under-gamma", false, 31).await;
+    {
+        let child_id = intent_core::AgentId::from(gamma_child.as_str());
+        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        session.parent_agent_id = Some(intent_core::AgentId::from(gamma.as_str()));
+        srv.store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("link gamma child");
+        let deleted = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":32,"method":"agent.delete","params":{{"workspaceId":"{ws_id}","agentId":"{gamma}"}}}}"#
+            ),
+        )
+        .await;
+        assert!(deleted.get("error").is_none(), "delete gamma: {deleted}");
+    }
+    // Persisted statuses drive the `running` rule: `active` counts, the
+    // legacy capitalized `Processing` counts, `idle` does not.
+    for (child, status) in [
+        (&alpha_child, intent_core::AgentStatus::Active),
+        (&alpha_bg_child, intent_core::AgentStatus::RuntimeIdle),
+        (&beta_child, intent_core::AgentStatus::Processing),
+        (&gamma_child, intent_core::AgentStatus::Active),
+    ] {
+        let child_id = intent_core::AgentId::from(child.as_str());
+        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        session.status = status;
+        srv.store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("set child status");
+    }
 
     let list = |params: String, id: i64| {
         let frame = format!(
@@ -1578,9 +1654,38 @@ async fn wss_agent_list_scope_bins_and_counts() {
         15,
     )
     .await;
+    let orphans = list(
+        r#","scope":"delegated","orphanedOnly":true"#.to_string(),
+        18,
+    )
+    .await;
+    // `orphanedOnly: false` is the whole-bin read byte-for-byte.
+    let delegated_not_orphaned_only = list(
+        r#","scope":"delegated","orphanedOnly":false"#.to_string(),
+        19,
+    )
+    .await;
 
-    // Envelope: every variant is `{ agents, retiredCount, scopeCounts }`.
-    let expected_counts = serde_json::json!({ "topLevel": 2, "delegated": 3, "background": 1 });
+    let including_retired = list(r#","includeRetired":true"#.to_string(), 16).await;
+    let retired_only = list(r#","retiredOnly":true"#.to_string(), 17).await;
+
+    // Envelope: every variant is
+    // `{ agents, retiredCount, scopeCounts, delegatedCounts }`.
+    let expected_counts = serde_json::json!({ "topLevel": 2, "delegated": 4, "background": 1 });
+    // Per direct parent, non-retired only: top-a has an `active` (running)
+    // and an `idle` background child, top-b a legacy `Processing` (running)
+    // child — its retired child is excluded — and the deleted gamma keeps
+    // its raw key with its `active` orphan; Σ total == scopeCounts.delegated,
+    // and `orphaned` counts exactly gamma's child.
+    let expected_delegated = serde_json::json!({
+        "running": 3,
+        "byParent": {
+            top_a.as_str(): { "total": 2, "running": 1 },
+            top_b.as_str(): { "total": 1, "running": 1 },
+            gamma.as_str(): { "total": 1, "running": 1 },
+        },
+        "orphaned": { "total": 1, "running": 1 },
+    });
     for (label, v) in [
         ("default", &default),
         ("all", &all),
@@ -1588,6 +1693,9 @@ async fn wss_agent_list_scope_bins_and_counts() {
         ("delegated", &delegated),
         ("background", &background),
         ("delegated/parent", &under_a),
+        ("delegated/orphanedOnly", &orphans),
+        ("includeRetired", &including_retired),
+        ("retiredOnly", &retired_only),
     ] {
         assert_eq!(v["jsonrpc"], "2.0", "{label}: {v}");
         assert!(v.get("error").is_none(), "{label}: {v}");
@@ -1599,27 +1707,64 @@ async fn wss_agent_list_scope_bins_and_counts() {
             .collect();
         assert_eq!(
             keys,
-            ["agents", "retiredCount", "scopeCounts"],
+            ["agents", "retiredCount", "scopeCounts", "delegatedCounts"],
             "{label}: envelope keys: {v}"
         );
-        assert_eq!(v["result"]["retiredCount"], 1, "{label}: {v}");
+        assert_eq!(v["result"]["retiredCount"], 2, "{label}: {v}");
         assert_eq!(
             v["result"]["scopeCounts"], expected_counts,
             "{label}: scopeCounts are workspace-wide and non-retired: {v}"
         );
+        assert_eq!(
+            v["result"]["delegatedCounts"], expected_delegated,
+            "{label}: delegatedCounts are workspace-wide, per parent, non-retired: {v}"
+        );
+        let by_parent = v["result"]["delegatedCounts"]["byParent"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: byParent object: {v}"));
+        assert_eq!(
+            by_parent
+                .values()
+                .map(|c| c["total"].as_u64().unwrap())
+                .sum::<u64>(),
+            v["result"]["scopeCounts"]["delegated"].as_u64().unwrap(),
+            "{label}: Σ byParent[*].total == scopeCounts.delegated: {v}"
+        );
+        assert_eq!(
+            by_parent
+                .values()
+                .map(|c| c["running"].as_u64().unwrap())
+                .sum::<u64>(),
+            v["result"]["delegatedCounts"]["running"].as_u64().unwrap(),
+            "{label}: running == Σ byParent[*].running: {v}"
+        );
+        assert!(
+            v["result"]["delegatedCounts"]["orphaned"]["total"]
+                .as_u64()
+                .unwrap()
+                <= v["result"]["scopeCounts"]["delegated"].as_u64().unwrap(),
+            "{label}: orphaned.total ≤ scopeCounts.delegated: {v}"
+        );
     }
     // `scope: "all"` IS the default read.
     assert_eq!(default["result"], all["result"]);
+    // `orphanedOnly: false` IS the whole-bin delegated read.
+    assert_eq!(delegated["result"], delegated_not_orphaned_only["result"]);
 
     // Bins.
     assert_eq!(ids(&top), set(&[&top_a, &top_b]));
     assert_eq!(
         ids(&delegated),
-        set(&[&alpha_child, &alpha_bg_child, &beta_child]),
-        "a background CHILD is delegated, not background"
+        set(&[&alpha_child, &alpha_bg_child, &beta_child, &gamma_child]),
+        "a background CHILD is delegated, not background; an orphan is delegated"
     );
     assert_eq!(ids(&background), set(&[&orphan_bg]));
     assert_eq!(ids(&under_a), set(&[&alpha_child, &alpha_bg_child]));
+    assert_eq!(
+        ids(&orphans),
+        set(&[&gamma_child]),
+        "orphanedOnly serves exactly the children whose parent row is gone"
+    );
     // Partition of the default read: union equal, pairwise disjoint, and
     // the retired row is in no bin.
     let union: std::collections::BTreeSet<String> = ids(&top)
@@ -1633,8 +1778,9 @@ async fn wss_agent_list_scope_bins_and_counts() {
         ids(&default).len()
     );
     assert!(!union.contains(&retired_top));
+    assert!(!union.contains(&retired_child));
     // Scoped rows are the default read's rows, unchanged.
-    for v in [&top, &delegated, &background, &under_a] {
+    for v in [&top, &delegated, &background, &under_a, &orphans] {
         for row in v["result"]["agents"].as_array().unwrap() {
             let default_row = default["result"]["agents"]
                 .as_array()
@@ -1688,6 +1834,35 @@ async fn wss_agent_list_scope_bins_and_counts() {
     assert_eq!(v["error"]["code"], -32602, "{v}");
     assert_eq!(
         v["error"]["message"], "parentAgentId requires scope \"delegated\"",
+        "{v}"
+    );
+    expect_invalid(
+        r#","scope":"delegated","orphanedOnly":"yes""#,
+        28,
+        "orphanedOnly must be a boolean",
+    )
+    .await;
+    expect_invalid(
+        r#","orphanedOnly":true"#,
+        29,
+        "orphanedOnly requires scope \"delegated\"",
+    )
+    .await;
+    expect_invalid(
+        r#","scope":"background","orphanedOnly":true"#,
+        33,
+        "orphanedOnly requires scope \"delegated\"",
+    )
+    .await;
+    let v = list(
+        format!(r#","scope":"delegated","orphanedOnly":true,"parentAgentId":"{top_a}""#),
+        34,
+    )
+    .await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
         "{v}"
     );
 
@@ -2523,6 +2698,156 @@ async fn wss_agent_list_caps_previews_get_serves_full() {
         "agent.list caps lastToolUse input near the budget, got {} bytes: {row}",
         served_tool.len()
     );
+
+    srv.ws.stop().await;
+}
+
+/// Response-level frame fit (intent-hq/intent#5531, fourth recurrence of
+/// the oversize `agent.list` frame): a workspace of 460 delegated sessions
+/// whose rows all sit inside the #2001 row contract — every preview at
+/// `AGENT_LIST_PREVIEW_BUDGET_BYTES`, detail fields stripped — used to
+/// encode to ~1.1 MB on the reproducing request shapes (the unscoped
+/// default read every FE reconciliation caller issues, and the sidebar's
+/// `scope: "delegated"` expand). Both frames must now stay under the 1 MiB
+/// `rpc_profile` soft limit, with every row keeping its fields (harder
+/// truncation, same shape) and no preview over the default cap. Seeds the
+/// sessions through the in-process API (one WSS round-trip per shape keeps
+/// the test fast); the assertion is on the literal frame bytes.
+#[intent_test_macros::daemon_test]
+async fn wss_agent_list_frame_stays_under_soft_limit_at_460_sessions() {
+    const ROWS: usize = 460;
+    const SOFT_LIMIT_BYTES: usize = 1024 * 1024;
+    const BUDGET: usize = intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES;
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Frame Fit"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let workspace_id = WorkspaceId(ws_id.clone());
+
+    let create = |name: String, parent: Option<intent_core::AgentId>| {
+        let api = srv.api.clone();
+        let workspace_id = workspace_id.clone();
+        async move {
+            let created = api
+                .agent_create(
+                    workspace_id,
+                    Some(name),
+                    None,
+                    None,
+                    parent,
+                    None,
+                    intent_core::AgentCreateExtra::default(),
+                )
+                .await
+                .expect("agent.create");
+            intent_core::AgentId::from(created["agent"]["id"].as_str().expect("agent id"))
+        }
+    };
+    let coordinator = create("Coordinator".to_string(), None).await;
+    let long_user = format!("delegated task {}", "u".repeat(BUDGET * 2));
+    let long_response = format!("done {}", "a".repeat(BUDGET * 2));
+    let long_report = format!("report {}", "r".repeat(BUDGET * 2));
+    for i in 0..ROWS {
+        let id = create(format!("worker-{i}"), Some(coordinator.clone())).await;
+        srv.api
+            .agent_append_message(
+                id.clone(),
+                Some(workspace_id.clone()),
+                "user".to_string(),
+                serde_json::json!([{ "type": "text", "text": long_user }]),
+                None,
+            )
+            .await
+            .expect("append user message");
+        srv.api
+            .agent_append_message(
+                id.clone(),
+                Some(workspace_id.clone()),
+                "assistant".to_string(),
+                serde_json::json!([
+                    {
+                        "type": "tool_use", "id": format!("m:{i}"), "name": "launch-process",
+                        "input": { "command": "x".repeat(BUDGET * 2) },
+                        "toolCallId": format!("t{i}"),
+                    },
+                    { "type": "text", "text": long_response },
+                ]),
+                None,
+            )
+            .await
+            .expect("append assistant message");
+        srv.api
+            .agent_update(
+                id,
+                Some(workspace_id.clone()),
+                serde_json::json!({ "completionReport": long_report }),
+            )
+            .await
+            .expect("set completionReport");
+    }
+
+    for (label, params) in [
+        ("default", String::new()),
+        ("scope=delegated", r#","scope":"delegated""#.to_string()),
+    ] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.list","params":{{"workspaceId":"{ws_id}"{params}}}}}"#
+        );
+        let text = wss_call_text(srv.port, srv.cfg.clone(), &frame).await;
+        assert!(
+            text.len() < SOFT_LIMIT_BYTES,
+            "{label}: agent.list frame is {} B, at or over the {SOFT_LIMIT_BYTES} B soft limit",
+            text.len()
+        );
+        let listed: Value = serde_json::from_str(&text).expect("json frame");
+        let rows = listed["result"]["agents"].as_array().expect("agents array");
+        let expected_rows = if label == "default" { ROWS + 1 } else { ROWS };
+        assert_eq!(
+            rows.len(),
+            expected_rows,
+            "{label}: every session is listed"
+        );
+        for row in rows.iter().filter(|r| r["parentAgentId"].is_string()) {
+            // Same shape as the per-row contract: every preview field is
+            // still present (truncated harder, never omitted) and under the
+            // default cap; the tool name survives.
+            for (field, value) in [
+                ("lastUserMessage", &row["lastUserMessage"]),
+                ("lastAgentResponse", &row["lastAgentResponse"]),
+                (
+                    "metadata.completionReport",
+                    &row["metadata"]["completionReport"],
+                ),
+            ] {
+                let len = value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{label}: {field} present on every row: {row}"))
+                    .len();
+                assert!(
+                    (1..=BUDGET).contains(&len),
+                    "{label}: {field} is {len} B, expected 1..={BUDGET}: {row}"
+                );
+            }
+            assert_eq!(
+                row["lastToolUse"]["name"].as_str(),
+                Some("launch-process"),
+                "{label}: tool name survives the frame fit: {row}"
+            );
+            assert_eq!(
+                row["lastToolUse"]["inputTruncated"].as_bool(),
+                Some(true),
+                "{label}: re-capped tool input stays flagged: {row}"
+            );
+        }
+    }
 
     srv.ws.stop().await;
 }
@@ -3365,6 +3690,435 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     srv.ws.stop().await;
 }
 
+/// Direct member add: `principal.list` over the wire answers the owner
+/// (legacy token → administrator) with every non-primary principal holding
+/// an active credential — `{ principals: [{ principalId, login, displayName,
+/// avatarUrl, githubUserId }] }`, oldest first — and omits the primary
+/// principal and a guest whose credentials were all revoked. A guest
+/// connection (per-principal credential) is refused at the transport
+/// allowlist with `-32003 Forbidden`.
+#[intent_test_macros::daemon_test]
+async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
+    use intent_core::{Principal, PrincipalId};
+
+    let srv = start(WsOptions::default()).await;
+    let primary = srv
+        .store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+    srv.store
+        .insert_principal_credential(&primary.id, &sha256_hex(b"primary-extra"))
+        .await
+        .expect("primary credential");
+
+    let guest = |login: &str, github_user_id: i64, created_at: &str| Principal {
+        id: PrincipalId::new(),
+        github_user_id: Some(github_user_id),
+        login: Some(login.to_string()),
+        display_name: Some(format!("{login} name")),
+        avatar_url: Some(format!("https://example.test/{login}.png")),
+        is_primary: false,
+        created_at: created_at.to_string(),
+        updated_at: created_at.to_string(),
+    };
+    let older = guest("older", 11, "2026-01-01T00:00:00Z");
+    let newer = guest("newer", 12, "2026-01-02T00:00:00Z");
+    let revoked = guest("revoked", 13, "2026-01-03T00:00:00Z");
+    for p in [&older, &newer, &revoked] {
+        srv.store.upsert_principal(p).await.expect("guest");
+    }
+    let older_token = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a";
+    srv.store
+        .insert_principal_credential(&older.id, &sha256_hex(older_token.as_bytes()))
+        .await
+        .expect("older credential");
+    srv.store
+        .insert_principal_credential(&newer.id, &sha256_hex(b"newer"))
+        .await
+        .expect("newer credential");
+    srv.store
+        .insert_principal_credential(&revoked.id, &sha256_hex(b"revoked"))
+        .await
+        .expect("revoked credential");
+    srv.store
+        .revoke_all_principal_credentials(&revoked.id)
+        .await
+        .expect("revoke");
+
+    let frame = r#"{"jsonrpc":"2.0","id":1,"method":"principal.list","params":{}}"#;
+    let owner_view = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(owner_view["jsonrpc"], "2.0");
+    assert_eq!(owner_view["id"], 1);
+    assert!(
+        owner_view.get("error").is_none(),
+        "principal.list over legacy token: {owner_view}"
+    );
+    assert_eq!(
+        owner_view["result"],
+        serde_json::json!({ "principals": [
+            {
+                "principalId": older.id.0,
+                "login": "older",
+                "displayName": "older name",
+                "avatarUrl": "https://example.test/older.png",
+                "githubUserId": 11,
+            },
+            {
+                "principalId": newer.id.0,
+                "login": "newer",
+                "displayName": "newer name",
+                "avatarUrl": "https://example.test/newer.png",
+                "githubUserId": 12,
+            },
+        ] }),
+        "{owner_view}"
+    );
+
+    // A guest connection is refused by the transport allowlist.
+    let url = format!("wss://localhost:{}/ws?token={older_token}", srv.port);
+    let mut ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let guest_view = loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str::<Value>(&text).expect("json")
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert_eq!(guest_view["id"], 1);
+    assert_eq!(
+        guest_view["error"]["code"], -32003,
+        "principal.list over guest: {guest_view}"
+    );
+    assert_eq!(guest_view["error"]["message"], "Forbidden");
+
+    srv.ws.stop().await;
+}
+
+/// Direct member add with live delivery (two callers over WSS): a guest
+/// holding its own credential is connected and subscribed to the global
+/// `workspace` channel BEFORE it is a member — its seq-0 snapshot omits the
+/// owner's workspace. The owner's `workspace.members.add` answers
+/// `{ added: true, memberCount }`, the owner's own `events.subscribe`
+/// (`workspace:updated`, opened before the add) delivers the §6 event with
+/// the `{ members, addedPrincipalId, memberCount }` changes delta, and the
+/// guest's open channel delivers the workspace as an upsert delta
+/// (`updated[0].id == ws`, `myRole: collaborator`) without a reconnect; its
+/// next `workspace.get` succeeds. A second add is `{ added: false }` with no
+/// further delta and no further event. Refusals over the wire: the guest
+/// itself is `-32003` at the transport allowlist; an unknown principal, the
+/// primary principal and a guest whose credentials were all revoked are
+/// `-32602 invalid-params` for the owner.
+#[intent_test_macros::daemon_test]
+async fn wss_members_add_delivers_workspace_to_connected_guest() {
+    use intent_core::{Principal, PrincipalId};
+    use serde_json::json;
+
+    type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+    async fn reply(ws: &mut Ws, id: u64) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == id {
+                            return v;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("reply within 10s")
+    }
+
+    async fn push(ws: &mut Ws, kind: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
+                            return v;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{kind} push within 10s"))
+    }
+
+    let srv = start(WsOptions::default()).await;
+    let primary = srv
+        .store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+
+    // Owner side (legacy token → administrator): one workspace.
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Direct add"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Two guests with their own credentials; one revokes itself.
+    let guest_of = |login: &str| Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some(login.to_string()),
+        display_name: Some(format!("{login} name")),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    let guest = guest_of("guest");
+    let revoked = guest_of("revoked");
+    let guest_token = "adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad";
+    for p in [&guest, &revoked] {
+        srv.store
+            .upsert_principal(p)
+            .await
+            .expect("guest principal");
+    }
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+    srv.store
+        .insert_principal_credential(&revoked.id, &sha256_hex(b"revoked"))
+        .await
+        .expect("revoked credential");
+    srv.store
+        .revoke_all_principal_credentials(&revoked.id)
+        .await
+        .expect("revoke");
+
+    // The guest connects and subscribes to the workspace channel first: the
+    // owner's workspace is not in its snapshot.
+    let url = format!("wss://localhost:{}/ws?token={guest_token}", srv.port);
+    let mut ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+    let mut next_id = 10u64;
+    let mut call = |method: &str, params: Value| {
+        next_id += 1;
+        let frame = json!({ "jsonrpc": "2.0", "id": next_id, "method": method, "params": params });
+        (next_id, frame.to_string())
+    };
+    let (id, frame) = call("workspace.get", json!({ "workspaceId": ws_id }));
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let before = reply(&mut ws, id).await;
+    assert_eq!(before["error"]["code"], -32602, "non-member get: {before}");
+    assert_eq!(before["error"]["data"]["code"], "not-found");
+    let (id, frame) = call("workspace.subscribe", json!({}));
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let sub = reply(&mut ws, id).await;
+    let sub_id = sub["result"]["subscriptionId"]
+        .as_str()
+        .expect("subscriptionId")
+        .to_string();
+    let snapshot = push(&mut ws, "snapshot").await;
+    assert_eq!(snapshot["params"]["subscriptionId"], sub_id);
+    assert_eq!(
+        snapshot["params"]["snapshot"],
+        json!([]),
+        "a non-member's snapshot is empty: {snapshot}"
+    );
+
+    // The guest cannot add itself: refused at the transport allowlist.
+    let (id, frame) = call(
+        "workspace.members.add",
+        json!({ "workspaceId": ws_id, "principalId": guest.id.0 }),
+    );
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let self_add = reply(&mut ws, id).await;
+    assert_eq!(self_add["error"]["code"], -32003, "guest add: {self_add}");
+    assert_eq!(self_add["error"]["message"], "Forbidden");
+
+    // The owner's own event feed: subscribed to `workspace:updated` before
+    // the add so the membership event is delivered to this client.
+    let mut owner_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    owner_ws
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "events.subscribe",
+                "params": { "eventTypes": ["workspace:updated"], "workspaceId": ws_id },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send");
+    let sub = reply(&mut owner_ws, 1).await;
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "events.subscribe: {sub}"
+    );
+
+    // Owner refusals: unknown / primary / no active credential.
+    let owner_add = |principal_id: String, rpc_id: u64| {
+        let frame = json!({
+            "jsonrpc": "2.0", "id": rpc_id, "method": "workspace.members.add",
+            "params": { "workspaceId": ws_id, "principalId": principal_id },
+        })
+        .to_string();
+        let (port, cfg) = (srv.port, srv.cfg.clone());
+        async move { wss_call(port, cfg, &frame).await }
+    };
+    for (what, principal_id) in [
+        ("unknown", PrincipalId::new().0),
+        ("primary", primary.id.0.clone()),
+        ("revoked", revoked.id.0.clone()),
+    ] {
+        let v = owner_add(principal_id, 2).await;
+        assert_eq!(v["error"]["code"], -32602, "{what}: {v}");
+        assert_eq!(v["error"]["data"]["code"], "invalid-params", "{what}: {v}");
+        assert!(v.get("result").is_none(), "{what}: {v}");
+    }
+
+    // The add: result shape, then the guest's live delta.
+    let added = owner_add(guest.id.0.clone(), 3).await;
+    assert_eq!(added["jsonrpc"], "2.0");
+    assert_eq!(added["id"], 3);
+    assert_eq!(
+        added["result"],
+        json!({ "added": true, "memberCount": 2 }),
+        "{added}"
+    );
+    let delta = push(&mut ws, "delta").await;
+    assert_eq!(delta["params"]["subscriptionId"], sub_id);
+    assert_eq!(delta["params"]["seq"], 1, "{delta}");
+    let row = &delta["params"]["delta"]["updated"][0];
+    assert_eq!(row["id"], ws_id, "live add delta: {delta}");
+    assert_eq!(row["myRole"], "collaborator", "{delta}");
+    assert!(
+        delta["params"]["delta"].get("removedIds").is_none(),
+        "{delta}"
+    );
+
+    // The owner's `events.event`: the §6.5 `workspace:updated` membership
+    // delta is self-sufficient (`members`, `addedPrincipalId`, `memberCount`).
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match owner_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:updated"
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = owner_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the owner's workspace:updated");
+    assert_eq!(evt["workspaceId"], ws_id.as_str(), "{evt}");
+    assert_eq!(evt["data"]["workspaceId"], ws_id.as_str(), "{evt}");
+    assert_eq!(
+        evt["data"]["changes"],
+        json!({
+            "members": true,
+            "addedPrincipalId": guest.id.0,
+            "memberCount": 2,
+        }),
+        "membership event delta: {evt}"
+    );
+
+    // Same connection, now a member.
+    let (id, frame) = call("workspace.get", json!({ "workspaceId": ws_id }));
+    ws.send(Message::Text(frame.into())).await.expect("send");
+    let after = reply(&mut ws, id).await;
+    assert!(after.get("error").is_none(), "member get: {after}");
+    assert_eq!(after["result"]["workspace"]["id"], ws_id);
+    assert_eq!(after["result"]["workspace"]["myRole"], "collaborator");
+
+    // Idempotent: nothing added, nothing pushed.
+    let again = owner_add(guest.id.0.clone(), 4).await;
+    assert_eq!(
+        again["result"],
+        json!({ "added": false, "memberCount": 2 }),
+        "{again}"
+    );
+    let quiet = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "subscription.push" {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "idempotent add pushed: {quiet:?}");
+    let quiet_owner = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match owner_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event" {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        quiet_owner.is_err(),
+        "idempotent add published an event: {quiet_owner:?}"
+    );
+
+    let roster = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.members.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let members = roster["result"]["members"].as_array().expect("members");
+    assert_eq!(members.len(), 2, "{roster}");
+    assert!(
+        members
+            .iter()
+            .any(|m| m["principalId"] == guest.id.0 && m["role"] == "collaborator"),
+        "{roster}"
+    );
+    assert_eq!(roster["result"]["guestCount"], 1, "{roster}");
+
+    drop(ws);
+    drop(owner_ws);
+    srv.ws.stop().await;
+}
+
 /// Multiplayer w3: the capability matrix is enforced in the service layer,
 /// keyed on the caller the connection was bound to. On a workspace the
 /// primary user created, a **non-member** guest is answered `NotFound`
@@ -3589,10 +4343,27 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
 
     // Owner-only stays refused with -32003 for a collaborator member —
     // including `agent.replaceMessages`, which would persist client-supplied
-    // user rows (and their `fromPrincipalId`) verbatim.
+    // user rows (and their `fromPrincipalId`) verbatim, and agent creation /
+    // delegation (decided 2026-09-19: guests steer existing agents only).
     for (method, params) in [
         (
+            "agent.create",
+            json!({ "workspaceId": ws_id, "name": "Guest Spawn" }),
+        ),
+        (
+            "agent.delegate",
+            json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+        ),
+        (
+            "agent.wakeOrCreate",
+            json!({ "workspaceId": ws_id, "taskNoteId": note_id, "contextMessage": "guest kickoff" }),
+        ),
+        (
             "agent.delete",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        ),
+        (
+            "agent.cancelDelete",
             json!({ "workspaceId": ws_id, "agentId": agent_id }),
         ),
         (
@@ -3619,6 +4390,32 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         assert_eq!(v["error"]["code"], -32003, "collaborator {method}: {v}");
         assert_eq!(v["error"]["message"], "Forbidden", "{v}");
         assert!(v.get("result").is_none(), "{v}");
+    }
+
+    // Steering an existing agent stays a member capability: none of these
+    // is refused at the transport gate or narrowed to NotFound.
+    for (method, params) in [
+        (
+            "agent.rename",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "name": "Steered by guest" }),
+        ),
+        (
+            "agent.setModel",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "modelId": "default" }),
+        ),
+        (
+            "agent.stop",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        ),
+    ] {
+        let (id, frame) = call(method, params);
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        let v = reply(&mut ws, id).await;
+        assert_ne!(v["error"]["code"], -32003, "collaborator {method}: {v}");
+        assert_ne!(
+            v["error"]["data"]["code"], "not-found",
+            "collaborator {method}: {v}"
+        );
     }
 
     // `agent.update`: display metadata is a member edit; anything else
@@ -4420,7 +5217,9 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
 /// persisted queue snapshot a later drain or restart would redrive), while
 /// the removed member's connection loses access (`agent.getQueue` and
 /// `workspace.get` are `NotFound`). A second collaborator's entry is not
-/// touched.
+/// touched. Per-user queue visibility throughout: the owner reads the full
+/// queue; each collaborator's `agent.getQueue` shows only its own entry
+/// (`position` not renumbered).
 #[tokio::test]
 async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     use intent_core::events::AGENT_QUEUE_UPDATED;
@@ -4507,17 +5306,43 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         "{staying_queued}"
     );
 
-    let before = leaving
-        .call("agent.getQueue", json!({ "agentId": agent_id }))
-        .await;
+    // The owner (administrator) reads the full queue.
+    let before = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getQueue","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
     let queue = before["result"]["queue"].as_array().expect("queue");
     assert_eq!(queue.len(), 3, "{before}");
+    // A collaborator's entry carries the sender preamble above its text
+    // (multiplayer); the owner's is the bare text. Match on the body.
+    let body_of = |q: &Value| -> String {
+        let content = q["content"].as_str().expect("content");
+        content
+            .rsplit_once("\n\n")
+            .map_or(content, |(_, body)| body)
+            .to_string()
+    };
     let stamp_of = |content: &str, queue: &[Value]| {
         queue
             .iter()
-            .find(|q| q["content"] == content)
+            .find(|q| body_of(q) == content)
             .map(|q| q["messageMetadata"]["fromPrincipalId"].clone())
     };
+    for q in queue {
+        let preambled = q["content"]
+            .as_str()
+            .expect("content")
+            .starts_with("Message from @guest");
+        assert_eq!(
+            preambled,
+            body_of(q) != "from owner",
+            "only the collaborators' entries carry the sender preamble: {q}"
+        );
+    }
     assert_eq!(
         stamp_of("from owner", queue),
         Some(json!(primary.id.0)),
@@ -4533,6 +5358,30 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         Some(json!(staying.principal.id.0)),
         "{before}"
     );
+
+    // Each collaborator reads only its own entry, at its full-queue
+    // position (the projection filters, it does not renumber).
+    for (guest, body, position) in [
+        (&mut leaving, "from leaving", 1),
+        (&mut staying, "from staying", 2),
+    ] {
+        let own = guest
+            .call("agent.getQueue", json!({ "agentId": agent_id }))
+            .await;
+        let visible = own["result"]["queue"].as_array().expect("queue");
+        assert_eq!(
+            visible.len(),
+            1,
+            "collaborator sees only its own entry: {own}"
+        );
+        assert_eq!(body_of(&visible[0]), body, "{own}");
+        assert_eq!(visible[0]["position"], json!(position), "{own}");
+        assert_eq!(
+            visible[0]["author"]["principalId"],
+            json!(guest.principal.id.0),
+            "{own}"
+        );
+    }
 
     // Owner subscribes for the shrunk-queue echo, then removes the member.
     let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
@@ -4593,11 +5442,11 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     .await
     .expect("agent:queue:updated after removal");
     assert_eq!(echo["data"]["agentId"], agent_id.as_str(), "{echo}");
-    let echoed: Vec<&str> = echo["data"]["queue"]
+    let echoed: Vec<String> = echo["data"]["queue"]
         .as_array()
         .expect("queue")
         .iter()
-        .map(|q| q["content"].as_str().expect("content"))
+        .map(body_of)
         .collect();
     assert_eq!(echoed, vec!["from owner", "from staying"], "{echo}");
 
@@ -4613,7 +5462,7 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     let queue = after["result"]["queue"].as_array().expect("queue");
     assert_eq!(queue.len(), 2, "{after}");
     assert!(
-        queue.iter().all(|q| q["content"] != "from leaving"),
+        queue.iter().all(|q| body_of(q) != "from leaving"),
         "removed member's entry must be gone: {after}"
     );
     assert_eq!(
@@ -4628,7 +5477,7 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     );
     let owner_entry = queue
         .iter()
-        .find(|q| q["content"] == "from owner")
+        .find(|q| body_of(q) == "from owner")
         .expect("owner entry");
     assert_eq!(
         owner_entry["author"]["principalId"], primary.id.0,
@@ -4636,7 +5485,7 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     );
     let staying_entry = queue
         .iter()
-        .find(|q| q["content"] == "from staying")
+        .find(|q| body_of(q) == "from staying")
         .expect("staying entry");
     // Both guests share the `guest` login, so the resolved author is pinned
     // by principal id: the staying member's, not the removed one's.
@@ -4711,10 +5560,17 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     let still = staying
         .call("agent.getQueue", json!({ "agentId": agent_id }))
         .await;
+    let still_queue = still["result"]["queue"].as_array().expect("queue");
     assert_eq!(
-        still["result"]["queue"].as_array().map(Vec::len),
-        Some(2),
-        "{still}"
+        still_queue.len(),
+        1,
+        "staying collaborator still sees only its own entry: {still}"
+    );
+    assert_eq!(body_of(&still_queue[0]), "from staying", "{still}");
+    assert_eq!(
+        still_queue[0]["position"],
+        json!(1),
+        "the removed entry's slot closed up ahead of it: {still}"
     );
 
     drop(leaving);
@@ -4726,9 +5582,12 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
 /// call only the vetted `COLLABORATOR_METHODS`; everything else is refused
 /// before dispatch with the forbidden error (`-32003`, docs/protocol §9).
 /// The happy-path client boot trace (`client.hello`, `system.capabilities`,
-/// `host.status`, `principal.me`, `workspace.list`, `events.subscribe`,
-/// `workspace.subscribe`) succeeds; `host.exec`, `browser.exec`,
-/// `forward.create`, `github.authStatus`, `mcp.servers.list` are refused;
+/// `system.status`, `host.status`, `principal.me`, `workspace.list`,
+/// `events.subscribe`, `workspace.subscribe`) succeeds — `system.status`
+/// answers the daemon snapshot (`running`, `hostname`, `prettyHostname`,
+/// `host.locality == "remote"`) so the guest's status panel and route
+/// refresh work; `host.exec`, `browser.exec`, `forward.create`,
+/// `github.authStatus`, `mcp.servers.list`, `system.shutdown` are refused;
 /// the alias `git.diff` is canonicalised to `git.diffs` before the lookup
 /// (allowed, so it reaches the router and fails on params, not on -32003);
 /// a `/tunnel` upgrade with the collaborator credential is refused (403). The
@@ -4760,7 +5619,12 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         .expect("reply within 10s")
     }
 
-    let srv = start(WsOptions::default()).await;
+    // Wire the control surface so `system.status` is answered from the
+    // connection-task fast path, exactly as the composition root does.
+    let control: Arc<dyn SystemControl> = Arc::new(WatchHealthControl {
+        health: WatchHealth::default(),
+    });
+    let srv = start_with_control(WsOptions::default(), None, None, Some(control)).await;
 
     let guest_token = "dcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc";
     let guest = Principal {
@@ -4798,6 +5662,7 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
             json!({ "clientId": "w3-guest", "name": "guest fe", "capabilities": {} }),
         ),
         ("system.capabilities", json!({})),
+        ("system.status", json!({})),
         ("host.status", json!({})),
         ("principal.me", json!({})),
         ("workspace.list", json!({})),
@@ -4815,11 +5680,32 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
             v.get("error").is_none(),
             "{method} must succeed for a collaborator: {v}"
         );
+        if method == "system.status" {
+            // The guest's daemon-status panel reads the guest-safe projection
+            // (`wss_collaborator_system_status_is_projected_to_guest_safe_fields`
+            // pins its exact shape): running flag, hostnames and the serving
+            // transport's locality (WSS ⇒ `remote`).
+            let result = &v["result"];
+            assert_eq!(result["running"], true, "system.status: {v}");
+            assert!(
+                result["hostname"].is_string(),
+                "system.status hostname: {v}"
+            );
+            assert!(
+                result["prettyHostname"].is_string(),
+                "system.status prettyHostname: {v}"
+            );
+            assert_eq!(
+                result["host"]["locality"], "remote",
+                "system.status host.locality: {v}"
+            );
+        }
     }
 
     // Owner-only methods are refused before dispatch with -32003.
     for (method, params) in [
         ("host.exec", json!({ "command": "true" })),
+        ("system.shutdown", json!({})),
         (
             "browser.exec",
             json!({ "actions": [{ "action": "listTabs" }] }),
@@ -4882,6 +5768,257 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         admin["error"]["code"], -32003,
         "administrator must not be allowlisted: {admin}"
     );
+
+    srv.ws.stop().await;
+}
+
+/// [`SystemControl`] whose snapshot reports daemon-wide activity — connected
+/// clients, live and busy agents, process / disk / file-watch / fd telemetry,
+/// the agent-memory budget and the idle-update handshake — standing in for
+/// the manager-backed counters the composition root wires. None of it is
+/// scoped to a workspace, so for a collaborator all of it is activity outside
+/// its member workspaces.
+struct BusyDaemonControl;
+
+impl SystemControl for BusyDaemonControl {
+    fn status(&self) -> SystemStatus {
+        SystemStatus {
+            listen_mode: "both".to_string(),
+            uds: true,
+            tcp: true,
+            port: Some(5180),
+            clients: 4,
+            agents: 3,
+            fingerprint: Some("AB:CD".to_string()),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            has_display: true,
+            max_agents: 20,
+            version: "0.0.0-test".to_string(),
+            build_commit: Some("0123456789abcdef".to_string()),
+            uptime_seconds: 4242,
+            local_ips: vec!["192.168.1.10".to_string()],
+            tc_address: Some("tc7f2a91.tailcat.net".to_string()),
+            hostname: "studio.local".to_string(),
+            pretty_hostname: "Owner's Studio".to_string(),
+            device_kind: Some("macStudio".to_string()),
+            hardware_model: Some("Mac Studio".to_string()),
+            cpu_percent: 42.0,
+            memory_bytes: 104_857_600,
+            child_processes: Some(9),
+            child_memory_bytes: Some(2_684_354_560),
+            child_memory_peak_bytes: Some(5_368_709_120),
+            agent_memory_bytes: Some(2_147_483_648),
+            agent_process_count: Some(3),
+            agent_memory_budget_bytes: Some(21_474_836_480),
+            agent_memory_charged_bytes: Some(3_221_225_472),
+            queued_spawns: Some(1),
+            workspaces_disk_available_bytes: Some(250_000_000_000),
+            workspaces_disk_total_bytes: Some(1_000_000_000_000),
+            file_watch: Some(FileWatchStatus {
+                active_streams: 6,
+                total_roots: 7,
+                failed_roots: 1,
+            }),
+            fd_count: Some(312),
+            fd_limit: Some(10240),
+            update_supported: true,
+            busy_agents: 2,
+            idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+        }
+    }
+    fn host_environment(&self) -> intent_transport::HostEnvironment {
+        intent_transport::HostEnvironment {
+            hostname: "studio.local".to_string(),
+            pretty_hostname: "Owner's Studio".to_string(),
+            device_kind: Some("macStudio".to_string()),
+            hardware_model: Some("Mac Studio".to_string()),
+        }
+    }
+    fn request_shutdown(&self) {}
+    fn request_update(&self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    fn import_legacy(
+        &self,
+        _force: bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
+    > {
+        Box::pin(async { Err("not supported in this test".to_string()) })
+    }
+    fn git_credential(
+        &self,
+        _client_pid: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
+    {
+        Box::pin(async { None })
+    }
+}
+
+/// Multiplayer w3, least privilege: a collaborator's `system.status` is the
+/// guest-safe projection, not the administrator's snapshot. With the daemon
+/// reporting activity a guest is not a member of (connected clients, live and
+/// busy agents, process / disk / watcher telemetry — [`BusyDaemonControl`]),
+/// the collaborator's result over WSS carries exactly the boot / routing /
+/// host-identity fields (`running`, `listenMode`, `port`, `version`,
+/// `buildCommit`, `protocolVersion`, `fingerprint`, `localIps`, `tcAddress`,
+/// `hostname`, `prettyHostname`, `host.{os, arch, locality, deviceKind,
+/// hardwareModel}`) with the administrator's values, and none of the counts,
+/// telemetry or `transports`; the administrator's own `system.status` on the
+/// same daemon still returns them all. `system.shutdown` and
+/// `system.requestUpdate` stay refused (-32003) for the collaborator even
+/// though the control surface would serve them.
+#[intent_test_macros::daemon_test]
+async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
+    use intent_core::{Principal, PrincipalId};
+    use serde_json::json;
+
+    let control: Arc<dyn SystemControl> = Arc::new(BusyDaemonControl);
+    let srv = start_with_control(WsOptions::default(), None, None, Some(control)).await;
+
+    let guest_token = "dedededededededededededededededededededededededededededededededede";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    srv.store.upsert_principal(&guest).await.expect("guest");
+    srv.store
+        .insert_principal_credential(&guest.id, &sha256_hex(guest_token.as_bytes()))
+        .await
+        .expect("guest credential");
+
+    // Administrator (legacy token): the full snapshot, activity included.
+    let admin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"system.status","params":{}}"#,
+    )
+    .await;
+    assert!(admin.get("error").is_none(), "administrator: {admin}");
+    let full = &admin["result"];
+    assert_eq!(full["clients"], 4, "{admin}");
+    assert_eq!(full["agents"], 3, "{admin}");
+    assert_eq!(full["busyAgents"], 2, "{admin}");
+    assert_eq!(full["maxAgents"], 20, "{admin}");
+    assert_eq!(full["uptimeSeconds"], 4242, "{admin}");
+    assert_eq!(full["childProcesses"], 9, "{admin}");
+    assert_eq!(full["fileWatch"]["activeStreams"], 6, "{admin}");
+    assert_eq!(full["fdCount"], 312, "{admin}");
+    assert_eq!(full["updateSupported"], true, "{admin}");
+    assert!(full["idleUpdateCheck"].is_object(), "{admin}");
+    assert_eq!(full["host"]["hasDisplay"], true, "{admin}");
+
+    // Collaborator: the projection.
+    let url = format!("wss://localhost:{}/ws?token={guest_token}", srv.port);
+    let mut ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
+    let resp = drive_frames(
+        &mut ws,
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"method":"system.status","params":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"system.shutdown","params":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"system.requestUpdate","params":{}}"#.to_string(),
+        ],
+    )
+    .await;
+    let guest_status = &resp[0];
+    assert_eq!(guest_status["jsonrpc"], "2.0");
+    assert_eq!(guest_status["id"], 1);
+    assert!(
+        guest_status.get("error").is_none(),
+        "collaborator system.status: {guest_status}"
+    );
+    let projected = &guest_status["result"];
+
+    let mut keys: Vec<&str> = projected
+        .as_object()
+        .expect("result object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "buildCommit",
+            "fingerprint",
+            "host",
+            "hostname",
+            "listenMode",
+            "localIps",
+            "port",
+            "prettyHostname",
+            "protocolVersion",
+            "running",
+            "tcAddress",
+            "version",
+        ],
+        "collaborator system.status keys: {guest_status}"
+    );
+    let mut host_keys: Vec<&str> = projected["host"]
+        .as_object()
+        .expect("host object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    host_keys.sort_unstable();
+    assert_eq!(
+        host_keys,
+        ["arch", "deviceKind", "hardwareModel", "locality", "os"],
+        "collaborator system.status host keys: {guest_status}"
+    );
+
+    // Retained fields carry the administrator's values (both connections are
+    // WSS, so `host.locality` is `remote` for both).
+    for key in [
+        "running",
+        "listenMode",
+        "port",
+        "version",
+        "buildCommit",
+        "protocolVersion",
+        "fingerprint",
+        "localIps",
+        "tcAddress",
+        "hostname",
+        "prettyHostname",
+    ] {
+        assert_eq!(projected[key], full[key], "{key}: {guest_status}");
+    }
+    assert!(
+        full.get("transports").is_some(),
+        "administrator snapshot carries transports: {full}"
+    );
+    assert_eq!(
+        projected["host"],
+        json!({
+            "os": full["host"]["os"],
+            "arch": full["host"]["arch"],
+            "locality": "remote",
+            "deviceKind": "macStudio",
+            "hardwareModel": "Mac Studio",
+        })
+    );
+    assert_eq!(projected["tcAddress"], "tc7f2a91.tailcat.net");
+    assert_eq!(projected["localIps"], json!(["192.168.1.10"]));
+
+    // The other `system.*` methods are refused before the control surface.
+    for (i, method) in [(1usize, "system.shutdown"), (2, "system.requestUpdate")] {
+        let v = &resp[i];
+        assert_eq!(v["id"], i + 1);
+        assert_eq!(
+            v["error"]["code"], -32003,
+            "{method} must be refused for a collaborator: {v}"
+        );
+        assert!(v.get("result").is_none(), "{v}");
+    }
+    let _ = ws.close(None).await;
 
     srv.ws.stop().await;
 }
@@ -6063,8 +7200,15 @@ async fn wss_presence_typing_sources_and_snapshot() {
 /// resolved `author` per user row: the stamp, else the workspace's legacy
 /// author, else its owner (pre-multiplayer rows). Assistant rows carry no
 /// author; a non-user role never gets a stamp.
+///
+/// Multiplayer sender preamble: the collaborator's `agent.sendMessage` /
+/// `agent.queueMessage` content is persisted (and served) with the daemon's
+/// single-line preamble naming the guest above the text, while the owner's
+/// `agent.sendMessage` content stays byte-identical.
 #[intent_test_macros::daemon_test]
 async fn wss_user_messages_stamp_principal_and_serve_author() {
+    const GUEST_PREAMBLE: &str = "Message from @guest (Guest User), a collaborator (guest) of \
+                                  this workspace — not the workspace owner.";
     use intent_core::{Principal, PrincipalId, WorkspaceRole};
 
     async fn next_event(
@@ -6307,8 +7451,49 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
     assert_eq!(guest_row["author"]["principalId"], guest.id.0);
     assert_eq!(guest_row["author"]["login"], "guest");
     assert_eq!(guest_row["author"]["displayName"], "Guest User");
+    assert_eq!(
+        guest_row["contentBlocks"][0]["text"],
+        format!("{GUEST_PREAMBLE}\n\nhello from guest"),
+        "the collaborator's persisted content starts with the sender preamble: {guest_row}"
+    );
+    assert_eq!(
+        guest_row["contentBlocks"].as_array().map(Vec::len),
+        Some(1),
+        "{guest_row}"
+    );
     let owner_row = find(&appended_id);
     assert_eq!(owner_row["author"]["principalId"], primary.id.0);
+    let owner_sent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"agent.sendMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"hello from owner"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        owner_sent["result"]["success"], true,
+        "owner send: {owner_sent}"
+    );
+    let owner_sent_row = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let owner_sent_row = owner_sent_row["result"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == owner_sent["result"]["messageId"])
+        .unwrap_or_else(|| panic!("owner send row: {owner_sent_row}"))
+        .clone();
+    assert_eq!(
+        owner_sent_row["contentBlocks"][0]["text"], "hello from owner",
+        "the owner's content stays byte-identical (no preamble): {owner_sent_row}"
+    );
     assert!(
         messages
             .iter()
@@ -6372,11 +7557,16 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
         .as_array()
         .expect("queue array")
         .iter()
-        .find(|q| q["content"] == "queued by guest")
+        .find(|q| q["messageMetadata"]["fromPrincipalId"] == guest.id.0)
         .unwrap_or_else(|| panic!("queued entry: {queue}"));
     assert_eq!(
         entry["messageMetadata"]["fromPrincipalId"], guest.id.0,
         "queue entry carries the caller's stamp: {entry}"
+    );
+    assert_eq!(
+        entry["content"],
+        format!("{GUEST_PREAMBLE}\n\nqueued by guest"),
+        "the queue entry captures the sender preamble on its content: {entry}"
     );
 
     srv.ws.stop().await;
@@ -8967,6 +10157,368 @@ async fn health_reports_ok_and_client_count() {
     )
     .await;
     assert!(resp.contains("\"clients\":1"), "health body: {resp}");
+    srv.ws.stop().await;
+}
+
+/// Guest connection caps at the `/ws` upgrade: with
+/// `maxConnectionsPerGuest = 1` a guest's second connection is `503` (with
+/// `Retry-After`) while another guest still connects; with
+/// `maxGuestConnections = 2` the third guest is `503` while the owner
+/// (legacy token, never counted) still
+/// connects; `/health` carries `guestConnections`; and a guest that
+/// disconnects gives its seat back so the refused guest is admitted.
+#[intent_test_macros::daemon_test]
+async fn wss_guest_connection_caps_refuse_503_and_release_on_disconnect() {
+    use intent_core::{Principal, PrincipalId};
+    use intent_transport::GuestConnectionLimits;
+
+    let srv = start(WsOptions {
+        guest_limits: GuestConnectionLimits {
+            max_guest_connections: 2,
+            max_connections_per_guest: 1,
+        }
+        .into(),
+        ..WsOptions::default()
+    })
+    .await;
+
+    let tokens = [
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+    ];
+    for (n, token) in tokens.iter().enumerate() {
+        let guest = Principal {
+            id: PrincipalId::new(),
+            github_user_id: None,
+            login: Some(format!("guest-{n}")),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        srv.store.upsert_principal(&guest).await.expect("guest");
+        srv.store
+            .insert_principal_credential(&guest.id, &sha256_hex(token.as_bytes()))
+            .await
+            .expect("guest credential");
+    }
+
+    let (port, cfg) = (srv.port, srv.cfg.clone());
+    let health = || {
+        let cfg = cfg.clone();
+        async move {
+            https_request(
+                port,
+                cfg,
+                "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .await
+        }
+    };
+    let guest_upgrade = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move { https_request(port, cfg, &upgrade_req("/ws", None, Some(token))).await }
+    };
+    let guest_connect = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move {
+            let url = format!("wss://localhost:{port}/ws?token={token}");
+            common::wss_connect_with_retry(port, cfg, &url).await
+        }
+    };
+    let await_guest_connections = |want: &'static str| {
+        let health = &health;
+        async move {
+            for _ in 0..100 {
+                let resp = health().await;
+                if resp.contains(want) {
+                    return resp;
+                }
+                // timing-guard: poll interval
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("guestConnections never reached {want}")
+        }
+    };
+
+    assert!(
+        health().await.contains("\"guestConnections\":0"),
+        "fresh listener"
+    );
+
+    // Guest A takes its one seat; its second upgrade is refused at the
+    // per-guest cap while guest B is still admitted.
+    let a = guest_connect(tokens[0]).await;
+    await_guest_connections("\"guestConnections\":1").await;
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "guest A over its cap");
+    let _b = guest_connect(tokens[1]).await;
+    await_guest_connections("\"guestConnections\":2").await;
+
+    // The listener-wide cap is spent: guest C is refused, the owner is not.
+    assert_guest_cap_refused(&guest_upgrade(tokens[2]).await, "listener full");
+    let _owner = connect_ws(srv.port, srv.cfg.clone()).await;
+    let resp = health().await;
+    assert!(resp.contains("\"clients\":3"), "health body: {resp}");
+    assert!(
+        resp.contains("\"guestConnections\":2"),
+        "health body: {resp}"
+    );
+
+    // Guest A leaves; its seat admits guest C.
+    drop(a);
+    await_guest_connections("\"guestConnections\":1").await;
+    let _c = guest_connect(tokens[2]).await;
+    await_guest_connections("\"guestConnections\":2").await;
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "listener full again");
+
+    srv.ws.stop().await;
+}
+
+/// Guest connection caps hot-reload: `settings.update` on
+/// `sharing.maxGuestConnections` / `sharing.maxConnectionsPerGuest` changes
+/// admission for the NEXT `/ws` upgrade with the listener still running —
+/// no daemon restart, no listener toggle. Lowering below the admitted count
+/// evicts nobody (the next guest gets `503` until connections drain);
+/// raising again lets the next upgrade through with `101`. The live cell is
+/// followed exactly as the composition root wires it
+/// (`SharedGuestLimits::follow` over the daemon's settings registry).
+#[intent_test_macros::daemon_test]
+async fn wss_guest_connection_caps_apply_live_on_settings_update() {
+    use intent_core::{Principal, PrincipalId};
+    use intent_transport::{GuestConnectionLimits, SharedGuestLimits};
+
+    let live = SharedGuestLimits::new(GuestConnectionLimits {
+        max_guest_connections: 0,
+        max_connections_per_guest: 0,
+    });
+    let srv = start(WsOptions {
+        guest_limits: live.clone(),
+        ..WsOptions::default()
+    })
+    .await;
+    let _follower = live.follow(srv.registry.clone());
+
+    let tokens = [
+        "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+    ];
+    for (n, token) in tokens.iter().enumerate() {
+        let guest = Principal {
+            id: PrincipalId::new(),
+            github_user_id: None,
+            login: Some(format!("guest-{n}")),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        srv.store.upsert_principal(&guest).await.expect("guest");
+        srv.store
+            .insert_principal_credential(&guest.id, &sha256_hex(token.as_bytes()))
+            .await
+            .expect("guest credential");
+    }
+
+    let (port, cfg) = (srv.port, srv.cfg.clone());
+    let health = || {
+        let cfg = cfg.clone();
+        async move {
+            https_request(
+                port,
+                cfg,
+                "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .await
+        }
+    };
+    let guest_upgrade = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move { https_request(port, cfg, &upgrade_req("/ws", None, Some(token))).await }
+    };
+    let guest_connect = |token: &'static str| {
+        let cfg = cfg.clone();
+        async move {
+            let url = format!("wss://localhost:{port}/ws?token={token}");
+            common::wss_connect_with_retry(port, cfg, &url).await
+        }
+    };
+    let await_guest_connections = |want: &'static str| {
+        let health = &health;
+        async move {
+            for _ in 0..100 {
+                let resp = health().await;
+                if resp.contains(want) {
+                    return resp;
+                }
+                // timing-guard: poll interval
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("guestConnections never reached {want}")
+        }
+    };
+    // `settings.update` over the owner's WSS connection, then wait for the
+    // follower task to publish the new caps to the live cell.
+    let update_caps = |id: u64, path: &'static str, value: u32| {
+        let cfg = cfg.clone();
+        let live = live.clone();
+        async move {
+            let frame = format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"settings.update","params":{{"changes":[{{"path":"{path}","value":{value}}}]}}}}"#
+            );
+            let resp = wss_call(port, cfg, &frame).await;
+            assert_eq!(resp["id"], id);
+            assert_eq!(
+                resp["result"]["applied"][0]["path"], path,
+                "settings.update {path}: {resp}"
+            );
+            for _ in 0..100 {
+                let caps = live.get();
+                let current = match path {
+                    "sharing.maxGuestConnections" => caps.max_guest_connections,
+                    _ => caps.max_connections_per_guest,
+                };
+                if current == value {
+                    return;
+                }
+                // timing-guard: poll interval
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!(
+                "{path} never reached {value} in the live cell: {:?}",
+                live.get()
+            );
+        }
+    };
+
+    // Unlimited at start: both guests connect, guest A twice.
+    let a1 = guest_connect(tokens[0]).await;
+    let _a2 = guest_connect(tokens[0]).await;
+    let _b1 = guest_connect(tokens[1]).await;
+    await_guest_connections("\"guestConnections\":3").await;
+
+    // Lower the listener-wide cap below the admitted count: nobody is
+    // disconnected, the next upgrade is refused.
+    update_caps(1, "sharing.maxGuestConnections", 1).await;
+    let resp = health().await;
+    assert!(
+        resp.contains("\"guestConnections\":3"),
+        "no eviction on lowering: {resp}"
+    );
+    assert_guest_cap_refused(&guest_upgrade(tokens[1]).await, "over the lowered cap");
+
+    // Raise it: the next upgrade succeeds with the listener never restarted.
+    update_caps(2, "sharing.maxGuestConnections", 0).await;
+    let _b2 = guest_connect(tokens[1]).await;
+    await_guest_connections("\"guestConnections\":4").await;
+
+    // Per-guest cap: guest A holds 2 seats; a cap of 1 refuses A only, and
+    // A is admitted again once it drains below the new cap.
+    update_caps(3, "sharing.maxConnectionsPerGuest", 1).await;
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "A over its new cap");
+    let resp = health().await;
+    assert!(
+        resp.contains("\"guestConnections\":4"),
+        "no eviction on lowering the per-guest cap: {resp}"
+    );
+    drop(a1);
+    await_guest_connections("\"guestConnections\":3").await;
+    assert_guest_cap_refused(&guest_upgrade(tokens[0]).await, "A still at its new cap");
+    update_caps(4, "sharing.maxConnectionsPerGuest", 2).await;
+    let _a3 = guest_connect(tokens[0]).await;
+    await_guest_connections("\"guestConnections\":4").await;
+
+    srv.ws.stop().await;
+}
+
+/// Guest seats are released on every exit path, not only a clean close:
+/// a malformed upgrade refused after admission returns its permit, a
+/// heartbeat-reaped connection returns its permit, and the same guest is
+/// re-admitted afterwards. The administrator credential never occupies a
+/// guest seat. Real TLS, single-seat listener, deterministic reaper via
+/// `heartbeat_gate` (promoted from the #1917 verification probe).
+#[intent_test_macros::daemon_test]
+async fn wss_guest_connection_caps_release_after_early_reject_and_heartbeat_abort() {
+    let (reap_tx, reap_rx) = tokio::sync::watch::channel(false);
+    let srv = start(WsOptions {
+        guest_limits: intent_transport::GuestConnectionLimits {
+            max_guest_connections: 1,
+            max_connections_per_guest: 1,
+        }
+        .into(),
+        heartbeat_interval: Duration::from_millis(25),
+        heartbeat_timeout: Duration::from_millis(75),
+        heartbeat_gate: Some(reap_rx),
+        ..WsOptions::default()
+    })
+    .await;
+    let token = "d6".repeat(32);
+    seed_principal(&srv.store, "caps-guest", &token).await;
+    let (port, cfg) = (srv.port, srv.cfg.clone());
+    let health = || {
+        let cfg = cfg.clone();
+        async move {
+            let response = https_request(
+                port,
+                cfg,
+                "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            let body = response.split_once("\r\n\r\n").expect("HTTP body").1;
+            serde_json::from_str::<Value>(body).expect("health JSON")["guestConnections"]
+                .as_u64()
+                .expect("guest count")
+        }
+    };
+    let wait_count = |wanted: u64| {
+        let health = &health;
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while health().await != wanted {
+                    // timing-guard: poll interval
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("guest count converges");
+        }
+    };
+
+    // A malformed upgrade (no Sec-WebSocket-Key) is refused after the seat
+    // was taken; the permit must come back every time.
+    let bad = upgrade_req("/ws", None, Some(&token))
+        .replace("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n", "");
+    for _ in 0..3 {
+        let response = https_request(port, cfg.clone(), &bad).await;
+        assert_eq!(status_code(&response), 400);
+        assert_eq!(health().await, 0, "early-reject permit is returned");
+    }
+
+    // A silent guest occupies the only seat until the reaper aborts it; the
+    // administrator credential connects regardless and never counts.
+    let url = format!("wss://localhost:{port}/ws?token={token}");
+    for _ in 0..3 {
+        let silent = common::wss_connect_with_retry(port, cfg.clone(), &url).await;
+        wait_count(1).await;
+        let response =
+            https_request(port, cfg.clone(), &upgrade_req("/ws", None, Some(&token))).await;
+        assert_guest_cap_refused(&response, "cap is really occupied");
+        let owner = connect_ws(port, cfg.clone()).await;
+        assert_eq!(health().await, 1, "administrator credential is exempt");
+        reap_tx.send(true).expect("open heartbeat gate");
+        wait_count(0).await;
+        reap_tx.send(false).expect("close heartbeat gate");
+        drop((silent, owner));
+    }
+
+    // Re-admitted after the reaper released the seat; clean close releases too.
+    let mut readmitted = common::wss_connect_with_retry(port, cfg.clone(), &url).await;
+    wait_count(1).await;
+    readmitted.close(None).await.expect("clean close");
+    drop(readmitted);
+    wait_count(0).await;
     srv.ws.stop().await;
 }
 
@@ -19804,6 +21356,8 @@ impl SystemControl for WatchHealthControl {
             child_processes: None,
             child_memory_bytes: None,
             child_memory_peak_bytes: None,
+            agent_memory_bytes: None,
+            agent_process_count: None,
             agent_memory_budget_bytes: None,
             agent_memory_charged_bytes: None,
             queued_spawns: None,

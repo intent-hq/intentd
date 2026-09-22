@@ -374,7 +374,7 @@ async fn repository_only_workspace_auto_commits_via_repository_path() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn auto_commit_disabled_setting_is_silent_skip() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -396,7 +396,7 @@ async fn auto_commit_disabled_setting_is_silent_skip() {
     assert_eq!(commits.len(), 1, "no new commit when auto-commit disabled");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_override_disabled_is_silent_skip() {
     // Global git.autoCommit stays at its default (true); the persisted
     // per-workspace override (false) must win at the idle-commit gate.
@@ -462,7 +462,7 @@ async fn session_skip_auto_commit_is_silent_skip() {
     assert_eq!(commits.len(), 1);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn clean_tree_is_silent_skip() {
     let repo = init_git_repo();
     let tmp = TempDb::new();
@@ -569,7 +569,7 @@ async fn idle_auto_commit_does_not_sweep_unattributed_changes() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn idle_auto_commit_with_no_attributed_paths_is_silent_skip() {
     // Dirty worktree but zero tracked-change rows for the idle agent: the
     // attribution-filtered fallback yields an empty commit set, which the
@@ -592,7 +592,7 @@ async fn idle_auto_commit_with_no_attributed_paths_is_silent_skip() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn idle_auto_commit_ignores_other_agents_attribution() {
     // Attribution rows exist, but for a different agent: the idle agent's
     // attributed set is still empty, so nothing is committed.
@@ -1087,7 +1087,7 @@ async fn malformed_output_falls_back_to_subject() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn no_changes_skips_generation_and_commit() {
     let repo = init_git_repo();
     let tmp = TempDb::new();

@@ -16,8 +16,8 @@ use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
 use intent_services::{
     agent_memory_budget_bytes, default_process_cap, host_total_memory_bytes, init_adapter_slots,
     live_adapters, max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes,
-    AgentManager, BusEventSink, EventBus, GitStatusRefresher, PermissionPolicy, Services,
-    TreeMemoryProbe, TreeSample, WatcherRegistry,
+    AgentManager, AgentMemorySnapshot, BusEventSink, EventBus, GitStatusRefresher,
+    PermissionPolicy, ProcessSample, Services, TreeMemoryProbe, TreeSample, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -2023,6 +2023,13 @@ async fn cmd_serve(
         Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
         Err(e) => tracing::warn!(error = %e, "PR monitor rehydration failed"),
     }
+    // Populate the primary principal's GitHub identity once at boot when the
+    // row still predates the GitHub connection (`login: null`), so roster
+    // reads do not wait for a `principal.me` (intent-hq/intent#5534).
+    // Fire-and-forget: only spawns the bounded off-path refresh (one refresh
+    // per IDENTITY_REFRESH_INTERVAL across all trigger sites); a no-op
+    // without GitHub auth and never a startup failure.
+    services.refresh_primary_identity_at_startup().await;
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
     // recursive removal (monorepo#473). Spawned so the potentially multi-GB
@@ -2246,6 +2253,20 @@ async fn cmd_serve(
         );
     }
     ws_options.rpc_limiter = rpc_limiter.clone();
+    // Guest connection caps (`sharing.maxGuestConnections` /
+    // `sharing.maxConnectionsPerGuest`, 0 = unlimited): ONE live cell built
+    // here (like `rpc_limiter`) and carried by every listener the runtime
+    // toggle builds later, so a toggle keeps the current values. The follower
+    // task applies `settings.update` / config.toml live-reload changes to the
+    // cell; they reach the next guest upgrade without a listener restart and
+    // never evict an admitted connection.
+    let guest_limits =
+        intent_transport::SharedGuestLimits::new(intent_transport::GuestConnectionLimits {
+            max_guest_connections: boot_settings.effective.sharing.max_guest_connections,
+            max_connections_per_guest: boot_settings.effective.sharing.max_connections_per_guest,
+        });
+    let guest_limits_task = guest_limits.follow(settings_registry.clone());
+    ws_options.guest_limits = guest_limits;
 
     // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
     // the token store for auth layers (§5.2/§5.3). Always provision for runtime
@@ -2531,6 +2552,13 @@ async fn cmd_serve(
         } else {
             None
         };
+    // Let `workspace.invite.list` stamp each open invite with its `url`
+    // (multiplayer w4): the same envelope the create fast path resolves.
+    if let Some(provider) = pairing_info.clone() {
+        services.attach_invite_link_builder(Arc::new(intent_transport::InviteLinkResolver::new(
+            provider,
+        )));
+    }
 
     let shutdown = {
         let notify = shutdown_notify.clone();
@@ -2674,6 +2702,7 @@ async fn cmd_serve(
     // that hold them.
     watcher_init_task.abort();
     config_watcher_task.abort();
+    guest_limits_task.abort();
     // Stop the MCP health monitor and reap every external MCP server's process
     // group so no orphan stdio servers survive the daemon (§18.3). The deferred
     // start task is JOINED (bounded) rather than merely aborted: a server still
@@ -3296,6 +3325,10 @@ struct ChildTreeSample {
     /// Measurement only today — nothing enforces per-agent limits with it.
     /// Behind an `Arc` so `load()` stays a cheap clone.
     agent_bytes: std::sync::Arc<HashMap<AgentId, u64>>,
+    /// The processes behind each `agent_bytes` bucket, from the same walk: a
+    /// bucket's rows sum to its total by construction. Collected only on
+    /// published sweeps — burst sweeps pass no agent roots and produce none.
+    agent_processes: std::sync::Arc<HashMap<AgentId, Vec<ProcessSample>>>,
     /// Host memory available for new allocations (`sysinfo::System::
     /// available_memory`, Linux `MemAvailable`), refreshed in the same sweep
     /// as `memory_bytes` so the spawn budget compares a tree total and the
@@ -3310,6 +3343,10 @@ struct ChildTreeSample {
     /// sweep with a byte total from the next would make it discard a correction
     /// it should keep, or keep one it should discard.
     seq: u64,
+    /// RFC-3339 UTC time the sweep was stored, for `agent.memoryUsage`'s
+    /// `sampledAt` (§5.5) — the sample a client reads is up to one
+    /// [`CHILD_TREE_BASE_PERIOD`] old, and the stamp lets it say so.
+    sampled_at: String,
 }
 
 /// The three fields are published together under one lock rather than as
@@ -3325,13 +3362,13 @@ struct ChildTreeUsage {
 }
 
 impl ChildTreeUsage {
-    fn store(
-        &self,
-        count: usize,
-        memory_bytes: u64,
-        agent_bytes: HashMap<AgentId, u64>,
-        available_memory_bytes: Option<u64>,
-    ) {
+    fn store(&self, walk: TreeWalk, available_memory_bytes: Option<u64>) {
+        let TreeWalk {
+            count,
+            bytes: memory_bytes,
+            agent_bytes,
+            agent_processes,
+        } = walk;
         let mut guard = self.inner.write().expect("child tree usage lock poisoned");
         let peak_memory_bytes = guard.as_ref().map_or(memory_bytes, |prev| {
             prev.peak_memory_bytes.max(memory_bytes)
@@ -3342,8 +3379,10 @@ impl ChildTreeUsage {
             memory_bytes,
             peak_memory_bytes,
             agent_bytes: std::sync::Arc::new(agent_bytes),
+            agent_processes: std::sync::Arc::new(agent_processes),
             available_memory_bytes,
             seq,
+            sampled_at: intent_core::now_iso(),
         });
     }
 
@@ -3401,6 +3440,16 @@ impl TreeMemoryProbe for ChildTreeUsage {
         self.load()
             .map(|s| s.agent_bytes.as_ref().clone())
             .unwrap_or_default()
+    }
+
+    fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+        // One `load()` for the stamp and the rows: `agent.memoryUsage` reports
+        // a `sampledAt` that describes exactly the processes beside it, even
+        // when a `store()` lands while the request is being served.
+        self.load().map(|s| AgentMemorySnapshot {
+            sampled_at: Some(s.sampled_at),
+            processes: s.agent_processes.as_ref().clone(),
+        })
     }
 }
 
@@ -3469,10 +3518,26 @@ const CHILD_TREE_WARN_FRACTION: f64 = 0.5;
 /// Absolute WARN threshold used when total system RAM cannot be determined.
 const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// Aggregate `(process count, resident bytes, per-agent resident bytes)` of
-/// every pid reachable from `root` through the `pid -> children` adjacency,
-/// excluding `root` itself — the root is already reported as `memoryBytes`,
-/// and counting it twice would inflate every bundle's tree total.
+/// One pass of [`walk_descendants`]: the aggregate, the per-agent buckets and
+/// the rows behind them, all from the same traversal.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TreeWalk {
+    /// Descendant processes found (the root excluded).
+    count: usize,
+    /// Aggregate resident bytes of those descendants.
+    bytes: u64,
+    /// Resident bytes credited to each registered agent root.
+    agent_bytes: HashMap<AgentId, u64>,
+    /// The processes credited to each agent; a bucket's rows sum to its
+    /// `agent_bytes` entry. Empty when `agent_roots` is empty.
+    agent_processes: HashMap<AgentId, Vec<ProcessSample>>,
+}
+
+/// Aggregate process count and resident bytes, plus per-agent buckets and
+/// rows, of every pid reachable from `root` through the `pid -> children`
+/// adjacency, excluding `root` itself — the root is already reported as
+/// `memoryBytes`, and counting it twice would inflate every bundle's tree
+/// total.
 ///
 /// `agent_roots` maps each registered agent's spawned child pid to its agent
 /// id. During the walk, every descendant is additionally credited to the
@@ -3483,6 +3548,10 @@ const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// the aggregate. One pass, O(processes) — attribution rides the existing
 /// traversal instead of re-walking per agent.
 ///
+/// `describe` yields a descendant's `(name, cmdline)` and is called only for
+/// pids that land in a bucket, so a walk with no `agent_roots` — the burst
+/// sweep — never pays for the strings.
+///
 /// Split from [`descendant_tree_usage`] so the traversal is testable without a
 /// live process table. The walk is iterative and visited-guarded: a pid table
 /// sampled while processes exit and get reparented can contain a cycle, and
@@ -3490,12 +3559,11 @@ const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 fn walk_descendants(
     children: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
     memory_of: &dyn Fn(sysinfo::Pid) -> Option<u64>,
+    describe: &dyn Fn(sysinfo::Pid) -> (String, String),
     root: sysinfo::Pid,
     agent_roots: &HashMap<sysinfo::Pid, AgentId>,
-) -> (usize, u64, HashMap<AgentId, u64>) {
-    let mut count = 0usize;
-    let mut bytes = 0u64;
-    let mut agent_bytes: HashMap<AgentId, u64> = HashMap::new();
+) -> TreeWalk {
+    let mut walk = TreeWalk::default();
     let mut seen: HashSet<sysinfo::Pid> = HashSet::from([root]);
     // Each frame carries the bucket its subtree inherits: the nearest
     // registered agent root at or above it (`None` outside any agent subtree).
@@ -3510,21 +3578,31 @@ fn walk_descendants(
             // credited to the sub-agent, not its ancestor.
             let child_bucket = agent_roots.get(child).or(bucket);
             if let Some(memory) = memory_of(*child) {
-                count += 1;
-                bytes = bytes.saturating_add(memory);
+                walk.count += 1;
+                walk.bytes = walk.bytes.saturating_add(memory);
                 if let Some(agent) = child_bucket {
-                    let slot = agent_bytes.entry(agent.clone()).or_insert(0);
+                    let slot = walk.agent_bytes.entry(agent.clone()).or_insert(0);
                     *slot = slot.saturating_add(memory);
+                    let (name, cmdline) = describe(*child);
+                    walk.agent_processes
+                        .entry(agent.clone())
+                        .or_default()
+                        .push(ProcessSample {
+                            pid: child.as_u32(),
+                            parent_pid: pid.as_u32(),
+                            name,
+                            cmdline,
+                            memory_bytes: memory,
+                        });
                 }
             }
             stack.push((*child, child_bucket));
         }
     }
-    (count, bytes, agent_bytes)
+    walk
 }
 
-/// Walk `root`'s descendants in the refreshed process table, returning
-/// `(process count, aggregate resident bytes, per-agent resident bytes)`.
+/// Walk `root`'s descendants in the refreshed process table.
 ///
 /// Thread rows are excluded from both the adjacency and the sums: on Linux,
 /// sysinfo lists threads (`/proc/<pid>/task` entries) as `Process` rows whose
@@ -3536,7 +3614,7 @@ fn descendant_tree_usage(
     sys: &sysinfo::System,
     root: sysinfo::Pid,
     agent_roots: &HashMap<sysinfo::Pid, AgentId>,
-) -> (usize, u64, HashMap<AgentId, u64>) {
+) -> TreeWalk {
     let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
     for (pid, proc) in sys.processes() {
         if proc.thread_kind().is_some() {
@@ -3552,6 +3630,17 @@ fn descendant_tree_usage(
             sys.process(pid)
                 .filter(|p| p.thread_kind().is_none())
                 .map(sysinfo::Process::memory)
+        },
+        &|pid| {
+            sys.process(pid).map_or_else(Default::default, |p| {
+                let cmdline = p
+                    .cmd()
+                    .iter()
+                    .map(|arg| arg.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (p.name().to_string_lossy().into_owned(), cmdline)
+            })
         },
         root,
         agent_roots,
@@ -3605,7 +3694,7 @@ fn child_tree_sweep(live_chains: usize, since_full: Duration) -> ChildTreeSweep 
 /// a peak-only sweep in between while an ephemeral adapter chain is live, and
 /// nothing at all otherwise.
 fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsage>) {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     let Ok(pid) = sysinfo::get_current_pid() else {
         tracing::warn!("cannot resolve own pid; child-process memory sampling disabled");
@@ -3634,6 +3723,11 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
         // row (monorepo#2342). The walk filters thread rows defensively,
         // but not fetching them at all keeps the sweep cheap.
         let refresh_kind = ProcessRefreshKind::nothing().with_memory().without_tasks();
+        // Published sweeps also fetch each process's command line for the
+        // per-agent rows — once per process (`OnlyIfNotSet`: one
+        // `/proc/<pid>/cmdline` read when it first appears), and never on a
+        // burst sweep, which consumes only the aggregate.
+        let publish_refresh_kind = refresh_kind.with_cmd(UpdateKind::OnlyIfNotSet);
         let mut sys = System::new();
         let mut warned = false;
         let mut tick = tokio::time::interval(CHILD_TREE_BURST_PERIOD);
@@ -3651,14 +3745,22 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
                 ChildTreeSweep::Full => true,
                 ChildTreeSweep::Peak => false,
             };
-            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                if publish {
+                    publish_refresh_kind
+                } else {
+                    refresh_kind
+                },
+            );
             // Snapshot of registered agent root pids, taken alongside the
             // process-table refresh so the buckets describe the same instant
             // as the tree they partition. Burst (peak-only) sweeps skip it:
             // `observe_burst` consumes only the aggregate bytes, so paying
-            // the handles lock + per-descendant bucketing at sub-second
-            // cadence would buy nothing — an empty map keeps the walk on
-            // its aggregate-only fast path.
+            // the handles lock + per-descendant bucketing and row building
+            // at sub-second cadence would buy nothing — an empty map keeps
+            // the walk on its aggregate-only fast path.
             let agent_roots: HashMap<sysinfo::Pid, AgentId> = if publish {
                 manager
                     .agent_root_pids()
@@ -3668,7 +3770,8 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
             } else {
                 HashMap::new()
             };
-            let (count, bytes, agent_bytes) = descendant_tree_usage(&sys, pid, &agent_roots);
+            let walk = descendant_tree_usage(&sys, pid, &agent_roots);
+            let (count, bytes) = (walk.count, walk.bytes);
             if publish {
                 // Host headroom is read only on published sweeps: it is the
                 // spawn budget's second input, and the budget only consumes
@@ -3678,7 +3781,7 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
                     0 => None,
                     bytes => Some(bytes),
                 };
-                task_usage.store(count, bytes, agent_bytes, available);
+                task_usage.store(walk, available);
                 // Stamped from the poll instant, not from here: dating the
                 // baseline from when the sweep *finished* would add its own
                 // ~12 ms to every period and let the published cadence drift.
@@ -3873,6 +3976,8 @@ impl SystemControl for DaemonControl {
             child_processes: child_tree.as_ref().map(|s| s.count),
             child_memory_bytes: child_tree.as_ref().map(|s| s.memory_bytes),
             child_memory_peak_bytes: child_tree.as_ref().map(|s| s.peak_memory_bytes),
+            agent_memory_bytes: child_tree.as_ref().map(|s| s.agent_bytes.values().sum()),
+            agent_process_count: child_tree.as_ref().map(|s| s.agent_bytes.len()),
             agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
             agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
             queued_spawns: budget.map(|(_, _, queued)| queued),
@@ -9142,6 +9247,38 @@ mod tests {
         );
     }
 
+    /// A [`TreeWalk`] with buckets but no rows, for the `store()` tests that
+    /// only exercise the aggregate and bucket fields.
+    fn tree_walk(count: usize, bytes: u64, agent_bytes: HashMap<AgentId, u64>) -> TreeWalk {
+        TreeWalk {
+            count,
+            bytes,
+            agent_bytes,
+            agent_processes: HashMap::new(),
+        }
+    }
+
+    /// Deterministic `(name, cmdline)` for a fake pid.
+    fn describe(pid: sysinfo::Pid) -> (String, String) {
+        (
+            format!("proc-{pid}"),
+            format!("/bin/proc-{pid} --pid {pid}"),
+        )
+    }
+
+    /// One row as [`walk_descendants`] builds it from [`describe`] and a
+    /// `pid * 100` memory table.
+    fn row(pid: u32, parent_pid: u32) -> ProcessSample {
+        let (name, cmdline) = describe(sysinfo::Pid::from_u32(pid));
+        ProcessSample {
+            pid,
+            parent_pid,
+            name,
+            cmdline,
+            memory_bytes: u64::from(pid) * 100,
+        }
+    }
+
     /// A status read that beats the sampler's first tick must report `null`,
     /// not zero — a bundle reading `childMemoryBytes: 0` would conclude the
     /// daemon has no children, which is the opposite of what an unsampled
@@ -9150,7 +9287,7 @@ mod tests {
     fn child_tree_usage_is_none_until_the_first_sample() {
         let usage = ChildTreeUsage::default();
         assert_eq!(usage.load(), None);
-        usage.store(6, 4_294_967_296, HashMap::new(), None);
+        usage.store(tree_walk(6, 4_294_967_296, HashMap::new()), None);
         let sample = usage.load().expect("sampled");
         assert_eq!(sample.count, 6);
         assert_eq!(sample.memory_bytes, 4_294_967_296);
@@ -9167,26 +9304,45 @@ mod tests {
         let a = AgentId::from("agent-a");
         let b = AgentId::from("agent-b");
         usage.store(
-            4,
-            1_000,
-            HashMap::from([(a.clone(), 700), (b.clone(), 200)]),
+            TreeWalk {
+                count: 4,
+                bytes: 1_000,
+                agent_bytes: HashMap::from([(a.clone(), 700), (b.clone(), 200)]),
+                agent_processes: HashMap::from([
+                    (a.clone(), vec![row(7, 1)]),
+                    (b.clone(), vec![row(2, 1)]),
+                ]),
+            },
             None,
         );
         let sample = usage.load().expect("sampled");
         assert_eq!(sample.agent_bytes.get(&a), Some(&700));
         assert_eq!(sample.agent_bytes.get(&b), Some(&200));
+        assert_eq!(sample.agent_processes.get(&a), Some(&vec![row(7, 1)]));
+        assert_eq!(sample.agent_processes.get(&b), Some(&vec![row(2, 1)]));
 
         // A burst reading moves only the peak — the buckets stay put.
         usage.observe_burst(9_000);
         let after_burst = usage.load().expect("sampled");
         assert_eq!(after_burst.agent_bytes, sample.agent_bytes);
+        assert_eq!(after_burst.agent_processes, sample.agent_processes);
 
         // The next full sample replaces the buckets wholesale: an agent that
         // exited between sweeps must not linger.
-        usage.store(1, 300, HashMap::from([(b.clone(), 300)]), None);
+        usage.store(
+            TreeWalk {
+                count: 1,
+                bytes: 300,
+                agent_bytes: HashMap::from([(b.clone(), 300)]),
+                agent_processes: HashMap::from([(b.clone(), vec![row(3, 1)])]),
+            },
+            None,
+        );
         let next = usage.load().expect("sampled");
         assert_eq!(next.agent_bytes.get(&a), None);
         assert_eq!(next.agent_bytes.get(&b), Some(&300));
+        assert_eq!(next.agent_processes.get(&a), None);
+        assert_eq!(next.agent_processes.get(&b), Some(&vec![row(3, 1)]));
     }
 
     /// The probe's `agent_samples` (monorepo#2063 A2) serves the buckets from
@@ -9199,8 +9355,71 @@ mod tests {
         let probe: &dyn TreeMemoryProbe = &usage;
         assert!(probe.agent_samples().is_empty());
         let a = AgentId::from("agent-a");
-        usage.store(2, 900, HashMap::from([(a.clone(), 700)]), None);
+        usage.store(
+            TreeWalk {
+                count: 2,
+                bytes: 900,
+                agent_bytes: HashMap::from([(a.clone(), 700)]),
+                agent_processes: HashMap::from([(a.clone(), vec![row(7, 1)])]),
+            },
+            None,
+        );
         assert_eq!(probe.agent_samples().get(&a), Some(&700));
+    }
+
+    /// The probe's `agent_memory_snapshot` (§5.5 `agent.memoryUsage`) serves
+    /// the sweep's timestamp and its per-agent process rows as one value from
+    /// one `load()` — `None` before the first sample — so a `store()` landing
+    /// between two reads can never pair one sweep's stamp with the next
+    /// sweep's rows. Each stored sweep replaces both together, and the stamp
+    /// is the one the stored sample carries.
+    #[test]
+    fn child_tree_usage_probe_serves_one_agent_snapshot_per_sweep() {
+        let usage = ChildTreeUsage::default();
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert_eq!(probe.agent_memory_snapshot(), None);
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        usage.store(
+            TreeWalk {
+                count: 2,
+                bytes: 900,
+                agent_bytes: HashMap::from([(a.clone(), 700)]),
+                agent_processes: HashMap::from([(a.clone(), vec![row(7, 1)])]),
+            },
+            None,
+        );
+        let first = probe.agent_memory_snapshot().expect("sampled");
+        let first_stored = usage.load().expect("sampled");
+        assert_eq!(
+            first.sampled_at.as_deref(),
+            Some(first_stored.sampled_at.as_str())
+        );
+        assert_eq!(
+            first.processes,
+            HashMap::from([(a.clone(), vec![row(7, 1)])])
+        );
+
+        usage.store(
+            TreeWalk {
+                count: 1,
+                bytes: 200,
+                agent_bytes: HashMap::from([(b.clone(), 200)]),
+                agent_processes: HashMap::from([(b.clone(), vec![row(2, 1)])]),
+            },
+            None,
+        );
+        let second = probe.agent_memory_snapshot().expect("sampled");
+        let second_stored = usage.load().expect("sampled");
+        assert_eq!(
+            second.sampled_at.as_deref(),
+            Some(second_stored.sampled_at.as_str())
+        );
+        assert_eq!(
+            second.processes,
+            HashMap::from([(b.clone(), vec![row(2, 1)])]),
+            "the next sweep replaces the rows wholesale alongside its stamp"
+        );
     }
 
     /// The probe's `sample` serves the tree total, its sequence number and
@@ -9215,7 +9434,7 @@ mod tests {
         let usage = ChildTreeUsage::default();
         let probe: &dyn TreeMemoryProbe = &usage;
         assert_eq!(probe.sample(), None);
-        usage.store(2, 900, HashMap::new(), Some(63_000_000_000));
+        usage.store(tree_walk(2, 900, HashMap::new()), Some(63_000_000_000));
         assert_eq!(
             probe.sample(),
             Some(TreeSample {
@@ -9224,7 +9443,7 @@ mod tests {
                 available_memory: Some(63_000_000_000),
             })
         );
-        usage.store(3, 1_200, HashMap::new(), None);
+        usage.store(tree_walk(3, 1_200, HashMap::new()), None);
         assert_eq!(
             probe.sample(),
             Some(TreeSample {
@@ -9243,9 +9462,9 @@ mod tests {
     #[test]
     fn child_tree_usage_peak_is_a_high_water_mark() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000, HashMap::new(), None);
-        usage.store(24, 5_000_000_000, HashMap::new(), None);
-        usage.store(0, 0, HashMap::new(), None);
+        usage.store(tree_walk(4, 1_000_000_000, HashMap::new()), None);
+        usage.store(tree_walk(24, 5_000_000_000, HashMap::new()), None);
+        usage.store(tree_walk(0, 0, HashMap::new()), None);
         let sample = usage.load().expect("sampled");
         assert_eq!(
             (sample.count, sample.memory_bytes, sample.peak_memory_bytes),
@@ -9262,9 +9481,9 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_reaches_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(0, 10_000_000, HashMap::new(), None);
+        usage.store(tree_walk(0, 10_000_000, HashMap::new()), None);
         usage.observe_burst(6_970_000_000);
-        usage.store(0, 10_000_000, HashMap::new(), None);
+        usage.store(tree_walk(0, 10_000_000, HashMap::new()), None);
         let sample = usage.load().expect("sampled");
         assert_eq!(
             sample.peak_memory_bytes, 6_970_000_000,
@@ -9281,7 +9500,7 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_moves_only_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000, HashMap::new(), None);
+        usage.store(tree_walk(4, 1_000_000_000, HashMap::new()), None);
         let before = usage.load().expect("sampled");
         usage.observe_burst(7_000_000_000);
         let after = usage.load().expect("sampled");
@@ -9334,14 +9553,14 @@ mod tests {
         const A: (usize, u64) = (4, 1_000_000_000);
         const B: (usize, u64) = (24, 5_000_000_000);
         let usage = Arc::new(ChildTreeUsage::default());
-        usage.store(A.0, A.1, HashMap::new(), None);
+        usage.store(tree_walk(A.0, A.1, HashMap::new()), None);
 
         let writer = {
             let usage = usage.clone();
             std::thread::spawn(move || {
                 for i in 0..20_000 {
                     let (count, bytes) = if i % 2 == 0 { A } else { B };
-                    usage.store(count, bytes, HashMap::new(), None);
+                    usage.store(tree_walk(count, bytes, HashMap::new()), None);
                 }
             })
         };
@@ -9392,12 +9611,21 @@ mod tests {
         // plus a second agent 1 → 5, and an unrelated tree 9 → 10.
         let children = adjacency(&[(1, 2), (2, 3), (3, 4), (1, 5), (9, 10)]);
         let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
-        let (count, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
-        assert_eq!(count, 4, "2, 3, 4 and 5 are all descendants of 1");
+        let walk = walk_descendants(
+            &children,
+            &memory,
+            &describe,
+            sysinfo::Pid::from(1),
+            &HashMap::new(),
+        );
+        assert_eq!(walk.count, 4, "2, 3, 4 and 5 are all descendants of 1");
         // 200 + 300 + 400 + 500 — the root's own 100 is deliberately absent.
-        assert_eq!(bytes, 1400);
-        assert!(agent_bytes.is_empty(), "no registered roots, no buckets");
+        assert_eq!(walk.bytes, 1400);
+        assert!(
+            walk.agent_bytes.is_empty(),
+            "no registered roots, no buckets"
+        );
+        assert!(walk.agent_processes.is_empty(), "no buckets, no rows");
     }
 
     /// Attribution buckets each descendant under its nearest registered agent
@@ -9416,16 +9644,31 @@ mod tests {
             (sysinfo::Pid::from(2), a.clone()),
             (sysinfo::Pid::from(5), b.clone()),
         ]);
-        let (count, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
-        assert_eq!(count, 6);
-        assert_eq!(bytes, 200 + 300 + 400 + 500 + 600 + 700);
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        assert_eq!(walk.count, 6);
+        assert_eq!(walk.bytes, 200 + 300 + 400 + 500 + 600 + 700);
         // Agent A: its root 2 plus descendants 3 and 4.
-        assert_eq!(agent_bytes.get(&a), Some(&(200 + 300 + 400)));
+        assert_eq!(walk.agent_bytes.get(&a), Some(&(200 + 300 + 400)));
         // Agent B: just its root 5.
-        assert_eq!(agent_bytes.get(&b), Some(&500));
+        assert_eq!(walk.agent_bytes.get(&b), Some(&500));
         // 6 → 7 is under no registered root: aggregate-only.
-        assert_eq!(agent_bytes.values().sum::<u64>(), 1400);
+        assert_eq!(walk.agent_bytes.values().sum::<u64>(), 1400);
+
+        // The rows behind each bucket: the same pids, each with the pid it
+        // hangs off and its own RSS, and nothing from the unregistered chain.
+        assert_eq!(
+            walk.agent_processes.get(&a),
+            Some(&vec![row(2, 1), row(3, 2), row(4, 3)])
+        );
+        assert_eq!(walk.agent_processes.get(&b), Some(&vec![row(5, 1)]));
+        assert_eq!(walk.agent_processes.len(), 2);
+        for (agent, rows) in &walk.agent_processes {
+            assert_eq!(
+                rows.iter().map(|r| r.memory_bytes).sum::<u64>(),
+                walk.agent_bytes[agent],
+                "a bucket's rows sum to its total"
+            );
+        }
     }
 
     /// A registered root nested under another agent's subtree opens its own
@@ -9442,11 +9685,16 @@ mod tests {
             (sysinfo::Pid::from(2), a.clone()),
             (sysinfo::Pid::from(3), b.clone()),
         ]);
-        let (_, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
-        assert_eq!(bytes, 200 + 300 + 400);
-        assert_eq!(agent_bytes.get(&a), Some(&200), "only its own pid");
-        assert_eq!(agent_bytes.get(&b), Some(&(300 + 400)));
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        assert_eq!(walk.bytes, 200 + 300 + 400);
+        assert_eq!(walk.agent_bytes.get(&a), Some(&200), "only its own pid");
+        assert_eq!(walk.agent_bytes.get(&b), Some(&(300 + 400)));
+        assert_eq!(walk.agent_processes.get(&a), Some(&vec![row(2, 1)]));
+        assert_eq!(
+            walk.agent_processes.get(&b),
+            Some(&vec![row(3, 2), row(4, 3)]),
+            "the nested root's rows belong to the nested agent"
+        );
     }
 
     /// A registered root whose pid is not in the walked tree (already exited,
@@ -9457,10 +9705,10 @@ mod tests {
         let children = adjacency(&[(1, 2)]);
         let memory = |_: sysinfo::Pid| Some(10);
         let roots = HashMap::from([(sysinfo::Pid::from(42), AgentId::from("agent-gone"))]);
-        let (count, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
-        assert_eq!((count, bytes), (1, 10));
-        assert!(agent_bytes.is_empty());
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        assert_eq!((walk.count, walk.bytes), (1, 10));
+        assert!(walk.agent_bytes.is_empty());
+        assert!(walk.agent_processes.is_empty());
     }
 
     /// An agent root that vanished mid-walk (its memory read fails) still
@@ -9472,10 +9720,22 @@ mod tests {
         let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
         let a = AgentId::from("agent-a");
         let roots = HashMap::from([(sysinfo::Pid::from(2), a.clone())]);
-        let (count, bytes, agent_bytes) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
-        assert_eq!((count, bytes), (1, 700));
-        assert_eq!(agent_bytes.get(&a), Some(&700));
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        assert_eq!((walk.count, walk.bytes), (1, 700));
+        assert_eq!(walk.agent_bytes.get(&a), Some(&700));
+        // The dead root itself gets no row; the live child under it keeps
+        // the root as its parent pid.
+        let (name, cmdline) = describe(sysinfo::Pid::from(3));
+        assert_eq!(
+            walk.agent_processes.get(&a),
+            Some(&vec![ProcessSample {
+                pid: 3,
+                parent_pid: 2,
+                name,
+                cmdline,
+                memory_bytes: 700,
+            }])
+        );
     }
 
     /// A pid table sampled while processes exit and get reparented can contain
@@ -9485,10 +9745,15 @@ mod tests {
     fn walk_descendants_terminates_on_a_cycle() {
         let children = adjacency(&[(1, 2), (2, 3), (3, 1), (3, 2)]);
         let memory = |_: sysinfo::Pid| Some(10);
-        let (count, bytes, _) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
-        assert_eq!(count, 2, "each pid is counted exactly once");
-        assert_eq!(bytes, 20);
+        let walk = walk_descendants(
+            &children,
+            &memory,
+            &describe,
+            sysinfo::Pid::from(1),
+            &HashMap::new(),
+        );
+        assert_eq!(walk.count, 2, "each pid is counted exactly once");
+        assert_eq!(walk.bytes, 20);
     }
 
     /// A pid that vanished between the table refresh and the walk contributes
@@ -9498,10 +9763,15 @@ mod tests {
     fn walk_descendants_skips_pids_that_exited_mid_walk() {
         let children = adjacency(&[(1, 2), (2, 3)]);
         let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
-        let (count, bytes, _) =
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
-        assert_eq!(count, 1);
-        assert_eq!(bytes, 700);
+        let walk = walk_descendants(
+            &children,
+            &memory,
+            &describe,
+            sysinfo::Pid::from(1),
+            &HashMap::new(),
+        );
+        assert_eq!(walk.count, 1);
+        assert_eq!(walk.bytes, 700);
     }
 
     /// A leaf root reports an empty tree — the daemon before any agent spawns.
@@ -9510,8 +9780,14 @@ mod tests {
         let children = adjacency(&[(9, 10)]);
         let memory = |_: sysinfo::Pid| Some(10);
         assert_eq!(
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new()),
-            (0, 0, HashMap::new())
+            walk_descendants(
+                &children,
+                &memory,
+                &describe,
+                sysinfo::Pid::from(1),
+                &HashMap::new()
+            ),
+            TreeWalk::default()
         );
     }
 
@@ -9592,7 +9868,7 @@ mod tests {
         );
         assert_eq!(
             usage,
-            (0, 0, HashMap::new()),
+            TreeWalk::default(),
             "threads are not descendant processes: a walk rooted at a multi-threaded child must charge nothing"
         );
     }

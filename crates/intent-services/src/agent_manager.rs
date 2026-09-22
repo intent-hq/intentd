@@ -1053,6 +1053,22 @@ pub struct TreeSample {
     pub available_memory: Option<u64>,
 }
 
+/// One process in a registered agent's subtree, as the descendant-tree
+/// sampler saw it in the sweep that produced the agent's bucket. The rows of a
+/// bucket sum to the bucket's [`TreeMemoryProbe::agent_samples`] total by
+/// construction — both come from the same walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessSample {
+    pub pid: u32,
+    pub parent_pid: u32,
+    /// Short process name (Linux: the 15-char `comm`).
+    pub name: String,
+    /// Full command line joined with single spaces; empty when unreadable.
+    pub cmdline: String,
+    /// Resident bytes.
+    pub memory_bytes: u64,
+}
+
 /// Source of the daemon's aggregate descendant-tree memory, implemented by the
 /// composition root's `system.status` sampler (intentd#1139) and by fakes in
 /// tests.
@@ -1069,6 +1085,39 @@ pub trait TreeMemoryProbe: Send + Sync {
     fn agent_samples(&self) -> HashMap<AgentId, u64> {
         HashMap::new()
     }
+
+    /// The per-process detail behind [`Self::agent_samples`] together with
+    /// the timestamp of the sweep that produced it, as one value — the
+    /// `agent.memoryUsage` (§5.5) read. `None` before the first sample lands.
+    /// Published together for the same reason [`TreeSample`] is: a stamp and
+    /// rows read separately could straddle a sweep and describe two different
+    /// trees. The default serves an empty, unstamped snapshot once
+    /// [`Self::sample`] is `Some`, for probes that don't attribute.
+    fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+        self.sample().map(|_| AgentMemorySnapshot::default())
+    }
+}
+
+/// One sweep's per-agent process rows and the time it was taken, read
+/// together via [`TreeMemoryProbe::agent_memory_snapshot`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentMemorySnapshot {
+    /// RFC-3339 UTC timestamp of the sweep, or `None` for probes that don't
+    /// record it.
+    pub sampled_at: Option<String>,
+    /// Every process in each registered agent's subtree, bucketed by agent.
+    /// Empty for probes that don't attribute.
+    pub processes: HashMap<AgentId, Vec<ProcessSample>>,
+}
+
+/// What the manager knows about a live agent's spawned child, for
+/// `agent.memoryUsage` rows (§5.5): the provider command it was spawned
+/// with, the model requested at spawn, and the child's root pid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSpawnDetails {
+    pub provider: String,
+    pub model: Option<String>,
+    pub root_pid: Option<u32>,
 }
 
 /// Host headroom the budget defends (monorepo#2063 follow-up). Below this much
@@ -2805,6 +2854,41 @@ impl AgentManager {
             .get()
             .map(|p| p.agent_samples())
             .unwrap_or_default()
+    }
+
+    /// The installed probe's latest per-agent process rows and their sweep
+    /// timestamp, read as one value — the per-process detail behind
+    /// [`Self::agent_memory_samples`]. `None` when no probe is wired or no
+    /// sample has landed yet.
+    pub fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+        self.tree_probe
+            .get()
+            .and_then(|p| p.agent_memory_snapshot())
+    }
+
+    /// Spawn details of every tracked handle, for `agent.memoryUsage` rows.
+    /// A handle whose child pid is unknown (fake/transport-only handles)
+    /// reports `root_pid: None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn agent_spawn_details(&self) -> HashMap<AgentId, AgentSpawnDetails> {
+        self.handles
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(agent_id, handle)| {
+                (
+                    agent_id.clone(),
+                    AgentSpawnDetails {
+                        provider: handle.spawned_provider.clone(),
+                        model: handle.spawned_model.clone(),
+                        root_pid: handle.child_pid,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Snapshot of `spawned child pid -> agent id` for every live handle that
@@ -7014,19 +7098,33 @@ impl AgentManager {
         // status events, and the spawn below must key on the workspace the
         // target lives in (see the module-header invariant).
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        // Ownership (multiplayer, intentd#2068): resolved before the pop,
+        // checked inside the pop's critical section against the entry found
+        // there — a guest force-sends only what its `agent.getQueue` shows it.
+        let gate = self.services.queue_entry_gate(&agent_id, false).await?;
+        self.services.park_queue_mutation_gate(gate.as_ref()).await;
         // Quarantine gate (monorepo#840): a provably-poisoned session must
         // not be redriven by delivery — every replay deterministically
         // fails. The entry STAYS in the queue (no side effects); the absent
         // case is still `-32602` so the contract holds.
         if self.services.session_poisoned(&session) {
+            let not_found =
+                || Error::InvalidParams(format!("queued message not found: {message_id}"));
+            if let Some(gate) = gate.as_ref() {
+                // A gated caller sees only the live entry: one mid-drain
+                // (overlay only) reads as absent, and a foreign one is refused.
+                let live = self
+                    .services
+                    .find_queued_message(&agent_id, &message_id)
+                    .ok_or_else(not_found)?;
+                gate.check(&live)?;
+            }
             let entry = self
                 .services
                 .queue_snapshot(&agent_id)
                 .into_iter()
                 .find(|m| m["id"].as_str() == Some(message_id.as_str()))
-                .ok_or_else(|| {
-                    Error::InvalidParams(format!("queued message not found: {message_id}"))
-                })?;
+                .ok_or_else(not_found)?;
             tracing::warn!(
                 agent = %agent_id,
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
@@ -7044,7 +7142,7 @@ impl AgentManager {
         // snapshots (§6.5 drain ordering) until `draining` is dropped.
         let (mut entry, draining) = self
             .services
-            .take_queued_message_draining(&agent_id, &message_id)
+            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;

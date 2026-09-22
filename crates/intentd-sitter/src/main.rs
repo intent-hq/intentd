@@ -210,6 +210,9 @@ fn run_update_command(
                 latest,
                 update_available,
             }) => {
+                if update_available && installed.as_deref() == Some(latest.as_str()) {
+                    println!("installed release is incomplete; `intentd update` will repair it");
+                }
                 match installed {
                     Some(installed) => println!("installed: intentd {installed}"),
                     None => println!("installed: none"),
@@ -236,6 +239,9 @@ fn run_update_command(
         }
         Ok(UpdateOutcome::Installed { version, previous }) => {
             match previous {
+                Some(previous) if previous == version => {
+                    println!("repaired intentd {version} payload");
+                }
                 Some(previous) => println!(
                     "installed intentd {version} from channel {channel} \
                      (was {previous})"

@@ -1773,6 +1773,127 @@ fn incremental_seed_from_snapshot_appends_fragments_after_the_snapshot_text() {
     );
 }
 
+/// A chunk event carrying `media` (§7.1 image dimension sidecar) travels on
+/// the text block: full mode emits the running UNION on every chunk once
+/// anything resolved; incremental mode emits only the chunk's own entries and
+/// omits the key on chunks that resolved nothing.
+#[test]
+fn chunk_delta_forwards_media_by_encoding() {
+    let with_media = |message_id: &str, block_id: &str, text: &str, media: Value| {
+        let mut ev = chunk_event(message_id, block_id, "text", &json!(text));
+        ev.data["media"] = media;
+        ev
+    };
+    let a = json!({ "a.png": { "width": 640, "height": 480 } });
+    let b = json!({ "docs/b.png": { "width": 8, "height": 9 } });
+    let union = json!({
+        "a.png": { "width": 640, "height": 480 },
+        "docs/b.png": { "width": 8, "height": 9 },
+    });
+
+    // §7.1: in BOTH encodings a chunk delta carries only the entries that
+    // chunk resolved — never the accumulated map — even though full mode
+    // carries the full accumulated text.
+    let mut full = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+    let d = full
+        .chunk_delta(&chunk_event("m", "m:0", "text", &json!("See ")))
+        .unwrap();
+    assert!(d["added"][0]["block"].get("media").is_none());
+    let d = full
+        .chunk_delta(&with_media("m", "m:0", "![a](a.png)", a.clone()))
+        .unwrap();
+    assert_eq!(d["updated"][0]["block"]["media"], a);
+    let d = full
+        .chunk_delta(&with_media("m", "m:0", " ![b](docs/b.png)", b.clone()))
+        .unwrap();
+    assert_eq!(
+        d["updated"][0]["block"]["text"],
+        json!("See ![a](a.png) ![b](docs/b.png)")
+    );
+    assert_eq!(
+        d["updated"][0]["block"]["media"], b,
+        "full mode: only the chunk's own entries travel: {d}"
+    );
+    let d = full
+        .chunk_delta(&chunk_event("m", "m:0", "text", &json!(" tail")))
+        .unwrap();
+    assert!(
+        d["updated"][0]["block"].get("media").is_none(),
+        "full mode omits media on chunks that resolved nothing: {d}"
+    );
+    let d = full
+        .chunk_delta(&chunk_event("m", "m:1", "text", &json!("next")))
+        .unwrap();
+    assert!(
+        d["added"][0]["block"].get("media").is_none(),
+        "media is per block: {d}"
+    );
+    assert_eq!(
+        full.media_acc.get("m:0").map(|m| Value::Object(m.clone())),
+        Some(union.clone()),
+        "the accumulator still holds the union for the terminal frame"
+    );
+
+    let mut inc = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
+    let d = inc
+        .chunk_delta(&with_media("m", "m:0", "![a](a.png)", a.clone()))
+        .unwrap();
+    assert_eq!(d["added"][0]["block"]["media"], a);
+    let d = inc
+        .chunk_delta(&with_media("m", "m:0", " ![b](docs/b.png)", b.clone()))
+        .unwrap();
+    assert_eq!(
+        d["updated"][0]["block"]["media"], b,
+        "incremental mode: only the chunk's own entries travel: {d}"
+    );
+    let d = inc
+        .chunk_delta(&chunk_event("m", "m:0", "text", &json!(" tail")))
+        .unwrap();
+    assert!(
+        d["updated"][0]["block"].get("media").is_none(),
+        "incremental mode omits media on chunks that resolved nothing: {d}"
+    );
+}
+
+/// A mid-turn resume seeds `media` from the snapshot's text blocks, so the
+/// full-mode union after the seed includes what resolved before the client
+/// subscribed.
+#[test]
+fn chat_seed_from_snapshot_primes_media() {
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+    s.seed_from_snapshot(&json!({
+        "agentId": "agent-1",
+        "messages": [{
+            "id": "msg-live",
+            "role": "assistant",
+            "isStreaming": true,
+            "contentBlocks": [{
+                "id": "msg-live:0", "type": "text", "text": "![a](a.png)",
+                "media": { "a.png": { "width": 1, "height": 2 } }
+            }]
+        }],
+    }));
+    let mut ev = chunk_event("msg-live", "msg-live:0", "text", &json!(" ![b](b.png)"));
+    ev.data["media"] = json!({ "b.png": { "width": 3, "height": 4 } });
+    let d = s.chunk_delta(&ev).expect("post-seed chunk");
+    assert_eq!(
+        d["updated"][0]["block"]["media"],
+        json!({ "b.png": { "width": 3, "height": 4 } }),
+        "the delta carries only what this chunk resolved (§7.1); the seeded entry \
+         already reached the client in the snapshot"
+    );
+    assert_eq!(
+        s.media_acc
+            .get("msg-live:0")
+            .map(|m| Value::Object(m.clone())),
+        Some(json!({
+            "a.png": { "width": 1, "height": 2 },
+            "b.png": { "width": 3, "height": 4 },
+        })),
+        "the seeded entry primes the accumulator so the terminal frame carries the union"
+    );
+}
+
 #[test]
 fn merge_live_turn_appends_in_flight_message_idempotently() {
     let mut snapshot = json!({
@@ -4409,6 +4530,36 @@ mod chat_terminal_reconcile_failure {
         );
         assert!(updated[0]["block"].get("textDelta").is_none());
         assert_eq!(updated[0]["streamingComplete"], true);
+    }
+
+    /// The degraded best-effort terminal frame carries the `media` union the
+    /// live chunks delivered (§7.1) — in incremental mode each chunk carried
+    /// only its own entries, so the terminal must rebuild the union.
+    #[tokio::test]
+    async fn incremental_best_effort_terminal_carries_the_media_union() {
+        let api = FailingConvApi::new();
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
+        let mut first = chunk_event("msg-1", "msg-1:0", "text", &json!("![a](a.png)"));
+        first.data["media"] = json!({ "a.png": { "width": 1, "height": 2 } });
+        let mut second = chunk_event("msg-1", "msg-1:0", "text", &json!(" ![b](b.png)"));
+        second.data["media"] = json!({ "b.png": { "width": 3, "height": 4 } });
+        s.chunk_delta(&first).expect("first chunk");
+        s.chunk_delta(&second).expect("second chunk");
+        let d = s
+            .delta(&api, &end_event("msg-1"))
+            .await
+            .expect("a failed reconcile must still emit a terminal frame");
+        let updated = d["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0]["block"]["text"], "![a](a.png) ![b](b.png)");
+        assert_eq!(
+            updated[0]["block"]["media"],
+            json!({
+                "a.png": { "width": 1, "height": 2 },
+                "b.png": { "width": 3, "height": 4 },
+            }),
+            "the degraded frame carries the media union: {d}"
+        );
     }
 
     #[tokio::test]

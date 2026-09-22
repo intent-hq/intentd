@@ -5121,6 +5121,298 @@ async fn update_note_expected_version_gate_hit_miss_absent() {
     }
 }
 
+/// Regression (intent-hq/intent#5589): a successful content `note.update`
+/// returns the committed row — `rev` equal to the persisted rev and
+/// `updated_at` equal to the stored timestamp — so the client can chain the
+/// returned `rev` into its next `expectedVersion`. Before the fix the
+/// pre-write in-memory Note was returned (rev 0 after the rev-1 write).
+#[intent_test_macros::daemon_test]
+async fn update_note_content_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+
+    let first = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v1".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("content write");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(first.rev, stored.rev, "response rev is the committed rev");
+    assert_eq!(first.updated_at, stored.updated_at);
+    assert_eq!(first.content, "v1");
+
+    // Chaining the returned rev as the next `expectedVersion` succeeds ...
+    let second = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v2".into()),
+                expected_version: Some(first.rev),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("chained conditional write");
+    assert_eq!(second.rev, 2);
+    assert_eq!(second.content, "v2");
+
+    // ... while the rev the first response superseded is now stale (-32005),
+    // and the rejection leaves the row untouched.
+    let stale = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v3-should-not-persist".into()),
+                expected_version: Some(first.rev),
+                ..Default::default()
+            },
+        )
+        .await;
+    match stale {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 2);
+            assert_eq!(current["content"], "v2");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(stored.content, "v2");
+}
+
+/// Same contract for a content `note.update` whose text carries an `@@@task`
+/// block: the auto-conversion rewrites the note, and the response `rev` is
+/// the rev of that final row (not of the caller's own write).
+#[intent_test_macros::daemon_test]
+async fn update_note_task_conversion_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    let updated = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("intro\n\n@@@task\n# Do it\nbody\n@@@\n".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("content write with task block");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert!(
+        stored.content.contains("intent://local/task/"),
+        "conversion rewrote the fence: {}",
+        stored.content
+    );
+    assert_eq!(updated.rev, stored.rev);
+    assert_eq!(updated.content, stored.content);
+    assert_eq!(updated.updated_at, stored.updated_at);
+    assert!(
+        updated.rev >= 1,
+        "rev advanced past the seed: {}",
+        updated.rev
+    );
+}
+
+/// The metadata arm of `note.update` (title/tags, no `content`) returns the
+/// committed row too: `rev` bumped, stored `updated_at`, and the content the
+/// row actually holds.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_arm_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    let renamed = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                title: Some("Renamed".into()),
+                tags: Some(vec!["x".into()]),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("metadata write");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(renamed.rev, stored.rev);
+    assert_eq!(renamed.updated_at, stored.updated_at);
+    assert_eq!(renamed.title, "Renamed");
+    assert_eq!(renamed.tags, vec!["x".to_string()]);
+    assert_eq!(renamed.content, "v0");
+
+    // The returned rev chains into the next conditional metadata write.
+    let again = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                title: Some("Renamed again".into()),
+                expected_version: Some(renamed.rev),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("chained metadata write");
+    assert_eq!(again.rev, 2);
+    assert_eq!(again.title, "Renamed again");
+}
+
+/// The metadata arm of `note.update` that read rev 0 while a user
+/// `setContent` lands at rev 1 (the intentd#1817 choreography) must return
+/// the row as committed — the user's content and rev 2 — never the stale
+/// pre-write copy it read.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_arm_snapshot_carries_concurrent_content() {
+    let (tmp, svc, ws, id) = setup_versioned("abc").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = svc.update_note(
+        ws.clone(),
+        id.clone(),
+        NoteUpdateInput {
+            title: Some("Renamed".into()),
+            ..Default::default()
+        },
+    );
+    let parked = poll_until(&mut fut, 20, || async {
+        svc.store.get_note(&ws, &id).await.expect("get note");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let saved = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None)
+        .await
+        .expect("user save");
+    assert_eq!(saved.rev, 1);
+    drop(held);
+
+    let returned = fut.await.expect("metadata write");
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(stored.content, "aXbc");
+    assert_eq!(
+        returned.rev, stored.rev,
+        "response rev is the committed rev"
+    );
+    assert_eq!(
+        returned.content, "aXbc",
+        "response snapshot carries the concurrently saved content, not the stale read"
+    );
+    assert_eq!(returned.title, "Renamed");
+    assert_eq!(returned.updated_at, stored.updated_at);
+}
+
+/// Regression (intent-hq/intent#5589): `note.updateMetadata` carries the
+/// committed `rev` and the stored `updated_at`, so the returned rev chains
+/// into the next conditional write; the rev it superseded is stale.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    let first = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("Renamed".into()),
+            Some(vec!["x".into()]),
+            Some(0),
+            None,
+        )
+        .await
+        .expect("metadata write");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(
+        first.rev,
+        Some(stored.rev),
+        "response rev is the committed rev"
+    );
+    assert_eq!(
+        first.updated_at.as_deref(),
+        Some(stored.updated_at.as_str())
+    );
+    assert_eq!(first.title.as_deref(), Some("Renamed"));
+    assert_eq!(first.tags, Some(vec!["x".to_string()]));
+    assert_eq!(first.skipped, None);
+
+    let second = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("Renamed again".into()),
+            None,
+            first.rev,
+            None,
+        )
+        .await
+        .expect("chained conditional metadata write");
+    assert_eq!(second.rev, Some(2));
+
+    let stale = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("stale".into()),
+            None,
+            first.rev,
+            None,
+        )
+        .await;
+    match stale {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 2);
+            assert_eq!(current["title"], "Renamed again");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+/// The `skipped` arm of `note.updateMetadata` (spec title only) writes
+/// nothing, so it carries no `rev`.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_skipped_carries_no_rev() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    store
+        .insert_note(&note(&ws, "spec", "body"))
+        .await
+        .expect("note");
+    let svc = Services::new(store);
+    let skipped = svc
+        .update_note_metadata(
+            ws,
+            NoteId::from("spec"),
+            Some("Renamed".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("skip");
+    assert_eq!(skipped.skipped, Some(true));
+    assert_eq!(skipped.rev, None);
+}
+
 #[intent_test_macros::daemon_test]
 async fn update_metadata_skips_spec_title_but_applies_tags() {
     let tmp = TempDb::new();
@@ -16192,10 +16484,42 @@ pub(crate) mod pr {
         /// Runs at the start of every `list_comments` (the last forge read
         /// of `pr_state`), so a test can move daemon state mid-snapshot.
         on_list_comments: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Every `(query, limit)` handed to `search_users`, in call order
+        /// (the `github.users.search` tests assert trimming, the clamp and
+        /// the blank-query short-circuit).
+        seen_user_searches: std::sync::Mutex<Vec<(String, u8)>>,
         /// When true, `check_auth` reports no working credential (a revoked
         /// or missing token), exercising the invite-create live auth gate
         /// (multiplayer w4).
         unauthenticated: bool,
+        /// Accounts `get_user_by_login` knows (keyed by lowercase login);
+        /// any other login is `NotFound`. Empty → the trait default
+        /// (`Unsupported`), so unrelated tests keep their behaviour.
+        pub(crate) users_by_login: std::collections::HashMap<String, UserIdentity>,
+        /// What `get_proof_gist` answers per gist id: `Ok(view)` or the
+        /// scripted error (`Err("not-found")` → `NotFound`,
+        /// `Err("anonymous")` → `Decode` — a gist without `owner.login` /
+        /// `created_at` — anything else → `Api`). An unknown id is
+        /// `NotFound`. Exercises `invite.prove`.
+        pub(crate) proof_gists: std::collections::HashMap<
+            String,
+            std::result::Result<intent_sourcecontrol::identity_proof::ProofGistView, String>,
+        >,
+        /// Every gist id handed to `get_proof_gist`, in call order.
+        pub(crate) seen_proof_gists: std::sync::Mutex<Vec<String>>,
+        /// How many times `get_user` was called (the primary identity
+        /// refresh tests assert exactly one spawn per interval). Counted
+        /// before [`Self::get_user_gate`] is awaited, so a held call is
+        /// still visible.
+        pub(crate) get_user_calls: std::sync::atomic::AtomicU64,
+        /// How many times `check_auth` was called (the unauthenticated
+        /// refresh tests wait on the auth-gate probe, then assert no
+        /// `get_user` followed).
+        pub(crate) check_auth_calls: std::sync::atomic::AtomicU64,
+        /// When set, `get_user` holds until the test releases a permit
+        /// (`add_permits(1)`): the caller proves the read it triggered from
+        /// returned while `GET /user` was still in flight.
+        pub(crate) get_user_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     }
 
     impl StubForge {
@@ -16203,6 +16527,14 @@ pub(crate) mod pr {
         pub(crate) fn unauthenticated() -> Self {
             Self {
                 unauthenticated: true,
+                ..Default::default()
+            }
+        }
+
+        /// A forge whose `get_user` holds until `gate` has a permit.
+        pub(crate) fn with_get_user_gate(gate: std::sync::Arc<tokio::sync::Semaphore>) -> Self {
+            Self {
+                get_user_gate: Some(gate),
                 ..Default::default()
             }
         }
@@ -16262,6 +16594,8 @@ pub(crate) mod pr {
             })
         }
         async fn check_auth(&self) -> ScResult<AuthStatus> {
+            self.check_auth_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.unauthenticated {
                 return Ok(AuthStatus {
                     authenticated: false,
@@ -16276,6 +16610,11 @@ pub(crate) mod pr {
             })
         }
         async fn get_user(&self) -> ScResult<UserIdentity> {
+            self.get_user_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &self.get_user_gate {
+                gate.acquire().await.expect("gate open").forget();
+            }
             Ok(UserIdentity {
                 login: "octocat".into(),
                 id: Some(583_231),
@@ -16283,6 +16622,57 @@ pub(crate) mod pr {
                 avatar_url: Some("https://avatars.example/u/1".into()),
                 html_url: Some("https://github.com/octocat".into()),
             })
+        }
+        async fn get_user_by_login(&self, login: &str) -> ScResult<UserIdentity> {
+            if self.users_by_login.is_empty() {
+                return Err(ScError::Unsupported("no scripted accounts".into()));
+            }
+            self.users_by_login
+                .get(&login.to_ascii_lowercase())
+                .cloned()
+                .ok_or_else(|| ScError::NotFound(format!("github user {login:?}")))
+        }
+        async fn get_proof_gist(
+            &self,
+            gist_id: &str,
+        ) -> ScResult<intent_sourcecontrol::identity_proof::ProofGistView> {
+            self.seen_proof_gists
+                .lock()
+                .unwrap()
+                .push(gist_id.to_string());
+            match self.proof_gists.get(gist_id) {
+                Some(Ok(view)) => Ok(view.clone()),
+                Some(Err(kind)) if kind == "not-found" => {
+                    Err(ScError::NotFound(format!("gist {gist_id:?}")))
+                }
+                Some(Err(kind)) if kind == "anonymous" => Err(ScError::Decode(
+                    "GET /gists/{id} response missing `owner.login`".to_string(),
+                )),
+                Some(Err(kind)) => Err(ScError::Api(format!("502: {kind}"))),
+                None => Err(ScError::NotFound(format!("gist {gist_id:?}"))),
+            }
+        }
+        async fn search_users(&self, query: &str, limit: u8) -> ScResult<Vec<UserIdentity>> {
+            self.seen_user_searches
+                .lock()
+                .unwrap()
+                .push((query.to_string(), limit));
+            Ok(vec![
+                UserIdentity {
+                    login: "octocat".into(),
+                    id: Some(583_231),
+                    name: Some("The Octocat".into()),
+                    avatar_url: Some("https://avatars.example/u/1".into()),
+                    html_url: Some("https://github.com/octocat".into()),
+                },
+                UserIdentity {
+                    login: "octodog".into(),
+                    id: Some(7),
+                    name: None,
+                    avatar_url: None,
+                    html_url: None,
+                },
+            ])
         }
         async fn list_repos(&self, page: PageParams) -> ScResult<Page<Repo>> {
             if self.paginate {
@@ -17272,6 +17662,85 @@ pub(crate) mod pr {
         assert!(user.get("name").is_none());
     }
 
+    /// `github.users.search`: hits carry `id` / `login` / `avatarUrl` /
+    /// `htmlUrl` (optionals default to `""`, engine `name` dropped); the
+    /// query reaches the forge trimmed with the default limit of 8, and an
+    /// explicit limit is clamped into `[1, 10]`.
+    #[intent_test_macros::daemon_test]
+    async fn github_users_search_shapes_hits_and_clamps_limit() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let v = svc
+            .github_users_search("  octo ".into(), None)
+            .await
+            .expect("search");
+        assert_eq!(
+            v,
+            json!({
+                "users": [
+                    {
+                        "id": 583_231,
+                        "login": "octocat",
+                        "avatarUrl": "https://avatars.example/u/1",
+                        "htmlUrl": "https://github.com/octocat",
+                    },
+                    { "id": 7, "login": "octodog", "avatarUrl": "", "htmlUrl": "" },
+                ]
+            })
+        );
+        svc.github_users_search("octo".into(), Some(0))
+            .await
+            .expect("clamped low");
+        svc.github_users_search("octo".into(), Some(99))
+            .await
+            .expect("clamped high");
+        assert_eq!(
+            *forge.seen_user_searches.lock().unwrap(),
+            vec![
+                ("octo".to_string(), 8),
+                ("octo".to_string(), 1),
+                ("octo".to_string(), 10),
+            ]
+        );
+    }
+
+    /// A blank / whitespace-only `query` answers `{ users: [] }` without a
+    /// forge round trip.
+    #[intent_test_macros::daemon_test]
+    async fn github_users_search_blank_query_short_circuits() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        for query in ["", "   ", "\t\n"] {
+            let v = svc
+                .github_users_search(query.into(), Some(5))
+                .await
+                .expect("blank search");
+            assert_eq!(v, json!({ "users": [] }), "query {query:?}");
+        }
+        assert!(forge.seen_user_searches.lock().unwrap().is_empty());
+    }
+
+    /// `github.users.search` is administrator-only: a collaborator wire
+    /// caller is refused `-32003` before the forge is reached (default-deny,
+    /// the method is not in `COLLABORATOR_METHODS`).
+    #[tokio::test]
+    async fn github_users_search_refuses_collaborator_caller() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let collaborator = intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            is_administrator: false,
+        };
+        let err =
+            intent_core::with_caller(collaborator, svc.github_users_search("octo".into(), None))
+                .await
+                .expect_err("collaborator must be refused");
+        assert!(matches!(err, Error::Forbidden(_)), "{err:?}");
+        assert_eq!(err.code(), -32003);
+        assert!(err.to_string().contains("github.users.search"), "{err}");
+        assert!(forge.seen_user_searches.lock().unwrap().is_empty());
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_auth_status_reports_configured_with_valid_token() {
         let (_t, svc) = github_svc().await;
@@ -17406,6 +17875,278 @@ pub(crate) mod pr {
         // Revoking with nothing stored stays an idempotent success.
         let r = svc.github_revoke().await.expect("revoke twice");
         assert_eq!(r["ok"], true);
+    }
+
+    /// `error.data.code` an identity-proof refusal would carry on the wire.
+    fn identity_proof_code(err: &intent_core::Error) -> &'static str {
+        match err {
+            intent_core::Error::IdentityProof(kind) => kind.as_str(),
+            other => panic!("expected an identity-proof refusal, got {other:?}"),
+        }
+    }
+
+    /// Loopback GitHub API stub for the identity-proof glue: `GET /user`
+    /// reports `scopes` (header omitted when `None`) and `login`, `POST
+    /// /gists` answers `gist_id`, `GET /gists/{gist_id}` reads it back as a
+    /// proof gist (same scopes header), `DELETE /gists/{gist_id}` is 204 and
+    /// any other gist 404. Returns its base URI.
+    async fn spawn_gist_api(scopes: Option<&'static str>, gist_id: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+                        let Some(head_end) = head_end else { continue };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                        let want = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= head_end + 4 + want {
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let line = head.lines().next().unwrap_or_default();
+                    let (status, extra, body) = if line.starts_with("GET /user ") {
+                        let extra = scopes
+                            .map(|s| format!("X-OAuth-Scopes: {s}\r\n"))
+                            .unwrap_or_default();
+                        (200, extra, r#"{"login":"octocat","id":1}"#.to_string())
+                    } else if line.starts_with("POST /gists ") {
+                        (201, String::new(), format!(r#"{{"id":"{gist_id}"}}"#))
+                    } else if line.starts_with(&format!("GET /gists/{gist_id} ")) {
+                        let extra = scopes
+                            .map(|s| format!("X-OAuth-Scopes: {s}\r\n"))
+                            .unwrap_or_default();
+                        (
+                            200,
+                            extra,
+                            format!(
+                                r#"{{"id":"{gist_id}","files":{{"intent-join-proof.txt":{{"filename":"intent-join-proof.txt"}}}}}}"#
+                            ),
+                        )
+                    } else if line.starts_with(&format!("DELETE /gists/{gist_id} ")) {
+                        (204, String::new(), String::new())
+                    } else if line.starts_with("GET /gists/") || line.starts_with("DELETE /gists/")
+                    {
+                        (404, String::new(), r#"{"message":"Not Found"}"#.to_string())
+                    } else {
+                        (
+                            500,
+                            String::new(),
+                            r#"{"message":"unexpected"}"#.to_string(),
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} Status\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        base
+    }
+
+    /// Loopback GitHub API stub whose quota is exhausted: every request is
+    /// answered `403` with GitHub's primary rate-limit body (no
+    /// `X-OAuth-Scopes`), so the identity-proof preflight `GET /user` hits
+    /// the limit before any gist is touched.
+    async fn spawn_rate_limited_api() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let body = r#"{"message":"API rate limit exceeded for user ID 1.","documentation_url":"https://docs.github.com/rest/overview/rate-limits-for-the-rest-api"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        base
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_without_a_stored_token_is_not_connected() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        let svc = svc.with_secret_store(mem);
+        let err = svc
+            .github_identity_proof_create("nonce-1".into(), "Studio".into())
+            .await
+            .expect_err("no token stored");
+        assert_eq!(identity_proof_code(&err), "github-not-connected");
+        assert_eq!(err.code(), -32603);
+        let err = svc
+            .github_identity_proof_delete("abc".into())
+            .await
+            .expect_err("no token stored");
+        assert_eq!(identity_proof_code(&err), "github-not-connected");
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_validates_params_before_the_token() {
+        let (_t, svc) = github_svc().await;
+        let svc = svc.with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+        for (nonce, label) in [("", "h"), ("n", " "), ("a\nb", "h"), ("n", "x\ny")] {
+            let err = svc
+                .github_identity_proof_create(nonce.into(), label.into())
+                .await
+                .expect_err("invalid params");
+            assert!(
+                matches!(err, intent_core::Error::InvalidParams(_)),
+                "{nonce:?}/{label:?}: {err:?}"
+            );
+        }
+        for gist_id in ["", "../x", "abc def"] {
+            let err = svc
+                .github_identity_proof_delete(gist_id.into())
+                .await
+                .expect_err("invalid gist id");
+            assert!(
+                matches!(err, intent_core::Error::InvalidParams(_)),
+                "{gist_id:?}: {err:?}"
+            );
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_and_delete_with_the_stored_token() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let base = spawn_gist_api(Some("repo, read:org, workflow, gist"), "g1").await;
+        let svc = svc.with_secret_store(mem).with_github_api_base_uri(base);
+        let v = svc
+            .github_identity_proof_create(" nonce-1 ".into(), "Studio".into())
+            .await
+            .expect("create proof gist");
+        assert_eq!(v, serde_json::json!({ "gistId": "g1", "login": "octocat" }));
+        let v = svc
+            .github_identity_proof_delete("g1".into())
+            .await
+            .expect("delete proof gist");
+        assert_eq!(v, serde_json::json!({ "ok": true }));
+        // Idempotent: an already-deleted gist (404) is still `ok`.
+        let v = svc
+            .github_identity_proof_delete("gone".into())
+            .await
+            .expect("delete missing gist");
+        assert_eq!(v, serde_json::json!({ "ok": true }));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_without_gist_scope_is_scope_missing() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let base = spawn_gist_api(Some("repo, read:org, workflow"), "g1").await;
+        let svc = svc.with_secret_store(mem).with_github_api_base_uri(base);
+        let err = svc
+            .github_identity_proof_create("nonce-1".into(), "Studio".into())
+            .await
+            .expect_err("scope missing");
+        assert_eq!(identity_proof_code(&err), "github-scope-missing");
+        assert_eq!(err.code(), -32603);
+    }
+
+    /// A GitHub rate limit hit on the identity-proof preflight (here an
+    /// exhausted primary quota; any cause classified as `RateLimited` maps
+    /// the same way) surfaces as `Error::RateLimited` (`-32603`, wire
+    /// `data.code = "rate-limited"`) on create and delete alike — never
+    /// `github-not-connected`, whose sign-in remedy would not help
+    /// (intent-hq/intent#5627).
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_under_an_exhausted_quota_is_rate_limited_not_not_connected() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let base = spawn_rate_limited_api().await;
+        let svc = svc.with_secret_store(mem).with_github_api_base_uri(base);
+
+        let err = svc
+            .github_identity_proof_create("nonce-1".into(), "Studio".into())
+            .await
+            .expect_err("rate limited create");
+        assert!(
+            matches!(&err, intent_core::Error::RateLimited(msg) if msg.contains("rate limit")),
+            "create: {err:?}"
+        );
+        assert_eq!(err.code(), -32603);
+        assert!(err.to_string().starts_with("source control rate limited: "));
+
+        let err = svc
+            .github_identity_proof_delete("g1".into())
+            .await
+            .expect_err("rate limited delete");
+        assert!(
+            matches!(&err, intent_core::Error::RateLimited(msg) if msg.contains("rate limit")),
+            "delete: {err:?}"
+        );
+        assert_eq!(err.code(), -32603);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_create_against_a_dead_host_is_unreachable() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        drop(listener);
+        let svc = svc.with_secret_store(mem).with_github_api_base_uri(base);
+        let err = svc
+            .github_identity_proof_create("nonce-1".into(), "Studio".into())
+            .await
+            .expect_err("unreachable");
+        assert_eq!(identity_proof_code(&err), "github-unreachable");
     }
 
     #[intent_test_macros::daemon_test]
@@ -44672,7 +45413,7 @@ mod derived_workspace_unread {
     /// call's error, the stored `unread` flag survives, and no `{ none }`
     /// event is emitted — the caller never sees "seen" while a session
     /// stays unread.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn workspace_mark_seen_propagates_marker_failures() {
         let h = harness().await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;

@@ -66,6 +66,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "agent.listInterrupted",
     "agent.listUserMessages",
     "agent.markSeen",
+    "agent.memoryUsage",
     "agent.pendingPermissions",
     "agent.queueMessage",
     "agent.removeQueuedMessage",
@@ -159,6 +160,8 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.identityProof.create",
+    "github.identityProof.delete",
     "github.issues.get",
     "github.issues.list",
     "github.issues.search",
@@ -178,6 +181,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "github.resolveThread",
     "github.revoke",
     "github.unresolveThread",
+    "github.users.search",
     "hook.cancel",
     "hook.list",
     "hook.runNow",
@@ -237,6 +241,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "primitive.addCli",
     "primitive.addPatch",
     "primitive.addReference",
+    "principal.list",
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
@@ -347,6 +352,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.list",
     "workspace.localChanges",
     "workspace.markSeen",
+    "workspace.members.add",
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
@@ -383,7 +389,7 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 53 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 55 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`, `server.rs`, `invite.rs`, `presence.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
@@ -428,7 +434,10 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
-    "invite.redeem",
+    "invite.accept",
+    "invite.challenge",
+    "invite.inspect",
+    "invite.prove",
     "note.presence.update",
     "pairing.getInfo",
     "presence.update",
@@ -485,8 +494,13 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// display probes, `browser.*`, `forward.*`, `terminal.*`, `script.*`,
 /// `github.*` / `linear.*` / `sentry.*` / `voice.*` (act with the primary
 /// user's third-party credentials), `settings.*`, `repo.*`, `mcp.*`,
-/// `server.*` / `pairing.*` / `system.*` (except `system.capabilities`),
-/// `workspace.create` / `git.clone` (arbitrary host paths), agent / hook /
+/// `server.*` / `pairing.*` / `system.*` (except `system.capabilities` and
+/// `system.status`, the latter served as the guest-safe projection
+/// `control::collaborator_status_json` rather than the administrator's
+/// snapshot),
+/// `workspace.create` / `git.clone` (arbitrary host paths), agent creation /
+/// delegation (`agent.create` / `agent.delegate` / `agent.wakeOrCreate`;
+/// decided 2026-09-19: guests steer existing agents only), agent / hook /
 /// PR-monitor deletion, and `agent.replaceMessages` — it persists
 /// client-supplied user rows verbatim, so a non-owner could forge
 /// `fromPrincipalId` attribution; collaborators keep
@@ -494,13 +508,11 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// `catalog/tests.rs` freezes the refused remainder so a new method must be
 /// classified explicitly.
 pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
-    ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows. Workspace-scoped, no host reach."),
+    ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows and, for a collaborator member, a user row's content carries the sender preamble (other roles byte-identical). Workspace-scoped, no host reach."),
     ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
-    ("agent.create", "Steer: creates an agent in a workspace. The agent acts with the owner's capabilities (decided); the guest only starts it."),
-    ("agent.delegate", "Steer: delegates a task note to a new agent in the workspace. Same trust as agent.create."),
     ("agent.dismissQuestions", "Steer: dismisses an agent's pending structured questions. Agent-scoped state only."),
-    ("agent.editAndRegenerate", "Steer: edits a user message and regenerates from it. Conversation write, workspace-scoped."),
-    ("agent.editQueuedMessage", "Steer: edits a queued message. Queue write, agent-scoped."),
+    ("agent.editAndRegenerate", "Steer: edits a user message and regenerates from it; the edited content carries the collaborator sender preamble. Conversation write, workspace-scoped."),
+    ("agent.editQueuedMessage", "Steer: edits a queued message; a collaborator's edit of a human-authored entry carries the sender preamble. Intentional exception: a collaborator's edit of an agent-authored (A2A / automatic) entry is NOT preambled — its sender stays the originating agent's header and the edit is recorded by the principal stamp. Queue write, agent-scoped."),
     ("agent.get", "Read: one agent record. Workspace-scoped."),
     ("agent.getConversation", "Read: an agent's transcript page. Workspace-scoped; tool bodies are the agent's own output."),
     ("agent.getMessageBlock", "Read: one full content block of a transcript message. Same scope as getConversation."),
@@ -515,23 +527,22 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.listUserMessages", "Read: the user rows of a conversation (prompt history). Workspace-scoped."),
     ("agent.markSeen", "Steer: clears an agent's unseen marker. Per-agent UI state."),
     ("agent.pendingPermissions", "Read: an agent's outstanding ACP permission prompts. Agent-scoped."),
-    ("agent.queueMessage", "Steer: queues a message for an agent; stamped with the caller's principal."),
+    ("agent.queueMessage", "Steer: queues a message for an agent; stamped with the caller's principal and, for a collaborator member, prefixed with the sender preamble."),
     ("agent.removeQueuedMessage", "Steer: retracts a queued message. Queue write, agent-scoped."),
     ("agent.rename", "Steer: renames an agent session. Metadata write."),
     ("agent.resolveInterrupted", "Steer: resumes or dismisses an interrupted agent. Agent lifecycle, no host reach."),
     ("agent.respondPermission", "Steer: answers an agent's ACP permission prompt. The agent already acts with the owner's capabilities; this only unblocks it."),
     ("agent.restore", "Steer: restores a retired agent. Agent lifecycle."),
     ("agent.retry", "Steer: retries a failed turn. Agent lifecycle."),
-    ("agent.sendMessage", "Steer: sends a message to an agent; stamped with the caller's principal (decided: agent.send* allowed)."),
+    ("agent.sendMessage", "Steer: sends a message to an agent; stamped with the caller's principal and, for a collaborator member, the content the model sees is prefixed with the sender preamble naming the guest (decided: agent.send* allowed)."),
     ("agent.sendQueuedMessageNow", "Steer: promotes a queued message. Queue write, agent-scoped."),
-    ("agent.sendToTask", "Steer: messages the agent assigned to a task note. Same as sendMessage."),
+    ("agent.sendToTask", "Steer: messages the agent assigned to a task note. Same as sendMessage, sender preamble included."),
     ("agent.setModel", "Steer: switches an agent's model among the catalog (decided: allowed). No credential access."),
     ("agent.stop", "Steer: stops an agent turn (decided: allowed)."),
     ("agent.subscribe", "Client boot: subscribes to an agent's events (fast path when no eventTypes). Delivery is narrowed by the collaborator event allowlist."),
     ("agent.summary", "Read: a short summary of an agent's work. Workspace-scoped."),
     ("agent.unsubscribe", "Client boot: drops an agent subscription."),
     ("agent.update", "Steer: updates agent metadata (name, background flag). No host reach."),
-    ("agent.wakeOrCreate", "Steer: ensures a task has a working agent. Same trust as agent.create."),
     ("chat.subscribe", "Client boot: the chat channel fast path the desktop renders conversations from. Workspace-scoped; delivery narrowed by the event allowlist."),
     ("chat.unsubscribe", "Client boot: drops a chat channel subscription."),
     ("client.hello", "Client boot: binds the connection's logical client id and capabilities. Identity is never taken from it: a collaborator's client id is namespaced by its principal, and a non-administrator connection is never bound into the reverse registry (no reverse-RPC / tab-host eligibility, presence, or client:* transitions) regardless of what it advertises."),
@@ -651,6 +662,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("stats.getRateHistory", "Read: usage rate history. Usage/stats read."),
     ("stats.getUsage", "Read: usage totals. Usage/stats read."),
     ("system.capabilities", "Client boot: the daemon's advertised capability flags. No host detail beyond feature booleans."),
+    ("system.status", "Client boot / status panel: the guest-safe projection (control::collaborator_status_json) — running / listen / version / protocol, routing (port, fingerprint, localIps, tcAddress) and host identity (hostname, prettyHostname, os / arch / locality / device), all already disclosed by the invite envelope and server.pairingInfo. Daemon-global counts (clients, agents, busyAgents) and process / disk / watcher telemetry are administrator-only: they aggregate activity outside the caller's member workspaces."),
     ("task.assignAgent", "Edit: assigns an agent to a task note."),
     ("task.convertBlocks", "Edit: converts @@@task blocks into task notes."),
     ("task.createPrerequisite", "Edit: adds a prerequisite task."),

@@ -2,6 +2,143 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.95] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Register and defer the baseline under a GitHub rate limit ([#2060](https://github.com/intent-hq/intentd/pull/2060))
+
+### 🧪 Testing
+
+- *(intentd)* Stable conversation fingerprint for WSS E2E no-wake assertions ([#2062](https://github.com/intent-hq/intentd/pull/2062))
+
+
+## [0.9.94] - 2026-09-22
+
+### 🚀 Features
+
+- Require the tunnel for invite links and emit tc only ([#2057](https://github.com/intent-hq/intentd/pull/2057))
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Document and test the startup-failure completion path; gate the non-UTF-8 ref test to Linux ([#2054](https://github.com/intent-hq/intentd/pull/2054))
+- *(notes)* Note.update / note.updateMetadata return the committed revision ([#2056](https://github.com/intent-hq/intentd/pull/2056))
+
+### 🔧 Refactor
+
+- *(core)* Single source for the running-turn status rule ([#2058](https://github.com/intent-hq/intentd/pull/2058))
+
+
+## [0.9.93] - 2026-09-21
+
+### 🚀 Features
+
+- *(acp)* Spawn agent children at reduced scheduling priority ([#2049](https://github.com/intent-hq/intentd/pull/2049))
+
+
+## [0.9.92] - 2026-09-21
+
+### 🚀 Features
+
+- *(agent)* Serve delegatedCounts on agent.list ([#2051](https://github.com/intent-hq/intentd/pull/2051))
+
+### 🐛 Bug Fixes
+
+- *(identity)* Keep a concurrent account switch over a stale background refresh ([#2050](https://github.com/intent-hq/intentd/pull/2050))
+- *(principal)* Refresh primary GitHub identity from principal.list and at startup ([#2047](https://github.com/intent-hq/intentd/pull/2047))
+
+
+## [0.9.91] - 2026-09-21
+
+### 🐛 Bug Fixes
+
+- *(identity)* Refresh the primary identity from workspace.members.list ([#2044](https://github.com/intent-hq/intentd/pull/2044))
+
+### 📚 Documentation
+
+- *(core)* Note lastToolUse flag presence in fit_agent_list_frame rustdoc ([#2043](https://github.com/intent-hq/intentd/pull/2043))
+
+
+## [0.9.90] - 2026-09-21
+
+### 🐛 Bug Fixes
+
+- *(agent)* Fit agent.list rows to a response-level frame budget ([#2039](https://github.com/intent-hq/intentd/pull/2039))
+
+
+## [0.9.89] - 2026-09-21
+
+### 🚀 Features
+
+- *(invite)* Invite.inspect and invite.accept for a returning guest on /invite ([#1963](https://github.com/intent-hq/intentd/pull/1963))
+- *(github)* Gist scope + github.identityProof.create/delete ([#1965](https://github.com/intent-hq/intentd/pull/1965))
+- *(invite)* Invite.challenge and invite.prove (nonce + gist identity proof) on /invite ([#1967](https://github.com/intent-hq/intentd/pull/1967))
+- *(multiplayer)* Make unpinned invite links reusable until expiry or revocation ([#1988](https://github.com/intent-hq/intentd/pull/1988))
+- *(multiplayer)* Refuse agent creation and delegation for collaborators ([#1998](https://github.com/intent-hq/intentd/pull/1998))
+- *(multiplayer)* Prepend a sender preamble to collaborator messages ([#1987](https://github.com/intent-hq/intentd/pull/1987))
+- *(principal)* Principal.list — owner-only roster of credentialed guests ([#2023](https://github.com/intent-hq/intentd/pull/2023))
+- *(workspace)* Workspace.members.add — direct member add with live guest delivery ([#2025](https://github.com/intent-hq/intentd/pull/2025))
+
+### 🐛 Bug Fixes
+
+- *(store)* Treat write-pool acquire timeouts as transient in the retry helpers ([#2030](https://github.com/intent-hq/intentd/pull/2030))
+- *(invite)* Refuse the host owner's own account joining as a guest ([#1986](https://github.com/intent-hq/intentd/pull/1986))
+
+### 🧪 Testing
+
+- *(transport)* Bound tunnel backpressure test waits by wall clock, not yield counts ([#2033](https://github.com/intent-hq/intentd/pull/2033))
+- *(services)* Presence deferred-flush test waits on the observable flush ([#2031](https://github.com/intent-hq/intentd/pull/2031))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(invite)* Remove the host-side device flow (invite.redeem) ([#1969](https://github.com/intent-hq/intentd/pull/1969))
+
+
+## [0.9.88] - 2026-09-20
+
+### 🚀 Features
+
+- *(github)* Add github.users.search RPC ([#1912](https://github.com/intent-hq/intentd/pull/1912))
+- *(invite)* Persist the invite secret and return url from workspace.invite.list ([#1913](https://github.com/intent-hq/intentd/pull/1913))
+- *(sharing)* Enforce guest membership and guest connection caps ([#1917](https://github.com/intent-hq/intentd/pull/1917))
+- *(sharing)* Hot-reload guest connection caps ([#1918](https://github.com/intent-hq/intentd/pull/1918))
+- *(sharing)* Allowlist system.status for collaborator connections ([#1934](https://github.com/intent-hq/intentd/pull/1934))
+- Agent memory fields on system.status and a daemon-wide agent.memoryUsage RPC ([#2026](https://github.com/intent-hq/intentd/pull/2026))
+- *(invite)* Return host identity in the invite.redeem phase-1 result ([#1955](https://github.com/intent-hq/intentd/pull/1955))
+
+
+## [0.9.87] - 2026-09-20
+
+### 🚀 Features
+
+- *(transport)* Tunnel CREDIT frame and per-stream daemon→client credit window ([#2022](https://github.com/intent-hq/intentd/pull/2022))
+
+
+## [0.9.86] - 2026-09-20
+
+### 🚀 Features
+
+- Principals - caller binding, principal.me and role on workspace payloads ([#1868](https://github.com/intent-hq/intentd/pull/1868))
+- Principal attribution on human chat messages ([#1869](https://github.com/intent-hq/intentd/pull/1869))
+- Membership and capability matrix enforcement in the service layer ([#1870](https://github.com/intent-hq/intentd/pull/1870))
+- Invite links and identity-only device-flow join ([#1872](https://github.com/intent-hq/intentd/pull/1872))
+- *(presence)* Workspace presence and per-note caret channel ([#1887](https://github.com/intent-hq/intentd/pull/1887))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Keep tunnel inbound draining while a large reply waits on a lagging client ([#2017](https://github.com/intent-hq/intentd/pull/2017))
+- *(services)* Bound one-shot ACP response sends by the running phase timeout ([#2016](https://github.com/intent-hq/intentd/pull/2016))
+- *(services)* Fail closed on an unbound caller at every capability gate ([#1877](https://github.com/intent-hq/intentd/pull/1877))
+
+### 🧪 Testing
+
+- *(multiplayer)* Emit-path taxonomy golden and collaborator e2e (w3 follow-up) ([#1871](https://github.com/intent-hq/intentd/pull/1871))
+
+### ⚙️ Miscellaneous Tasks
+
+- Arm INTENTD_ASSERT_BOUND_CALLER in the coverage jobs ([#2020](https://github.com/intent-hq/intentd/pull/2020))
+
+
 ## [0.9.85] - 2026-09-20
 
 ### 🐛 Bug Fixes

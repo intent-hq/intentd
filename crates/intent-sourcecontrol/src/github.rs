@@ -62,6 +62,35 @@ impl GitHubSourceControl {
         Ok(Self { client })
     }
 
+    /// Build a client with **no** credential (same base URI and timeouts as
+    /// [`Self::new`]): the host's fallback for reading a guest's public or
+    /// secret proof gist when it holds no GitHub token of its own. Every
+    /// authenticated read on it fails with `Auth`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the octocrab client cannot be built (e.g. an
+    /// invalid `api_base_url`).
+    pub fn anonymous(api_base_url: Option<&str>) -> Result<Self> {
+        let mut builder = octocrab::Octocrab::builder()
+            .set_connect_timeout(Some(CONNECT_TIMEOUT))
+            .set_read_timeout(Some(READ_WRITE_TIMEOUT))
+            .set_write_timeout(Some(READ_WRITE_TIMEOUT));
+        if let Some(base) = api_base_url {
+            builder = builder
+                .base_uri(base)
+                .map_err(|e| Error::Config(format!("invalid github apiBaseUrl {base:?}: {e}")))?;
+        }
+        let client = builder.build()?;
+        Ok(Self { client })
+    }
+
+    /// The underlying octocrab client (token + base URI + timeouts), for
+    /// crate-internal callers outside the [`SourceControl`] surface.
+    pub(crate) fn client(&self) -> &octocrab::Octocrab {
+        &self.client
+    }
+
     fn repo_path(repo: &RepoRef, suffix: &str) -> String {
         format!("/repos/{}/{}{}", repo.owner, repo.name, suffix)
     }
@@ -522,6 +551,28 @@ pub(crate) fn build_repo_search_query(input: &str) -> String {
             }
         }
     }
+}
+
+/// Rewrite raw user-search input into GitHub `/search/users` syntax: trim, drop
+/// one leading `@`, keep only the leading run of login characters (ASCII
+/// alphanumerics and `-`, GitHub's login alphabet), then narrow to login
+/// matches on user accounts (`<prefix> in:login type:user`). Cutting at the
+/// first non-login character keeps the input from reaching GitHub's search
+/// parser as syntax — `alice in:name`, `foo OR bar` and `repos:>100` search
+/// the logins `alice`, `foo` and `repos`, never a qualifier or a boolean.
+/// Input with no login prefix yields an empty query so the caller can skip
+/// the network round trip.
+pub(crate) fn build_user_search_query(input: &str) -> String {
+    let trimmed = input.trim();
+    let trimmed = trimmed.strip_prefix('@').unwrap_or(trimmed).trim_start();
+    let prefix_len = trimmed
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(trimmed.len());
+    let prefix = &trimmed[..prefix_len];
+    if prefix.is_empty() {
+        return String::new();
+    }
+    format!("{prefix} in:login type:user")
 }
 
 pub(crate) fn map_review(value: Value) -> Result<Review> {
@@ -1424,6 +1475,34 @@ impl SourceControl for GitHubSourceControl {
             .get(format!("/users/{login}"), None::<&()>)
             .await?;
         map_user_identity(v)
+    }
+
+    async fn get_proof_gist(&self, gist_id: &str) -> Result<crate::identity_proof::ProofGistView> {
+        let gist_id = gist_id.trim();
+        if gist_id.is_empty() || !gist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::NotFound(format!("gist {gist_id:?}")));
+        }
+        let v: Value = self
+            .client
+            .get(format!("/gists/{gist_id}"), None::<&()>)
+            .await?;
+        crate::identity_proof::proof_gist_view(&v)
+    }
+
+    async fn search_users(&self, query: &str, limit: u8) -> Result<Vec<UserIdentity>> {
+        let search_query = build_user_search_query(query);
+        if search_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let params: Vec<(&str, String)> =
+            vec![("q", search_query), ("per_page", limit.max(1).to_string())];
+        let v: Value = self.client.get("/search/users", Some(&params)).await?;
+        let items: Vec<Value> = serde_json::from_value(
+            v.get("items")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )?;
+        items.into_iter().map(map_user_identity).collect()
     }
 
     async fn list_repos(&self, page: PageParams) -> Result<Page<Repo>> {
@@ -3009,6 +3088,59 @@ mod tests {
         );
         assert_eq!(build_repo_search_query("   "), "");
         assert_eq!(build_repo_search_query(""), "");
+    }
+
+    #[test]
+    fn rewrites_user_search_query() {
+        assert_eq!(
+            build_user_search_query("octocat"),
+            "octocat in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("  @octocat  "),
+            "octocat in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("octo-cat42"),
+            "octo-cat42 in:login type:user"
+        );
+        assert_eq!(build_user_search_query("@"), "");
+        assert_eq!(build_user_search_query("   "), "");
+        assert_eq!(build_user_search_query(""), "");
+    }
+
+    /// Search syntax never leaks through: the query is cut at the first
+    /// non-login character, so qualifiers, booleans, quotes and parentheses
+    /// in the typed text can neither widen the login-prefix contract nor
+    /// break the forge request.
+    #[test]
+    fn user_search_query_keeps_only_the_login_prefix() {
+        assert_eq!(
+            build_user_search_query("alice in:name"),
+            "alice in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("foo OR bar"),
+            "foo in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("repos:>100"),
+            "repos in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("@bob@example.com"),
+            "bob in:login type:user"
+        );
+        assert_eq!(
+            build_user_search_query("octo\"cat"),
+            "octo in:login type:user"
+        );
+        // A bare qualifier is just the login prefix before its colon.
+        assert_eq!(build_user_search_query("in:name"), "in in:login type:user");
+        // No login prefix at all: nothing to search.
+        assert_eq!(build_user_search_query("(x)"), "");
+        assert_eq!(build_user_search_query("\"quoted\""), "");
+        assert_eq!(build_user_search_query("@ (x)"), "");
     }
 
     #[test]

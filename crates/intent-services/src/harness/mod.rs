@@ -48,6 +48,7 @@ pub(crate) mod v2_3;
 pub(crate) mod v2_4;
 pub(crate) mod v2_5;
 pub(crate) mod v2_6;
+pub(crate) mod v2_7;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -188,6 +189,17 @@ pub(crate) trait Harness: Send + Sync {
     /// prepended to agent-origin (A2A) sends; an absent `name` renders
     /// `[MESSAGE FROM AGENT ({agent_id})]`.
     fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String;
+    /// `Message from @{login} ({display_name}), a collaborator (guest) of
+    /// this workspace — not the workspace owner.` sender preamble prepended
+    /// to a human message sent by a collaborator principal (multiplayer).
+    /// Falls back to the login alone, then the display name alone, then
+    /// `principal {principal_id}`.
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String;
     /// Human-readable wait for [`Harness::dequeue_wait_note`]: `Ns` under a
     /// minute, then `Nm Ss`, then `Nh Mm`; negative waits clamp to `0s`.
     fn wait_duration(&self, secs: i64) -> String;
@@ -331,7 +343,13 @@ pub(crate) trait Harness: Send + Sync {
     fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String;
     /// FE-cancel notice body (`hook.cancel` with no agent caller).
     fn hook_cancelled_from_app_notice(&self) -> String;
-    /// Archive-sweep cancel notice body.
+    /// Pre-v2.7 per-hook archive-sweep cancel notice body. Retired as a
+    /// runtime surface by the consolidated
+    /// [`Harness::workspace_archived_watches_cancelled_notice`]; kept on the
+    /// trait so the per-version goldens keep pinning its bytes.
+    // `expect(dead_code)` cannot pin an unused trait method (rustc treats it as a
+    // liveness root and reports the expectation unfulfilled), hence the allow.
+    #[cfg_attr(not(test), expect(clippy::allow_attributes), allow(dead_code))]
     fn hook_cancelled_workspace_archived_notice(&self) -> String;
 
     // --- PR monitor wakes and notices (`pr_monitor.rs`) ---
@@ -361,11 +379,27 @@ pub(crate) trait Harness: Send + Sync {
     ) -> String;
     /// FE-cancel notice (`pr.unmonitor` with no agent caller).
     fn pr_monitor_cancelled_from_app_notice(&self, label: &str) -> String;
-    /// Archive-sweep cancel notice.
+    /// Pre-v2.7 per-monitor archive-sweep cancel notice. Retired as a
+    /// runtime surface by the consolidated
+    /// [`Harness::workspace_archived_watches_cancelled_notice`]; kept on the
+    /// trait so the per-version goldens keep pinning its bytes.
+    #[cfg_attr(not(test), expect(clippy::allow_attributes), allow(dead_code))]
     fn pr_monitor_cancelled_workspace_archived_notice(&self, label: &str) -> String;
     /// Former-owner notice when the monitor was taken over by the owner's
     /// parent (`reason: "transferred"`).
     fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String;
+
+    // --- Workspace archive notices (`lib.rs`) ---
+
+    /// The one consolidated notice an agent reads after its workspace was
+    /// unarchived, naming every background hook (`(name, hook_id)`) and PR
+    /// monitor (label) the archive sweep cancelled and how to re-arm each
+    /// kind. Callers pass at least one item; empty kinds are omitted.
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String;
 
     // --- Other conversation-reaching strings (`agent_ops.rs`) ---
 
@@ -443,6 +477,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2_4::ENTRY,
     &v2_5::ENTRY,
     &v2_6::ENTRY,
+    &v2_7::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -499,7 +534,7 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "2.6");
+        assert_eq!(entry.version, "2.7");
         assert_eq!(next_steps(entry.harness), next_steps(&v2_4::V2_4));
         assert_ne!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
         assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));

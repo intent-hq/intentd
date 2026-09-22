@@ -11,21 +11,22 @@ use crate::ids::{
     AgentId, ClientId, HookId, NoteId, PrMonitorId, PrincipalId, WorkspaceGitRootId, WorkspaceId,
 };
 use crate::model::{
-    AgentDelegateInput, AgentListRowScope, AgentLite, AgentScopeCounts, AgentSession, BrowserTab,
-    BrowserTabInput, ClientHostInfo, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentResolveThreadResult, CommentRespondResult, ContextItem, Draft,
-    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
-    LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
-    NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
-    ScriptCreateParams, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    AgentDelegateInput, AgentDelegatedCounts, AgentListRowScope, AgentLite, AgentScopeCounts,
+    AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo, CommentAddResult,
+    CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentResolveThreadResult,
+    CommentRespondResult, ContextItem, Draft, EventQueryParams, EventSubscribeResult,
+    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
+    GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
+    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
+    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
+    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
+    WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -1526,6 +1527,20 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_scope_counts not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Per-parent non-retired delegated session counts — the `delegatedCounts`
+    /// field attached to every `agent.list` response variant (PROTOCOL §5.5).
+    fn agent_delegated_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<AgentDelegatedCounts>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_delegated_counts not implemented".to_string(),
             ))
         })
     }
@@ -4339,6 +4354,62 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.users.search`: login-prefix user search (`GET /search/users`)
+    /// → `{ users: [{ id, login, avatarUrl, htmlUrl }] }`. `limit` defaults to
+    /// 8 and is clamped into `[1, 10]`; a blank `query` answers `{ users: [] }`
+    /// without touching the forge.
+    fn github_users_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (query, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_users_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.identityProof.create`: publish a host-issued `nonce` in a
+    /// **secret gist** created with the stored GitHub token (guest half of
+    /// the gist identity-proof join flow) → `{ gistId, login }`. Refused
+    /// with `Error::IdentityProof` (`github-not-connected` when no token is
+    /// stored or GitHub rejects it, `github-scope-missing` when the token
+    /// lacks the `gist` scope, `github-unreachable` on transport failure).
+    /// Owner-client only. Never returns the token.
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (nonce, host_label);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_identity_proof_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.identityProof.delete`: delete a proof gist created by
+    /// `github.identityProof.create` → `{ ok: true }`. Idempotent (an
+    /// already-deleted gist is `ok`); same bounded `Error::IdentityProof`
+    /// codes as create, the `gist`-scope check included. The gist is read
+    /// back before the delete and must be a proof gist (exactly one file,
+    /// `intent-join-proof.txt`); any other gist of the account is refused
+    /// with `-32602` and nothing is deleted. Owner-client only.
+    fn github_identity_proof_delete(
+        &self,
+        gist_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = gist_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_identity_proof_delete not implemented".to_string(),
+            ))
+        })
+    }
+
     // ========================================================================
     // principal.* (multiplayer w1)
     // ========================================================================
@@ -4356,9 +4427,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `principal.list` (direct member add): the host's credentialed guests
+    /// → `{ principals: [{ principalId, login?, displayName?, avatarUrl?,
+    /// githubUserId? }] }` — every non-primary principal holding at least
+    /// one active (non-revoked) credential, by `createdAt`; a guest that
+    /// revoked itself is omitted (it cannot connect). No params.
+    /// Owner-only: a per-principal (collaborator) wire caller is
+    /// `Forbidden`; the administrator, agents and the daemon pass.
+    fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::principal_list not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `workspace.members.list` (multiplayer w3): the members of a workspace
     /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
-    /// addedAt }] }`, owners first. Member-visible; a non-member gets
+    /// addedAt }], guestCount, guestLimit }`, owners first. `guestCount` is
+    /// the collaborators plus open invites spent against `guestLimit`
+    /// (`sharing.maxGuestsPerWorkspace`). Member-visible; a non-member gets
     /// `NotFound`.
     fn workspace_members_list(
         &self,
@@ -4368,6 +4456,27 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_members_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.members.add` (direct member add): attach an existing
+    /// credentialed guest as a collaborator → `{ added: bool, memberCount }`;
+    /// `added: false` when the principal is already a member (idempotent,
+    /// nothing published). Owner-only. `InvalidParams` for an unknown
+    /// principal, the primary principal, or a principal without an active
+    /// credential; `guest-limit` when the workspace's guest cap is spent.
+    /// On an add the same `workspace:updated { members: true,
+    /// addedPrincipalId, memberCount }` an invite join publishes.
+    fn workspace_members_add(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_members_add not implemented".to_string(),
             ))
         })
     }
@@ -4554,9 +4663,14 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `workspace.invite.create` (multiplayer w4), service half: mint a
-    /// single-use invite for `workspace_id` → `{ invite, secret }` where
-    /// `secret` is returned exactly once (only its hash is stored). Owner-only.
+    /// `workspace.invite.create` (multiplayer w4), service half: mint an
+    /// invite for `workspace_id` → `{ invite, secret }`. Unpinned, the invite
+    /// is reusable until it expires or is revoked; pinned, it is single-use
+    /// (`invite.reusable` on the wire). The plaintext `secret` is persisted
+    /// next to its hash (migration `0128`) so the owner can copy the link
+    /// again later, but it never serialises as a field: this result carries
+    /// it exactly once, and afterwards it reaches the wire only inside the
+    /// rebuilt `url` of `workspace_invite_list`. Owner-only.
     /// Refused with `InviteErrorKind::GithubIdentityRequired` unless the
     /// owner's GitHub identity is linked; `pin_login` (a GitHub login) is
     /// resolved to its account id and stored as the pin
@@ -4579,8 +4693,12 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `workspace.invite.list` (multiplayer w4): the open invites of a
-    /// workspace → `{ invites: [WorkspaceInvite] }` (secrets never included).
-    /// Owner-only.
+    /// workspace → `{ invites: [WorkspaceInvite + url?] }` — each row is the
+    /// serialised `WorkspaceInvite` (secrets never included as fields) plus
+    /// the additive `url`, the invite's `intent://invite?…` link rebuilt from
+    /// the stored secret; `url` is omitted when the row predates the stored
+    /// secret or no link can be built right now (listener down, tunnel
+    /// down — invite links are tunnel-only). Owner-only.
     fn workspace_invite_list(
         &self,
         workspace_id: WorkspaceId,
@@ -4609,12 +4727,16 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `invite.redeem` phase 1 (multiplayer w4, unauthenticated `/invite`
-    /// endpoint): validate `(invite_id, secret)` and start an identity-only
-    /// GitHub device flow → `{ flowId, userCode, verificationUri, expiresIn,
-    /// interval, workspaceId, workspaceTitle }`. The access token the flow
-    /// yields is used once for `GET /user` and never persisted.
-    fn invite_redeem_start(
+    /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
+    /// endpoint): validate `(invite_id, secret)` — the
+    /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
+    /// revoked / (pinned and) redeemed link — and answer `{ workspaceId, workspaceTitle }`
+    /// without touching GitHub or issuing a nonce. The `/invite` transport
+    /// extends the result with the host's `hostname` / `prettyHostname`
+    /// (same sources as `system.status`), so a client can show the consent
+    /// prompt before it decides between `invite.accept` and
+    /// `invite.challenge` / `invite.prove`.
+    fn invite_inspect(
         &self,
         invite_id: String,
         secret: String,
@@ -4622,22 +4744,91 @@ pub trait WorkspaceApi: Send + Sync {
         let _ = (invite_id, secret);
         Box::pin(async {
             Err(Error::Internal(
-                "WorkspaceApi::invite_redeem_start not implemented".to_string(),
+                "WorkspaceApi::invite_inspect not implemented".to_string(),
             ))
         })
     }
 
-    /// `invite.redeem` phase 2 (multiplayer w4): wait for the flow started by
-    /// [`Self::invite_redeem_start`] to settle → `{ status: "authorized",
-    /// token, principalId, login, workspaceId }` exactly once (the flow is
-    /// forgotten after the result is collected), or the terminal
-    /// [`crate::InviteErrorKind`] error (denied / expired / pin mismatch /
-    /// invite closed meanwhile).
-    fn invite_redeem_wait(&self, flow_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = flow_id;
+    /// `invite.accept` (multiplayer w4, unauthenticated `/invite` endpoint):
+    /// the returning guest's join. `credential` is a per-principal bearer
+    /// credential this host minted earlier (another workspace's join);
+    /// its hash resolves the principal like the `/ws` bearer gate does —
+    /// unknown or revoked is [`crate::InviteErrorKind::CredentialInvalid`]
+    /// (`credential-invalid`); one bound to the primary principal (the host
+    /// owner's own account) is [`crate::InviteErrorKind::OwnerSelfJoin`]
+    /// (`owner-self-join`). The invite is then validated like
+    /// [`Self::invite_inspect`], a pin is checked against the
+    /// principal's stored `github_user_id` (`invite-pin-mismatch`), and the
+    /// join commits with the stored identity (no GitHub call, no profile
+    /// refresh) → the [`Self::invite_prove`] shape
+    /// `{ status: "authorized", token, principalId, login, workspaceId }`
+    /// with a fresh credential.
+    fn invite_accept(
+        &self,
+        invite_id: String,
+        secret: String,
+        credential: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret, credential);
         Box::pin(async {
             Err(Error::Internal(
-                "WorkspaceApi::invite_redeem_wait not implemented".to_string(),
+                "WorkspaceApi::invite_accept not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.challenge` (gist identity-proof join, unauthenticated
+    /// `/invite` endpoint): validate `(invite_id, secret)` exactly like
+    /// [`Self::invite_inspect`] and issue a single-use nonce bound to the
+    /// invite → `{ workspaceId, workspaceTitle, nonce, nonceExpiresAt }`.
+    /// The nonce is 32 random bytes (base64url, unpadded), lives 10 minutes
+    /// and is consumed by the first [`Self::invite_prove`] that names it.
+    /// GitHub is never contacted. The `/invite` transport extends the result
+    /// with the host's `hostname` / `prettyHostname`.
+    fn invite_challenge(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_challenge not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.prove` (gist identity-proof join, unauthenticated `/invite`
+    /// endpoint): the guest published `nonce` in a gist under its own
+    /// account and names it. The host reads `GET /gists/{gist_id}` and
+    /// requires the owner login to equal `login` (case-insensitively), the
+    /// file `intent-join-proof.txt` to start with the nonce and the gist to
+    /// have been created no earlier than the nonce was issued; then resolves
+    /// `GET /users/{login}` and commits the join → `{ status: "authorized",
+    /// token, principalId, login, workspaceId }`. Refusals:
+    /// [`crate::InviteErrorKind::ProofInvalid`]
+    /// (any mismatch, an unknown gist, or a nonce not issued for this invite
+    /// / already consumed), [`crate::InviteErrorKind::ProofExpired`],
+    /// [`crate::InviteErrorKind::GithubUnreachable`];
+    /// [`crate::InviteErrorKind::OwnerSelfJoin`] (`owner-self-join`) when
+    /// the proven account is the primary principal's own — the host owner
+    /// cannot join its own host as a guest and no credential is minted; a
+    /// closed invite, a pin
+    /// mismatch and a full workspace answer their existing kinds. The nonce
+    /// is consumed by the first attempt that reaches the verification,
+    /// except when GitHub was unreachable (the guest may retry).
+    fn invite_prove(
+        &self,
+        invite_id: String,
+        secret: String,
+        nonce: String,
+        gist_id: String,
+        login: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret, nonce, gist_id, login);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_prove not implemented".to_string(),
             ))
         })
     }
@@ -5267,6 +5458,23 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::unsloth_stop not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.memoryUsage`: daemon-wide per-agent memory attribution from the
+    /// descendant-tree sampler (§5.5) — `{ sampledAt, totalBytes, agents:
+    /// [{ agentId, agentName, workspaceId, provider, model?, rootPid,
+    /// processCount, memoryBytes, processes: [{ pid, parentPid, name,
+    /// cmdline, memoryBytes }] }] }`, `agents` sorted by `memoryBytes`
+    /// descending; a bucket whose session row is gone is omitted. No
+    /// workspace id: the sample spans every live agent.
+    /// `{ sampledAt: null, totalBytes: null, agents: [] }` before the first
+    /// sample lands or when no tree probe is installed.
+    fn agent_memory_usage(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_memory_usage not implemented".to_string(),
             ))
         })
     }
@@ -7063,9 +7271,13 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.pr.monitor`: register (idempotently) a centralized monitor on
     /// `pr_number` for `agent_id`, returning the monitor row plus the freshly
-    /// fetched merge-requirements checklist. `repo` is an optional
-    /// `"owner/name"` override; `None` resolves the workspace repo. MCP-only
-    /// — monitors are agent-owned, so there is no wire registration method.
+    /// fetched merge-requirements checklist — `requirements: null` plus a
+    /// `pausedUntil` deadline when the forge quota is exhausted and the
+    /// baseline fetch is deferred to the end of the daemon's global
+    /// rate-limit pause (the monitor is still registered). `repo` is an
+    /// optional `"owner/name"` override; `None` resolves the workspace repo.
+    /// MCP-only — monitors are agent-owned, so there is no wire registration
+    /// method.
     fn pr_monitor_start(
         &self,
         workspace_id: WorkspaceId,

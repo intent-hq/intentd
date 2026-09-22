@@ -133,6 +133,15 @@ impl Harness for V2_3 {
         V1.a2a_sender_note(name, agent_id)
     }
 
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String {
+        V1.collaborator_sender_preamble(login, display_name, principal_id)
+    }
+
     fn wait_duration(&self, secs: i64) -> String {
         V1.wait_duration(secs)
     }
@@ -335,6 +344,14 @@ impl Harness for V2_3 {
 
     fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String {
         V1.pr_monitor_transferred_to_parent_notice(label, parent_id)
+    }
+
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String {
+        V1.workspace_archived_watches_cancelled_notice(hooks, monitors)
     }
 
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String {

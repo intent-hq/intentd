@@ -1260,16 +1260,19 @@ async fn parked_messages_survive_wake_or_create_replacement() {
     assert!(saw_deleted, "agent:deleted observed for the poisoned agent");
 }
 
-/// Multiplayer w2: a collaborator's `agent.wakeOrCreate` keeps its principal
+/// Multiplayer w2 + agent-creation decision (2026-09-19: guests steer
+/// existing agents only): a collaborator's `agent.wakeOrCreate` is refused
+/// at the transport gate with `-32003 Forbidden` before any side effect —
+/// no agent exists afterwards. The owner's wake then keeps its principal
 /// through the runtime wake path's terminal-failure requeue. The wake row is
-/// persisted with the guest's `fromPrincipalId`; when the turn fails
+/// persisted with the owner's `fromPrincipalId`; when the turn fails
 /// session-fatally (mock provider safety block) the requeued kickoff on
-/// `agent.getQueue` / `agent:queue:updated` still carries the guest's stamp
-/// (not the owner's, not none) plus the resolved `author` projection, and
-/// `agent.getSession` serves the same `author` on the persisted row as
-/// `agent.getConversation`.
+/// `agent.getQueue` / `agent:queue:updated` still carries the owner's stamp
+/// (not the retrying guest's, not none) plus the resolved `author`
+/// projection, and `agent.getSession` serves the same `author` on the
+/// persisted row as `agent.getConversation`.
 #[intent_test_macros::daemon_test]
-async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
+async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
     use intent_core::{now_iso, Principal, PrincipalId};
     use intent_store::Store;
     use sha2::Digest as _;
@@ -1307,7 +1310,7 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
         created_at: now_iso(),
         updated_at: now_iso(),
     };
-    {
+    let primary = {
         let store = Store::open(&daemon.data_dir.path().join("intentd.db"))
             .await
             .expect("open daemon store");
@@ -1335,7 +1338,8 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
             )
             .await
             .expect("guest membership");
-    }
+        store.get_primary_principal().await.expect("primary")
+    };
 
     // SUBSCRIBER conn (owner) — subscribe BEFORE any turn.
     let mut sub = connect_ws(port, cfg.clone()).await;
@@ -1347,25 +1351,48 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
     )
     .await;
 
-    // The GUEST wakes (creates) the task agent with a spoofed stamp.
+    let wake_params = json!({
+        "workspaceId": ws_id,
+        "taskNoteId": task_note_id,
+        "contextMessage": "guest kickoff",
+        "model": "default",
+        "messageMetadata": { "fromPrincipalId": "spoof" },
+        "create": { "provider": "mock" },
+    });
+
+    // The GUEST may not create agents: refused at the transport gate, and
+    // no agent exists in the workspace afterwards.
     let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
     let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
-    let woke = wss_rpc(
+    let refused =
+        wss_rpc_envelope(&mut guest_rpc, 9, "agent.wakeOrCreate", wake_params.clone()).await;
+    assert_eq!(
+        refused["error"]["code"], -32003,
+        "guest agent.wakeOrCreate is Forbidden: {refused}"
+    );
+    assert_eq!(refused["error"]["message"], "Forbidden", "{refused}");
+    assert!(refused.get("result").is_none(), "{refused}");
+    let agents = wss_rpc(
         &mut guest_rpc,
         10,
-        "agent.wakeOrCreate",
-        json!({
-            "workspaceId": ws_id,
-            "taskNoteId": task_note_id,
-            "contextMessage": "guest kickoff",
-            "model": "default",
-            "messageMetadata": { "fromPrincipalId": "spoof" },
-            "create": { "provider": "mock" },
-        }),
+        "agent.list",
+        json!({ "workspaceId": ws_id }),
     )
     .await;
-    assert_eq!(woke["ok"], true, "guest wakeOrCreate: {woke}");
+    assert_eq!(
+        agents["agents"].as_array().map(Vec::len),
+        Some(0),
+        "the refused wake created nothing: {agents}"
+    );
+
+    // The OWNER wakes (creates) the task agent with a spoofed stamp.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let woke = wss_rpc(&mut rpc, 10, "agent.wakeOrCreate", wake_params).await;
+    assert_eq!(woke["ok"], true, "owner wakeOrCreate: {woke}");
     let agent_id = woke["agentId"].as_str().expect("agentId").to_string();
+    // The OWNER enqueued the kickoff, so no collaborator sender preamble is
+    // prepended: the requeue keeps the enqueue-time content verbatim.
+    let kickoff_content = json!("guest kickoff");
 
     // Wait for the terminal failure and for the `agent:queue:updated` that
     // announces the requeued kickoff.
@@ -1383,7 +1410,7 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
         if event["type"] == "agent:queue:updated"
             && event["data"]["queue"]
                 .as_array()
-                .is_some_and(|q| q.iter().any(|m| m["content"] == "guest kickoff"))
+                .is_some_and(|q| q.iter().any(|m| m["content"] == kickoff_content))
         {
             requeue_event = Some(event["data"].clone());
         }
@@ -1393,8 +1420,7 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
     }
     assert!(saw_status_error, "agent parked in error after the block");
 
-    // The requeued kickoff keeps the guest's stamp — on the queue read …
-    let mut rpc = connect_ws(port, cfg.clone()).await;
+    // The requeued kickoff keeps the owner's stamp — on the queue read …
     let queue = wss_rpc(
         &mut rpc,
         11,
@@ -1405,18 +1431,18 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
     let parked = queue["queue"].as_array().expect("queue array");
     let kickoff = parked
         .iter()
-        .find(|m| m["content"] == "guest kickoff")
+        .find(|m| m["content"] == kickoff_content)
         .unwrap_or_else(|| panic!("requeued kickoff on the queue: {queue}"));
     assert_eq!(
         kickoff["messageMetadata"]["fromPrincipalId"],
-        json!(guest.id.0),
-        "the requeued wake carries the guest's principal (never the spoof, never none): {kickoff}"
+        json!(primary.id.0),
+        "the requeued wake carries the owner's principal (never the spoof, never none): {kickoff}"
     );
     let expected_author = json!({
-        "principalId": guest.id.0,
-        "login": "guest",
-        "displayName": "Guest User",
-        "avatarUrl": null,
+        "principalId": primary.id.0,
+        "login": primary.login,
+        "displayName": primary.display_name,
+        "avatarUrl": primary.avatar_url,
     });
     assert_eq!(
         kickoff["author"], expected_author,
@@ -1428,12 +1454,12 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
         .as_array()
         .expect("queue array")
         .iter()
-        .find(|m| m["content"] == "guest kickoff")
+        .find(|m| m["content"] == kickoff_content)
         .unwrap_or_else(|| panic!("requeued kickoff in agent:queue:updated: {queue_event}"));
     assert_eq!(
         announced["messageMetadata"]["fromPrincipalId"],
-        json!(guest.id.0),
-        "agent:queue:updated carries the guest's stamp: {announced}"
+        json!(primary.id.0),
+        "agent:queue:updated carries the owner's stamp: {announced}"
     );
     assert_eq!(
         announced["author"], expected_author,
@@ -1453,7 +1479,7 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
         .as_array()
         .expect("session messages")
         .iter()
-        .find(|m| m["role"] == "user" && m["metadata"]["fromPrincipalId"] == json!(guest.id.0))
+        .find(|m| m["role"] == "user" && m["metadata"]["fromPrincipalId"] == json!(primary.id.0))
         .unwrap_or_else(|| panic!("stamped wake row in agent.getSession: {session}"));
     assert_eq!(
         session_row["author"], expected_author,
@@ -1486,18 +1512,19 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
         "non-user rows carry no author on agent.getSession: {session}"
     );
 
-    // agent.retry by a DIFFERENT caller (the owner) redrives the guest's
-    // requeued kickoff. Rule: the retrier is not the author — the redriven
-    // entry keeps the guest's stamp, and when the redrive fails the same way
-    // the second requeue still carries it (never re-stamped to the owner).
+    // agent.retry by a DIFFERENT caller (the guest — a steer it keeps)
+    // redrives the owner's requeued kickoff. Rule: the retrier is not the
+    // author — the redriven entry keeps the owner's stamp, and when the
+    // redrive fails the same way the second requeue still carries it (never
+    // re-stamped to the guest).
     let retried = wss_rpc(
-        &mut rpc,
+        &mut guest_rpc,
         14,
         "agent.retry",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
     .await;
-    assert_eq!(retried["ok"], true, "owner agent.retry: {retried}");
+    assert_eq!(retried["ok"], true, "guest agent.retry: {retried}");
     assert_eq!(
         retried["redriven"], true,
         "retry redrove the requeued kickoff: {retried}"
@@ -1529,7 +1556,7 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
         if event["type"] == "agent:queue:updated"
             && event["data"]["queue"]
                 .as_array()
-                .is_some_and(|q| q.iter().any(|m| m["content"] == "guest kickoff"))
+                .is_some_and(|q| q.iter().any(|m| m["content"] == kickoff_content))
         {
             second_requeue = Some(event["data"].clone());
         }
@@ -1543,12 +1570,12 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
         .as_array()
         .expect("queue array")
         .iter()
-        .find(|m| m["content"] == "guest kickoff")
+        .find(|m| m["content"] == kickoff_content)
         .expect("kickoff in the second requeue");
     assert_eq!(
         redriven["messageMetadata"]["fromPrincipalId"],
-        json!(guest.id.0),
-        "the entry redriven by the owner's retry keeps the guest's stamp: {redriven}"
+        json!(primary.id.0),
+        "the entry redriven by the guest's retry keeps the owner's stamp: {redriven}"
     );
     assert_eq!(redriven["author"], expected_author, "{redriven}");
     assert_eq!(redriven["requeuedAfterFailure"], true, "{redriven}");
@@ -1564,17 +1591,17 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
         .as_array()
         .expect("queue array")
         .iter()
-        .find(|m| m["content"] == "guest kickoff")
+        .find(|m| m["content"] == kickoff_content)
         .unwrap_or_else(|| panic!("kickoff requeued after the retry: {queue_after_retry}"));
     assert_eq!(
         kickoff_after_retry["messageMetadata"]["fromPrincipalId"],
-        json!(guest.id.0),
+        json!(primary.id.0),
         "agent.getQueue after retry: {kickoff_after_retry}"
     );
     assert_eq!(kickoff_after_retry["author"], expected_author);
 
     // The transcript never gains a row attributed to the retrier: every
-    // user row still carries the guest's principal.
+    // user row still carries the owner's principal.
     let session_after_retry = wss_rpc(
         &mut rpc,
         16,
@@ -1592,7 +1619,7 @@ async fn guest_wake_stamp_survives_terminal_failure_requeue_over_wss() {
     for row in user_rows {
         assert_eq!(
             row["metadata"]["fromPrincipalId"],
-            json!(guest.id.0),
+            json!(primary.id.0),
             "a user row was re-attributed by the retry: {row}"
         );
         assert_eq!(row["author"], expected_author, "{row}");

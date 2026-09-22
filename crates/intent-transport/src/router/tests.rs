@@ -605,6 +605,7 @@ impl WorkspaceApi for FakeApi {
                 updated_at: Some("t1".to_string()),
                 skipped: None,
                 reason: None,
+                rev: Some(1),
             })
         })
     }
@@ -1296,6 +1297,46 @@ impl WorkspaceApi for FakeApi {
                 "user": { "login": "octocat", "avatarUrl": "a", "htmlUrl": "h" }
             }))
         })
+    }
+
+    fn github_users_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "users": [],
+                "echoQuery": query,
+                "echoLimit": limit,
+            }))
+        })
+    }
+
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            // The fake refuses a sentinel nonce with the bounded scope error
+            // so the wire mapping (`-32603` + `data.code`) is exercised.
+            if nonce == "no-scope" {
+                return Err(Error::IdentityProof(
+                    intent_core::IdentityProofErrorKind::ScopeMissing,
+                ));
+            }
+            Ok(serde_json::json!({
+                "gistId": "g1",
+                "login": "octocat",
+                "echoNonce": nonce,
+                "echoHostLabel": host_label,
+            }))
+        })
+    }
+
+    fn github_identity_proof_delete(&self, gist_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "echoGistId": gist_id })) })
     }
 
     fn git_commit(
@@ -2523,6 +2564,27 @@ fn voice_not_configured_maps_to_structured_error_data() {
     assert_eq!(
         rpc.data.expect("structured data"),
         serde_json::json!({ "code": "voice-no-api-key", "detail": detail })
+    );
+}
+
+#[test]
+fn rate_limited_maps_to_structured_error_data() {
+    // Forge rate limiting (intent-hq/intent#5627) — any cause the
+    // source-control layer classifies as `RateLimited` — keeps the -32603
+    // code and the exact `source control rate limited: <detail>` message,
+    // and carries `error.data = { code: "rate-limited" }` so the invite flow
+    // routes "wait for the limit to reset" instead of a sign-in prompt.
+    let rpc = super::domain_to_rpc(intent_core::Error::RateLimited(
+        "API rate limit exceeded for user ID 1.".to_string(),
+    ));
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.message,
+        "source control rate limited: API rate limit exceeded for user ID 1."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({ "code": "rate-limited" })
     );
 }
 
@@ -3761,8 +3823,10 @@ async fn singular_event_subscribe_aliases_are_not_routable() {
 
 /// `agent.list` row-scope params (§5.5): an unknown or non-string `scope` is
 /// `-32602` (never coerced, unlike the lenient retired flags), a bin scope
-/// cannot ride with either retired flag, and `parentAgentId` must be a
-/// canonical `agent-{uuid}` paired with `scope: "delegated"`.
+/// cannot ride with either retired flag, `parentAgentId` must be a
+/// canonical `agent-{uuid}` paired with `scope: "delegated"`, and
+/// `orphanedOnly` must be a boolean paired with `scope: "delegated"` and
+/// never with `parentAgentId`.
 #[tokio::test]
 async fn agent_list_scope_params_are_validated() {
     let scope_msg = "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"";
@@ -3803,10 +3867,46 @@ async fn agent_list_scope_params_are_validated() {
             r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
             "parentAgentId requires scope \"delegated\"",
         ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":"yes"}}"#,
+            "orphanedOnly must be a boolean",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":1}}"#,
+            "orphanedOnly must be a boolean",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"background","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":true,"parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+            "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
+        ),
     ] {
         let v = call(frame).await.unwrap();
         assert_eq!(err_code(&v), -32602, "{frame}: {v}");
         assert_eq!(v["error"]["message"], serde_json::json!(expected), "{frame}");
+    }
+    // `orphanedOnly: false` reads as absent on any scope: the frame passes
+    // param validation into the trait default (`Internal` → `-32603`),
+    // like a valid `orphanedOnly: true` delegated read.
+    for frame in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","orphanedOnly":false}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","orphanedOnly":false}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":false,"parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":true}}"#,
+    ] {
+        let v = call(frame).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "{frame}: {v}");
     }
     // The retired-flag contradiction still wins over a scope combination.
     let v = call(
@@ -4655,6 +4755,91 @@ async fn github_repos_search_routes_query() {
     .await
     .unwrap();
     assert_eq!(v["result"]["echoQuery"], serde_json::json!("react"));
+}
+
+#[tokio::test]
+async fn github_users_search_requires_query() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.users.search","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn github_identity_proof_create_routes_nonce_and_host_label() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{"nonce":"n1","hostLabel":"Studio"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["gistId"], serde_json::json!("g1"));
+    assert_eq!(v["result"]["login"], serde_json::json!("octocat"));
+    assert_eq!(v["result"]["echoNonce"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["echoHostLabel"], serde_json::json!("Studio"));
+}
+
+#[tokio::test]
+async fn github_identity_proof_create_requires_nonce_and_host_label() {
+    for params in ["{}", r#"{"nonce":"n1"}"#, r#"{"hostLabel":"h"}"#] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
+}
+
+#[tokio::test]
+async fn github_identity_proof_refusal_carries_bounded_data_code() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{"nonce":"no-scope","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "github-scope-missing" })
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("gist")),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn github_identity_proof_delete_routes_gist_id_and_requires_it() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.delete","params":{"gistId":"g1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["echoGistId"], serde_json::json!("g1"));
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.delete","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn github_users_search_routes_query_and_optional_limit() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.users.search","params":{"query":"octo","limit":3}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoQuery"], serde_json::json!("octo"));
+    assert_eq!(v["result"]["echoLimit"], serde_json::json!(3));
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"github.users.search","params":{"query":"octo"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoLimit"], Value::Null);
 }
 
 #[tokio::test]

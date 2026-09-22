@@ -143,6 +143,7 @@ const COMPARED_SURFACES: &[&str] = &[
     "stale_redrive_note",
     "dequeue_wait_note",
     "a2a_sender_note",
+    "collaborator_sender_preamble",
     "wait_duration",
     "idle_timeout_warning",
     "truncation_redrive_nudge",
@@ -181,6 +182,7 @@ const COMPARED_SURFACES: &[&str] = &[
     "pr_monitor_cancelled_from_app_notice",
     "pr_monitor_cancelled_workspace_archived_notice",
     "pr_monitor_transferred_to_parent_notice",
+    "workspace_archived_watches_cancelled_notice",
     "delegation_first_message",
     "questions_dismissed_notice",
     "proposal_applied_notice",
@@ -315,6 +317,12 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(dequeue_wait_note("2026-01-02T03:04:05Z", "5 minutes"));
     same!(a2a_sender_note(Some("Coordinator"), "agent-1"));
     same!(a2a_sender_note(None, "agent-1"));
+    same!(collaborator_sender_preamble(
+        Some("octocat"),
+        Some("The Octocat"),
+        "principal-1"
+    ));
+    same!(collaborator_sender_preamble(None, None, "principal-1"));
     for secs in [0, 59, 60, 3599, 3600, 90_000] {
         same!(wait_duration(secs));
     }
@@ -462,6 +470,16 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(pr_monitor_transferred_to_parent_notice(
         "o/r#42",
         "agent-parent"
+    ));
+
+    // --- Workspace archive notices ---
+    same!(workspace_archived_watches_cancelled_notice(
+        &[("pr-watch", "hook-1")],
+        &["o/r#42"]
+    ));
+    same!(workspace_archived_watches_cancelled_notice(
+        &[],
+        &["o/r#42"]
     ));
 
     // --- Other conversation-reaching strings ---

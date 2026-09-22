@@ -539,8 +539,9 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
 /// hook-initiated archive must STAY PARKED behind the archived gate even when
 /// it lands while the hook owner is mid-turn.
 ///
-/// The archive tail's hook sweep wakes the owner; when the owner's turn is
-/// still in flight the wake takes `deliver_wake_message`'s fast enqueue
+/// The archive tail wakes the owner (the consolidated archive-watch notice
+/// naming the swept hook); when the owner's turn is still in flight the wake
+/// takes `deliver_wake_message`'s fast enqueue
 /// branch (busy → queue) — bypassing that path's archived gate, which only
 /// covers the idle-delivery arm. The owner's worker then popped the parked
 /// wake in its end-of-turn drain, whose `try_begin` re-claim auto-unarchived
@@ -731,8 +732,9 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     );
     assert_eq!(fetched["workspace"]["status"], json!("Archived"));
 
-    // ...and the cancel wake is still PARKED in the owner's queue — proof it
-    // was gated rather than consumed by a stray turn.
+    // ...and the consolidated archive-watch wake is still PARKED in the
+    // owner's queue — proof it was gated rather than consumed by a stray
+    // turn.
     let queue = wss_rpc(
         &mut rpc,
         "agent.getQueue",
@@ -743,7 +745,7 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     assert!(
         entries.iter().any(|m| m["content"]
             .as_str()
-            .is_some_and(|c| c.contains("cancelled because its workspace was archived"))),
-        "the hook-cancel wake stays parked until unarchive: {queue}"
+            .is_some_and(|c| c.contains("was archived and has since been unarchived"))),
+        "the archive-watch wake stays parked until unarchive: {queue}"
     );
 }

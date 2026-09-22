@@ -149,15 +149,37 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// `note.presence.update`) and +1 router method (`presence.snapshot`); the
 /// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
 /// counted with the other subscription channels, not here.
-const EXPECTED_TOTAL_METHODS: usize = 378;
+///
+/// Also within 10.3: +1 router method (`github.users.search`, the
+/// collaborator picker's login-prefix user search).
+///
+/// Agent memory attribution (§5.5): +1 router method (`agent.memoryUsage`).
+///
+/// Returning guest (multiplayer w4): +2 fast-path methods on the `/invite`
+/// endpoint (`invite.inspect`, `invite.accept`).
+///
+/// Gist identity proof (guest half): +2 router methods
+/// (`github.identityProof.create`, `github.identityProof.delete`).
+///
+/// Gist identity proof (host half): +2 fast-path methods on the `/invite`
+/// endpoint (`invite.challenge`, `invite.prove`).
+///
+/// Gist identity proof replaces the host-side device flow: −1 fast-path
+/// method (`invite.redeem`); the guest joins through `invite.challenge` /
+/// `invite.prove` (or `invite.accept` with a credential) instead.
+///
+/// Direct member add: +2 router methods (`principal.list`, the owner-only
+/// roster of credentialed guests; `workspace.members.add`, the owner-only
+/// direct attach of one of them).
+const EXPECTED_TOTAL_METHODS: usize = 387;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 323;
+const EXPECTED_ROUTER_METHODS: usize = 329;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 53;
+const EXPECTED_FASTPATH_METHODS: usize = 56;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -420,7 +442,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
     ),
     (
         "agent.retry",
-        "re-delivers the requeued entry with the stamp captured at enqueue / wake delivery — the retrier is never the author (`guest_wake_stamp_survives_terminal_failure_requeue_over_wss`)",
+        "re-delivers the requeued entry with the stamp captured at enqueue / wake delivery — the retrier is never the author (`wake_stamp_survives_terminal_failure_requeue_over_wss`)",
     ),
     (
         "agent.sendMessage",
@@ -495,6 +517,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.listInterrupted",
     "agent.listUserMessages",
     "agent.markSeen",
+    "agent.memoryUsage",
     "agent.pendingPermissions",
     "agent.removeQueuedMessage",
     "agent.rename",
@@ -598,6 +621,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.identityProof.create",
+    "github.identityProof.delete",
     "github.issues.get",
     "github.issues.list",
     "github.issues.search",
@@ -617,6 +642,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.resolveThread",
     "github.revoke",
     "github.unresolveThread",
+    "github.users.search",
     "hook.cancel",
     "hook.list",
     "hook.runNow",
@@ -641,7 +667,10 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
-    "invite.redeem",
+    "invite.accept",
+    "invite.challenge",
+    "invite.inspect",
+    "invite.prove",
     "linear.authStatus",
     "linear.createIssue",
     "linear.getIssue",
@@ -701,6 +730,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "primitive.addCli",
     "primitive.addPatch",
     "primitive.addReference",
+    "principal.list",
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
@@ -822,6 +852,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.list",
     "workspace.localChanges",
     "workspace.markSeen",
+    "workspace.members.add",
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
@@ -1083,11 +1114,14 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// Owner-only families: `host.*` but the two display probes, `browser.*`,
 /// `forward.*`, `terminal.*`, `script.*`, `github.*`, `linear.*`, `sentry.*`,
 /// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
-/// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`),
+/// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`
+/// and `system.status`),
 /// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
-/// `git.agentCommit` (agent-only), agent deletion / proposals / one-shot
-/// completions, `agent.replaceMessages` (persists client-supplied user rows
+/// `git.agentCommit` (agent-only), agent creation / delegation (decided
+/// 2026-09-19: guests steer existing agents only — `agent.create`,
+/// `agent.delegate`, `agent.wakeOrCreate`), agent deletion / proposals /
+/// one-shot completions, `agent.replaceMessages` (persists client-supplied user rows
 /// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
 /// PR-monitor cancel/flush, daemon-wide metrics, and the `accept-changes.*` /
 /// `file-tracking.*` publishing flow (stages, commits, pushes and merges as
@@ -1100,12 +1134,16 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.prepare",
     "agent.cancelDelete",
     "agent.completeOnce",
+    "agent.create",
+    "agent.delegate",
     "agent.delete",
     "agent.diagnostics",
     "agent.enhancePrompt",
+    "agent.memoryUsage",
     "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveProposal",
+    "agent.wakeOrCreate",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -1133,6 +1171,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.identityProof.create",
+    "github.identityProof.delete",
     "github.issues.get",
     "github.issues.list",
     "github.issues.search",
@@ -1152,6 +1192,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.resolveThread",
     "github.revoke",
     "github.unresolveThread",
+    "github.users.search",
     "hook.cancel",
     "hook.runNow",
     "host.checkAuggie",
@@ -1173,7 +1214,10 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
-    "invite.redeem",
+    "invite.accept",
+    "invite.challenge",
+    "invite.inspect",
+    "invite.prove",
     "linear.authStatus",
     "linear.createIssue",
     "linear.getIssue",
@@ -1202,6 +1246,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "pairing.getInfo",
     "prMonitor.cancel",
     "prMonitor.flush",
+    "principal.list",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1248,7 +1293,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
-    "system.status",
     "terminal.create",
     "terminal.getBuffer",
     "terminal.kill",
@@ -1284,6 +1328,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "workspace.invite.create",
     "workspace.invite.list",
     "workspace.invite.revoke",
+    "workspace.members.add",
     "workspace.members.remove",
     "workspace.restore",
     "workspace.saveSetupScript",
@@ -1423,6 +1468,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "chat.subscribe",
         "workspace.subscribe",
         "system.capabilities",
+        "system.status",
         "host.status",
         "principal.me",
         "pr.status",
@@ -1431,7 +1477,8 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "presence.snapshot",
         "presence.update",
         "note.presence.subscribe",
-        "agent.create",
+        "agent.rename",
+        "agent.update",
         "agent.stop",
         "agent.sendMessage",
         "agent.setModel",
@@ -1453,11 +1500,17 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "mcp.servers.list",
         "prMonitor.cancel",
         "settings.get",
+        "system.shutdown",
+        "system.requestUpdate",
         "repo.list",
         "voice.transcribe",
         "workspace.create",
         "git.clone",
+        "agent.create",
+        "agent.delegate",
+        "agent.wakeOrCreate",
         "agent.delete",
+        "agent.cancelDelete",
         "agent.replaceMessages",
         "terminal.list",
         "script.list",
@@ -1508,7 +1561,9 @@ fn reverse_methods_are_never_on_the_collaborator_allowlist() {
 ///
 /// The remaining refused methods — the connection-task fast paths (`host.*`,
 /// `browser.*`, `forward.*`, `system.*`, `pairing.*`, `server.*`,
-/// `providers.setup.*`, `invite.redeem`) and the subscription channels — have
+/// `providers.setup.*`, `invite.inspect` / `invite.accept` /
+/// `invite.challenge` / `invite.prove`)
+/// and the subscription channels — have
 /// no `WorkspaceApi` method to gate; they are protected only by the
 /// transport allowlist in `conn::process_frame` (`-32003`) and stay out of
 /// this table by construction. That partition is asserted, not assumed.
@@ -1575,6 +1630,9 @@ mod unbound_owner_only_methods {
     /// growing it needs a reason on the row. The failure message prints the
     /// recomputed list.
     const UNGATED_AT_SERVICE_LAYER: &[(&str, &str)] = &[
+        // No gate: daemon-wide per-agent memory read; no-manager early
+        // return `{ sampledAt: null, totalBytes: null, agents: [] }`.
+        ("agent.memoryUsage", "ok"),
         // No gate: daemon-wide reverse-client listing.
         ("client.list", "ok"),
         // No gate: process-wide stack sampler.
@@ -1668,12 +1726,18 @@ mod unbound_owner_only_methods {
                 "agent.completeOnce",
                 json!({ "prompt": "p", "timeoutMs": 1 }),
             ),
+            ("agent.create", json!({ "workspaceId": ws })),
+            (
+                "agent.delegate",
+                json!({ "workspaceId": ws, "taskNoteId": "t1" }),
+            ),
             ("agent.delete", json!({ "agentId": "a1" })),
             ("agent.diagnostics", json!({ "workspaceId": ws })),
             (
                 "agent.enhancePrompt",
                 json!({ "prompt": "p", "timeoutMs": 1 }),
             ),
+            ("agent.memoryUsage", json!({})),
             (
                 "agent.replaceMessages",
                 json!({ "agentId": "a1", "messages": [] }),
@@ -1685,6 +1749,10 @@ mod unbound_owner_only_methods {
             (
                 "agent.resolveProposal",
                 json!({ "workspaceId": ws, "agentId": "a1", "proposalId": "p1", "outcome": "reject" }),
+            ),
+            (
+                "agent.wakeOrCreate",
+                json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
             ),
             ("client.list", json!({})),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
@@ -1715,6 +1783,11 @@ mod unbound_owner_only_methods {
             ("github.connect", json!({})),
             ("github.getReviewThreads", gh_n.clone()),
             ("github.getUser", json!({})),
+            (
+                "github.identityProof.create",
+                json!({ "nonce": "n", "hostLabel": "h" }),
+            ),
+            ("github.identityProof.delete", json!({ "gistId": "g" })),
             ("github.issues.get", gh_n.clone()),
             ("github.issues.list", gh.clone()),
             ("github.issues.search", gh.clone()),
@@ -1740,6 +1813,7 @@ mod unbound_owner_only_methods {
             ("github.resolveThread", json!({ "threadId": "t" })),
             ("github.revoke", json!({})),
             ("github.unresolveThread", json!({ "threadId": "t" })),
+            ("github.users.search", json!({ "query": "q" })),
             ("hook.cancel", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("linear.authStatus", json!({})),
@@ -1790,6 +1864,7 @@ mod unbound_owner_only_methods {
                 "prMonitor.flush",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),
             ),
+            ("principal.list", json!({})),
             ("repo.list", json!({})),
             ("repo.remove", json!({ "path": dir })),
             (
@@ -1909,6 +1984,10 @@ mod unbound_owner_only_methods {
                 json!({ "workspaceId": ws, "inviteId": "inv" }),
             ),
             (
+                "workspace.members.add",
+                json!({ "workspaceId": ws, "principalId": "p" }),
+            ),
+            (
                 "workspace.members.remove",
                 json!({ "workspaceId": ws, "principalId": "p" }),
             ),
@@ -1941,6 +2020,42 @@ mod unbound_owner_only_methods {
             .collect()
     }
 
+    /// `intent_services::capability::ASSERT_BOUND_CALLER_ENV`: armed, an
+    /// unbound capability gate aborts the process instead of answering
+    /// `-32003`, which is the very outcome this module observes.
+    const ASSERT_BOUND_CALLER_ENV: &str = "INTENTD_ASSERT_BOUND_CALLER";
+
+    /// CI's coverage jobs run the suite with [`ASSERT_BOUND_CALLER_ENV`]
+    /// set, so when it is, this re-runs `test` (a name in this module) in a
+    /// copy of this binary with the variable removed, asserts that it
+    /// passed, and answers `true` so the caller returns; unarmed (locally,
+    /// and inside that child) it answers `false` and the caller runs its
+    /// body inline. A re-exec rather than `remove_var`: the harness is
+    /// multi-threaded.
+    fn reran_unarmed(test: &str) -> bool {
+        if std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none() {
+            return false;
+        }
+        let exe = std::env::current_exe().expect("test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                &format!("catalog::tests::unbound_owner_only_methods::{test}"),
+                "--nocapture",
+            ])
+            .env_remove(ASSERT_BOUND_CALLER_ENV)
+            .output()
+            .expect("run unarmed child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "unarmed `{test}`: {:?}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        true
+    }
+
     /// One unbound dispatch through the real router; the outcome label is
     /// `ok` or the JSON-RPC error code.
     async fn dispatch_unbound(services: &Services, method: &str, params: &Value) -> String {
@@ -1962,6 +2077,9 @@ mod unbound_owner_only_methods {
 
     #[tokio::test]
     async fn every_owner_only_router_method_is_forbidden_unbound() {
+        if reran_unarmed("every_owner_only_router_method_is_forbidden_unbound") {
+            return;
+        }
         let f = fixture().await;
         let table: BTreeMap<&str, Value> = minimal_params(&f).into_iter().collect();
         let universe = owner_only_router_methods();
@@ -2098,6 +2216,9 @@ mod unbound_owner_only_methods {
     /// here and moves the cell onto the router path.
     #[tokio::test]
     async fn armed_conditional_gates_are_forbidden_unbound() {
+        if reran_unarmed("armed_conditional_gates_are_forbidden_unbound") {
+            return;
+        }
         let f = fixture().await;
         let table: BTreeMap<&str, Value> = minimal_params(&f).into_iter().collect();
         for (method, unarmed, arming) in CONDITIONALLY_GATED_AT_SERVICE_LAYER {
@@ -2195,6 +2316,9 @@ mod unbound_owner_only_methods {
     /// the missing binding and not the fixture.
     #[tokio::test]
     async fn bound_daemon_control_passes_a_gated_method() {
+        if reran_unarmed("bound_daemon_control_passes_a_gated_method") {
+            return;
+        }
         let f = fixture().await;
         let params = json!({ "workspaceId": f.ws.as_str() });
         let unbound = dispatch_unbound(&f.services, "workspace.invite.list", &params).await;
@@ -2223,6 +2347,9 @@ mod unbound_owner_only_methods {
     /// `-32003`, while a bound daemon caller keeps the unresolved answer.
     #[tokio::test]
     async fn unbound_respond_permission_is_forbidden_without_a_manager() {
+        if reran_unarmed("unbound_respond_permission_is_forbidden_without_a_manager") {
+            return;
+        }
         let f = fixture().await;
         let params = json!({ "requestId": "req-1", "outcome": { "outcome": "cancelled" } });
         let unbound = dispatch_unbound(&f.services, "agent.respondPermission", &params).await;

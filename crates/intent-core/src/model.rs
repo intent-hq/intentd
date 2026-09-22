@@ -408,7 +408,8 @@ pub struct WorkspaceMembership {
     pub my_role: Option<WorkspaceRole>,
     /// Number of `workspace_member` rows (the owner counts).
     pub member_count: u64,
-    /// Open invitations (not redeemed, not revoked, not expired) awaiting
+    /// Open invitations (not revoked, not expired, and — pinned ones — not
+    /// redeemed; a reusable one stays open across redemptions) awaiting
     /// acceptance (multiplayer w4).
     pub open_invite_count: u64,
 }
@@ -1874,6 +1875,11 @@ pub struct NoteUpdateMetadataResult {
     pub skipped: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The note's `rev` after the write: the base a follow-up conditional
+    /// write should send as `expectedVersion`. Absent on the `skipped` arm,
+    /// which writes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<i64>,
 }
 
 /// Result of `note.delete`.
@@ -2645,6 +2651,44 @@ pub enum AgentStatus {
     Processing,
 }
 
+impl AgentStatus {
+    /// Every variant in declaration order — the enumeration behind the
+    /// running-turn golden and the store's SQL status lists. Completeness is
+    /// pinned against serde's derived variant inventory
+    /// (`agent_status_all_matches_serde_variant_inventory`), so a variant
+    /// added to the enum but not here fails the suite.
+    pub const ALL: [Self; 9] = [
+        Self::Pending,
+        Self::Active,
+        Self::RuntimeIdle,
+        Self::Error,
+        Self::Deleted,
+        Self::Idle,
+        Self::Waiting,
+        Self::Completed,
+        Self::Processing,
+    ];
+
+    /// Whether a session persisted in this status is running a turn: `pending`,
+    /// `active`, or the legacy capitalized `Processing`. The single definition
+    /// of the rule behind the §5.5 retire guard, the §5.19 agent-lock liveness
+    /// test, the transfer export "agents-running" warning, and the
+    /// `delegatedCounts.running` SQL aggregate on `agent.list`. Exhaustive so a
+    /// new variant fails to compile until it is classified.
+    #[must_use]
+    pub const fn is_running_turn(self) -> bool {
+        match self {
+            Self::Pending | Self::Active | Self::Processing => true,
+            Self::RuntimeIdle
+            | Self::Error
+            | Self::Deleted
+            | Self::Idle
+            | Self::Waiting
+            | Self::Completed => false,
+        }
+    }
+}
+
 /// Per-session credit/message/tool stats (§9.1 / §19.2). A derived snapshot
 /// populated from `auggie session stats --json`; it is **not** persisted in the
 /// `agent_session` table (the `stats` field is recomputed on demand). Field
@@ -3006,8 +3050,14 @@ pub enum AgentListRowScope {
     /// lists by default.
     TopLevel,
     /// `parent_agent_id IS NOT NULL`, optionally narrowed to one parent's
-    /// direct sub-agents (`parent_agent_id = ?`).
-    Delegated { parent_agent_id: Option<AgentId> },
+    /// direct sub-agents (`parent_agent_id = ?`) OR — `orphaned_only` — to
+    /// the workspace's orphaned delegated rows (the rows
+    /// [`AgentDelegatedCounts::orphaned`] counts). The two sub-filters are
+    /// mutually exclusive; the router rejects the pair with `-32602`.
+    Delegated {
+        parent_agent_id: Option<AgentId>,
+        orphaned_only: bool,
+    },
     /// `parent_agent_id IS NULL AND is_background <> 0` — unparented
     /// background agents.
     Background,
@@ -3035,6 +3085,60 @@ pub struct AgentScopeCounts {
     pub top_level: u64,
     pub delegated: u64,
     pub background: u64,
+}
+
+/// One parent's entry in [`AgentDelegatedCounts::by_parent`] (§5.5):
+/// `total` is the number of non-retired sessions whose `parent_agent_id`
+/// names that parent (direct children only — a grandchild counts under its
+/// own parent), `running` the subset whose persisted status is
+/// `pending` / `active` / legacy `Processing` (the daemon's
+/// `is_running_turn` rule).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentParentDelegatedCounts {
+    pub total: u64,
+    pub running: u64,
+}
+
+/// The **orphaned** subset of [`AgentDelegatedCounts`] (§5.5, within 10.6):
+/// non-retired sessions with `parent_agent_id` set whose parent is NOT a
+/// non-retired `agent_session` row of the same workspace (parent deleted,
+/// soft-retired, or absent). Orphan-hood is decided by the DIRECT parent's
+/// liveness only — a child of a live standalone background parent is not
+/// an orphan, and neither is a child of an orphan. `running` follows the
+/// same `is_running_turn` rule as `byParent[*].running`. Always present:
+/// `{ total: 0, running: 0 }` when the workspace has no orphaned delegated
+/// session. Invariant: `total ≤ scopeCounts.delegated`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentOrphanedDelegatedCounts {
+    pub total: u64,
+    pub running: u64,
+}
+
+/// The always-present `delegatedCounts` field on every `agent.list`
+/// response variant (§5.5): the workspace's non-retired delegated sessions
+/// (the `delegated` bin, `parent_agent_id IS NOT NULL`) counted per DIRECT
+/// parent, one grouped SQL aggregate — so a client renders each top-level
+/// agent's collapsed "N delegated" / "R / N running" group from the counts
+/// alone and pulls one parent's children only on expand. `running` is the
+/// workspace-wide running delegated count (`Σ byParent[*].running`);
+/// `by_parent` carries NO entry for a parent without non-retired children
+/// and is always serialized (an empty object on a workspace with no
+/// delegated sessions), and its keys are the raw `parent_agent_id` values,
+/// so a key may name a parent outside this workspace (cross-workspace
+/// delegation). Invariant: `Σ byParent[*].total == scopeCounts.delegated`.
+/// `orphaned` is the always-present orphaned sub-aggregate of the same row
+/// set ([`AgentOrphanedDelegatedCounts`]), served from the same statement.
+/// Like [`AgentScopeCounts`], the counts stay workspace-wide even when the
+/// rows read was narrowed by `scope`, `parentAgentId` or `orphanedOnly`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDelegatedCounts {
+    pub running: u64,
+    pub by_parent: BTreeMap<AgentId, AgentParentDelegatedCounts>,
+    #[serde(default)]
+    pub orphaned: AgentOrphanedDelegatedCounts,
 }
 
 /// Per-field byte budget for `agent.list` row previews (list-payload cost
@@ -3112,8 +3216,113 @@ pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
 /// field-by-field. Meeting the ≈ 1 KB/row frame goal for 1,000 worst-case
 /// rows would require lowering the preview cap (each 100 B off
 /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] takes ≈ 600 B off this budget) or
-/// paging `agent.list` — separate protocol decisions.
+/// paging `agent.list` — separate protocol decisions. The response-level
+/// frame fit ([`fit_agent_list_frame`]) is the non-protocol half of that:
+/// it lowers the preview cap per response when the row count demands it.
 pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 6 * 1024;
+
+/// Response-level byte budget for the serialized `agent.list` rows array
+/// (intent-hq/intent#5531, fourth recurrence of the oversize frame): the
+/// per-field and per-row caps above bound each ROW, but the frame the
+/// transport warns on (1 MiB = 1,048,576 B, `rpc_profile`) is the whole
+/// RESPONSE, and a 459-session workspace whose rows all sat inside the row
+/// contract (2,338 B/row average — previews at the 400 B cap, detail fields
+/// stripped) still encoded to 1.07 MB. [`fit_agent_list_frame`] measures the
+/// serialized rows against this budget after the per-row pass and, when
+/// over, re-applies [`AgentLite::cap_list_previews_to`] with a tighter
+/// preview budget. 1,000 KiB leaves ≈ 24 KiB under the warn threshold for
+/// the envelope (`{"jsonrpc":"2.0","id":…,"result":{"agents":[…],
+/// "retiredCount":…,"scopeCounts":{…},"delegatedCounts":{…}}}`, well under
+/// 300 B on a workspace without delegated sessions and ≈ 70 B per
+/// `byParent` entry otherwise (outside the rows array; see the §5.5 row) with
+/// the small
+/// counter / UUID `id`s real clients send). The `id` is client-chosen and
+/// echoed by the router; the service layer never sees it, so a client that
+/// sends a multi-KiB `id` adds its own bytes on top of this budget and can
+/// still draw the WARN — that is the client's contribution, not the rows'.
+pub const AGENT_LIST_FRAME_BUDGET_BYTES: usize = 1000 * 1024;
+
+/// Smallest per-field preview budget the frame fit descends to
+/// (intent-hq/intent#5531): the fit halves [`AGENT_LIST_PREVIEW_BUDGET_BYTES`]
+/// (400 → 200 → 100 → this floor) until the rows array fits
+/// [`AGENT_LIST_FRAME_BUDGET_BYTES`], and stops here so every list row keeps
+/// a one-line-render-sized preview even on a workspace too large to fit —
+/// the non-preview part of a row (ids, timestamps, flags) measures ≈ 1,140 B
+/// on the motivating workspace, so with previews at zero the frame would
+/// still overflow at ≈ 900 rows; bounding THAT needs paging (a protocol
+/// decision), not harder truncation.
+pub const AGENT_LIST_PREVIEW_FLOOR_BYTES: usize = 50;
+
+/// Outcome of [`fit_agent_list_frame`] when the rows array was over
+/// [`AGENT_LIST_FRAME_BUDGET_BYTES`] at the default preview cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentListFrameFit {
+    /// Serialized size of the rows array at [`AGENT_LIST_PREVIEW_BUDGET_BYTES`].
+    pub bytes_before: usize,
+    /// Serialized size of the rows array after the tightened re-cap. May
+    /// still exceed the budget when `preview_budget` reached
+    /// [`AGENT_LIST_PREVIEW_FLOOR_BYTES`].
+    pub bytes_after: usize,
+    /// The preview budget the rows were re-capped to.
+    pub preview_budget: usize,
+}
+
+/// Serialized size of the JSON array `rows` would encode to
+/// (`[` + rows + separating commas + `]`), counted through a discarding writer.
+fn agent_list_rows_bytes(rows: &[AgentLite]) -> usize {
+    struct CountingSink(usize);
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = CountingSink(0);
+    serde_json::to_writer(&mut sink, rows).map_or(0, |()| sink.0)
+}
+
+/// Response-level frame fit for `agent.list` rows (intent-hq/intent#5531):
+/// the list path's per-row strip + cap pass
+/// ([`AgentLite::strip_detail_only_fields`] + [`AgentLite::cap_list_previews`])
+/// must already have run on every row. Measures the serialized rows array
+/// against [`AGENT_LIST_FRAME_BUDGET_BYTES`]; when it fits, nothing changes
+/// and `None` is returned. Otherwise the preview budget is halved from
+/// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] and every row re-capped
+/// ([`AgentLite::cap_list_previews_to`] is monotone, so re-capping an
+/// already-capped row only shortens it) until the array fits or the budget
+/// reaches [`AGENT_LIST_PREVIEW_FLOOR_BYTES`], whichever comes first. Row
+/// shape is unchanged and no key outside the documented row contract is
+/// introduced: the one presence effect stays inside the `lastToolUse` contract
+/// `{ name, input?, inputTruncated?, inputBytes? }` — an `input` that passed
+/// the 400-byte list cap unflagged and is truncated by a tighter re-cap gains
+/// `inputTruncated: true` + `inputBytes` (original serialized size), exactly
+/// as the normal cap stamps them — so no client sees a new wire shape.
+/// O(rows) work: at most four serialization passes over the rows.
+pub fn fit_agent_list_frame(rows: &mut [AgentLite]) -> Option<AgentListFrameFit> {
+    let bytes_before = agent_list_rows_bytes(rows);
+    if bytes_before <= AGENT_LIST_FRAME_BUDGET_BYTES {
+        return None;
+    }
+    let mut preview_budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+    let mut bytes_after = bytes_before;
+    while bytes_after > AGENT_LIST_FRAME_BUDGET_BYTES
+        && preview_budget > AGENT_LIST_PREVIEW_FLOOR_BYTES
+    {
+        preview_budget = (preview_budget / 2).max(AGENT_LIST_PREVIEW_FLOOR_BYTES);
+        for row in rows.iter_mut() {
+            row.cap_list_previews_to(preview_budget);
+        }
+        bytes_after = agent_list_rows_bytes(rows);
+    }
+    Some(AgentListFrameFit {
+        bytes_before,
+        bytes_after,
+        preview_budget,
+    })
+}
 
 /// Key allowlist golden for a serialized `agent.list` row
 /// (intent-hq/intent#5383): the top-level keys a list row may carry. The
@@ -3325,7 +3534,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.6";
+pub const CURRENT_HARNESS_VERSION: &str = "2.7";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -4286,8 +4495,23 @@ impl AgentLite {
     /// classification keeps working. These fields exist to render a one-line
     /// summary in list contexts, so `agent.list` applies this to every row;
     /// the detail reads (`agent.get` / `agent.getSession`) never call it and
-    /// keep serving full values.
+    /// keep serving full values. Equivalent to
+    /// [`Self::cap_list_previews_to`] at [`AGENT_LIST_PREVIEW_BUDGET_BYTES`].
     pub fn cap_list_previews(&mut self) {
+        self.cap_list_previews_to(AGENT_LIST_PREVIEW_BUDGET_BYTES);
+    }
+
+    /// [`Self::cap_list_previews`] with an explicit per-field preview budget
+    /// in place of [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] — the seam the
+    /// response-level frame fit ([`fit_agent_list_frame`],
+    /// intent-hq/intent#5531) uses to re-cap every row of an over-budget
+    /// `agent.list` response harder. Only the six preview slots
+    /// (`lastAgentResponse`, `lastUserMessage`, `digest`,
+    /// `metadata.completionReport`, `metadata.attentionRequestReason`,
+    /// `lastToolUse.input`) follow `preview_budget`; `name` / `model` and the
+    /// sandbox strings keep their own fixed caps. Monotone: re-capping an
+    /// already-capped row at a smaller budget only shortens it.
+    pub fn cap_list_previews_to(&mut self, preview_budget: usize) {
         use serde_json::Value;
         // JSON-escaped content bytes of `s` as it will hit the wire (quotes
         // excluded), counted through a discarding writer like
@@ -4332,20 +4556,11 @@ impl AgentLite {
                 cap_str(s, budget);
             }
         }
-        cap_string(
-            &mut self.last_agent_response,
-            AGENT_LIST_PREVIEW_BUDGET_BYTES,
-        );
-        cap_string(&mut self.last_user_message, AGENT_LIST_PREVIEW_BUDGET_BYTES);
-        cap_string(&mut self.digest, AGENT_LIST_PREVIEW_BUDGET_BYTES);
-        cap_string(
-            &mut self.metadata.completion_report,
-            AGENT_LIST_PREVIEW_BUDGET_BYTES,
-        );
-        cap_string(
-            &mut self.metadata.attention_request_reason,
-            AGENT_LIST_PREVIEW_BUDGET_BYTES,
-        );
+        cap_string(&mut self.last_agent_response, preview_budget);
+        cap_string(&mut self.last_user_message, preview_budget);
+        cap_string(&mut self.digest, preview_budget);
+        cap_string(&mut self.metadata.completion_report, preview_budget);
+        cap_string(&mut self.metadata.attention_request_reason, preview_budget);
         cap_str(&mut self.name, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.model, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.metadata.sandbox_path, AGENT_LIST_PATH_CAP_BYTES);
@@ -4354,8 +4569,8 @@ impl AgentLite {
             Some(Value::Object(preview)) => {
                 if let Some(input) = preview.get("input") {
                     let size = slim_body_size(input);
-                    if size > AGENT_LIST_PREVIEW_BUDGET_BYTES {
-                        let mut budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+                    if size > preview_budget {
+                        let mut budget = preview_budget;
                         let capped = cap_json_value(input, &mut budget);
                         preview.insert("input".to_string(), capped);
                         preview.insert("inputTruncated".to_string(), Value::Bool(true));
@@ -4368,8 +4583,8 @@ impl AgentLite {
             // Defensive: the persisted 0098 preview is always the object
             // shape above; a non-object value still gets the whole-value
             // bound so no row can smuggle an unbounded payload.
-            Some(other) if slim_body_size(other) > AGENT_LIST_PREVIEW_BUDGET_BYTES => {
-                let mut budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+            Some(other) if slim_body_size(other) > preview_budget => {
+                let mut budget = preview_budget;
                 *other = cap_json_value(other, &mut budget);
             }
             _ => {}
@@ -5214,11 +5429,22 @@ impl PrincipalCredential {
     }
 }
 
-/// One `workspace_invite` row (multiplayer w4): a single-use, expiring link
-/// an owner minted so one person can join a workspace as a collaborator.
-/// The link secret is persisted only as `secret_hash` (hex SHA-256); an
-/// optional pin restricts redemption to one GitHub account, entered as a
-/// login but stored and compared as the stable `pin_github_user_id`.
+/// One `workspace_invite` row (multiplayer w4): an expiring link an owner
+/// minted so people can join a workspace as collaborators. Redemption
+/// matches the link secret against `secret_hash` (hex SHA-256); the
+/// plaintext `secret` is kept alongside (migration `0128`, `None` on older
+/// rows) only so the owner can copy the link again — it never serialises,
+/// reaching the wire solely inside a rebuilt `url`. An optional pin
+/// restricts redemption to one GitHub account, entered as a login but
+/// stored and compared as the stable `pin_github_user_id`.
+///
+/// Reuse is derived from the pin (migration `0129`): an **unpinned** invite
+/// is [`reusable`](Self::is_reusable) — any number of distinct accounts may
+/// redeem it until it expires or is revoked — while a **pinned** invite
+/// closes on its single redemption. `redeemed_at` /
+/// `redeemed_by_principal_id` name the *last* redemption and
+/// `redemption_count` the memberships the link created (a member re-joining
+/// through the same link is idempotent and not counted again).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceInvite {
@@ -5226,6 +5452,8 @@ pub struct WorkspaceInvite {
     pub workspace_id: WorkspaceId,
     #[serde(skip_serializing)]
     pub secret_hash: String,
+    #[serde(default, skip_serializing)]
+    pub secret: Option<String>,
     pub created_by_principal_id: PrincipalId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_github_user_id: Option<i64>,
@@ -5239,14 +5467,27 @@ pub struct WorkspaceInvite {
     pub redeemed_by_principal_id: Option<PrincipalId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
+    /// Memberships this link created so far.
+    #[serde(default)]
+    pub redemption_count: u64,
 }
 
 impl WorkspaceInvite {
+    /// Whether the invite stays open across redemptions: `true` when
+    /// unpinned, `false` when pinned to one GitHub account (single-use).
+    #[must_use]
+    pub fn is_reusable(&self) -> bool {
+        self.pin_github_user_id.is_none()
+    }
+
     /// Whether the invite can still be redeemed at `now` (ISO-8601 UTC,
-    /// compared lexically like every other timestamp column).
+    /// compared lexically like every other timestamp column): not revoked,
+    /// not expired, and — for a pinned, single-use invite — not yet redeemed.
     #[must_use]
     pub fn is_open_at(&self, now: &str) -> bool {
-        self.redeemed_at.is_none() && self.revoked_at.is_none() && self.expires_at.as_str() > now
+        (self.is_reusable() || self.redeemed_at.is_none())
+            && self.revoked_at.is_none()
+            && self.expires_at.as_str() > now
     }
 }
 
@@ -6579,6 +6820,80 @@ mod tests {
         }
     }
 
+    /// Golden for the running-turn rule (PROTOCOL §5.5 `agent.list`
+    /// `delegatedCounts` "running rule"): exactly `pending`, `active` and the
+    /// legacy capitalized `Processing` count as running, keyed by the persisted
+    /// wire name so the docs prose has one authoritative counterpart.
+    /// `AgentStatus::ALL` must enumerate every variant exactly once.
+    #[test]
+    fn agent_status_running_turn_golden() {
+        let expected = [
+            ("pending", true),
+            ("active", true),
+            ("idle", false),
+            ("error", false),
+            ("deleted", false),
+            ("Idle", false),
+            ("Waiting", false),
+            ("Completed", false),
+            ("Processing", true),
+        ];
+        assert_eq!(AgentStatus::ALL.len(), expected.len());
+        for (status, (wire, running)) in AgentStatus::ALL.into_iter().zip(expected) {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{wire}\""),
+                "ALL order must match the golden"
+            );
+            assert_eq!(
+                status.is_running_turn(),
+                running,
+                "running-turn classification of {wire}"
+            );
+        }
+        assert_eq!(
+            AgentStatus::ALL
+                .iter()
+                .filter(|s| s.is_running_turn())
+                .map(|s| serde_json::to_value(s).unwrap())
+                .collect::<Vec<_>>(),
+            vec![json!("pending"), json!("active"), json!("Processing")]
+        );
+    }
+
+    /// `AgentStatus::ALL` is complete: serde's derive generates the variant
+    /// inventory from the enum itself and lists it in the unknown-variant
+    /// error ("expected one of `a`, `b`, …"), so a variant added to the
+    /// enum — and classified in the exhaustive `is_running_turn` match — but
+    /// left out of `ALL` fails here instead of silently dropping out of the
+    /// store's generated SQL status list.
+    #[test]
+    fn agent_status_all_matches_serde_variant_inventory() {
+        let err = serde_json::from_str::<AgentStatus>("\"__not_a_status__\"")
+            .unwrap_err()
+            .to_string();
+        let (_, listed) = err
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("serde unknown-variant error shape changed: {err}"));
+        let mut inventory: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+        inventory.sort_unstable();
+        let mut all: Vec<String> = AgentStatus::ALL
+            .iter()
+            .map(|s| {
+                serde_json::to_value(s)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        all.sort_unstable();
+        assert_eq!(
+            all, inventory,
+            "AgentStatus::ALL must list every variant exactly once"
+        );
+    }
+
     /// `WorkspaceStatus` serializes to the `PascalCase` TS `WorkspaceStatus` string
     /// enum (`src/shared/types.ts`): `Active`/`Inactive`/`Archived`/`Deleted`.
     #[test]
@@ -7577,6 +7892,153 @@ mod tests {
             lite.last_user_message.as_deref().map(str::len),
             Some(AGENT_LIST_PREVIEW_BUDGET_BYTES),
             "escaping-free content at exactly the budget passes untouched"
+        );
+    }
+
+    /// [`fit_agent_list_frame`] (intent-hq/intent#5531): a rows array that
+    /// fits [`AGENT_LIST_FRAME_BUDGET_BYTES`] at the default preview cap is
+    /// left untouched (`None`); one that overflows — the motivating shape,
+    /// hundreds of delegated rows each inside the row contract with every
+    /// preview at the cap — is re-capped at successively halved preview
+    /// budgets until it fits, the fit reports the applied budget and the
+    /// before/after sizes, and rows keep every field (harder truncation,
+    /// same shape). The floor bounds the descent: a workspace too large to
+    /// fit even at the floor still gets floor-sized previews, never zero.
+    #[test]
+    fn fit_agent_list_frame_tightens_previews_until_rows_fit() {
+        let row = |i: usize| {
+            let session = AgentSession {
+                harness_version: CURRENT_HARNESS_VERSION.to_string(),
+                harness_features: None,
+                id: AgentId::from(format!("agent-{i:0>36}").as_str()),
+                workspace_id: WorkspaceId::from("ws-1"),
+                parent_agent_id: Some(AgentId::from("agent-parent-0000-0000-0000-000000000000")),
+                backend_session_id: None,
+                acp_session_id: Some(format!("acp-{i:0>36}")),
+                name: "Delegated worker".to_string(),
+                name_explicitly_set: false,
+                model: Some("claude-sonnet-4-5-20250929".to_string()),
+                reasoning_effort: None,
+                effort_levels: None,
+                provider: Some("auggie".to_string()),
+                system_prompt: None,
+                specialist: Some("implementor".to_string()),
+                status: AgentStatus::Idle,
+                is_active: false,
+                messages: vec![],
+                stats: None,
+                task_note_id: Some(format!("task-{i:0>32}").into()),
+                skip_auto_commit: false,
+                completion_report: Some("r".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2)),
+                completion_report_timestamp: Some("2026-09-21T05:00:00.000000000Z".to_string()),
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: Some(1),
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                file_blocks: None,
+                is_background: false,
+                metadata: Some(
+                    json!({ "createdByAgentId": "agent-parent-0000-0000-0000-000000000000" }),
+                ),
+                stop_reason: None,
+                stop_reason_timestamp: None,
+                session_corrupted: false,
+                pending_delete_at: None,
+                retired_at: None,
+                notifications_muted: false,
+                created_at: "2026-09-21T04:00:00.000000000Z".to_string(),
+                updated_at: "2026-09-21T05:00:00.000000000Z".to_string(),
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+            };
+            let mut lite = AgentLite::from_session(
+                session,
+                40,
+                Some("a".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2)),
+                Some("u".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2)),
+                None,
+                Some("assistant".to_string()),
+                Some(format!("msg-{i:0>36}")),
+            );
+            lite.last_tool_use = Some(json!({
+                "name": "launch-process",
+                "input": { "command": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2) },
+            }));
+            lite.strip_detail_only_fields();
+            lite.cap_list_previews();
+            lite
+        };
+
+        // A small workspace fits at the default cap: untouched.
+        let mut few: Vec<AgentLite> = (0..10).map(row).collect();
+        let before = serde_json::to_string(&few).unwrap();
+        assert_eq!(fit_agent_list_frame(&mut few), None);
+        assert_eq!(serde_json::to_string(&few).unwrap(), before);
+
+        // 460 rows at the default cap encode past the frame budget (each row
+        // is inside the row budget); the fit tightens until they fit.
+        let mut many: Vec<AgentLite> = (0..460).map(row).collect();
+        let per_row = serde_json::to_string(&many[0]).unwrap().len();
+        assert!(
+            per_row <= AGENT_LIST_ROW_BUDGET_BYTES,
+            "fixture row {per_row} B"
+        );
+        let fit = fit_agent_list_frame(&mut many).expect("over budget at the default cap");
+        assert!(
+            fit.bytes_before > AGENT_LIST_FRAME_BUDGET_BYTES,
+            "fixture must overflow at the default cap: {fit:?}"
+        );
+        assert!(
+            fit.bytes_after <= AGENT_LIST_FRAME_BUDGET_BYTES,
+            "460 rows fit after the re-cap: {fit:?}"
+        );
+        assert_eq!(
+            serde_json::to_string(&many).unwrap().len(),
+            fit.bytes_after,
+            "reported size is the serialized rows array"
+        );
+        assert!(
+            fit.preview_budget < AGENT_LIST_PREVIEW_BUDGET_BYTES
+                && fit.preview_budget >= AGENT_LIST_PREVIEW_FLOOR_BYTES,
+            "tightened budget is between the floor and the default: {fit:?}"
+        );
+        let served = &many[0];
+        assert_eq!(
+            served.last_user_message.as_deref().map(str::len),
+            Some(fit.preview_budget)
+        );
+        assert_eq!(
+            served.last_agent_response.as_deref().map(str::len),
+            Some(fit.preview_budget)
+        );
+        assert_eq!(
+            served.metadata.completion_report.as_deref().map(str::len),
+            Some(fit.preview_budget)
+        );
+        let tool_use = served.last_tool_use.as_ref().unwrap();
+        assert_eq!(tool_use["name"], "launch-process");
+        assert_eq!(tool_use["inputTruncated"], json!(true));
+        assert_eq!(
+            tool_use["inputBytes"],
+            json!(slim_body_size(
+                &json!({ "command": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2) })
+            )),
+            "inputBytes still names the ORIGINAL input size after the re-cap"
+        );
+
+        // Too many rows to fit even at the floor: the descent stops at the
+        // floor and reports the residual overflow rather than zeroing previews.
+        let mut huge: Vec<AgentLite> = (0..2000).map(row).collect();
+        let fit = fit_agent_list_frame(&mut huge).expect("over budget");
+        assert_eq!(fit.preview_budget, AGENT_LIST_PREVIEW_FLOOR_BYTES);
+        assert!(fit.bytes_after > AGENT_LIST_FRAME_BUDGET_BYTES, "{fit:?}");
+        assert_eq!(
+            huge[0].last_user_message.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_FLOOR_BYTES)
         );
     }
 

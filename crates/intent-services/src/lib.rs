@@ -100,6 +100,7 @@ mod agent_list_cache;
 mod harness;
 mod history_xml;
 mod hook_manager;
+mod image_dimensions;
 mod invite_ops;
 mod line_attribution;
 mod linear_ops;
@@ -169,6 +170,8 @@ mod v2_3_goldens;
 mod v2_4_goldens;
 #[cfg(test)]
 mod v2_5_goldens;
+#[cfg(test)]
+mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
@@ -195,7 +198,7 @@ pub mod auggie_discovery {
 
 pub use agent_manager::{
     compute_process_cap, default_process_cap, recommended_memory_budget_bytes, AgentManager,
-    BusEventSink, ProcessRegistry, TreeMemoryProbe, TreeSample,
+    AgentMemorySnapshot, BusEventSink, ProcessRegistry, ProcessSample, TreeMemoryProbe, TreeSample,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via
@@ -785,6 +788,14 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_task_update_projection_park`.
     task_update_projection_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intentd#2068) for the per-id queue mutations
+    /// (`agent.editQueuedMessage` / `removeQueuedMessage` /
+    /// `sendQueuedMessageNow`): parks each between its ownership
+    /// pre-resolution and the locked mutation, so a concurrent drain pop +
+    /// `requeue_front` landing inside that window is deterministic. `None`
+    /// in production wiring; tests inject via the `#[cfg(test)]`-only
+    /// `with_queue_mutation_gate_park`.
+    queue_mutation_gate_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`); tests inject
@@ -950,6 +961,11 @@ pub struct Services {
     /// Held as `Arc<OnceLock>` so the control can be attached after the `api`
     /// Arc is built (composition-root wiring, §5.12). Shared across clones.
     server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
+    /// Rebuilds an open invite's `intent://invite?…` link for
+    /// `workspace.invite.list` (multiplayer w4). Attached after
+    /// the `api` Arc like `server_control` (the transport owns the pairing
+    /// envelope); unset means no `url` is stamped. Shared across clones.
+    invite_links: Arc<OnceLock<Arc<dyn intent_core::InviteLinkBuilder>>>,
     /// In-memory watermark cache for incremental token-usage scanning (finding F2).
     /// Maps `workspace_id` → `agent_message` count. When the watermark is unchanged
     /// since the last scan, the workspace is skipped. A restart rescans once.
@@ -974,12 +990,11 @@ pub struct Services {
     /// minting (multiplayer w4): see
     /// [`principal_ops::IdentityTransitionLock`]. Shared across clones.
     identity_transition: principal_ops::IdentityTransitionLock,
-    /// In-flight identity-only device flows started by `invite.redeem`
-    /// (multiplayer w4), keyed by flow id; shared across clones.
-    invite_flows: invite_ops::InviteFlowState,
-    /// Admission permits for those flows (`MAX_INFLIGHT_INVITE_FLOWS`),
-    /// taken before the upstream device-code request.
-    invite_flow_permits: invite_ops::InviteFlowPermits,
+    /// Outstanding `invite.challenge` nonces awaiting their `invite.prove`
+    /// (gist identity proof), keyed by nonce; shared across clones.
+    invite_nonces: invite_ops::InviteNonceState,
+    /// Admission permits for those nonces (`MAX_OUTSTANDING_NONCES`).
+    invite_nonce_permits: invite_ops::InviteNoncePermits,
     /// Live feed of principals whose credentials were just revoked
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
@@ -987,9 +1002,9 @@ pub struct Services {
     /// Ephemeral workspace / note presence table (multiplayer w5), shared
     /// with the caret coalescer's trailing-flush tasks.
     presence: Arc<presence::PresenceRegistry>,
-    /// Test-only override for the GitHub API base the identity-only flow's
-    /// `GET /user` talks to (`None` → `$INTENTD_GITHUB_API_BASE_URI` →
-    /// api.github.com).
+    /// Test-only override for the GitHub API base the invite identity reads
+    /// (`invite.prove`, the primary's `GET /user` refresh) talk to (`None` →
+    /// `$INTENTD_GITHUB_API_BASE_URI` → api.github.com).
     github_api_base_uri: Option<String>,
     /// Shared cache + offload gates for git-derived aggregates that are still
     /// computed on demand (`diffSummary` for explicit callers, `CoW` support
@@ -1324,6 +1339,7 @@ impl Services {
             unread_settle_entry_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
+            queue_mutation_gate_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -1351,13 +1367,14 @@ impl Services {
             last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
+            invite_links: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
-            invite_flows: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            invite_flow_permits: invite_ops::new_flow_permits(),
+            invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            invite_nonce_permits: invite_ops::new_nonce_permits(),
             principal_revocations: tokio::sync::broadcast::channel(
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
@@ -1550,9 +1567,9 @@ impl Services {
         self
     }
 
-    /// Override the GitHub API base the identity-only invite flow's
-    /// `GET /user` talks to (multiplayer w4 test seam). Production wiring
-    /// keeps `None` (env override → api.github.com).
+    /// Override the GitHub API base the invite identity reads talk to
+    /// (multiplayer w4 test seam). Production wiring keeps `None` (env
+    /// override → api.github.com).
     #[must_use]
     pub fn with_github_api_base_uri(mut self, base_uri: impl Into<String>) -> Self {
         self.github_api_base_uri = Some(base_uri.into());
@@ -2130,6 +2147,19 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.task_update_projection_park = Some(park);
+        self
+    }
+
+    /// Test seam (intentd#2068): park the per-id queue mutations between
+    /// their ownership pre-resolution and the locked mutation so a
+    /// concurrent drain pop + `requeue_front` inside that window is
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_queue_mutation_gate_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.queue_mutation_gate_park = Some(park);
         self
     }
 
@@ -4269,6 +4299,15 @@ impl Services {
     /// Idempotent: a second call is a no-op (the `OnceLock` keeps the first).
     pub fn attach_server_control(&self, control: Arc<dyn intent_core::ServerControl>) {
         let _ = self.server_control.set(control);
+    }
+
+    /// Attach the [`InviteLinkBuilder`](intent_core::InviteLinkBuilder) so
+    /// `workspace.invite.list` can stamp each open invite with its `url`
+    /// (multiplayer w4; `.create` is stamped by the transport, which resolves
+    /// the envelope itself). Idempotent like
+    /// [`attach_server_control`](Self::attach_server_control).
+    pub fn attach_invite_link_builder(&self, builder: Arc<dyn intent_core::InviteLinkBuilder>) {
+        let _ = self.invite_links.set(builder);
     }
 
     /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
@@ -16315,6 +16354,107 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_memory_usage(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let empty = serde_json::json!({
+                "sampledAt": serde_json::Value::Null,
+                "totalBytes": serde_json::Value::Null,
+                "agents": [],
+            });
+            let Some(manager) = self.agent_manager() else {
+                return Ok(empty);
+            };
+            // One probe read: the stamp and the rows come from the same sweep
+            // by construction, so a sampler store landing mid-request cannot
+            // pair one sweep's `sampledAt` with the next sweep's processes.
+            let Some(snapshot) = manager.agent_memory_snapshot() else {
+                return Ok(empty);
+            };
+            let crate::agent_manager::AgentMemorySnapshot {
+                sampled_at,
+                processes: samples,
+            } = snapshot;
+            let spawn_details = manager.agent_spawn_details();
+
+            let mut agents = Vec::with_capacity(samples.len());
+            let mut total_bytes: u64 = 0;
+            for (agent_id, processes) in samples {
+                // The bucket is keyed by the agent's registered root pid; a
+                // handle may already be gone (the exit watcher raced the
+                // sweep), so fall back to the row no other row in the bucket
+                // parents — the subtree root.
+                let details = spawn_details.get(&agent_id);
+                let pids: std::collections::HashSet<u32> =
+                    processes.iter().map(|p| p.pid).collect();
+                let root_pid = details.and_then(|d| d.root_pid).or_else(|| {
+                    processes
+                        .iter()
+                        .find(|p| !pids.contains(&p.parent_pid))
+                        .map(|p| p.pid)
+                });
+                // A bucket whose session row is gone (deleted mid-sweep) is
+                // omitted: the row's name / workspace are the session's. Any
+                // other store failure propagates — a partial total that
+                // silently dropped live agents would read as a smaller tree.
+                let session = match self.store.get_agent_session_summary(&agent_id).await {
+                    Ok(session) => session,
+                    Err(Error::NotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                };
+                // The session row carries the provider id clients know from
+                // `agent.get` ("mock", "auggie"); the handle's spawn-time
+                // value is the resolved command ("node"), so it is only the
+                // fallback for a row that never recorded one.
+                let provider = session
+                    .provider
+                    .clone()
+                    .or_else(|| details.map(|d| d.provider.clone()))
+                    .unwrap_or_default();
+                let model = details
+                    .and_then(|d| d.model.clone())
+                    .or_else(|| session.model.clone());
+                let memory_bytes: u64 = processes.iter().map(|p| p.memory_bytes).sum();
+                total_bytes += memory_bytes;
+                let mut processes: Vec<_> = processes;
+                processes.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes));
+                let mut row = serde_json::json!({
+                    "agentId": agent_id.0,
+                    "agentName": session.name,
+                    "workspaceId": session.workspace_id.0,
+                    "provider": provider,
+                    "rootPid": root_pid,
+                    "processCount": processes.len(),
+                    "memoryBytes": memory_bytes,
+                    "processes": processes
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "pid": p.pid,
+                            "parentPid": p.parent_pid,
+                            "name": p.name,
+                            "cmdline": p.cmdline,
+                            "memoryBytes": p.memory_bytes,
+                        }))
+                        .collect::<Vec<_>>(),
+                });
+                if let Some(model) = model {
+                    row["model"] = serde_json::Value::String(model);
+                }
+                agents.push(row);
+            }
+            agents.sort_by(|a, b| {
+                b["memoryBytes"]
+                    .as_u64()
+                    .cmp(&a["memoryBytes"].as_u64())
+                    .then_with(|| a["agentId"].as_str().cmp(&b["agentId"].as_str()))
+            });
+            Ok(serde_json::json!({
+                "sampledAt": sampled_at,
+                "totalBytes": total_bytes,
+                "agents": agents,
+            }))
+        })
+    }
+
     fn rules_list(
         &self,
         workspace_id: Option<WorkspaceId>,
@@ -21328,22 +21468,30 @@ impl WorkspaceApi for Services {
                 }
                 // Cancel every active background hook in the workspace: task
                 // aborted, state persisted to `cancelled`, `hook:cancelled`
-                // emitted, owner woken with a notice. Unarchive does NOT
-                // resurrect cancelled hooks — the notice tells the owner to
-                // reschedule if the condition still matters. Runs AFTER the
-                // archived row is persisted so the cancel wakes park behind the
-                // archived gate in `deliver_wake_message` (queued at most, no
-                // turn spawned) — the same reason the interrupt sweep above
-                // runs post-persist.
-                this.cancel_workspace_hooks(&id).await;
+                // emitted — silently per hook. Unarchive does NOT resurrect
+                // cancelled hooks; the consolidated notice below tells the
+                // owner to reschedule if the condition still matters.
+                let cancelled_hooks = this.cancel_workspace_hooks(&id).await;
                 // Cancel every ACTIVE PR monitor the same way
                 // (intent-hq/monorepo#1828): state persisted to `cancelled`,
-                // `prMonitor:cancelled` emitted, owner woken with a notice
-                // that parks behind the same archived gate. Unarchive does
-                // NOT resurrect cancelled monitors. Without this sweep an
-                // archived workspace's displayStatus rollup reads
-                // `in_progress` indefinitely off the active-monitor signal.
-                this.cancel_workspace_pr_monitors(&id).await;
+                // `prMonitor:cancelled` emitted, silently per monitor.
+                // Unarchive does NOT resurrect cancelled monitors. Without
+                // this sweep an archived workspace's displayStatus rollup
+                // reads `in_progress` indefinitely off the active-monitor
+                // signal.
+                let cancelled_monitors = this.cancel_workspace_pr_monitors(&id).await;
+                // ONE consolidated wake per affected owner naming every hook
+                // and monitor the two sweeps cancelled, THEN the owner's
+                // deferral backstop (the per-item cancels above skipped it so
+                // a deferred completion watch stays armed behind the queued
+                // notice). Runs AFTER the archived row is persisted so the
+                // wake parks behind the archived gate in
+                // `deliver_wake_message` (queued at most, no turn spawned) —
+                // the same reason the interrupt sweep above runs post-persist
+                // — and is only ever read after unarchive, which is the
+                // moment its wording is written for.
+                this.notify_owners_of_archived_watches(&id, cancelled_hooks, cancelled_monitors)
+                    .await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,
                 // and persist it through the scoped monotonic write
@@ -22958,6 +23106,11 @@ impl WorkspaceApi for Services {
                     .update_note_metadata_versioned(&note, expected_version)
                     .await?;
             }
+            // Return the row as committed — the bumped `rev`, the stored
+            // `updated_at`, and (on the metadata arm) any content a
+            // concurrent write landed — rather than the pre-write copy
+            // (intent-hq/intent#5589).
+            note = fetch_note(&store, &workspace_id, &note_id).await?;
             if let Some(plan) = reanchor_plan {
                 plan.apply_orphaned(&store, &workspace_id).await?;
             }
@@ -23398,13 +23551,16 @@ impl WorkspaceApi for Services {
                     updated_at: None,
                     skipped: Some(true),
                     reason: Some("spec title cannot be modified".to_string()),
+                    rev: None,
                 });
             }
-            let now = now_iso();
-            note.updated_at = now.clone();
+            note.updated_at = now_iso();
             store
                 .update_note_metadata_versioned(&note, expected_version)
                 .await?;
+            // Report the row as committed (intent-hq/intent#5589): the
+            // bumped `rev` and stored `updated_at`, not the pre-write copy.
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -23421,9 +23577,10 @@ impl WorkspaceApi for Services {
                 note_id: note.id,
                 title: Some(note.title),
                 tags: Some(note.tags),
-                updated_at: Some(now),
+                updated_at: Some(note.updated_at),
                 skipped: None,
                 reason: None,
+                rev: Some(note.rev),
             })
         })
     }
@@ -27796,6 +27953,13 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_scope_counts_op(workspace_id).await })
     }
 
+    fn agent_delegated_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::AgentDelegatedCounts>> {
+        Box::pin(async move { self.agent_delegated_counts_op(workspace_id).await })
+    }
+
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_list_active_op().await })
     }
@@ -27900,15 +28064,19 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         _workspace_id: Option<WorkspaceId>,
         role: String,
-        content: serde_json::Value,
+        mut content: serde_json::Value,
         metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
             // Principal stamp (multiplayer w2): a `user` row appended by a
             // wire caller is human-authored; any other role only has a
-            // client-supplied stamp stripped.
+            // client-supplied stamp stripped. A `user` row is model-facing
+            // on the next turn, so a collaborator's also carries the sender
+            // preamble (content-level counterpart of the stamp).
             let metadata = if role == "user" {
+                self.annotate_collaborator_sender_value_for_agent(&agent_id, &mut content)
+                    .await?;
                 crate::principal_ops::stamp_principal_attribution(metadata)?
             } else {
                 crate::principal_ops::strip_principal_attribution(metadata)
@@ -28052,7 +28220,7 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
-        message: String,
+        mut message: String,
         priority: Option<String>,
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -28060,6 +28228,10 @@ impl WorkspaceApi for Services {
             self.require_member(&workspace_id).await?;
             let message_metadata =
                 crate::principal_ops::stamp_principal_attribution(message_metadata)?;
+            // Collaborator sender preamble (multiplayer): content-level
+            // counterpart of the stamp, collaborator members only.
+            self.annotate_collaborator_sender(&workspace_id, &mut message)
+                .await?;
             self.agent_send_to_task_op(
                 workspace_id,
                 task_note_id,
@@ -28075,7 +28247,7 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
-        content: String,
+        mut content: String,
         message_id: Option<String>,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
@@ -28099,6 +28271,15 @@ impl WorkspaceApi for Services {
             } else {
                 crate::principal_ops::strip_principal_attribution(message_metadata)
             };
+            // Collaborator sender preamble (multiplayer): the content-level
+            // counterpart of the stamp, applied once here so the runtime
+            // path and the store-only fallback persist what the model sees.
+            // Same gate as the stamp — only a user-origin send is a person
+            // speaking; the owner's content stays byte-identical.
+            if origin.is_user() {
+                self.annotate_collaborator_sender(&workspace_id, &mut content)
+                    .await?;
+            }
             // Attachment-reference validation (PROTOCOL §5.5) up front: the
             // runtime-manager path below never reaches
             // `agent_send_message_op`'s check.
@@ -28168,6 +28349,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
+            // Ownership (multiplayer): a guest collaborator force-sends only
+            // the entries its `agent.getQueue` shows it — checked by each
+            // path below inside its pop's critical section
+            // (`Services::queue_entry_gate`).
             match self.agent_manager() {
                 Some(manager) => {
                     manager
@@ -28234,7 +28419,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         message_id: String,
-        content: String,
+        mut content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
         model: Option<String>,
@@ -28245,6 +28430,10 @@ impl WorkspaceApi for Services {
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
+            // Collaborator sender preamble (multiplayer): the edited message
+            // is a fresh human-authored row by the editor.
+            self.annotate_collaborator_sender(&workspace_id, &mut content)
+                .await?;
             // Attachment-reference validation (PROTOCOL §5.5), same seam as
             // agent.sendMessage — before any state change.
             crate::agent_ops::validate_file_blocks(
@@ -28314,7 +28503,7 @@ impl WorkspaceApi for Services {
     fn agent_queue_message(
         &self,
         agent_id: AgentId,
-        content: String,
+        mut content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
         message_metadata: Option<serde_json::Value>,
@@ -28326,6 +28515,10 @@ impl WorkspaceApi for Services {
             // carry it.
             let message_metadata =
                 crate::principal_ops::stamp_principal_attribution(message_metadata)?;
+            // Collaborator sender preamble (multiplayer): captured on the
+            // entry's content, so the drain persists what the model sees.
+            self.annotate_collaborator_sender_for_agent(&agent_id, &mut content)
+                .await?;
             self.agent_queue_message_op(
                 agent_id,
                 content,
@@ -28691,7 +28884,7 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
-        context_message: String,
+        mut context_message: String,
         mut input: intent_core::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
@@ -28706,6 +28899,10 @@ impl WorkspaceApi for Services {
             // message, whichever branch (wake / queue / create) carries it.
             input.message_metadata =
                 crate::principal_ops::stamp_principal_attribution(input.message_metadata)?;
+            // Collaborator sender preamble (multiplayer) on the same
+            // context message, every branch alike.
+            self.annotate_collaborator_sender(&workspace_id, &mut context_message)
+                .await?;
             self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, input)
                 .await
         })
@@ -30354,12 +30551,89 @@ impl WorkspaceApi for Services {
     }
 
     fn github_get_user(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
         Box::pin(async move {
             Self::require_administrator("github.getUser")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = self.identity_source_control().await?;
             let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
+        })
+    }
+
+    fn github_users_search(
+        &self,
+        query: String,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            Self::require_administrator("github.users.search")?;
+            let query = query.trim();
+            if query.is_empty() {
+                return Ok(serde_json::json!({ "users": [] }));
+            }
+            let limit = github_browse_ops::clamp_user_search_limit(limit);
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let users = sc
+                .search_users(query, limit)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({
+                "users": github_browse_ops::user_hits_to_wire(&users)
+            }))
+        })
+    }
+
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Guest half of the gist identity-proof join flow: the proof gist is
+        // made with the STORED device-flow token only (never the env / `gh`
+        // fallbacks), against the same API host the reconnect guard uses.
+        // 🔒 The token stays server-side; only `{ gistId, login }` crosses.
+        let secrets = self.secrets.clone();
+        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        Box::pin(async move {
+            Self::require_administrator("github.identityProof.create")?;
+            let nonce = github_auth_ops::proof_line_param("nonce", &nonce)?;
+            let host_label = github_auth_ops::proof_line_param("hostLabel", &host_label)?;
+            let token = github_auth_ops::load_stored_token(&secrets).await?;
+            let gist = intent_sourcecontrol::identity_proof::create_proof_gist(
+                &token,
+                api_base.as_deref(),
+                &nonce,
+                &host_label,
+            )
+            .await
+            .map_err(github_auth_ops::map_identity_proof_err)?;
+            Ok(serde_json::json!({ "gistId": gist.gist_id, "login": gist.login }))
+        })
+    }
+
+    fn github_identity_proof_delete(
+        &self,
+        gist_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let secrets = self.secrets.clone();
+        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        Box::pin(async move {
+            Self::require_administrator("github.identityProof.delete")?;
+            let gist_id = gist_id.trim();
+            if gist_id.is_empty() || !gist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(Error::InvalidParams(
+                    "gistId must be a non-empty alphanumeric gist id".to_string(),
+                ));
+            }
+            let token = github_auth_ops::load_stored_token(&secrets).await?;
+            intent_sourcecontrol::identity_proof::delete_proof_gist(
+                &token,
+                api_base.as_deref(),
+                gist_id,
+            )
+            .await
+            .map_err(github_auth_ops::map_identity_proof_err)?;
+            Ok(serde_json::json!({ "ok": true }))
         })
     }
 
@@ -30371,6 +30645,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.principal_me_op().await })
     }
 
+    fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.principal_list_op().await })
+    }
+
     // `workspace.members.*` (multiplayer w3) — see `capability`.
 
     fn workspace_members_list(
@@ -30378,6 +30656,17 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.workspace_members_list_op(&workspace_id).await })
+    }
+
+    fn workspace_members_add(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_members_add_op(&workspace_id, &principal_id)
+                .await
+        })
     }
 
     fn workspace_members_remove(
@@ -30391,7 +30680,7 @@ impl WorkspaceApi for Services {
         })
     }
 
-    // Invites + identity-only join (multiplayer w4) — see `invite_ops`.
+    // Invites + join (multiplayer w4) — see `invite_ops`.
 
     fn workspace_members_leave(
         &self,
@@ -30495,16 +30784,46 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn invite_redeem_start(
+    fn invite_inspect(
         &self,
         invite_id: String,
         secret: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.invite_redeem_start_op(&invite_id, &secret).await })
+        Box::pin(async move { self.invite_inspect_op(&invite_id, &secret).await })
     }
 
-    fn invite_redeem_wait(&self, flow_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.invite_redeem_wait_op(&flow_id).await })
+    fn invite_accept(
+        &self,
+        invite_id: String,
+        secret: String,
+        credential: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.invite_accept_op(&invite_id, &secret, &credential)
+                .await
+        })
+    }
+
+    fn invite_challenge(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.invite_challenge_op(&invite_id, &secret).await })
+    }
+
+    fn invite_prove(
+        &self,
+        invite_id: String,
+        secret: String,
+        nonce: String,
+        gist_id: String,
+        login: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.invite_prove_op(&invite_id, &secret, &nonce, &gist_id, &login)
+                .await
+        })
     }
 
     fn primary_principal_id(&self) -> BoxFuture<'_, Result<intent_core::PrincipalId>> {
@@ -31853,6 +32172,75 @@ impl WorkspaceApi for Services {
 /// (`workspace.unarchive` / `workspace.restore`) and the turn-start
 /// auto-unarchive (monorepo — auto-unarchive on agent activity).
 impl Services {
+    /// Archive tail: queue ONE consolidated wake per agent whose background
+    /// hooks and/or PR monitors the archive sweeps
+    /// ([`Services::cancel_workspace_hooks`],
+    /// [`Services::cancel_workspace_pr_monitors`]) just cancelled — the
+    /// [`crate::harness::Harness::workspace_archived_watches_cancelled_notice`]
+    /// surface naming every cancelled hook (`name` + id) and monitor
+    /// (label) plus the re-arm calls, tagged
+    /// `{ type: "workspace_archive_wake", hookIds, prMonitorIds }` (both
+    /// arrays always present). Agents with nothing cancelled get nothing.
+    /// The wake rides the archived gate in [`Services::deliver_wake_message`]
+    /// — parked in the queue, delivered by the unarchive drain kick
+    /// ([`Services::unarchive_workspace_inner`]) or folded into the combined
+    /// turn of a post-archive user send — so the notice is only ever read
+    /// after the workspace is Active again, and its wording says so.
+    ///
+    /// The per-item cancels were DEFERRED
+    /// ([`crate::hook_manager::CancelSettlement::Deferred`]): none ran the
+    /// deferral backstop, so this tail runs
+    /// [`Services::redeliver_completion_after_queue_mutation`] once per
+    /// owner AFTER queueing its wake — on delivery failure too. Ordering is
+    /// the point: a completion watch deferred on a monitoring-idle owner
+    /// must find the queued notice (ready-to-send → the backstop defers,
+    /// exactly as it did behind the retired per-item wakes) and stay armed
+    /// for the owner's real turn after unarchive, not be consumed by a
+    /// synthesized completion the final per-item cancel would otherwise
+    /// produce against an empty queue. Best-effort per agent: a delivery
+    /// failure is logged and the tail moves on — the cancels themselves
+    /// already persisted.
+    async fn notify_owners_of_archived_watches(
+        &self,
+        workspace_id: &WorkspaceId,
+        hooks: std::collections::BTreeMap<AgentId, Vec<(String, intent_core::HookId)>>,
+        monitors: std::collections::BTreeMap<AgentId, Vec<(String, intent_core::PrMonitorId)>>,
+    ) {
+        let owners: std::collections::BTreeSet<&AgentId> =
+            hooks.keys().chain(monitors.keys()).collect();
+        for owner in owners {
+            let agent_hooks = hooks.get(owner).map(Vec::as_slice).unwrap_or_default();
+            let agent_monitors = monitors.get(owner).map(Vec::as_slice).unwrap_or_default();
+            let hook_items: Vec<(&str, &str)> = agent_hooks
+                .iter()
+                .map(|(name, id)| (name.as_str(), id.as_str()))
+                .collect();
+            let monitor_labels: Vec<&str> = agent_monitors
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect();
+            let notice = crate::harness::latest()
+                .workspace_archived_watches_cancelled_notice(&hook_items, &monitor_labels);
+            let metadata = serde_json::json!({
+                "type": "workspace_archive_wake",
+                "hookIds": agent_hooks.iter().map(|(_, id)| id).collect::<Vec<_>>(),
+                "prMonitorIds": agent_monitors.iter().map(|(_, id)| id).collect::<Vec<_>>(),
+            });
+            if let Err(e) = self
+                .deliver_wake_message(workspace_id, owner, &notice, Some(&metadata))
+                .await
+            {
+                tracing::warn!(
+                    workspace = %workspace_id.as_str(),
+                    agent = %owner.as_str(),
+                    error = %e,
+                    "archive sweep: consolidated watch-cancel wake delivery failed"
+                );
+            }
+            self.redeliver_completion_after_queue_mutation(owner).await;
+        }
+    }
+
     /// Flip an archived workspace back to Active: persist the row, kick the
     /// drains parked by the archived gates, derive `lastActivity`/`activity`,
     /// and publish ONE `workspace:updated` delta. `auto_unarchive` — set only

@@ -14,13 +14,14 @@ pub mod device_flow;
 pub mod error;
 pub mod gh_sync;
 pub mod github;
+pub mod identity_proof;
 pub mod model;
 pub mod registry;
 pub mod token;
 
 use async_trait::async_trait;
 
-pub use device_flow::{DeviceFlow, IdentityFlow, IdentityPollStatus, PollStatus};
+pub use device_flow::{DeviceFlow, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use model::{
@@ -73,6 +74,25 @@ pub trait SourceControl: Send + Sync {
     async fn get_user_by_login(&self, login: &str) -> Result<UserIdentity> {
         Err(Error::Unsupported(format!(
             "user lookup by login is not supported by this provider (login {login:?})"
+        )))
+    }
+
+    /// Search user accounts by login prefix (`GET /search/users`), at most
+    /// `limit` hits. Backs `github.users.search`. Providers without a user
+    /// search answer `Unsupported`.
+    async fn search_users(&self, query: &str, limit: u8) -> Result<Vec<UserIdentity>> {
+        Err(Error::Unsupported(format!(
+            "user search is not supported by this provider (query {query:?}, limit {limit})"
+        )))
+    }
+
+    /// The host-side read of a guest's identity-proof gist
+    /// (`GET /gists/{gist_id}`), projected onto what the verification needs
+    /// ([`identity_proof::ProofGistView`]). [`Error::NotFound`] when no gist
+    /// has that id. Backs `invite.prove`.
+    async fn get_proof_gist(&self, gist_id: &str) -> Result<identity_proof::ProofGistView> {
+        Err(Error::Unsupported(format!(
+            "gist lookup is not supported by this provider (gist {gist_id:?})"
         )))
     }
 
