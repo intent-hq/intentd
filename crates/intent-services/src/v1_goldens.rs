@@ -1539,6 +1539,53 @@ fn golden_image_and_attachment_notice_bytes() {
     );
 }
 
+/// Workspace setup-stage notices (§6.5): exact bytes of the in-progress
+/// notice and of the failure notice with and without an exit code, plus the
+/// envelope slot — after the snapshot line, before the Context block.
+#[test]
+fn golden_setup_notice_bytes_and_envelope_slot() {
+    use crate::harness::TurnEnvelopeParams;
+    let h = crate::harness::resolve_entry("1.0").harness;
+    assert_eq!(
+        h.setup_in_progress_notice("Setup Script"),
+        "[System: workspace setup is still running — the setup script is executing in the \
+         \"Setup Script\" terminal. Worktree contents (submodules, tooling, generated files) \
+         are provisional until ws.workspace.details().setupStatus.state is \"completed\". Do \
+         not diagnose missing files or tools as bugs yet: wait with a self-checking background \
+         hook (ws.hook.schedule) that reads ws.workspace.details().setupStatus and dispatches \
+         once state is \"completed\" (or \"failed\"), then re-check the worktree.]"
+    );
+    assert_eq!(
+        h.setup_failed_notice(Some(3), "Setup Script"),
+        "[System: workspace setup failed — the setup script exited with code 3. Its output is \
+         in the \"Setup Script\" terminal (ws.terminal.list / ws.terminal.readOutput). The \
+         worktree may be missing submodules or tooling: read that output before diagnosing \
+         missing files, and tell the user setup needs attention.]"
+    );
+    assert_eq!(
+        h.setup_failed_notice(None, "Setup Script"),
+        "[System: workspace setup failed — the setup script failed before it exited (no exit \
+         code). Its output is in the \"Setup Script\" terminal (ws.terminal.list / \
+         ws.terminal.readOutput). The worktree may be missing submodules or tooling: read \
+         that output before diagnosing missing files, and tell the user setup needs \
+         attention.]"
+    );
+    let composed = h.compose_turn_prompt(&TurnEnvelopeParams {
+        first_turn_prepend: Some("<system>sp</system>"),
+        snapshot_line: Some("current ws.agent.snapshot() => {}"),
+        setup_notice: Some("[System: setup]"),
+        stdin_context: Some("ctx"),
+        naming_nudge: None,
+        role_reminder: None,
+        body: "hello",
+    });
+    assert_eq!(
+        composed,
+        "<system>sp</system>\n\ncurrent ws.agent.snapshot() => {}\n\n[System: setup]\n\n\
+         Context:\nctx\n\n---\n\nhello"
+    );
+}
+
 /// Supervisor-history truncation markers: the omitted-exchanges comment
 /// (exact bytes inside the wrapper) and the middle-truncation marker line
 /// inside an oversized `tool_result`.

@@ -124,6 +124,14 @@ impl Harness for V2_4 {
         V1.role_reminder_prefix(name, reminder)
     }
 
+    fn setup_in_progress_notice(&self, terminal_name: &str) -> String {
+        V1.setup_in_progress_notice(terminal_name)
+    }
+
+    fn setup_failed_notice(&self, exit_code: Option<u32>, terminal_name: &str) -> String {
+        V1.setup_failed_notice(exit_code, terminal_name)
+    }
+
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String {
         V1.compose_turn_prompt(params)
     }

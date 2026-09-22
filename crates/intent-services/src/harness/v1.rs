@@ -424,9 +424,35 @@ impl Harness for V1 {
         format!("[Role Reminder: You are a {name}. {reminder}]")
     }
 
+    fn setup_in_progress_notice(&self, terminal_name: &str) -> String {
+        format!(
+            "[System: workspace setup is still running — the setup script is executing in the \
+             \"{terminal_name}\" terminal. Worktree contents (submodules, tooling, generated \
+             files) are provisional until ws.workspace.details().setupStatus.state is \
+             \"completed\". Do not diagnose missing files or tools as bugs yet: wait with a \
+             self-checking background hook (ws.hook.schedule) that reads \
+             ws.workspace.details().setupStatus and dispatches once state is \"completed\" \
+             (or \"failed\"), then re-check the worktree.]"
+        )
+    }
+
+    fn setup_failed_notice(&self, exit_code: Option<u32>, terminal_name: &str) -> String {
+        let outcome = match exit_code {
+            Some(code) => format!("the setup script exited with code {code}"),
+            None => "the setup script failed before it exited (no exit code)".to_string(),
+        };
+        format!(
+            "[System: workspace setup failed — {outcome}. Its output is in the \
+             \"{terminal_name}\" terminal (ws.terminal.list / ws.terminal.readOutput). The \
+             worktree may be missing submodules or tooling: read that output before \
+             diagnosing missing files, and tell the user setup needs attention.]"
+        )
+    }
+
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String {
         // Inside-out layering, `\n\n` joins: body ← role reminder ← naming
-        // nudge ← Context block ← snapshot line ← FirstTurnPrepend.
+        // nudge ← Context block ← setup notice ← snapshot line ←
+        // FirstTurnPrepend.
         let prompt_text = match params.role_reminder {
             Some(r) => format!("{r}\n\n{}", params.body),
             None => params.body.to_string(),
@@ -437,6 +463,10 @@ impl Harness for V1 {
         };
         let prompt_text = match params.stdin_context {
             Some(ctx) => format!("Context:\n{ctx}\n\n---\n\n{prompt_text}"),
+            None => prompt_text,
+        };
+        let prompt_text = match params.setup_notice {
+            Some(notice) => format!("{notice}\n\n{prompt_text}"),
             None => prompt_text,
         };
         let prompt_text = match params.snapshot_line {

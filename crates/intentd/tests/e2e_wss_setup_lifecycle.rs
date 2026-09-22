@@ -13,7 +13,10 @@
 //! .setupStatus`, MCP-only): a mock ACP agent's turn started during the
 //! setup window reads `pending` / `running`, a turn after
 //! `workspace:setup:completed` reads `completed` with the exit code, and a
-//! failing script reads `failed`.
+//! failing script reads `failed` — and the prompt-only setup notice: a turn
+//! started while the script runs carries the in-progress notice ahead of the
+//! user content, a workspace without a script carries none, and the first
+//! turn after a failed script carries the failure notice exactly once.
 
 #![cfg(unix)]
 
@@ -796,5 +799,331 @@ async fn setup_status_visible_to_agents_over_mcp() {
     assert!(
         failed_status["startedAt"].is_string() && failed_status["finishedAt"].is_string(),
         "failed carries both timestamps: {failed_status}"
+    );
+}
+
+/// Leading bytes of the daemon's in-progress setup notice (the harness owns
+/// the full wording; `crate::v1_goldens` pins it byte-for-byte).
+const SETUP_RUNNING_NOTICE_PREFIX: &str = "[System: workspace setup is still running — the \
+                                            setup script is executing in the \"Setup Script\" \
+                                            terminal.";
+/// Leading bytes of the daemon's setup-failure notice.
+const SETUP_FAILED_NOTICE_PREFIX: &str =
+    "[System: workspace setup failed — the setup script exited with code 3.";
+/// Common prefix of both notices, for "no notice at all" assertions.
+const SETUP_NOTICE_MARKER: &str = "[System: workspace setup ";
+
+/// The mock fixture's `MOCK_AGENT_PROMPT_LOG` lines: the outbound prompt
+/// text of every turn any mock child received, in arrival order.
+fn read_prompt_texts(path: &Path) -> Vec<String> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).expect("prompt log line json");
+            v["text"].as_str().expect("text").to_string()
+        })
+        .collect()
+}
+
+/// The logged prompt whose user content is `user_content` (the tail of the
+/// prompt, ignoring a dequeue-wait `[SYSTEM NOTE]` a queued send appends),
+/// with the outermost fire-once `<system>` block (the mock provider's
+/// `FirstTurnPrepend` system prompt) stripped so the assertion sees the first
+/// per-turn decoration.
+fn prompt_after_system_block(log: &[String], user_content: &str) -> String {
+    let text = log
+        .iter()
+        .find(|t| {
+            t.split("\n\n[SYSTEM NOTE] This message was queued at")
+                .next()
+                .unwrap()
+                .ends_with(user_content)
+        })
+        .unwrap_or_else(|| panic!("no logged prompt ends with {user_content:?}: {log:?}"));
+    match text.strip_prefix("<system>\n") {
+        Some(rest) => match rest.split_once("\n</system>\n\n") {
+            Some((_, after)) => after.to_string(),
+            None => panic!("unterminated <system> block: {text:?}"),
+        },
+        None => text.clone(),
+    }
+}
+
+/// Send `content` to `agent_id` and wait for that turn's `agent:stream:end`.
+async fn send_and_await_turn<S>(
+    rpc: &mut WebSocketStream<S>,
+    sub: &mut WebSocketStream<S>,
+    id: i64,
+    ws_id: &str,
+    agent_id: &str,
+    content: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let sent = wss_rpc(
+        rpc,
+        id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": content }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    await_event(sub, &format!("agent:stream:end for {agent_id}"), |evt| {
+        evt["type"] == json!("agent:stream:end") && evt["data"]["agentId"] == json!(agent_id)
+    })
+    .await;
+}
+
+/// End-to-end, prompt-facing: the daemon prepends a prompt-only setup notice
+/// to turns that start while the workspace's setup script is `pending` /
+/// `running`. Asserted on the exact outbound prompt via the mock fixture's
+/// `MOCK_AGENT_PROMPT_LOG` seam: the create-time initial send of a workspace
+/// with a barrier-parked script begins (after the provider's first-turn
+/// `<system>` block) with the in-progress notice, while the persisted user
+/// message stays the bare prompt; a turn after `workspace:setup:completed`
+/// carries no notice; a workspace with no setup script carries none on its
+/// initial send; and after a script exits `3` the first turn of an agent
+/// carries the failure notice naming the exit code, the second does not.
+#[tokio::test]
+async fn setup_notice_prepended_to_turns_during_setup_over_wss() {
+    let Some(script) = mock_agent_gate("setup notice over WSS") else {
+        return;
+    };
+
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let home_dir = data_dir.join("home");
+    std::fs::create_dir_all(&home_dir).expect("mkdir hermetic home");
+    let repo_dir = create_test_repo();
+    let repo_path = repo_dir.path().to_path_buf();
+
+    let prompt_log = data_dir.join("prompt-log.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ack" }).to_string();
+    let env: [(&str, &str); 3] = [
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+    ];
+    let _daemon = spawn_serve(&data_dir, &home_dir, &env);
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:setup:*", "agent:*"] }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Workspace 1: barrier-parked script + initial agent. The initial send
+    // starts before the script is even spawned (`pending`) and the script
+    // cannot finish while the barrier holds.
+    let barrier = Barrier::new(&data_dir, "setup-notice");
+    let setup_script = format!(
+        "#!/bin/sh\n{}\n{}\nexit 0\n",
+        barrier.sh_arrive(),
+        barrier.sh_wait()
+    );
+    let slow_prompt = "inspect the workspace during setup";
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Setup notice (slow)",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "setupScript": setup_script,
+            "initialAgent": {
+                "prompt": slow_prompt,
+                "name": "Notice inspector",
+                "model": "default", "provider": "mock",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let agent_id = created["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent id")
+        .to_string();
+    await_event(
+        &mut sub,
+        &format!("agent:stream:end for {agent_id}"),
+        |evt| evt["type"] == json!("agent:stream:end") && evt["data"]["agentId"] == json!(agent_id),
+    )
+    .await;
+
+    let during = prompt_after_system_block(&read_prompt_texts(&prompt_log), slow_prompt);
+    assert!(
+        during.starts_with(SETUP_RUNNING_NOTICE_PREFIX),
+        "initial send during setup begins with the in-progress notice: {during:?}"
+    );
+    assert!(
+        during.ends_with(&format!("\n\n{slow_prompt}")),
+        "user content follows the notice: {during:?}"
+    );
+
+    // The notice is prompt-only: the persisted transcript carries the bare
+    // user prompt and no notice bytes anywhere.
+    let conv = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let user_texts: Vec<&str> = conv["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["role"] == json!("user"))
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    assert_eq!(
+        user_texts,
+        vec![slow_prompt],
+        "stored user message is the bare prompt: {conv}"
+    );
+    assert!(
+        !conv.to_string().contains(SETUP_NOTICE_MARKER),
+        "notice must not be persisted: {conv}"
+    );
+
+    // Release the script; once `workspace:setup:completed` fires the next
+    // turn carries no notice.
+    wait_for_entered(&barrier, Duration::from_secs(20)).await;
+    barrier.release();
+    await_event(&mut sub, "workspace:setup:completed (slow)", |evt| {
+        evt["type"] == json!("workspace:setup:completed") && evt["workspaceId"] == json!(ws_id)
+    })
+    .await;
+    let after_prompt = "inspect the workspace after setup";
+    send_and_await_turn(&mut rpc, &mut sub, 15, &ws_id, &agent_id, after_prompt).await;
+    let after = prompt_after_system_block(&read_prompt_texts(&prompt_log), after_prompt);
+    assert!(
+        !after.contains(SETUP_NOTICE_MARKER),
+        "no notice once setup completed: {after:?}"
+    );
+
+    // Workspace 2: no setup script (`skipped`) — the initial send carries no
+    // notice.
+    let plain_prompt = "inspect the workspace with no setup script";
+    let created2 = wss_rpc(
+        &mut rpc,
+        20,
+        "workspace.create",
+        json!({
+            "title": "Setup notice (none)",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "initialAgent": {
+                "prompt": plain_prompt,
+                "name": "Plain inspector",
+                "model": "default", "provider": "mock",
+            },
+        }),
+    )
+    .await;
+    let plain_agent_id = created2["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent 2 id")
+        .to_string();
+    await_event(
+        &mut sub,
+        &format!("agent:stream:end for {plain_agent_id}"),
+        |evt| {
+            evt["type"] == json!("agent:stream:end")
+                && evt["data"]["agentId"] == json!(plain_agent_id)
+        },
+    )
+    .await;
+    let plain = prompt_after_system_block(&read_prompt_texts(&prompt_log), plain_prompt);
+    assert!(
+        !plain.contains(SETUP_NOTICE_MARKER),
+        "no notice without a setup script: {plain:?}"
+    );
+
+    // Workspace 3: the script exits `3`. An agent created after the failure
+    // is told once — its first turn carries the failure notice with the
+    // exit code, its second turn does not.
+    let created3 = wss_rpc(
+        &mut rpc,
+        30,
+        "workspace.create",
+        json!({
+            "title": "Setup notice (failing)",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "setupScript": "#!/bin/sh\nexit 3\n",
+        }),
+    )
+    .await;
+    let failing_ws_id = created3["workspace"]["id"]
+        .as_str()
+        .expect("workspace 3 id")
+        .to_string();
+    let completed3 = await_event(&mut sub, "workspace:setup:completed (failing)", |evt| {
+        evt["type"] == json!("workspace:setup:completed")
+            && evt["workspaceId"] == json!(failing_ws_id)
+    })
+    .await;
+    assert_eq!(completed3["data"]["exitCode"], json!(3), "{completed3}");
+    let created_agent = wss_rpc(
+        &mut rpc,
+        31,
+        "agent.create",
+        json!({ "workspaceId": failing_ws_id, "name": "Failure inspector", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let failed_agent_id = created_agent["agent"]["id"]
+        .as_str()
+        .expect("agent 3 id")
+        .to_string();
+    let first_prompt = "first turn after the failure";
+    send_and_await_turn(
+        &mut rpc,
+        &mut sub,
+        40,
+        &failing_ws_id,
+        &failed_agent_id,
+        first_prompt,
+    )
+    .await;
+    let first = prompt_after_system_block(&read_prompt_texts(&prompt_log), first_prompt);
+    assert!(
+        first.starts_with(SETUP_FAILED_NOTICE_PREFIX),
+        "first turn after failure begins with the failure notice: {first:?}"
+    );
+    let second_prompt = "second turn after the failure";
+    send_and_await_turn(
+        &mut rpc,
+        &mut sub,
+        42,
+        &failing_ws_id,
+        &failed_agent_id,
+        second_prompt,
+    )
+    .await;
+    let second = prompt_after_system_block(&read_prompt_texts(&prompt_log), second_prompt);
+    assert!(
+        !second.contains(SETUP_NOTICE_MARKER),
+        "failure notice fires once per agent: {second:?}"
     );
 }
