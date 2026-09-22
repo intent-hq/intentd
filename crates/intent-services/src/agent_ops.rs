@@ -6233,16 +6233,17 @@ impl Services {
         Ok(json!({ "success": true, "queue": queue }))
     }
 
-    /// Ownership gate for the per-id queue mutations (multiplayer): the
-    /// entry's author is the principal [`intent_core::queue_visible_to`]
-    /// projects it under — the same resolution as `agent.getQueue`
-    /// ([`crate::principal_ops::MessageAuthorResolver::queue_author_principal_id`]).
-    /// `author_only` (`agent.editQueuedMessage`) refuses EVERY wire caller,
-    /// the administrator included, on an entry another principal authored;
-    /// otherwise (`agent.removeQueuedMessage`, `agent.sendQueuedMessageNow`)
-    /// only a non-administrator wire caller is restricted, to the entries
-    /// its `agent.getQueue` shows it, and a foreign entry reads as absent —
-    /// `-32602 queued message not found`, no side effects. Agents, the
+    /// Ownership gate for the per-id queue mutations (multiplayer). Visibility
+    /// applies FIRST, through the shared [`intent_core::queue_visible_to`]
+    /// predicate over the entry's resolved author — the same resolution as
+    /// `agent.getQueue`
+    /// ([`crate::principal_ops::MessageAuthorResolver::queue_author_principal_id`]):
+    /// an entry the caller's `agent.getQueue` hides reads as absent for every
+    /// mutation — `-32602 queued message not found`, no side effects. Then
+    /// `author_only` (`agent.editQueuedMessage`) refuses a VISIBLE entry
+    /// another principal authored — this only ever reaches the administrator,
+    /// who sees the whole queue. `agent.removeQueuedMessage` /
+    /// `agent.sendQueuedMessageNow` stop at the visibility check. Agents, the
     /// daemon and unbound callers are unrestricted; an entry with no human
     /// author, or one that is not in the queue, passes so the op's own
     /// missing-id contract applies.
@@ -6252,10 +6253,12 @@ impl Services {
         message_id: &str,
         author_only: bool,
     ) -> Result<()> {
-        let Some(intent_core::Caller::Wire {
-            principal_id,
-            is_administrator,
-        }) = intent_core::current_caller()
+        let Some(
+            caller @ intent_core::Caller::Wire {
+                principal_id: _,
+                is_administrator,
+            },
+        ) = intent_core::current_caller()
         else {
             return Ok(());
         };
@@ -6276,17 +6279,27 @@ impl Services {
             }
         };
         let workspace_id = self.agent_workspace(agent_id).await?;
-        let author = crate::principal_ops::MessageAuthorResolver::new(self, &workspace_id)
+        let Some(author) = crate::principal_ops::MessageAuthorResolver::new(self, &workspace_id)
             .queue_author_principal_id(metadata.as_ref())
-            .await;
-        match author {
-            Some(author) if author != principal_id => Err(Error::InvalidParams(if author_only {
-                format!("queued message {message_id} can only be edited by its author")
-            } else {
-                format!("queued message not found: {message_id}")
-            })),
-            _ => Ok(()),
+            .await
+        else {
+            return Ok(());
+        };
+        let projected = json!({ "author": { "principalId": author.0 } });
+        if !intent_core::queue_visible_to(&caller, &projected) {
+            return Err(Error::InvalidParams(format!(
+                "queued message not found: {message_id}"
+            )));
         }
+        let intent_core::Caller::Wire { principal_id, .. } = caller else {
+            return Ok(());
+        };
+        if author_only && author != principal_id {
+            return Err(Error::InvalidParams(format!(
+                "queued message {message_id} can only be edited by its author"
+            )));
+        }
+        Ok(())
     }
 
     /// `agent.editQueuedMessage` (PROTOCOL §5.5). Updates the entry's content

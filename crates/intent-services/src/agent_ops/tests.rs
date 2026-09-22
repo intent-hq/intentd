@@ -13657,34 +13657,50 @@ async fn queue_mutations_enforce_entry_ownership() {
     };
     let not_found = |mid: &str| format!("queued message not found: {mid}");
 
-    // Edit — author-only for every wire caller.
-    for (label, caller, mid) in [
+    // Edit — visibility first (a hidden entry is "not found" for the guest),
+    // then authorship for the administrator, who sees the whole queue.
+    let author_only = |mid: &str| format!("queued message {mid} can only be edited by its author");
+    for (label, caller, mid, expected) in [
         (
             "guest edits the owner's entry",
             as_guest.clone(),
             &owner_entry,
+            not_found(&owner_entry),
         ),
         (
             "guest edits the fallback-owned legacy entry",
             as_guest.clone(),
             &legacy_entry,
+            not_found(&legacy_entry),
         ),
         (
             "administrator edits the guest's entry",
             as_admin.clone(),
             &guest_entry,
+            author_only(&guest_entry),
         ),
     ] {
-        let before = content(mid);
+        let before = entry(mid).unwrap_or_else(|| panic!("entry {mid}"));
         let err = match edit_as(caller, mid, "hijacked").await {
             Ok(v) => panic!("{label}: must be refused, got {v}"),
             Err(e) => e,
         };
-        assert!(matches!(err, Error::InvalidParams(_)), "{label}: {err:?}");
+        match err {
+            Error::InvalidParams(msg) => assert_eq!(msg, expected, "{label}"),
+            other => panic!("{label}: expected -32602, got {other:?}"),
+        }
+        let after = entry(mid).unwrap_or_else(|| panic!("entry {mid}"));
         assert_eq!(
-            content(mid),
-            before,
-            "{label}: a refused edit mutates nothing"
+            after["content"], before["content"],
+            "{label}: a refused edit leaves the content untouched"
+        );
+        assert_eq!(
+            after["messageMetadata"], before["messageMetadata"],
+            "{label}: a refused edit does not restamp the metadata"
+        );
+        assert_eq!(
+            after["editing"], before["editing"],
+            "{label}: a refused edit leaves the editing flag untouched"
         );
     }
     edit_as(as_guest.clone(), &guest_entry, "from guest (edited)")
