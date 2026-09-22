@@ -6233,6 +6233,62 @@ impl Services {
         Ok(json!({ "success": true, "queue": queue }))
     }
 
+    /// Ownership gate for the per-id queue mutations (multiplayer): the
+    /// entry's author is the principal [`intent_core::queue_visible_to`]
+    /// projects it under — the same resolution as `agent.getQueue`
+    /// ([`crate::principal_ops::MessageAuthorResolver::queue_author_principal_id`]).
+    /// `author_only` (`agent.editQueuedMessage`) refuses EVERY wire caller,
+    /// the administrator included, on an entry another principal authored;
+    /// otherwise (`agent.removeQueuedMessage`, `agent.sendQueuedMessageNow`)
+    /// only a non-administrator wire caller is restricted, to the entries
+    /// its `agent.getQueue` shows it, and a foreign entry reads as absent —
+    /// `-32602 queued message not found`, no side effects. Agents, the
+    /// daemon and unbound callers are unrestricted; an entry with no human
+    /// author, or one that is not in the queue, passes so the op's own
+    /// missing-id contract applies.
+    pub(crate) async fn require_queue_entry_ownership(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        author_only: bool,
+    ) -> Result<()> {
+        let Some(intent_core::Caller::Wire {
+            principal_id,
+            is_administrator,
+        }) = intent_core::current_caller()
+        else {
+            return Ok(());
+        };
+        if is_administrator && !author_only {
+            return Ok(());
+        }
+        let metadata = {
+            let guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            match guard
+                .get(agent_id)
+                .and_then(|queue| queue.iter().find(|m| m.id == message_id))
+            {
+                Some(entry) => entry.message_metadata.clone(),
+                None => return Ok(()),
+            }
+        };
+        let workspace_id = self.agent_workspace(agent_id).await?;
+        let author = crate::principal_ops::MessageAuthorResolver::new(self, &workspace_id)
+            .queue_author_principal_id(metadata.as_ref())
+            .await;
+        match author {
+            Some(author) if author != principal_id => Err(Error::InvalidParams(if author_only {
+                format!("queued message {message_id} can only be edited by its author")
+            } else {
+                format!("queued message not found: {message_id}")
+            })),
+            _ => Ok(()),
+        }
+    }
+
     /// `agent.editQueuedMessage` (PROTOCOL §5.5). Updates the entry's content
     /// in place (matching the reference's `handleEditQueuedMessage`) and, when
     /// the optional `editing` flag is provided, transitions the entry between
@@ -6249,6 +6305,10 @@ impl Services {
     /// while it was under edit is probed first: its marker lifts the STAB-52
     /// `Error` gate for that entry alone, and an unmarked entry still meets
     /// the ordinary gate.
+    ///
+    /// Edits are author-only for every wire caller
+    /// ([`Self::require_queue_entry_ownership`]): an entry another principal
+    /// authored is refused with `-32602` before anything moves.
     pub(crate) async fn agent_edit_queued_message_op(
         &self,
         agent_id: AgentId,
@@ -6256,6 +6316,8 @@ impl Services {
         mut content: String,
         editing: Option<bool>,
     ) -> Result<Value> {
+        self.require_queue_entry_ownership(&agent_id, &message_id, true)
+            .await?;
         // Principal stamp (multiplayer w2): an edit by a wire caller makes
         // the editor the author of a human-authored entry; an agent /
         // daemon edit leaves the original stamp alone. Human authorship is
@@ -6349,12 +6411,17 @@ impl Services {
     /// found. The FE's seeded queue can diverge from the BE's in-memory queue
     /// (especially after a daemon restart); the original "Queued message not
     /// found" error caused the FE's optimistic delete to roll back, leaving
-    /// ghost messages on screen.
+    /// ghost messages on screen. The one exception is ownership
+    /// ([`Self::require_queue_entry_ownership`]): a guest collaborator may
+    /// remove only the entries its `agent.getQueue` shows it, and a foreign
+    /// entry is refused as `-32602 queued message not found` untouched.
     pub(crate) async fn agent_remove_queued_message_op(
         &self,
         agent_id: AgentId,
         message_id: String,
     ) -> Result<Value> {
+        self.require_queue_entry_ownership(&agent_id, &message_id, false)
+            .await?;
         let removed = {
             let mut guard = self
                 .agent_queues

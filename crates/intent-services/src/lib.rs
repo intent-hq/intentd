@@ -28307,6 +28307,11 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
+            // Ownership (multiplayer): a guest collaborator force-sends only
+            // the entries its `agent.getQueue` shows it; gated once here so
+            // the runtime and the store-only paths below share it.
+            self.require_queue_entry_ownership(&agent_id, &message_id, false)
+                .await?;
             match self.agent_manager() {
                 Some(manager) => {
                     manager

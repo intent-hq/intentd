@@ -494,6 +494,22 @@ impl<'a> MessageAuthorResolver<'a> {
         ))
     }
 
+    /// The principal a queue entry with `metadata` resolves to under the
+    /// [`Self::attach_queue`] rule: its stamp, else the workspace fallback
+    /// for an unstamped entry whose metadata still reads as human-authored;
+    /// `None` for agent-sent / automatic entries and anything the workspace
+    /// cannot resolve. No principal-table read — the identity alone.
+    pub(crate) async fn queue_author_principal_id(
+        &self,
+        metadata: Option<&Value>,
+    ) -> Option<PrincipalId> {
+        match lift_from_principal_id(metadata) {
+            Some(id) => Some(id),
+            None if is_human_authored_metadata(metadata) => self.fallback_principal_id().await,
+            None => None,
+        }
+    }
+
     /// Set `author` on EVERY entry of a queue snapshot (`agent.getQueue` /
     /// `agent:queue:updated`): the key is always present so a client can
     /// treat it as authoritative — the projection resolved from the entry's
