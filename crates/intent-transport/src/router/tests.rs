@@ -2568,6 +2568,27 @@ fn voice_not_configured_maps_to_structured_error_data() {
 }
 
 #[test]
+fn rate_limited_maps_to_structured_error_data() {
+    // Forge rate limiting (intent-hq/intent#5627) — any cause the
+    // source-control layer classifies as `RateLimited` — keeps the -32603
+    // code and the exact `source control rate limited: <detail>` message,
+    // and carries `error.data = { code: "rate-limited" }` so the invite flow
+    // routes "wait for the limit to reset" instead of a sign-in prompt.
+    let rpc = super::domain_to_rpc(intent_core::Error::RateLimited(
+        "API rate limit exceeded for user ID 1.".to_string(),
+    ));
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.message,
+        "source control rate limited: API rate limit exceeded for user ID 1."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({ "code": "rate-limited" })
+    );
+}
+
+#[test]
 fn adapter_busy_maps_to_structured_error_data() {
     // An `agent.completeOnce` that queued past its own timeout at the
     // daemon-wide ephemeral-adapter bound (PROTOCOL §5.32, monorepo#2062)
@@ -3802,8 +3823,10 @@ async fn singular_event_subscribe_aliases_are_not_routable() {
 
 /// `agent.list` row-scope params (§5.5): an unknown or non-string `scope` is
 /// `-32602` (never coerced, unlike the lenient retired flags), a bin scope
-/// cannot ride with either retired flag, and `parentAgentId` must be a
-/// canonical `agent-{uuid}` paired with `scope: "delegated"`.
+/// cannot ride with either retired flag, `parentAgentId` must be a
+/// canonical `agent-{uuid}` paired with `scope: "delegated"`, and
+/// `orphanedOnly` must be a boolean paired with `scope: "delegated"` and
+/// never with `parentAgentId`.
 #[tokio::test]
 async fn agent_list_scope_params_are_validated() {
     let scope_msg = "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"";
@@ -3844,10 +3867,46 @@ async fn agent_list_scope_params_are_validated() {
             r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
             "parentAgentId requires scope \"delegated\"",
         ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":"yes"}}"#,
+            "orphanedOnly must be a boolean",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":1}}"#,
+            "orphanedOnly must be a boolean",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"background","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":true,"parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+            "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
+        ),
     ] {
         let v = call(frame).await.unwrap();
         assert_eq!(err_code(&v), -32602, "{frame}: {v}");
         assert_eq!(v["error"]["message"], serde_json::json!(expected), "{frame}");
+    }
+    // `orphanedOnly: false` reads as absent on any scope: the frame passes
+    // param validation into the trait default (`Internal` → `-32603`),
+    // like a valid `orphanedOnly: true` delegated read.
+    for frame in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","orphanedOnly":false}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","orphanedOnly":false}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":false,"parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":true}}"#,
+    ] {
+        let v = call(frame).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "{frame}: {v}");
     }
     // The retired-flag contradiction still wins over a scope combination.
     let v = call(

@@ -3050,8 +3050,14 @@ pub enum AgentListRowScope {
     /// lists by default.
     TopLevel,
     /// `parent_agent_id IS NOT NULL`, optionally narrowed to one parent's
-    /// direct sub-agents (`parent_agent_id = ?`).
-    Delegated { parent_agent_id: Option<AgentId> },
+    /// direct sub-agents (`parent_agent_id = ?`) OR — `orphaned_only` — to
+    /// the workspace's orphaned delegated rows (the rows
+    /// [`AgentDelegatedCounts::orphaned`] counts). The two sub-filters are
+    /// mutually exclusive; the router rejects the pair with `-32602`.
+    Delegated {
+        parent_agent_id: Option<AgentId>,
+        orphaned_only: bool,
+    },
     /// `parent_agent_id IS NULL AND is_background <> 0` — unparented
     /// background agents.
     Background,
@@ -3094,6 +3100,22 @@ pub struct AgentParentDelegatedCounts {
     pub running: u64,
 }
 
+/// The **orphaned** subset of [`AgentDelegatedCounts`] (§5.5, within 10.6):
+/// non-retired sessions with `parent_agent_id` set whose parent is NOT a
+/// non-retired `agent_session` row of the same workspace (parent deleted,
+/// soft-retired, or absent). Orphan-hood is decided by the DIRECT parent's
+/// liveness only — a child of a live standalone background parent is not
+/// an orphan, and neither is a child of an orphan. `running` follows the
+/// same `is_running_turn` rule as `byParent[*].running`. Always present:
+/// `{ total: 0, running: 0 }` when the workspace has no orphaned delegated
+/// session. Invariant: `total ≤ scopeCounts.delegated`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentOrphanedDelegatedCounts {
+    pub total: u64,
+    pub running: u64,
+}
+
 /// The always-present `delegatedCounts` field on every `agent.list`
 /// response variant (§5.5): the workspace's non-retired delegated sessions
 /// (the `delegated` bin, `parent_agent_id IS NOT NULL`) counted per DIRECT
@@ -3106,13 +3128,17 @@ pub struct AgentParentDelegatedCounts {
 /// delegated sessions), and its keys are the raw `parent_agent_id` values,
 /// so a key may name a parent outside this workspace (cross-workspace
 /// delegation). Invariant: `Σ byParent[*].total == scopeCounts.delegated`.
+/// `orphaned` is the always-present orphaned sub-aggregate of the same row
+/// set ([`AgentOrphanedDelegatedCounts`]), served from the same statement.
 /// Like [`AgentScopeCounts`], the counts stay workspace-wide even when the
-/// rows read was narrowed by `scope` or `parentAgentId`.
+/// rows read was narrowed by `scope`, `parentAgentId` or `orphanedOnly`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDelegatedCounts {
     pub running: u64,
     pub by_parent: BTreeMap<AgentId, AgentParentDelegatedCounts>,
+    #[serde(default)]
+    pub orphaned: AgentOrphanedDelegatedCounts,
 }
 
 /// Per-field byte budget for `agent.list` row previews (list-payload cost
@@ -3508,7 +3534,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.6";
+pub const CURRENT_HARNESS_VERSION: &str = "2.7";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching

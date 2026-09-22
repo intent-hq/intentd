@@ -7098,19 +7098,33 @@ impl AgentManager {
         // status events, and the spawn below must key on the workspace the
         // target lives in (see the module-header invariant).
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        // Ownership (multiplayer, intentd#2068): resolved before the pop,
+        // checked inside the pop's critical section against the entry found
+        // there — a guest force-sends only what its `agent.getQueue` shows it.
+        let gate = self.services.queue_entry_gate(&agent_id, false).await?;
+        self.services.park_queue_mutation_gate(gate.as_ref()).await;
         // Quarantine gate (monorepo#840): a provably-poisoned session must
         // not be redriven by delivery — every replay deterministically
         // fails. The entry STAYS in the queue (no side effects); the absent
         // case is still `-32602` so the contract holds.
         if self.services.session_poisoned(&session) {
+            let not_found =
+                || Error::InvalidParams(format!("queued message not found: {message_id}"));
+            if let Some(gate) = gate.as_ref() {
+                // A gated caller sees only the live entry: one mid-drain
+                // (overlay only) reads as absent, and a foreign one is refused.
+                let live = self
+                    .services
+                    .find_queued_message(&agent_id, &message_id)
+                    .ok_or_else(not_found)?;
+                gate.check(&live)?;
+            }
             let entry = self
                 .services
                 .queue_snapshot(&agent_id)
                 .into_iter()
                 .find(|m| m["id"].as_str() == Some(message_id.as_str()))
-                .ok_or_else(|| {
-                    Error::InvalidParams(format!("queued message not found: {message_id}"))
-                })?;
+                .ok_or_else(not_found)?;
             tracing::warn!(
                 agent = %agent_id,
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
@@ -7128,7 +7142,7 @@ impl AgentManager {
         // snapshots (§6.5 drain ordering) until `draining` is dropped.
         let (mut entry, draining) = self
             .services
-            .take_queued_message_draining(&agent_id, &message_id)
+            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;

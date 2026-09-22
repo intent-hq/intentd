@@ -295,7 +295,8 @@ impl Services {
     }
 
     /// The forge used for identity lookups — the invite pin's
-    /// `GET /users/{login}` and the primary's `GET /user` refresh: the
+    /// `GET /users/{login}`, the primary's `GET /user` refresh and
+    /// `github.getUser`: the
     /// injected engine when one is wired, else the active provider built
     /// from defaults with the API-base override applied, so every identity
     /// read talks to the same host (the e2e mock in tests, `api.github.com`
