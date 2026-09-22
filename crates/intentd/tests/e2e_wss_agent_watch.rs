@@ -518,10 +518,14 @@ async fn await_conversation_contains(
 }
 
 /// Poll until the agent's conversation stops changing across two consecutive
-/// reads 400ms apart (all queued wake turns drained). "Changing" is judged on
-/// the `common::conversation_fingerprint` (persisted row identity/content),
-/// not the raw payload, so read-time `author` hydration cannot keep the loop
-/// spinning (intent-hq/intent#5603). Returns the settled page.
+/// reads 400ms apart with no turn in flight (all queued wake turns drained).
+/// "Changing" is judged on the `common::conversation_fingerprint` (persisted
+/// row identity/content), not the raw payload, so read-time `author`
+/// hydration cannot keep the loop spinning (intent-hq/intent#5603). A turn
+/// persists nothing until it ends, so the page-level `turnInFlight` flag
+/// (dropped by the fingerprint) is checked separately: matching fingerprints
+/// while a wake turn is still running do not count as settled. Returns the
+/// settled page.
 async fn await_conversation_settled(
     rpc: &mut TlsWs,
     req_id: &mut i64,
@@ -535,7 +539,10 @@ async fn await_conversation_settled(
         tokio::time::sleep(Duration::from_millis(400)).await;
         let next = conversation_page(rpc, *req_id, ws_id, agent_id).await;
         *req_id += 1;
-        if common::conversation_fingerprint(&next) == common::conversation_fingerprint(&prev) {
+        let turn_in_flight = next["turnInFlight"].as_bool() == Some(true);
+        if !turn_in_flight
+            && common::conversation_fingerprint(&next) == common::conversation_fingerprint(&prev)
+        {
             return next;
         }
         prev = next;
