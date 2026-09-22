@@ -407,6 +407,22 @@ impl Conflate for ChatItem {
                 {
                     slot.push_str(&add);
                 }
+                // The `media` sidecar (§7.1) composes like the fragments:
+                // the newer chunk's entries join the pending block's map.
+                if let Some(Value::Object(media)) =
+                    newer.entity.get("block").and_then(|b| b.get("media"))
+                {
+                    if let Some(Value::Object(block)) = self.entity.get_mut("block") {
+                        match block.get_mut("media") {
+                            Some(Value::Object(acc)) => {
+                                acc.extend(media.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            }
+                            _ => {
+                                block.insert("media".to_string(), Value::Object(media.clone()));
+                            }
+                        }
+                    }
+                }
                 None
             }
             // Full-text encoding: latest entity wins (each carries the FULL

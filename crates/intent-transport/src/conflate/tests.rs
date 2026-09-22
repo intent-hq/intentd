@@ -381,6 +381,47 @@ fn incremental_chat_blocks_do_not_merge_across_blocks() {
     assert_eq!(second["added"][0]["block"]["textDelta"], json!("two"));
 }
 
+/// Incremental fragments carrying `media` (§7.1) union their entries into the
+/// pending block; a fragment without `media` leaves the pending map intact.
+#[test]
+fn incremental_chat_blocks_union_media_across_merged_fragments() {
+    let with_media = |added: bool, text: &str, media: Value| {
+        let mut d = incremental_chunk_delta(added, "m-1:0", text);
+        let bucket = if added { "added" } else { "updated" };
+        d[bucket][0]["block"]["media"] = media;
+        d
+    };
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    for delta in [
+        incremental_chunk_delta(true, "m-1:0", "See "),
+        with_media(
+            false,
+            "![a](a.png)",
+            json!({ "a.png": { "width": 1, "height": 2 } }),
+        ),
+        incremental_chunk_delta(false, "m-1:0", " and "),
+        with_media(
+            false,
+            "![b](b.png)",
+            json!({ "b.png": { "width": 3, "height": 4 } }),
+        ),
+    ] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    let only = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    let block = &only["added"][0]["block"];
+    assert_eq!(block["textDelta"], json!("See ![a](a.png) and ![b](b.png)"));
+    assert_eq!(
+        block["media"],
+        json!({
+            "a.png": { "width": 1, "height": 2 },
+            "b.png": { "width": 3, "height": 4 },
+        })
+    );
+}
+
 #[test]
 fn oversized_incremental_merge_seals_the_entry_and_starts_a_new_one() {
     let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
