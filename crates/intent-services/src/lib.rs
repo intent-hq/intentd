@@ -13079,6 +13079,26 @@ impl WorkspaceSetupStates {
     }
 }
 
+/// Test seam: when set to a path, `workspace.create` pauses before resolving
+/// the effective setup script for as long as that file exists, so a test can
+/// hold a create between `pending` and its resolution (`skipped` / spawn)
+/// deterministically while it drives RPCs over the live socket, then release
+/// it by deleting the file. Unset (the normal case) is a no-op.
+const TEST_SETUP_RESOLVE_HOLD_FILE_ENV: &str = "INTENTD_TEST_SETUP_RESOLVE_HOLD_FILE";
+
+/// Pause while the [`TEST_SETUP_RESOLVE_HOLD_FILE_ENV`] hold file exists.
+async fn test_hold_setup_resolution() {
+    let Some(hold) = std::env::var_os(TEST_SETUP_RESOLVE_HOLD_FILE_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    while hold.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// Record `pending` for `workspace_id`: the worktree exists and the setup
 /// stage is about to resolve its effective script. Called synchronously in
 /// `workspace.create` before the initial agent's message is sent.
@@ -20220,9 +20240,8 @@ impl WorkspaceApi for Services {
                     // message is sent so a turn started at create time can
                     // observe the in-progress stage via
                     // `ws.workspace.details().setupStatus`. `pending` when a
-                    // worktree exists (the effective script is resolved by the
-                    // background task below); `skipped` when the stage never
-                    // runs (skipWorktree / no worktree provisioned).
+                    // worktree exists; `skipped` when the stage never runs
+                    // (skipWorktree / no worktree provisioned).
                     let setup_worktree = if ws.skip_worktree {
                         None
                     } else {
@@ -20232,6 +20251,50 @@ impl WorkspaceApi for Services {
                         record_setup_pending(&services.workspace_setup_states, &ws.id);
                     } else {
                         record_setup_skipped(&services.workspace_setup_states, &ws.id);
+                    }
+                    // Resolve the effective setup script (explicit request param
+                    // > worktree repo config > legacy DB row) BEFORE the initial
+                    // send as well: a no-script workspace is `skipped` — never
+                    // transiently `pending` — by the time its first turn starts,
+                    // so that turn carries no in-progress notice. The explicit
+                    // param is execute-only, never persisted (§5.1).
+                    let effective_setup_script = match &setup_worktree {
+                        Some(worktree) => {
+                            test_hold_setup_resolution().await;
+                            match explicit_setup_script {
+                                Some(explicit) => Some(explicit),
+                                None => crate::repo_config::read_repo_config(worktree)
+                                    .await
+                                    .setup_script
+                                    .filter(|s| !s.is_empty())
+                                    .or_else(|| {
+                                        ws.setup_script.as_ref().and_then(|ss| {
+                                            let script = ss.script.trim();
+                                            if script.is_empty() {
+                                                None
+                                            } else {
+                                                Some(script.to_string())
+                                            }
+                                        })
+                                    }),
+                            }
+                        }
+                        None => None,
+                    };
+                    if setup_worktree.is_some() && effective_setup_script.is_none() {
+                        record_setup_skipped(&services.workspace_setup_states, &ws.id);
+                    }
+                    if effective_setup_script.is_none() {
+                        // skipWorktree / no worktree provisioned / no effective
+                        // script: the setup stage never runs (state recorded
+                        // `skipped` above), but the lifecycle still completes
+                        // (§6.5) — before the initial agent exists, so
+                        // `workspace:setup:completed` precedes `agent:created`.
+                        publish_event(
+                            bus.as_ref(),
+                            workspace_setup_completed_event(&ws.id, false, None),
+                        )
+                        .await;
                     }
                     let mut initial_agent = None;
                     if let Some((mut plan, prompt, image_blocks)) = planned_initial_agent {
@@ -20350,12 +20413,10 @@ impl WorkspaceApi for Services {
                         }
                         initial_agent = created.get("agent").cloned();
                     }
-                    // Execute the workspace setup script (fire-and-forget): after worktree
-                    // provisioning, resolve the effective setup script (explicit request
-                    // param > repo config > legacy DB row) and run it in a "Setup" terminal.
-                    // The explicit param is execute-only — it is never persisted (§5.1).
-                    // Execution is non-blocking (tokio::spawn) and must never fail the create.
-                    // Skipped when skipWorktree or no worktree was provisioned.
+                    // Execute the effective setup script resolved above (fire-and-forget)
+                    // in a "Setup" terminal. Execution is non-blocking (tokio::spawn) and
+                    // must never fail the create. Skipped when skipWorktree, no worktree
+                    // was provisioned, or no effective script resolved.
                     // Lives inside the idempotency closure so a cached response (same idempotencyKey)
                     // returns immediately without re-executing the script.
                     // Setup lifecycle (§6.5): `workspace:setup:started` fires iff an
@@ -20366,9 +20427,10 @@ impl WorkspaceApi for Services {
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
                     let setup_states = self.workspace_setup_states.clone();
-                    if let Some(worktree_path_buf) = setup_worktree {
-                        // Spawn background task to read + execute setup script (fire-and-forget).
-                        // Move config IO into the task so workspace.create doesn't block on it.
+                    if let (Some(worktree_path_buf), Some(script)) =
+                        (setup_worktree, effective_setup_script)
+                    {
+                        // Spawn background task to execute the setup script (fire-and-forget).
                         let workspace_id = ws.id.clone();
                         let worktree_path = worktree_path_buf.to_string_lossy().to_string();
                         let repo_path = ws
@@ -20380,39 +20442,8 @@ impl WorkspaceApi for Services {
                             .base_ref
                             .clone()
                             .unwrap_or_default();
-                        let legacy_script = ws.setup_script.clone();
                         let worktree_for_read = worktree_path_buf.clone();
                         intent_core::spawn_daemon(async move {
-                            // Resolve the effective setup script: the explicit param wins
-                            // for this create; an omitted param falls back to the
-                            // worktree-first repo-config read, then the legacy DB row.
-                            let effective_script = match explicit_setup_script {
-                                Some(explicit) => Some(explicit),
-                                None => crate::repo_config::read_repo_config(&worktree_for_read)
-                                    .await
-                                    .setup_script
-                                    .filter(|s| !s.is_empty())
-                                    .or_else(|| {
-                                        legacy_script.as_ref().and_then(|ss| {
-                                            let script = ss.script.trim();
-                                            if script.is_empty() {
-                                                None
-                                            } else {
-                                                Some(script.to_string())
-                                            }
-                                        })
-                                    }),
-                            };
-                            let Some(script) = effective_script else {
-                                // No script to execute: the setup stage is done.
-                                record_setup_skipped(&setup_states, &workspace_id);
-                                publish_event(
-                                    bus_for_setup.as_ref(),
-                                    workspace_setup_completed_event(&workspace_id, false, None),
-                                )
-                                .await;
-                                return;
-                            };
                             tracing::info!(
                                 workspace = %workspace_id.as_str(),
                                 script_length = script.len(),
@@ -20601,15 +20632,6 @@ impl WorkspaceApi for Services {
                             )
                             .await;
                         });
-                    } else {
-                        // skipWorktree / no worktree provisioned: the setup stage
-                        // never runs (state already recorded `skipped` above),
-                        // but the lifecycle still completes.
-                        publish_event(
-                            bus_for_setup.as_ref(),
-                            workspace_setup_completed_event(&ws.id, false, None),
-                        )
-                        .await;
                     }
                     Ok(WorkspaceCreateResult {
                         workspace: ws,

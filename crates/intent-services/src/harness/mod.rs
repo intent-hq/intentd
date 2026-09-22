@@ -182,7 +182,9 @@ pub(crate) trait Harness: Send + Sync {
     /// starts while the workspace's setup script is `pending` / `running`:
     /// names the terminal, marks the worktree provisional, and tells the
     /// agent to wait with a self-checking hook on
-    /// `ws.workspace.details().setupStatus`.
+    /// `ws.workspace.details().setupStatus` that dispatches once `state` is
+    /// anything other than `pending` / `running` (safe under any ordering,
+    /// including a stage that settles `skipped`).
     fn setup_in_progress_notice(&self, terminal_name: &str) -> String;
     /// `[System: workspace setup failed …]` notice for the first turn after
     /// the setup script `failed`; `exit_code` is `None` when the script died

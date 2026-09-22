@@ -1550,10 +1550,12 @@ fn golden_setup_notice_bytes_and_envelope_slot() {
         h.setup_in_progress_notice("Setup Script"),
         "[System: workspace setup is still running — the setup script is executing in the \
          \"Setup Script\" terminal. Worktree contents (submodules, tooling, generated files) \
-         are provisional until ws.workspace.details().setupStatus.state is \"completed\". Do \
-         not diagnose missing files or tools as bugs yet: wait with a self-checking background \
-         hook (ws.hook.schedule) that reads ws.workspace.details().setupStatus and dispatches \
-         once state is \"completed\" (or \"failed\"), then re-check the worktree.]"
+         are provisional while ws.workspace.details().setupStatus.state is \"pending\" or \
+         \"running\". Do not diagnose missing files or tools as bugs yet: wait with a \
+         self-checking background hook (ws.hook.schedule) that reads \
+         ws.workspace.details().setupStatus and dispatches as soon as state is anything \
+         other than \"pending\" or \"running\" (\"completed\", \"failed\", \"skipped\", or \
+         \"unknown\"), then re-check the worktree.]"
     );
     assert_eq!(
         h.setup_failed_notice(Some(3), "Setup Script"),

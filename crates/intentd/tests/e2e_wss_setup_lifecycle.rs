@@ -15,8 +15,10 @@
 //! `workspace:setup:completed` reads `completed` with the exit code, and a
 //! failing script reads `failed` — and the prompt-only setup notice: a turn
 //! started while the script runs carries the in-progress notice ahead of the
-//! user content, a workspace without a script carries none, and the first
-//! turn after a failed script carries the failure notice exactly once.
+//! user content, a workspace without a script carries none (its effective
+//! script is resolved before the initial agent exists — pinned with the
+//! `INTENTD_TEST_SETUP_RESOLVE_HOLD_FILE` seam), and the first turn after a
+//! failed script carries the failure notice exactly once.
 
 #![cfg(unix)]
 
@@ -208,10 +210,27 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    wss_send(ws, id, method, params).await;
+    wss_await_result(ws, id, method).await
+}
+
+/// Send one request frame without waiting for its response (pair with
+/// [`wss_await_result`] when the test needs to act while the RPC is in flight).
+async fn wss_send<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
+}
+
+/// Drain frames until the response for `id` arrives and return its `result`.
+async fn wss_await_result<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
         let next = timeout(Duration::from_secs(15), ws.next())
             .await
@@ -1125,5 +1144,152 @@ async fn setup_notice_prepended_to_turns_during_setup_over_wss() {
     assert!(
         !second.contains(SETUP_NOTICE_MARKER),
         "failure notice fires once per agent: {second:?}"
+    );
+}
+
+/// A no-script `workspace.create` resolves its (absent) effective script
+/// BEFORE the initial agent exists, so the first turn can never observe a
+/// transient `pending` and carry the in-progress notice. The
+/// `INTENTD_TEST_SETUP_RESOLVE_HOLD_FILE` seam parks the create between
+/// `pending` and resolution: while held, `workspace:created` has fired but no
+/// agent row exists and no prompt was delivered; once released the stage
+/// settles `skipped` — `workspace:setup:completed { ranScript: false }`
+/// precedes `agent:created` — and the delivered prompt carries no notice.
+#[tokio::test]
+async fn no_script_create_resolves_setup_before_initial_turn_over_wss() {
+    let Some(script) = mock_agent_gate("no-script create ordering over WSS") else {
+        return;
+    };
+
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let home_dir = data_dir.join("home");
+    std::fs::create_dir_all(&home_dir).expect("mkdir hermetic home");
+    let repo_dir = create_test_repo();
+    let repo_path = repo_dir.path().to_path_buf();
+
+    // The hold file pre-exists the daemon, so the very first create parks
+    // before resolving its effective script.
+    let hold = data_dir.join("setup-resolve.hold");
+    std::fs::write(&hold, []).expect("write hold file");
+    let hold_str = hold.to_string_lossy().into_owned();
+    let prompt_log = data_dir.join("prompt-log.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ack" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+        ("INTENTD_TEST_SETUP_RESOLVE_HOLD_FILE", &hold_str),
+    ];
+    let _daemon = spawn_serve(&data_dir, &home_dir, &env);
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:*", "agent:*"] }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut probe = connect_ws(port, cfg.clone()).await;
+
+    let plain_prompt = "inspect the workspace with no setup script";
+    wss_send(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Setup ordering (none)",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "initialAgent": {
+                "prompt": plain_prompt,
+                "name": "Plain inspector",
+                "model": "default", "provider": "mock",
+            },
+        }),
+    )
+    .await;
+
+    // `workspace:created` publishes before the hold point, so observing it
+    // pins the create at "held": the workspace row exists, its stage is
+    // unresolved, and nothing initial-agent-shaped may exist yet.
+    let created_evt = await_event(&mut sub, "workspace:created", |evt| {
+        evt["type"] == json!("workspace:created")
+    })
+    .await;
+    let ws_id = created_evt["data"]["workspaceId"]
+        .as_str()
+        .expect("workspace id in workspace:created")
+        .to_string();
+    let listed = wss_rpc(&mut probe, 2, "agent.list", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(
+        listed["agents"].as_array().map_or(0, Vec::len),
+        0,
+        "no initial agent may be persisted while setup resolution is held: {listed}"
+    );
+    assert!(
+        read_prompt_texts(&prompt_log).is_empty(),
+        "no prompt may be delivered while setup resolution is held"
+    );
+
+    // Release: the stage settles `skipped` and completes before the initial
+    // agent is persisted, then the first turn is delivered without a notice.
+    std::fs::remove_file(&hold).expect("release hold file");
+    let created = wss_await_result(&mut rpc, 10, "workspace.create").await;
+    assert_eq!(created["workspace"]["id"], json!(ws_id), "{created}");
+    let agent_id = created["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent id")
+        .to_string();
+    let mut saw_completed = false;
+    let mut saw_agent_created = false;
+    await_event(
+        &mut sub,
+        "setup:completed → agent:created → stream:end",
+        |evt| {
+            match evt["type"].as_str() {
+                Some("workspace:setup:completed") if evt["workspaceId"] == json!(ws_id) => {
+                    assert_eq!(evt["data"]["ranScript"], json!(false), "{evt}");
+                    assert!(
+                        !saw_agent_created,
+                        "workspace:setup:completed precedes agent:created for a no-script create"
+                    );
+                    saw_completed = true;
+                }
+                Some("agent:created") if evt["data"]["agentId"] == json!(agent_id) => {
+                    assert!(
+                        saw_completed,
+                        "agent:created must follow workspace:setup:completed: {evt}"
+                    );
+                    saw_agent_created = true;
+                }
+                Some("agent:stream:end") if evt["data"]["agentId"] == json!(agent_id) => {
+                    return true;
+                }
+                _ => {}
+            }
+            false
+        },
+    )
+    .await;
+    assert!(saw_completed, "workspace:setup:completed observed");
+    assert!(saw_agent_created, "agent:created observed");
+    let plain = prompt_after_system_block(&read_prompt_texts(&prompt_log), plain_prompt);
+    assert!(
+        !plain.contains(SETUP_NOTICE_MARKER),
+        "no notice for a no-script create: {plain:?}"
     );
 }

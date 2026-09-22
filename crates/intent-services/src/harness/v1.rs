@@ -428,11 +428,12 @@ impl Harness for V1 {
         format!(
             "[System: workspace setup is still running — the setup script is executing in the \
              \"{terminal_name}\" terminal. Worktree contents (submodules, tooling, generated \
-             files) are provisional until ws.workspace.details().setupStatus.state is \
-             \"completed\". Do not diagnose missing files or tools as bugs yet: wait with a \
-             self-checking background hook (ws.hook.schedule) that reads \
-             ws.workspace.details().setupStatus and dispatches once state is \"completed\" \
-             (or \"failed\"), then re-check the worktree.]"
+             files) are provisional while ws.workspace.details().setupStatus.state is \
+             \"pending\" or \"running\". Do not diagnose missing files or tools as bugs yet: \
+             wait with a self-checking background hook (ws.hook.schedule) that reads \
+             ws.workspace.details().setupStatus and dispatches as soon as state is anything \
+             other than \"pending\" or \"running\" (\"completed\", \"failed\", \"skipped\", or \
+             \"unknown\"), then re-check the worktree.]"
         )
     }
 
