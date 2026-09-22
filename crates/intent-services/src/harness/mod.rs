@@ -48,6 +48,7 @@ pub(crate) mod v2_3;
 pub(crate) mod v2_4;
 pub(crate) mod v2_5;
 pub(crate) mod v2_6;
+pub(crate) mod v2_7;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -378,6 +379,21 @@ pub(crate) trait Harness: Send + Sync {
     /// parent (`reason: "transferred"`).
     fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String;
 
+    // --- Workspace archive notices (`lib.rs`) ---
+
+    /// The one consolidated notice an agent reads after its workspace was
+    /// unarchived, naming every background hook (`(name, hook_id)`) and PR
+    /// monitor (label) the archive sweep cancelled and how to re-arm each
+    /// kind. Callers pass at least one item; empty kinds are omitted.
+    // `expect(dead_code)` cannot pin an unused trait method (rustc treats it as a
+    // liveness root and reports the expectation unfulfilled), hence the allow.
+    #[cfg_attr(not(test), expect(clippy::allow_attributes), allow(dead_code))]
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String;
+
     // --- Other conversation-reaching strings (`agent_ops.rs`) ---
 
     /// The delegated child's first message: the optional body joined with the
@@ -454,6 +470,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2_4::ENTRY,
     &v2_5::ENTRY,
     &v2_6::ENTRY,
+    &v2_7::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -510,7 +527,7 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "2.6");
+        assert_eq!(entry.version, "2.7");
         assert_eq!(next_steps(entry.harness), next_steps(&v2_4::V2_4));
         assert_ne!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
         assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));

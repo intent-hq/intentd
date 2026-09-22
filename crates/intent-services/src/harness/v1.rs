@@ -1261,6 +1261,37 @@ impl Harness for V1 {
         )
     }
 
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String {
+        let items: Vec<String> = hooks
+            .iter()
+            .map(|(name, id)| format!("hook \"{name}\" ({id})"))
+            .chain(monitors.iter().map(|label| format!("PR monitor {label}")))
+            .collect();
+        let cancelled = if items.len() == 1 {
+            "this background watch was cancelled and was NOT resumed"
+        } else {
+            "these background watches were cancelled and were NOT resumed"
+        };
+        let mut re_arm = Vec::new();
+        if !hooks.is_empty() {
+            re_arm.push("ws.hook.get(hookId) recovers a hook's script for ws.hook.schedule");
+        }
+        if !monitors.is_empty() {
+            re_arm.push("ws.pr.monitor re-registers a PR");
+        }
+        format!(
+            "[SYSTEM NOTICE] This workspace was archived and has since been unarchived. \
+             While it was archived, {cancelled}: {}. If a condition still matters, \
+             re-arm it: {}.",
+            items.join(", "),
+            re_arm.join("; ")
+        )
+    }
+
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String {
         // Build the preamble from adjacent string literals (via `concat!`)
         // so no source-level indentation leaks into the emitted bytes. Every

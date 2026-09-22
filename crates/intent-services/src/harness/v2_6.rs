@@ -23,7 +23,7 @@ mod tests {
     #[test]
     fn plain_language_reaches_interactive_roles_even_without_attention_tools() {
         let previous = super::super::resolve_entry("2.5");
-        let current = super::super::latest_entry();
+        let current = super::super::resolve_entry("2.6");
         assert_eq!(current.version, "2.6");
         for auto_commit in [true, false] {
             assert_eq!(
