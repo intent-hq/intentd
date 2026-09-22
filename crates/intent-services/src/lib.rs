@@ -1127,6 +1127,12 @@ pub struct Services {
     /// — reads `prCache.maxAgeSeconds` live from the settings registry;
     /// values outside [floor, ceiling] are clamped at read time.
     pr_cache_max_age_seconds: Option<u64>,
+    /// Test park seam for the on-demand PR read's miss→fetch window: parks
+    /// [`Services::read_pr`] after its preflight cache miss and before the
+    /// shared path's authoritative lookup, so a concurrent fill landing
+    /// inside that window is deterministic. `None` in production wiring;
+    /// tests inject via the `#[cfg(test)]`-only `with_pr_read_park`.
+    pr_read_park: Option<Arc<CompletionClassifyPark>>,
     /// Explicit override for the centralized PR-monitor loop's poll cadence
     /// (seconds). `None` — the production wiring — reads
     /// `prMonitor.pollSeconds` live from the settings registry; values below
@@ -1404,6 +1410,7 @@ impl Services {
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
             issue_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_cache_max_age_seconds: None,
+            pr_read_park: None,
             pr_monitor_poll_seconds: None,
             pr_monitor_hourly_request_budget: None,
             pr_monitor_quota_share_percent: None,
@@ -1430,6 +1437,14 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_pr_cache_max_age_seconds(mut self, seconds: u64) -> Self {
         self.pr_cache_max_age_seconds = Some(seconds);
+        self
+    }
+
+    /// Park the on-demand PR read between its preflight cache miss and the
+    /// shared path's authoritative lookup (test wiring); see `pr_read_park`.
+    #[cfg(test)]
+    pub(crate) fn with_pr_read_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
+        self.pr_read_park = Some(park);
         self
     }
 

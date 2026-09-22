@@ -20559,6 +20559,19 @@ pub(crate) mod pr {
     async fn fold_setup(
         seed: impl FnOnce(&mut intent_core::Workspace),
     ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        let forge = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        fold_setup_with(forge, seed).await
+    }
+
+    /// [`fold_setup`] over a caller-held `forge`, for tests that observe or
+    /// drive its calls directly.
+    async fn fold_setup_with(
+        forge: Arc<StubForge>,
+        seed: impl FnOnce(&mut intent_core::Workspace),
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_id = WorkspaceId::new();
@@ -20577,10 +20590,7 @@ pub(crate) mod pr {
         let svc = Services::new(store)
             .with_event_bus(bus)
             .with_workspaces_root(wsroot.path().to_path_buf())
-            .with_source_control(Arc::new(StubForge {
-                merged_linked: true,
-                ..Default::default()
-            }));
+            .with_source_control(forge);
         (tmp, wsroot, svc, ws_id)
     }
 
@@ -20974,6 +20984,109 @@ pub(crate) mod pr {
         assert_eq!(root_list.len(), 1);
         assert_eq!(root_list[0].url, canonical);
         assert_eq!(root_list[0].status, intent_core::PullRequestStatus::Merged);
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
+    }
+
+    /// Regression (intent-hq/intentd#2064 review): the fold runs only when
+    /// `github.pulls.get`'s own read fetched the record. A concurrent fill
+    /// landing between the read's preflight cache miss and the shared path's
+    /// authoritative lookup makes that lookup a hit: the hover answers the
+    /// concurrently stored record with no forge request of its own, and the
+    /// linked workspace is never folded (persisted Open stays Open, no
+    /// `pr:updated`, no displayStatus transition). A later read that does
+    /// fetch — the entry aged past `max_age` — folds as usual.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_never_folds_when_a_concurrent_fill_serves_the_read() {
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let forge = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        let (_t, _root, svc, ws_id) = fold_setup_with(forge.clone(), |ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        let svc = svc
+            .with_pr_cache_max_age_seconds(60)
+            .with_pr_read_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let parked = intent_core::spawn_daemon({
+            let svc = svc.clone();
+            async move { svc.github_pulls_get("o".into(), "r".into(), 42).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("pulls.get reaches the miss→fetch window");
+        assert!(forge.seen_get_pr.lock().unwrap().is_empty());
+
+        // The concurrent fill (another on-demand reader or a sweep) stores
+        // #42 while the hover's read sits parked past its preflight miss.
+        crate::pr_monitor::read_pr_via(
+            forge.as_ref(),
+            &RepoRef::new("o", "r"),
+            42,
+            &svc.pr_cache,
+            crate::pr_monitor::PrReadPolicy::REFRESH,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("concurrent fill");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        park.release.notify_one();
+
+        let v = parked.await.expect("join").expect("pulls.get");
+        assert_eq!(v["pull"]["number"], 42);
+        assert_eq!(v["pull"]["merged"], true, "answers the concurrent fill");
+        assert_eq!(
+            *forge.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "the parked read costs no forge request of its own"
+        );
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Open),
+            "a read served from the cache never folds"
+        );
+        assert_eq!(
+            after.pull_requests.as_ref().expect("pull_requests")[0].status,
+            intent_core::PullRequestStatus::Open
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+
+        // Aged past max_age, the next read fetches — and that one folds.
+        // (The still-armed park is released ahead of the read.)
+        svc.backdate_pr_cache(std::time::Duration::from_secs(61));
+        park.release.notify_one();
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get after expiry");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42, 42]);
+        let folded = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            folded.pr_status,
+            Some(intent_core::PullRequestStatus::Merged),
+            "a read that fetched folds"
+        );
         assert_eq!(
             display_status_events(&svc, &ws_id).await,
             vec![json!("pr_merged")]

@@ -906,17 +906,39 @@ pub(crate) async fn read_pr_via(
     policy: PrReadPolicy,
     monitored: &HashSet<PrKey>,
 ) -> Result<PrCacheEntry> {
+    read_pr_via_with_fetched(sc, repo_ref, number, cache, policy, monitored)
+        .await
+        .map(|(entry, _)| entry)
+}
+
+/// [`read_pr_via`] also reporting whether the read reached the forge for
+/// the PR record: `false` only for a `Serve` hit, decided by the branch that
+/// returned the entry (never inferred from an earlier lookup), so a caller
+/// with a side effect keyed on a real fetch sees the exact outcome even
+/// when a concurrent reader filled the slot meanwhile. `Poll` always reads
+/// the record and reports `true`.
+pub(crate) async fn read_pr_via_with_fetched(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    cache: &PrCache,
+    policy: PrReadPolicy,
+    monitored: &HashSet<PrKey>,
+) -> Result<(PrCacheEntry, bool)> {
     let key = pr_key_for(repo_ref, number.cast_signed());
     let max_age = match policy {
-        PrReadPolicy::Poll => return poll_pr(sc, repo_ref, number, cache, key, monitored).await,
+        PrReadPolicy::Poll => {
+            let entry = poll_pr(sc, repo_ref, number, cache, key, monitored).await?;
+            return Ok((entry, true));
+        }
         PrReadPolicy::Serve { max_age } => max_age,
     };
     if let Some(entry) = cached_pr_within(cache, &key, max_age) {
         tracing::trace!(pr_number = number, "pr cache: serving the cached read");
-        return Ok(entry);
+        return Ok((entry, false));
     }
     let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
-    Ok(store_on_demand(cache, key, pr, snapshot, monitored))
+    Ok((store_on_demand(cache, key, pr, snapshot, monitored), true))
 }
 
 /// The cached entry for `key` when a forge read confirmed it current less
@@ -1585,17 +1607,44 @@ impl Services {
         number: u64,
         policy: PrReadPolicy,
     ) -> Result<PrCacheEntry> {
+        self.read_pr_with_fetched(repo_ref, number, policy)
+            .await
+            .map(|(entry, _)| entry)
+    }
+
+    /// [`Self::read_pr`] also reporting whether the read reached the forge
+    /// for the PR record ([`read_pr_via_with_fetched`]): `false` for a
+    /// `Serve` hit — the preflight one that skips the source-control and
+    /// store reads, or the shared path's authoritative one when a concurrent
+    /// reader filled the slot between the two — decided by the branch that
+    /// produced the entry, never inferred beforehand.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_pr`].
+    pub(crate) async fn read_pr_with_fetched(
+        &self,
+        repo_ref: &RepoRef,
+        number: u64,
+        policy: PrReadPolicy,
+    ) -> Result<(PrCacheEntry, bool)> {
         // A `Serve` hit costs neither a forge call nor a store read.
         if let PrReadPolicy::Serve { max_age } = policy {
             let key = pr_key_for(repo_ref, number.cast_signed());
             if let Some(entry) = cached_pr_within(&self.pr_cache, &key, max_age) {
                 tracing::trace!(pr_number = number, "pr cache: serving the cached read");
-                return Ok(entry);
+                return Ok((entry, false));
             }
         }
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let monitored = self.monitored_pr_keys().await;
-        read_pr_via(
+        // Test seam: park in the miss→fetch window so a test can land a
+        // concurrent fill before the shared path's authoritative lookup.
+        if let Some(park) = &self.pr_read_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+        read_pr_via_with_fetched(
             sc.as_ref(),
             repo_ref,
             number,
@@ -1606,14 +1655,11 @@ impl Services {
         .await
     }
 
-    /// [`Self::read_pr`] under the on-demand readers' policy — `Serve` at
-    /// `prCache.maxAgeSeconds` ([`Self::pr_cache_max_age`]) — also reporting
-    /// whether the read went to the forge: `false` when the cached entry was
-    /// served, so a caller with a side effect keyed on a real fetch
-    /// (`github.pulls.get`'s fold) skips it on a hit. Best effort on that
-    /// flag: a concurrent reader storing the PR between the hit check and
-    /// the fetch makes the fetch a hit reported as a fetch, costing at most
-    /// one redundant fold of a fresh record.
+    /// [`Self::read_pr_with_fetched`] under the on-demand readers' policy —
+    /// `Serve` at `prCache.maxAgeSeconds` ([`Self::pr_cache_max_age`]). The
+    /// flag is exact: `false` whenever the cached entry was served (a caller
+    /// with a side effect keyed on a real fetch, `github.pulls.get`'s fold,
+    /// skips it), `true` only when this read fetched the record itself.
     ///
     /// # Errors
     ///
@@ -1624,15 +1670,8 @@ impl Services {
         number: u64,
     ) -> Result<(PrCacheEntry, bool)> {
         let max_age = self.pr_cache_max_age();
-        let key = pr_key_for(repo_ref, number.cast_signed());
-        if let Some(entry) = cached_pr_within(&self.pr_cache, &key, max_age) {
-            tracing::trace!(pr_number = number, "pr cache: serving the cached read");
-            return Ok((entry, false));
-        }
-        let entry = self
-            .read_pr(repo_ref, number, PrReadPolicy::Serve { max_age })
-            .await?;
-        Ok((entry, true))
+        self.read_pr_with_fetched(repo_ref, number, PrReadPolicy::Serve { max_age })
+            .await
     }
 
     /// The PRs under an active monitor, for the cache's retention pass
@@ -8119,6 +8158,84 @@ mod tests {
             "served from the registration fetch"
         );
         assert_eq!(entry.pr.number, 42);
+    }
+
+    /// `serve_pr`'s flag is the read's exact outcome: a cold read fetches
+    /// (`true`), a read within `max_age` is served (`false`), and an entry
+    /// aged past the window is fetched again (`true`).
+    #[tokio::test]
+    async fn serve_pr_reports_fetch_versus_hit_exactly() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+        let repo = RepoRef::new("o", "r");
+
+        let (cold, fetched) = svc.serve_pr(&repo, 42).await.expect("cold");
+        assert!(fetched, "a cold read fetches");
+        assert_eq!(cold.pr.number, 42);
+        assert_eq!(forge.fetches(), 1);
+
+        let (_, fetched) = svc.serve_pr(&repo, 42).await.expect("hit");
+        assert!(!fetched, "a read within max_age is a hit");
+        assert_eq!(forge.fetches(), 1, "a hit costs no forge request");
+
+        svc.backdate_pr_cache(Duration::from_secs(61));
+        let (_, fetched) = svc.serve_pr(&repo, 42).await.expect("aged");
+        assert!(fetched, "an entry older than max_age is fetched again");
+        assert_eq!(forge.fetches(), 2);
+    }
+
+    /// Regression (intent-hq/intentd#2064 review): a concurrent fill landing
+    /// between `read_pr_with_fetched`'s preflight miss and the shared path's
+    /// authoritative lookup makes that lookup a hit — and the flag says so.
+    /// The parked read answers the concurrently stored entry, costs no forge
+    /// request of its own, and reports `false`; a flag inferred from the
+    /// preflight miss would have reported a fetch that never happened.
+    #[tokio::test]
+    async fn serve_pr_reports_a_hit_when_a_concurrent_fill_lands_in_the_miss_window() {
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let svc = svc
+            .with_pr_cache_max_age_seconds(60)
+            .with_pr_read_park(park.clone());
+        let repo = RepoRef::new("o", "r");
+
+        let parked = tokio::spawn({
+            let svc = svc.clone();
+            let repo = repo.clone();
+            async move { svc.serve_pr(&repo, 42).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("serve_pr reaches the miss→fetch window");
+        assert_eq!(forge.fetches(), 0, "parked before its own fetch");
+
+        // The concurrent fill: another reader stores #42 while the first
+        // sits parked past its preflight miss.
+        forge.edit(|s| s.conversation_comments += 1);
+        let filled = read_pr_via(
+            &forge,
+            &repo,
+            42,
+            &svc.pr_cache,
+            PrReadPolicy::REFRESH,
+            &NONE,
+        )
+        .await
+        .expect("concurrent fill");
+        assert_eq!(forge.fetches(), 1);
+        park.release.notify_one();
+
+        let (entry, fetched) = parked.await.expect("join").expect("serve_pr");
+        assert!(!fetched, "the authoritative lookup hit the concurrent fill");
+        assert_eq!(
+            forge.fetches(),
+            1,
+            "the parked read costs no forge request of its own"
+        );
+        assert_eq!(
+            entry.snapshot.conversation_count, filled.snapshot.conversation_count,
+            "the parked read answers the concurrently stored entry"
+        );
     }
 
     /// `prCache.maxAgeSeconds` is clamped into [10, 600] at read time; the
