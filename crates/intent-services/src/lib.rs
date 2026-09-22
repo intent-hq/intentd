@@ -100,6 +100,7 @@ mod agent_list_cache;
 mod harness;
 mod history_xml;
 mod hook_manager;
+mod image_dimensions;
 mod invite_ops;
 mod line_attribution;
 mod linear_ops;

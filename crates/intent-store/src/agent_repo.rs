@@ -880,7 +880,11 @@ impl Store {
             );
             let mut last_message_id: Option<String> = None;
             for (idx, (role, _, metadata, created_at)) in owned_messages.iter().enumerate() {
-                let (content_json, payload_rows) = &prepared[idx];
+                let PreparedContent {
+                    content_json,
+                    payload_rows,
+                    ..
+                } = &prepared[idx];
                 let metadata_json = match metadata {
                     Some(md) => Some(serde_json::to_string(md).map_err(|e| {
                         Error::Internal(format!("encode message metadata failed: {e}"))
@@ -3478,27 +3482,48 @@ const MESSAGE_INSERT_COLUMNS: &str = MESSAGE_COLUMNS;
 /// CPU for a multi-MB screenshot), so callers MUST await this BEFORE opening
 /// the write transaction / entering the `with_write_txn_retry` closure — never
 /// inside — and the work itself runs on a blocking thread, off the tokio
-/// worker. The cheap `needs_thumbnails` pre-check keeps the common
-/// no-oversized-image message free of the clone + thread hop.
-async fn thumbnails_payload_row(
+/// worker. The same hop stamps the intrinsic `width`/`height` onto the
+/// message's base64 `image` blocks (v10.7 sidecar; header-only decode) and
+/// returns the stamped content — `None` when no block needed stamping — so
+/// the thumbnail map and the persisted blocks come from one clone. The cheap
+/// `needs_dimensions` / `needs_thumbnails` pre-checks keep the common
+/// no-image message free of the clone + thread hop.
+async fn image_dimensions_and_thumbnails(
     content: &serde_json::Value,
-) -> Option<crate::message_payload::PayloadRow> {
-    if !crate::message_thumbnails::needs_thumbnails(content) {
-        return None;
+) -> (
+    Option<serde_json::Value>,
+    Option<crate::message_payload::PayloadRow>,
+) {
+    if !crate::message_thumbnails::needs_dimensions(content)
+        && !crate::message_thumbnails::needs_thumbnails(content)
+    {
+        return (None, None);
     }
-    let owned = content.clone();
-    let map = match tokio::task::spawn_blocking(move || {
-        crate::message_thumbnails::generate_message_thumbnails(&owned)
+    let mut owned = content.clone();
+    let (stamped, map) = match tokio::task::spawn_blocking(move || {
+        let stamped = crate::message_thumbnails::stamp_image_dimensions(&mut owned);
+        let map = if crate::message_thumbnails::needs_thumbnails(&owned) {
+            crate::message_thumbnails::generate_message_thumbnails(&owned)
+        } else {
+            None
+        };
+        (stamped.then_some(owned), map)
     })
     .await
     {
-        Ok(map) => map?,
+        Ok(out) => out,
         Err(e) => {
-            tracing::warn!(error = %e, "thumbnail generation task failed; persisting none");
-            return None;
+            tracing::warn!(
+                error = %e,
+                "image dimension/thumbnail task failed; persisting blocks as-is"
+            );
+            return (None, None);
         }
     };
-    match serde_json::to_vec(&map) {
+    let Some(map) = map else {
+        return (stamped, None);
+    };
+    let row = match serde_json::to_vec(&map) {
         Ok(json) => {
             let (encoding, body) = crate::message_payload::encode_body(&json);
             Some(crate::message_payload::PayloadRow {
@@ -3512,21 +3537,36 @@ async fn thumbnails_payload_row(
             tracing::warn!(error = %e, "encode message thumbnails failed; persisting none");
             None
         }
-    }
+    };
+    (stamped, row)
+}
+
+/// One message content prepared for persistence by
+/// [`content_col_and_payload_rows`].
+struct PreparedContent {
+    /// The `content` column value.
+    content_json: String,
+    /// The `agent_message_payload` rows to insert alongside.
+    payload_rows: Vec<crate::message_payload::PayloadRow>,
+    /// The caller's content with intrinsic `width`/`height` stamped on its
+    /// image blocks — what the column actually holds — or `None` when no
+    /// block needed stamping (the caller's value is what was persisted).
+    stamped: Option<serde_json::Value>,
 }
 
 /// Prepare one message content for persistence: the `content` column value
-/// (slim when any heavy body crossed the 0108 extraction threshold) plus the
-/// `agent_message_payload` rows to insert alongside — extracted bodies and
-/// the write-time thumbnails map. Extraction + compression of a multi-MB
-/// body is CPU-bound, so like thumbnail generation it runs on a blocking
-/// thread and MUST be awaited BEFORE the write transaction opens; the cheap
-/// `needs_extraction` pre-check keeps the common all-small message free of
-/// the clone + thread hop, and the blocking task consumes the one clone it
-/// is handed (`extract_payloads` takes the value) — no second multi-MB copy.
-async fn content_col_and_payload_rows(
-    content: &serde_json::Value,
-) -> Result<(String, Vec<crate::message_payload::PayloadRow>)> {
+/// (image blocks stamped with `width`/`height`; slim when any heavy body
+/// crossed the 0108 extraction threshold) plus the `agent_message_payload`
+/// rows to insert alongside — extracted bodies and the write-time thumbnails
+/// map. Extraction + compression of a multi-MB body is CPU-bound, so like
+/// thumbnail generation it runs on a blocking thread and MUST be awaited
+/// BEFORE the write transaction opens; the cheap `needs_extraction` pre-check
+/// keeps the common all-small message free of the clone + thread hop, and
+/// the blocking task consumes the one clone it is handed (`extract_payloads`
+/// takes the value) — no second multi-MB copy.
+async fn content_col_and_payload_rows(content: &serde_json::Value) -> Result<PreparedContent> {
+    let (stamped, thumbnails_row) = image_dimensions_and_thumbnails(content).await;
+    let content = stamped.as_ref().unwrap_or(content);
     let extracted = if crate::message_payload::needs_extraction(content) {
         let owned = content.clone();
         Some(
@@ -3543,10 +3583,14 @@ async fn content_col_and_payload_rows(
     };
     let content_json = serde_json::to_string(to_encode.as_ref())
         .map_err(|e| Error::Internal(format!("encode message content failed: {e}")))?;
-    if let Some(row) = thumbnails_payload_row(content).await {
+    if let Some(row) = thumbnails_row {
         rows.push(row);
     }
-    Ok((content_json, rows))
+    Ok(PreparedContent {
+        content_json,
+        payload_rows: rows,
+        stamped,
+    })
 }
 
 /// [`content_col_and_payload_rows`] for a whole batch, positionally aligned
@@ -3554,7 +3598,7 @@ async fn content_col_and_payload_rows(
 /// `SQLITE_BUSY` retry re-runs only the SQL, never the extraction/image work.
 async fn batch_content_cols_and_payload_rows(
     messages: &[OwnedBatchMessage],
-) -> Result<Vec<(String, Vec<crate::message_payload::PayloadRow>)>> {
+) -> Result<Vec<PreparedContent>> {
     let mut out = Vec::with_capacity(messages.len());
     for (_, content, _, _) in messages {
         out.push(content_col_and_payload_rows(content).await?);
@@ -3991,7 +4035,8 @@ impl Store {
     /// heavy body is unrecoverable; reads serve the stored preview).
     ///
     /// The returned [`AgentMessage`] echoes `content` as passed (placeholders
-    /// included); full-fidelity read paths hydrate the staged bodies back,
+    /// included, image blocks stamped with their `width`/`height` like every
+    /// append); full-fidelity read paths hydrate the staged bodies back,
     /// byte-identical to a one-shot append of the pre-extraction content.
     ///
     /// # Errors
@@ -4079,9 +4124,13 @@ impl Store {
             None => None,
         };
         // Awaited before any write transaction below opens: payload
-        // extraction/compression and thumbnail generation are CPU-bound and
-        // run on blocking threads.
-        let (content_json, payload_rows) = content_col_and_payload_rows(content).await?;
+        // extraction/compression, image dimension stamping and thumbnail
+        // generation are CPU-bound and run on blocking threads.
+        let PreparedContent {
+            content_json,
+            payload_rows,
+            stamped,
+        } = content_col_and_payload_rows(content).await?;
         // Prestaged reconciliation (0109): staged rows the final content no
         // longer references — not a placeholder block's key and not about to
         // be (re-)inserted — are stale (the block was re-patched below the
@@ -4211,7 +4260,7 @@ impl Store {
             agent_id: agent_id.clone(),
             seq,
             role: role.to_string(),
-            content: content.clone(),
+            content: stamped.unwrap_or_else(|| content.clone()),
             app_message_id: intent_core::lift_app_message_id(metadata),
             author: None,
             metadata: metadata.cloned(),
@@ -5181,7 +5230,11 @@ impl Store {
                 if role == "user" || role == "assistant" {
                     last_message_id = Some(id.clone());
                 }
-                let (content_json, payload_rows) = &prepared[idx];
+                let PreparedContent {
+                    content_json,
+                    payload_rows,
+                    stamped,
+                } = &prepared[idx];
                 let metadata_json = match metadata {
                     Some(md) => Some(serde_json::to_string(md).map_err(|e| {
                         Error::Internal(format!("encode replaced message metadata failed: {e}"))
@@ -5207,7 +5260,7 @@ impl Store {
                     agent_id: agent_id.clone(),
                     seq,
                     role: role.clone(),
-                    content: content.clone(),
+                    content: stamped.as_ref().unwrap_or(content).clone(),
                     app_message_id: intent_core::lift_app_message_id(metadata.as_ref()),
                     author: None,
                     metadata: metadata.clone(),
@@ -7131,7 +7184,9 @@ mod tests {
     /// getter returns it keyed by message id, and text-only / under-budget
     /// rows persist NULL (absent from the getter's map). Legacy rows
     /// (thumbnails column NULL) are simply absent — the slim read then
-    /// serves the block with data omitted.
+    /// serves the block with data omitted. The same append stamps the
+    /// image block's intrinsic `width`/`height` (v10.7) on the returned
+    /// message and on the stored row.
     #[tokio::test]
     async fn append_persists_image_thumbnails_and_page_getter_reads_them() {
         use base64::Engine as _;
@@ -7174,6 +7229,21 @@ mod tests {
             )
             .await
             .expect("append image message");
+        assert_eq!(
+            with_image.content[1]["width"], 512,
+            "{}",
+            with_image.content
+        );
+        assert_eq!(with_image.content[1]["height"], 384);
+        assert!(with_image.content[0].get("width").is_none());
+        let stored = store
+            .get_agent_message_by_id(&agent_id, &with_image.id)
+            .await
+            .expect("read stored row")
+            .expect("row exists");
+        assert_eq!(stored.content[1]["width"], 512, "{}", stored.content);
+        assert_eq!(stored.content[1]["height"], 384);
+        assert_eq!(stored.content[1]["data"], data, "full data intact");
         let text_only = store
             .append_agent_message(
                 &agent_id,
@@ -7209,6 +7279,104 @@ mod tests {
                 .is_empty(),
             "empty id list short-circuits"
         );
+    }
+
+    /// Legacy transfer/replace path (pre-v10.7 slim shape): a
+    /// `dataIsThumbnail: true` image block WITHOUT `width`/`height` re-persisted
+    /// via `replace_agent_messages` must stay dimensionless — its `data` is the
+    /// downscaled thumbnail, so decoding it would record the thumbnail's size
+    /// as the original's. A sibling full image block in the same replaced
+    /// message is still stamped, and a slim block that already carries the
+    /// original dimensions keeps them.
+    #[tokio::test]
+    async fn replace_leaves_legacy_thumbnail_blocks_unstamped() {
+        use base64::Engine as _;
+        use intent_core::now_iso;
+
+        fn noise_png(w: u32, h: u32) -> String {
+            let img = image::RgbImage::from_fn(w, h, |x, y| {
+                let v = (x.wrapping_mul(31).wrapping_add(y.wrapping_mul(17)) % 251) as u8;
+                image::Rgb([v, v.wrapping_add(97), v.wrapping_add(193)])
+            });
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .expect("encode test png");
+            base64::engine::general_purpose::STANDARD.encode(&buf)
+        }
+
+        let tmp = TempDb::new("test-legacy-thumb-replace");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-legacy-thumb".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-legacy-thumb".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "placeholder" }]),
+                &ts,
+            )
+            .await
+            .expect("append placeholder");
+
+        let thumb = noise_png(8, 8);
+        let full = noise_png(16, 4);
+        let legacy = serde_json::json!({
+            "type": "image", "data": thumb, "mimeType": "image/png",
+            "dataIsThumbnail": true, "dataTruncated": true, "dataBytes": 123_456,
+        });
+        let stamped_slim = serde_json::json!({
+            "type": "image", "data": thumb, "mimeType": "image/png",
+            "dataIsThumbnail": true, "width": 1024, "height": 768,
+        });
+        let content = serde_json::json!([
+            legacy.clone(),
+            { "type": "image", "data": full, "mimeType": "image/png" },
+            stamped_slim.clone(),
+        ]);
+        let swapped = store
+            .replace_agent_messages(
+                &agent_id,
+                &[ReplaceMessage {
+                    role: "user",
+                    content: &content,
+                    metadata: None,
+                    created_at: &ts,
+                }],
+            )
+            .await
+            .expect("replace");
+        assert_eq!(swapped.len(), 1);
+        assert_eq!(
+            swapped[0].content[0], legacy,
+            "legacy thumbnail block returned unstamped"
+        );
+        assert_eq!(swapped[0].content[1]["width"], 16);
+        assert_eq!(swapped[0].content[1]["height"], 4);
+        assert_eq!(swapped[0].content[2], stamped_slim);
+
+        let stored = store
+            .get_agent_message_by_id(&agent_id, &swapped[0].id)
+            .await
+            .expect("read stored row")
+            .expect("row exists");
+        assert_eq!(
+            stored.content[0], legacy,
+            "legacy thumbnail block persisted unstamped: {}",
+            stored.content
+        );
+        assert_eq!(stored.content[1]["width"], 16);
+        assert_eq!(stored.content[1]["height"], 4);
+        assert_eq!(stored.content[2], stamped_slim);
     }
 
     /// 0108 heavy-payload extraction: an over-threshold `tool_result.output`

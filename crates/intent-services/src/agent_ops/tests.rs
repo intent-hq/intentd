@@ -7523,9 +7523,11 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
 }
 
 /// Slim projection image handling: an oversized image with a persisted
-/// write-time thumbnail serves the thumbnail (`dataIsThumbnail: true`), a
-/// legacy row without one serves the block with `data` omitted, and an
-/// under-budget image passes through untouched.
+/// write-time thumbnail serves the thumbnail (`dataIsThumbnail: true`) while
+/// keeping the ORIGINAL intrinsic `width`/`height` stamped at append time
+/// (v10.7), a legacy row without one serves the block with `data` omitted,
+/// and an under-budget image passes through untouched (undecodable bytes
+/// carry no dimensions).
 #[tokio::test]
 async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
     use base64::Engine as _;
@@ -7601,19 +7603,26 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
         served.len() < data.len(),
         "thumbnail is smaller than the original"
     );
-    assert!(
-        image::load_from_memory(
-            &base64::engine::general_purpose::STANDARD
-                .decode(served)
-                .expect("thumbnail base64 decodes")
-        )
-        .is_ok(),
-        "served thumbnail is a renderable image"
+    let thumb_img = image::load_from_memory(
+        &base64::engine::general_purpose::STANDARD
+            .decode(served)
+            .expect("thumbnail base64 decodes"),
+    )
+    .expect("served thumbnail is a renderable image");
+    assert!(thumb_img.width() < 512, "thumbnail is downscaled");
+    assert_eq!(thumbed["width"], 512, "original width, not the thumbnail's");
+    assert_eq!(
+        thumbed["height"], 384,
+        "original height, not the thumbnail's"
     );
     // Under-budget image: untouched, no flags.
     let small_block = &blocks[1];
     assert_eq!(small_block["data"], small);
     assert!(small_block.get("dataTruncated").is_none());
+    assert!(
+        small_block.get("width").is_none() && small_block.get("height").is_none(),
+        "undecodable bytes are persisted without dimensions: {small_block}"
+    );
     // Legacy row (garbage base64 → no thumbnail persisted): data omitted.
     let legacy = &messages.last().unwrap()["contentBlocks"][0];
     assert!(legacy.get("data").is_none(), "unrenderable data omitted");
@@ -7623,6 +7632,10 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
         garbage.len()
     );
     assert_eq!(legacy["mimeType"], "image/png", "mimeType intact");
+    assert!(
+        legacy.get("width").is_none(),
+        "garbage data → no dimensions"
+    );
 }
 
 /// Slim page byte budget (§5.5): the per-block bound caps each body, but
