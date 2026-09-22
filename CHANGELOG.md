@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.94] - 2026-09-22
+
+### 🔧 Refactor
+
+- *(core)* Single source for the running-turn status rule ([#2058](https://github.com/intent-hq/intentd/pull/2058))
+
+
 ## [0.9.93] - 2026-09-21
 
 ### 🚀 Features
