@@ -598,8 +598,12 @@ pub fn serve_command_fixed_port() -> std::process::Command {
 /// own `gh auth login` — green on CI and on a logged-out machine, red on a
 /// logged-in one. Removes both env tokens and points `GH_CONFIG_DIR` at an
 /// empty directory under `data_dir` (no `hosts.yml` → `gh auth token` fails
-/// without consulting the keyring). Callers that seed their own token /
-/// secrets file / API-base mock still layer those on top via later `.env(..)`.
+/// without consulting the keyring). This covers only the env and `gh` rungs:
+/// the caller must ALSO isolate the secrets store (`INTENTD_SECRETS_FILE`
+/// under the test dir, as every spawn helper here already does) or a stored
+/// device-flow token on the host still wins. Callers that seed their own
+/// token / secrets file / API-base mock still layer those on top via later
+/// `.env(..)`.
 pub fn hermetic_github_identity(cmd: &mut std::process::Command, data_dir: &Path) {
     let gh_config_dir = data_dir.join("gh-config");
     std::fs::create_dir_all(&gh_config_dir).expect("mkdir empty gh config dir");
