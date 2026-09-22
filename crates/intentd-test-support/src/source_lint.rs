@@ -22,9 +22,10 @@
 //!   production code.
 //!
 //! Where a `#[cfg(test)]` item ends: one introduced by `const` / `static` /
-//! `type` / `use` (any `const` other than `const fn`) or a `mod name;`
-//! declaration ends at the first `;` at depth 0, so an initializer with its
-//! own blocks is skipped whole; one introduced by `fn` / `mod` / `impl` /
+//! `type` / `use` (any `const` other than `const fn`), a statement-level
+//! `let` (including `let … else { … };`), or a `mod name;` declaration ends
+//! at the first `;` at depth 0, so an initializer with its own blocks is
+//! skipped whole; one introduced by `fn` / `mod` / `impl` /
 //! `struct` / `enum` / `union` / `trait` / `macro_rules` ends at the `}`
 //! closing its body, or at a `;` at depth 0 seen first (`struct X;`, a trait
 //! method signature). Anything else falls back to the first balanced `}` or
@@ -62,9 +63,9 @@ const BODY_ITEM_KEYWORDS: &[&str] = &[
     "trait",
     "macro_rules",
 ];
-/// Items that end at the first `;` at depth 0, whatever blocks their
-/// initializer contains.
-const SEMICOLON_ITEM_KEYWORDS: &[&str] = &["const", "static", "type", "use"];
+/// Items (and the statement-level `let`) that end at the first `;` at depth
+/// 0, whatever blocks their initializer contains.
+const SEMICOLON_ITEM_KEYWORDS: &[&str] = &["const", "static", "type", "use", "let"];
 /// Qualifiers that turn `const` into `const fn` / `const unsafe fn` / ….
 const FN_QUALIFIERS: &[&str] = &["fn", "unsafe", "extern", "async"];
 
@@ -1023,6 +1024,56 @@ fn with_test_statement() -> bool {
                 .map(|i| (i.start, i.end))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn cfg_test_let_with_block_initializer_is_blanked_through_its_semicolon() {
+        let src = "\
+fn with_test_let(a: bool) -> bool {
+    #[cfg(test)]
+    let v = if a { 1 } else { 2 };
+    production_after_let(a)
+}
+";
+        let text = production_text(src);
+        assert!(
+            !text.contains("let v") && !text.contains("else { 2 }"),
+            "the whole `let` statement through its `;` is blanked:\n{text}"
+        );
+        assert_eq!(
+            line_of(&text, "production_after_let(a)"),
+            line_of(src, "production_after_let(a)")
+        );
+
+        let chars: Vec<char> = lex(src).blanked.chars().collect();
+        let ranges = cfg_test_item_ranges(&chars);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(chars[ranges[0].1 - 1], ';');
+    }
+
+    #[test]
+    fn cfg_test_let_else_is_blanked_through_its_semicolon() {
+        let src = "\
+fn with_let_else(y: Option<u8>) -> u8 {
+    #[cfg(test)]
+    let Some(x) = y else { return 0 };
+    production_after_let_else(y)
+}
+";
+        let text = production_text(src);
+        assert!(
+            !text.contains("Some(x)") && !text.contains("return 0"),
+            "`let … else {{ … }};` is blanked through its `;`:\n{text}"
+        );
+        assert_eq!(
+            line_of(&text, "production_after_let_else(y)"),
+            line_of(src, "production_after_let_else(y)")
+        );
+
+        let chars: Vec<char> = lex(src).blanked.chars().collect();
+        let ranges = cfg_test_item_ranges(&chars);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(chars[ranges[0].1 - 1], ';');
     }
 
     #[test]
