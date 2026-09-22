@@ -632,12 +632,26 @@
 //! quintet is served as byte-identical aliases. The catalog contains 334
 //! router methods, 56 fast-path methods, and two aliases: 392
 //! client-callable names.
+//!
+//! Versions 10.5 (`sourceControl.*` forge auth) and 10.6 (provider-neutral
+//! principal identity) are documented in the monorepo's
+//! `docs/protocol/versioning.md`.
+//!
+//! Version 10.7 is an additive minor bump over 10.6: the image dimension
+//! sidecar (§5.5, §7.1). A `text` content block gains
+//! `media?: { [src]: { width, height } }` — intrinsic dimensions of every
+//! probeable Markdown image reference, keyed by the `src` exactly as
+//! written, omitted when nothing resolved; live `chat.subscribe` text chunk
+//! deltas carry only the entries that chunk resolved and the persisted block
+//! carries the union. An `image` block gains `width?` / `height?` (the
+//! original's intrinsic dimensions, kept by the slim projection). Both are
+//! computed on the write path and stored; no method-catalog change.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.5";
+pub const PROTOCOL_VERSION: &str = "10.7";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

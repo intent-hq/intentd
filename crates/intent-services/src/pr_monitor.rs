@@ -60,7 +60,7 @@
 //! fingerprint is blind to the comment / review / thread movement the
 //! monitor exists to report.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,6 +78,7 @@ use intent_sourcecontrol::{
 use intent_store::{NewEvent, PrMonitorListEntry, PrMonitorPollUpdate};
 use serde_json::{json, Value};
 
+use crate::hook_manager::CancelSettlement;
 use crate::pr_ops::{self, MergeRequirements};
 use crate::rate_limit::RATE_LIMIT_MAX_PAUSE;
 use crate::workspace_status::MonitorPrSignals;
@@ -2232,10 +2233,11 @@ impl Services {
         let notice = caller.is_none().then(|| {
             crate::harness::latest().pr_monitor_cancelled_from_app_notice(&monitor_label(&monitor))
         });
-        match self
-            .cancel_active_pr_monitor(monitor, notice.as_deref())
-            .await?
-        {
+        let settlement = match notice.as_deref() {
+            Some(notice) => CancelSettlement::Notify(notice),
+            None => CancelSettlement::Resettle,
+        };
+        match self.cancel_active_pr_monitor(monitor, settlement).await? {
             Some(monitor) => Ok(monitor),
             // A concurrent cancel/complete won between our read and the
             // guarded write; the monitor is no longer active either way.
@@ -2249,20 +2251,16 @@ impl Services {
     /// Core cancel transition shared by [`Services::pr_monitor_cancel`] and
     /// the archive sweep ([`Services::cancel_workspace_pr_monitors`]),
     /// mirroring [`Services::cancel_active_hook`]: guarded CAS write to
-    /// `cancelled`, catch-up-marker removal, `prMonitor:cancelled` emit.
-    /// With a `wake_notice` the owner is woken (the wake runs the deferral
-    /// backstop itself, inside `wake_pr_monitor_owner`, after the delivery
-    /// attempt); without one, no wake is delivered — a deferred completion
-    /// watch on the (idle) owner would otherwise never settle when this was
-    /// its last active monitor, so the backstop runs directly. Ends with the
-    /// transition-only displayStatus recompute (§6.5). Returns `Ok(None)`
-    /// when a concurrent cancel/complete won the CAS — the monitor is no
-    /// longer active either way. The caller must have verified the monitor
-    /// is ACTIVE.
+    /// `cancelled`, catch-up-marker removal, `prMonitor:cancelled` emit. How
+    /// the owner's deferred completion watches settle is the caller's
+    /// [`CancelSettlement`] choice. Ends with the transition-only
+    /// displayStatus recompute (§6.5). Returns `Ok(None)` when a concurrent
+    /// cancel/complete won the CAS — the monitor is no longer active either
+    /// way. The caller must have verified the monitor is ACTIVE.
     async fn cancel_active_pr_monitor(
         &self,
         mut monitor: PrMonitor,
-        wake_notice: Option<&str>,
+        settlement: CancelSettlement<'_>,
     ) -> Result<Option<PrMonitor>> {
         let now = now_iso();
         if !self
@@ -2280,15 +2278,16 @@ impl Services {
             .remove(&monitor.monitor_id);
         self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
             .await;
-        match wake_notice {
-            Some(notice) => {
+        match settlement {
+            CancelSettlement::Notify(notice) => {
                 self.wake_pr_monitor_owner(&monitor, notice, "cancelled")
                     .await;
             }
-            None => {
+            CancelSettlement::Resettle => {
                 self.resettle_owner_after_pr_monitor_terminal(&monitor)
                     .await;
             }
+            CancelSettlement::Deferred => {}
         }
         // A cancelled monitor's open-PR signal lapses — the derived
         // displayStatus can drop off `pr_open`/`pr_ready` (§6.5) — and the
@@ -2304,17 +2303,25 @@ impl Services {
     /// in the workspace through the shared cancel transition
     /// ([`Services::cancel_active_pr_monitor`]), mirroring the hook sweep
     /// ([`Services::cancel_workspace_hooks`]) — state persisted to
-    /// `cancelled`, `prMonitor:cancelled` emitted, owner woken with a notice
-    /// so the agent learns why its watch stopped. Runs AFTER the archived
-    /// row is persisted: the wake rides the archived gate in
-    /// [`Services::deliver_wake_message`], so it parks in the queue (at
-    /// most) and never starts a turn while the workspace is archived.
+    /// `cancelled`, `prMonitor:cancelled` emitted, waiting recomputed
+    /// (§5.1). Each cancel is SILENT (no per-monitor wake) and DEFERRED
+    /// ([`CancelSettlement::Deferred`]: no per-item completion backstop
+    /// either): the cancelled monitors are returned grouped by owner as
+    /// `(label, monitor_id)` pairs, and the archive tail
+    /// ([`crate::Services::notify_owners_of_archived_watches`]) folds them
+    /// with the swept hooks into ONE consolidated notice per agent and only
+    /// THEN runs the backstop, so a deferred completion watch on the owner
+    /// stays armed behind the queued notice.
     /// Terminal monitors are untouched, and unarchive does NOT resurrect
     /// cancelled monitors — the notice tells the owner to re-register if the
     /// PR still matters. Best-effort per monitor: a store failure is logged
     /// and the sweep moves on — archiving must not fail because one monitor
     /// row would not update.
-    pub(crate) async fn cancel_workspace_pr_monitors(&self, workspace_id: &WorkspaceId) {
+    pub(crate) async fn cancel_workspace_pr_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> BTreeMap<AgentId, Vec<(String, PrMonitorId)>> {
+        let mut cancelled: BTreeMap<AgentId, Vec<(String, PrMonitorId)>> = BTreeMap::new();
         let monitors = match self
             .store
             .list_active_pr_monitors_by_workspace(workspace_id)
@@ -2327,24 +2334,34 @@ impl Services {
                     error = %e,
                     "archive pr-monitor sweep: monitor list failed; skipping"
                 );
-                return;
+                return cancelled;
             }
         };
         for monitor in monitors {
             let monitor_id = monitor.monitor_id.clone();
-            let notice = crate::harness::latest()
-                .pr_monitor_cancelled_workspace_archived_notice(&monitor_label(&monitor));
-            // `Ok(None)` = a concurrent cancel/complete won the CAS between
-            // the list read and the guarded write; no longer active either way.
-            if let Err(e) = self.cancel_active_pr_monitor(monitor, Some(&notice)).await {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    monitor = %monitor_id.0,
-                    error = %e,
-                    "archive pr-monitor sweep: cancel failed; continuing"
-                );
+            match self
+                .cancel_active_pr_monitor(monitor, CancelSettlement::Deferred)
+                .await
+            {
+                Ok(Some(monitor)) => cancelled
+                    .entry(monitor.agent_id.clone())
+                    .or_default()
+                    .push((monitor_label(&monitor), monitor.monitor_id)),
+                // A concurrent cancel/complete won the CAS between the list
+                // read and the guarded write; no longer active either way,
+                // and not this sweep's to report.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        monitor = %monitor_id.0,
+                        error = %e,
+                        "archive pr-monitor sweep: cancel failed; continuing"
+                    );
+                }
             }
         }
+        cancelled
     }
 
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE PR monitor
@@ -2375,7 +2392,10 @@ impl Services {
             let monitor_id = monitor.monitor_id.clone();
             // `Ok(None)` = a concurrent cancel/complete won the CAS between
             // the list read and the guarded write; no longer active either way.
-            if let Err(e) = self.cancel_active_pr_monitor(monitor, None).await {
+            if let Err(e) = self
+                .cancel_active_pr_monitor(monitor, CancelSettlement::Resettle)
+                .await
+            {
                 tracing::warn!(
                     agent = %agent_id.0,
                     monitor = %monitor_id.0,

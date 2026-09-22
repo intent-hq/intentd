@@ -283,8 +283,13 @@ pub(crate) async fn load_stored_token(
 /// remedy is the same sign-in), a missing `gist` scope is
 /// `github-scope-missing`, a transport failure `github-unreachable`; a
 /// `gistId` that names a gist other than an Intent proof gist is a caller
-/// error (`-32602`, nothing deleted); any other forge error stays a plain
-/// `-32603` with its message.
+/// error (`-32602`, nothing deleted); a GitHub rate limit (any cause the
+/// source-control layer classifies as [`Error::RateLimited`]: REST primary
+/// 403 / 429, secondary-limit 403s, GraphQL `RATE_LIMIT`) keeps that class
+/// via [`crate::pr_ops::map_sc_err`] — `-32603` with
+/// `data.code = "rate-limited"`, never `github-not-connected`, because a
+/// fresh sign-in does not help (intent-hq/intent#5627); any other forge
+/// error stays a plain `-32603` with its message.
 pub(crate) fn map_identity_proof_err(e: IdentityProofError) -> Error {
     match e {
         IdentityProofError::ScopeMissing { .. } => {
