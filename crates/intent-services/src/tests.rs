@@ -12033,11 +12033,25 @@ mod change_event_parity {
     /// `workspace:updated` with the full applied delta
     /// (`archived`/`status`/`archivedAt`). Verify `archive_workspace` fires
     /// exactly one such event whose `archivedAt` equals the persisted
-    /// timestamp (Audit D C3).
+    /// timestamp (Audit D C3). Precondition: the workspace has no guests —
+    /// the owner is its only member and no invite is open — so the guest
+    /// sweep publishes no membership / invite delta.
     #[intent_test_macros::daemon_test]
     async fn archive_workspace_emits_workspace_updated_once() {
         use intent_core::WorkspaceApi;
         let h = harness().await;
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "owner-only precondition: {members:?}");
+        assert!(h
+            .store
+            .list_open_workspace_invites(&h.ws)
+            .await
+            .expect("invites")
+            .is_empty());
         let mut sub = subscribe(&h);
         let ws = h
             .services
@@ -12065,19 +12079,937 @@ mod change_event_parity {
         );
     }
 
+    /// Insert a non-primary principal (not yet a member) named `login`.
+    async fn guest_principal(h: &Harness, login: &str) -> intent_core::PrincipalId {
+        let p = intent_core::Principal {
+            id: intent_core::PrincipalId::new(),
+            github_user_id: None,
+            login: Some(login.to_string()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        h.store.upsert_principal(&p).await.expect("principal");
+        p.id
+    }
+
+    /// Seat a fresh `collaborator` named `login` on the harness workspace.
+    async fn seat_collaborator(h: &Harness, login: &str) -> intent_core::PrincipalId {
+        let id = guest_principal(h, login).await;
+        h.store
+            .add_workspace_member(&h.ws, &id, intent_core::WorkspaceRole::Collaborator)
+            .await
+            .expect("collaborator");
+        id
+    }
+
+    /// Mint one open (unpinned, unexpired) invite on the harness workspace.
+    async fn open_invite(h: &Harness) -> intent_core::WorkspaceInvite {
+        let primary = h.store.get_primary_principal().await.expect("primary");
+        let invite = intent_core::WorkspaceInvite {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: h.ws.clone(),
+            secret_hash: crate::invite_ops::hash_secret("s"),
+            secret: None,
+            created_by_principal_id: primary.id,
+            pin_github_user_id: None,
+            pin_login: None,
+            created_at: now_iso(),
+            expires_at: intent_core::iso_ms_from_now(3_600_000),
+            redeemed_at: None,
+            redeemed_by_principal_id: None,
+            revoked_at: None,
+            redemption_count: 0,
+        };
+        h.store
+            .insert_workspace_invite(&invite)
+            .await
+            .expect("open invite");
+        invite
+    }
+
+    /// Archiving removes guests: on a workspace with two collaborators and
+    /// one open invite, `archive_workspace` detaches every collaborator (one
+    /// `{ members, removedPrincipalId, memberCount }` delta each, the
+    /// `members.remove` shape), revokes the invite (one `{ invites: true }`
+    /// delta), then publishes the archived delta last. The response carries
+    /// the post-sweep `memberCount == 1` / `openInviteCount == 0`, only the
+    /// owner row survives, and a following unarchive resurrects nothing.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_detaches_collaborators_and_revokes_open_invites() {
+        use intent_core::{WorkspaceApi, WorkspaceRole};
+        let h = harness().await;
+        let primary = h.store.get_primary_principal().await.expect("primary");
+        let mut guests = Vec::new();
+        for login in ["guest-a", "guest-b"] {
+            guests.push(seat_collaborator(&h, login).await);
+        }
+        let invite = open_invite(&h).await;
+        assert_eq!(
+            h.store
+                .workspace_membership_summaries(None, std::slice::from_ref(&h.ws))
+                .await
+                .expect("summary")[&h.ws]
+                .member_count,
+            3
+        );
+
+        let mut sub = subscribe(&h);
+        let ws = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let membership = ws.membership.expect("membership attached");
+        assert_eq!(membership.member_count, 1, "owner only");
+        assert_eq!(membership.open_invite_count, 0, "invite revoked");
+
+        // One removal delta per collaborator, `memberCount` shrinking with
+        // each; then the invite delta; then the archived delta — nothing
+        // else.
+        let mut removed = Vec::new();
+        for expected_count in [2u64, 1] {
+            let ev = recv_one(&mut sub).await;
+            assert_envelope(&ev, &h.ws.0, "workspace:updated");
+            let changes = &ev["data"]["changes"];
+            assert_eq!(changes["members"], true, "{ev}");
+            assert_eq!(changes["memberCount"], expected_count, "{ev}");
+            removed.push(
+                changes["removedPrincipalId"]
+                    .as_str()
+                    .expect("removedPrincipalId")
+                    .to_string(),
+            );
+        }
+        let mut expected: Vec<String> = guests.iter().map(|g| g.0.clone()).collect();
+        expected.sort();
+        removed.sort();
+        assert_eq!(removed, expected);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "changes": { "invites": true } })
+        );
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "archived": true,
+                    "status": "Archived",
+                    "archivedAt": ws.archived_at,
+                }
+            })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
+
+        // Store: only the owner row survives; the invite is closed.
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_eq!(members[0].principal_id, primary.id);
+        assert_eq!(members[0].role, WorkspaceRole::Owner);
+        assert!(h
+            .store
+            .list_open_workspace_invites(&h.ws)
+            .await
+            .expect("invites")
+            .is_empty());
+        let stored = h
+            .store
+            .get_workspace_invite(&invite.id)
+            .await
+            .expect("invite read")
+            .expect("invite row kept");
+        assert!(stored.revoked_at.is_some());
+
+        // Unarchive resurrects nothing.
+        h.services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let summary = h
+            .store
+            .workspace_membership_summaries(None, std::slice::from_ref(&h.ws))
+            .await
+            .expect("summary");
+        assert_eq!(summary[&h.ws].member_count, 1);
+        assert_eq!(summary[&h.ws].open_invite_count, 0);
+    }
+
+    /// Access revocation is never best-effort (PR #2066 review): the guest
+    /// detach commits in the archive's own transaction, so an injected
+    /// `BEFORE DELETE` failure on `workspace_member` fails the RPC and rolls
+    /// everything back — the row stays active, the collaborator keeps its
+    /// seat, the invite stays open — and nothing is published.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_fails_closed_when_guest_detach_fails() {
+        use intent_core::{WorkspaceApi, WorkspaceStatus};
+        let h = harness().await;
+        let guest = seat_collaborator(&h, "guest").await;
+        let invite = open_invite(&h).await;
+        sqlx::query(
+            "CREATE TRIGGER archive_detach_fail BEFORE DELETE ON workspace_member \
+             BEGIN SELECT RAISE(ABORT, 'injected detach failure'); END",
+        )
+        .execute(h.store.write_pool())
+        .await
+        .expect("arm trigger");
+
+        let mut sub = subscribe(&h);
+        let err = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect_err("archive must fail when the detach fails");
+        assert!(
+            matches!(err, intent_core::Error::Internal(ref msg) if msg.contains("injected detach failure")),
+            "{err:?}"
+        );
+
+        let ws = h.store.get_workspace(&h.ws).await.expect("ws");
+        assert_eq!(ws.status, WorkspaceStatus::Active);
+        assert!(!ws.archived);
+        assert!(ws.archived_at.is_none());
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert!(
+            members.iter().any(|m| m.principal_id == guest),
+            "collaborator must keep its seat: {members:?}"
+        );
+        let open = h
+            .store
+            .list_open_workspace_invites(&h.ws)
+            .await
+            .expect("invites");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, invite.id);
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a rolled-back archive publishes nothing: {quiet:?}"
+        );
+    }
+
+    /// The sweep runs inside the archive's `BEGIN IMMEDIATE` transaction,
+    /// not off a snapshot read before it (PR #2066 review): a collaborator
+    /// seated by a write transaction that commits while the archive waits
+    /// for the (single) write connection is still detached. The held
+    /// transaction guarantees the ordering — the archive cannot begin until
+    /// it commits — so the test is deterministic without timing.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_sweeps_a_collaborator_seated_by_a_concurrent_write() {
+        use intent_core::{WorkspaceApi, WorkspaceRole};
+        let h = harness().await;
+        let primary = h.store.get_primary_principal().await.expect("primary");
+        let guest = guest_principal(&h, "late-guest").await;
+
+        let mut held = h
+            .store
+            .write_pool()
+            .acquire()
+            .await
+            .expect("hold write conn");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *held)
+            .await
+            .expect("begin held txn");
+        let mut sub = subscribe(&h);
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let archive =
+            intent_core::spawn_daemon(async move { services.archive_workspace(ws_id, None).await });
+
+        // Seat the guest through the held transaction: it commits before
+        // the archive can take the write connection, so the archive's
+        // sweep must observe it.
+        sqlx::query(
+            "INSERT INTO workspace_member (workspace_id, principal_id, role, added_at) \
+             VALUES (?, ?, 'collaborator', ?)",
+        )
+        .bind(&h.ws.0)
+        .bind(&guest.0)
+        .bind(now_iso())
+        .execute(&mut *held)
+        .await
+        .expect("seat via held txn");
+        assert!(
+            !archive.is_finished(),
+            "archive cannot commit past the held write txn"
+        );
+        sqlx::query("COMMIT")
+            .execute(&mut *held)
+            .await
+            .expect("commit held txn");
+        drop(held);
+
+        let ws = archive.await.expect("join").expect("archive");
+        assert_eq!(
+            ws.membership.expect("membership attached").member_count,
+            1,
+            "owner only"
+        );
+
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "members": true,
+                    "removedPrincipalId": guest.0,
+                    "memberCount": 1,
+                }
+            })
+        );
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(ev["data"]["changes"]["archived"], true);
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
+
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_eq!(members[0].principal_id, primary.id);
+        assert_eq!(members[0].role, WorkspaceRole::Owner);
+    }
+
+    /// No late sweep (PR #2066 review): the guest detach commits inside the
+    /// archive's transaction and nothing in the detached tail writes access,
+    /// so archive → unarchive → `members.add` keeps the new member. While
+    /// archived the add is refused as `workspace-archived` (checked inside
+    /// the add's own write transaction) with nothing written; the event
+    /// stream is the archive deltas, the unarchive delta, then the add delta.
+    #[intent_test_macros::daemon_test]
+    async fn archive_then_unarchive_keeps_a_member_added_afterwards() {
+        use intent_core::{InviteErrorKind, WorkspaceApi, WorkspaceRole};
+        let h = harness().await;
+        let early = seat_collaborator(&h, "early-guest").await;
+        let late = guest_principal(&h, "late-guest").await;
+        h.store
+            .insert_principal_credential(&late, &crate::invite_ops::hash_secret("late-token"))
+            .await
+            .expect("late credential");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &late)
+            .await
+            .expect_err("add on an archived workspace is refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.code(), -32602);
+        assert_eq!(
+            h.store
+                .get_workspace_member_role(&h.ws, &late)
+                .await
+                .expect("role"),
+            None,
+            "a refused add leaves no row"
+        );
+
+        h.services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let added = h
+            .services
+            .workspace_members_add_op(&h.ws, &late)
+            .await
+            .expect("add after unarchive");
+        assert_eq!(added["added"], json!(true));
+        assert_eq!(added["memberCount"], json!(2));
+
+        // archive: removal of the early guest, then the archived delta;
+        // unarchive: its delta; add: the addedPrincipalId delta. No late
+        // removal anywhere after the add.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["changes"]["removedPrincipalId"], early.0, "{ev}");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["changes"]["archived"], true, "{ev}");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["changes"]["archived"], false, "{ev}");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "members": true,
+                    "addedPrincipalId": late.0,
+                    "memberCount": 2,
+                }
+            })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
+
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 2, "{members:?}");
+        let late_row = members
+            .iter()
+            .find(|m| m.principal_id == late)
+            .expect("late guest seated");
+        assert_eq!(late_row.role, WorkspaceRole::Collaborator);
+        assert!(members.iter().all(|m| m.principal_id != early));
+    }
+
+    /// Post-commit tail fence (PR #2066 review, round 2): the archive's
+    /// detached tail is parked INSIDE its fenced window — guest sweep
+    /// committed, the guest's stale queued message dropped, its removal
+    /// delta out, fence still held. A concurrent `unarchive` cannot flip
+    /// until the fence releases (it stays pending), and `members.add`
+    /// refuses while archived — so the tail can never drop a message queued
+    /// by a re-seated member nor announce the removal of a current one. Once
+    /// released, the unarchive + re-add + fresh enqueue proceed and the
+    /// stream is: removal, unarchive, add — with NO stale `archived: true`
+    /// after the `archived: false` (the tail re-reads under the fence and
+    /// skips its lifecycle delta once the row was unarchived), and the fresh
+    /// message survives.
+    #[intent_test_macros::daemon_test]
+    async fn archive_tail_fence_orders_unarchive_and_readd_behind_the_guest_drop() {
+        use intent_core::{InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceRole};
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let mut h = harness().await;
+        h.services = h.services.clone().with_archive_tail_park(park.clone());
+        let guest = seat_collaborator(&h, "guest").await;
+        h.store
+            .insert_principal_credential(&guest, &crate::invite_ops::hash_secret("guest-token"))
+            .await
+            .expect("guest credential");
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("session");
+        let stamp = json!({ "fromPrincipalId": guest.0 });
+        h.services.enqueue_message(
+            &agent_id,
+            "stale".into(),
+            None,
+            None,
+            Some(stamp.clone()),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+
+        let mut sub = subscribe(&h);
+        let archive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.archive_workspace(ws, None).await }
+        });
+        park.entered.notified().await;
+
+        // Inside the window: the sweep committed and the guest's stale
+        // message is gone, but the fence is still held.
+        assert!(
+            h.store.get_workspace(&h.ws).await.expect("row").archived,
+            "sweep committed before the park"
+        );
+        assert!(
+            h.services.queue_snapshot(&agent_id).is_empty(),
+            "the detached guest's queued message is dropped before the fence releases"
+        );
+        let mut unarchive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.unarchive_workspace(ws).await }
+        });
+        let pending = tokio::time::timeout(Duration::from_millis(200), &mut unarchive).await;
+        assert!(
+            pending.is_err(),
+            "unarchive must stay fenced behind the archive tail"
+        );
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect_err("re-add inside the window is refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+
+        park.release.notify_one();
+        unarchive
+            .await
+            .expect("unarchive task")
+            .expect("unarchive after the fence releases");
+        let added = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect("re-add after unarchive");
+        assert_eq!(added["added"], json!(true));
+        h.services.enqueue_message(
+            &agent_id,
+            "fresh".into(),
+            None,
+            None,
+            Some(stamp),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        let ws = archive
+            .await
+            .expect("archive task")
+            .expect("archive succeeds");
+        assert!(
+            ws.archived,
+            "the archive call reports the state it committed"
+        );
+
+        // The re-seated guest's fresh message survives the tail.
+        let queued = h.services.queue_snapshot(&agent_id);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0]["content"], "fresh");
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        let seat = members
+            .iter()
+            .find(|m| m.principal_id == guest)
+            .expect("guest re-seated");
+        assert_eq!(seat.role, WorkspaceRole::Collaborator);
+        assert!(!h.store.get_workspace(&h.ws).await.expect("row").archived);
+
+        // Workspace lifecycle/membership deltas in order: the removal (inside
+        // the fence), then the unarchive, then the re-add. The tail's
+        // `archived: true` is skipped because the row was unarchived before
+        // its fenced re-read — no stale archived delta after the unarchive.
+        let mut lifecycle = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while lifecycle.len() < 3 {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace deltas delivered")
+                .expect("subscription open");
+            for ev in batch {
+                let ev = serde_json::to_value(&ev).expect("serialize event");
+                if ev["type"] == "workspace:updated"
+                    && ev["data"]["changes"].get("lastActivity").is_none()
+                {
+                    lifecycle.push(ev["data"]["changes"].clone());
+                }
+            }
+        }
+        assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
+        assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
+        assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
+        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let batch = sub.recv().await.expect("subscription open");
+                for ev in batch {
+                    let ev = serde_json::to_value(&ev).expect("serialize event");
+                    if ev["type"] == "workspace:updated"
+                        && ev["data"]["changes"].get("archived").is_some()
+                    {
+                        return ev;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "stale archived delta after unarchive: {quiet:?}"
+        );
+    }
+
+    /// Post-commit, PRE-drop barrier (PR #2066 review, round 3): the
+    /// archive's detached tail is parked right after the guest sweep
+    /// committed and BEFORE the detached guest's queued message is dropped
+    /// (fence held, nothing announced yet). A generic `workspace.update {
+    /// archived: false, status: Active }` — the lifecycle bypass — must not
+    /// flip the row inside that window: it delegates to the fenced unarchive
+    /// and stays pending, `members.add` still refuses, so the tail cannot
+    /// drop a message a re-seated member queued nor announce the removal of
+    /// a current one. Once released: removal, then `archived: false`, then
+    /// the re-add; the fresh message and the new seat survive, and no
+    /// `archived: true` trails the unarchive.
+    #[intent_test_macros::daemon_test]
+    async fn archive_predrop_barrier_fences_workspace_update_unarchive_and_readd() {
+        use intent_core::{
+            InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceRole, WorkspaceStatus,
+            WorkspaceUpdate,
+        };
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let mut h = harness().await;
+        h.services = h.services.clone().with_archive_predrop_park(park.clone());
+        let guest = seat_collaborator(&h, "guest").await;
+        h.store
+            .insert_principal_credential(&guest, &crate::invite_ops::hash_secret("guest-token"))
+            .await
+            .expect("guest credential");
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("session");
+        let stamp = json!({ "fromPrincipalId": guest.0 });
+        h.services.enqueue_message(
+            &agent_id,
+            "stale".into(),
+            None,
+            None,
+            Some(stamp.clone()),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+
+        let mut sub = subscribe(&h);
+        let archive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.archive_workspace(ws, None).await }
+        });
+        park.entered.notified().await;
+
+        // Inside the window: committed, but the stale message is NOT dropped
+        // yet and nothing has been announced.
+        assert!(
+            h.store.get_workspace(&h.ws).await.expect("row").archived,
+            "sweep committed before the park"
+        );
+        assert_eq!(
+            h.services.queue_snapshot(&agent_id).len(),
+            1,
+            "the guest's queued message is still pending inside the pre-drop window"
+        );
+        let mut update = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move {
+                svc.update_workspace(
+                    ws,
+                    WorkspaceUpdate {
+                        archived: Some(false),
+                        status: Some(WorkspaceStatus::Active),
+                        title: Some("renamed while archiving".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        });
+        let pending = tokio::time::timeout(Duration::from_millis(200), &mut update).await;
+        assert!(
+            pending.is_err(),
+            "workspace.update {{ archived: false }} must stay fenced behind the archive tail"
+        );
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(row.archived, "the generic write never flips archived");
+        assert_eq!(row.status, WorkspaceStatus::Archived);
+        assert_eq!(
+            row.title, "renamed while archiving",
+            "the card part of the update lands without waiting on the fence"
+        );
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect_err("re-add inside the window is refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+
+        park.release.notify_one();
+        let updated = update
+            .await
+            .expect("update task")
+            .expect("update after the fence releases");
+        assert!(!updated.archived);
+        assert_eq!(updated.status, WorkspaceStatus::Active);
+        assert!(updated.archived_at.is_none());
+        let added = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect("re-add after unarchive");
+        assert_eq!(added["added"], json!(true));
+        h.services.enqueue_message(
+            &agent_id,
+            "fresh".into(),
+            None,
+            None,
+            Some(stamp),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        archive
+            .await
+            .expect("archive task")
+            .expect("archive succeeds");
+
+        // The stale message was dropped by the tail; the re-seated guest's
+        // fresh message and the new seat survive it.
+        let queued = h.services.queue_snapshot(&agent_id);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0]["content"], "fresh");
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        let seat = members
+            .iter()
+            .find(|m| m.principal_id == guest)
+            .expect("guest re-seated");
+        assert_eq!(seat.role, WorkspaceRole::Collaborator);
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(!row.archived);
+        assert_eq!(row.status, WorkspaceStatus::Active);
+
+        // Lifecycle/membership deltas in order: removal (inside the fence),
+        // the unarchive, the re-add — and no `archived: true` afterwards.
+        let mut lifecycle = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while lifecycle.len() < 3 {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace deltas delivered")
+                .expect("subscription open");
+            for ev in batch {
+                let ev = serde_json::to_value(&ev).expect("serialize event");
+                if ev["type"] == "workspace:updated"
+                    && ev["data"]["changes"].get("lastActivity").is_none()
+                    && ev["data"]["changes"].get("title").is_none()
+                {
+                    lifecycle.push(ev["data"]["changes"].clone());
+                }
+            }
+        }
+        assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
+        assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
+        assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
+        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let batch = sub.recv().await.expect("subscription open");
+                for ev in batch {
+                    let ev = serde_json::to_value(&ev).expect("serialize event");
+                    if ev["type"] == "workspace:updated"
+                        && ev["data"]["changes"].get("archived").is_some()
+                    {
+                        return ev;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "stale archived delta after unarchive: {quiet:?}"
+        );
+    }
+
+    /// Post-commit, PRE-drop barrier, stale card-only writer (PR #2066
+    /// review, round 3): a full-row snapshot read BEFORE the archive and a
+    /// generic `workspace.update { statusMessage }` inside the pre-drop
+    /// window neither revert the archived row nor need the fence — the
+    /// generic write never touches the lifecycle columns. So the guards
+    /// keep holding (`members.add` still refused), the tail still drops the
+    /// guest's stale message and announces the removal, the archive's own
+    /// `archived: true` still goes out (the row is still archived at its
+    /// fenced re-read), and no `archived: false` ever appears.
+    #[intent_test_macros::daemon_test]
+    async fn archive_predrop_barrier_survives_stale_card_only_updates() {
+        use intent_core::{
+            InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceStatus, WorkspaceUpdate,
+        };
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let mut h = harness().await;
+        h.services = h.services.clone().with_archive_predrop_park(park.clone());
+        let guest = seat_collaborator(&h, "guest").await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("session");
+        h.services.enqueue_message(
+            &agent_id,
+            "stale".into(),
+            None,
+            None,
+            Some(json!({ "fromPrincipalId": guest.0 })),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        // A full-row snapshot taken before the archive — the shape a
+        // `workspace.update` whose read predated the archive writes back.
+        let mut stale = h.store.get_workspace(&h.ws).await.expect("snapshot");
+        assert!(!stale.archived);
+
+        let mut sub = subscribe(&h);
+        let archive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.archive_workspace(ws, None).await }
+        });
+        park.entered.notified().await;
+
+        // Inside the window: the stale full-row write and a card-only
+        // update both complete without the fence and leave the row archived.
+        stale.title = "stale title".to_string();
+        stale.updated_at = intent_core::now_iso();
+        h.store
+            .update_workspace(&stale)
+            .await
+            .expect("stale full-row write");
+        let card = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.services.update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    status_message: Some("card only".to_string()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("card-only update is not fenced")
+        .expect("card-only update");
+        assert!(card.archived, "{card:?}");
+        assert_eq!(card.status, WorkspaceStatus::Archived);
+        assert_eq!(card.title, "stale title");
+        assert_eq!(card.status_message.as_deref(), Some("card only"));
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(row.archived, "stale writes must not resurrect the row");
+        assert_eq!(row.status, WorkspaceStatus::Archived);
+        assert!(row.archived_at.is_some());
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect_err("re-add stays refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(h.services.queue_snapshot(&agent_id).len(), 1);
+
+        park.release.notify_one();
+        let archived = archive
+            .await
+            .expect("archive task")
+            .expect("archive succeeds");
+        assert!(archived.archived);
+        assert!(
+            h.services.queue_snapshot(&agent_id).is_empty(),
+            "the detached guest's stale message is dropped by the tail"
+        );
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert!(members.iter().all(|m| m.principal_id != guest));
+
+        // Deltas: the card update, the removal, then the archive's own
+        // `archived: true`; never an `archived: false`.
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !seen
+            .iter()
+            .any(|c: &serde_json::Value| c["archived"] == json!(true))
+        {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace deltas delivered")
+                .expect("subscription open");
+            for ev in batch {
+                let ev = serde_json::to_value(&ev).expect("serialize event");
+                if ev["type"] == "workspace:updated"
+                    && ev["data"]["changes"].get("lastActivity").is_none()
+                {
+                    seen.push(ev["data"]["changes"].clone());
+                }
+            }
+        }
+        let removal = seen
+            .iter()
+            .position(|c| c["removedPrincipalId"] == guest.0)
+            .expect("removal delta");
+        let archived_delta = seen
+            .iter()
+            .position(|c| c["archived"] == json!(true))
+            .expect("archived delta");
+        assert!(removal < archived_delta, "{seen:?}");
+        assert!(
+            seen.iter().all(|c| c["archived"] != json!(false)),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|c| c["statusMessage"] == json!("card only")),
+            "{seen:?}"
+        );
+    }
+
     /// Symmetric to archive: `unarchive_workspace` emits one `workspace:updated`
     /// carrying the full applied delta with an explicit `archivedAt: null` so
     /// clients clear the field (Audit D C3).
     #[intent_test_macros::daemon_test]
     async fn unarchive_workspace_emits_workspace_updated_once() {
-        use intent_core::{WorkspaceApi, WorkspaceStatus};
+        use intent_core::WorkspaceApi;
         let h = harness().await;
         // Seed the row as archived so unarchive has a real state to flip.
-        let mut ws = workspace(&h.ws);
-        ws.status = WorkspaceStatus::Archived;
-        ws.archived = true;
-        ws.archived_at = Some(intent_core::now_iso());
-        h.store.update_workspace(&ws).await.expect("archive row");
+        h.store
+            .archive_workspace_detaching_guests(&h.ws, &intent_core::now_iso())
+            .await
+            .expect("archive row");
         let mut sub = subscribe(&h);
         h.services
             .unarchive_workspace(h.ws.clone())
@@ -12163,11 +13095,10 @@ mod change_event_parity {
     async fn auto_unarchive_on_turn_start_emits_stamped_delta() {
         use intent_core::WorkspaceStatus;
         let h = harness().await;
-        let mut ws = workspace(&h.ws);
-        ws.status = WorkspaceStatus::Archived;
-        ws.archived = true;
-        ws.archived_at = Some(intent_core::now_iso());
-        h.store.update_workspace(&ws).await.expect("archive row");
+        h.store
+            .archive_workspace_detaching_guests(&h.ws, &intent_core::now_iso())
+            .await
+            .expect("archive row");
         let agent_id = AgentId::from("agent-auto-unarchive");
         h.store
             .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
@@ -12318,13 +13249,11 @@ mod change_event_parity {
     /// `agentName: null` in the stamp.
     #[tokio::test]
     async fn auto_unarchive_stamps_null_name_when_session_missing() {
-        use intent_core::WorkspaceStatus;
         let h = harness().await;
-        let mut ws = workspace(&h.ws);
-        ws.status = WorkspaceStatus::Archived;
-        ws.archived = true;
-        ws.archived_at = Some(intent_core::now_iso());
-        h.store.update_workspace(&ws).await.expect("archive row");
+        h.store
+            .archive_workspace_detaching_guests(&h.ws, &intent_core::now_iso())
+            .await
+            .expect("archive row");
         let agent_id = AgentId::from("agent-no-row");
         let mut sub = subscribe(&h);
         let flipped = h
@@ -16459,6 +17388,12 @@ pub(crate) mod pr {
         /// PR numbers `get_pr` was called with, in call order (sweep
         /// stale-pool heal tests assert cap + ordering).
         seen_get_pr: std::sync::Mutex<Vec<u64>>,
+        /// Issue numbers `get_issue` was called with, in call order (the
+        /// issue cache tests assert a hit costs no forge read).
+        seen_get_issue: std::sync::Mutex<Vec<u64>>,
+        /// Issue number whose `get_issue` fails with `NotFound`, exercising
+        /// the issue cache's never-cache-errors rule.
+        missing_issue: Option<u64>,
         /// When true, `get_pr` and `list_prs` fail with `RateLimited`
         /// (exhausted GitHub core quota, monorepo#2961), exercising the
         /// global sweep pause.
@@ -17126,6 +18061,15 @@ pub(crate) mod pr {
             unimplemented!()
         }
         async fn get_issue(&self, _: &RepoRef, number: u64) -> ScResult<Issue> {
+            self.seen_get_issue.lock().unwrap().push(number);
+            if self.rate_limited {
+                return Err(ScError::RateLimited(
+                    "API rate limit exceeded for user ID 526899.".into(),
+                ));
+            }
+            if self.missing_issue == Some(number) {
+                return Err(ScError::NotFound("no such issue".into()));
+            }
             Ok(Issue {
                 number,
                 ..stub_issue()
@@ -18396,11 +19340,14 @@ pub(crate) mod pr {
             "pausedUntil is RFC 3339: {until}"
         );
 
-        // Gate paused at the start, lifted by the last forge read.
+        // Gate paused at the start, lifted by the last forge read — which
+        // only runs if the second snapshot MISSES the shared PR cache the
+        // first one seeded.
         let gate = svc.sweep_rate_limit.clone();
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
             assert!(gate.lift());
         }));
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + std::time::Duration::from_secs(1));
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert!(
             svc.sweep_rate_limit_paused_until().is_none(),
@@ -19716,6 +20663,150 @@ pub(crate) mod pr {
         assert_eq!(issue["comments"], 0);
     }
 
+    /// `github.issues.get` reads through the issue cache under the PR
+    /// cache's `prCache.maxAgeSeconds`: the first read costs one `get_issue`,
+    /// a repeat within the window answers the identical JSON with no forge
+    /// call (case-variant addressing shares the entry), another issue is
+    /// another miss, and an entry aged past the window is re-fetched.
+    #[intent_test_macros::daemon_test]
+    async fn github_issues_get_is_served_from_the_issue_cache_within_max_age() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+
+        let first = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![7]);
+        assert_eq!(svc.issue_cache_len(), 1);
+
+        let again = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(again, first, "a hit answers the cached issue");
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7],
+            "a hit within max_age costs no forge request"
+        );
+
+        // The RepoRef identity is case-insensitive: the same slot is hit,
+        // while the DTO echoes the caller's addressing.
+        let folded = svc
+            .github_issues_get("O".into(), "R".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![7]);
+        assert_eq!(folded["issue"]["owner"], "O");
+        assert_eq!(folded["issue"]["number"], 7);
+
+        svc.github_issues_get("o".into(), "r".into(), 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7, 8],
+            "another issue is another miss"
+        );
+        assert_eq!(svc.issue_cache_len(), 2);
+
+        svc.backdate_issue_cache(std::time::Duration::from_secs(61));
+        svc.github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7, 8, 7],
+            "an entry older than max_age is re-fetched"
+        );
+    }
+
+    /// A failed `get_issue` propagates to the caller and stores nothing: the
+    /// next read reaches the forge again (a `NotFound`, then a rate-limit
+    /// error mapped to `Error::RateLimited`, neither poisons the cache).
+    #[intent_test_macros::daemon_test]
+    async fn github_issues_get_never_caches_errors() {
+        let forge = Arc::new(StubForge {
+            missing_issue: Some(404),
+            ..Default::default()
+        });
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+
+        for _ in 0..2 {
+            let err = svc
+                .github_issues_get("o".into(), "r".into(), 404)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Internal(_)), "{err:?}");
+        }
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![404, 404]);
+        assert_eq!(svc.issue_cache_len(), 0, "a failed read is never cached");
+        assert!(!svc.issue_cached(&RepoRef::new("o", "r"), 404));
+
+        let quota = Arc::new(StubForge {
+            rate_limited: true,
+            ..Default::default()
+        });
+        let (_t2, svc2, _ws2) = setup_with_shared(quota.clone(), false).await;
+        let err = svc2
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::RateLimited(_)), "{err:?}");
+        assert_eq!(svc2.issue_cache_len(), 0);
+    }
+
+    /// Retention mirrors the PR cache's unmonitored policy: the map is
+    /// bounded by [`crate::issue_cache::ISSUE_CACHE_MAX_ENTRIES`] on every
+    /// write (oldest fetch evicted first), and an entry idle past
+    /// [`crate::issue_cache::ISSUE_CACHE_MAX_IDLE`] is dropped by the next
+    /// write.
+    #[intent_test_macros::daemon_test]
+    async fn the_issue_cache_is_bounded_and_expires_idle_entries_on_write() {
+        use crate::issue_cache::{ISSUE_CACHE_MAX_ENTRIES, ISSUE_CACHE_MAX_IDLE};
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let repo = RepoRef::new("o", "r");
+
+        let oldest = 1_000_u64;
+        svc.github_issues_get("o".into(), "r".into(), oldest)
+            .await
+            .unwrap();
+        svc.backdate_issue_cache(std::time::Duration::from_secs(30));
+        let overflow = 8;
+        for written in 1..=ISSUE_CACHE_MAX_ENTRIES + overflow {
+            let number = written as u64;
+            svc.github_issues_get("o".into(), "r".into(), number)
+                .await
+                .unwrap();
+            assert_eq!(
+                svc.issue_cache_len(),
+                (written + 1).min(ISSUE_CACHE_MAX_ENTRIES),
+                "bounded after write #{number}"
+            );
+        }
+        assert!(
+            !svc.issue_cached(&repo, oldest),
+            "the oldest fetch went first"
+        );
+        for number in 1..=overflow as u64 {
+            assert!(
+                !svc.issue_cached(&repo, number),
+                "#{number} was evicted in fetch order"
+            );
+        }
+        assert!(svc.issue_cached(&repo, (ISSUE_CACHE_MAX_ENTRIES + overflow) as u64));
+
+        svc.backdate_issue_cache(ISSUE_CACHE_MAX_IDLE + std::time::Duration::from_secs(1));
+        svc.github_issues_get("o".into(), "r".into(), oldest)
+            .await
+            .unwrap();
+        assert_eq!(svc.issue_cache_len(), 1, "only the fresh write survives");
+        assert!(svc.issue_cached(&repo, oldest));
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_issues_list_and_search_shapes() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
@@ -20766,6 +21857,19 @@ pub(crate) mod pr {
     async fn fold_setup(
         seed: impl FnOnce(&mut intent_core::Workspace),
     ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        let forge = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        fold_setup_with(forge, seed).await
+    }
+
+    /// [`fold_setup`] over a caller-held `forge`, for tests that observe or
+    /// drive its calls directly.
+    async fn fold_setup_with(
+        forge: Arc<StubForge>,
+        seed: impl FnOnce(&mut intent_core::Workspace),
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_id = WorkspaceId::new();
@@ -20784,10 +21888,7 @@ pub(crate) mod pr {
         let svc = Services::new(store)
             .with_event_bus(bus)
             .with_workspaces_root(wsroot.path().to_path_buf())
-            .with_source_control(Arc::new(StubForge {
-                merged_linked: true,
-                ..Default::default()
-            }));
+            .with_source_control(forge);
         (tmp, wsroot, svc, ws_id)
     }
 
@@ -21181,6 +22282,109 @@ pub(crate) mod pr {
         assert_eq!(root_list.len(), 1);
         assert_eq!(root_list[0].url, canonical);
         assert_eq!(root_list[0].status, intent_core::PullRequestStatus::Merged);
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
+    }
+
+    /// Regression (intent-hq/intentd#2064 review): the fold runs only when
+    /// `github.pulls.get`'s own read fetched the record. A concurrent fill
+    /// landing between the read's preflight cache miss and the shared path's
+    /// authoritative lookup makes that lookup a hit: the hover answers the
+    /// concurrently stored record with no forge request of its own, and the
+    /// linked workspace is never folded (persisted Open stays Open, no
+    /// `pr:updated`, no displayStatus transition). A later read that does
+    /// fetch — the entry aged past `max_age` — folds as usual.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_never_folds_when_a_concurrent_fill_serves_the_read() {
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let forge = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        let (_t, _root, svc, ws_id) = fold_setup_with(forge.clone(), |ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        let svc = svc
+            .with_pr_cache_max_age_seconds(60)
+            .with_pr_read_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let parked = intent_core::spawn_daemon({
+            let svc = svc.clone();
+            async move { svc.github_pulls_get("o".into(), "r".into(), 42).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("pulls.get reaches the miss→fetch window");
+        assert!(forge.seen_get_pr.lock().unwrap().is_empty());
+
+        // The concurrent fill (another on-demand reader or a sweep) stores
+        // #42 while the hover's read sits parked past its preflight miss.
+        crate::pr_monitor::read_pr_via(
+            forge.as_ref(),
+            &RepoRef::new("o", "r"),
+            42,
+            &svc.pr_cache,
+            crate::pr_monitor::PrReadPolicy::REFRESH,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("concurrent fill");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        park.release.notify_one();
+
+        let v = parked.await.expect("join").expect("pulls.get");
+        assert_eq!(v["pull"]["number"], 42);
+        assert_eq!(v["pull"]["merged"], true, "answers the concurrent fill");
+        assert_eq!(
+            *forge.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "the parked read costs no forge request of its own"
+        );
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Open),
+            "a read served from the cache never folds"
+        );
+        assert_eq!(
+            after.pull_requests.as_ref().expect("pull_requests")[0].status,
+            intent_core::PullRequestStatus::Open
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+
+        // Aged past max_age, the next read fetches — and that one folds.
+        // (The still-armed park is released ahead of the read.)
+        svc.backdate_pr_cache(std::time::Duration::from_secs(61));
+        park.release.notify_one();
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get after expiry");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42, 42]);
+        let folded = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            folded.pr_status,
+            Some(intent_core::PullRequestStatus::Merged),
+            "a read that fetched folds"
+        );
         assert_eq!(
             display_status_events(&svc, &ws_id).await,
             vec![json!("pr_merged")]

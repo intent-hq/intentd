@@ -809,7 +809,9 @@ async fn search_repos_rejects_malformed_and_over_cap() {
 /// the addressing reaches the engine verbatim and the `{ issue }` result is
 /// the `GithubIssue` DTO with `user.login` / `createdAt` / `updatedAt`
 /// populated from the engine model, while a missing `number` is rejected in
-/// the router with `-32602` before the engine is touched.
+/// the router with `-32602` before the engine is touched. A repeat read
+/// within `prCache.maxAgeSeconds` is served from the daemon's issue cache:
+/// the same `{ issue }`, no second `get_issue` on the engine.
 #[intent_test_macros::daemon_test]
 async fn issues_get_returns_issue_with_author_and_timestamps() {
     let fx = boot().await;
@@ -854,6 +856,17 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
     .await;
     assert_eq!(r3["issue"]["number"], 9);
 
+    // A repeat hover within `prCache.maxAgeSeconds` is a cache hit: the
+    // identical `{ issue }` with no further engine read.
+    let again = wss_rpc(
+        &mut ws,
+        4,
+        "github.issues.get",
+        json!({ "owner": "o", "repo": "r", "number": 7 }),
+    )
+    .await;
+    assert_eq!(again["issue"], r["issue"], "a hit answers the cached issue");
+
     // `RepoRef` equality is case-insensitive, so compare the recorded fields
     // directly to prove the addressing was forwarded verbatim.
     let gets = fx.forge.issue_gets.lock().unwrap();
@@ -861,7 +874,11 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
         .iter()
         .map(|(repo, number)| (repo.owner.as_str(), repo.name.as_str(), *number))
         .collect();
-    assert_eq!(recorded, vec![("o", "r", 7), ("Intent-HQ", "IntentD", 9)]);
+    assert_eq!(
+        recorded,
+        vec![("o", "r", 7), ("Intent-HQ", "IntentD", 9)],
+        "a hit within max_age costs no engine request"
+    );
 }
 
 /// `github.issues.search` rejects the PR-only `review-requested` filter with
