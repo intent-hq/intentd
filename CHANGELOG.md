@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.95] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Register and defer the baseline under a GitHub rate limit ([#2060](https://github.com/intent-hq/intentd/pull/2060))
+
+### 🧪 Testing
+
+- *(intentd)* Stable conversation fingerprint for WSS E2E no-wake assertions ([#2062](https://github.com/intent-hq/intentd/pull/2062))
+
+
 ## [0.9.94] - 2026-09-22
 
 ### 🚀 Features
