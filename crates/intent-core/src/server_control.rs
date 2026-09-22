@@ -24,8 +24,8 @@ pub type ResolvedInviteLinkEnvelope = Option<Box<dyn InviteLinkEnvelope>>;
 pub trait InviteLinkBuilder: Send + Sync {
     /// Resolve the listener's current link envelope once, to stamp a batch
     /// of invites. `None` whenever no link can be built right now — TCP
-    /// listener down, no dialable route — which is never an error for a
-    /// read like `workspace.invite.list`.
+    /// listener down, tunnel down (invite links are tunnel-only) — which is
+    /// never an error for a read like `workspace.invite.list`.
     fn invite_link_envelope(
         &self,
     ) -> Pin<Box<dyn Future<Output = ResolvedInviteLinkEnvelope> + Send + '_>>;

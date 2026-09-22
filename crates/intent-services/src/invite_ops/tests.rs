@@ -874,7 +874,7 @@ async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
 }
 
 /// Without a builder, or with one that cannot build a link right now
-/// (listener down, no dialable route), `create` and `list` still answer —
+/// (listener down, tunnel down), `create` and `list` still answer —
 /// their rows simply carry no `url`.
 #[tokio::test]
 async fn invite_list_omits_the_url_when_no_link_can_be_built() {
