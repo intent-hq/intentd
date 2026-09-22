@@ -32129,6 +32129,7 @@ mod setup_lifecycle_events {
         WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceSetupState,
     };
     use intent_store::Store;
+    #[cfg(unix)]
     use intentd_test_support::Barrier;
     use serde_json::{json, Value};
 
@@ -32137,6 +32138,7 @@ mod setup_lifecycle_events {
 
     /// Wait until the setup script has reached its barrier (proving the
     /// spawn succeeded and the script is parked there).
+    #[cfg(unix)]
     async fn wait_for_barrier(barrier: &Barrier) {
         tokio::time::timeout(Duration::from_secs(20), async {
             while !barrier.entered() {
