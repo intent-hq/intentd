@@ -774,7 +774,27 @@ pub fn workspace_root() -> PathBuf {
     }
 }
 
-/// Every `*.rs` file under `dir` (recursively), sorted.
+/// The one traversal behind [`rust_files`] and [`crate_src_files`]: appends
+/// every `*.rs` file under `dir` to `out`, descending into a subdirectory
+/// only when `prune` returns `false` for it. A pruned directory is never
+/// `read_dir`'d, so an excluded subtree may be unreadable without failing the
+/// walk; every directory that is entered must be readable.
+fn walk_rust_files(dir: &Path, prune: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+        let path = entry.path();
+        if path.is_dir() {
+            if !prune(&path) {
+                walk_rust_files(&path, prune, out);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Every `*.rs` file under `dir` (recursively, nothing pruned), sorted.
 ///
 /// Fail-fast: a `read_dir` or entry error anywhere in the tree panics naming
 /// the offending directory. A lint must never pass because it could not read
@@ -787,21 +807,8 @@ pub fn workspace_root() -> PathBuf {
 /// When `dir` or any subdirectory cannot be read or listed.
 #[must_use]
 pub fn rust_files(dir: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let entries =
-            fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
-        for entry in entries {
-            let entry = entry.unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
-            }
-        }
-    }
     let mut out = Vec::new();
-    walk(dir, &mut out);
+    walk_rust_files(dir, &|_| false, &mut out);
     out.sort();
     out
 }
@@ -813,11 +820,14 @@ pub fn rust_files(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Fail-fast like [`rust_files`]: every directory under `crates/` is a crate
 /// and must have a readable `src/`. Non-directory entries in `crates/`
-/// (stray files) are not crates and are skipped.
+/// (stray files) are not crates and are skipped. A `tests/` directory is
+/// pruned before it is read, so an unreadable test fixture tree does not fail
+/// a lint that never needed it.
 ///
 /// # Panics
 ///
-/// When `crates/` or any crate's `src/` tree cannot be read or listed.
+/// When `crates/` or any crate's `src/` tree, `tests/` directories excepted,
+/// cannot be read or listed.
 #[must_use]
 pub fn crate_src_files(root: &Path) -> Vec<PathBuf> {
     let crates_dir = root.join("crates");
@@ -830,15 +840,20 @@ pub fn crate_src_files(root: &Path) -> Vec<PathBuf> {
         if !krate.is_dir() {
             continue;
         }
-        let src = krate.join("src");
-        out.extend(rust_files(&src).into_iter().filter(|path| {
-            let rel = path.strip_prefix(&src).unwrap_or(path);
-            path.file_name().is_some_and(|name| name != "tests.rs")
-                && rel.components().all(|c| c.as_os_str() != "tests")
-        }));
+        let mut files = Vec::new();
+        walk_rust_files(&krate.join("src"), &is_tests_dir, &mut files);
+        out.extend(
+            files
+                .into_iter()
+                .filter(|path| path.file_name().is_some_and(|name| name != "tests.rs")),
+        );
     }
     out.sort();
     out
+}
+
+fn is_tests_dir(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|name| name == "tests")
 }
 
 #[cfg(test)]
@@ -1242,5 +1257,78 @@ let h = 8;
             msg.contains(&no_crates.join("crates").display().to_string()),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn crate_src_files_prunes_tests_directories_before_reading_them() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let src = root.join("crates/k/src");
+        fs::create_dir_all(src.join("tests/nested")).expect("mkdir");
+        fs::create_dir_all(src.join("inner/tests")).expect("mkdir");
+        fs::write(src.join("lib.rs"), "").expect("write");
+        fs::write(src.join("inner/a.rs"), "").expect("write");
+        fs::write(src.join("tests/t.rs"), "").expect("write");
+        fs::write(src.join("tests/nested/n.rs"), "").expect("write");
+        fs::write(src.join("inner/tests/i.rs"), "").expect("write");
+
+        // The shared traversal asks about a `tests` directory and never about
+        // anything below it; the unpruned walk lists everything.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut pruned = Vec::new();
+        walk_rust_files(
+            &src,
+            &|dir| {
+                asked.borrow_mut().push(dir.to_path_buf());
+                is_tests_dir(dir)
+            },
+            &mut pruned,
+        );
+        pruned.sort();
+        let mut asked = asked.into_inner();
+        asked.sort();
+        assert_eq!(pruned, vec![src.join("inner/a.rs"), src.join("lib.rs")]);
+        assert_eq!(
+            asked,
+            vec![
+                src.join("inner"),
+                src.join("inner/tests"),
+                src.join("tests")
+            ]
+        );
+        assert_eq!(rust_files(&src).len(), 5);
+        assert_eq!(
+            crate_src_files(root),
+            vec![src.join("inner/a.rs"), src.join("lib.rs")]
+        );
+
+        // With the fixture tree unreadable (a no-op as root, so only asserted
+        // when it took effect) the production-only walk still succeeds while
+        // the unpruned one fails fast naming the directory.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tests = src.join("tests");
+            let readable = fs::metadata(&tests).expect("metadata").permissions();
+            fs::set_permissions(&tests, fs::Permissions::from_mode(0o000)).expect("chmod");
+            let unreadable = fs::read_dir(&tests).is_err();
+            let listed = std::panic::catch_unwind(|| crate_src_files(root));
+            let unpruned = std::panic::catch_unwind(|| rust_files(&src));
+            fs::set_permissions(&tests, readable).expect("chmod");
+
+            assert_eq!(
+                listed.expect("crate_src_files must not read a pruned tests/ directory"),
+                vec![src.join("inner/a.rs"), src.join("lib.rs")]
+            );
+            if unreadable {
+                let err = unpruned.expect_err("rust_files must fail fast on an unreadable dir");
+                let msg = err
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .expect("panic payload is a string");
+                assert!(msg.starts_with("read_dir "), "{msg}");
+                assert!(msg.contains(&tests.display().to_string()), "{msg}");
+            }
+        }
     }
 }
