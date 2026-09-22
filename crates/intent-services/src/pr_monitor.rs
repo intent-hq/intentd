@@ -1579,7 +1579,7 @@ impl Services {
     ///
     /// Returns an error when no source-control provider is configured or
     /// the forge read fails; a `Serve` hit never reaches the forge.
-    pub async fn read_pr(
+    pub(crate) async fn read_pr(
         &self,
         repo_ref: &RepoRef,
         number: u64,

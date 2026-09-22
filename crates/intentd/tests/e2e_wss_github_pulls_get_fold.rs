@@ -29,9 +29,8 @@ use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
     AuthStatus, Branch, CheckRun, Comment, CommentAnchor, Issue, IssueQuery, MergeMethod,
     MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability, NewPullRequest, Page,
-    PageParams, PrPatch, PrQuery,
-    PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewThread,
-    ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
+    PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review,
+    ReviewComment, ReviewThread, ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -231,11 +230,7 @@ impl SourceControl for StubForge {
         self.get_pr_calls.fetch_add(1, Ordering::SeqCst);
         Ok(merged_pr(number))
     }
-    async fn merge_requirements(
-        &self,
-        _: &RepoRef,
-        _: u64,
-    ) -> ScResult<MergeRequirementSignals> {
+    async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
         Ok(MergeRequirementSignals {
             is_in_merge_queue: Some(true),
             ..Default::default()
