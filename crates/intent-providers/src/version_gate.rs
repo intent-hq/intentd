@@ -15,9 +15,11 @@
 //! ([`auggie_cli_gate`]) reuses the same probe/gate shapes so the
 //! skip-and-continue spawn resolver treats an unparseable version as usable.
 
+use std::path::Path;
+
 use crate::config::{
-    AUGGIE_CLI_MIN_VERSION, AUGGIE_CLI_REQUIREMENT, PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION,
-    PI_CLI_REQUIREMENT,
+    AUGGIE_CLI_MIN_VERSION, AUGGIE_CLI_REQUIREMENT, NPX_MIN_NPM_VERSION, NPX_NPM_REQUIREMENT,
+    PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
 };
 
 /// Result of probing the `pi` CLI, as fed to [`pi_cli_gate`].
@@ -131,6 +133,49 @@ pub fn auggie_cli_gate(probe: &PiCliProbe) -> PiCliGate {
             _ => PiCliGate::Unknown,
         },
     }
+}
+
+/// Decide the spawn-time npx gate from an `npx --version` probe (npx prints
+/// its npm version). Pure — no filesystem, PATH, or subprocess access. Same
+/// permissive policy as the pi/auggie gates: only a confirmed npm older than
+/// [`NPX_MIN_NPM_VERSION`] gates; an unparseable or failed probe is
+/// [`PiCliGate::Unknown`] and the spawn proceeds as before.
+#[must_use]
+pub fn npx_gate(probe: &PiCliProbe) -> PiCliGate {
+    match probe {
+        PiCliProbe::Missing => PiCliGate::Missing,
+        PiCliProbe::Failed => PiCliGate::Unknown,
+        PiCliProbe::Output(output) => match (
+            parse_cli_version(output),
+            parse_cli_version(NPX_MIN_NPM_VERSION),
+        ) {
+            (Some(found), Some(min)) if found < min => PiCliGate::TooOld(format_version(found)),
+            (Some(_), Some(_)) => PiCliGate::Ok,
+            _ => PiCliGate::Unknown,
+        },
+    }
+}
+
+/// User-facing rejection for a stale `npx` (intent-hq/intent#5725), or `None`
+/// unless the gate is [`PiCliGate::TooOld`]. Names the stale npx path, the
+/// `node` the daemon detected (when known — the two drifted apart), and the
+/// remedy, so the spawn error explains itself instead of surfacing as an
+/// opaque handshake failure. `Missing` is not this gate's concern: the
+/// caller already reports a missing npx with its own Node.js message.
+#[must_use]
+pub fn stale_npx_reason(gate: &PiCliGate, npx: &Path, node: Option<&Path>) -> Option<String> {
+    let PiCliGate::TooOld(found) = gate else {
+        return None;
+    };
+    let node_clause = node.map_or_else(String::new, |node| {
+        format!(" while the detected node is {}", node.display())
+    });
+    Some(format!(
+        "npx at {} is npm {found}, which cannot run the pinned adapter — {NPX_NPM_REQUIREMENT} \
+         is required{node_clause}. Remove the stale global npm/npx, or put the Node installation's \
+         bin directory ahead of it on PATH, so npx comes from the same Node as node.",
+        npx.display()
+    ))
 }
 
 /// Tolerantly extract a `major.minor.patch` triple from `--version` output:
@@ -291,6 +336,61 @@ mod tests {
     #[test]
     fn auggie_missing_gates() {
         assert_eq!(auggie_cli_gate(&PiCliProbe::Missing), PiCliGate::Missing);
+    }
+
+    fn npx_gate_output(output: &str) -> PiCliGate {
+        npx_gate(&PiCliProbe::Output(output.to_string()))
+    }
+
+    #[test]
+    fn npx_min_version_constant_parses() {
+        assert_eq!(parse_cli_version(NPX_MIN_NPM_VERSION), Some((7, 0, 0)));
+    }
+
+    #[test]
+    fn npx_npm6_gates_as_too_old_and_npm7_plus_is_ok() {
+        // The exact stale shim from intent-hq/intent#5725.
+        assert_eq!(
+            npx_gate_output("6.14.15"),
+            PiCliGate::TooOld("6.14.15".into())
+        );
+        assert_eq!(
+            npx_gate_output("6.14.18\n"),
+            PiCliGate::TooOld("6.14.18".into())
+        );
+        assert_eq!(npx_gate_output("7.0.0"), PiCliGate::Ok);
+        assert_eq!(npx_gate_output("11.13.0"), PiCliGate::Ok);
+        assert_eq!(npx_gate_output("garbage"), PiCliGate::Unknown);
+        assert_eq!(npx_gate(&PiCliProbe::Failed), PiCliGate::Unknown);
+        assert_eq!(npx_gate(&PiCliProbe::Missing), PiCliGate::Missing);
+    }
+
+    #[test]
+    fn stale_npx_reason_names_both_paths_and_the_remedy() {
+        let npx = std::path::Path::new("/usr/local/bin/npx");
+        let node = std::path::Path::new("/Users/me/.nvm/versions/node/v24.16.0/bin/node");
+        let reason = stale_npx_reason(&PiCliGate::TooOld("6.14.18".into()), npx, Some(node))
+            .expect("too-old npx is rejected");
+        assert!(reason.contains("/usr/local/bin/npx"), "{reason}");
+        assert!(reason.contains("6.14.18"), "{reason}");
+        assert!(
+            reason.contains("/Users/me/.nvm/versions/node/v24.16.0/bin/node"),
+            "{reason}"
+        );
+        assert!(reason.contains(NPX_NPM_REQUIREMENT), "{reason}");
+        assert!(reason.contains("PATH"), "{reason}");
+
+        let without_node =
+            stale_npx_reason(&PiCliGate::TooOld("6.14.18".into()), npx, None).unwrap();
+        assert!(
+            without_node.contains("/usr/local/bin/npx"),
+            "{without_node}"
+        );
+        assert!(without_node.contains("6.14.18"), "{without_node}");
+
+        assert_eq!(stale_npx_reason(&PiCliGate::Ok, npx, Some(node)), None);
+        assert_eq!(stale_npx_reason(&PiCliGate::Unknown, npx, Some(node)), None);
+        assert_eq!(stale_npx_reason(&PiCliGate::Missing, npx, Some(node)), None);
     }
 
     #[test]
