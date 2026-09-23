@@ -172,9 +172,11 @@ pub enum LaunchMode {
 
 /// The neutral directory an npx launch starts in (intent-hq/intent#5738).
 /// Created per spawn under [`SpawnOptions::npx_launch_root`] (owner-only on
-/// Unix, uuid-named) and removed when dropped — the owner keeps it alive for
-/// the child's lifetime, since Node resolves relative paths against, and
-/// `process.cwd()` fails inside, a removed directory.
+/// Unix, named `intent_core::NPX_LAUNCH_DIR_PREFIX` + uuid so a launch root
+/// sweep can tell it from ordinary leftovers) and removed when dropped — the
+/// owner keeps it alive for the child's lifetime, since Node resolves
+/// relative paths against, and `process.cwd()` fails inside, a removed
+/// directory.
 ///
 /// Being empty is not enough: npm picks its project root by walking up from
 /// the cwd to the nearest `package.json` (or `node_modules`) and reads that
@@ -255,7 +257,11 @@ impl NpxLaunchDir {
     /// manifest cannot be created.
     pub fn create(root: Option<&Path>) -> std::io::Result<Self> {
         let root = root.map_or_else(std::env::temp_dir, Path::to_path_buf);
-        let path = root.join(format!("intentd-npx-{}", uuid::Uuid::new_v4()));
+        let path = root.join(format!(
+            "{}{}",
+            intent_core::NPX_LAUNCH_DIR_PREFIX,
+            uuid::Uuid::new_v4()
+        ));
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]

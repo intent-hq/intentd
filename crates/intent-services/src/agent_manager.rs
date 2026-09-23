@@ -2344,8 +2344,9 @@ struct AgentHandle {
     _pi_extension: Option<PiExtensionDelivery>,
     /// The neutral directory an npx launch started in, removed when the
     /// handle drops (intent-hq/intent#5738; `None` for other launch tiers).
-    /// Teardown paths that hand the child out of the handle must move this
-    /// with it ([`DetachedChild`]): it is the live child's cwd.
+    /// Every teardown path takes the child out of the handle together with
+    /// this dir ([`DetachedChild::take`]) — it is the live tree's cwd, and
+    /// only the detached child's owned cleanup may release it.
     npx_launch_dir: Option<NpxLaunchDir>,
     antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
@@ -3256,9 +3257,12 @@ impl AgentManager {
             env_mcp_config.as_deref(),
         );
         // An npx launch starts in a fresh empty dir under the daemon-owned
-        // agent-configs root (startup-swept like the config files above), so
-        // the workspace's own package configuration never reaches npm
-        // (intent-hq/intent#5738). The workspace stays the ACP session cwd.
+        // agent-configs root, so the workspace's own package configuration
+        // never reaches npm (intent-hq/intent#5738). Unlike the config files
+        // above, the startup sweep skips these dirs
+        // (`intent_core::NPX_LAUNCH_DIR_PREFIX`): one retained by an
+        // interrupted teardown (`RetainUnlessSwept`) may still be a live
+        // tree's cwd. The workspace stays the ACP session cwd.
         if spawn_opts.npx_launch_root.is_none() {
             spawn_opts.npx_launch_root = Some(config_dir.as_path());
         }
@@ -3389,9 +3393,8 @@ impl AgentManager {
         // respawn-time window. (Drop the lock before awaiting the kill.)
         let stale = self.handles.lock().unwrap().remove(&agent_id);
         if let Some(mut stale) = stale {
-            let stale_pid = stale.child_pid;
-            if let Some(child) = stale.child.take() {
-                kill_child_tree(child, stale_pid).await;
+            if let Some(child) = DetachedChild::take(&mut stale) {
+                child.kill_tree().await;
             }
         }
         // Teardown fence (ghost-agent race): a `workspace.delete` batch stop
@@ -3417,9 +3420,8 @@ impl AgentManager {
         };
         if let Some(mut handle) = fenced {
             self.registry.deregister(&agent_id);
-            let spawn_pid = handle.child_pid;
-            if let Some(child) = handle.child.take() {
-                kill_child_tree(child, spawn_pid).await;
+            if let Some(child) = DetachedChild::take(&mut handle) {
+                child.kill_tree().await;
             }
             return Err(Error::NotFound(format!(
                 "agent session {agent_id} is being deleted"
@@ -9034,9 +9036,8 @@ impl AgentManager {
     async fn kill_child_only(&self, agent_id: &AgentId) {
         let handle = self.handles.lock().unwrap().remove(agent_id);
         if let Some(mut handle) = handle {
-            let spawn_pid = handle.child_pid;
-            if let Some(child) = handle.child.take() {
-                kill_child_tree(child, spawn_pid).await;
+            if let Some(child) = DetachedChild::take(&mut handle) {
+                child.kill_tree().await;
             }
         }
         self.registry.deregister(agent_id);
@@ -9055,9 +9056,8 @@ impl AgentManager {
                     .upgrade()
                     .and_then(|h| h.lock().unwrap().remove(&id));
                 if let Some(mut handle) = removed {
-                    let spawn_pid = handle.child_pid;
-                    if let Some(child) = handle.child.take() {
-                        kill_child_tree(child, spawn_pid).await;
+                    if let Some(child) = DetachedChild::take(&mut handle) {
+                        child.kill_tree().await;
                     }
                 }
             })
@@ -9154,11 +9154,7 @@ impl AgentManager {
                                 Some((
                                     status,
                                     dead.map(|mut h| {
-                                        (
-                                            h.child.take(),
-                                            h.npx_launch_dir.take(),
-                                            Arc::clone(&h.connection),
-                                        )
+                                        (DetachedChild::take(&mut h), Arc::clone(&h.connection))
                                     }),
                                 ))
                             }
@@ -9166,10 +9162,8 @@ impl AgentManager {
                     }
                 };
                 if let Some((status, dead)) = exited {
-                    let (dead_child, dead_launch_dir, dead_conn) = dead
-                        .map_or((None, None, None), |(child, dir, conn)| {
-                            (child, dir, Some(conn))
-                        });
+                    let (dead_child, dead_conn) =
+                        dead.map_or((None, None), |(child, conn)| (child, Some(conn)));
                     // The direct child is already reaped (`try_wait` above),
                     // but same-group descendants can survive it: sweep the
                     // process group via the spawn-time pid. Swept BEFORE the
@@ -9181,9 +9175,8 @@ impl AgentManager {
                     // is those descendants' cwd, so it is released only once
                     // the sweep is done (intent-hq/intent#5738).
                     if let Some(dead_child) = dead_child {
-                        kill_child_tree(dead_child, child_pid).await;
+                        dead_child.kill_tree().await;
                     }
-                    drop(dead_launch_dir);
                     // Honest capture hint (monorepo#3570): bounded-await the
                     // stderr drain's settle (EOF + flush — the whole group is
                     // dead now, so EOF is normally immediate) and only name
@@ -9238,13 +9231,30 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
 
 /// A provider child handed out of its [`AgentHandle`] for a bounded
-/// process-tree kill, together with the npx launch dir it runs in
-/// (intent-hq/intent#5738): that dir is the live tree's cwd, so its RAII
-/// guard must outlive [`kill_child_tree`] / [`kill_child_trees`] rather than
+/// process-tree kill, together with its spawn-time pid (the process-group
+/// id, still valid once the leader has been `try_wait`ed) and the npx launch
+/// dir it runs in (intent-hq/intent#5738): that dir is the live tree's cwd,
+/// so it must outlive [`kill_child_tree`] / [`kill_child_trees`] rather than
 /// drop with the handle before the tree has been signalled.
+///
+/// Cleanup ownership is persistent, not the awaiting caller's: [`Self::kill_tree`]
+/// and [`Self::kill_trees`] move the child, its pgid and the launch dir into
+/// ONE owned task on the current runtime and await that task. Cancelling the
+/// caller — `stop()` aborting a worker inside `kill_child_only` after the
+/// handle left the map, an RPC deadline dropping a `stop` / `stop_many`
+/// future — leaves the task, and the descendant snapshot it already took,
+/// running to completion (a second kill could not rediscover escaped
+/// descendants once the leader is dead). [`Drop`] starts the same task for a
+/// detached child that was never killed explicitly. When no runtime can run
+/// the task, or it shuts down before the task finishes, the launch dir is
+/// retained on disk rather than removed from under a possibly live tree, and
+/// the child falls back to `kill_on_drop` — the same boundary as the
+/// ephemeral adapter's `AdapterChild`.
 struct DetachedChild {
-    child: Child,
+    /// `None` once moved into the owned cleanup task.
+    child: Option<Child>,
     spawn_pid: Option<u32>,
+    /// `None` once moved into the owned cleanup task.
     npx_launch_dir: Option<NpxLaunchDir>,
 }
 
@@ -9254,31 +9264,107 @@ impl DetachedChild {
     fn take(handle: &mut AgentHandle) -> Option<Self> {
         let child = handle.child.take()?;
         Some(Self {
-            child,
+            child: Some(child),
             spawn_pid: handle.child_pid,
             npx_launch_dir: handle.npx_launch_dir.take(),
         })
     }
 
-    /// [`kill_child_tree`], releasing the launch dir only afterwards.
-    async fn kill_tree(self) {
-        kill_child_tree(self.child, self.spawn_pid).await;
-        drop(self.npx_launch_dir);
+    /// [`kill_child_tree`] on an owned task, releasing the launch dir only
+    /// afterwards; awaits the task, but the task outlives a cancelled await.
+    async fn kill_tree(mut self) {
+        if let Some(cleanup) = self.start_cleanup() {
+            let _ = cleanup.await;
+        }
     }
 
-    /// [`kill_child_trees`] over the batch, releasing every launch dir only
-    /// after the shared sweep completes.
+    /// Move the child and the launch dir into the owned cleanup task. `None`
+    /// when there is nothing left to clean up or no runtime to run it on
+    /// (then the dir is retained and the child left to `kill_on_drop`).
+    fn start_cleanup(&mut self) -> Option<JoinHandle<()>> {
+        let child = self.child.take()?;
+        let spawn_pid = self.spawn_pid;
+        let launch_dir = RetainUnlessSwept(self.npx_launch_dir.take());
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            drop(launch_dir);
+            drop(child);
+            return None;
+        };
+        Some(spawn_owned_cleanup(&runtime, async move {
+            kill_child_tree(child, spawn_pid).await;
+            launch_dir.remove();
+        }))
+    }
+
+    /// [`kill_child_trees`] over the batch on ONE owned task, releasing every
+    /// launch dir only after the shared sweep completes; a cancelled await
+    /// leaves the batch sweep running.
     async fn kill_trees(children: Vec<Self>) {
+        let mut trees = Vec::with_capacity(children.len());
         let mut launch_dirs = Vec::with_capacity(children.len());
-        let children = children
-            .into_iter()
-            .map(|detached| {
-                launch_dirs.push(detached.npx_launch_dir);
-                (detached.child, detached.spawn_pid)
-            })
-            .collect();
-        kill_child_trees(children).await;
-        drop(launch_dirs);
+        for mut detached in children {
+            if let Some(child) = detached.child.take() {
+                trees.push((child, detached.spawn_pid));
+            }
+            launch_dirs.push(RetainUnlessSwept(detached.npx_launch_dir.take()));
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let _ = spawn_owned_cleanup(&runtime, async move {
+            kill_child_trees(trees).await;
+            for dir in launch_dirs {
+                dir.remove();
+            }
+        })
+        .await;
+    }
+}
+
+impl Drop for DetachedChild {
+    fn drop(&mut self) {
+        drop(self.start_cleanup());
+    }
+}
+
+/// Spawn `cleanup` on `runtime` as a task no caller owns: it runs with
+/// [`intent_core::Caller::Daemon`] bound (like [`intent_core::spawn_daemon`])
+/// and is neither aborted nor dropped when the future awaiting its
+/// [`JoinHandle`] is cancelled.
+fn spawn_owned_cleanup<F>(runtime: &tokio::runtime::Handle, cleanup: F) -> JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    runtime.spawn(intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        cleanup,
+    ))
+}
+
+/// A launch dir travelling through the owned cleanup: [`Self::remove`]
+/// deletes it once the tree has been swept; dropping the wrapper any other
+/// way (the cleanup future dropped unpolled on a shutting-down runtime, or
+/// never scheduled at all) retains the directory instead of deleting it. A
+/// retained dir survives the next daemon start too: the agent-configs
+/// startup sweep skips `intent_core::NPX_LAUNCH_DIR_PREFIX` entries, since a
+/// restart cannot tell a still-live orphan tree from a dead one.
+struct RetainUnlessSwept(Option<NpxLaunchDir>);
+
+impl RetainUnlessSwept {
+    fn remove(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl Drop for RetainUnlessSwept {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            tracing::debug!(
+                path = %dir.path().display(),
+                "retaining npx launch dir: process-tree cleanup could not finish"
+            );
+            std::mem::forget(dir);
+        }
     }
 }
 
@@ -13184,7 +13270,9 @@ mod npx_launch_dir_lifetime_tests {
     //! Each child reports, from inside its SIGTERM trap, whether its cwd still
     //! existed when the kill reached it; the dir must be gone afterwards.
 
-    use super::dead_child_respawn_tests::install_fake_handle_with_launch_dir;
+    use super::dead_child_respawn_tests::{
+        fake_handle_with_launch_dir, install_fake_handle_with_launch_dir,
+    };
     use super::role_reminder_tests::manager_with;
     use super::*;
 
@@ -13362,6 +13450,407 @@ mod npx_launch_dir_lifetime_tests {
         assert!(
             !launch_path.exists(),
             "idle-exit: launch dir must be removed once the sweep completes"
+        );
+    }
+
+    // ---- cancellation regressions (intent-hq/intent#5738) -----------------
+    //
+    // The kill is a multi-await operation (descendant snapshot → SIGTERM →
+    // grace → SIGKILL → escape sweep) and every teardown entry point can be
+    // cancelled mid-way: `stop()` aborts the worker running `kill_child_only`,
+    // an RPC deadline drops a `stop`/`stop_many` future, a `stop_many` sweep
+    // is itself abandoned. Cleanup ownership must not travel with the
+    // cancelled future: the launch dir has to survive until the bounded kill
+    // — the one that already took the descendant snapshot — has finished.
+
+    /// SIGKILLs a pid on drop so a failed test never leaves the fixture's
+    /// SIGTERM-ignoring grandchild behind.
+    struct KillGrandchildOnDrop(i32);
+
+    impl Drop for KillGrandchildOnDrop {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.0),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    /// A leader whose cwd is `dir`: it starts a same-group grandchild that
+    /// ignores SIGTERM (`SIG_IGN` survives `exec`) and writes its pid to
+    /// `pidfile`; on SIGTERM the leader itself creates `term_marker` and KEEPS
+    /// running. The tree therefore only dies on the group's SIGKILL
+    /// escalation after [`PROCESS_GROUP_TERM_GRACE`], and `term_marker`
+    /// proves the kill has passed its descendant snapshot and signalled the
+    /// group — the window in which the killing caller is cancelled.
+    fn term_ignoring_tree(dir: &Path, pidfile: &Path, term_marker: &Path) -> Child {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "trap ': > \"$1\"' TERM; sh -c 'trap \"\" TERM; exec sleep 300' & \
+                 echo $! > \"$0\"; while :; do sleep 0.05; done",
+            )
+            .arg(pidfile)
+            .arg(term_marker)
+            .current_dir(dir)
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn SIGTERM-ignoring tree")
+    }
+
+    async fn wait_for_file(path: &Path, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: {} never appeared",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn read_grandchild_pid(pidfile: &Path) -> i32 {
+        wait_for_file(pidfile, "grandchild pidfile").await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(pidfile)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild pid never written"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A spawned [`term_ignoring_tree`] plus the launch dir it runs in.
+    struct Tree {
+        launch_dir: Option<NpxLaunchDir>,
+        launch_path: PathBuf,
+        child: Option<Child>,
+        grandchild: i32,
+        term_marker: PathBuf,
+        _sweep: KillGrandchildOnDrop,
+    }
+
+    async fn spawn_tree(root: &Path, tag: &str) -> Tree {
+        let launch_dir = NpxLaunchDir::create(Some(root)).expect("create launch dir");
+        let launch_path = launch_dir.path().to_path_buf();
+        let pidfile = root.join(format!("{tag}.grandchild.pid"));
+        let term_marker = root.join(format!("{tag}.term"));
+        let child = term_ignoring_tree(&launch_path, &pidfile, &term_marker);
+        let grandchild = read_grandchild_pid(&pidfile).await;
+        assert_eq!(
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(grandchild)))
+                .expect("grandchild pgid")
+                .as_raw(),
+            child.id().expect("leader pid").cast_signed(),
+            "grandchild must share the leader's process group"
+        );
+        Tree {
+            launch_dir: Some(launch_dir),
+            launch_path,
+            child: Some(child),
+            grandchild,
+            term_marker,
+            _sweep: KillGrandchildOnDrop(grandchild),
+        }
+    }
+
+    /// Install `tree` as `agent_id`'s handle (child + launch dir guard).
+    fn install_tree(
+        mgr: &AgentManager,
+        tree: &mut Tree,
+        agent_id: &AgentId,
+    ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        install_fake_handle_with_launch_dir(
+            mgr,
+            agent_id,
+            tree.child.take(),
+            tree.launch_dir.take(),
+        )
+    }
+
+    /// The launch dir must exist for as long as the discoverable tree is
+    /// live, and be gone once the bounded kill has swept it.
+    async fn assert_dir_outlives_tree(tree: &Tree, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while pid_alive(tree.grandchild) {
+            assert!(
+                tree.launch_path.is_dir(),
+                "{what}: launch dir {} removed while grandchild {} is still alive",
+                tree.launch_path.display(),
+                tree.grandchild
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: grandchild {} still alive after the bounded kill window",
+                tree.grandchild
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while tree.launch_path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: launch dir {} still present after the tree died",
+                tree.launch_path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Abort `task` and confirm it neither panicked nor is still running.
+    async fn abort_and_settle(task: JoinHandle<()>, what: &str) {
+        task.abort();
+        let outcome = task.await;
+        assert!(
+            outcome
+                .as_ref()
+                .map_or_else(tokio::task::JoinError::is_cancelled, |()| true),
+            "{what}: task neither finished nor cancelled: {outcome:?}"
+        );
+    }
+
+    /// `stop()` cancelled after the kill has signalled the group (an RPC
+    /// deadline, a dropped future).
+    #[tokio::test]
+    async fn cancelled_stop_keeps_launch_dir_until_tree_is_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-stop-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let mut tree = spawn_tree(tmp.path(), "stop").await;
+        let agent_id = AgentId::from("agent-npx-cancel-stop");
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+
+        let stopping = {
+            let mgr = Arc::clone(&mgr);
+            let agent_id = agent_id.clone();
+            intent_core::spawn_daemon(async move {
+                mgr.stop(&agent_id).await;
+            })
+        };
+        wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+        assert!(tree.launch_path.is_dir());
+        abort_and_settle(stopping, "stop").await;
+
+        assert_dir_outlives_tree(&tree, "stop cancelled mid-kill").await;
+    }
+
+    /// `stop_many()` cancelled after the shared SIGTERM phase: every launch
+    /// dir of the batch must survive the batch's bounded sweep.
+    #[tokio::test]
+    async fn cancelled_stop_many_keeps_launch_dirs_until_sweep_completes() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-many-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let mut a = spawn_tree(tmp.path(), "many-a").await;
+        let mut b = spawn_tree(tmp.path(), "many-b").await;
+        let id_a = AgentId::from("agent-npx-cancel-many-a");
+        let id_b = AgentId::from("agent-npx-cancel-many-b");
+        let _ends_a = install_tree(&mgr, &mut a, &id_a);
+        let _ends_b = install_tree(&mgr, &mut b, &id_b);
+
+        let sweeping = {
+            let mgr = Arc::clone(&mgr);
+            let ids = [id_a.clone(), id_b.clone()];
+            intent_core::spawn_daemon(async move {
+                let _fence = mgr.stop_many(&ids).await;
+            })
+        };
+        wait_for_file(&a.term_marker, "leader a SIGTERM").await;
+        wait_for_file(&b.term_marker, "leader b SIGTERM").await;
+        abort_and_settle(sweeping, "stop_many").await;
+
+        assert_dir_outlives_tree(&a, "stop_many cancelled mid-sweep (a)").await;
+        assert_dir_outlives_tree(&b, "stop_many cancelled mid-sweep (b)").await;
+    }
+
+    /// The worker-owned path: `kill_child_only` (retry / respawn / terminal
+    /// failure) removes the handle from the map BEFORE the kill, so once
+    /// `stop()` aborts the worker mid-kill there is no handle left for an
+    /// external stop to recover — the kill it interrupted must finish on its
+    /// own.
+    #[tokio::test]
+    async fn cancelled_kill_child_only_keeps_launch_dir_until_tree_is_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-worker-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let mut tree = spawn_tree(tmp.path(), "worker").await;
+        let agent_id = AgentId::from("agent-npx-cancel-worker");
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+
+        let worker = {
+            let mgr = Arc::clone(&mgr);
+            let agent_id = agent_id.clone();
+            intent_core::spawn_daemon(async move {
+                mgr.kill_child_only(&agent_id).await;
+            })
+        };
+        wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+        assert!(
+            !mgr.handles.lock().unwrap().contains_key(&agent_id),
+            "handle is out of the map before the kill runs"
+        );
+        abort_and_settle(worker, "kill_child_only").await;
+        assert!(
+            !mgr.stop(&agent_id).await,
+            "an external stop after the abort finds no handle to recover"
+        );
+
+        assert_dir_outlives_tree(&tree, "kill_child_only cancelled mid-kill").await;
+    }
+
+    /// The registry kill callback (`make_kill`) cancelled mid-kill.
+    #[tokio::test]
+    async fn cancelled_registry_kill_keeps_launch_dir_until_tree_is_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-registry-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mut tree = spawn_tree(tmp.path(), "registry").await;
+        let agent_id = AgentId::from("agent-npx-cancel-registry");
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+
+        let kill = mgr.make_kill(agent_id.clone());
+        let killing = intent_core::spawn_daemon(kill());
+        wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+        abort_and_settle(killing, "registry kill").await;
+
+        assert_dir_outlives_tree(&tree, "registry kill cancelled mid-kill").await;
+    }
+
+    /// A detached child dropped before its kill was ever awaited (the caller
+    /// cancelled between `detach` and `kill_tree`) still owns its cleanup:
+    /// the tree is swept, and only then the dir removed.
+    #[tokio::test]
+    async fn dropped_detached_child_still_sweeps_tree_before_removing_launch_dir() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-drop-detached-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mut tree = spawn_tree(tmp.path(), "dropped").await;
+        let agent_id = AgentId::from("agent-npx-drop-detached");
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+
+        let (removed, detached) = mgr.detach(&agent_id).await;
+        assert!(removed);
+        drop(detached.expect("handle owned a child"));
+
+        assert_dir_outlives_tree(&tree, "detached child dropped unkilled").await;
+    }
+
+    /// Detach `tree` the way every teardown path does: out of an
+    /// [`AgentHandle`] via [`DetachedChild::take`].
+    fn detach_tree(tree: &mut Tree) -> DetachedChild {
+        let (mut handle, _ends) =
+            fake_handle_with_launch_dir(tree.child.take(), tree.launch_dir.take());
+        DetachedChild::take(&mut handle).expect("handle owned a child")
+    }
+
+    /// Interrupted cleanup: the runtime shuts down while the owned kill is
+    /// still inside its grace window. The kill cannot finish, so the launch
+    /// dir is retained (a small orphan directory) rather than removed from
+    /// under a tree that may still be running — the same boundary as the
+    /// ephemeral adapter's.
+    #[test]
+    fn launch_dir_is_retained_when_the_runtime_shuts_down_mid_kill() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-rt-shutdown-");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tree, _killing) = rt.block_on(async {
+            let mut tree = spawn_tree(tmp.path(), "rt-shutdown").await;
+            let detached = detach_tree(&mut tree);
+            let killing = intent_core::spawn_daemon(detached.kill_tree());
+            wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+            (tree, killing)
+        });
+        assert!(pid_alive(tree.grandchild));
+
+        drop(rt);
+        assert!(
+            tree.launch_path.is_dir(),
+            "launch dir {} removed on runtime shutdown although its kill never finished",
+            tree.launch_path.display()
+        );
+    }
+
+    /// A launch dir retained on runtime shutdown lives under the agent-configs
+    /// root, which the next daemon start sweeps before spawning anything. The
+    /// sweep must skip it — its descendants may still run in it — while still
+    /// reclaiming the per-agent config files beside it.
+    #[test]
+    fn startup_sweep_keeps_launch_dir_retained_on_runtime_shutdown() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-startup-sweep-");
+        let root = intent_core::agent_configs_root(tmp.path());
+        intent_core::create_agent_configs_dir(&root).expect("create agent-configs root");
+        let stale_config = root.join("intentd-mcp-stale.json");
+        std::fs::write(&stale_config, b"{}").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tree, _killing) = rt.block_on(async {
+            let mut tree = spawn_tree(&root, "startup-sweep").await;
+            let detached = detach_tree(&mut tree);
+            let killing = intent_core::spawn_daemon(detached.kill_tree());
+            wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+            (tree, killing)
+        });
+        drop(rt);
+        assert!(tree.launch_path.is_dir(), "precondition: dir retained");
+        assert!(pid_alive(tree.grandchild), "precondition: descendant alive");
+
+        intent_core::sweep_agent_configs(&root).expect("startup sweep");
+        assert!(
+            tree.launch_path.is_dir(),
+            "startup sweep removed retained launch dir {} while grandchild {} is still alive",
+            tree.launch_path.display(),
+            tree.grandchild
+        );
+        assert!(
+            tree.launch_path.join("package.json").is_file(),
+            "retained launch dir must keep its sentinel manifest"
+        );
+        assert!(
+            !stale_config.exists(),
+            "startup sweep must still reclaim leaked config files"
+        );
+    }
+
+    /// No runtime at all: a detached child dropped outside any runtime cannot
+    /// start its owned kill, so the dir is retained and the child left to
+    /// `kill_on_drop`.
+    #[test]
+    fn launch_dir_is_retained_when_no_runtime_can_run_the_kill() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-no-rt-");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tree, detached) = rt.block_on(async {
+            let mut tree = spawn_tree(tmp.path(), "no-rt").await;
+            let detached = detach_tree(&mut tree);
+            (tree, detached)
+        });
+        drop(rt);
+
+        drop(detached);
+        assert!(
+            tree.launch_path.is_dir(),
+            "launch dir {} removed with no runtime to run the kill",
+            tree.launch_path.display()
         );
     }
 }
@@ -15024,6 +15513,20 @@ mod dead_child_respawn_tests {
         child: Option<Child>,
         npx_launch_dir: Option<NpxLaunchDir>,
     ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (handle, ends) = fake_handle_with_launch_dir(child, npx_launch_dir);
+        mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
+        ends
+    }
+
+    /// Build (without installing) a fake duplex-backed handle owning `child`
+    /// and an npx launch dir guard; returns the handle and the far ends.
+    pub(super) fn fake_handle_with_launch_dir(
+        child: Option<Child>,
+        npx_launch_dir: Option<NpxLaunchDir>,
+    ) -> (
+        AgentHandle,
+        (tokio::io::DuplexStream, tokio::io::DuplexStream),
+    ) {
         let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
         let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
         let connection = Arc::new(Connection::new(
@@ -15032,8 +15535,8 @@ mod dead_child_respawn_tests {
             None,
             ConnectionHooks::default(),
         ));
-        install_handle_parts(mgr, agent_id, child, connection, npx_launch_dir);
-        (c2a_agent, a2c_agent)
+        let handle = fake_handle(child, connection, npx_launch_dir);
+        (handle, (c2a_agent, a2c_agent))
     }
 
     /// Install a handle around a caller-built `connection` (e.g. one with a
@@ -15045,19 +15548,18 @@ mod dead_child_respawn_tests {
         child: Option<Child>,
         connection: Arc<Connection>,
     ) {
-        install_handle_parts(mgr, agent_id, child, connection, None);
+        let handle = fake_handle(child, connection, None);
+        mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
     }
 
-    fn install_handle_parts(
-        mgr: &AgentManager,
-        agent_id: &AgentId,
+    fn fake_handle(
         child: Option<Child>,
         connection: Arc<Connection>,
         npx_launch_dir: Option<NpxLaunchDir>,
-    ) {
+    ) -> AgentHandle {
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let child_pid = child.as_ref().and_then(tokio::process::Child::id);
-        let handle = AgentHandle {
+        AgentHandle {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
@@ -15075,8 +15577,7 @@ mod dead_child_respawn_tests {
             thought_level: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
-        };
-        mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
+        }
     }
 
     /// Live child + unchanged model → the cached session comes back with no
