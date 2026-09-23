@@ -631,6 +631,143 @@ async fn spawn_provider_relative_bare_command_present_in_cwd_is_not_provider_not
     }
 }
 
+/// A workspace fixture that reproduces the intent-hq/intent#5738 failure
+/// mode: a pnpm/Bun workspace whose `package.json` uses `catalog:`
+/// specifiers. npm run from inside it rejects the manifest
+/// (`EUNSUPPORTEDPROTOCOL`) before any `npx -y <adapter>` install can start.
+/// The directory name carries a space so the ACP cwd path shape is exercised.
+#[cfg(unix)]
+fn catalog_workspace(tmp: &std::path::Path) -> std::path::PathBuf {
+    let workspace = tmp.join("bun workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("package.json"),
+        r#"{"name":"catalog-workspace","private":true,"dependencies":{"zod":"catalog:"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\ncatalog:\n  zod: ^3.23.0\n",
+    )
+    .unwrap();
+    workspace
+}
+
+/// A stand-in `npx` that behaves like npm inside a `catalog:` workspace:
+/// records its cwd and the number of entries in it to `report`, then fails
+/// with npm's `EUNSUPPORTEDPROTOCOL` when a `package.json` is present in the
+/// cwd and otherwise exits 0. Never downloads anything.
+#[cfg(unix)]
+fn write_fake_npx(dir: &std::path::Path, report: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let npx = dir.join("npx");
+    std::fs::write(
+        &npx,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > '{report}'\nls -A | wc -l >> '{report}'\n\
+             if [ -e package.json ]; then\n  echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2\n  \
+             echo 'npm error Unsupported URL Type \"catalog:\": catalog:' >&2\n  exit 1\nfi\n\
+             exit 0\n",
+            report = report.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    npx
+}
+
+/// Poll `report` until the fake npx has written both of its lines.
+#[cfg(unix)]
+async fn read_npx_report(report: &std::path::Path) -> (std::path::PathBuf, usize) {
+    for _ in 0..200 {
+        if let Ok(s) = tokio::fs::read_to_string(report).await {
+            let mut lines = s.lines();
+            if let (Some(cwd), Some(count)) = (lines.next(), lines.next()) {
+                if let Ok(count) = count.trim().parse::<usize>() {
+                    return (std::path::PathBuf::from(cwd), count);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("fake npx never reported its cwd to {}", report.display());
+}
+
+/// intent-hq/intent#5738: an npx launch runs npx in a neutral, EMPTY
+/// directory — never the workspace — so a `catalog:` workspace cannot break
+/// adapter startup. `opts.cwd` (the ACP session cwd the agent manager passes
+/// to `session/new` separately) is left untouched.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_runs_npx_launch_in_an_empty_neutral_dir() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+
+    let tmp = test_temp_dir("intent-acp-npx-isolation-");
+    let workspace = catalog_workspace(tmp.path());
+    let report = tmp.path().join("npx-report");
+    let npx = write_fake_npx(tmp.path(), &report);
+
+    let provider = *intent_providers::find_provider("claude-code").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&workspace);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = provider.npx_only_package;
+    assert_eq!(opts.launch_target().0, LaunchMode::NpxFallback);
+
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn fake npx");
+    let (npx_cwd, entries) = read_npx_report(&report).await;
+    let status = agent.child_mut().wait().await.expect("wait fake npx");
+    assert!(
+        status.success(),
+        "npx must not see the workspace package.json (exit {status:?})"
+    );
+    assert_ne!(npx_cwd, workspace, "npx ran inside the workspace");
+    assert!(
+        !npx_cwd.starts_with(&workspace),
+        "npx cwd {} is under the workspace",
+        npx_cwd.display()
+    );
+    assert_eq!(
+        entries,
+        0,
+        "npx launch dir {} is not empty",
+        npx_cwd.display()
+    );
+    assert_eq!(
+        opts.cwd,
+        Some(workspace.as_path()),
+        "ACP session cwd untouched"
+    );
+    agent.kill().await.ok();
+}
+
+/// intent-hq/intent#5738 (spawn classification): the process cwd of an npx
+/// launch is the neutral dir, so a workspace directory that no longer exists
+/// neither fails the spawn nor is reported as the missing working directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_npx_launch_does_not_depend_on_the_workspace_existing() {
+    use crate::spawn::{spawn_provider, SpawnOptions};
+
+    let tmp = test_temp_dir("intent-acp-npx-gone-ws-");
+    let gone = tmp.path().join("deleted workspace");
+    let report = tmp.path().join("npx-report");
+    let npx = write_fake_npx(tmp.path(), &report);
+
+    let provider = *intent_providers::find_provider("codex").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&gone);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = provider.fallback_npx_package;
+    assert!(opts.via_npx());
+
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default())
+        .expect("npx launch must not require the workspace directory");
+    let (npx_cwd, _) = read_npx_report(&report).await;
+    assert_ne!(npx_cwd, gone);
+    agent.kill().await.ok();
+}
+
 /// The bare-command `PATH` search of `classify_not_found` walks the child's
 /// enhanced `PATH`: a command present there (`sh`) is "program exists" and a
 /// name absent from every directory is `ProviderNotFound`.
@@ -650,7 +787,7 @@ fn classify_not_found_searches_the_child_path_for_bare_commands() {
     let opts = SpawnOptions::new(&present);
     let (launch, target) = opts.launch_target();
     assert_eq!(launch, LaunchMode::BareCommand);
-    let err = classify_not_found(&opts, launch, target, "sh", &enoent);
+    let err = classify_not_found(&opts, launch, target, "sh", opts.cwd, &enoent);
     match &err {
         AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
         other => panic!("expected Spawn for a bare command on PATH, got {other:?}"),
@@ -667,6 +804,7 @@ fn classify_not_found_searches_the_child_path_for_bare_commands() {
         launch,
         target,
         "intentd-no-such-provider-command-4971",
+        opts.cwd,
         &enoent,
     );
     assert!(
@@ -713,10 +851,10 @@ fn classify_not_found_resolves_relative_path_entries_against_child_cwd() {
     let (launch, target) = opts.launch_target();
     assert_eq!(launch, LaunchMode::BareCommand);
     let err = classify_not_found_with_path(
-        &opts,
         launch,
         target,
         "intentd-4971-child-local",
+        opts.cwd,
         &enoent,
         child_path,
     );
@@ -728,10 +866,10 @@ fn classify_not_found_resolves_relative_path_entries_against_child_cwd() {
     let opts = SpawnOptions::new(&provider);
     let (launch, target) = opts.launch_target();
     let err = classify_not_found_with_path(
-        &opts,
         launch,
         target,
         "intentd-4971-child-local",
+        opts.cwd,
         &enoent,
         child_path,
     );
