@@ -1,17 +1,20 @@
 //! WSS e2e for npx startup isolation (intent-hq/intent#5738): an npx-only
 //! provider (claude-code) launched inside a Bun/pnpm workspace whose
 //! `package.json` uses `catalog:` specifiers must still come up, because the
-//! daemon runs `npx -y <pinned adapter>` in a neutral, empty directory rather
-//! than the workspace — while the ACP `session/new` still names the real
-//! workspace (a path containing a space) as its `cwd`.
+//! daemon runs `npx -y <pinned adapter>` in a neutral directory rather than
+//! the workspace — while the ACP `session/new` still names the real
+//! workspace (a path containing a space) as its `cwd`. The daemon data dir
+//! (an ancestor of the `agent-configs` launch root) carries a `catalog:`
+//! manifest and a `.npmrc` too, so the launch dir must stop npm's
+//! project-root walk-up, not merely be empty.
 //!
 //! Hermetic setup: the daemon child's `PATH` starts with a scratch `bin/`
-//! holding a fake `npx` that behaves like npm inside a `catalog:` workspace —
-//! it records its cwd + argv, fails with `EUNSUPPORTEDPROTOCOL` when a
-//! `package.json` is present in its cwd, and otherwise execs the deterministic
-//! mock ACP fixture under `node`. Nothing is downloaded. The fixture's
-//! `MOCK_AGENT_SESSION_LOG` seam records the `session/new` `cwd` param and
-//! the child's actual process cwd.
+//! holding a fake `npx` that behaves like npm's project-root discovery — it
+//! records its cwd + argv, walks up from its cwd to the nearest
+//! `package.json`, fails with `EUNSUPPORTEDPROTOCOL` when that manifest uses
+//! `catalog:`, and otherwise execs the deterministic mock ACP fixture under
+//! `node`. Nothing is downloaded. The fixture's `MOCK_AGENT_SESSION_LOG` seam
+//! records the `session/new` `cwd` param and the child's actual process cwd.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -314,44 +317,63 @@ fn make_source_repo(dir: &Path) -> PathBuf {
     repo
 }
 
-/// Write the fake `npx` into `bin_dir`: it appends its cwd to `<report>.cwd`
-/// and its argv to `<report>.args`, then fails exactly like npm inside a
-/// `catalog:` workspace when a `package.json` is present in its cwd
-/// (`EUNSUPPORTEDPROTOCOL`), and otherwise execs the mock fixture under `node`.
+/// The fake `npx` body; `__REPORT__`, `__NODE__` and `__SCRIPT__` are
+/// substituted. It appends its cwd to `<report>.cwd` and its argv to
+/// `<report>.args`, walks up from its cwd to the nearest `package.json` the
+/// way `@npmcli/config` picks npm's local prefix, fails exactly like npm when
+/// that manifest uses `catalog:` (`EUNSUPPORTEDPROTOCOL`), and otherwise execs
+/// the mock fixture under `node`.
+const FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
+printf '%s\n' "$PWD" >> '__REPORT__.cwd'
+printf '%s\n' "$*" >> '__REPORT__.args'
+d="$PWD"
+while :; do
+  if [ -e "$d/package.json" ]; then
+    if grep -q 'catalog:' "$d/package.json"; then
+      echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2
+      echo 'npm error Unsupported URL Type "catalog:": catalog:' >&2
+      exit 1
+    fi
+    break
+  fi
+  [ "$d" = / ] && break
+  d=$(dirname "$d")
+done
+exec '__NODE__' '__SCRIPT__'
+"#;
+
+/// Write [`FAKE_NPX_SCRIPT`] as an executable `npx` into `bin_dir`.
 fn write_fake_npx(bin_dir: &Path, report: &Path, script: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
     let npx = bin_dir.join("npx");
     std::fs::write(
         &npx,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" >> '{report}.cwd'\nprintf '%s\\n' \"$*\" >> '{report}.args'\n\
-             if [ -e package.json ]; then\n  echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2\n  \
-             echo 'npm error Unsupported URL Type \"catalog:\": catalog:' >&2\n  exit 1\nfi\n\
-             exec '{node}' '{script}'\n",
-            report = report.display(),
-            node = node.display(),
-        ),
+        FAKE_NPX_SCRIPT
+            .replace("__REPORT__", &report.display().to_string())
+            .replace("__NODE__", &node.display().to_string())
+            .replace("__SCRIPT__", script),
     )
     .expect("write fake npx");
     std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).expect("chmod npx");
     npx
 }
 
-/// Turn `workspace` into the failing fixture: a pnpm/Bun workspace whose
-/// manifest uses `catalog:` specifiers (what npm rejects with
-/// `EUNSUPPORTEDPROTOCOL` when run from inside it).
-fn seed_catalog_workspace(workspace: &Path) {
+/// Turn `dir` into the failing fixture: a pnpm/Bun workspace whose manifest
+/// uses `catalog:` specifiers (what npm rejects with `EUNSUPPORTEDPROTOCOL`
+/// when it picks `dir` as its project root), plus a project `.npmrc`.
+fn seed_catalog_workspace(dir: &Path) {
     std::fs::write(
-        workspace.join("package.json"),
+        dir.join("package.json"),
         r#"{"name":"catalog-workspace","private":true,"dependencies":{"zod":"catalog:"}}"#,
     )
     .expect("write package.json");
     std::fs::write(
-        workspace.join("pnpm-workspace.yaml"),
+        dir.join("pnpm-workspace.yaml"),
         "packages:\n  - packages/*\ncatalog:\n  zod: ^3.23.0\n",
     )
     .expect("write pnpm-workspace.yaml");
+    std::fs::write(dir.join(".npmrc"), "registry=http://127.0.0.1:9/\n").expect("write .npmrc");
 }
 
 /// Parse the fixture's session log into `(method, cwd, processCwd)` rows.
@@ -371,9 +393,10 @@ fn read_session_log(path: &Path) -> Vec<(String, Value, Value)> {
 }
 
 /// NPX LAUNCH ISOLATION (intent-hq/intent#5738): a claude-code agent in a
-/// `catalog:` workspace comes up — npx runs in a neutral empty directory,
-/// never the workspace — and its `session/new` still names the workspace as
-/// the ACP cwd, spaces included.
+/// `catalog:` workspace comes up — npx runs in a neutral directory, never the
+/// workspace, and unaffected by the `catalog:` manifest sitting above its
+/// `<data_dir>/agent-configs` launch root — and its `session/new` still names
+/// the workspace as the ACP cwd, spaces included.
 #[tokio::test]
 async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspace() {
     let Some(script) = gate("WSS npx launch isolation E2E") else {
@@ -386,6 +409,9 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
     let home_dir = data_dir.join("home");
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(&home_dir).unwrap();
+    // The data dir is an ancestor of the `agent-configs` npx launch root: an
+    // npx that walked up out of the launch dir would find this manifest.
+    seed_catalog_workspace(&data_dir);
     let report = data_dir.join("npx-report");
     write_fake_npx(&bin_dir, &report, &script);
     let source_repo = make_source_repo(&data_dir);

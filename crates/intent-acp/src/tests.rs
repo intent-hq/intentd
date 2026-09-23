@@ -653,39 +653,55 @@ fn catalog_workspace(tmp: &std::path::Path) -> std::path::PathBuf {
     workspace
 }
 
-/// A stand-in `npx` that behaves like npm inside a `catalog:` workspace:
-/// records its cwd and the number of entries in it to `report`, then fails
-/// with npm's `EUNSUPPORTEDPROTOCOL` when a `package.json` is present in the
-/// cwd and otherwise exits 0. Never downloads anything.
+/// The fake `npx` script body; `__REPORT__` is the report path. It behaves
+/// like npm's project-root discovery: writes its cwd and the cwd's entries to
+/// the report (atomically, via rename), walks up from the cwd to the nearest
+/// `package.json` the way `@npmcli/config` picks the local prefix, and fails
+/// with npm's `EUNSUPPORTEDPROTOCOL` when that manifest uses `catalog:`
+/// specifiers. Exits 0 otherwise; never downloads anything.
+#[cfg(unix)]
+const FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
+{ printf '%s\n' "$PWD"; ls -A; } > '__REPORT__.tmp' && mv '__REPORT__.tmp' '__REPORT__'
+d="$PWD"
+while :; do
+  if [ -e "$d/package.json" ]; then
+    if grep -q 'catalog:' "$d/package.json"; then
+      echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2
+      echo 'npm error Unsupported URL Type "catalog:": catalog:' >&2
+      exit 1
+    fi
+    break
+  fi
+  [ "$d" = / ] && break
+  d=$(dirname "$d")
+done
+exit 0
+"#;
+
+/// Write [`FAKE_NPX_SCRIPT`] as an executable `npx` into `dir`.
 #[cfg(unix)]
 fn write_fake_npx(dir: &std::path::Path, report: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let npx = dir.join("npx");
     std::fs::write(
         &npx,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > '{report}'\nls -A | wc -l >> '{report}'\n\
-             if [ -e package.json ]; then\n  echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2\n  \
-             echo 'npm error Unsupported URL Type \"catalog:\": catalog:' >&2\n  exit 1\nfi\n\
-             exit 0\n",
-            report = report.display()
-        ),
+        FAKE_NPX_SCRIPT.replace("__REPORT__", &report.display().to_string()),
     )
     .unwrap();
     std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
     npx
 }
 
-/// Poll `report` until the fake npx has written both of its lines.
+/// Poll `report` until the fake npx has renamed it into place: the cwd it
+/// ran in and the names of that directory's entries.
 #[cfg(unix)]
-async fn read_npx_report(report: &std::path::Path) -> (std::path::PathBuf, usize) {
+async fn read_npx_report(report: &std::path::Path) -> (std::path::PathBuf, Vec<String>) {
     for _ in 0..200 {
         if let Ok(s) = tokio::fs::read_to_string(report).await {
             let mut lines = s.lines();
-            if let (Some(cwd), Some(count)) = (lines.next(), lines.next()) {
-                if let Ok(count) = count.trim().parse::<usize>() {
-                    return (std::path::PathBuf::from(cwd), count);
-                }
+            if let Some(cwd) = lines.next() {
+                let entries = lines.map(str::to_owned).collect();
+                return (std::path::PathBuf::from(cwd), entries);
             }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -693,13 +709,34 @@ async fn read_npx_report(report: &std::path::Path) -> (std::path::PathBuf, usize
     panic!("fake npx never reported its cwd to {}", report.display());
 }
 
-/// intent-hq/intent#5738: an npx launch runs npx in a neutral, EMPTY
-/// directory — never the workspace — so a `catalog:` workspace cannot break
-/// adapter startup. `opts.cwd` (the ACP session cwd the agent manager passes
-/// to `session/new` separately) is left untouched.
+/// The launch dir holds exactly the private sentinel `package.json` that stops
+/// npm's walk-up at the launch dir (so no ancestor manifest or project
+/// `.npmrc` is consulted) and nothing else.
+#[cfg(unix)]
+fn assert_neutral_launch_dir(npx_cwd: &std::path::Path, entries: &[String]) {
+    assert_eq!(
+        entries,
+        ["package.json"],
+        "npx launch dir {} must hold only the sentinel manifest",
+        npx_cwd.display()
+    );
+    let sentinel: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(npx_cwd.join("package.json")).unwrap())
+            .expect("sentinel package.json is JSON");
+    assert_eq!(sentinel["private"], serde_json::json!(true), "{sentinel}");
+    assert!(
+        sentinel.get("dependencies").is_none() && sentinel.get("workspaces").is_none(),
+        "sentinel must not declare dependencies or workspaces: {sentinel}"
+    );
+}
+
+/// intent-hq/intent#5738: an npx launch runs npx in a neutral directory —
+/// never the workspace — so a `catalog:` workspace cannot break adapter
+/// startup. `opts.cwd` (the ACP session cwd the agent manager passes to
+/// `session/new` separately) is left untouched.
 #[cfg(unix)]
 #[tokio::test]
-async fn spawn_provider_runs_npx_launch_in_an_empty_neutral_dir() {
+async fn spawn_provider_runs_npx_launch_in_a_neutral_dir() {
     use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
 
     let tmp = test_temp_dir("intent-acp-npx-isolation-");
@@ -727,17 +764,62 @@ async fn spawn_provider_runs_npx_launch_in_an_empty_neutral_dir() {
         "npx cwd {} is under the workspace",
         npx_cwd.display()
     );
-    assert_eq!(
-        entries,
-        0,
-        "npx launch dir {} is not empty",
-        npx_cwd.display()
-    );
+    assert_neutral_launch_dir(&npx_cwd, &entries);
     assert_eq!(
         opts.cwd,
         Some(workspace.as_path()),
         "ACP session cwd untouched"
     );
+    agent.kill().await.ok();
+}
+
+/// intent-hq/intent#5738: npm picks its project root by walking UP from the
+/// cwd to the nearest `package.json` and reads that root's `.npmrc`, so an
+/// empty launch dir is not neutral when an ancestor of `npx_launch_root`
+/// (here a `$HOME` holding a `catalog:` manifest above `.intent/agent-configs`)
+/// carries package configuration. The launch dir must terminate that walk.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_npx_launch_is_isolated_from_the_launch_roots_ancestors() {
+    use crate::spawn::{spawn_provider, SpawnOptions};
+
+    let tmp = test_temp_dir("intent-acp-npx-ancestor-");
+    let workspace = tmp.path().join("plain workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let home = tmp.path().join("home");
+    let launch_root = home.join(".intent").join("agent-configs");
+    std::fs::create_dir_all(&launch_root).unwrap();
+    std::fs::write(
+        home.join("package.json"),
+        r#"{"name":"home","private":true,"dependencies":{"zod":"catalog:"}}"#,
+    )
+    .unwrap();
+    std::fs::write(home.join(".npmrc"), "registry=http://127.0.0.1:9/\n").unwrap();
+    let report = tmp.path().join("npx-report");
+    let npx = write_fake_npx(tmp.path(), &report);
+
+    let provider = *intent_providers::find_provider("claude-code").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&workspace);
+    opts.npx_launch_root = Some(&launch_root);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = provider.npx_only_package;
+    assert!(opts.via_npx());
+
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn fake npx");
+    let (npx_cwd, entries) = read_npx_report(&report).await;
+    let status = agent.child_mut().wait().await.expect("wait fake npx");
+    assert!(
+        npx_cwd.starts_with(&launch_root),
+        "npx cwd {} is not under the launch root {}",
+        npx_cwd.display(),
+        launch_root.display()
+    );
+    assert!(
+        status.success(),
+        "npx must not walk up to the launch root's ancestor package.json (exit {status:?})"
+    );
+    assert_neutral_launch_dir(&npx_cwd, &entries);
     agent.kill().await.ok();
 }
 

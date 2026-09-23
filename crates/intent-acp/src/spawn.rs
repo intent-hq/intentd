@@ -40,12 +40,14 @@ pub struct SpawnOptions<'a> {
     /// directory for resolved-binary and bare-command launches. An npx
     /// launch does NOT start here — see [`SpawnOptions::npx_launch_root`].
     pub cwd: Option<&'a Path>,
-    /// Parent directory for the neutral, empty per-spawn directory an npx
+    /// Parent directory for the neutral per-spawn [`NpxLaunchDir`] an npx
     /// launch starts in (`None` → the OS temp dir). npm reads the package
     /// configuration of its cwd, so `npx -y <adapter>` run inside a Bun/pnpm
     /// workspace with `catalog:` specifiers dies before the adapter starts
     /// (intent-hq/intent#5738); the workspace stays the ACP session cwd,
-    /// never the npx process cwd. Ignored by every other launch tier.
+    /// never the npx process cwd. The launch dir shields npx from this root's
+    /// ancestors too, so any daemon-owned directory serves. Ignored by every
+    /// other launch tier.
     pub npx_launch_root: Option<&'a Path>,
     /// Path to a rules file (appended when the provider supports rules).
     pub rules_file: Option<&'a str>,
@@ -168,23 +170,34 @@ pub enum LaunchMode {
     BareCommand,
 }
 
-/// The neutral, empty directory an npx launch starts in (intent-hq/intent#5738).
+/// The neutral directory an npx launch starts in (intent-hq/intent#5738).
 /// Created per spawn under [`SpawnOptions::npx_launch_root`] (owner-only on
 /// Unix, uuid-named) and removed when dropped — the owner keeps it alive for
 /// the child's lifetime, since Node resolves relative paths against, and
 /// `process.cwd()` fails inside, a removed directory.
+///
+/// Being empty is not enough: npm picks its project root by walking up from
+/// the cwd to the nearest `package.json` (or `node_modules`) and reads that
+/// root's `.npmrc`, so the directory holds [`NPX_LAUNCH_SENTINEL_MANIFEST`] — a
+/// private, dependency-less manifest that makes the launch dir itself the
+/// project root, whatever the launch root's ancestors contain.
 #[derive(Debug)]
 pub struct NpxLaunchDir {
     path: PathBuf,
 }
 
+/// The `package.json` written into every [`NpxLaunchDir`].
+pub const NPX_LAUNCH_SENTINEL_MANIFEST: &str =
+    "{\n  \"name\": \"intentd-npx-launch\",\n  \"private\": true\n}\n";
+
 impl NpxLaunchDir {
-    /// Create a fresh empty directory under `root` (the OS temp dir when
-    /// `None`), creating missing parents.
+    /// Create a fresh directory under `root` (the OS temp dir when `None`),
+    /// creating missing parents, holding only the sentinel `package.json`.
     ///
     /// # Errors
     ///
-    /// Returns the underlying I/O error when the directory cannot be created.
+    /// Returns the underlying I/O error when the directory or its sentinel
+    /// manifest cannot be created.
     pub fn create(root: Option<&Path>) -> std::io::Result<Self> {
         let root = root.map_or_else(std::env::temp_dir, Path::to_path_buf);
         let path = root.join(format!("intentd-npx-{}", uuid::Uuid::new_v4()));
@@ -196,7 +209,9 @@ impl NpxLaunchDir {
             builder.mode(0o700);
         }
         builder.create(&path)?;
-        Ok(Self { path })
+        let dir = Self { path };
+        std::fs::write(dir.path.join("package.json"), NPX_LAUNCH_SENTINEL_MANIFEST)?;
+        Ok(dir)
     }
 
     /// The directory the npx child runs in.
@@ -459,7 +474,7 @@ fn reduced_priority_shortfall(pid: u32, increment: i32) -> Option<String> {
 ///
 /// An npx launch built here starts in `opts.npx_launch_root` (else the OS
 /// temp dir) rather than the workspace; only [`spawn_provider`] creates the
-/// per-spawn empty [`NpxLaunchDir`] underneath it.
+/// per-spawn [`NpxLaunchDir`] underneath it.
 #[must_use]
 pub fn build_command(opts: &SpawnOptions) -> Command {
     build_command_with_captured_env(opts, captured_credential_env(), agent_nice())
@@ -674,7 +689,7 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
     let nice_increment = agent_nice();
     let (launch, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
-    // An npx launch starts in a fresh empty directory, never the workspace
+    // An npx launch starts in a fresh neutral directory, never the workspace
     // (intent-hq/intent#5738); the workspace remains the ACP session cwd.
     let npx_launch_dir = if opts.via_npx() {
         Some(NpxLaunchDir::create(opts.npx_launch_root).map_err(|e| {
