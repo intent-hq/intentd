@@ -8560,6 +8560,22 @@ impl AgentManager {
             .map_err(|e| Error::Internal(format!("auggie version probe task failed: {e}")))??;
             resolved.provider_binary = Some(selected);
         }
+        // npx version gate (intent-hq/intent#5725): before a fresh child spawns
+        // through npx (npx-only providers and the codex npx fallback), reject
+        // an npm-6 npx with an actionable error instead of three doomed
+        // `npx -y` attempts. Only for a fresh spawn — a reused live child
+        // never re-runs npx, so a later stale or hanging probe must not fail
+        // or stall its next turn — and off the runtime like the auggie probe
+        // (blocking subprocess, ≤3s on a cache miss).
+        if let Some(npx) = resolved.npx_fallback_binary.clone() {
+            if !self.contains(agent_id) {
+                tokio::task::spawn_blocking(move || {
+                    guard_npx_version(&npx, intent_providers::find_node().as_deref())
+                })
+                .await
+                .map_err(|e| Error::Internal(format!("npx version probe task failed: {e}")))??;
+            }
+        }
         // unsloth spawn gate (spec "Proposed design" §4): before the child
         // spawns, make sure the daemon-managed Unsloth server is running and
         // ready for the session's model, and thread the resulting endpoint
@@ -10055,7 +10071,6 @@ fn resolve_spawn(
     let (npx_fallback_binary, npx_fallback_package) = if provider_binary.is_none() {
         if let Some(pkg) = provider.fallback_npx_package {
             if let Some(npx_path) = intent_providers::find_npx() {
-                guard_npx_version(&npx_path, intent_providers::find_node().as_deref())?;
                 tracing::info!(
                     provider_id = provider_id,
                     npx_path = ?npx_path,
@@ -10088,8 +10103,9 @@ fn resolve_spawn(
 
 /// Resolve the npx spawn inputs for an npx-only provider. `npx_path` is the
 /// caller-supplied `find_npx()` result (parameterized as a test seam). Missing
-/// npx is a hard, user-facing error — there is no local-binary fallback — and
-/// so is a stale npm-6 npx ([`guard_npx_version`]).
+/// npx is a hard, user-facing error — there is no local-binary fallback. A
+/// stale npm-6 npx is rejected later, by [`guard_npx_version`] in
+/// `ensure_started`, only when a fresh child is about to spawn.
 fn resolve_npx_only(
     provider: &ProviderConfig,
     npx_path: Option<PathBuf>,
@@ -10110,7 +10126,6 @@ fn resolve_npx_only(
             provider.display_name
         ))
     })?;
-    guard_npx_version(&npx, intent_providers::find_node().as_deref())?;
     tracing::info!(
         provider_id = provider.id,
         npx_path = ?npx,
@@ -10126,8 +10141,9 @@ fn resolve_npx_only(
 /// the remedy — npm 6's npx rejects `npx -y <pkg>` outright, so the spawn
 /// would otherwise retry three times and surface only "agent stdout closed".
 /// Permissive when the probe fails or its output does not parse (same policy
-/// as the pi/auggie gates). Shared by the npx-only path and the codex npx
-/// fallback.
+/// as the pi/auggie gates). Runs from `ensure_started` for every fresh
+/// npx-backed spawn (npx-only providers and the codex npx fallback); blocking
+/// (subprocess), so callers run it off the runtime.
 fn guard_npx_version(npx: &Path, node: Option<&Path>) -> Result<()> {
     let gate = intent_providers::npx_gate(&probe_npx_version_cached(npx));
     match intent_providers::stale_npx_reason(&gate, npx, node) {
@@ -10144,27 +10160,70 @@ fn guard_npx_version(npx: &Path, node: Option<&Path>) -> Result<()> {
     }
 }
 
-/// `npx --version` probe result memoized per npx path + file mtime, so the
-/// guard costs one short subprocess per distinct npx binary per daemon
-/// lifetime (`resolve_spawn` runs on every turn) and a repointed/upgraded
-/// npx is re-probed. A failed probe is cached too — that outcome is
-/// permissive, so caching it only preserves the pre-guard behaviour.
+/// How long a memoized `npx --version` verdict stays valid without a
+/// re-probe. A replacement that preserves every fingerprint field is
+/// re-checked after this at the latest, so a repaired installation is never
+/// rejected for the rest of the daemon's lifetime.
+const NPX_PROBE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Identity of the file behind an npx path, for cache invalidation: the
+/// symlink target (a repointed `/usr/local/bin/npx` changes it even when the
+/// new target carries the same metadata — published npm 6/7/11 archives all
+/// stamp `npx-cli.js` with the same mtime), size, mtime, and on Unix the
+/// device + inode. `None` when the path cannot be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NpxFingerprint {
+    target: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    dev_ino: (u64, u64),
+}
+
+fn npx_fingerprint(npx: &Path) -> Option<NpxFingerprint> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(npx).ok()?;
+    Some(NpxFingerprint {
+        target: std::fs::canonicalize(npx).unwrap_or_else(|_| npx.to_path_buf()),
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        #[cfg(unix)]
+        dev_ino: (meta.dev(), meta.ino()),
+    })
+}
+
+/// `npx --version` probe result memoized per npx path, keyed on the file's
+/// [`NpxFingerprint`] and bounded by [`NPX_PROBE_TTL`], so the guard costs
+/// one short subprocess per distinct npx binary per TTL window and a
+/// repointed/upgraded npx is re-probed. A failed probe is cached too — that
+/// outcome is permissive, so caching it only preserves the pre-guard
+/// behaviour.
 fn probe_npx_version_cached(npx: &Path) -> intent_providers::PiCliProbe {
     use intent_providers::PiCliProbe;
-    type NpxProbeCache = Mutex<HashMap<PathBuf, (Option<SystemTime>, PiCliProbe)>>;
-    static CACHE: std::sync::OnceLock<NpxProbeCache> = std::sync::OnceLock::new();
-    let mtime = std::fs::metadata(npx).and_then(|m| m.modified()).ok();
+    struct CachedProbe {
+        fingerprint: Option<NpxFingerprint>,
+        probed_at: Instant,
+        probe: PiCliProbe,
+    }
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, CachedProbe>>> =
+        std::sync::OnceLock::new();
+    let fingerprint = npx_fingerprint(npx);
     let cache = CACHE.get_or_init(Mutex::default);
-    if let Some((cached_mtime, probe)) = cache.lock().unwrap().get(npx) {
-        if *cached_mtime == mtime {
-            return probe.clone();
+    if let Some(cached) = cache.lock().unwrap().get(npx) {
+        if cached.fingerprint == fingerprint && cached.probed_at.elapsed() < NPX_PROBE_TTL {
+            return cached.probe.clone();
         }
     }
     let probe = run_npx_version_probe(npx).map_or(PiCliProbe::Failed, PiCliProbe::Output);
-    cache
-        .lock()
-        .unwrap()
-        .insert(npx.to_path_buf(), (mtime, probe.clone()));
+    cache.lock().unwrap().insert(
+        npx.to_path_buf(),
+        CachedProbe {
+            fingerprint,
+            probed_at: Instant::now(),
+            probe: probe.clone(),
+        },
+    );
     probe
 }
 

@@ -786,7 +786,7 @@ fn find_in_dirs_for(dirs: &[PathBuf], command: &str, is_windows: bool) -> Option
 
 /// Resolve `npx` to an absolute path using the same enhanced PATH scanning that
 /// `find_provider_binary` uses, preferring the `npx` that belongs to the
-/// detected `node`: the first `node` over the enhanced dirs (the one
+/// detected `node`: the `node` [`find_node`] resolves (the one
 /// `host.checkNode` reports) is followed through symlinks and the `npx` in
 /// that same directory wins. Only when no such sibling exists does the plain
 /// first-match scan decide. This keeps node/npx from the same toolchain when
@@ -796,27 +796,67 @@ fn find_in_dirs_for(dirs: &[PathBuf], command: &str, is_windows: bool) -> Option
 /// `None` when npx cannot be found.
 #[must_use]
 pub fn find_npx() -> Option<PathBuf> {
-    find_npx_in_dirs(&intent_core::path_utils::enhanced_path_dirs())
+    find_npx_in_dirs(
+        &intent_core::path_utils::inherited_path_dirs(),
+        &intent_core::path_utils::enriched_tool_dirs(),
+    )
 }
 
-/// Resolve the `node` the daemon detects — the first executable `node` over
-/// the enhanced PATH dirs, the same one [`find_npx`] pairs npx with. Not
+/// Resolve the `node` the daemon detects — the same candidate the
+/// `host.checkNode` resolver (`intent-transport::host_ops`) reports, so the
+/// npx [`find_npx`] pairs with it and the guard's diagnostic name the Node the
+/// UI shows: the inherited PATH first, then the newest usable nvm
+/// installation (a GUI launch outside a login shell often inherits no
+/// `node`), then the remaining enriched tool dirs — NOT the plain enhanced
+/// scan, whose `/usr/local/bin` / Homebrew entries precede the nvm dirs and
+/// would pair an older global Node's npx with a detected Node 24. Not
 /// canonicalized: user-facing messages name the path as it appears on PATH.
 #[must_use]
 pub fn find_node() -> Option<PathBuf> {
-    find_in_enhanced_dirs("node")
+    find_node_in_dirs_for(
+        &intent_core::path_utils::inherited_path_dirs(),
+        &intent_core::path_utils::enriched_tool_dirs(),
+        cfg!(windows),
+    )
 }
 
-/// [`find_npx`] over an explicit dir list (test seam).
-fn find_npx_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
-    find_npx_in_dirs_for(dirs, cfg!(windows))
+/// [`find_node`] over explicit inherited-PATH and enriched dir lists,
+/// parametrized on the platform (test seam).
+fn find_node_in_dirs_for(
+    inherited: &[PathBuf],
+    enriched: &[PathBuf],
+    is_windows: bool,
+) -> Option<PathBuf> {
+    find_in_dirs_for(inherited, "node", is_windows)
+        .or_else(|| {
+            let nvm_dirs: Vec<PathBuf> = enriched
+                .iter()
+                .filter(|dir| intent_core::path_utils::is_nvm_node_bin_dir(dir))
+                .cloned()
+                .collect();
+            find_in_dirs_for(&nvm_dirs, "node", is_windows)
+        })
+        .or_else(|| find_in_dirs_for(enriched, "node", is_windows))
 }
 
-/// [`find_npx_in_dirs`] parametrized on the platform (test seam).
-fn find_npx_in_dirs_for(dirs: &[PathBuf], is_windows: bool) -> Option<PathBuf> {
-    find_in_dirs_for(dirs, "node", is_windows)
+/// [`find_npx`] over explicit inherited-PATH and enriched dir lists (test
+/// seam).
+fn find_npx_in_dirs(inherited: &[PathBuf], enriched: &[PathBuf]) -> Option<PathBuf> {
+    find_npx_in_dirs_for(inherited, enriched, cfg!(windows))
+}
+
+/// [`find_npx_in_dirs`] parametrized on the platform (test seam). The
+/// fallback scan covers the inherited dirs then the enriched dirs — the
+/// [`intent_core::path_utils::enhanced_path_dirs`] order.
+fn find_npx_in_dirs_for(
+    inherited: &[PathBuf],
+    enriched: &[PathBuf],
+    is_windows: bool,
+) -> Option<PathBuf> {
+    find_node_in_dirs_for(inherited, enriched, is_windows)
         .and_then(|node| npx_beside_node(&node, is_windows))
-        .or_else(|| find_in_dirs_for(dirs, "npx", is_windows))
+        .or_else(|| find_in_dirs_for(inherited, "npx", is_windows))
+        .or_else(|| find_in_dirs_for(enriched, "npx", is_windows))
 }
 
 /// The `npx` shipped with `node`: looked up in the directory of node's
@@ -1642,7 +1682,53 @@ mod find_provider_binary_tests {
         make_executable(&usr_local_bin.join("npx"));
 
         let dirs = vec![usr_local_bin, v24_bin];
-        assert_eq!(find_npx_in_dirs(&dirs), Some(sibling_npx));
+        assert_eq!(find_npx_in_dirs(&dirs, &[]), Some(sibling_npx));
+    }
+
+    /// The inherited PATH carries no `node` (a GUI launch outside a login
+    /// shell) while the enriched dirs list `/usr/local/bin` — holding an older
+    /// global node + npm-6 npx — ahead of the nvm dirs. `host.checkNode`
+    /// reports the newest nvm Node in that case, so `find_node` / `find_npx`
+    /// must apply the same nvm-first fallback instead of pairing with the
+    /// older global installation the plain enhanced scan reaches first.
+    #[cfg(unix)]
+    #[test]
+    fn find_npx_prefers_nvm_node_over_earlier_enriched_dirs_without_inherited_node() {
+        let home = unique_temp_dir("npx-nvm-fallback-home");
+        let inherited_bin = home.path().join("inherited/bin");
+        let usr_local_bin = home.path().join("usr/local/bin");
+        let v24_bin = home.path().join(".nvm/versions/node/v24.16.0/bin");
+        for dir in [&inherited_bin, &usr_local_bin, &v24_bin] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        make_executable(&usr_local_bin.join("node"));
+        make_executable(&usr_local_bin.join("npx"));
+        make_executable(&v24_bin.join("node"));
+        let sibling_npx = v24_bin.join("npx");
+        make_executable(&sibling_npx);
+
+        let inherited = vec![inherited_bin.clone()];
+        let enriched = vec![usr_local_bin.clone(), v24_bin.clone()];
+        assert_eq!(
+            find_node_in_dirs_for(&inherited, &enriched, false),
+            Some(v24_bin.join("node"))
+        );
+        assert_eq!(
+            find_npx_in_dirs(&inherited, &enriched),
+            Some(sibling_npx.clone())
+        );
+
+        // An inherited-PATH node still wins over any nvm installation, as in
+        // `host.checkNode` (a merely installed version never overrides the
+        // host's active Node).
+        make_executable(&inherited_bin.join("node"));
+        let inherited_npx = inherited_bin.join("npx");
+        make_executable(&inherited_npx);
+        assert_eq!(
+            find_node_in_dirs_for(&inherited, &enriched, false),
+            Some(inherited_bin.join("node"))
+        );
+        assert_eq!(find_npx_in_dirs(&inherited, &enriched), Some(inherited_npx));
     }
 
     /// A non-symlinked node later on PATH still pulls in its own npx ahead of
@@ -1661,7 +1747,7 @@ mod find_provider_binary_tests {
         make_executable(&sibling_npx);
 
         let dirs = vec![stale_bin, v24_bin];
-        assert_eq!(find_npx_in_dirs(&dirs), Some(sibling_npx));
+        assert_eq!(find_npx_in_dirs(&dirs, &[]), Some(sibling_npx));
     }
 
     /// No npx beside the detected node (or no node at all) → the first-match
@@ -1679,13 +1765,16 @@ mod find_provider_binary_tests {
         make_executable(&v24_bin.join("node"));
 
         let dirs = vec![usr_local_bin.clone(), v24_bin];
-        assert_eq!(find_npx_in_dirs(&dirs), Some(scan_npx.clone()));
+        assert_eq!(find_npx_in_dirs(&dirs, &[]), Some(scan_npx.clone()));
 
-        let dirs_without_node = vec![usr_local_bin];
-        assert_eq!(find_npx_in_dirs(&dirs_without_node), Some(scan_npx));
+        let dirs_without_node = vec![usr_local_bin.clone()];
+        assert_eq!(
+            find_npx_in_dirs(&dirs_without_node, &[]),
+            Some(scan_npx.clone())
+        );
+        assert_eq!(find_npx_in_dirs(&[], &dirs_without_node), Some(scan_npx));
 
-        let empty: Vec<PathBuf> = Vec::new();
-        assert_eq!(find_npx_in_dirs(&empty), None);
+        assert_eq!(find_npx_in_dirs(&[], &[]), None);
     }
 
     #[test]

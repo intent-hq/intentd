@@ -15878,11 +15878,53 @@ fn resolve_npx_only_rejects_stale_npm6_npx_naming_both_paths() {
     assert!(msg.contains("6.14.18"), "{msg}");
     assert!(msg.contains("PATH"), "{msg}");
 
+    // The guard is a fresh-spawn gate in `ensure_started`, not part of
+    // per-turn resolution: a reused live child never re-runs npx, so
+    // resolving the spawn inputs must not probe or reject.
     let provider = intent_providers::provider_config("claude-code");
-    let err = resolve_npx_only(provider, Some(npx.clone()))
-        .expect_err("npx-only resolution applies the guard");
-    assert!(matches!(err, intent_core::Error::InvalidInput(_)));
-    assert!(err.to_string().contains(&npx.display().to_string()));
+    let (bin, _) = resolve_npx_only(provider, Some(npx.clone()))
+        .expect("resolution itself does not apply the guard");
+    assert_eq!(bin, npx);
+}
+
+/// The memoized verdict must follow the FILE behind the npx path, not the
+/// path alone: repointing `npx` from a stale npm-6 install to a repaired one
+/// whose target has the same size and mtime (published npm 6/7/11 archives
+/// all stamp `npx-cli.js` identically) must be re-probed and accepted, not
+/// rejected from cache for the daemon's lifetime.
+#[cfg(unix)]
+#[test]
+fn guard_npx_version_reprobes_when_npx_is_repointed_to_an_identical_looking_target() {
+    let dir = test_tempdir("intentd-repointed-npx-");
+    let stale_dir = dir.path().join("stale");
+    let fresh_dir = dir.path().join("fresh");
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    std::fs::create_dir_all(&fresh_dir).unwrap();
+    // Same byte length ("6.14.18" / "11.13.0") and the same mtime.
+    let stale = fake_npx_printing(&stale_dir, "6.14.18");
+    let fresh = fake_npx_printing(&fresh_dir, "11.13.0");
+    assert_eq!(
+        std::fs::metadata(&stale).unwrap().len(),
+        std::fs::metadata(&fresh).unwrap().len()
+    );
+    let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(499_162_500);
+    for script in [&stale, &fresh] {
+        std::fs::File::options()
+            .write(true)
+            .open(script)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+    }
+
+    let npx = dir.path().join("npx");
+    std::os::unix::fs::symlink(&stale, &npx).unwrap();
+    let err = guard_npx_version(&npx, None).expect_err("stale target is rejected");
+    assert!(err.to_string().contains("6.14.18"), "{err}");
+
+    std::fs::remove_file(&npx).unwrap();
+    std::os::unix::fs::symlink(&fresh, &npx).unwrap();
+    guard_npx_version(&npx, None).expect("repointed npx is re-probed and accepted");
 }
 
 /// npm 7+ and an unprobeable npx both pass the guard (permissive on Unknown,
