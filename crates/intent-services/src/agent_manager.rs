@@ -42,8 +42,8 @@ use intent_acp::{
     spawn_provider, to_acp_session_mcp_servers, to_auggie_mcp_config, to_opencode_mcp_config,
     ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
     IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer, NormalizedMcpServers,
-    PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData, SinkEvent,
-    SpawnOptions, WorkspaceMcpServer,
+    NpxLaunchDir, PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
+    SinkEvent, SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
@@ -2342,6 +2342,9 @@ struct AgentHandle {
     /// Bundled pi-extension MCP delivery files (extension + wrapper script),
     /// removed when the handle drops (pi only).
     _pi_extension: Option<PiExtensionDelivery>,
+    /// The neutral directory an npx launch started in, removed when the
+    /// handle drops (intent-hq/intent#5738; `None` for other launch tiers).
+    _npx_launch_dir: Option<NpxLaunchDir>,
     antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
@@ -3250,6 +3253,13 @@ impl AgentManager {
             mcp_config_path.as_deref(),
             env_mcp_config.as_deref(),
         );
+        // An npx launch starts in a fresh empty dir under the daemon-owned
+        // agent-configs root (startup-swept like the config files above), so
+        // the workspace's own package configuration never reaches npm
+        // (intent-hq/intent#5738). The workspace stays the ACP session cwd.
+        if spawn_opts.npx_launch_root.is_none() {
+            spawn_opts.npx_launch_root = Some(config_dir.as_path());
+        }
         // `agents.acpNodeMaxOldSpaceMb` is read live per spawn (not pinned at
         // boot), so a settings change applies to the next spawned/respawned
         // provider process without a daemon restart (intent-hq/intent#4330).
@@ -3311,7 +3321,7 @@ impl AgentManager {
             .await;
         let spawned = spawn_provider(&spawn_opts, hooks)
             .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
-        let (child, connection) = spawned.into_parts();
+        let (child, connection, npx_launch_dir) = spawned.into_parts();
         // Pin the spawned child's pid for the exit watcher armed below: the
         // watcher stands down when the handle's child no longer matches it
         // (a respawn installed a newer child with its own watcher).
@@ -3358,6 +3368,7 @@ impl AgentManager {
             _mcp_config: mcp_config,
             _rules_config: rules_config,
             _pi_extension: pi_extension,
+            _npx_launch_dir: npx_launch_dir,
             antigravity_profile,
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
@@ -10144,6 +10155,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.env_mcp_config = env_mcp_config;
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
     spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
+    spawn_opts.npx_launch_root = opts.npx_launch_root;
     spawn_opts
 }
 
@@ -11762,6 +11774,14 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
 /// child, publish an `agent:stream:status` retry hint, and spawn a fresh
 /// process. Returns the `acpSessionId` on success, or the final error after
 /// exhausting all attempts.
+///
+/// A retried attempt's WARN names the stderr capture dir when THAT attempt's
+/// child wrote stderr before dying (via [`stderr_capture_hint`], which sweeps
+/// the child's process group and bounded-awaits the flush first), so the
+/// first failure stays diagnosable even when a later attempt succeeds and
+/// nothing terminal is ever surfaced. The final / non-retryable attempt keeps
+/// the plain WARN: its handle is left installed for the caller's terminal
+/// "failed after all retries" hint.
 async fn retry_spawn(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -11775,24 +11795,44 @@ async fn retry_spawn(
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
                 let error_msg = e.to_string();
-                tracing::warn!(
-                    agent = %agent_id,
-                    attempt = attempt,
-                    max = MAX_SPAWN_ATTEMPTS,
-                    retryable = retryable,
-                    error = %e,
-                    "agent spawn attempt failed"
-                );
+                let will_retry = retryable && attempt < MAX_SPAWN_ATTEMPTS;
+                let captured = if will_retry {
+                    stderr_capture_hint(mgr, agent_id, &e).await
+                } else {
+                    None
+                };
+                if let Some(log) = captured {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        attempt = attempt,
+                        max = MAX_SPAWN_ATTEMPTS,
+                        retryable = retryable,
+                        error = %e,
+                        "agent spawn attempt failed (agent stderr captured at {})",
+                        log.display()
+                    );
+                } else {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        attempt = attempt,
+                        max = MAX_SPAWN_ATTEMPTS,
+                        retryable = retryable,
+                        error = %e,
+                        "agent spawn attempt failed"
+                    );
+                }
 
                 last_error = Some(e);
 
                 // If non-retryable or last attempt, fail immediately
-                if !retryable || attempt == MAX_SPAWN_ATTEMPTS {
+                if !will_retry {
                     break;
                 }
 
                 // Tear down the failed child so the next attempt spawns fresh
-                // (narrower than full stop() — only kills child/handle, no worker/busy-flag touch)
+                // (narrower than full stop() — only kills child/handle, no
+                // worker/busy-flag touch). A no-op when the hint above
+                // already swept it.
                 mgr.kill_child_only(agent_id).await;
 
                 // Publish retry status hint with the actual failure kind
@@ -12617,9 +12657,10 @@ fn is_benign_turn_error(err: &Error) -> bool {
     prompt_cancellation_error(err)
 }
 
-/// STAB-53: when a terminal failure means the child died mid-turn ("agent
-/// stdout closed") and stderr capture is enabled, return the capture directory
-/// for `agent_id` so the WARN line can point at the child's last words.
+/// STAB-53: when a failure means the child died ("agent stdout closed" — a
+/// terminal mid-turn failure, or a startup attempt [`retry_spawn`] is about
+/// to retry) and stderr capture is enabled, return the capture directory for
+/// `agent_id` so the WARN line can point at the child's last words.
 /// Matches on the structured `Error::Internal` payload — the transport's
 /// child-death error is always wrapped there (handshake/prompt failures) —
 /// avoiding a Display allocation per check.
@@ -12699,6 +12740,176 @@ mod stderr_capture_hint_tests {
             stderr_capture_dir_populated(&empty),
             "dir with a capture file"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod first_attempt_stderr_hint_tests {
+    //! First-failed-startup diagnostics: `retry_spawn`'s per-attempt WARN
+    //! names the stderr capture dir when THIS attempt's child wrote stderr
+    //! before dying, so a later successful retry cannot hide where the first
+    //! failure's last words went — and the claim stays honest: a silent
+    //! child over a stale capture dir names nothing.
+
+    use super::dead_child_respawn_tests::{install_handle_with_connection, mock_agent_script};
+    use super::role_reminder_tests::{manager_with, session};
+    use super::tests::{AgentManagerLogCapture, EnvGuard};
+    use super::*;
+
+    const STDOUT_CLOSED: &str = "handshake failed: JSON-RPC error 0: agent stdout closed";
+
+    fn read_capture_dir(dir: &Path) -> String {
+        let mut out = String::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                out.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+        out
+    }
+
+    /// Mock exits (logging to stderr) on attempt 1 and serves attempt 2: the
+    /// attempt-1 WARN names the capture dir holding its last words, the
+    /// retry still succeeds, and no later WARN obscures the first one.
+    #[tokio::test]
+    async fn first_failed_attempt_warn_names_capture_dir_then_retry_succeeds() {
+        let script = mock_agent_script();
+        let tmp = crate::tests::test_tempdir("intentd-first-attempt-hint-");
+        let attempt_file = tmp.path().join("attempts.txt");
+        let attempt_file = attempt_file.to_string_lossy().into_owned();
+        let _env = EnvGuard::apply(&[
+            ("MOCK_AGENT_SCRIPT_PATH", Some(script.as_str())),
+            (
+                "MOCK_AGENT_BEHAVIOR",
+                Some(r#"{"exitImmediatelyAttempts":1}"#),
+            ),
+            ("MOCK_AGENT_ATTEMPT_FILE", Some(attempt_file.as_str())),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", Some("0,0")),
+        ]);
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let log_root = tmp.path().join("agent-logs");
+        let mgr = mgr.with_agent_log_root(log_root.clone());
+        let ws = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-first-attempt-hint");
+        let mut s = session(&agent_id, &ws, None);
+        s.provider = Some("mock".to_string());
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+
+        let capture = AgentManagerLogCapture::default();
+        let guard = capture.set_as_default();
+        let result = retry_spawn(&mgr, &agent_id, &ws).await;
+        drop(guard);
+        assert!(
+            result.is_ok(),
+            "attempt 2 succeeds after the attempt-1 exit: {result:?}"
+        );
+
+        let capture_dir = log_root.join(&agent_id.0);
+        let captured = read_capture_dir(&capture_dir);
+        assert!(
+            captured.contains("exiting immediately (attempt 1/1)"),
+            "capture dir {} holds the attempt-1 child's last words; got: {captured:?}",
+            capture_dir.display()
+        );
+
+        let lines = capture.lines();
+        let attempt_warns: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("agent spawn attempt failed"))
+            .collect();
+        assert_eq!(
+            attempt_warns.len(),
+            1,
+            "exactly one failed attempt was logged: {lines:?}"
+        );
+        let first = attempt_warns[0];
+        assert!(first.contains("attempt=1"), "WARN is attempt one: {first}");
+        let expected = format!("agent stderr captured at {}", capture_dir.display());
+        assert!(
+            first.contains(&expected),
+            "attempt-1 WARN names the capture dir {expected:?}: {first}"
+        );
+        assert!(
+            mgr.handle_is_live(&agent_id),
+            "the successful retry leaves a live handle installed"
+        );
+        mgr.kill_child_only(&agent_id).await;
+    }
+
+    /// A child that died without writing stderr, over a capture dir a
+    /// previous run populated, must not be claimed as "stderr captured at"
+    /// — the per-connection `stderr_captured` flag gates the hint. The same
+    /// connection shape with fresh output names the dir.
+    #[tokio::test]
+    async fn silent_child_over_stale_capture_claims_nothing() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let tmp = crate::tests::test_tempdir("intentd-stale-capture-hint-");
+        let log_root = tmp.path().join("agent-logs");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = mgr.with_agent_log_root(log_root.clone());
+        let agent_id = AgentId::from("agent-stale-capture");
+        let dir = log_root.join(&agent_id.0);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2020-01-01.log"), "old run\n").unwrap();
+        let err = Error::Internal(STDOUT_CLOSED.to_string());
+
+        let connect = |dir: PathBuf| {
+            let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
+            let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
+            let (stderr_w, stderr_r) = tokio::io::duplex(4096);
+            let hooks = ConnectionHooks {
+                stderr_log_dir: Some(dir),
+                ..ConnectionHooks::default()
+            };
+            let conn = Arc::new(Connection::new(
+                c2a_client,
+                a2c_client,
+                Some(Box::new(stderr_r)),
+                hooks,
+            ));
+            (conn, stderr_w, (c2a_agent, a2c_agent))
+        };
+
+        // Silent child: EOF with no output → no claim despite the stale file.
+        let (conn, stderr_w, _ends) = connect(dir.clone());
+        install_handle_with_connection(&mgr, &agent_id, None, conn);
+        drop(stderr_w);
+        assert!(
+            stderr_capture_hint(&mgr, &agent_id, &err).await.is_none(),
+            "silent child over a stale capture dir must not claim capture"
+        );
+        assert!(
+            !mgr.handles.lock().unwrap().contains_key(&agent_id),
+            "the hint tore the failed child's handle down"
+        );
+
+        // Child that wrote stderr before dying → the dir is named.
+        let (conn, mut stderr_w, _ends) = connect(dir.clone());
+        install_handle_with_connection(&mgr, &agent_id, None, conn);
+        stderr_w.write_all(b"fresh crash output\n").await.unwrap();
+        stderr_w.flush().await.unwrap();
+        drop(stderr_w);
+        assert_eq!(
+            stderr_capture_hint(&mgr, &agent_id, &err).await,
+            Some(dir.clone()),
+            "child that wrote stderr names its capture dir"
+        );
+
+        // Not a child-death error → no claim even with a fresh capture.
+        let (conn, mut stderr_w, _ends) = connect(dir.clone());
+        install_handle_with_connection(&mgr, &agent_id, None, conn);
+        stderr_w.write_all(b"unrelated\n").await.unwrap();
+        stderr_w.flush().await.unwrap();
+        drop(stderr_w);
+        let timeout = Error::Internal("session/new failed: timed out".to_string());
+        assert!(
+            stderr_capture_hint(&mgr, &agent_id, &timeout)
+                .await
+                .is_none(),
+            "a non-child-death error never carries the hint"
+        );
+        mgr.kill_child_only(&agent_id).await;
     }
 }
 
@@ -14564,6 +14775,19 @@ mod dead_child_respawn_tests {
             None,
             ConnectionHooks::default(),
         ));
+        install_handle_with_connection(mgr, agent_id, child, connection);
+        (c2a_agent, a2c_agent)
+    }
+
+    /// Install a handle around a caller-built `connection` (e.g. one with a
+    /// stderr pipe + capture dir) so tests can drive the stderr-capture hint
+    /// against a connection whose capture state they control.
+    pub(super) fn install_handle_with_connection(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        child: Option<Child>,
+        connection: Arc<Connection>,
+    ) {
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let child_pid = child.as_ref().and_then(tokio::process::Child::id);
         let handle = AgentHandle {
@@ -14576,6 +14800,7 @@ mod dead_child_respawn_tests {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            _npx_launch_dir: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -14585,7 +14810,6 @@ mod dead_child_respawn_tests {
             wake_listener: None,
         };
         mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
-        (c2a_agent, a2c_agent)
     }
 
     /// Live child + unchanged model → the cached session comes back with no

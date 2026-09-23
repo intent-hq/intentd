@@ -2321,6 +2321,7 @@ fn mock_handle() -> AgentHandle {
         _mcp_config: None,
         _rules_config: None,
         _pi_extension: None,
+        _npx_launch_dir: None,
         antigravity_profile: None,
         session_mcp_servers: Vec::new(),
         spawned_model: None,
@@ -4597,6 +4598,7 @@ fn track_mock_agent_inner(
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            _npx_launch_dir: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -4746,6 +4748,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            _npx_launch_dir: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -8491,6 +8494,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            _npx_launch_dir: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -14020,14 +14024,14 @@ enum TargetHome {
 /// Captures the `agent_manager` tracing events (fields rendered as
 /// `name=value`) so a test can assert on the session-workspace rebind log.
 #[derive(Clone, Default)]
-struct AgentManagerLogCapture(Arc<Mutex<Vec<String>>>);
+pub(super) struct AgentManagerLogCapture(Arc<Mutex<Vec<String>>>);
 
 impl AgentManagerLogCapture {
-    fn lines(&self) -> Vec<String> {
+    pub(super) fn lines(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
     }
 
-    fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
+    pub(super) fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
         crate::test_tracing::set_capture_default(self.clone())
     }
 }
@@ -19421,6 +19425,7 @@ mod harness_wake_tests {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            _npx_launch_dir: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
