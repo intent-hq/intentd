@@ -1353,10 +1353,13 @@ wait
     /// A fake `npx` whose leader EXITS right after starting its grandchild,
     /// leaving the `sleep` behind in the leader's process group (plain `sh`,
     /// no job control). Models an adapter chain whose direct child died
-    /// while a same-group descendant kept running in the launch dir.
+    /// while a same-group descendant kept running in the launch dir. The
+    /// grandchild IGNORES SIGTERM (`SIG_IGN` survives `exec`), so only the
+    /// group's SIGKILL escalation — which must not be skipped because the
+    /// leader is already reaped — can end it.
     const EXITING_FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
 printf '%s\n' "$PWD" > "$INTENTD_FAKE_NPX_REPORT.tmp" && mv "$INTENTD_FAKE_NPX_REPORT.tmp" "$INTENTD_FAKE_NPX_REPORT"
-sleep 300 &
+sh -c 'trap "" TERM; exec sleep 300' &
 echo $! > "$INTENTD_FAKE_NPX_PIDFILE"
 exit 0
 "#;
