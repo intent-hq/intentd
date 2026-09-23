@@ -160,12 +160,26 @@ pub(crate) const PROMPT_SUSPEND_INTERRUPT_PREFIX: &str =
 /// against this prefix so the contract cannot drift.
 pub(crate) const PROMPT_AUTH_REQUIRED_PREFIX: &str = "session/prompt: provider \"";
 
+/// The auth-specific marker of [`crate::provider_auth::not_authenticated_message`].
+/// The turn-start disabled-provider rejection
+/// ([`crate::agent_ops::ensure_provider_enabled`] labelled `session/prompt`,
+/// intent-hq/intent#5737) shares [`PROMPT_AUTH_REQUIRED_PREFIX`] but reads
+/// `… is not enabled …` and has NOT emitted the terminal pair, so the
+/// classifier requires this marker too.
+pub(crate) const PROMPT_AUTH_REQUIRED_MARKER: &str = ") is not authenticated";
+
 /// Whether a turn error is the auth-required `session/prompt` mapping from
-/// [`Services::run_prompt_turn`] (see [`PROMPT_AUTH_REQUIRED_PREFIX`]).
-/// Prefix-anchored on the `InvalidParams` payload — mid-string mentions and
-/// other `InvalidParams` shapes never classify.
+/// [`Services::run_prompt_turn`] (see [`PROMPT_AUTH_REQUIRED_PREFIX`] and
+/// [`PROMPT_AUTH_REQUIRED_MARKER`]). Prefix-anchored on the `InvalidParams`
+/// payload — mid-string mentions, the disabled-provider rejection, and other
+/// `InvalidParams` shapes never classify.
 pub(crate) fn prompt_auth_required_turn_error(err: &Error) -> bool {
-    matches!(err, Error::InvalidParams(msg) if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX))
+    matches!(
+        err,
+        Error::InvalidParams(msg)
+            if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX)
+                && msg.contains(PROMPT_AUTH_REQUIRED_MARKER)
+    )
 }
 
 /// Prefix of the auth-required `session/load` mapping
