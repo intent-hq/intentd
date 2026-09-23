@@ -21,13 +21,15 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
+#[cfg(unix)]
+use super::guard_npx_version;
 use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
-    guard_npx_version, is_cancel_transport_closed, pop_and_wake_waiter,
-    recommended_memory_budget_bytes, resolve_npx_only, resolve_spawn, settle_stale_waiter,
-    text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, RegistryInner,
-    ResolvedSpawn, TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES,
-    PROVISIONAL_AGENT_BYTES, REASON_MEMORY_BUDGET, REASON_SLOTS,
+    is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
+    resolve_npx_only, resolve_spawn, settle_stale_waiter, text_prompt, AgentHandle, AgentManager,
+    BusEventSink, KillFn, ProcessRegistry, RegistryInner, ResolvedSpawn, TreeMemoryProbe,
+    TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES,
+    REASON_MEMORY_BUDGET, REASON_SLOTS,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
