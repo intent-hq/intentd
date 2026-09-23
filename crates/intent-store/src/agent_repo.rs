@@ -2373,8 +2373,14 @@ impl Store {
     /// change `provider` after first real use (the case
     /// [`Store::update_agent_session`]'s immutability guard rejects), and
     /// unlike it the model may be `None` (the target provider's CLI default).
-    /// Scoped to `workspace_id` (defense-in-depth). `NotFound` if the session
-    /// is absent or the workspace does not match.
+    /// Compare-and-set on the `provider` column: the write lands only while
+    /// the row still carries `expected_provider` (the value the caller read
+    /// and found disabled; `None` matches a NULL column), so a concurrent
+    /// `agent.setModel` that moved the session elsewhere between the
+    /// caller's read and this write is never overwritten — the call then
+    /// returns `Ok(false)` and mutates nothing. Scoped to `workspace_id`
+    /// (defense-in-depth). `NotFound` if the session is absent or the
+    /// workspace does not match.
     ///
     /// # Errors
     ///
@@ -2383,27 +2389,40 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         id: &AgentId,
+        expected_provider: Option<&str>,
         provider: &str,
         model: Option<&str>,
         updated_at: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let rows = sqlx::query(
             "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, updated_at=? \
-             WHERE id=? AND workspace_id=?",
+             WHERE id=? AND workspace_id=? AND provider IS ?",
         )
         .bind(provider)
         .bind(model)
         .bind(updated_at)
         .bind(&id.0)
         .bind(&workspace_id.0)
+        .bind(expected_provider)
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?
         .rows_affected();
-        if rows == 0 {
+        if rows > 0 {
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?;
+        if exists == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Persist the assembled system prompt (the spawn path): a narrow write
@@ -11386,7 +11405,9 @@ mod tests {
     /// lands after first real use, may clear `model` (target CLI default),
     /// always clears `reasoning_effort`, and leaves `acp_session_id` and
     /// unrelated columns untouched. Wrong-workspace writes are `NotFound` and
-    /// mutate nothing.
+    /// mutate nothing; a stale `expected_provider` (a concurrent
+    /// `agent.setModel` moved the row) returns `Ok(false)` and mutates
+    /// nothing.
     #[tokio::test]
     async fn rehome_agent_session_provider_switches_provider_and_clears_effort() {
         use intent_core::now_iso;
@@ -11411,6 +11432,7 @@ mod tests {
             .rehome_agent_session_provider(
                 &WorkspaceId("ws-other".to_string()),
                 &agent_id,
+                Some("auggie"),
                 "codex",
                 None,
                 &now_iso(),
@@ -11423,11 +11445,36 @@ mod tests {
         assert_eq!(unchanged.model.as_deref(), Some("opus4.7"));
         assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
 
+        // Stale expectation (a concurrent setModel moved the row): no write.
+        let landed = store
+            .rehome_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                Some("claude-code"),
+                "codex",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("stale expected provider is not an error");
+        assert!(!landed, "compare-and-set must not land on a mismatch");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("auggie"));
+        assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
+
         let updated_at = now_iso();
-        store
-            .rehome_agent_session_provider(&ws_id, &agent_id, "codex", None, &updated_at)
+        let landed = store
+            .rehome_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                Some("auggie"),
+                "codex",
+                None,
+                &updated_at,
+            )
             .await
             .expect("re-home after first real use");
+        assert!(landed);
         let after = store.get_agent_session(&agent_id).await.expect("get after");
         assert_eq!(after.provider.as_deref(), Some("codex"));
         assert_eq!(after.model, None, "target CLI default clears the model");
@@ -11436,13 +11483,54 @@ mod tests {
         assert_eq!(after.acp_session_id.as_deref(), Some("acp-live"));
         assert_eq!(after.name, "Baseline", "unrelated columns untouched");
 
-        store
-            .rehome_agent_session_provider(&ws_id, &agent_id, "mock", Some("m-1"), &now_iso())
+        let landed = store
+            .rehome_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                Some("codex"),
+                "mock",
+                Some("m-1"),
+                &now_iso(),
+            )
             .await
             .expect("re-home with a settings default model");
+        assert!(landed);
         let with_model = store.get_agent_session(&agent_id).await.expect("get");
         assert_eq!(with_model.provider.as_deref(), Some("mock"));
         assert_eq!(with_model.model.as_deref(), Some("m-1"));
+
+        // A NULL provider column (session resolving to the disabled default)
+        // is matched by `expected_provider = None`.
+        let null_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut null_session = baseline_test_session(&null_id, &ws_id, &ts, None);
+        null_session.provider = None;
+        store
+            .insert_agent_session(&null_session)
+            .await
+            .expect("insert");
+        assert!(
+            !store
+                .rehome_agent_session_provider(
+                    &ws_id,
+                    &null_id,
+                    Some("codex"),
+                    "mock",
+                    None,
+                    &now_iso()
+                )
+                .await
+                .expect("mismatch is not an error"),
+            "Some(expected) never matches a NULL column"
+        );
+        assert!(
+            store
+                .rehome_agent_session_provider(&ws_id, &null_id, None, "mock", None, &now_iso())
+                .await
+                .expect("NULL column re-home"),
+            "None matches a NULL column"
+        );
+        let after = store.get_agent_session(&null_id).await.expect("get");
+        assert_eq!(after.provider.as_deref(), Some("mock"));
     }
 
     /// monorepo#1936 regression: the spawn path's system-prompt persist is a

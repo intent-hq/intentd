@@ -8285,11 +8285,17 @@ impl AgentManager {
     /// never persists a notice or commits an identity the agent never ran
     /// under; retry attempts within one turn (`retry_spawn`) cannot duplicate
     /// the notice — the identity commit lands with the first success.
+    /// `rehomed` (a turn-start re-home off a disabled provider,
+    /// intent-hq/intent#5737) suppresses the row: the `provider_rehomed`
+    /// notice already explains this exact identity change, so a second
+    /// `model_changed` row would be a duplicate. The identity commit still
+    /// runs so the next turn compares against the re-homed identity.
     async fn maybe_persist_model_change_notice(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         resolved: &ResolvedSpawn,
+        rehomed: bool,
     ) {
         let to_model = resolved.model.as_deref();
         let to_provider = resolved.provider.id;
@@ -8312,7 +8318,7 @@ impl AgentManager {
                 prev_provider != to_provider || from_model.as_deref() != to_model
             }
         };
-        if changed {
+        if changed && !rehomed {
             let label = |provider: &str, model: Option<&str>| match model {
                 Some(m) => format!("{provider}:{m}"),
                 None => format!("{provider} (default model)"),
@@ -8428,12 +8434,15 @@ impl AgentManager {
     ///    [`intent_store::Store::rehome_agent_session_provider`] writer. The
     ///    caller's `resolve_spawn` then yields the new identity, so a live
     ///    child takes the existing `agent.setModel` respawn branch (kill,
-    ///    fresh `session/new`) and the model-change notice/commit runs on
-    ///    success exactly as after a `setModel`. This also emits the same
-    ///    `agent:updated` invalidation `agent.setModel` publishes, and
-    ///    persists a `provider_rehomed` system row in the transcript (see
-    ///    [`AgentManager::persist_provider_rehome_notice`]). One-way:
-    ///    re-enabling the old provider never moves the session back.
+    ///    fresh `session/new`) and the last-turn identity commit runs on
+    ///    success exactly as after a `setModel` — but the generic
+    ///    `model_changed` row is suppressed for this turn (the `rehomed`
+    ///    flag returned here), because the `provider_rehomed` system row this
+    ///    persists in the transcript (see
+    ///    [`AgentManager::persist_provider_rehome_notice`]) already names the
+    ///    same identity change. This also emits the same `agent:updated`
+    ///    invalidation `agent.setModel` publishes. One-way: re-enabling the
+    ///    old provider never moves the session back.
     /// 2. Otherwise the turn fails before any spawn with the distinct "not
     ///    enabled" `-32602` from
     ///    [`crate::agent_ops::ensure_provider_enabled`] (method label
@@ -8441,25 +8450,30 @@ impl AgentManager {
     ///
     /// Every turn origin (user send, hook wake, queued message, delegated
     /// child) funnels through `ensure_started`, so all are covered. Returns
-    /// the (possibly re-homed) session the spawn resolution must use.
+    /// the (possibly re-homed) session the spawn resolution must use and
+    /// whether a re-home happened — the caller uses that flag to force the
+    /// live child's teardown (the disabled provider's child must never be
+    /// reused, even when the target shares its `command` and resolved model,
+    /// e.g. `opencode` → `unsloth`) and to suppress the generic
+    /// `model_changed` row.
     async fn rehome_if_provider_disabled(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         session: AgentSession,
         settings: &intent_core::settings_file::SettingsFile,
-    ) -> Result<AgentSession> {
+    ) -> Result<(AgentSession, bool)> {
         const METHOD: &str = "session/prompt";
         // Nothing resolves → `resolve_spawn` raises its own loud error.
         let Some(raw) = session_provider_id(
             &session,
             crate::agent_session::derived_default_provider(settings).as_deref(),
         ) else {
-            return Ok(session);
+            return Ok((session, false));
         };
         let current = intent_providers::provider_config(&raw).id;
         if !crate::agent_ops::provider_is_disabled(current, settings.providers.enabled.as_ref()) {
-            return Ok(session);
+            return Ok((session, false));
         }
         let Some(target) =
             crate::agent_ops::resolve_disabled_provider_rehome(&self.services, settings, METHOD)
@@ -8474,7 +8488,7 @@ impl AgentManager {
                 current,
                 settings.providers.enabled.as_ref(),
             )
-            .map(|()| session);
+            .map(|()| (session, false));
         };
         tracing::info!(
             agent_id = %agent_id,
@@ -8483,16 +8497,31 @@ impl AgentManager {
             to_model = ?target.model,
             "session provider is disabled; re-homing onto the default provider"
         );
-        self.services
+        // Compare-and-set on the provider the snapshot above was read with:
+        // a concurrent `agent.setModel` that moved the session between that
+        // read and this write wins — nothing is overwritten, no notice or
+        // invalidation is emitted, and the turn proceeds on the fresh row
+        // (the next turn re-runs this gate against whatever it carries).
+        let landed = self
+            .services
             .store
             .rehome_agent_session_provider(
                 workspace_id,
                 agent_id,
+                session.provider.as_deref(),
                 &target.provider,
                 target.model.as_deref(),
                 &now_iso(),
             )
             .await?;
+        if !landed {
+            tracing::info!(
+                agent_id = %agent_id,
+                "session provider changed concurrently; skipping the re-home"
+            );
+            let fresh = self.services.store.get_agent_session(agent_id).await?;
+            return Ok((fresh, false));
+        }
         // Same follow-through as `agent.setModel`: the persisted display
         // resolution (D14) names the old model — clear it (best-effort), then
         // invalidate clients so they re-read the projection.
@@ -8523,7 +8552,7 @@ impl AgentManager {
         session.provider = Some(target.provider);
         session.model = target.model;
         session.reasoning_effort = None;
-        Ok(session)
+        Ok((session, true))
     }
 
     /// Persist the informational `provider_rehomed` transcript row for a
@@ -8638,7 +8667,7 @@ impl AgentManager {
         // `resolve_spawn`, so the respawn branch below sees the new identity)
         // or fail the turn with the same "not enabled" rejection the create
         // front doors raise.
-        let session = self
+        let (session, rehomed) = self
             .rehome_if_provider_disabled(agent_id, workspace_id, session, &settings)
             .await?;
         let mut resolved = resolve_spawn(
@@ -8675,7 +8704,11 @@ impl AgentManager {
             // the live-child reuse branch below would return the stale session
             // with the armed flag sitting unconsumed.
             let forced = self.force_recreate.lock().unwrap().contains(agent_id);
-            if needs_respawn || forced {
+            // A re-home off a disabled provider always tears the live child
+            // down: the identity comparison above keys on the provider
+            // `command`, which `opencode` and `unsloth` share, so it alone
+            // could reuse the disabled provider's child.
+            if needs_respawn || forced || rehomed {
                 // Tear down the existing child (preserving the acpSessionId so
                 // start_session can try session/load for providers that support it).
                 // This is narrower than stop() — only kills the child/handle, no
@@ -8687,8 +8720,13 @@ impl AgentManager {
                     // session. The notice/commit still runs: the live child may
                     // predate a same-provider model change the reuse tolerates,
                     // and an unchanged identity is a cheap no-op read.
-                    self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
-                        .await;
+                    self.maybe_persist_model_change_notice(
+                        agent_id,
+                        workspace_id,
+                        &resolved,
+                        rehomed,
+                    )
+                    .await;
                     // A `reasoningEffort` change needs no respawn: re-apply it
                     // on the live session through the `thought_level` config
                     // option discovered at session open, so it takes effect
@@ -8917,8 +8955,9 @@ impl AgentManager {
         // not persist a notice or commit `last_turn_*` to an identity the
         // agent never ran under. Store-based (not handle-based) so detection
         // also covers idle-agent respawns. Best-effort — a notice failure
-        // never blocks the turn.
-        self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
+        // never blocks the turn. A re-home turn commits the identity but
+        // skips the row (the `provider_rehomed` notice already landed).
+        self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved, rehomed)
             .await;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
@@ -14911,7 +14950,7 @@ mod dead_child_respawn_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod disabled_provider_rehome_tests {
     //! Regression tests for intent-hq/intent#5737: a turn for a session whose
     //! provider was disabled in Settings > Agents (`providers.enabled[id] ==
@@ -14925,7 +14964,7 @@ mod disabled_provider_rehome_tests {
     //! `mock` plays the runnable default — its availability is gated purely
     //! on `MOCK_AGENT_SCRIPT_PATH`, which [`mock_env`] pins.
 
-    use super::dead_child_respawn_tests::{mock_agent_script, mock_env};
+    use super::dead_child_respawn_tests::{install_fake_handle, mock_agent_script, mock_env};
     use super::role_reminder_tests::{session, workspace};
     use super::*;
     use crate::events::{EventBus, SubscriptionFilter};
@@ -15088,6 +15127,198 @@ mod disabled_provider_rehome_tests {
             .expect("notice emitted agent:message");
         assert_eq!(msg_event.data["messageId"], json!(notice.id));
         mgr.stop(&agent_id).await;
+    }
+
+    /// (a′) A session with a COMMITTED prior turn on the disabled provider
+    /// (`last_turn_*` set, as after any real turn) gets exactly ONE system
+    /// notice for the re-home — the `provider_rehomed` row — never the
+    /// generic `model_changed` row the identity comparison would otherwise
+    /// also produce. The identity commit still lands, so the next turn and
+    /// a turn after re-enabling the old provider add no further notices.
+    #[tokio::test]
+    async fn rehome_after_committed_turn_persists_exactly_one_notice() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        let ws = WorkspaceId::from(WS);
+        let agent_id = AgentId::from("agent-5737-prior-turn");
+        seed_session(&mgr, &agent_id, "codex", Some("gpt-5"), None).await;
+        mgr.services
+            .store
+            .set_agent_session_last_turn_model(&ws, &agent_id, Some("gpt-5"), "codex")
+            .await
+            .unwrap();
+
+        let system_rows = |messages: &[intent_core::AgentMessage]| -> Vec<String> {
+            messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| {
+                    m.metadata
+                        .as_ref()
+                        .and_then(|md| md["type"].as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        };
+
+        mgr.ensure_started(&agent_id, &ws)
+            .await
+            .expect("re-homed turn spawns the default provider");
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            system_rows(&messages),
+            vec!["provider_rehomed".to_string()],
+            "one notice for the re-home, no model_changed duplicate: {messages:?}"
+        );
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session_last_turn_model(&ws, &agent_id)
+                .await
+                .unwrap(),
+            (None, Some("mock".to_string())),
+            "identity commit still lands on the re-homed pair"
+        );
+
+        // Subsequent turn on the (now enabled) re-homed provider: no notice.
+        mgr.ensure_started(&agent_id, &ws)
+            .await
+            .expect("second turn reuses the re-homed session");
+        // Re-enabling the old provider is one-way: no move back, no notice.
+        set(&mgr, "providers.enabled", json!({ "codex": true }));
+        mgr.ensure_started(&agent_id, &ws)
+            .await
+            .expect("turn after re-enable stays on the re-homed provider");
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            system_rows(&messages),
+            vec!["provider_rehomed".to_string()],
+            "later turns add no notices: {messages:?}"
+        );
+        let row = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert_eq!(row.provider.as_deref(), Some("mock"));
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (a″) A LIVE child on the disabled provider is always torn down by the
+    /// re-home, even when the respawn comparison alone would reuse it: the
+    /// fake handle below was "spawned" with the same `command` (`node`) and
+    /// resolved model (`None`) the mock target resolves to — the
+    /// `opencode` → `unsloth` shape — so without the forced teardown the
+    /// live-child reuse branch would hand back the cached session.
+    #[tokio::test]
+    async fn rehome_tears_down_live_child_sharing_the_target_command() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        let agent_id = AgentId::from("agent-5737-live-child");
+        let mut s = session(&agent_id, &WorkspaceId::from(WS), None);
+        s.provider = Some("codex".to_string());
+        s.acp_session_id = Some("acp-cached".to_string());
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        let acp = mgr
+            .ensure_started(&agent_id, &WorkspaceId::from(WS))
+            .await
+            .expect("re-homed turn respawns onto the default provider");
+        assert_ne!(
+            acp, "acp-cached",
+            "the disabled provider's session is never reused"
+        );
+        {
+            let handles = mgr.handles.lock().unwrap();
+            assert!(
+                handles.get(&agent_id).unwrap().child.is_some(),
+                "re-home replaced the fake handle with a real child"
+            );
+        }
+        let row = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert_eq!(row.provider.as_deref(), Some("mock"));
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (a‴) A concurrent `agent.setModel` that moves the session off the
+    /// disabled provider between `ensure_started`'s snapshot read and the
+    /// re-home write wins: the compare-and-set does not land, no notice or
+    /// `agent:updated` is emitted, and the turn runs on the fresh row.
+    #[tokio::test]
+    async fn concurrent_set_model_is_not_overwritten_by_rehome() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        let ws = WorkspaceId::from(WS);
+        let agent_id = AgentId::from("agent-5737-race");
+        seed_session(&mgr, &agent_id, "codex", Some("gpt-5"), None).await;
+        let settings = mgr.services.effective_settings();
+        // The stale snapshot `ensure_started` would have read...
+        let stale = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        // ...and the user's newer pick landing before the re-home write.
+        mgr.services
+            .store
+            .set_agent_session_model(&ws, &agent_id, "m-user", Some("mock"), &now_iso())
+            .await
+            .unwrap();
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let (fresh, rehomed) = mgr
+            .rehome_if_provider_disabled(&agent_id, &ws, stale, &settings)
+            .await
+            .expect("a lost race is not an error");
+        assert!(!rehomed, "the concurrent setModel wins");
+        assert_eq!(fresh.provider.as_deref(), Some("mock"));
+        assert_eq!(
+            fresh.model.as_deref(),
+            Some("m-user"),
+            "user's pick survives"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert!(messages.is_empty(), "no re-home notice on a lost race");
+        let events = drain(&mut sub).await;
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event_type != intent_core::events::AGENT_UPDATED),
+            "no agent:updated on a lost race"
+        );
     }
 
     /// (b) Disabled provider + no usable default (none configured): the turn

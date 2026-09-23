@@ -20295,7 +20295,7 @@ mod model_change_notice_tests {
         let (ws, id) = (WorkspaceId::from("ws-mc1"), AgentId::from("a-mc1"));
         seed_agent(&mgr, &ws, &id).await;
 
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
             .await;
 
         let messages = mgr
@@ -20329,10 +20329,15 @@ mod model_change_notice_tests {
         });
 
         // Turn 1 commits the baseline; turn 2 switches model + provider.
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
             .await;
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
-            .await;
+        mgr.maybe_persist_model_change_notice(
+            &id,
+            &ws,
+            &resolved("claude-code", Some("sonnet")),
+            false,
+        )
+        .await;
 
         let messages = mgr
             .services
@@ -20368,8 +20373,13 @@ mod model_change_notice_tests {
         assert_eq!(event.data["messageId"], json!(notice.id));
 
         // Turn 3 under the unchanged identity: no second notice.
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
-            .await;
+        mgr.maybe_persist_model_change_notice(
+            &id,
+            &ws,
+            &resolved("claude-code", Some("sonnet")),
+            false,
+        )
+        .await;
         let messages = mgr
             .services
             .store
@@ -20388,10 +20398,10 @@ mod model_change_notice_tests {
         let (ws, id) = (WorkspaceId::from("ws-mc3"), AgentId::from("a-mc3"));
         seed_agent(&mgr, &ws, &id).await;
 
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
             .await;
         // (setModel A→B→A happened between turns; nothing committed.)
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
             .await;
 
         let messages = mgr
@@ -20414,9 +20424,9 @@ mod model_change_notice_tests {
         let (ws, id) = (WorkspaceId::from("ws-mc4"), AgentId::from("a-mc4"));
         seed_agent(&mgr, &ws, &id).await;
 
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", None))
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", None), false)
             .await;
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
             .await;
 
         let messages = mgr
@@ -20429,6 +20439,64 @@ mod model_change_notice_tests {
         let md = messages[0].metadata.as_ref().unwrap();
         assert_eq!(md["from"], json!(null));
         assert_eq!(md["to"], json!("gpt-5"));
+    }
+
+    /// A turn-start re-home (intent-hq/intent#5737) passes `rehomed = true`:
+    /// the identity change is real, but the row is suppressed — the
+    /// `provider_rehomed` notice already explains it — while the identity
+    /// still commits, so the following turn under the new pair is silent.
+    #[tokio::test]
+    async fn rehomed_switch_commits_identity_without_model_changed_row() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-mc6"), AgentId::from("a-mc6"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
+            .await;
+        mgr.maybe_persist_model_change_notice(
+            &id,
+            &ws,
+            &resolved("claude-code", Some("sonnet")),
+            true,
+        )
+        .await;
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert!(
+            messages.is_empty(),
+            "re-home suppresses the model_changed row"
+        );
+        let (m, p) = mgr
+            .services
+            .store
+            .get_agent_session_last_turn_model(&ws, &id)
+            .await
+            .unwrap();
+        assert_eq!(m.as_deref(), Some("sonnet"));
+        assert_eq!(p.as_deref(), Some("claude-code"));
+
+        mgr.maybe_persist_model_change_notice(
+            &id,
+            &ws,
+            &resolved("claude-code", Some("sonnet")),
+            false,
+        )
+        .await;
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert!(
+            messages.is_empty(),
+            "next turn under the re-homed pair is silent"
+        );
     }
 
     /// The recreate-replay body must exclude BOTH the current user message and
@@ -20462,8 +20530,13 @@ mod model_change_notice_tests {
             .set_agent_session_last_turn_model(&ws, &id, Some("gpt-5"), "auggie")
             .await
             .unwrap();
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
-            .await;
+        mgr.maybe_persist_model_change_notice(
+            &id,
+            &ws,
+            &resolved("claude-code", Some("sonnet")),
+            false,
+        )
+        .await;
         mgr.recreated.lock().unwrap().insert(id.clone());
 
         let body = mgr.build_turn_body(&id, "current ask").await;
