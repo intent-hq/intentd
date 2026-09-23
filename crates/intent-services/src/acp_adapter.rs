@@ -1425,6 +1425,17 @@ wait
         )
     }
 
+    /// Hold `adapter` until the task is aborted (drops it un-reaped).
+    async fn park_forever(adapter: SpawnedAdapter) {
+        let _adapter = adapter;
+        std::future::pending::<()>().await;
+    }
+
+    /// Reap `adapter` in a task a test can abort mid-way.
+    async fn reap_adapter(mut adapter: SpawnedAdapter) {
+        adapter.child.reap().await;
+    }
+
     /// Spawn the live fake npx under `tmp`, in a task that then parks
     /// forever holding the adapter. Returns the parked task, the launch dir
     /// the fake npx reported, and its grandchild's pid.
@@ -1433,10 +1444,7 @@ wait
         slots: &Arc<AdapterSlots>,
     ) -> (tokio::task::JoinHandle<()>, PathBuf, i32) {
         let (adapter, npx_cwd, grandchild) = spawn_fake_npx(tmp, slots, LIVE_FAKE_NPX_SCRIPT).await;
-        let parked = tokio::spawn(async move {
-            let _adapter = adapter;
-            std::future::pending::<()>().await;
-        });
+        let parked = tokio::spawn(park_forever(adapter)); // caller-binding: allow — test-only parking of a fake adapter; reaches no service layer
         (parked, npx_cwd, grandchild)
     }
 
@@ -1547,10 +1555,7 @@ wait
         let terminated = tmp.path().join(LEADER_TERMINATED_MARKER);
         assert!(!terminated.exists());
 
-        let reaping = tokio::spawn(async move {
-            let mut adapter = adapter;
-            adapter.child.reap().await;
-        });
+        let reaping = tokio::spawn(reap_adapter(adapter)); // caller-binding: allow — test-only bounded reap of a fake adapter; reaches no service layer
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !terminated.exists() {
             assert!(
