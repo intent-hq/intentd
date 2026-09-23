@@ -64,16 +64,20 @@ function log(msg) {
 }
 
 // Session-lifecycle log: one JSON line per session/new | session/load —
-// { method, sessionId, pid, meta, nodeOptions } — when MOCK_AGENT_SESSION_LOG
-// points at a file. Lets e2e tests assert exactly which session ids the daemon
-// offered to which child process (e.g. that a cross-provider switch never
-// issues session/load with the old provider's id — monorepo#907). `meta`
-// carries the request's `_meta` verbatim (null when absent) so tests can
-// assert the exact provider-specific payload on the wire (e.g. codex
-// `sessionTitle`, monorepo#3151). `nodeOptions` is the child's inherited
-// NODE_OPTIONS (null when unset) so tests can assert the daemon-injected V8
-// heap cap (`agents.acpNodeMaxOldSpaceMb`, intent-hq/intent#4330).
-function logSessionCall(method, sessionId, meta) {
+// { method, sessionId, pid, meta, nodeOptions, cwd, processCwd } — when
+// MOCK_AGENT_SESSION_LOG points at a file. Lets e2e tests assert exactly
+// which session ids the daemon offered to which child process (e.g. that a
+// cross-provider switch never issues session/load with the old provider's id
+// — monorepo#907). `meta` carries the request's `_meta` verbatim (null when
+// absent) so tests can assert the exact provider-specific payload on the wire
+// (e.g. codex `sessionTitle`, monorepo#3151). `nodeOptions` is the child's
+// inherited NODE_OPTIONS (null when unset) so tests can assert the
+// daemon-injected V8 heap cap (`agents.acpNodeMaxOldSpaceMb`,
+// intent-hq/intent#4330). `cwd` is the request's `cwd` param (the ACP
+// session directory, null when absent) and `processCwd` this child's actual
+// working directory, so tests can prove the two are decoupled for npx
+// launches (intent-hq/intent#5738).
+function logSessionCall(method, sessionId, meta, cwd) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
   try {
@@ -85,6 +89,8 @@ function logSessionCall(method, sessionId, meta) {
         pid: process.pid,
         meta: meta ?? null,
         nodeOptions: process.env.NODE_OPTIONS ?? null,
+        cwd: cwd ?? null,
+        processCwd: process.cwd(),
       }) + '\n'
     );
   } catch (err) {
@@ -960,7 +966,7 @@ async function dispatch(msg) {
         ? msg.params.mcpServers
         : [];
       sessionFromLoad = false;
-      logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta);
+      logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta, msg.params && msg.params.cwd);
       return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions(behavior) });
     }
     case 'session/load':
@@ -973,7 +979,7 @@ async function dispatch(msg) {
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
         ? msg.params.mcpServers
         : [];
-      logSessionCall('session/load', msg.params && msg.params.sessionId, msg.params && msg.params._meta);
+      logSessionCall('session/load', msg.params && msg.params.sessionId, msg.params && msg.params._meta, msg.params && msg.params.cwd);
       // With `loadSession: true` behavior, accept ANY session id — including a
       // foreign one — modelling the worst-case provider monorepo#907 guards
       // against. With `advertiseLoadSession`, accept the resume (all

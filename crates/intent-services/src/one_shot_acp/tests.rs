@@ -123,6 +123,91 @@ async fn session_new_omits_meta_when_none_given() {
     assert_eq!(params["mcpServers"], serde_json::json!([]));
 }
 
+/// Mock adapter that replies with the `session/new` params it received plus
+/// its own `process.cwd()`, that directory's entries, and the `package.json`
+/// found there (the npx launch sentinel).
+#[cfg(unix)]
+const CWD_ECHO_ADAPTER: &str = r"
+import fs from 'node:fs';
+let sessionNew = null;
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'session/new') sessionNew = msg.params;
+});
+const onPrompt = (id) => {
+  chunk(JSON.stringify({
+    sessionNew,
+    processCwd: process.cwd(),
+    entries: fs.readdirSync(process.cwd()),
+    manifest: JSON.parse(fs.readFileSync('package.json', 'utf8')),
+  }));
+  result(id, { stopReason: 'end_turn' });
+};
+";
+
+/// intent-hq/intent#5738 end to end for one-shots (`agent.completeOnce` with
+/// a workspace cwd): an npx launch from a `catalog:` workspace must not run
+/// npx inside it — npm rejects the manifest before the adapter can start — yet
+/// `session/new` still receives the workspace as `cwd`. The fake npx fails
+/// exactly like npm when its project root carries `catalog:` and otherwise
+/// execs the mock adapter; the launch dir is swept once the run is over.
+#[cfg(unix)]
+#[tokio::test]
+async fn one_shot_npx_launch_runs_outside_the_catalog_workspace_but_keeps_it_as_session_cwd() {
+    use crate::acp_adapter::npx_launch_tests::{
+        catalog_workspace, read_npx_report, write_fake_npx,
+    };
+
+    let tmp = test_tempdir("intent-one-shot-npx-");
+    let workspace = catalog_workspace(tmp.path());
+    let report = tmp.path().join("npx-report");
+    let npx = write_fake_npx(tmp.path());
+    let adapter = tmp.path().join("mock-one-shot-adapter.mjs");
+    std::fs::write(&adapter, format!("{ADAPTER_PRELUDE}{CWD_ECHO_ADAPTER}")).unwrap();
+    let cmd = OneShotCommand::npx(npx, "claude-agent-acp@0.0.0-test")
+        .cwd(workspace.clone())
+        .env("INTENTD_FAKE_NPX_REPORT", report.as_os_str())
+        .env("INTENTD_FAKE_NPX_ADAPTER", adapter.as_os_str());
+
+    let slots = AdapterSlots::new(1);
+    let text = run_one_shot_acp_in(&slots, cmd, "where", None, None, Duration::from_secs(30))
+        .await
+        .expect("npx one-shot from a catalog workspace succeeds");
+    let reply: Value = serde_json::from_str(&text).expect("echoed reply parses");
+    assert_eq!(
+        reply["sessionNew"]["cwd"],
+        json!(workspace.to_string_lossy()),
+        "session/new cwd must stay the workspace: {reply}"
+    );
+    let process_cwd = PathBuf::from(reply["processCwd"].as_str().expect("processCwd"));
+    assert_ne!(process_cwd, workspace, "npx ran inside the workspace");
+    assert!(
+        !process_cwd.starts_with(&workspace),
+        "adapter cwd {} is under the workspace",
+        process_cwd.display()
+    );
+    let entries: Vec<String> = serde_json::from_value(reply["entries"].clone()).unwrap();
+    assert_eq!(entries, ["package.json"], "{reply}");
+    let manifest = &reply["manifest"];
+    assert_eq!(manifest["private"], json!(true), "{reply}");
+    assert!(
+        manifest.get("dependencies").is_none() && manifest.get("workspaces").is_none(),
+        "sentinel must not declare dependencies or workspaces: {reply}"
+    );
+    let (npx_cwd, npx_entries) = read_npx_report(&report).await;
+    assert_eq!(
+        npx_cwd, process_cwd,
+        "the adapter inherits the npx launch dir"
+    );
+    assert_eq!(npx_entries, entries);
+    assert!(
+        !process_cwd.exists(),
+        "launch dir {} must be swept once the run is over",
+        process_cwd.display()
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn prompt_timeout_reports_timeout_and_reaps_child() {
