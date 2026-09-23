@@ -10,7 +10,7 @@
 /// one-line code change here.
 macro_rules! claude_agent_acp_version {
     () => {
-        "0.73.0"
+        "0.81.1"
     };
 }
 

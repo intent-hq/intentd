@@ -1245,11 +1245,11 @@ mod build_command_tests {
             vec![
                 "--workspaces=false".to_string(),
                 "-y".to_string(),
-                "@agentclientprotocol/claude-agent-acp@0.73.0".to_string(),
+                "@agentclientprotocol/claude-agent-acp@0.81.1".to_string(),
             ],
             "bumping the adapter pin is a deliberate change — update this literal with it"
         );
-        assert_eq!(intent_providers::CLAUDE_AGENT_ACP_VERSION, "0.73.0");
+        assert_eq!(intent_providers::CLAUDE_AGENT_ACP_VERSION, "0.81.1");
     }
 
     #[test]
