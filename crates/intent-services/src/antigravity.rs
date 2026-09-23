@@ -161,7 +161,7 @@ where
     F: FnMut(&str),
     C: std::future::Future<Output = ()>,
 {
-    use crate::acp_adapter::{initialize_params, reap_child, spawn_adapter, AcpAdapterCommand};
+    use crate::acp_adapter::{initialize_params, spawn_adapter, AcpAdapterCommand};
     let profile = probe_profile(helper)
         .map_err(|_| "Cannot create private Antigravity login configuration")?;
     let mut env =
@@ -244,7 +244,7 @@ where
         () = &mut cancelled => Err("Antigravity login cancelled"),
         result = tokio::time::timeout(budget, flow) => result.unwrap_or(Err(LOGIN_TIMED_OUT)),
     };
-    reap_child(&mut adapter.child).await;
+    adapter.child.reap().await;
     result.map_err(str::to_string)
 }
 

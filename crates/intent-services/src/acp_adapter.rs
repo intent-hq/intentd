@@ -102,8 +102,8 @@ impl AdapterSlots {
     }
 
     /// Chains currently live: permits handed out and not yet returned. A permit
-    /// is taken before the child is spawned and returned when
-    /// [`SpawnedAdapter`] drops — after the reap — so this spans the whole
+    /// is taken before the child is spawned and returned by the
+    /// [`AdapterChild`] once the tree is reaped — so this spans the whole
     /// lifetime of every ephemeral chain, which is exactly the window the
     /// descendant-tree sampler needs to be watching (monorepo#2107).
     pub(crate) fn live(&self) -> usize {
@@ -329,23 +329,117 @@ impl AcpAdapterCommand {
 /// A spawned adapter: the child, its ACP connection, and the inbound
 /// notification/request streams the caller drives.
 pub(crate) struct SpawnedAdapter {
-    /// The adapter process (reap with [`reap_child`]).
-    pub(crate) child: tokio::process::Child,
+    /// The adapter process (reap with [`AdapterChild::reap`]).
+    pub(crate) child: AdapterChild,
     /// The JSON-RPC connection over the child's piped stdio.
     pub(crate) conn: Connection,
     /// Agent → client notifications (`session/update`, …).
     pub(crate) notifications: mpsc::UnboundedReceiver<IncomingNotification>,
     /// Agent → client requests (`session/request_permission`, `fs/*`, …).
     pub(crate) requests: mpsc::UnboundedReceiver<IncomingRequest>,
-    /// The neutral directory an npx launch runs in (intent-hq/intent#5738);
-    /// `None` for resolved binaries. Held, like the slot, until the adapter
-    /// value is dropped after the child has been reaped, so the directory
-    /// outlives the whole process tree.
-    _npx_launch_dir: Option<NpxLaunchDir>,
-    /// This run's slot in the daemon-wide bound. Never read — held so the
-    /// slot is returned when the adapter value is dropped, which is after the
-    /// child has been reaped on every exit path.
-    _slot: OwnedSemaphorePermit,
+}
+
+/// What must outlive the adapter's whole process tree: the neutral directory
+/// an npx launch runs in (intent-hq/intent#5738; `None` for resolved
+/// binaries) and this run's slot in the daemon-wide bound. Released only
+/// after a completed [`reap_child`] — group kill, bounded wait, descendant
+/// sweep — never on the direct child's exit alone, since a reaped child can
+/// leave descendants that still run in the directory.
+struct HeldWhileLive {
+    npx_launch_dir: Option<NpxLaunchDir>,
+    slot: OwnedSemaphorePermit,
+}
+
+/// The adapter process plus [`HeldWhileLive`], dereferencing to the
+/// [`tokio::process::Child`]. [`Self::reap`] is the ordinary end of a run and
+/// releases both. A value dropped before that (a cancelled future, an early
+/// return, a panic) hands the child and the held resources to a detached
+/// bounded cleanup on the current runtime, so the directory is still removed
+/// only after the tree is reaped and swept; when that cleanup cannot run or
+/// finish (no runtime, runtime shutting down) the directory is retained on
+/// disk rather than deleted from under a possibly live tree, and the child
+/// falls back to `kill_on_drop`.
+pub(crate) struct AdapterChild {
+    /// `None` only once [`Drop`] has moved the child into the cleanup task.
+    child: Option<tokio::process::Child>,
+    /// `None` once released by [`Self::reap`] or taken by [`Drop`].
+    held: Option<HeldWhileLive>,
+}
+
+impl AdapterChild {
+    /// Reap the process tree ([`reap_child`]), then release the launch dir
+    /// and the slot.
+    pub(crate) async fn reap(&mut self) {
+        reap_child(self).await;
+        self.held = None;
+    }
+}
+
+impl std::ops::Deref for AdapterChild {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.child
+            .as_ref()
+            .expect("adapter child is only taken while dropping")
+    }
+}
+
+impl std::ops::DerefMut for AdapterChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child
+            .as_mut()
+            .expect("adapter child is only taken while dropping")
+    }
+}
+
+impl Drop for AdapterChild {
+    fn drop(&mut self) {
+        let (Some(held), Some(mut child)) = (self.held.take(), self.child.take()) else {
+            return;
+        };
+        let HeldWhileLive {
+            npx_launch_dir,
+            slot,
+        } = held;
+        let launch_dir = RetainUnlessSwept(npx_launch_dir);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            drop(launch_dir);
+            drop(child);
+            drop(slot);
+            return;
+        };
+        handle.spawn(async move {
+            reap_child(&mut child).await;
+            launch_dir.remove();
+            drop(child);
+            drop(slot);
+        });
+    }
+}
+
+/// A launch dir travelling through the detached cleanup: [`Self::remove`]
+/// deletes it once the tree has been reaped; dropping the wrapper any other
+/// way (the cleanup future dropped unpolled on a shutting-down runtime, or
+/// never scheduled at all) retains the directory instead of deleting it.
+struct RetainUnlessSwept(Option<NpxLaunchDir>);
+
+impl RetainUnlessSwept {
+    fn remove(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl Drop for RetainUnlessSwept {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            tracing::debug!(
+                path = %dir.path().display(),
+                "retaining npx launch dir: adapter cleanup could not finish"
+            );
+            std::mem::forget(dir);
+        }
+    }
 }
 
 /// Why an adapter could not be started.
@@ -363,9 +457,9 @@ pub(crate) enum SpawnError {
 /// spawn the adapter with piped stdio, its own process group, and the
 /// enhanced PATH, and wire an ACP [`Connection`] around it. Failures come back
 /// as [`SpawnError`] so callers can map them onto their own error types. The
-/// child is `kill_on_drop`, so an early return still reaps it, and the slot
-/// rides on the returned [`SpawnedAdapter`] — released when the caller drops
-/// it after reaping, never before.
+/// slot (and an npx launch dir) ride on the returned [`SpawnedAdapter`]'s
+/// [`AdapterChild`] — released by its `reap`, or by the detached bounded
+/// cleanup an early drop hands the child to, never before the tree is reaped.
 pub(crate) async fn spawn_adapter(
     cmd: &AcpAdapterCommand,
     queue_wait: Duration,
@@ -462,12 +556,16 @@ fn spawn_admitted_adapter(
     };
     let conn = Connection::new(stdin, stdout, stderr, hooks);
     Ok(SpawnedAdapter {
-        child,
+        child: AdapterChild {
+            child: Some(child),
+            held: Some(HeldWhileLive {
+                npx_launch_dir,
+                slot,
+            }),
+        },
         conn,
         notifications,
         requests,
-        _npx_launch_dir: npx_launch_dir,
-        _slot: slot,
     })
 }
 
@@ -965,7 +1063,7 @@ exit 0
     /// An npx launch from inside a `catalog:` workspace runs npx in a neutral
     /// launch dir (so npm never sees the workspace manifest) while
     /// `working_dir()` — what `session/new` receives — stays the workspace;
-    /// the launch dir is removed once the spawned adapter is dropped.
+    /// the launch dir is removed once the spawned adapter is reaped.
     #[tokio::test]
     async fn npx_adapter_runs_outside_the_workspace_and_keeps_it_as_session_cwd() {
         let tmp = test_tempdir("intent-adapter-npx-");
@@ -995,10 +1093,10 @@ exit 0
         assert_neutral_launch_dir(&npx_cwd, &entries);
         assert_eq!(cmd.working_dir(), workspace, "session cwd untouched");
         assert!(npx_cwd.is_dir(), "launch dir lives as long as the adapter");
-        drop(adapter);
+        adapter.child.reap().await;
         assert!(
             !npx_cwd.exists(),
-            "launch dir {} must be removed with the adapter",
+            "launch dir {} must be removed once the adapter is reaped",
             npx_cwd.display()
         );
     }
@@ -1176,7 +1274,7 @@ exit 0
         }
         assert_ne!(launched[0], launched[1], "each launch gets its own dir");
         for mut spawned in alive {
-            reap_child(&mut spawned.child).await;
+            spawned.child.reap().await;
         }
         for cwd in &launched {
             assert!(
@@ -1185,5 +1283,142 @@ exit 0
                 cwd.display()
             );
         }
+    }
+
+    /// A fake `npx` that stays alive like a real adapter chain: records its
+    /// cwd, starts a grandchild (`sleep`, its pid in
+    /// `$INTENTD_FAKE_NPX_PIDFILE`) and waits on it. A `kill_on_drop` SIGKILL
+    /// of the direct child alone leaves that grandchild running.
+    const LIVE_FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
+printf '%s\n' "$PWD" > "$INTENTD_FAKE_NPX_REPORT.tmp" && mv "$INTENTD_FAKE_NPX_REPORT.tmp" "$INTENTD_FAKE_NPX_REPORT"
+sleep 300 &
+echo $! > "$INTENTD_FAKE_NPX_PIDFILE"
+wait
+"#;
+
+    /// SIGKILLs a pid on drop so a test failure never leaves the fixture's
+    /// `sleep` grandchild behind.
+    struct KillGrandchildOnDrop(i32);
+
+    impl Drop for KillGrandchildOnDrop {
+        fn drop(&mut self) {
+            use nix::sys::signal::{kill, Signal};
+            let _ = kill(nix::unistd::Pid::from_raw(self.0), Signal::SIGKILL);
+        }
+    }
+
+    fn grandchild_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    /// Spawn the live fake npx under `tmp`, in a task that then parks
+    /// forever holding the adapter. Returns the parked task, the launch dir
+    /// the fake npx reported, and its grandchild's pid.
+    async fn spawn_parked_live_npx(
+        tmp: &Path,
+        slots: &Arc<AdapterSlots>,
+    ) -> (tokio::task::JoinHandle<()>, PathBuf, i32) {
+        use std::os::unix::fs::PermissionsExt;
+        let report = tmp.join("npx-report");
+        let pidfile = tmp.join("grandchild.pid");
+        let npx = tmp.join("npx");
+        std::fs::write(&npx, LIVE_FAKE_NPX_SCRIPT).unwrap();
+        std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cmd = AcpAdapterCommand::npx(npx, "claude-agent-acp@0.0.0-test")
+            .npx_launch_root(tmp.join("launch-root"))
+            .env("INTENTD_FAKE_NPX_REPORT", report.as_os_str())
+            .env("INTENTD_FAKE_NPX_PIDFILE", pidfile.as_os_str());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let slots = Arc::clone(slots);
+        let parked = tokio::spawn(async move {
+            let _adapter = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
+                .await
+                .expect("spawn live fake npx");
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.expect("adapter spawned");
+        let (npx_cwd, _) = read_npx_report(&report).await;
+        let mut grandchild = None;
+        for _ in 0..250 {
+            if let Ok(s) = tokio::fs::read_to_string(&pidfile).await {
+                if let Ok(pid) = s.trim().parse::<i32>() {
+                    grandchild = Some(pid);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (parked, npx_cwd, grandchild.expect("grandchild pid written"))
+    }
+
+    /// Cancellation regression (intent-hq/intent#5738 follow-up): before the
+    /// isolation the process cwd was a persistent workspace, so a cancelled
+    /// run left nothing to remove. Now the cwd is the temporary launch dir,
+    /// and dropping the adapter mid-run (task abort, timeout, early return)
+    /// must not delete it ahead of the process tree: the direct child's
+    /// `kill_on_drop` SIGKILL reaches neither the grandchild nor the escaped
+    /// descendants, so the directory has to survive until the bounded reap
+    /// (group kill + descendant sweep) has finished — and only then is it
+    /// removed and the slot returned.
+    #[tokio::test]
+    async fn cancelled_npx_adapter_keeps_its_launch_dir_until_the_tree_is_reaped() {
+        let tmp = test_tempdir("intent-adapter-npx-cancel-");
+        let slots = Arc::new(AdapterSlots::new(1));
+        let (parked, npx_cwd, grandchild) = spawn_parked_live_npx(tmp.path(), &slots).await;
+        let _sweep = KillGrandchildOnDrop(grandchild);
+        assert!(npx_cwd.is_dir());
+        assert!(grandchild_alive(grandchild));
+        assert_eq!(slots.available(), 0, "slot held while the adapter runs");
+
+        parked.abort();
+        assert!(parked.await.unwrap_err().is_cancelled());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while grandchild_alive(grandchild) {
+            assert!(
+                npx_cwd.is_dir(),
+                "launch dir {} removed while grandchild {grandchild} is still alive",
+                npx_cwd.display()
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild {grandchild} still alive 10s after the adapter was dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while npx_cwd.exists() || slots.available() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "after the tree died: launch dir exists = {}, free slots = {} (want none / 1)",
+                npx_cwd.exists(),
+                slots.available()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// When the runtime shuts down while an adapter is still live, the
+    /// bounded cleanup cannot run to completion; the launch dir must then be
+    /// retained (a small orphan directory) rather than deleted from under a
+    /// tree that may still be running.
+    #[test]
+    fn launch_dir_is_retained_when_the_runtime_shuts_down_before_cleanup_finishes() {
+        let tmp = test_tempdir("intent-adapter-npx-shutdown-");
+        let slots = Arc::new(AdapterSlots::new(1));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_parked, npx_cwd, grandchild) = rt.block_on(spawn_parked_live_npx(tmp.path(), &slots));
+        let _sweep = KillGrandchildOnDrop(grandchild);
+        assert!(npx_cwd.is_dir());
+
+        drop(rt);
+        assert!(
+            npx_cwd.is_dir(),
+            "launch dir {} deleted on runtime shutdown although its cleanup never finished",
+            npx_cwd.display()
+        );
     }
 }

@@ -39,8 +39,8 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::acp_adapter::{
-    adapter_slots, exited_detail, initialize_params, observe_exit_status, reap_child,
-    spawn_adapter_in, AcpAdapterCommand, AdapterSlots, SpawnError,
+    adapter_slots, exited_detail, initialize_params, observe_exit_status, spawn_adapter_in,
+    AcpAdapterCommand, AdapterSlots, SpawnError,
 };
 
 /// The one-shot launch description (shared with the model probe).
@@ -166,7 +166,7 @@ pub(crate) async fn run_one_shot_acp_in(
         Ok(text) => Ok(text),
         Err(err) => Err(attribute_early_exit(err, &mut adapter.child, &adapter.conn).await),
     };
-    reap_child(&mut adapter.child).await;
+    adapter.child.reap().await;
     result
 }
 
