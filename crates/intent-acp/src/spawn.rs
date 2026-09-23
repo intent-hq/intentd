@@ -12,7 +12,7 @@
 //! the daemon itself was niced.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use intent_providers::{
@@ -36,8 +36,19 @@ pub struct SpawnOptions<'a> {
     /// model_reasoning_effort=…` config override; an effort embedded in a
     /// compound `{base}/{effort}` model id still wins over this value.
     pub reasoning_effort: Option<&'a str>,
-    /// Working directory for the child.
+    /// The agent's workspace: the ACP session cwd, and the child's working
+    /// directory for resolved-binary and bare-command launches. An npx
+    /// launch does NOT start here — see [`SpawnOptions::npx_launch_root`].
     pub cwd: Option<&'a Path>,
+    /// Parent directory for the neutral per-spawn [`NpxLaunchDir`] an npx
+    /// launch starts in (`None` → the OS temp dir). npm reads the package
+    /// configuration of its cwd, so `npx -y <adapter>` run inside a Bun/pnpm
+    /// workspace with `catalog:` specifiers dies before the adapter starts
+    /// (intent-hq/intent#5738); the workspace stays the ACP session cwd,
+    /// never the npx process cwd. The launch dir plus
+    /// [`NPX_NO_WORKSPACES_ARG`] shield npx from this root's ancestors too, so
+    /// any daemon-owned directory serves. Ignored by every other launch tier.
+    pub npx_launch_root: Option<&'a Path>,
     /// Path to a rules file (appended when the provider supports rules).
     pub rules_file: Option<&'a str>,
     /// Path to an MCP config file (appended when the provider supports MCP).
@@ -127,6 +138,7 @@ impl<'a> SpawnOptions<'a> {
             model: None,
             reasoning_effort: None,
             cwd: None,
+            npx_launch_root: None,
             rules_file: None,
             mcp_config_file: None,
             env_mcp_config: None,
@@ -158,6 +170,132 @@ pub enum LaunchMode {
     BareCommand,
 }
 
+/// The neutral directory an npx launch starts in (intent-hq/intent#5738).
+/// Created per spawn under [`SpawnOptions::npx_launch_root`] (owner-only on
+/// Unix, named `intent_core::NPX_LAUNCH_DIR_PREFIX` + uuid so a launch root
+/// sweep can tell it from ordinary leftovers) and removed when dropped — the
+/// owner keeps it alive for the child's lifetime, since Node resolves
+/// relative paths against, and `process.cwd()` fails inside, a removed
+/// directory.
+///
+/// Being empty is not enough: npm picks its project root by walking up from
+/// the cwd to the nearest `package.json` (or `node_modules`) and reads that
+/// root's `.npmrc`, so the directory holds [`NPX_LAUNCH_SENTINEL_MANIFEST`] — a
+/// private, dependency-less manifest that makes the launch dir npm's nearest
+/// root. The sentinel alone is not enough either: npm walks on past it to an
+/// ancestor whose `workspaces` glob matches the launch dir, so
+/// [`build_args`] also passes [`NPX_NO_WORKSPACES_ARG`]; together they keep
+/// the launch dir the project root whatever the launch root's ancestors
+/// contain.
+#[derive(Debug)]
+pub struct NpxLaunchDir {
+    path: PathBuf,
+}
+
+/// The `package.json` written into every [`NpxLaunchDir`].
+pub const NPX_LAUNCH_SENTINEL_MANIFEST: &str =
+    "{\n  \"name\": \"intentd-npx-launch\",\n  \"private\": true\n}\n";
+
+/// The npx argument that keeps npm's project root at the [`NpxLaunchDir`]
+/// (intent-hq/intent#5738). The sentinel manifest is only npm's *first*
+/// candidate: `@npmcli/config` `loadLocalPrefix` keeps walking up and adopts
+/// any ancestor `package.json` whose `workspaces` glob matches the launch
+/// dir — loading that root's `.npmrc`, and rejecting two live launch dirs as
+/// duplicate workspace names — unless `workspaces` is `false` on the command
+/// line (the env layer does not count). Must precede the package positional:
+/// npx passes everything after it to the adapter.
+pub const NPX_NO_WORKSPACES_ARG: &str = "--workspaces=false";
+
+/// Whether `key` is an npm environment config selecting workspaces. npm reads
+/// every `npm_config_<key>` variable case-insensitively and normalises
+/// `<key>` like `@npmcli/config` `loadEnv` (`_` → `-`, lowercased), so
+/// `npm_config_workspace`, `NPM_CONFIG_WORKSPACE` and
+/// `npm_config_include_workspace_root` all count. An inherited `workspace`
+/// selector is fatal next to [`NPX_NO_WORKSPACES_ARG`] (`npm error Cannot use
+/// --no-workspaces and --workspace at the same time`) and, without the
+/// switch, when the launch dir has no such workspace (`No workspaces found`);
+/// `workspaces` / `include-workspace-root` steer the same selection.
+#[must_use]
+pub fn is_npm_workspace_selector_env(key: &str) -> bool {
+    const PREFIX: &str = "npm_config_";
+    let Some(prefix) = key.get(..PREFIX.len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(PREFIX) {
+        return false;
+    }
+    let normalized = key[PREFIX.len()..].replace('_', "-").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "workspace" | "workspaces" | "include-workspace-root"
+    )
+}
+
+/// The environment keys a managed npx launch removes so no workspace selector
+/// reaches npm: every [`is_npm_workspace_selector_env`] key in the daemon's own
+/// environment (the child inherits it) plus those among `explicit`, the keys
+/// the launch would otherwise set itself. Apply with `env_remove` after every
+/// other env merge.
+#[must_use]
+pub fn npm_workspace_selector_env_keys<'a>(
+    explicit: impl IntoIterator<Item = &'a str>,
+) -> std::collections::BTreeSet<String> {
+    std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .chain(explicit.into_iter().map(str::to_owned))
+        .filter(|key| is_npm_workspace_selector_env(key))
+        .collect()
+}
+
+impl NpxLaunchDir {
+    /// Create a fresh directory under `root` (the OS temp dir when `None`),
+    /// creating missing parents, holding only the sentinel `package.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when the directory or its sentinel
+    /// manifest cannot be created.
+    pub fn create(root: Option<&Path>) -> std::io::Result<Self> {
+        let root = root.map_or_else(std::env::temp_dir, Path::to_path_buf);
+        let path = root.join(format!(
+            "{}{}",
+            intent_core::NPX_LAUNCH_DIR_PREFIX,
+            uuid::Uuid::new_v4()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path)?;
+        let dir = Self { path };
+        std::fs::write(dir.path.join("package.json"), NPX_LAUNCH_SENTINEL_MANIFEST)?;
+        Ok(dir)
+    }
+
+    /// The directory the npx child runs in.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for NpxLaunchDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "failed to remove npx launch dir"
+                );
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for LaunchMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -173,7 +311,8 @@ impl std::fmt::Display for LaunchMode {
 
 /// Assemble the launch arguments, including the Codex `-c` config overrides
 /// (which read `CODEX_REASONING_EFFORT` / `CODEX_MODEL_REASONING_EFFORT`).
-/// When spawning via npx fallback, prepends `-y <package>` before the provider's args.
+/// When spawning via npx fallback, prepends [`NPX_NO_WORKSPACES_ARG`] and
+/// `-y <package>` before the provider's args.
 #[must_use]
 pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     let mut args = Vec::new();
@@ -182,6 +321,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     // prepend the npx-specific args before the provider's args
     if opts.via_npx() {
         if let Some(pkg) = opts.npx_fallback_package {
+            args.push(NPX_NO_WORKSPACES_ARG.to_string());
             args.push("-y".to_string());
             args.push(pkg.to_string());
         }
@@ -394,9 +534,28 @@ fn reduced_priority_shortfall(pid: u32, increment: i32) -> Option<String> {
 /// that path directly; otherwise, when `opts.npx_fallback_binary` is set,
 /// spawns npx; otherwise falls back to the bare `opts.provider.command`
 /// and relies on the enriched `PATH`.
+///
+/// An npx launch built here starts in `opts.npx_launch_root` (else the OS
+/// temp dir) rather than the workspace; only [`spawn_provider`] creates the
+/// per-spawn [`NpxLaunchDir`] underneath it.
 #[must_use]
 pub fn build_command(opts: &SpawnOptions) -> Command {
     build_command_with_captured_env(opts, captured_credential_env(), agent_nice())
+}
+
+/// The working directory the child starts in: for an npx launch the neutral
+/// `npx_launch_dir` (falling back to `npx_launch_root` / the OS temp dir when
+/// no per-spawn dir was created), otherwise the workspace `opts.cwd`.
+fn process_cwd(opts: &SpawnOptions, npx_launch_dir: Option<&Path>) -> Option<PathBuf> {
+    if opts.via_npx() {
+        Some(
+            npx_launch_dir
+                .or(opts.npx_launch_root)
+                .map_or_else(std::env::temp_dir, Path::to_path_buf),
+        )
+    } else {
+        opts.cwd.map(Path::to_path_buf)
+    }
 }
 
 /// The login-shell credential capture merged by [`build_command`]. In this
@@ -429,6 +588,17 @@ fn build_command_with_captured_env(
     captured: &BTreeMap<String, String>,
     nice_increment: i32,
 ) -> Command {
+    build_command_in(opts, captured, nice_increment, None)
+}
+
+/// [`build_command_with_captured_env`] with the per-spawn [`NpxLaunchDir`]
+/// an npx launch starts in (`None` → see [`process_cwd`]).
+fn build_command_in(
+    opts: &SpawnOptions,
+    captured: &BTreeMap<String, String>,
+    nice_increment: i32,
+    npx_launch_dir: Option<&Path>,
+) -> Command {
     let args = build_args(opts);
 
     // Decide which binary to spawn: provider_binary > npx_fallback (both fields) > provider.command
@@ -436,7 +606,7 @@ fn build_command_with_captured_env(
 
     let mut cmd = Command::new(command);
     cmd.args(&args);
-    if let Some(cwd) = opts.cwd {
+    if let Some(cwd) = process_cwd(opts, npx_launch_dir) {
         cmd.current_dir(cwd);
     }
     // An npx spawn (fallback or npx-only) always runs a Node child, so env
@@ -486,6 +656,24 @@ fn build_command_with_captured_env(
         cmd.env_remove("CODEX_CONFIG");
     }
 
+    // The npx bootstrap targets the neutral launch dir only: an inherited (or
+    // merged) npm workspace selector such as `npm_config_workspace` makes npm
+    // reject `--workspaces=false` before the adapter starts
+    // (intent-hq/intent#5738). Applies after every env merge above so no
+    // source — provider env, extra_env, captured login shell, daemon env —
+    // can reintroduce one; unrelated npm settings (registry, auth, proxy,
+    // cache) pass through untouched.
+    if via_npx {
+        let explicit = provider_env
+            .keys()
+            .chain(opts.extra_env.keys())
+            .chain(captured.keys())
+            .map(String::as_str);
+        for key in npm_workspace_selector_env_keys(explicit) {
+            cmd.env_remove(key);
+        }
+    }
+
     // Enhanced PATH must include the binary's parent dir so dependencies resolve
     // (e.g., when spawning npx, node must be findable)
     cmd.env("PATH", enhanced_path(opts.path_enrichment_binary()));
@@ -502,10 +690,12 @@ fn build_command_with_captured_env(
     cmd
 }
 
-/// A spawned provider child paired with its live ACP [`Connection`].
+/// A spawned provider child paired with its live ACP [`Connection`] and, for
+/// an npx launch, the neutral directory it started in.
 pub struct SpawnedAgent {
     child: Child,
     connection: Connection,
+    npx_launch_dir: Option<NpxLaunchDir>,
 }
 
 impl SpawnedAgent {
@@ -559,9 +749,10 @@ impl SpawnedAgent {
         kill_result.and(wait_result)
     }
 
-    /// Decompose into the child and connection (e.g. to store separately).
-    pub fn into_parts(self) -> (Child, Connection) {
-        (self.child, self.connection)
+    /// Decompose into the child, connection and npx launch dir (e.g. to store
+    /// separately). The launch dir must be kept alive as long as the child.
+    pub fn into_parts(self) -> (Child, Connection, Option<NpxLaunchDir>) {
+        (self.child, self.connection, self.npx_launch_dir)
     }
 }
 
@@ -572,16 +763,37 @@ impl SpawnedAgent {
 /// Returns [`AcpError::ProviderNotFound`] when the spawn failed with `ENOENT`
 /// and the launched program is established to be missing (see
 /// [`classify_not_found`]), naming the launch tier that was missing, and
-/// [`AcpError::Spawn`] for every other spawn failure or when the stdio pipes
-/// cannot be taken.
+/// [`AcpError::Spawn`] for every other spawn failure, when the neutral npx
+/// launch directory cannot be created, or when the stdio pipes cannot be
+/// taken.
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
     let nice_increment = agent_nice();
-    let mut cmd = build_command_with_captured_env(opts, captured_credential_env(), nice_increment);
     let (launch, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
+    // An npx launch starts in a fresh neutral directory, never the workspace
+    // (intent-hq/intent#5738); the workspace remains the ACP session cwd.
+    let npx_launch_dir = if opts.via_npx() {
+        Some(NpxLaunchDir::create(opts.npx_launch_root).map_err(|e| {
+            AcpError::Spawn(format!(
+                "{command_name}: cannot create npx launch directory: {e}"
+            ))
+        })?)
+    } else {
+        None
+    };
+    let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
+    let mut cmd = build_command_in(opts, captured_credential_env(), nice_increment, launch_cwd);
+    let process_cwd = process_cwd(opts, launch_cwd);
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            classify_not_found(opts, launch, target, &command_name, &e)
+            classify_not_found(
+                opts,
+                launch,
+                target,
+                &command_name,
+                process_cwd.as_deref(),
+                &e,
+            )
         } else {
             AcpError::Spawn(format!("{command_name}: {e}"))
         }
@@ -611,7 +823,11 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
         .take()
         .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>);
     let connection = Connection::new(stdin, stdout, stderr, hooks);
-    Ok(SpawnedAgent { child, connection })
+    Ok(SpawnedAgent {
+        child,
+        connection,
+        npx_launch_dir,
+    })
 }
 
 /// Attribute a spawn `ENOENT`. The kernel returns `ENOENT` for more than a
@@ -623,28 +839,38 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
 /// [`enhanced_path`] `build_command` sets) contains. Every other `ENOENT`
 /// stays an [`AcpError::Spawn`] carrying the original error plus the
 /// established fact (missing working directory, or "program exists").
+/// `process_cwd` is the directory the child was actually started in (the
+/// neutral npx launch dir for an npx launch, else `opts.cwd`).
 pub(crate) fn classify_not_found(
     opts: &SpawnOptions,
     launch: LaunchMode,
     target: &std::ffi::OsStr,
     command_name: &str,
+    process_cwd: Option<&Path>,
     e: &std::io::Error,
 ) -> AcpError {
     let child_path = enhanced_path(opts.path_enrichment_binary());
-    classify_not_found_with_path(opts, launch, target, command_name, e, child_path.as_ref())
+    classify_not_found_with_path(
+        launch,
+        target,
+        command_name,
+        process_cwd,
+        e,
+        child_path.as_ref(),
+    )
 }
 
 /// [`classify_not_found`] with the child's `PATH` injected (test seam — avoids
 /// mutating the process-global `PATH` in parallel tests).
 pub(crate) fn classify_not_found_with_path(
-    opts: &SpawnOptions,
     launch: LaunchMode,
     target: &std::ffi::OsStr,
     command_name: &str,
+    process_cwd: Option<&Path>,
     e: &std::io::Error,
     child_path: &std::ffi::OsStr,
 ) -> AcpError {
-    if let Some(cwd) = opts.cwd.filter(|cwd| !cwd.is_dir()) {
+    if let Some(cwd) = process_cwd.filter(|cwd| !cwd.is_dir()) {
         return AcpError::Spawn(format!(
             "{command_name}: {e} (working directory `{}` does not exist)",
             cwd.display()
@@ -653,7 +879,7 @@ pub(crate) fn classify_not_found_with_path(
     let program = Path::new(target);
     // The exec happens after the chdir, so a relative program path — and a
     // relative `PATH` entry — resolves against the child's working directory.
-    let in_child_cwd = |p: &Path| match opts.cwd {
+    let in_child_cwd = |p: &Path| match process_cwd {
         Some(cwd) if p.is_relative() => cwd.join(p).exists(),
         _ => p.exists(),
     };
@@ -1004,8 +1230,8 @@ mod build_command_tests {
 
     #[test]
     fn claude_code_npx_spawn_argv_is_pinned() {
-        // The exact spawn argv for claude-code: `<npx> -y <pinned package>` —
-        // no other args (claude-code has no base args).
+        // The exact spawn argv for claude-code: `<npx> --workspaces=false -y
+        // <pinned package>` — no other args (claude-code has no base args).
         let provider = intent_providers::find_provider("claude-code").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
@@ -1017,6 +1243,7 @@ mod build_command_tests {
         assert_eq!(
             args,
             vec![
+                "--workspaces=false".to_string(),
                 "-y".to_string(),
                 "@agentclientprotocol/claude-agent-acp@0.73.0".to_string(),
             ],
@@ -1064,6 +1291,82 @@ mod build_command_tests {
         // And args should NOT include npx -y package
         let args = build_args(&opts);
         assert!(!args.contains(&"-y".to_string()));
+    }
+
+    /// intent-hq/intent#5738: an npx launch (npx-only provider or npx
+    /// fallback) must NOT start in the workspace — npm reads the package
+    /// configuration of its cwd, so a Bun/pnpm workspace with `catalog:`
+    /// specifiers breaks `npx -y <adapter>` before the adapter starts. The
+    /// workspace stays the ACP session cwd (passed separately by the agent
+    /// manager), never the npx process cwd.
+    #[test]
+    fn build_command_does_not_start_npx_launches_in_the_workspace() {
+        let workspace = PathBuf::from("/repos/bun workspace");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+
+        // npx-only provider (claude-code).
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        let mut opts = SpawnOptions::new(claude);
+        opts.cwd = Some(&workspace);
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = claude.npx_only_package;
+        assert!(opts.via_npx());
+        let cmd = build_command(&opts);
+        assert_ne!(
+            cmd.as_std().get_current_dir(),
+            Some(workspace.as_path()),
+            "npx-only launch must not run npx inside the workspace"
+        );
+
+        // npx fallback (codex without a resolved binary).
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(codex);
+        opts.cwd = Some(&workspace);
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = codex.fallback_npx_package;
+        assert!(opts.via_npx());
+        let cmd = build_command(&opts);
+        assert_ne!(
+            cmd.as_std().get_current_dir(),
+            Some(workspace.as_path()),
+            "npx fallback launch must not run npx inside the workspace"
+        );
+    }
+
+    /// The counterpart of the test above: resolved binaries (discovered or
+    /// `providers.paths` overrides) and bare commands keep the workspace as
+    /// their process cwd — only the npx tier is isolated.
+    #[test]
+    fn build_command_keeps_workspace_cwd_for_resolved_binaries_and_bare_commands() {
+        let workspace = PathBuf::from("/repos/bun workspace");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let resolved = PathBuf::from("/custom/codex-acp");
+        let mut opts = SpawnOptions::new(codex);
+        opts.cwd = Some(&workspace);
+        opts.provider_binary = Some(&resolved);
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = codex.fallback_npx_package;
+        assert!(!opts.via_npx());
+        let cmd = build_command(&opts);
+        assert_eq!(cmd.as_std().get_current_dir(), Some(workspace.as_path()));
+
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        let adapter = PathBuf::from("/opt/claude-agent-acp/dist/index.js");
+        let mut opts = SpawnOptions::new(claude);
+        opts.cwd = Some(&workspace);
+        opts.provider_binary = Some(&adapter);
+        assert!(!opts.via_npx());
+        let cmd = build_command(&opts);
+        assert_eq!(cmd.as_std().get_current_dir(), Some(workspace.as_path()));
+
+        let auggie = intent_providers::find_provider("auggie").unwrap();
+        let mut opts = SpawnOptions::new(auggie);
+        opts.cwd = Some(&workspace);
+        assert_eq!(opts.launch_target().0, LaunchMode::BareCommand);
+        let cmd = build_command(&opts);
+        assert_eq!(cmd.as_std().get_current_dir(), Some(workspace.as_path()));
     }
 
     #[test]
@@ -1320,6 +1623,127 @@ mod build_command_tests {
             !touched,
             "non-codex npx spawns must not touch CODEX_PATH/CODEX_CONFIG"
         );
+    }
+
+    /// npm's env-config normalisation (`@npmcli/config` `loadEnv`): the
+    /// `npm_config_` prefix is case-insensitive and `_` folds to `-`, so every
+    /// spelling of the workspace selectors is recognised while the registry /
+    /// auth / proxy / cache settings and non-npm keys are not.
+    #[test]
+    fn npm_workspace_selector_env_recognises_npm_case_and_separator_variants() {
+        for key in [
+            "npm_config_workspace",
+            "NPM_CONFIG_WORKSPACE",
+            "Npm_Config_Workspace",
+            "npm_config_workspaces",
+            "npm_config_include_workspace_root",
+            "npm_config_include-workspace-root",
+            "NPM_CONFIG_INCLUDE_WORKSPACE_ROOT",
+        ] {
+            assert!(is_npm_workspace_selector_env(key), "{key}");
+        }
+        for key in [
+            "npm_config_registry",
+            "npm_config_userconfig",
+            "npm_config_cache",
+            "npm_config_offline",
+            "npm_config_proxy",
+            "npm_config_//registry.npmjs.org/:_authToken",
+            "npm_config_workspace_root",
+            "npm_config_",
+            "npm_config",
+            "workspace",
+            "NPM_WORKSPACE",
+            "",
+        ] {
+            assert!(!is_npm_workspace_selector_env(key), "{key}");
+        }
+        let keys = npm_workspace_selector_env_keys(["NPM_CONFIG_WORKSPACE", "npm_config_registry"]);
+        assert!(keys.contains("NPM_CONFIG_WORKSPACE"));
+        assert!(!keys.contains("npm_config_registry"));
+    }
+
+    /// intent-hq/intent#5738: a workspace selector reaching the npx bootstrap
+    /// from any env source — here the explicit `extra_env` merged last — is
+    /// removed from the child env on both npx tiers (npx-only claude-code,
+    /// codex fallback), while unrelated npm settings merged alongside it stay.
+    #[test]
+    fn build_command_strips_npm_workspace_selectors_on_npx_spawns() {
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        let codex = intent_providers::find_provider("codex").unwrap();
+        for (provider, package) in [
+            (claude, claude.npx_only_package),
+            (codex, codex.fallback_npx_package),
+        ] {
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx_path);
+            opts.npx_fallback_package = package;
+            for (k, v) in [
+                ("npm_config_workspace", "some-workspace"),
+                ("NPM_CONFIG_WORKSPACE", "some-workspace"),
+                ("npm_config_include_workspace_root", "true"),
+                ("npm_config_registry", "https://registry.example.test/"),
+                ("npm_config_proxy", "http://proxy.example.test:3128"),
+            ] {
+                opts.extra_env.insert(k.to_string(), v.to_string());
+            }
+            assert!(opts.via_npx());
+            let cmd = build_command(&opts);
+            for key in [
+                "npm_config_workspace",
+                "NPM_CONFIG_WORKSPACE",
+                "npm_config_include_workspace_root",
+            ] {
+                assert!(
+                    env_removed(&cmd, key),
+                    "{}: {key} must be env_remove'd from the npx spawn",
+                    provider.id
+                );
+            }
+            assert_eq!(
+                env_value(&cmd, "npm_config_registry").as_deref(),
+                Some("https://registry.example.test/"),
+                "{}: unrelated npm settings must survive",
+                provider.id
+            );
+            assert_eq!(
+                env_value(&cmd, "npm_config_proxy").as_deref(),
+                Some("http://proxy.example.test:3128"),
+                "{}: unrelated npm settings must survive",
+                provider.id
+            );
+        }
+    }
+
+    /// Control: a resolved binary or bare command is not an npx bootstrap, so
+    /// an explicit `npm_config_workspace` reaches it unchanged.
+    #[test]
+    fn build_command_keeps_npm_workspace_selectors_for_non_npx_spawns() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let provider_binary = PathBuf::from("/custom/codex-acp");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        let mut resolved = SpawnOptions::new(codex);
+        resolved.provider_binary = Some(&provider_binary);
+        resolved.npx_fallback_binary = Some(&npx_path);
+        resolved.npx_fallback_package = codex.fallback_npx_package;
+        let auggie = intent_providers::find_provider("auggie").unwrap();
+        let bare = SpawnOptions::new(auggie);
+        for mut opts in [resolved, bare] {
+            opts.extra_env.insert(
+                "npm_config_workspace".to_string(),
+                "some-workspace".to_string(),
+            );
+            assert!(!opts.via_npx());
+            let cmd = build_command(&opts);
+            assert_eq!(
+                env_value(&cmd, "npm_config_workspace").as_deref(),
+                Some("some-workspace"),
+                "{}: non-npx spawns keep the selector",
+                opts.provider.id
+            );
+            assert!(!env_removed(&cmd, "npm_config_workspace"));
+        }
     }
 }
 
