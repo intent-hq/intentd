@@ -8285,17 +8285,28 @@ impl AgentManager {
     /// never persists a notice or commits an identity the agent never ran
     /// under; retry attempts within one turn (`retry_spawn`) cannot duplicate
     /// the notice — the identity commit lands with the first success.
-    /// `rehomed` (a turn-start re-home off a disabled provider,
-    /// intent-hq/intent#5737) suppresses the row: the `provider_rehomed`
-    /// notice already explains this exact identity change, so a second
-    /// `model_changed` row would be a duplicate. The identity commit still
-    /// runs so the next turn compares against the re-homed identity.
+    ///
+    /// A turn-start re-home off a disabled provider (intent-hq/intent#5737)
+    /// suppresses the row: the `provider_rehomed` notice
+    /// [`AgentManager::rehome_if_provider_disabled`] persisted already
+    /// explains this exact provider hop, so a second `model_changed` row
+    /// would be a duplicate. The suppression is derived from the transcript
+    /// (see [`AgentManager::model_change_is_announced_rehome`]) rather than
+    /// carried in memory, because the re-home lands in the store on the
+    /// FIRST spawn attempt while the identity commit waits for the first
+    /// SUCCESS: a handshake failure followed by a `retry_spawn` attempt, a
+    /// later turn after an exhausted retry budget, or a daemon restart in
+    /// between all reach this method with the session already on the target
+    /// provider and `last_turn_provider` still naming the disabled one. The
+    /// identity commit still runs so the next turn compares against the
+    /// re-homed identity; `last_turn_provider` is never committed early
+    /// because the cross-provider resume guard in `agent_session` relies on
+    /// it naming the owner of the stored `acp_session_id`.
     async fn maybe_persist_model_change_notice(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         resolved: &ResolvedSpawn,
-        rehomed: bool,
     ) {
         let to_model = resolved.model.as_deref();
         let to_provider = resolved.provider.id;
@@ -8318,7 +8329,15 @@ impl AgentManager {
                 prev_provider != to_provider || from_model.as_deref() != to_model
             }
         };
-        if changed && !rehomed {
+        let announced = changed
+            && self
+                .model_change_is_announced_rehome(
+                    agent_id,
+                    from_provider.as_deref().unwrap_or(""),
+                    to_provider,
+                )
+                .await;
+        if changed && !announced {
             let label = |provider: &str, model: Option<&str>| match model {
                 Some(m) => format!("{provider}:{m}"),
                 None => format!("{provider} (default model)"),
@@ -8374,6 +8393,52 @@ impl AgentManager {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to commit last-turn model");
             }
         }
+    }
+
+    /// Whether a pending `model_changed` row for the provider hop
+    /// `from_provider` → `to_provider` is the deferred last-turn commit of a
+    /// re-home the transcript already announces (intent-hq/intent#5737): the
+    /// agent's newest identity-change system row
+    /// ([`intent_store::Store::latest_agent_identity_notice`]) is a
+    /// `provider_rehomed` notice for that same hop, both sides canonicalized
+    /// through the provider registry. Requiring the NEWEST identity row (not
+    /// merely any re-home row) keeps a stale notice from muting a later,
+    /// explicit switch that happens to retrace the hop: an explicit switch
+    /// back off the target lands its own `model_changed` row in between. A
+    /// read failure reads as "not announced" so the generic row still lands
+    /// — a duplicate beats a silent switch. Same-provider changes are never
+    /// a re-home.
+    async fn model_change_is_announced_rehome(
+        &self,
+        agent_id: &AgentId,
+        from_provider: &str,
+        to_provider: &str,
+    ) -> bool {
+        let canonical = |id: &str| intent_providers::provider_config(id).id;
+        if canonical(from_provider) == canonical(to_provider) {
+            return false;
+        }
+        let latest = match self
+            .services
+            .store
+            .latest_agent_identity_notice(agent_id)
+            .await
+        {
+            Ok(latest) => latest,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read latest identity notice; keeping the model-change notice");
+                return false;
+            }
+        };
+        let Some(latest) = latest else {
+            return false;
+        };
+        if latest["type"].as_str() != Some("provider_rehomed") {
+            return false;
+        }
+        let hop = |key: &str| latest[key].as_str().map(canonical);
+        hop("fromProvider") == Some(canonical(from_provider))
+            && hop("toProvider") == Some(canonical(to_provider))
     }
 
     /// Persist the informational `auto_unarchived` transcript row when this
@@ -8436,11 +8501,14 @@ impl AgentManager {
     ///    child takes the existing `agent.setModel` respawn branch (kill,
     ///    fresh `session/new`) and the last-turn identity commit runs on
     ///    success exactly as after a `setModel` — but the generic
-    ///    `model_changed` row is suppressed for this turn (the `rehomed`
-    ///    flag returned here), because the `provider_rehomed` system row this
-    ///    persists in the transcript (see
+    ///    `model_changed` row is suppressed, because the `provider_rehomed`
+    ///    system row this persists in the transcript (see
     ///    [`AgentManager::persist_provider_rehome_notice`]) already names the
-    ///    same identity change. This also emits the same `agent:updated`
+    ///    same identity change; the suppression is read back from that row
+    ///    ([`AgentManager::model_change_is_announced_rehome`]) so it survives
+    ///    a failed first spawn attempt, whose retry (or a later turn, or a
+    ///    restart) finds the session already on the target provider with
+    ///    the identity commit still pending. This also emits the same `agent:updated`
     ///    invalidation `agent.setModel` publishes. One-way: re-enabling the
     ///    old provider never moves the session back.
     /// 2. Otherwise the turn fails before any spawn with the distinct "not
@@ -8454,8 +8522,7 @@ impl AgentManager {
     /// whether a re-home happened — the caller uses that flag to force the
     /// live child's teardown (the disabled provider's child must never be
     /// reused, even when the target shares its `command` and resolved model,
-    /// e.g. `opencode` → `unsloth`) and to suppress the generic
-    /// `model_changed` row.
+    /// e.g. `opencode` → `unsloth`).
     async fn rehome_if_provider_disabled(
         &self,
         agent_id: &AgentId,
@@ -8720,13 +8787,8 @@ impl AgentManager {
                     // session. The notice/commit still runs: the live child may
                     // predate a same-provider model change the reuse tolerates,
                     // and an unchanged identity is a cheap no-op read.
-                    self.maybe_persist_model_change_notice(
-                        agent_id,
-                        workspace_id,
-                        &resolved,
-                        rehomed,
-                    )
-                    .await;
+                    self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
+                        .await;
                     // A `reasoningEffort` change needs no respawn: re-apply it
                     // on the live session through the `thought_level` config
                     // option discovered at session open, so it takes effect
@@ -8955,9 +9017,10 @@ impl AgentManager {
         // not persist a notice or commit `last_turn_*` to an identity the
         // agent never ran under. Store-based (not handle-based) so detection
         // also covers idle-agent respawns. Best-effort — a notice failure
-        // never blocks the turn. A re-home turn commits the identity but
-        // skips the row (the `provider_rehomed` notice already landed).
-        self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved, rehomed)
+        // never blocks the turn. A re-home commits the identity but skips the
+        // row (the `provider_rehomed` notice already landed) — detected from
+        // the transcript, so it holds on a retry after a failed first spawn.
+        self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
             .await;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
@@ -15216,6 +15279,105 @@ mod disabled_provider_rehome_tests {
             .await
             .unwrap();
         assert_eq!(row.provider.as_deref(), Some("mock"));
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (a‴) The single-notice guarantee survives a FAILED first spawn on the
+    /// re-homed provider. The re-home (row + `provider_rehomed` notice) lands
+    /// on the first `ensure_started`, whose child then dies before the
+    /// handshake; the next attempt — `retry_spawn` within the turn, a later
+    /// turn, or a restart — finds the session already on the enabled target
+    /// (no re-home this time) with `last_turn_provider` still naming the
+    /// disabled provider, and must still not append a `model_changed` row.
+    /// The mock exits immediately on its first launch (attempt counter in
+    /// `MOCK_AGENT_ATTEMPT_FILE`) and serves the second; the turn is driven
+    /// through `retry_spawn` exactly as the message worker does.
+    #[tokio::test]
+    async fn rehome_with_failed_first_spawn_still_persists_exactly_one_notice() {
+        let script = mock_agent_script();
+        let attempts = crate::tests::test_tempdir("intentd-rehome-attempts-");
+        let attempt_file = attempts
+            .path()
+            .join("attempts.txt")
+            .to_string_lossy()
+            .into_owned();
+        let behavior = json!({ "exitImmediatelyAttempts": 1 }).to_string();
+        let _env = super::tests::EnvGuard::apply(&[
+            ("MOCK_AGENT_SCRIPT_PATH", Some(&script)),
+            ("MOCK_AGENT_BEHAVIOR", Some(&behavior)),
+            ("MOCK_AGENT_ATTEMPT_FILE", Some(&attempt_file)),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", Some("10,20")),
+        ]);
+        let (mgr, _bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        let ws = WorkspaceId::from(WS);
+        let agent_id = AgentId::from("agent-5737-failed-first-spawn");
+        seed_session(&mgr, &agent_id, "codex", Some("gpt-5"), None).await;
+        mgr.services
+            .store
+            .set_agent_session_last_turn_model(&ws, &agent_id, Some("gpt-5"), "codex")
+            .await
+            .unwrap();
+
+        let system_rows = |messages: &[intent_core::AgentMessage]| -> Vec<String> {
+            messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| {
+                    m.metadata
+                        .as_ref()
+                        .and_then(|md| md["type"].as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        };
+
+        retry_spawn(&mgr, &agent_id, &ws)
+            .await
+            .expect("the retried spawn succeeds on the re-homed provider");
+        assert_eq!(
+            std::fs::read_to_string(&attempt_file).unwrap().trim(),
+            "3",
+            "the mock was launched twice: one failed attempt, one served"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            system_rows(&messages),
+            vec!["provider_rehomed".to_string()],
+            "one notice across the failed and the successful attempt: {messages:?}"
+        );
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session_last_turn_model(&ws, &agent_id)
+                .await
+                .unwrap(),
+            (None, Some("mock".to_string())),
+            "the successful attempt commits the re-homed identity"
+        );
+
+        // A third turn under the committed identity stays silent.
+        mgr.ensure_started(&agent_id, &ws)
+            .await
+            .expect("later turn reuses the re-homed session");
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            system_rows(&messages),
+            vec!["provider_rehomed".to_string()],
+            "later turns add no notices: {messages:?}"
+        );
         mgr.stop(&agent_id).await;
     }
 

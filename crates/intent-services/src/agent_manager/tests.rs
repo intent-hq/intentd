@@ -20295,7 +20295,7 @@ mod model_change_notice_tests {
         let (ws, id) = (WorkspaceId::from("ws-mc1"), AgentId::from("a-mc1"));
         seed_agent(&mgr, &ws, &id).await;
 
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
             .await;
 
         let messages = mgr
@@ -20329,15 +20329,10 @@ mod model_change_notice_tests {
         });
 
         // Turn 1 commits the baseline; turn 2 switches model + provider.
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
             .await;
-        mgr.maybe_persist_model_change_notice(
-            &id,
-            &ws,
-            &resolved("claude-code", Some("sonnet")),
-            false,
-        )
-        .await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
 
         let messages = mgr
             .services
@@ -20373,13 +20368,8 @@ mod model_change_notice_tests {
         assert_eq!(event.data["messageId"], json!(notice.id));
 
         // Turn 3 under the unchanged identity: no second notice.
-        mgr.maybe_persist_model_change_notice(
-            &id,
-            &ws,
-            &resolved("claude-code", Some("sonnet")),
-            false,
-        )
-        .await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
         let messages = mgr
             .services
             .store
@@ -20398,10 +20388,10 @@ mod model_change_notice_tests {
         let (ws, id) = (WorkspaceId::from("ws-mc3"), AgentId::from("a-mc3"));
         seed_agent(&mgr, &ws, &id).await;
 
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
             .await;
         // (setModel A→B→A happened between turns; nothing committed.)
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
             .await;
 
         let messages = mgr
@@ -20424,9 +20414,9 @@ mod model_change_notice_tests {
         let (ws, id) = (WorkspaceId::from("ws-mc4"), AgentId::from("a-mc4"));
         seed_agent(&mgr, &ws, &id).await;
 
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", None), false)
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", None))
             .await;
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
             .await;
 
         let messages = mgr
@@ -20441,34 +20431,67 @@ mod model_change_notice_tests {
         assert_eq!(md["to"], json!("gpt-5"));
     }
 
-    /// A turn-start re-home (intent-hq/intent#5737) passes `rehomed = true`:
-    /// the identity change is real, but the row is suppressed — the
-    /// `provider_rehomed` notice already explains it — while the identity
-    /// still commits, so the following turn under the new pair is silent.
+    /// A turn-start re-home (intent-hq/intent#5737) leaves a
+    /// `provider_rehomed` system row in the transcript: the identity change
+    /// it announces is real, but the `model_changed` row for that same
+    /// provider hop is suppressed — read back from the transcript, so it
+    /// holds however many spawn attempts, turns or restarts separate the
+    /// re-home from the first successful spawn — while the identity still
+    /// commits, so the following turn under the new pair is silent. The
+    /// suppression is scoped to the newest identity row: an explicit switch
+    /// back off the target gets its row, and retracing the hop afterwards is
+    /// an ordinary switch again.
     #[tokio::test]
     async fn rehomed_switch_commits_identity_without_model_changed_row() {
         let (_tmp, mgr) = manager().await;
         let (ws, id) = (WorkspaceId::from("ws-mc6"), AgentId::from("a-mc6"));
         seed_agent(&mgr, &ws, &id).await;
+        let identity_rows = || async {
+            mgr.services
+                .store
+                .get_agent_messages(&id, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.metadata.unwrap()["type"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
 
-        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")), false)
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
             .await;
-        mgr.maybe_persist_model_change_notice(
-            &id,
-            &ws,
-            &resolved("claude-code", Some("sonnet")),
-            true,
-        )
-        .await;
-
-        let messages = mgr
-            .services
+        // The re-home persisted its notice and moved the session row; the
+        // identity commit is still pending (the spawn has not succeeded yet).
+        mgr.services
             .store
-            .get_agent_messages(&id, None)
+            .append_agent_message_with_metadata(
+                &id,
+                "system",
+                &json!([{ "type": "text", "text": "re-homed" }]),
+                Some(&json!({
+                    "type": "provider_rehomed",
+                    "reason": "provider_disabled",
+                    "from": "gpt-5",
+                    "to": "sonnet",
+                    "fromProvider": "auggie",
+                    "toProvider": "claude-code",
+                })),
+                &now_iso(),
+            )
             .await
             .unwrap();
-        assert!(
-            messages.is_empty(),
+        // Two successful spawns under the target identity (a retried first
+        // attempt, or a later turn) both find the hop announced.
+        for _ in 0..2 {
+            mgr.maybe_persist_model_change_notice(
+                &id,
+                &ws,
+                &resolved("claude-code", Some("sonnet")),
+            )
+            .await;
+        }
+        assert_eq!(
+            identity_rows().await,
+            vec!["provider_rehomed".to_string()],
             "re-home suppresses the model_changed row"
         );
         let (m, p) = mgr
@@ -20480,23 +20503,83 @@ mod model_change_notice_tests {
         assert_eq!(m.as_deref(), Some("sonnet"));
         assert_eq!(p.as_deref(), Some("claude-code"));
 
-        mgr.maybe_persist_model_change_notice(
-            &id,
-            &ws,
-            &resolved("claude-code", Some("sonnet")),
-            false,
-        )
-        .await;
+        // An explicit switch back onto the re-enabled provider is announced.
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+        assert_eq!(
+            identity_rows().await,
+            vec!["provider_rehomed".to_string(), "model_changed".to_string()],
+            "switching back is an ordinary change"
+        );
+        // Retracing the re-home hop explicitly is an ordinary change too:
+        // the stale `provider_rehomed` row is no longer the newest identity
+        // row, so it must not mute this switch.
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
+        assert_eq!(
+            identity_rows().await,
+            vec![
+                "provider_rehomed".to_string(),
+                "model_changed".to_string(),
+                "model_changed".to_string(),
+            ],
+            "a stale re-home row never mutes a later explicit switch"
+        );
+    }
+
+    /// The transcript-derived suppression matches the provider hop exactly:
+    /// a `provider_rehomed` row for a DIFFERENT hop, or a same-provider
+    /// model change under the re-homed provider, still gets its
+    /// `model_changed` row.
+    #[tokio::test]
+    async fn rehome_suppression_is_scoped_to_the_announced_hop() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-mc7"), AgentId::from("a-mc7"));
+        seed_agent(&mgr, &ws, &id).await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+        mgr.services
+            .store
+            .append_agent_message_with_metadata(
+                &id,
+                "system",
+                &json!([{ "type": "text", "text": "re-homed" }]),
+                Some(&json!({
+                    "type": "provider_rehomed",
+                    "reason": "provider_disabled",
+                    "from": "gpt-5",
+                    "to": null,
+                    "fromProvider": "codex",
+                    "toProvider": "claude-code",
+                })),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
         let messages = mgr
             .services
             .store
             .get_agent_messages(&id, None)
             .await
             .unwrap();
-        assert!(
-            messages.is_empty(),
-            "next turn under the re-homed pair is silent"
+        assert_eq!(messages.len(), 2, "a different hop is not announced");
+        assert_eq!(
+            messages[1].metadata.as_ref().unwrap()["type"],
+            json!("model_changed")
         );
+
+        // Same-provider model change under the target: never a re-home.
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("opus")))
+            .await;
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 3, "same-provider change is announced");
     }
 
     /// The recreate-replay body must exclude BOTH the current user message and
@@ -20530,13 +20613,8 @@ mod model_change_notice_tests {
             .set_agent_session_last_turn_model(&ws, &id, Some("gpt-5"), "auggie")
             .await
             .unwrap();
-        mgr.maybe_persist_model_change_notice(
-            &id,
-            &ws,
-            &resolved("claude-code", Some("sonnet")),
-            false,
-        )
-        .await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
         mgr.recreated.lock().unwrap().insert(id.clone());
 
         let body = mgr.build_turn_body(&id, "current ask").await;

@@ -2038,6 +2038,39 @@ impl Store {
         Ok(())
     }
 
+    /// Metadata of the agent's newest `role: "system"` transcript row that
+    /// records a spawn-identity change — a `model_changed` or a
+    /// `provider_rehomed` notice — or `None` when the transcript carries
+    /// neither. The model-change notice path reads it to tell a re-home's
+    /// deferred last-turn commit (the newest such row is the
+    /// `provider_rehomed` notice for this very provider hop) from an
+    /// ordinary switch, durably across spawn retries, later turns and
+    /// daemon restarts (intent-hq/intent#5737). Newest-first over the
+    /// `(agent_id, role, seq DESC)` index; system rows are rare, so the
+    /// scan is short. Unparseable metadata reads as `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn latest_agent_identity_notice(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<serde_json::Value>> {
+        let raw = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT metadata FROM agent_message \
+             WHERE agent_id=? AND role='system' \
+               AND json_extract(metadata, '$.type') IN ('model_changed', 'provider_rehomed') \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&agent_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("latest agent identity notice failed: {e}")))?;
+        Ok(raw
+            .flatten()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok()))
+    }
+
     /// Read one session's `model`, `resolved_model` (D14 display identity of
     /// an explicit pick, if any), `provider`, and its persisted cumulative
     /// end-of-turn `token_usage` snapshot (§5.23) in a single row read. This
@@ -11531,6 +11564,120 @@ mod tests {
         );
         let after = store.get_agent_session(&null_id).await.expect("get");
         assert_eq!(after.provider.as_deref(), Some("mock"));
+    }
+
+    /// `latest_agent_identity_notice` (intent-hq/intent#5737) returns the
+    /// newest system `model_changed` / `provider_rehomed` row's metadata
+    /// only: other system rows, user/assistant rows carrying those types,
+    /// and other agents' rows never count; no such row reads as `None`.
+    #[tokio::test]
+    async fn latest_agent_identity_notice_returns_newest_identity_system_row() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-notice".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        store.insert_agent_session(&session).await.expect("insert");
+        let other_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let other = baseline_test_session(&other_id, &ws_id, &ts, None);
+        store.insert_agent_session(&other).await.expect("insert");
+
+        let text = serde_json::json!([{ "type": "text", "text": "x" }]);
+        let append = |agent: &AgentId, role: &str, metadata: serde_json::Value| {
+            let agent = agent.clone();
+            let role = role.to_string();
+            let text = text.clone();
+            let store = &store;
+            async move {
+                store
+                    .append_agent_message_with_metadata(
+                        &agent,
+                        &role,
+                        &text,
+                        Some(&metadata),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("append")
+            }
+        };
+
+        assert_eq!(
+            store
+                .latest_agent_identity_notice(&agent_id)
+                .await
+                .expect("read"),
+            None,
+            "empty transcript"
+        );
+        append(
+            &agent_id,
+            "user",
+            serde_json::json!({ "type": "provider_rehomed" }),
+        )
+        .await;
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "auto_unarchived" }),
+        )
+        .await;
+        append(
+            &other_id,
+            "system",
+            serde_json::json!({ "type": "model_changed", "toProvider": "other" }),
+        )
+        .await;
+        assert_eq!(
+            store
+                .latest_agent_identity_notice(&agent_id)
+                .await
+                .expect("read"),
+            None,
+            "only system rows of the two identity types count, per agent"
+        );
+
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "provider_rehomed", "fromProvider": "a", "toProvider": "b" }),
+        )
+        .await;
+        let latest = store
+            .latest_agent_identity_notice(&agent_id)
+            .await
+            .expect("read")
+            .expect("rehome row");
+        assert_eq!(latest["type"], "provider_rehomed");
+        assert_eq!(latest["toProvider"], "b");
+
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "model_changed", "fromProvider": "b", "toProvider": "a" }),
+        )
+        .await;
+        append(
+            &agent_id,
+            "assistant",
+            serde_json::json!({ "type": "provider_rehomed" }),
+        )
+        .await;
+        let latest = store
+            .latest_agent_identity_notice(&agent_id)
+            .await
+            .expect("read")
+            .expect("model_changed row");
+        assert_eq!(latest["type"], "model_changed", "newest identity row wins");
+        assert_eq!(latest["toProvider"], "a");
     }
 
     /// monorepo#1936 regression: the spawn path's system-prompt persist is a
