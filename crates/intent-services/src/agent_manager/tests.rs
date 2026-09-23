@@ -23,11 +23,11 @@ use tokio::time::{timeout, Duration};
 
 use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
-    is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
-    resolve_npx_only, resolve_spawn, settle_stale_waiter, text_prompt, AgentHandle, AgentManager,
-    BusEventSink, KillFn, ProcessRegistry, RegistryInner, ResolvedSpawn, TreeMemoryProbe,
-    TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES, PROVISIONAL_AGENT_BYTES,
-    REASON_MEMORY_BUDGET, REASON_SLOTS,
+    guard_npx_version, is_cancel_transport_closed, pop_and_wake_waiter,
+    recommended_memory_budget_bytes, resolve_npx_only, resolve_spawn, settle_stale_waiter,
+    text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, RegistryInner,
+    ResolvedSpawn, TreeMemoryProbe, TreeSample, DEFAULT_AGENT_TYPE, HOST_MEMORY_RESERVE_BYTES,
+    PROVISIONAL_AGENT_BYTES, REASON_MEMORY_BUDGET, REASON_SLOTS,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -15820,7 +15820,9 @@ async fn resolve_spawn_strips_legacy_compound_model_rows() {
 fn resolve_npx_only_returns_pinned_package_and_errors_without_npx() {
     let provider = intent_providers::provider_config("claude-code");
 
-    let npx = PathBuf::from("/usr/local/bin/npx");
+    // A path that does not exist on any host: the version guard's probe
+    // fails → permissive Unknown, keeping this test free of a real spawn.
+    let npx = PathBuf::from("/nonexistent/intent-test/bin/npx");
     let (bin, pkg) = resolve_npx_only(provider, Some(npx.clone())).expect("npx present resolves");
     assert_eq!(bin, npx);
     assert_eq!(pkg, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
@@ -15840,6 +15842,67 @@ fn resolve_npx_only_returns_pinned_package_and_errors_without_npx() {
         msg.contains("Anthropic Claude Code"),
         "error must name the provider, got: {msg}"
     );
+}
+
+/// Write a fake `npx` script that prints `version` for `--version`.
+#[cfg(unix)]
+fn fake_npx_printing(dir: &std::path::Path, version: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let npx = dir.join("npx");
+    std::fs::write(&npx, format!("#!/bin/sh\necho {version}\n")).unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    npx
+}
+
+/// Spawn-time version guard (intent-hq/intent#5725): an npx that reports
+/// npm < 7 (`npx -y <pkg>` is rejected by npm 6 with "You must supply a
+/// command") is a hard `InvalidInput` error naming the stale npx path, the
+/// detected node path, and the remedy — instead of three doomed spawn
+/// retries ending in an opaque "agent stdout closed" handshake failure.
+#[cfg(unix)]
+#[test]
+fn resolve_npx_only_rejects_stale_npm6_npx_naming_both_paths() {
+    let dir = test_tempdir("intentd-stale-npx-");
+    let npx = fake_npx_printing(dir.path(), "6.14.18");
+    let node = dir.path().join("nvm/versions/node/v24.16.0/bin/node");
+
+    let err = guard_npx_version(&npx, Some(&node)).expect_err("npm 6 npx is rejected");
+    assert!(
+        matches!(err, intent_core::Error::InvalidInput(_)),
+        "stale npx is an environment misconfiguration, got: {err:?}"
+    );
+    let msg = err.to_string();
+    eprintln!("stale npx rejection: {msg}");
+    assert!(msg.contains(&npx.display().to_string()), "{msg}");
+    assert!(msg.contains(&node.display().to_string()), "{msg}");
+    assert!(msg.contains("6.14.18"), "{msg}");
+    assert!(msg.contains("PATH"), "{msg}");
+
+    let provider = intent_providers::provider_config("claude-code");
+    let err = resolve_npx_only(provider, Some(npx.clone()))
+        .expect_err("npx-only resolution applies the guard");
+    assert!(matches!(err, intent_core::Error::InvalidInput(_)));
+    assert!(err.to_string().contains(&npx.display().to_string()));
+}
+
+/// npm 7+ and an unprobeable npx both pass the guard (permissive on Unknown,
+/// matching the pi/auggie gates), so a changed `--version` format never
+/// blocks a spawn.
+#[cfg(unix)]
+#[test]
+fn resolve_npx_only_accepts_modern_and_unprobeable_npx() {
+    let dir = test_tempdir("intentd-modern-npx-");
+    let npx = fake_npx_printing(dir.path(), "11.13.0");
+    guard_npx_version(&npx, None).expect("npm 11 passes");
+    let (bin, _) = resolve_npx_only(
+        intent_providers::provider_config("claude-code"),
+        Some(npx.clone()),
+    )
+    .expect("modern npx resolves");
+    assert_eq!(bin, npx);
+
+    let missing = dir.path().join("absent/npx");
+    guard_npx_version(&missing, None).expect("unprobeable npx is permissive");
 }
 
 /// Non-npx-only providers reject npx-only resolution (defensive seam guard).

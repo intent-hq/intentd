@@ -10055,6 +10055,7 @@ fn resolve_spawn(
     let (npx_fallback_binary, npx_fallback_package) = if provider_binary.is_none() {
         if let Some(pkg) = provider.fallback_npx_package {
             if let Some(npx_path) = intent_providers::find_npx() {
+                guard_npx_version(&npx_path, intent_providers::find_node().as_deref())?;
                 tracing::info!(
                     provider_id = provider_id,
                     npx_path = ?npx_path,
@@ -10087,7 +10088,8 @@ fn resolve_spawn(
 
 /// Resolve the npx spawn inputs for an npx-only provider. `npx_path` is the
 /// caller-supplied `find_npx()` result (parameterized as a test seam). Missing
-/// npx is a hard, user-facing error — there is no local-binary fallback.
+/// npx is a hard, user-facing error — there is no local-binary fallback — and
+/// so is a stale npm-6 npx ([`guard_npx_version`]).
 fn resolve_npx_only(
     provider: &ProviderConfig,
     npx_path: Option<PathBuf>,
@@ -10108,6 +10110,7 @@ fn resolve_npx_only(
             provider.display_name
         ))
     })?;
+    guard_npx_version(&npx, intent_providers::find_node().as_deref())?;
     tracing::info!(
         provider_id = provider.id,
         npx_path = ?npx,
@@ -10115,6 +10118,102 @@ fn resolve_npx_only(
         "spawning npx-only provider via pinned npx package"
     );
     Ok((npx, pkg))
+}
+
+/// Spawn-time npx version guard (intent-hq/intent#5725): reject an `npx`
+/// whose npm is older than [`intent_providers::NPX_MIN_NPM_VERSION`] with a
+/// user-facing `InvalidInput` naming the stale npx, the detected `node`, and
+/// the remedy — npm 6's npx rejects `npx -y <pkg>` outright, so the spawn
+/// would otherwise retry three times and surface only "agent stdout closed".
+/// Permissive when the probe fails or its output does not parse (same policy
+/// as the pi/auggie gates). Shared by the npx-only path and the codex npx
+/// fallback.
+fn guard_npx_version(npx: &Path, node: Option<&Path>) -> Result<()> {
+    let gate = intent_providers::npx_gate(&probe_npx_version_cached(npx));
+    match intent_providers::stale_npx_reason(&gate, npx, node) {
+        Some(reason) => {
+            tracing::warn!(
+                npx_path = ?npx,
+                node_path = ?node,
+                gate = ?gate,
+                "rejecting stale npx before spawn"
+            );
+            Err(Error::InvalidInput(reason))
+        }
+        None => Ok(()),
+    }
+}
+
+/// `npx --version` probe result memoized per npx path + file mtime, so the
+/// guard costs one short subprocess per distinct npx binary per daemon
+/// lifetime (`resolve_spawn` runs on every turn) and a repointed/upgraded
+/// npx is re-probed. A failed probe is cached too — that outcome is
+/// permissive, so caching it only preserves the pre-guard behaviour.
+fn probe_npx_version_cached(npx: &Path) -> intent_providers::PiCliProbe {
+    use intent_providers::PiCliProbe;
+    type NpxProbeCache = Mutex<HashMap<PathBuf, (Option<SystemTime>, PiCliProbe)>>;
+    static CACHE: std::sync::OnceLock<NpxProbeCache> = std::sync::OnceLock::new();
+    let mtime = std::fs::metadata(npx).and_then(|m| m.modified()).ok();
+    let cache = CACHE.get_or_init(Mutex::default);
+    if let Some((cached_mtime, probe)) = cache.lock().unwrap().get(npx) {
+        if *cached_mtime == mtime {
+            return probe.clone();
+        }
+    }
+    let probe = run_npx_version_probe(npx).map_or(PiCliProbe::Failed, PiCliProbe::Output);
+    cache
+        .lock()
+        .unwrap()
+        .insert(npx.to_path_buf(), (mtime, probe.clone()));
+    probe
+}
+
+/// Run `<npx> --version` with a 3s budget and return the trimmed first
+/// stdout line, or `None` on spawn failure, nonzero exit, timeout, or empty
+/// output (same shape as the `auggie_cli` / `pi_cli` probes). Probes with
+/// the same enhanced PATH the real spawn uses so npx's `#!/usr/bin/env node`
+/// shebang resolves the sibling `node`.
+fn run_npx_version_probe(npx: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(npx)
+        .arg("--version")
+        .env("PATH", intent_providers::enhanced_path(Some(npx)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let timeout = Duration::from_secs(3);
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut output = Vec::new();
+                child.stdout.take()?.read_to_end(&mut output).ok()?;
+                let stdout = String::from_utf8_lossy(&output);
+                let first_line = stdout.lines().next()?.trim();
+                if first_line.is_empty() {
+                    return None;
+                }
+                return Some(first_line.to_string());
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Rebuild the caller's [`SpawnOptions`] for `create_agent`, injecting the
