@@ -1004,6 +1004,121 @@ async fn spawn_provider_real_npx_ignores_matching_ancestor_workspaces_and_siblin
     }
 }
 
+/// Seed `root` as a VALID npm workspace root — `workspaces: ["packages/*"]`
+/// with a `packages/some-workspace` member — and return an npx launch root
+/// beneath it (`root/.intent/agent-configs`, outside the glob). This is where
+/// a daemon whose environment carries `npm_config_workspace=some-workspace`
+/// (a shell exported it, or an `npm run` script launched the daemon) would
+/// otherwise have bootstrapped npx successfully before intent-hq/intent#5738.
+#[cfg(unix)]
+fn seed_valid_workspace_root(root: &std::path::Path) -> std::path::PathBuf {
+    let member = root.join("packages").join("some-workspace");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{"name":"some-workspace","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let launch_root = root.join(".intent").join("agent-configs");
+    std::fs::create_dir_all(&launch_root).unwrap();
+    launch_root
+}
+
+/// intent-hq/intent#5738 (regression of the `--workspaces=false` fix against
+/// the REAL npm CLI): npm reads `npm_config_workspace` — in any letter case —
+/// from the environment, and a selector next to `--workspaces=false` is fatal
+/// (`Cannot use --no-workspaces and --workspace at the same time`, exit 1)
+/// before the adapter starts. The managed bootstrap must remove every
+/// inherited selector after all env merges (here they arrive through
+/// `extra_env`, the last merge) while passing unrelated npm settings — the
+/// private npmrc / cache / offline configuration this test itself relies on —
+/// through. Offline; skips without `npx`.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_real_npx_ignores_inherited_npm_workspace_selectors() {
+    use crate::spawn::{spawn_provider, SpawnOptions};
+
+    let Some(npx) = real_npx("real-npx inherited workspace selector regression") else {
+        return;
+    };
+    let tmp = test_temp_dir("intent-acp-npx-real-selector-");
+    let workspace = tmp.path().join("plain workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let home = tmp.path().join("clean-home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("user.npmrc"), "").unwrap();
+    std::fs::write(home.join("global.npmrc"), "").unwrap();
+    let launch_root = seed_valid_workspace_root(&tmp.path().join("valid-workspace"));
+    let adapter = local_adapter_package(tmp.path());
+    let adapter_spec: &'static str =
+        Box::leak(adapter.to_str().unwrap().to_owned().into_boxed_str());
+    let report = tmp.path().join("adapter-report");
+
+    let provider = *intent_providers::find_provider("claude-code").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&workspace);
+    opts.npx_launch_root = Some(&launch_root);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = Some(adapter_spec);
+    for (k, v) in [
+        ("HOME", home.to_str().unwrap()),
+        (
+            "npm_config_userconfig",
+            home.join("user.npmrc").to_str().unwrap(),
+        ),
+        (
+            "npm_config_globalconfig",
+            home.join("global.npmrc").to_str().unwrap(),
+        ),
+        (
+            "npm_config_cache",
+            tmp.path().join("npm-cache").to_str().unwrap(),
+        ),
+        ("npm_config_offline", "true"),
+        ("npm_config_update_notifier", "false"),
+        ("npm_config_loglevel", "error"),
+        ("DD_TRACE_ENABLED", "false"),
+        ("ADAPTER_REPORT", report.to_str().unwrap()),
+        // The inherited selectors under test, in both spellings npm accepts.
+        ("npm_config_workspace", "some-workspace"),
+        ("NPM_CONFIG_WORKSPACE", "some-workspace"),
+    ] {
+        opts.extra_env.insert(k.to_string(), v.to_string());
+    }
+    assert!(opts.via_npx());
+
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
+    let status = tokio::time::timeout(Duration::from_secs(120), agent.child_mut().wait())
+        .await
+        .expect("real npx launch did not exit")
+        .expect("wait real npx");
+    assert!(
+        status.success(),
+        "real npx must start the adapter despite an inherited npm_config_workspace selector \
+         (exit {status:?}; 1 = `Cannot use --no-workspaces and --workspace at the same time`)"
+    );
+    let started =
+        std::fs::read_to_string(&report).unwrap_or_else(|e| panic!("adapter never started ({e})"));
+    let cwd = std::path::PathBuf::from(
+        started
+            .trim()
+            .strip_prefix("ADAPTER_STARTED ")
+            .unwrap_or_else(|| panic!("unexpected report {started:?}")),
+    );
+    assert!(
+        cwd.starts_with(&launch_root),
+        "adapter cwd {} is not under the launch root {}",
+        cwd.display(),
+        launch_root.display()
+    );
+    agent.kill().await.ok();
+}
+
 /// intent-hq/intent#5738 (spawn classification): the process cwd of an npx
 /// launch is the neutral dir, so a workspace directory that no longer exists
 /// neither fails the spawn nor is reported as the missing working directory.

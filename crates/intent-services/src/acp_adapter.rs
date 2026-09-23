@@ -28,7 +28,7 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use intent_acp::spawn::NPX_NO_WORKSPACES_ARG;
+use intent_acp::spawn::{npm_workspace_selector_env_keys, NPX_NO_WORKSPACES_ARG};
 #[cfg(unix)]
 use intent_acp::{descendant_pids, sweep_escaped_descendants};
 use intent_acp::{
@@ -546,6 +546,16 @@ fn spawn_admitted_adapter(
     }
     for key in &cmd.envs_removed {
         command.env_remove(key);
+    }
+    // An inherited npm workspace selector (`npm_config_workspace` and its
+    // case variants) makes npm reject `--workspaces=false` before the adapter
+    // starts (intent-hq/intent#5738); scrub it after every env merge, for the
+    // npx bootstrap only.
+    if cmd.via_npx {
+        let explicit = cmd.envs.iter().map(|(key, _)| key.as_str());
+        for key in npm_workspace_selector_env_keys(explicit) {
+            command.env_remove(key);
+        }
     }
     #[cfg(unix)]
     command.process_group(0);
@@ -1322,6 +1332,143 @@ exit 0
                 cwd.display()
             );
         }
+    }
+
+    /// Seed `root` as a VALID npm workspace root (`workspaces: ["packages/*"]`
+    /// with a `packages/some-workspace` member) and return an npx launch root
+    /// beneath it, outside the glob — where a daemon inheriting
+    /// `npm_config_workspace=some-workspace` bootstrapped npx successfully
+    /// before intent-hq/intent#5738.
+    fn seed_valid_workspace_root(root: &Path) -> PathBuf {
+        let member = root.join("packages").join("some-workspace");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("package.json"),
+            r#"{"name":"some-workspace","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let launch_root = root.join(".intent").join("agent-configs");
+        std::fs::create_dir_all(&launch_root).unwrap();
+        launch_root
+    }
+
+    /// intent-hq/intent#5738 (regression of the `--workspaces=false` fix
+    /// against the REAL npm CLI): an `npm_config_workspace` selector reaching
+    /// the ephemeral npx bootstrap from the environment — in any letter case —
+    /// is fatal next to `--workspaces=false` (`Cannot use --no-workspaces and
+    /// --workspace at the same time`, exit 1). The launch must remove the
+    /// selectors after every env merge (here they arrive as explicit command
+    /// env, the last merge) while the unrelated npm settings this test relies
+    /// on pass through. Offline; skips without `npx`.
+    #[tokio::test]
+    async fn real_npx_adapter_ignores_inherited_npm_workspace_selectors() {
+        let Some(npx) = intent_providers::resolve_on_path("npx") else {
+            eprintln!("skipping real-npx inherited selector regression: npx not on PATH");
+            return;
+        };
+        let tmp = test_tempdir("intent-adapter-npx-real-selector-");
+        let workspace = tmp.path().join("plain workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let home = tmp.path().join("clean-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("user.npmrc"), "").unwrap();
+        std::fs::write(home.join("global.npmrc"), "").unwrap();
+        let launch_root = seed_valid_workspace_root(&tmp.path().join("valid-workspace"));
+        let adapter = local_adapter_package(tmp.path());
+        let report = tmp.path().join("adapter-report");
+
+        let mut cmd = AcpAdapterCommand::npx(npx, adapter.to_str().unwrap())
+            .cwd(workspace)
+            .npx_launch_root(launch_root.clone())
+            .env("ADAPTER_REPORT", report.as_os_str());
+        for (k, v) in [
+            ("HOME", home.clone()),
+            ("npm_config_userconfig", home.join("user.npmrc")),
+            ("npm_config_globalconfig", home.join("global.npmrc")),
+            ("npm_config_cache", tmp.path().join("npm-cache")),
+        ] {
+            cmd = cmd.env(k, v.as_os_str());
+        }
+        for (k, v) in [
+            ("npm_config_offline", "true"),
+            ("npm_config_update_notifier", "false"),
+            ("npm_config_loglevel", "error"),
+            ("DD_TRACE_ENABLED", "false"),
+            // The inherited selectors under test, in both spellings npm accepts.
+            ("npm_config_workspace", "some-workspace"),
+            ("NPM_CONFIG_WORKSPACE", "some-workspace"),
+        ] {
+            cmd = cmd.env(k, v);
+        }
+
+        let slots = AdapterSlots::new(1);
+        let mut spawned = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
+            .await
+            .expect("spawn real npx");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let started = loop {
+            if let Ok(s) = std::fs::read_to_string(&report) {
+                break s;
+            }
+            if let Ok(Some(status)) = spawned.child.try_wait() {
+                panic!(
+                    "real npx exited {status:?} before the adapter started (1 = `Cannot use \
+                     --no-workspaces and --workspace at the same time`); stderr: {:?}",
+                    spawned.conn.recent_stderr()
+                );
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "adapter never started"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let cwd = PathBuf::from(
+            started
+                .trim()
+                .strip_prefix("ADAPTER_STARTED ")
+                .unwrap_or_else(|| panic!("unexpected report {started:?}")),
+        );
+        assert!(
+            cwd.starts_with(&launch_root),
+            "adapter cwd {} is not under the launch root {}",
+            cwd.display(),
+            launch_root.display()
+        );
+        spawned.child.reap().await;
+    }
+
+    /// Control: the selector scrub is npx-only — a resolved binary receives an
+    /// explicit `npm_config_workspace` unchanged.
+    #[tokio::test]
+    async fn binary_adapter_keeps_npm_workspace_selectors() {
+        let tmp = test_tempdir("intent-adapter-bin-selector-");
+        let report = tmp.path().join("bin-report");
+        let cmd = AcpAdapterCommand::binary(
+            PathBuf::from("sh"),
+            vec![
+                "-c".into(),
+                "printf '%s' \"$npm_config_workspace\" > \"$INTENTD_BIN_REPORT\"".into(),
+            ],
+        )
+        .cwd(tmp.path().to_path_buf())
+        .env("INTENTD_BIN_REPORT", report.as_os_str())
+        .env("npm_config_workspace", "some-workspace");
+
+        let slots = AdapterSlots::new(1);
+        let mut adapter = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
+            .await
+            .expect("spawn sh");
+        assert!(adapter.child.wait().await.expect("wait sh").success());
+        assert_eq!(
+            std::fs::read_to_string(&report).expect("sh reported the selector"),
+            "some-workspace"
+        );
     }
 
     /// A fake `npx` that stays alive like a real adapter chain: records its

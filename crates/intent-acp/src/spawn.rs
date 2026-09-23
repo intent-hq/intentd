@@ -204,6 +204,47 @@ pub const NPX_LAUNCH_SENTINEL_MANIFEST: &str =
 /// npx passes everything after it to the adapter.
 pub const NPX_NO_WORKSPACES_ARG: &str = "--workspaces=false";
 
+/// Whether `key` is an npm environment config selecting workspaces. npm reads
+/// every `npm_config_<key>` variable case-insensitively and normalises
+/// `<key>` like `@npmcli/config` `loadEnv` (`_` → `-`, lowercased), so
+/// `npm_config_workspace`, `NPM_CONFIG_WORKSPACE` and
+/// `npm_config_include_workspace_root` all count. An inherited `workspace`
+/// selector is fatal next to [`NPX_NO_WORKSPACES_ARG`] (`npm error Cannot use
+/// --no-workspaces and --workspace at the same time`) and, without the
+/// switch, when the launch dir has no such workspace (`No workspaces found`);
+/// `workspaces` / `include-workspace-root` steer the same selection.
+#[must_use]
+pub fn is_npm_workspace_selector_env(key: &str) -> bool {
+    const PREFIX: &str = "npm_config_";
+    let Some(prefix) = key.get(..PREFIX.len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(PREFIX) {
+        return false;
+    }
+    let normalized = key[PREFIX.len()..].replace('_', "-").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "workspace" | "workspaces" | "include-workspace-root"
+    )
+}
+
+/// The environment keys a managed npx launch removes so no workspace selector
+/// reaches npm: every [`is_npm_workspace_selector_env`] key in the daemon's own
+/// environment (the child inherits it) plus those among `explicit`, the keys
+/// the launch would otherwise set itself. Apply with `env_remove` after every
+/// other env merge.
+#[must_use]
+pub fn npm_workspace_selector_env_keys<'a>(
+    explicit: impl IntoIterator<Item = &'a str>,
+) -> std::collections::BTreeSet<String> {
+    std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .chain(explicit.into_iter().map(str::to_owned))
+        .filter(|key| is_npm_workspace_selector_env(key))
+        .collect()
+}
+
 impl NpxLaunchDir {
     /// Create a fresh directory under `root` (the OS temp dir when `None`),
     /// creating missing parents, holding only the sentinel `package.json`.
@@ -607,6 +648,24 @@ fn build_command_in(
     if opts.provider.id == "codex" && via_npx {
         cmd.env_remove("CODEX_PATH");
         cmd.env_remove("CODEX_CONFIG");
+    }
+
+    // The npx bootstrap targets the neutral launch dir only: an inherited (or
+    // merged) npm workspace selector such as `npm_config_workspace` makes npm
+    // reject `--workspaces=false` before the adapter starts
+    // (intent-hq/intent#5738). Applies after every env merge above so no
+    // source — provider env, extra_env, captured login shell, daemon env —
+    // can reintroduce one; unrelated npm settings (registry, auth, proxy,
+    // cache) pass through untouched.
+    if via_npx {
+        let explicit = provider_env
+            .keys()
+            .chain(opts.extra_env.keys())
+            .chain(captured.keys())
+            .map(String::as_str);
+        for key in npm_workspace_selector_env_keys(explicit) {
+            cmd.env_remove(key);
+        }
     }
 
     // Enhanced PATH must include the binary's parent dir so dependencies resolve
@@ -1558,6 +1617,127 @@ mod build_command_tests {
             !touched,
             "non-codex npx spawns must not touch CODEX_PATH/CODEX_CONFIG"
         );
+    }
+
+    /// npm's env-config normalisation (`@npmcli/config` `loadEnv`): the
+    /// `npm_config_` prefix is case-insensitive and `_` folds to `-`, so every
+    /// spelling of the workspace selectors is recognised while the registry /
+    /// auth / proxy / cache settings and non-npm keys are not.
+    #[test]
+    fn npm_workspace_selector_env_recognises_npm_case_and_separator_variants() {
+        for key in [
+            "npm_config_workspace",
+            "NPM_CONFIG_WORKSPACE",
+            "Npm_Config_Workspace",
+            "npm_config_workspaces",
+            "npm_config_include_workspace_root",
+            "npm_config_include-workspace-root",
+            "NPM_CONFIG_INCLUDE_WORKSPACE_ROOT",
+        ] {
+            assert!(is_npm_workspace_selector_env(key), "{key}");
+        }
+        for key in [
+            "npm_config_registry",
+            "npm_config_userconfig",
+            "npm_config_cache",
+            "npm_config_offline",
+            "npm_config_proxy",
+            "npm_config_//registry.npmjs.org/:_authToken",
+            "npm_config_workspace_root",
+            "npm_config_",
+            "npm_config",
+            "workspace",
+            "NPM_WORKSPACE",
+            "",
+        ] {
+            assert!(!is_npm_workspace_selector_env(key), "{key}");
+        }
+        let keys = npm_workspace_selector_env_keys(["NPM_CONFIG_WORKSPACE", "npm_config_registry"]);
+        assert!(keys.contains("NPM_CONFIG_WORKSPACE"));
+        assert!(!keys.contains("npm_config_registry"));
+    }
+
+    /// intent-hq/intent#5738: a workspace selector reaching the npx bootstrap
+    /// from any env source — here the explicit `extra_env` merged last — is
+    /// removed from the child env on both npx tiers (npx-only claude-code,
+    /// codex fallback), while unrelated npm settings merged alongside it stay.
+    #[test]
+    fn build_command_strips_npm_workspace_selectors_on_npx_spawns() {
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        let codex = intent_providers::find_provider("codex").unwrap();
+        for (provider, package) in [
+            (claude, claude.npx_only_package),
+            (codex, codex.fallback_npx_package),
+        ] {
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx_path);
+            opts.npx_fallback_package = package;
+            for (k, v) in [
+                ("npm_config_workspace", "some-workspace"),
+                ("NPM_CONFIG_WORKSPACE", "some-workspace"),
+                ("npm_config_include_workspace_root", "true"),
+                ("npm_config_registry", "https://registry.example.test/"),
+                ("npm_config_proxy", "http://proxy.example.test:3128"),
+            ] {
+                opts.extra_env.insert(k.to_string(), v.to_string());
+            }
+            assert!(opts.via_npx());
+            let cmd = build_command(&opts);
+            for key in [
+                "npm_config_workspace",
+                "NPM_CONFIG_WORKSPACE",
+                "npm_config_include_workspace_root",
+            ] {
+                assert!(
+                    env_removed(&cmd, key),
+                    "{}: {key} must be env_remove'd from the npx spawn",
+                    provider.id
+                );
+            }
+            assert_eq!(
+                env_value(&cmd, "npm_config_registry").as_deref(),
+                Some("https://registry.example.test/"),
+                "{}: unrelated npm settings must survive",
+                provider.id
+            );
+            assert_eq!(
+                env_value(&cmd, "npm_config_proxy").as_deref(),
+                Some("http://proxy.example.test:3128"),
+                "{}: unrelated npm settings must survive",
+                provider.id
+            );
+        }
+    }
+
+    /// Control: a resolved binary or bare command is not an npx bootstrap, so
+    /// an explicit `npm_config_workspace` reaches it unchanged.
+    #[test]
+    fn build_command_keeps_npm_workspace_selectors_for_non_npx_spawns() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let provider_binary = PathBuf::from("/custom/codex-acp");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        let mut resolved = SpawnOptions::new(codex);
+        resolved.provider_binary = Some(&provider_binary);
+        resolved.npx_fallback_binary = Some(&npx_path);
+        resolved.npx_fallback_package = codex.fallback_npx_package;
+        let auggie = intent_providers::find_provider("auggie").unwrap();
+        let bare = SpawnOptions::new(auggie);
+        for mut opts in [resolved, bare] {
+            opts.extra_env.insert(
+                "npm_config_workspace".to_string(),
+                "some-workspace".to_string(),
+            );
+            assert!(!opts.via_npx());
+            let cmd = build_command(&opts);
+            assert_eq!(
+                env_value(&cmd, "npm_config_workspace").as_deref(),
+                Some("some-workspace"),
+                "{}: non-npx spawns keep the selector",
+                opts.provider.id
+            );
+            assert!(!env_removed(&cmd, "npm_config_workspace"));
+        }
     }
 }
 
