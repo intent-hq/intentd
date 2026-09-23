@@ -344,60 +344,56 @@ pub(crate) struct SpawnedAdapter {
 /// binaries) and this run's slot in the daemon-wide bound. Released only
 /// after a completed [`reap_child`] — group kill, bounded wait, descendant
 /// sweep — never on the direct child's exit alone, since a reaped child can
-/// leave descendants that still run in the directory.
+/// leave descendants that still run in the directory (in its process group
+/// or escaped from it).
 struct HeldWhileLive {
     npx_launch_dir: Option<NpxLaunchDir>,
     slot: OwnedSemaphorePermit,
 }
 
 /// The adapter process plus [`HeldWhileLive`], dereferencing to the
-/// [`tokio::process::Child`]. [`Self::reap`] is the ordinary end of a run and
-/// releases both. A value dropped before that (a cancelled future, an early
-/// return, a panic) hands the child and the held resources to a detached
-/// bounded cleanup on the current runtime, so the directory is still removed
-/// only after the tree is reaped and swept; when that cleanup cannot run or
-/// finish (no runtime, runtime shutting down) the directory is retained on
-/// disk rather than deleted from under a possibly live tree, and the child
-/// falls back to `kill_on_drop`.
+/// [`tokio::process::Child`] until reaped. Both [`Self::reap`] (the ordinary
+/// end of a run) and [`Drop`] (a cancelled future, an early return, a panic)
+/// move the child and the held resources into ONE owned cleanup task on the
+/// current runtime — group kill, bounded wait, descendant sweep, and only
+/// then the directory removal and slot release. `reap` awaits that task;
+/// cancelling the awaiting caller leaves the task, and the descendant
+/// snapshot it already took, running to completion (a second reap could not
+/// rediscover escaped descendants once the leader is dead). When the task
+/// cannot run or finish (no runtime, runtime shutting down) the directory is
+/// retained on disk rather than deleted from under a possibly live tree, and
+/// the child falls back to `kill_on_drop`.
 pub(crate) struct AdapterChild {
-    /// `None` only once [`Drop`] has moved the child into the cleanup task.
+    /// `None` once moved into the cleanup task by [`Self::reap`] or [`Drop`];
+    /// dereferencing after `reap` panics.
     child: Option<tokio::process::Child>,
-    /// `None` once released by [`Self::reap`] or taken by [`Drop`].
+    /// The leader's pid at spawn, which is also its process-group id
+    /// (`process_group(0)`). Kept separately because `Child::id()` is `None`
+    /// once the leader has been waited — e.g. by [`observe_exit_status`]
+    /// during exit attribution — while same-group descendants can still be
+    /// running in the launch dir.
+    spawn_pid: u32,
+    /// `None` once moved into the cleanup task.
     held: Option<HeldWhileLive>,
 }
 
 impl AdapterChild {
     /// Reap the process tree ([`reap_child`]), then release the launch dir
-    /// and the slot.
+    /// and the slot. The child is consumed: do not dereference afterwards.
     pub(crate) async fn reap(&mut self) {
-        reap_child(self).await;
-        self.held = None;
+        if let Some(cleanup) = self.start_cleanup() {
+            let _ = cleanup.await;
+        }
     }
-}
 
-impl std::ops::Deref for AdapterChild {
-    type Target = tokio::process::Child;
-
-    fn deref(&self) -> &Self::Target {
-        self.child
-            .as_ref()
-            .expect("adapter child is only taken while dropping")
-    }
-}
-
-impl std::ops::DerefMut for AdapterChild {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.child
-            .as_mut()
-            .expect("adapter child is only taken while dropping")
-    }
-}
-
-impl Drop for AdapterChild {
-    fn drop(&mut self) {
+    /// Move the child and the held resources into the owned cleanup task.
+    /// `None` when there is nothing left to clean up or no runtime to run
+    /// it on (then the dir is retained and the child left to `kill_on_drop`).
+    fn start_cleanup(&mut self) -> Option<tokio::task::JoinHandle<()>> {
         let (Some(held), Some(mut child)) = (self.held.take(), self.child.take()) else {
-            return;
+            return None;
         };
+        let spawn_pid = self.spawn_pid;
         let HeldWhileLive {
             npx_launch_dir,
             slot,
@@ -407,14 +403,38 @@ impl Drop for AdapterChild {
             drop(launch_dir);
             drop(child);
             drop(slot);
-            return;
+            return None;
         };
-        handle.spawn(async move {
-            reap_child(&mut child).await;
+        Some(handle.spawn(async move {
+            reap_child(&mut child, spawn_pid).await;
             launch_dir.remove();
             drop(child);
             drop(slot);
-        });
+        }))
+    }
+}
+
+impl std::ops::Deref for AdapterChild {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.child
+            .as_ref()
+            .expect("adapter child is consumed by reap")
+    }
+}
+
+impl std::ops::DerefMut for AdapterChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child
+            .as_mut()
+            .expect("adapter child is consumed by reap")
+    }
+}
+
+impl Drop for AdapterChild {
+    fn drop(&mut self) {
+        drop(self.start_cleanup());
     }
 }
 
@@ -533,6 +553,9 @@ fn spawn_admitted_adapter(
     let mut child = command
         .spawn()
         .map_err(|e| format!("{}: {e}", cmd.program.display()))?;
+    let spawn_pid = child
+        .id()
+        .ok_or_else(|| format!("{}: spawned child has no pid", cmd.program.display()))?;
     let stdin = child
         .stdin
         .take()
@@ -558,6 +581,7 @@ fn spawn_admitted_adapter(
     Ok(SpawnedAdapter {
         child: AdapterChild {
             child: Some(child),
+            spawn_pid,
             held: Some(HeldWhileLive {
                 npx_launch_dir,
                 slot,
@@ -669,31 +693,47 @@ fn stderr_tail(stderr: &[String]) -> Option<String> {
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// Kill the adapter child and reap it. Signals the whole process group (the
-/// child is its own group leader via `process_group(0)`) so grandchildren
-/// (e.g. `npx` → `node`) die too, following the crate's SIGTERM → grace →
-/// SIGKILL pattern, then waits briefly so the child does not linger as a
-/// zombie. `kill_on_drop(true)` back-stops any wait timeout.
+/// child is its own group leader via `process_group(0)`, so `spawn_pid` —
+/// its pid at spawn — is the group id) so grandchildren (e.g. `npx` →
+/// `node`) die too, following the crate's SIGTERM → grace → SIGKILL pattern,
+/// then waits briefly so the child does not linger as a zombie.
+/// `kill_on_drop(true)` back-stops any wait timeout.
+///
+/// The group is signalled from `spawn_pid` rather than `Child::id()`: once
+/// the leader has been waited (`id()` is `None`) same-group descendants can
+/// still be running, and the group outlives its leader until its last member
+/// exits. A `killpg` that finds no such group (`ESRCH`) ends the group stage
+/// at once.
 ///
 /// Group signalling alone is not enough: adapters can start MCP servers that
 /// move into their OWN process groups, so descendants are snapshotted before
 /// the kill and any survivors swept afterwards regardless of process group —
 /// see `intent_acp::descendant_sweep` for the shared backstop and its
-/// snapshot-before-kill rationale.
-pub(crate) async fn reap_child(child: &mut tokio::process::Child) {
+/// snapshot-before-kill rationale. The snapshot is taken only while the
+/// leader is unreaped: a reaped leader's descendants have already reparented
+/// (nothing to find), and its pid may already be reused.
+pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32) {
+    #[cfg(not(unix))]
+    let _ = spawn_pid;
     #[cfg(unix)]
-    let descendants = match child.id() {
-        Some(pid) => descendant_pids(pid).await,
-        None => Vec::new(),
+    let descendants = if child.id().is_some() {
+        descendant_pids(spawn_pid).await
+    } else {
+        Vec::new()
     };
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    {
         use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
-        let pgid = Pid::from_raw(pid.cast_signed());
-        let _ = killpg(pgid, Signal::SIGTERM);
-        tokio::time::sleep(TERM_GRACE).await;
-        if !matches!(child.try_wait(), Ok(Some(_))) {
-            let _ = killpg(pgid, Signal::SIGKILL);
+        let pgid = Pid::from_raw(spawn_pid.cast_signed());
+        if killpg(pgid, Signal::SIGTERM).is_ok() {
+            tokio::time::sleep(TERM_GRACE).await;
+            // Reap the leader first so a zombie leader does not keep the
+            // group "present"; any remaining member is then killed.
+            let _ = child.try_wait();
+            if killpg(pgid, None).is_ok() {
+                let _ = killpg(pgid, Signal::SIGKILL);
+            }
         }
     }
     let _ = child.kill().await;
@@ -853,10 +893,9 @@ mod reap_tests {
 
         // Prove the grandchild actually escaped the adapter's process group —
         // otherwise killpg would reach it and the test would be vacuous.
-        let child_pgid = getpgid(Some(Pid::from_raw(
-            child.id().expect("child pid").cast_signed(),
-        )))
-        .expect("child pgid");
+        let leader_pid = child.id().expect("child pid");
+        let child_pgid =
+            getpgid(Some(Pid::from_raw(leader_pid.cast_signed()))).expect("child pgid");
         let grandchild_pgid =
             getpgid(Some(Pid::from_raw(grandchild_pid))).expect("grandchild pgid");
         assert_ne!(
@@ -867,14 +906,14 @@ mod reap_tests {
         // Distinct failure signal for the snapshot path: if `ps` stalls past
         // its budget on a loaded runner the snapshot comes back empty and the
         // sweep silently no-ops — fail here, not at the terminal panic below.
-        let snapshot = descendant_pids(child.id().expect("child pid")).await;
+        let snapshot = descendant_pids(leader_pid).await;
         assert!(
             snapshot.contains(&grandchild_pid),
             "descendant snapshot {snapshot:?} must include grandchild {grandchild_pid} \
              (empty/partial snapshot ⇒ `ps` walk failed, not the sweep)"
         );
 
-        reap_child(&mut child).await;
+        reap_child(&mut child, leader_pid).await;
         tokio::fs::remove_file(&pidfile).await.ok();
 
         // `kill(pid, 0)` returns ESRCH once the pid is gone (the grandchild
@@ -1311,33 +1350,60 @@ wait
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
     }
 
-    /// Spawn the live fake npx under `tmp`, in a task that then parks
-    /// forever holding the adapter. Returns the parked task, the launch dir
-    /// the fake npx reported, and its grandchild's pid.
-    async fn spawn_parked_live_npx(
+    /// A fake `npx` whose leader EXITS right after starting its grandchild,
+    /// leaving the `sleep` behind in the leader's process group (plain `sh`,
+    /// no job control). Models an adapter chain whose direct child died
+    /// while a same-group descendant kept running in the launch dir.
+    const EXITING_FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
+printf '%s\n' "$PWD" > "$INTENTD_FAKE_NPX_REPORT.tmp" && mv "$INTENTD_FAKE_NPX_REPORT.tmp" "$INTENTD_FAKE_NPX_REPORT"
+sleep 300 &
+echo $! > "$INTENTD_FAKE_NPX_PIDFILE"
+exit 0
+"#;
+
+    /// A fake `npx` whose grandchild ESCAPES into its own process group (job
+    /// control, like `reap_child_sweeps_grandchild_in_foreign_process_group`)
+    /// and whose leader reports SIGTERM by touching
+    /// `$INTENTD_FAKE_NPX_TERMINATED` before exiting — the marker lets a test
+    /// act at a known point inside the reap (after the snapshot and the
+    /// group signal, before the sweep).
+    const ESCAPING_FAKE_NPX_SCRIPT: &str = r#"#!/bin/bash
+printf '%s\n' "$PWD" > "$INTENTD_FAKE_NPX_REPORT.tmp" && mv "$INTENTD_FAKE_NPX_REPORT.tmp" "$INTENTD_FAKE_NPX_REPORT"
+set -m
+sleep 300 &
+echo $! > "$INTENTD_FAKE_NPX_PIDFILE"
+trap ': > "$INTENTD_FAKE_NPX_TERMINATED"; exit 0' TERM
+wait
+"#;
+
+    /// Name of the SIGTERM marker file [`ESCAPING_FAKE_NPX_SCRIPT`] touches.
+    const LEADER_TERMINATED_MARKER: &str = "leader-terminated";
+
+    /// Spawn a fake npx `script` under `tmp` through the admitted spawn path.
+    /// Returns the adapter, the launch dir the fake npx reported, and its
+    /// grandchild's pid.
+    async fn spawn_fake_npx(
         tmp: &Path,
         slots: &Arc<AdapterSlots>,
-    ) -> (tokio::task::JoinHandle<()>, PathBuf, i32) {
+        script: &str,
+    ) -> (SpawnedAdapter, PathBuf, i32) {
         use std::os::unix::fs::PermissionsExt;
         let report = tmp.join("npx-report");
         let pidfile = tmp.join("grandchild.pid");
         let npx = tmp.join("npx");
-        std::fs::write(&npx, LIVE_FAKE_NPX_SCRIPT).unwrap();
+        std::fs::write(&npx, script).unwrap();
         std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cmd = AcpAdapterCommand::npx(npx, "claude-agent-acp@0.0.0-test")
             .npx_launch_root(tmp.join("launch-root"))
             .env("INTENTD_FAKE_NPX_REPORT", report.as_os_str())
-            .env("INTENTD_FAKE_NPX_PIDFILE", pidfile.as_os_str());
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let slots = Arc::clone(slots);
-        let parked = tokio::spawn(async move {
-            let _adapter = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
-                .await
-                .expect("spawn live fake npx");
-            ready_tx.send(()).unwrap();
-            std::future::pending::<()>().await;
-        });
-        ready_rx.await.expect("adapter spawned");
+            .env("INTENTD_FAKE_NPX_PIDFILE", pidfile.as_os_str())
+            .env(
+                "INTENTD_FAKE_NPX_TERMINATED",
+                tmp.join(LEADER_TERMINATED_MARKER).as_os_str(),
+            );
+        let adapter = spawn_adapter_in(slots, &cmd, Duration::from_secs(5))
+            .await
+            .expect("spawn fake npx");
         let (npx_cwd, _) = read_npx_report(&report).await;
         let mut grandchild = None;
         for _ in 0..250 {
@@ -1349,7 +1415,166 @@ wait
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        (parked, npx_cwd, grandchild.expect("grandchild pid written"))
+        (
+            adapter,
+            npx_cwd,
+            grandchild.expect("grandchild pid written"),
+        )
+    }
+
+    /// Spawn the live fake npx under `tmp`, in a task that then parks
+    /// forever holding the adapter. Returns the parked task, the launch dir
+    /// the fake npx reported, and its grandchild's pid.
+    async fn spawn_parked_live_npx(
+        tmp: &Path,
+        slots: &Arc<AdapterSlots>,
+    ) -> (tokio::task::JoinHandle<()>, PathBuf, i32) {
+        let (adapter, npx_cwd, grandchild) = spawn_fake_npx(tmp, slots, LIVE_FAKE_NPX_SCRIPT).await;
+        let parked = tokio::spawn(async move {
+            let _adapter = adapter;
+            std::future::pending::<()>().await;
+        });
+        (parked, npx_cwd, grandchild)
+    }
+
+    fn pgid_of(pid: i32) -> i32 {
+        nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid)))
+            .expect("pgid")
+            .as_raw()
+    }
+
+    /// Poll until the grandchild is gone, then until the launch dir is
+    /// removed and the slot returned; each bounded by `deadline`.
+    async fn assert_tree_then_dir_and_slot_released(
+        grandchild: i32,
+        npx_cwd: &Path,
+        slots: &AdapterSlots,
+        deadline: tokio::time::Instant,
+        what: &str,
+    ) {
+        while grandchild_alive(grandchild) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: grandchild {grandchild} still alive (launch dir exists = {}, free slots = {})",
+                npx_cwd.exists(),
+                slots.available()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while npx_cwd.exists() || slots.available() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: after the tree died: launch dir exists = {}, free slots = {} (want none / 1)",
+                npx_cwd.exists(),
+                slots.available()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Exited-leader regression: `attribute_early_exit` (one-shot, probe)
+    /// runs [`observe_exit_status`], which waits the direct child, so by the
+    /// time [`AdapterChild::reap`] runs `Child::id()` is already `None`. The
+    /// reap must still signal the spawn-time process group — a same-group
+    /// descendant can outlive the leader in the launch dir — and only then
+    /// remove the dir and return the slot.
+    #[tokio::test]
+    async fn reap_after_the_leader_exited_still_kills_its_group_before_removing_the_launch_dir() {
+        let tmp = test_tempdir("intent-adapter-npx-exited-leader-");
+        let slots = Arc::new(AdapterSlots::new(1));
+        let (mut adapter, npx_cwd, grandchild) =
+            spawn_fake_npx(tmp.path(), &slots, EXITING_FAKE_NPX_SCRIPT).await;
+        let _sweep = KillGrandchildOnDrop(grandchild);
+        let leader_pid = adapter.child.id().expect("leader pid").cast_signed();
+        assert_eq!(
+            pgid_of(grandchild),
+            leader_pid,
+            "grandchild must share the leader's process group for this regression"
+        );
+
+        let status = observe_exit_status(&mut adapter.child, &adapter.conn).await;
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "leader exited cleanly: {status:?}"
+        );
+        assert!(
+            adapter.child.id().is_none(),
+            "leader already waited: Child::id() must be None to exercise the regression"
+        );
+        assert!(
+            grandchild_alive(grandchild),
+            "grandchild outlives the leader"
+        );
+        assert!(npx_cwd.is_dir());
+        assert_eq!(slots.available(), 0);
+
+        adapter.child.reap().await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert_tree_then_dir_and_slot_released(
+            grandchild,
+            &npx_cwd,
+            &slots,
+            deadline,
+            "reap of an exited leader",
+        )
+        .await;
+    }
+
+    /// Mid-reap cancellation regression: the caller of [`AdapterChild::reap`]
+    /// is cancelled after the reap has snapshotted descendants and signalled
+    /// the leader but before the escaped-descendant sweep. The pre-kill
+    /// snapshot is the only way to find an escaped descendant (post-kill it
+    /// has reparented to init), so cancellation must not discard it: the
+    /// escaped grandchild must still die, and only then the launch dir go
+    /// and the slot return.
+    #[tokio::test]
+    async fn cancelling_a_reap_midway_still_sweeps_the_escaped_descendant() {
+        let tmp = test_tempdir("intent-adapter-npx-cancel-reap-");
+        let slots = Arc::new(AdapterSlots::new(1));
+        let (adapter, npx_cwd, grandchild) =
+            spawn_fake_npx(tmp.path(), &slots, ESCAPING_FAKE_NPX_SCRIPT).await;
+        let _sweep = KillGrandchildOnDrop(grandchild);
+        let leader_pid = adapter.child.id().expect("leader pid").cast_signed();
+        assert_ne!(
+            pgid_of(grandchild),
+            leader_pid,
+            "grandchild must be in a foreign process group for this regression"
+        );
+        let terminated = tmp.path().join(LEADER_TERMINATED_MARKER);
+        assert!(!terminated.exists());
+
+        let reaping = tokio::spawn(async move {
+            let mut adapter = adapter;
+            adapter.child.reap().await;
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !terminated.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "leader never reported SIGTERM (reap finished = {})",
+                reaping.is_finished()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        reaping.abort();
+        let outcome = reaping.await;
+        assert!(
+            outcome
+                .as_ref()
+                .map_or_else(tokio::task::JoinError::is_cancelled, |()| true),
+            "reap task neither finished nor cancelled: {outcome:?}"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        assert_tree_then_dir_and_slot_released(
+            grandchild,
+            &npx_cwd,
+            &slots,
+            deadline,
+            &format!("reap cancelled mid-way (cancelled = {})", outcome.is_err()),
+        )
+        .await;
     }
 
     /// Cancellation regression (intent-hq/intent#5738 follow-up): before the
