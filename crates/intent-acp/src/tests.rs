@@ -654,27 +654,57 @@ fn catalog_workspace(tmp: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The fake `npx` script body; `__REPORT__` is the report path. It behaves
-/// like npm's project-root discovery: writes its cwd and the cwd's entries to
-/// the report (atomically, via rename), walks up from the cwd to the nearest
-/// `package.json` the way `@npmcli/config` picks the local prefix, and fails
-/// with npm's `EUNSUPPORTEDPROTOCOL` when that manifest uses `catalog:`
-/// specifiers. Exits 0 otherwise; never downloads anything.
+/// like npm's project-root discovery (`@npmcli/config` `loadLocalPrefix`):
+/// writes its cwd and the cwd's entries to the report (atomically, via
+/// rename), walks up from the cwd to the nearest `package.json`, and — unless
+/// `--workspaces=false` / `--no-workspaces` is on the command line — keeps
+/// walking and adopts an ancestor manifest declaring `workspaces` as the
+/// project root instead (real npm adopts it only when a glob matches the cwd;
+/// the fake treats any `workspaces` field as matching). It then fails like npm
+/// when that root's manifest uses `catalog:` (`EUNSUPPORTEDPROTOCOL`) or its
+/// `.npmrc` names a `script-shell` that does not exist (`ENOENT`, exit 254).
+/// Exits 0 otherwise; never downloads anything. The duplicate-workspace-name
+/// rejection is left to the real-npx regression.
 #[cfg(unix)]
 const FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
 { printf '%s\n' "$PWD"; ls -A; } > '__REPORT__.tmp' && mv '__REPORT__.tmp' '__REPORT__'
+no_ws=0
+for a in "$@"; do
+  case "$a" in
+    --) break ;;
+    --workspaces=false|--no-workspaces) no_ws=1 ;;
+    -*) ;;
+    *) break ;;
+  esac
+done
+root=""
 d="$PWD"
 while :; do
   if [ -e "$d/package.json" ]; then
-    if grep -q 'catalog:' "$d/package.json"; then
-      echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2
-      echo 'npm error Unsupported URL Type "catalog:": catalog:' >&2
-      exit 1
+    if [ -z "$root" ]; then
+      root="$d"
+      [ "$no_ws" = 1 ] && break
+    elif grep -q '"workspaces"' "$d/package.json"; then
+      root="$d"
+      break
     fi
-    break
   fi
   [ "$d" = / ] && break
   d=$(dirname "$d")
 done
+if [ -n "$root" ]; then
+  if grep -q 'catalog:' "$root/package.json"; then
+    echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2
+    echo 'npm error Unsupported URL Type "catalog:": catalog:' >&2
+    exit 1
+  fi
+  shell=$(sed -n 's/^script-shell=//p' "$root/.npmrc" 2>/dev/null)
+  if [ -n "$shell" ] && [ ! -x "$shell" ]; then
+    echo 'npm error code ENOENT' >&2
+    echo "npm error enoent spawn $shell ENOENT" >&2
+    exit 254
+  fi
+fi
 exit 0
 "#;
 
@@ -709,9 +739,10 @@ async fn read_npx_report(report: &std::path::Path) -> (std::path::PathBuf, Vec<S
     panic!("fake npx never reported its cwd to {}", report.display());
 }
 
-/// The launch dir holds exactly the private sentinel `package.json` that stops
-/// npm's walk-up at the launch dir (so no ancestor manifest or project
-/// `.npmrc` is consulted) and nothing else.
+/// The launch dir holds exactly the private sentinel `package.json` that makes
+/// it npm's nearest project root and nothing else. (The sentinel alone does
+/// not stop npm consulting an ancestor: `--workspaces=false` on the argv does
+/// — see `spawn_provider_real_npx_*`.)
 #[cfg(unix)]
 fn assert_neutral_launch_dir(npx_cwd: &std::path::Path, entries: &[String]) {
     assert_eq!(
@@ -773,11 +804,36 @@ async fn spawn_provider_runs_npx_launch_in_a_neutral_dir() {
     agent.kill().await.ok();
 }
 
+/// Seed `ancestor` (an ancestor of the npx launch root at
+/// `ancestor/.intent/agent-configs`) with the verifier's intent-hq/intent#5738
+/// fixture: a `catalog:` manifest whose `workspaces` glob matches every launch
+/// dir, plus a `.npmrc` whose `script-shell` does not exist. npm that adopts
+/// this root dies with `ENOENT` before the adapter starts; two live launch
+/// dirs under it are rejected as duplicate workspace names.
+#[cfg(unix)]
+fn seed_matching_workspace_ancestor(ancestor: &std::path::Path) -> std::path::PathBuf {
+    let launch_root = ancestor.join(".intent").join("agent-configs");
+    std::fs::create_dir_all(&launch_root).unwrap();
+    std::fs::write(
+        ancestor.join("package.json"),
+        r#"{"name":"catalog-parent","private":true,"workspaces":[".intent/agent-configs/*"],"dependencies":{"zod":"catalog:"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ancestor.join(".npmrc"),
+        "script-shell=/intentd-test-nonexistent-shell\nregistry=http://127.0.0.1:9/\n",
+    )
+    .unwrap();
+    launch_root
+}
+
 /// intent-hq/intent#5738: npm picks its project root by walking UP from the
-/// cwd to the nearest `package.json` and reads that root's `.npmrc`, so an
-/// empty launch dir is not neutral when an ancestor of `npx_launch_root`
-/// (here a `$HOME` holding a `catalog:` manifest above `.intent/agent-configs`)
-/// carries package configuration. The launch dir must terminate that walk.
+/// cwd; the nearest `package.json` is only its first candidate — it keeps
+/// walking and adopts an ancestor whose `workspaces` glob matches the cwd
+/// (`@npmcli/config` `loadLocalPrefix`) unless workspaces are disabled on the
+/// command line. An ancestor of `npx_launch_root` (here a `$HOME` above
+/// `.intent/agent-configs`) carrying such a manifest and a broken `.npmrc`
+/// must not reach the launch, sentinel or not.
 #[cfg(unix)]
 #[tokio::test]
 async fn spawn_provider_npx_launch_is_isolated_from_the_launch_roots_ancestors() {
@@ -786,15 +842,7 @@ async fn spawn_provider_npx_launch_is_isolated_from_the_launch_roots_ancestors()
     let tmp = test_temp_dir("intent-acp-npx-ancestor-");
     let workspace = tmp.path().join("plain workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let home = tmp.path().join("home");
-    let launch_root = home.join(".intent").join("agent-configs");
-    std::fs::create_dir_all(&launch_root).unwrap();
-    std::fs::write(
-        home.join("package.json"),
-        r#"{"name":"home","private":true,"dependencies":{"zod":"catalog:"}}"#,
-    )
-    .unwrap();
-    std::fs::write(home.join(".npmrc"), "registry=http://127.0.0.1:9/\n").unwrap();
+    let launch_root = seed_matching_workspace_ancestor(&tmp.path().join("home"));
     let report = tmp.path().join("npx-report");
     let npx = write_fake_npx(tmp.path(), &report);
 
@@ -817,10 +865,143 @@ async fn spawn_provider_npx_launch_is_isolated_from_the_launch_roots_ancestors()
     );
     assert!(
         status.success(),
-        "npx must not walk up to the launch root's ancestor package.json (exit {status:?})"
+        "npx must not adopt the launch root's ancestor workspace manifest (exit {status:?})"
     );
     assert_neutral_launch_dir(&npx_cwd, &entries);
     agent.kill().await.ok();
+}
+
+/// The installed real `npx`, or `None` (the test skips) when there is none.
+#[cfg(unix)]
+fn real_npx(test: &str) -> Option<std::path::PathBuf> {
+    let npx = intent_providers::resolve_on_path("npx");
+    if npx.is_none() {
+        eprintln!("skipping {test}: npx not on PATH");
+    }
+    npx
+}
+
+/// A local, dependency-less npm package whose `bin` records `process.cwd()`
+/// into the file named by `$ADAPTER_REPORT` — what `npx -y <this path>`
+/// resolves offline, standing in for the pinned adapter.
+#[cfg(unix)]
+fn local_adapter_package(dir: &std::path::Path) -> std::path::PathBuf {
+    let adapter = dir.join("adapter");
+    std::fs::create_dir_all(&adapter).unwrap();
+    std::fs::write(
+        adapter.join("package.json"),
+        r#"{"name":"intentd-test-adapter","version":"1.0.0","bin":{"intentd-test-adapter":"cli.js"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        adapter.join("cli.js"),
+        "#!/usr/bin/env node\nrequire('fs').writeFileSync(process.env.ADAPTER_REPORT, 'ADAPTER_STARTED ' + process.cwd() + '\\n');\n",
+    )
+    .unwrap();
+    adapter
+}
+
+/// intent-hq/intent#5738 — the verifier's reproduction against the REAL npm
+/// CLI (fake npx scripts only approximate `@npmcli/config`): under an
+/// ancestor whose `workspaces` glob matches the launch dirs and whose `.npmrc`
+/// sets a nonexistent `script-shell`, `npx -y <adapter>` must still start the
+/// adapter (a) from one launch dir — without the workspaces flag npm adopts the
+/// ancestor, loads its `.npmrc` and dies with `ENOENT` (exit 254) — and (b)
+/// from a second launch dir while the first still exists — without the flag
+/// npm rejects the two same-named sentinels as duplicate workspaces (exit 1).
+/// Offline, with private user/global npmrc and cache; skips without `npx`.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_real_npx_ignores_matching_ancestor_workspaces_and_sibling_launch_dirs() {
+    use crate::spawn::{spawn_provider, SpawnOptions};
+
+    let Some(npx) = real_npx("real-npx ancestor workspaces regression") else {
+        return;
+    };
+    let tmp = test_temp_dir("intent-acp-npx-real-");
+    let workspace = tmp.path().join("plain workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let home = tmp.path().join("clean-home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("user.npmrc"), "").unwrap();
+    std::fs::write(home.join("global.npmrc"), "").unwrap();
+    let launch_root = seed_matching_workspace_ancestor(&tmp.path().join("parent"));
+    let adapter = local_adapter_package(tmp.path());
+    // `npx_fallback_package` is the `&'static` pinned package spec in production.
+    let adapter_spec: &'static str =
+        Box::leak(adapter.to_str().unwrap().to_owned().into_boxed_str());
+
+    let provider = *intent_providers::find_provider("claude-code").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&workspace);
+    opts.npx_launch_root = Some(&launch_root);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = Some(adapter_spec);
+    for (k, v) in [
+        ("HOME", home.to_str().unwrap()),
+        (
+            "npm_config_userconfig",
+            home.join("user.npmrc").to_str().unwrap(),
+        ),
+        (
+            "npm_config_globalconfig",
+            home.join("global.npmrc").to_str().unwrap(),
+        ),
+        (
+            "npm_config_cache",
+            tmp.path().join("npm-cache").to_str().unwrap(),
+        ),
+        ("npm_config_offline", "true"),
+        ("npm_config_update_notifier", "false"),
+        ("npm_config_loglevel", "error"),
+        ("DD_TRACE_ENABLED", "false"),
+    ] {
+        opts.extra_env.insert(k.to_string(), v.to_string());
+    }
+    assert!(opts.via_npx());
+
+    let mut launched = Vec::new();
+    let mut alive = Vec::new();
+    for label in ["first", "second"] {
+        let report = tmp.path().join(format!("adapter-report-{label}"));
+        opts.extra_env.insert(
+            "ADAPTER_REPORT".to_string(),
+            report.to_str().unwrap().to_string(),
+        );
+        // The previous launch dir is still alive (`alive`), so npm now sees two
+        // same-named sentinels under the matching glob.
+        let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
+        let status = tokio::time::timeout(Duration::from_secs(120), agent.child_mut().wait())
+            .await
+            .unwrap_or_else(|_| panic!("{label} real npx launch did not exit"))
+            .expect("wait real npx");
+        assert!(
+            status.success(),
+            "{label} launch: real npx must start the adapter despite the matching ancestor \
+             workspaces glob / broken .npmrc (exit {status:?}; 254 = ancestor .npmrc \
+             script-shell adopted, 1 = duplicate workspace names)"
+        );
+        let started = std::fs::read_to_string(&report)
+            .unwrap_or_else(|e| panic!("{label} launch: adapter never started ({e})"));
+        let cwd = std::path::PathBuf::from(
+            started
+                .trim()
+                .strip_prefix("ADAPTER_STARTED ")
+                .unwrap_or_else(|| panic!("{label} launch: unexpected report {started:?}")),
+        );
+        assert!(
+            cwd.starts_with(&launch_root),
+            "{label} launch: adapter cwd {} is not under the launch root {}",
+            cwd.display(),
+            launch_root.display()
+        );
+        launched.push(cwd);
+        alive.push(agent);
+    }
+    assert_ne!(launched[0], launched[1], "each launch gets its own dir");
+    for mut agent in alive {
+        agent.kill().await.ok();
+    }
 }
 
 /// intent-hq/intent#5738 (spawn classification): the process cwd of an npx

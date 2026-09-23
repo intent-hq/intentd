@@ -45,9 +45,9 @@ pub struct SpawnOptions<'a> {
     /// configuration of its cwd, so `npx -y <adapter>` run inside a Bun/pnpm
     /// workspace with `catalog:` specifiers dies before the adapter starts
     /// (intent-hq/intent#5738); the workspace stays the ACP session cwd,
-    /// never the npx process cwd. The launch dir shields npx from this root's
-    /// ancestors too, so any daemon-owned directory serves. Ignored by every
-    /// other launch tier.
+    /// never the npx process cwd. The launch dir plus
+    /// [`NPX_NO_WORKSPACES_ARG`] shield npx from this root's ancestors too, so
+    /// any daemon-owned directory serves. Ignored by every other launch tier.
     pub npx_launch_root: Option<&'a Path>,
     /// Path to a rules file (appended when the provider supports rules).
     pub rules_file: Option<&'a str>,
@@ -179,8 +179,12 @@ pub enum LaunchMode {
 /// Being empty is not enough: npm picks its project root by walking up from
 /// the cwd to the nearest `package.json` (or `node_modules`) and reads that
 /// root's `.npmrc`, so the directory holds [`NPX_LAUNCH_SENTINEL_MANIFEST`] — a
-/// private, dependency-less manifest that makes the launch dir itself the
-/// project root, whatever the launch root's ancestors contain.
+/// private, dependency-less manifest that makes the launch dir npm's nearest
+/// root. The sentinel alone is not enough either: npm walks on past it to an
+/// ancestor whose `workspaces` glob matches the launch dir, so
+/// [`build_args`] also passes [`NPX_NO_WORKSPACES_ARG`]; together they keep
+/// the launch dir the project root whatever the launch root's ancestors
+/// contain.
 #[derive(Debug)]
 pub struct NpxLaunchDir {
     path: PathBuf,
@@ -189,6 +193,16 @@ pub struct NpxLaunchDir {
 /// The `package.json` written into every [`NpxLaunchDir`].
 pub const NPX_LAUNCH_SENTINEL_MANIFEST: &str =
     "{\n  \"name\": \"intentd-npx-launch\",\n  \"private\": true\n}\n";
+
+/// The npx argument that keeps npm's project root at the [`NpxLaunchDir`]
+/// (intent-hq/intent#5738). The sentinel manifest is only npm's *first*
+/// candidate: `@npmcli/config` `loadLocalPrefix` keeps walking up and adopts
+/// any ancestor `package.json` whose `workspaces` glob matches the launch
+/// dir — loading that root's `.npmrc`, and rejecting two live launch dirs as
+/// duplicate workspace names — unless `workspaces` is `false` on the command
+/// line (the env layer does not count). Must precede the package positional:
+/// npx passes everything after it to the adapter.
+pub const NPX_NO_WORKSPACES_ARG: &str = "--workspaces=false";
 
 impl NpxLaunchDir {
     /// Create a fresh directory under `root` (the OS temp dir when `None`),
@@ -250,7 +264,8 @@ impl std::fmt::Display for LaunchMode {
 
 /// Assemble the launch arguments, including the Codex `-c` config overrides
 /// (which read `CODEX_REASONING_EFFORT` / `CODEX_MODEL_REASONING_EFFORT`).
-/// When spawning via npx fallback, prepends `-y <package>` before the provider's args.
+/// When spawning via npx fallback, prepends [`NPX_NO_WORKSPACES_ARG`] and
+/// `-y <package>` before the provider's args.
 #[must_use]
 pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     let mut args = Vec::new();
@@ -259,6 +274,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     // prepend the npx-specific args before the provider's args
     if opts.via_npx() {
         if let Some(pkg) = opts.npx_fallback_package {
+            args.push(NPX_NO_WORKSPACES_ARG.to_string());
             args.push("-y".to_string());
             args.push(pkg.to_string());
         }
@@ -1149,8 +1165,8 @@ mod build_command_tests {
 
     #[test]
     fn claude_code_npx_spawn_argv_is_pinned() {
-        // The exact spawn argv for claude-code: `<npx> -y <pinned package>` —
-        // no other args (claude-code has no base args).
+        // The exact spawn argv for claude-code: `<npx> --workspaces=false -y
+        // <pinned package>` — no other args (claude-code has no base args).
         let provider = intent_providers::find_provider("claude-code").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
@@ -1162,6 +1178,7 @@ mod build_command_tests {
         assert_eq!(
             args,
             vec![
+                "--workspaces=false".to_string(),
                 "-y".to_string(),
                 "@agentclientprotocol/claude-agent-acp@0.73.0".to_string(),
             ],

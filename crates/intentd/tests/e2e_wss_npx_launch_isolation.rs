@@ -5,16 +5,20 @@
 //! the workspace — while the ACP `session/new` still names the real
 //! workspace (a path containing a space) as its `cwd`. The daemon data dir
 //! (an ancestor of the `agent-configs` launch root) carries a `catalog:`
-//! manifest and a `.npmrc` too, so the launch dir must stop npm's
-//! project-root walk-up, not merely be empty.
+//! manifest whose `workspaces` glob matches every launch dir plus a `.npmrc`
+//! with a nonexistent `script-shell`, so the launch must both hold its own
+//! project root and disable npm's ancestor workspace-root adoption.
 //!
 //! Hermetic setup: the daemon child's `PATH` starts with a scratch `bin/`
 //! holding a fake `npx` that behaves like npm's project-root discovery — it
 //! records its cwd + argv, walks up from its cwd to the nearest
-//! `package.json`, fails with `EUNSUPPORTEDPROTOCOL` when that manifest uses
-//! `catalog:`, and otherwise execs the deterministic mock ACP fixture under
-//! `node`. Nothing is downloaded. The fixture's `MOCK_AGENT_SESSION_LOG` seam
-//! records the `session/new` `cwd` param and the child's actual process cwd.
+//! `package.json` (and on to an ancestor declaring `workspaces` unless
+//! `--workspaces=false` is on its argv), fails with `EUNSUPPORTEDPROTOCOL`
+//! when that root's manifest uses `catalog:` or with `ENOENT` when its
+//! `.npmrc` names a missing `script-shell`, and otherwise execs the
+//! deterministic mock ACP fixture under `node`. Nothing is downloaded. The
+//! fixture's `MOCK_AGENT_SESSION_LOG` seam records the `session/new` `cwd`
+//! param and the child's actual process cwd.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -319,26 +323,55 @@ fn make_source_repo(dir: &Path) -> PathBuf {
 
 /// The fake `npx` body; `__REPORT__`, `__NODE__` and `__SCRIPT__` are
 /// substituted. It appends its cwd to `<report>.cwd` and its argv to
-/// `<report>.args`, walks up from its cwd to the nearest `package.json` the
-/// way `@npmcli/config` picks npm's local prefix, fails exactly like npm when
-/// that manifest uses `catalog:` (`EUNSUPPORTEDPROTOCOL`), and otherwise execs
-/// the mock fixture under `node`.
+/// `<report>.args`, then picks npm's project root the way `@npmcli/config`
+/// `loadLocalPrefix` does: the nearest `package.json` above its cwd, unless
+/// an ancestor further up declares `workspaces` (real npm adopts it only when
+/// a glob matches the cwd; the fake treats any `workspaces` field as matching)
+/// and `--workspaces=false` / `--no-workspaces` is absent from the argv. It
+/// fails like npm when that root's manifest uses `catalog:`
+/// (`EUNSUPPORTEDPROTOCOL`) or its `.npmrc` names a `script-shell` that does
+/// not exist (`ENOENT`, exit 254), and otherwise execs the mock fixture under
+/// `node`.
 const FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
 printf '%s\n' "$PWD" >> '__REPORT__.cwd'
 printf '%s\n' "$*" >> '__REPORT__.args'
+no_ws=0
+for a in "$@"; do
+  case "$a" in
+    --) break ;;
+    --workspaces=false|--no-workspaces) no_ws=1 ;;
+    -*) ;;
+    *) break ;;
+  esac
+done
+root=""
 d="$PWD"
 while :; do
   if [ -e "$d/package.json" ]; then
-    if grep -q 'catalog:' "$d/package.json"; then
-      echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2
-      echo 'npm error Unsupported URL Type "catalog:": catalog:' >&2
-      exit 1
+    if [ -z "$root" ]; then
+      root="$d"
+      [ "$no_ws" = 1 ] && break
+    elif grep -q '"workspaces"' "$d/package.json"; then
+      root="$d"
+      break
     fi
-    break
   fi
   [ "$d" = / ] && break
   d=$(dirname "$d")
 done
+if [ -n "$root" ]; then
+  if grep -q 'catalog:' "$root/package.json"; then
+    echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2
+    echo 'npm error Unsupported URL Type "catalog:": catalog:' >&2
+    exit 1
+  fi
+  shell=$(sed -n 's/^script-shell=//p' "$root/.npmrc" 2>/dev/null)
+  if [ -n "$shell" ] && [ ! -x "$shell" ]; then
+    echo 'npm error code ENOENT' >&2
+    echo "npm error enoent spawn $shell ENOENT" >&2
+    exit 254
+  fi
+fi
 exec '__NODE__' '__SCRIPT__'
 "#;
 
@@ -376,6 +409,24 @@ fn seed_catalog_workspace(dir: &Path) {
     std::fs::write(dir.join(".npmrc"), "registry=http://127.0.0.1:9/\n").expect("write .npmrc");
 }
 
+/// Turn the daemon data dir — the ancestor of its `agent-configs` npx launch
+/// root — into the verifier's fixture: a `catalog:` manifest whose
+/// `workspaces` glob matches every launch dir, plus a `.npmrc` naming a
+/// `script-shell` that does not exist. npm that adopts this root as its
+/// project dies with `ENOENT` before the adapter starts.
+fn seed_matching_workspace_ancestor(data_dir: &Path) {
+    std::fs::write(
+        data_dir.join("package.json"),
+        r#"{"name":"catalog-parent","private":true,"workspaces":["agent-configs/*"],"dependencies":{"zod":"catalog:"}}"#,
+    )
+    .expect("write ancestor package.json");
+    std::fs::write(
+        data_dir.join(".npmrc"),
+        "script-shell=/intentd-e2e-nonexistent-shell\nregistry=http://127.0.0.1:9/\n",
+    )
+    .expect("write ancestor .npmrc");
+}
+
 /// Parse the fixture's session log into `(method, cwd, processCwd)` rows.
 fn read_session_log(path: &Path) -> Vec<(String, Value, Value)> {
     let raw = std::fs::read_to_string(path).unwrap_or_default();
@@ -394,9 +445,10 @@ fn read_session_log(path: &Path) -> Vec<(String, Value, Value)> {
 
 /// NPX LAUNCH ISOLATION (intent-hq/intent#5738): a claude-code agent in a
 /// `catalog:` workspace comes up — npx runs in a neutral directory, never the
-/// workspace, and unaffected by the `catalog:` manifest sitting above its
-/// `<data_dir>/agent-configs` launch root — and its `session/new` still names
-/// the workspace as the ACP cwd, spaces included.
+/// workspace, and unaffected by the matching-workspaces `catalog:` manifest
+/// and broken `.npmrc` sitting above its `<data_dir>/agent-configs` launch
+/// root — and its `session/new` still names the workspace as the ACP cwd,
+/// spaces included.
 #[tokio::test]
 async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspace() {
     let Some(script) = gate("WSS npx launch isolation E2E") else {
@@ -410,8 +462,9 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(&home_dir).unwrap();
     // The data dir is an ancestor of the `agent-configs` npx launch root: an
-    // npx that walked up out of the launch dir would find this manifest.
-    seed_catalog_workspace(&data_dir);
+    // npx that walked up out of the launch dir, or adopted this manifest's
+    // matching `workspaces` glob, would load its `.npmrc`.
+    seed_matching_workspace_ancestor(&data_dir);
     let report = data_dir.join("npx-report");
     write_fake_npx(&bin_dir, &report, &script);
     let source_repo = make_source_repo(&data_dir);
@@ -529,8 +582,12 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
     let first_args = args.lines().next().expect("at least one npx launch");
     assert_eq!(
         first_args,
-        format!("-y {}", intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE),
-        "claude-code npx argv is the pinned package"
+        format!(
+            "{} -y {}",
+            intent_acp::spawn::NPX_NO_WORKSPACES_ARG,
+            intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
+        ),
+        "claude-code npx argv is the pinned package with ancestor workspaces disabled"
     );
     let cwds = std::fs::read_to_string(format!("{}.cwd", report.display()))
         .expect("fake npx recorded its cwd");
