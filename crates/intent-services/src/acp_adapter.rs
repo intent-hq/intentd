@@ -28,9 +28,12 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use intent_acp::spawn::NPX_NO_WORKSPACES_ARG;
 #[cfg(unix)]
 use intent_acp::{descendant_pids, sweep_escaped_descendants};
-use intent_acp::{Connection, ConnectionHooks, IncomingNotification, IncomingRequest};
+use intent_acp::{
+    Connection, ConnectionHooks, IncomingNotification, IncomingRequest, NpxLaunchDir,
+};
 use intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS;
 use intent_providers::enhanced_path;
 use serde_json::{json, Value};
@@ -183,24 +186,35 @@ pub(crate) struct AcpAdapterCommand {
     envs: Vec<(String, OsString)>,
     envs_removed: Vec<String>,
     auth_required_stdout_marker: Option<&'static str>,
-    /// Working directory for the child and the `session/new` `cwd`. `None`
-    /// runs the adapter in the system temp dir (the ephemeral default).
+    /// The `session/new` `cwd`, and the process cwd of a resolved binary.
+    /// `None` means the system temp dir (the ephemeral default).
     cwd: Option<PathBuf>,
-    /// npx-run adapters get the longer cold-install timeout budget.
+    /// npx-run adapters get the longer cold-install timeout budget and start
+    /// in a neutral [`NpxLaunchDir`] rather than `cwd`.
     via_npx: bool,
+    /// Parent of the per-launch [`NpxLaunchDir`]; `None` is the OS temp dir.
+    npx_launch_root: Option<PathBuf>,
 }
 
 impl AcpAdapterCommand {
-    /// Run a pinned npm package via `npx -y <package>`.
+    /// Run a pinned npm package via `npx --workspaces=false -y <package>`
+    /// (the same npm-isolation argv as `intent_acp::spawn::build_args`;
+    /// the switch precedes the package because npx forwards everything after
+    /// it to the adapter).
     pub(crate) fn npx(npx: PathBuf, package: &str) -> Self {
         Self {
             program: npx,
-            args: vec!["-y".to_string(), package.to_string()],
+            args: vec![
+                NPX_NO_WORKSPACES_ARG.to_string(),
+                "-y".to_string(),
+                package.to_string(),
+            ],
             envs: Vec::new(),
             envs_removed: Vec::new(),
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: true,
+            npx_launch_root: None,
         }
     }
 
@@ -214,7 +228,15 @@ impl AcpAdapterCommand {
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: false,
+            npx_launch_root: None,
         }
+    }
+
+    /// Root the npx launch dir under `root` instead of the OS temp dir.
+    #[cfg(test)]
+    pub(crate) fn npx_launch_root(mut self, root: PathBuf) -> Self {
+        self.npx_launch_root = Some(root);
+        self
     }
 
     /// Append extra launch arguments after the ones already assembled.
@@ -223,14 +245,20 @@ impl AcpAdapterCommand {
         self
     }
 
-    /// Pin the adapter's working directory (also used as the `session/new`
-    /// `cwd`). Callers that leave this unset run in the system temp dir.
+    /// Pin the `session/new` `cwd` (and a resolved binary's working
+    /// directory; see [`Self::working_dir`]). Callers that leave this unset
+    /// get the system temp dir.
     pub(crate) fn cwd(mut self, dir: PathBuf) -> Self {
         self.cwd = Some(dir);
         self
     }
 
-    /// The effective working directory for this launch.
+    /// The launch's `session/new` `cwd` — and, for a resolved binary, its
+    /// process cwd. An npx launch's process cwd is its [`NpxLaunchDir`]
+    /// instead (intent-hq/intent#5738): npm resolves its project root by
+    /// walking up from the process cwd, and a workspace manifest there
+    /// (`catalog:` specifiers, a matching `workspaces` glob, a project
+    /// `.npmrc`) breaks `npx -y <adapter>` before the adapter can start.
     pub(crate) fn working_dir(&self) -> PathBuf {
         self.cwd.clone().unwrap_or_else(std::env::temp_dir)
     }
@@ -309,6 +337,11 @@ pub(crate) struct SpawnedAdapter {
     pub(crate) notifications: mpsc::UnboundedReceiver<IncomingNotification>,
     /// Agent → client requests (`session/request_permission`, `fs/*`, …).
     pub(crate) requests: mpsc::UnboundedReceiver<IncomingRequest>,
+    /// The neutral directory an npx launch runs in (intent-hq/intent#5738);
+    /// `None` for resolved binaries. Held, like the slot, until the adapter
+    /// value is dropped after the child has been reaped, so the directory
+    /// outlives the whole process tree.
+    _npx_launch_dir: Option<NpxLaunchDir>,
     /// This run's slot in the daemon-wide bound. Never read — held so the
     /// slot is returned when the adapter value is dropped, which is after the
     /// child has been reaped on every exit path.
@@ -374,10 +407,21 @@ fn spawn_admitted_adapter(
     cmd: &AcpAdapterCommand,
     slot: OwnedSemaphorePermit,
 ) -> Result<SpawnedAdapter, String> {
+    let npx_launch_dir = if cmd.via_npx {
+        Some(
+            NpxLaunchDir::create(cmd.npx_launch_root.as_deref())
+                .map_err(|e| format!("{}: npx launch dir: {e}", cmd.program.display()))?,
+        )
+    } else {
+        None
+    };
+    let process_cwd = npx_launch_dir
+        .as_ref()
+        .map_or_else(|| cmd.working_dir(), |dir| dir.path().to_path_buf());
     let mut command = tokio::process::Command::new(&cmd.program);
     command
         .args(&cmd.args)
-        .current_dir(cmd.working_dir())
+        .current_dir(process_cwd)
         .env("PATH", enhanced_path(Some(&cmd.program)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -422,6 +466,7 @@ fn spawn_admitted_adapter(
         conn,
         notifications,
         requests,
+        _npx_launch_dir: npx_launch_dir,
         _slot: slot,
     })
 }
@@ -743,5 +788,402 @@ mod reap_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("grandchild pid {grandchild_pid} still alive after reap_child sweep");
+    }
+}
+
+/// intent-hq/intent#5738 for the ephemeral launcher: an npx-run adapter
+/// (model probes, one-shot completions) starts npx in a neutral launch dir,
+/// never in the caller's workspace, while `working_dir()` — the `session/new`
+/// `cwd` — is untouched. Shared fake-npx helpers are `pub(crate)` for the
+/// one-shot runner's end-to-end regression.
+#[cfg(all(test, unix))]
+pub(crate) mod npx_launch_tests {
+    use super::*;
+    use crate::test_support::test_tempdir;
+    use std::path::Path;
+
+    /// A workspace fixture reproducing the intent-hq/intent#5738 failure mode:
+    /// a pnpm/Bun workspace whose `package.json` uses `catalog:` specifiers.
+    /// The directory name carries a space so the ACP cwd path shape is
+    /// exercised.
+    pub(crate) fn catalog_workspace(tmp: &Path) -> PathBuf {
+        let workspace = tmp.join("bun workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("package.json"),
+            r#"{"name":"catalog-workspace","private":true,"dependencies":{"zod":"catalog:"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\ncatalog:\n  zod: ^3.23.0\n",
+        )
+        .unwrap();
+        workspace
+    }
+
+    /// The fake `npx`: records its cwd and that directory's entries to
+    /// `$INTENTD_FAKE_NPX_REPORT` (atomically), then mirrors npm's project-root
+    /// discovery (`@npmcli/config` `loadLocalPrefix`): the nearest
+    /// `package.json` up from the cwd, and — unless `--workspaces=false` /
+    /// `--no-workspaces` precedes the package positional — an ancestor manifest
+    /// declaring `workspaces` instead. It fails like npm when that root's
+    /// manifest uses `catalog:` (`EUNSUPPORTEDPROTOCOL`, exit 1) or its `.npmrc`
+    /// names a `script-shell` that does not exist (`ENOENT`, exit 254).
+    /// Otherwise it execs `node $INTENTD_FAKE_NPX_ADAPTER` when set (the
+    /// "installed" adapter), else exits 0. Never downloads anything.
+    const FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
+{ printf '%s\n' "$PWD"; ls -A; } > "$INTENTD_FAKE_NPX_REPORT.tmp" && mv "$INTENTD_FAKE_NPX_REPORT.tmp" "$INTENTD_FAKE_NPX_REPORT"
+no_ws=0
+for a in "$@"; do
+  case "$a" in
+    --) break ;;
+    --workspaces=false|--no-workspaces) no_ws=1 ;;
+    -*) ;;
+    *) break ;;
+  esac
+done
+root=""
+d="$PWD"
+while :; do
+  if [ -e "$d/package.json" ]; then
+    if [ -z "$root" ]; then
+      root="$d"
+      [ "$no_ws" = 1 ] && break
+    elif grep -q '"workspaces"' "$d/package.json"; then
+      root="$d"
+      break
+    fi
+  fi
+  [ "$d" = / ] && break
+  d=$(dirname "$d")
+done
+if [ -n "$root" ]; then
+  if grep -q 'catalog:' "$root/package.json"; then
+    echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2
+    echo 'npm error Unsupported URL Type "catalog:": catalog:' >&2
+    exit 1
+  fi
+  shell=$(sed -n 's/^script-shell=//p' "$root/.npmrc" 2>/dev/null)
+  if [ -n "$shell" ] && [ ! -x "$shell" ]; then
+    echo 'npm error code ENOENT' >&2
+    echo "npm error enoent spawn $shell ENOENT" >&2
+    exit 254
+  fi
+fi
+if [ -n "$INTENTD_FAKE_NPX_ADAPTER" ]; then
+  exec node "$INTENTD_FAKE_NPX_ADAPTER"
+fi
+exit 0
+"#;
+
+    /// Write [`FAKE_NPX_SCRIPT`] as an executable `npx` into `dir`.
+    pub(crate) fn write_fake_npx(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let npx = dir.join("npx");
+        std::fs::write(&npx, FAKE_NPX_SCRIPT).unwrap();
+        std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        npx
+    }
+
+    /// Poll `report` until the fake npx has renamed it into place: the cwd it
+    /// ran in and the names of that directory's entries.
+    pub(crate) async fn read_npx_report(report: &Path) -> (PathBuf, Vec<String>) {
+        for _ in 0..400 {
+            if let Ok(s) = tokio::fs::read_to_string(report).await {
+                let mut lines = s.lines();
+                if let Some(cwd) = lines.next() {
+                    return (PathBuf::from(cwd), lines.map(str::to_owned).collect());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fake npx never reported its cwd to {}", report.display());
+    }
+
+    /// The launch dir holds exactly the private sentinel `package.json` that
+    /// makes it npm's nearest project root and nothing else.
+    pub(crate) fn assert_neutral_launch_dir(npx_cwd: &Path, entries: &[String]) {
+        assert_eq!(
+            entries,
+            ["package.json"],
+            "npx launch dir {} must hold only the sentinel manifest",
+            npx_cwd.display()
+        );
+        let sentinel: Value =
+            serde_json::from_str(&std::fs::read_to_string(npx_cwd.join("package.json")).unwrap())
+                .expect("sentinel package.json is JSON");
+        assert_eq!(sentinel["private"], json!(true), "{sentinel}");
+        assert!(
+            sentinel.get("dependencies").is_none() && sentinel.get("workspaces").is_none(),
+            "sentinel must not declare dependencies or workspaces: {sentinel}"
+        );
+    }
+
+    /// Seed `ancestor` (an ancestor of the npx launch root at
+    /// `ancestor/.intent/agent-configs`) with the intent-hq/intent#5738
+    /// fixture: a `catalog:` manifest whose `workspaces` glob matches every
+    /// launch dir, plus a `.npmrc` whose `script-shell` does not exist.
+    fn seed_matching_workspace_ancestor(ancestor: &Path) -> PathBuf {
+        let launch_root = ancestor.join(".intent").join("agent-configs");
+        std::fs::create_dir_all(&launch_root).unwrap();
+        std::fs::write(
+            ancestor.join("package.json"),
+            r#"{"name":"catalog-parent","private":true,"workspaces":[".intent/agent-configs/*"],"dependencies":{"zod":"catalog:"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ancestor.join(".npmrc"),
+            "script-shell=/intentd-test-nonexistent-shell\nregistry=http://127.0.0.1:9/\n",
+        )
+        .unwrap();
+        launch_root
+    }
+
+    /// The npx argv is pinned: the workspaces switch precedes `-y <package>`
+    /// (npx forwards everything after the package to the adapter), and extra
+    /// launch args land after the package.
+    #[test]
+    fn npx_command_disables_workspace_root_adoption_ahead_of_the_package() {
+        let cmd = AcpAdapterCommand::npx(PathBuf::from("/usr/bin/npx"), "codex-acp@1.2.3")
+            .args(["--model".to_string(), "gpt".to_string()]);
+        assert_eq!(
+            cmd.args,
+            [
+                NPX_NO_WORKSPACES_ARG,
+                "-y",
+                "codex-acp@1.2.3",
+                "--model",
+                "gpt"
+            ]
+        );
+        assert!(cmd.via_npx);
+        let bin = AcpAdapterCommand::binary(PathBuf::from("/opt/codex-acp"), vec!["a".into()]);
+        assert_eq!(bin.args, ["a"], "direct binaries take no npx switches");
+    }
+
+    /// An npx launch from inside a `catalog:` workspace runs npx in a neutral
+    /// launch dir (so npm never sees the workspace manifest) while
+    /// `working_dir()` — what `session/new` receives — stays the workspace;
+    /// the launch dir is removed once the spawned adapter is dropped.
+    #[tokio::test]
+    async fn npx_adapter_runs_outside_the_workspace_and_keeps_it_as_session_cwd() {
+        let tmp = test_tempdir("intent-adapter-npx-");
+        let workspace = catalog_workspace(tmp.path());
+        let report = tmp.path().join("npx-report");
+        let npx = write_fake_npx(tmp.path());
+        let cmd = AcpAdapterCommand::npx(npx, "claude-agent-acp@0.0.0-test")
+            .cwd(workspace.clone())
+            .env("INTENTD_FAKE_NPX_REPORT", report.as_os_str());
+
+        let slots = AdapterSlots::new(1);
+        let mut adapter = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
+            .await
+            .expect("spawn fake npx");
+        let (npx_cwd, entries) = read_npx_report(&report).await;
+        let status = adapter.child.wait().await.expect("wait fake npx");
+        assert!(
+            status.success(),
+            "npx must not see the workspace package.json (exit {status:?})"
+        );
+        assert_ne!(npx_cwd, workspace, "npx ran inside the workspace");
+        assert!(
+            !npx_cwd.starts_with(&workspace),
+            "npx cwd {} is under the workspace",
+            npx_cwd.display()
+        );
+        assert_neutral_launch_dir(&npx_cwd, &entries);
+        assert_eq!(cmd.working_dir(), workspace, "session cwd untouched");
+        assert!(npx_cwd.is_dir(), "launch dir lives as long as the adapter");
+        drop(adapter);
+        assert!(
+            !npx_cwd.exists(),
+            "launch dir {} must be removed with the adapter",
+            npx_cwd.display()
+        );
+    }
+
+    /// The launch root's own ancestors cannot reach the launch either: an
+    /// ancestor `package.json` whose `workspaces` glob matches the launch dir
+    /// (with a broken `.npmrc`) must not be adopted as npm's project root.
+    #[tokio::test]
+    async fn npx_adapter_is_isolated_from_the_launch_roots_ancestors() {
+        let tmp = test_tempdir("intent-adapter-npx-ancestor-");
+        let workspace = tmp.path().join("plain workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let launch_root = seed_matching_workspace_ancestor(&tmp.path().join("home"));
+        let report = tmp.path().join("npx-report");
+        let npx = write_fake_npx(tmp.path());
+        let cmd = AcpAdapterCommand::npx(npx, "claude-agent-acp@0.0.0-test")
+            .cwd(workspace)
+            .npx_launch_root(launch_root.clone())
+            .env("INTENTD_FAKE_NPX_REPORT", report.as_os_str());
+
+        let slots = AdapterSlots::new(1);
+        let mut adapter = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
+            .await
+            .expect("spawn fake npx");
+        let (npx_cwd, entries) = read_npx_report(&report).await;
+        let status = adapter.child.wait().await.expect("wait fake npx");
+        assert!(
+            npx_cwd.starts_with(&launch_root),
+            "npx cwd {} is not under the launch root {}",
+            npx_cwd.display(),
+            launch_root.display()
+        );
+        assert!(
+            status.success(),
+            "npx must not adopt the launch root's ancestor workspace manifest (exit {status:?})"
+        );
+        assert_neutral_launch_dir(&npx_cwd, &entries);
+    }
+
+    /// Control: a resolved binary keeps `working_dir()` as its process cwd and
+    /// takes no launch dir — the isolation is npx-only.
+    #[tokio::test]
+    async fn binary_adapter_keeps_the_pinned_cwd_as_its_process_cwd() {
+        let tmp = test_tempdir("intent-adapter-bin-cwd-");
+        let workspace = catalog_workspace(tmp.path());
+        let report = tmp.path().join("bin-report");
+        let cmd = AcpAdapterCommand::binary(
+            PathBuf::from("sh"),
+            vec!["-c".into(), "pwd > \"$INTENTD_BIN_REPORT\"".into()],
+        )
+        .cwd(workspace.clone())
+        .env("INTENTD_BIN_REPORT", report.as_os_str());
+
+        let slots = AdapterSlots::new(1);
+        let mut adapter = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
+            .await
+            .expect("spawn sh");
+        assert!(adapter.child.wait().await.expect("wait sh").success());
+        let pwd = std::fs::read_to_string(&report).expect("sh reported its cwd");
+        assert_eq!(
+            PathBuf::from(pwd.trim()).canonicalize().unwrap(),
+            workspace.canonicalize().unwrap()
+        );
+    }
+
+    /// A local, dependency-less npm package whose `bin` records `process.cwd()`
+    /// into `$ADAPTER_REPORT`, then stays alive on stdin — what
+    /// `npx -y <this path>` resolves offline, standing in for a pinned adapter.
+    fn local_adapter_package(dir: &Path) -> PathBuf {
+        let adapter = dir.join("adapter");
+        std::fs::create_dir_all(&adapter).unwrap();
+        std::fs::write(
+            adapter.join("package.json"),
+            r#"{"name":"intentd-test-adapter","version":"1.0.0","bin":{"intentd-test-adapter":"cli.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            adapter.join("cli.js"),
+            "#!/usr/bin/env node\n\
+             require('fs').writeFileSync(process.env.ADAPTER_REPORT, 'ADAPTER_STARTED ' + process.cwd() + '\\n');\n\
+             process.stdin.resume();\n",
+        )
+        .unwrap();
+        adapter
+    }
+
+    /// intent-hq/intent#5738 against the REAL npm CLI (fake npx scripts only
+    /// approximate `@npmcli/config`): under an ancestor whose `workspaces` glob
+    /// matches the launch dirs and whose `.npmrc` sets a nonexistent
+    /// `script-shell`, an ephemeral `npx -y <adapter>` must still start the
+    /// adapter from a first launch dir (without the workspaces flag npm adopts
+    /// the ancestor and dies with `ENOENT`, exit 254) and from a second one
+    /// while the first is still alive (two same-named sentinels would be
+    /// rejected as duplicate workspaces, exit 1). Offline, with private
+    /// user/global npmrc and cache; skips without `npx`.
+    #[tokio::test]
+    async fn real_npx_adapter_ignores_matching_ancestor_workspaces_and_sibling_launch_dirs() {
+        let Some(npx) = intent_providers::resolve_on_path("npx") else {
+            eprintln!("skipping real-npx ephemeral adapter regression: npx not on PATH");
+            return;
+        };
+        let tmp = test_tempdir("intent-adapter-npx-real-");
+        let workspace = tmp.path().join("plain workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let home = tmp.path().join("clean-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("user.npmrc"), "").unwrap();
+        std::fs::write(home.join("global.npmrc"), "").unwrap();
+        let launch_root = seed_matching_workspace_ancestor(&tmp.path().join("parent"));
+        let adapter = local_adapter_package(tmp.path());
+
+        let slots = AdapterSlots::new(2);
+        let mut launched = Vec::new();
+        let mut alive = Vec::new();
+        for label in ["first", "second"] {
+            let report = tmp.path().join(format!("adapter-report-{label}"));
+            let mut cmd = AcpAdapterCommand::npx(npx.clone(), adapter.to_str().unwrap())
+                .cwd(workspace.clone())
+                .npx_launch_root(launch_root.clone())
+                .env("ADAPTER_REPORT", report.as_os_str());
+            for (k, v) in [
+                ("HOME", home.clone()),
+                ("npm_config_userconfig", home.join("user.npmrc")),
+                ("npm_config_globalconfig", home.join("global.npmrc")),
+                ("npm_config_cache", tmp.path().join("npm-cache")),
+            ] {
+                cmd = cmd.env(k, v.as_os_str());
+            }
+            for (k, v) in [
+                ("npm_config_offline", "true"),
+                ("npm_config_update_notifier", "false"),
+                ("npm_config_loglevel", "error"),
+                ("DD_TRACE_ENABLED", "false"),
+            ] {
+                cmd = cmd.env(k, v);
+            }
+            // The previous launch dir is still alive (`alive`), so npm now
+            // sees two same-named sentinels under the matching glob.
+            let mut spawned = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
+                .await
+                .expect("spawn real npx");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            let started = loop {
+                if let Ok(s) = std::fs::read_to_string(&report) {
+                    break s;
+                }
+                if let Ok(Some(status)) = spawned.child.try_wait() {
+                    panic!(
+                        "{label} launch: real npx exited {status:?} before the adapter started \
+                         (254 = ancestor .npmrc script-shell adopted, 1 = duplicate workspace \
+                         names); stderr: {:?}",
+                        spawned.conn.recent_stderr()
+                    );
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{label} launch: adapter never started"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            let cwd = PathBuf::from(
+                started
+                    .trim()
+                    .strip_prefix("ADAPTER_STARTED ")
+                    .unwrap_or_else(|| panic!("{label} launch: unexpected report {started:?}")),
+            );
+            assert!(
+                cwd.starts_with(&launch_root),
+                "{label} launch: adapter cwd {} is not under the launch root {}",
+                cwd.display(),
+                launch_root.display()
+            );
+            launched.push(cwd);
+            alive.push(spawned);
+        }
+        assert_ne!(launched[0], launched[1], "each launch gets its own dir");
+        for mut spawned in alive {
+            reap_child(&mut spawned.child).await;
+        }
+        for cwd in &launched {
+            assert!(
+                !cwd.exists(),
+                "launch dir {} swept after reap",
+                cwd.display()
+            );
+        }
     }
 }
