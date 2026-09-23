@@ -13296,6 +13296,13 @@ mod npx_launch_dir_lifetime_tests {
     /// gone for the whole `ps` snapshot + signal window and the descendant
     /// records `cwd-gone`; with the guard held across the sweep it can never
     /// observe a missing cwd.
+    ///
+    /// The descendant is `SIGKILLed` mid-loop, so each verdict is published by
+    /// `mv` (an atomic rename) rather than `>` on the marker itself: a kill
+    /// landing between the redirect's truncate and its write would otherwise
+    /// leave an empty marker (reproduced 3/40 under parallel load). The
+    /// watcher is armed only once the first verdict is on disk, so the sweep
+    /// provably reaches a running descendant.
     #[tokio::test]
     async fn idle_exit_sweep_keeps_launch_dir_until_descendants_are_swept() {
         let tmp = crate::tests::test_tempdir("intentd-npx-lifetime-idle-");
@@ -13307,8 +13314,8 @@ mod npx_launch_dir_lifetime_tests {
             .arg("-c")
             .arg(
                 "(trap '' TERM; while :; do if [ -e ./package.json ]; \
-                 then echo cwd-present > \"$0\"; else echo cwd-gone > \"$0\"; fi; \
-                 sleep 0.01; done) & exit 0",
+                 then echo cwd-present > \"$0.tmp\"; else echo cwd-gone > \"$0.tmp\"; fi; \
+                 mv -f \"$0.tmp\" \"$0\"; sleep 0.01; done) & exit 0",
             )
             .arg(&marker)
             .current_dir(&launch_path)
@@ -13323,6 +13330,20 @@ mod npx_launch_dir_lifetime_tests {
         let agent_id = AgentId::from("agent-npx-lifetime-idle");
         let _ends =
             install_fake_handle_with_launch_dir(&mgr, &agent_id, Some(child), Some(launch_dir));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant never published its first verdict"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            verdict(&marker),
+            "cwd-present",
+            "descendant started in its cwd"
+        );
 
         let fired = mgr
             .arm_child_exit_watcher(agent_id.clone(), child_pid)
