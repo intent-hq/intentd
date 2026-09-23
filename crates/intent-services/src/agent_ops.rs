@@ -930,9 +930,7 @@ pub(crate) fn ensure_provider_enabled(
     provider_id: &str,
     enabled: Option<&std::collections::BTreeMap<String, bool>>,
 ) -> Result<()> {
-    let disableable =
-        intent_providers::find_provider(provider_id).is_some_and(|p| p.can_be_disabled);
-    if disableable && enabled.is_some_and(|m| m.get(provider_id) == Some(&false)) {
+    if provider_is_disabled(provider_id, enabled) {
         let display = intent_providers::provider_config(provider_id).display_name;
         return Err(Error::InvalidParams(format!(
             "{method}: provider \"{provider_id}\" ({display}) is not enabled — enable it in \
@@ -940,6 +938,72 @@ pub(crate) fn ensure_provider_enabled(
         )));
     }
     Ok(())
+}
+
+/// The predicate half of [`ensure_provider_enabled`]: a registered provider
+/// with [`intent_providers::ProviderConfig::can_be_disabled`] whose
+/// `providers.enabled[id]` entry is `false`. An absent map or absent entry
+/// means enabled (the settings default); providers that cannot be disabled
+/// and unregistered ids are never disabled.
+pub(crate) fn provider_is_disabled(
+    provider_id: &str,
+    enabled: Option<&std::collections::BTreeMap<String, bool>>,
+) -> bool {
+    let disableable =
+        intent_providers::find_provider(provider_id).is_some_and(|p| p.can_be_disabled);
+    disableable && enabled.is_some_and(|m| m.get(provider_id) == Some(&false))
+}
+
+/// Where a turn-start re-home lands (intent-hq/intent#5737): the target
+/// provider and the model the session is pinned to on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DisabledProviderRehome {
+    pub(crate) provider: String,
+    /// The settings-default model for `provider` — resolved exactly as a new
+    /// agent's would be ([`resolve_default_model_from_settings`], dropped to
+    /// the CLI default when it provably belongs to another provider) — or
+    /// `None` for the provider's CLI default.
+    pub(crate) model: Option<String>,
+}
+
+/// Resolve where a session whose provider was disabled in settings is
+/// re-homed at turn start (intent-hq/intent#5737): the settings-derived
+/// default provider ([`crate::agent_session::derived_default_provider`])
+/// when it passes the create/delegate front door's availability funnel
+/// ([`ensure_provider_available`]: enabled → authenticated → runnable), with
+/// the model a fresh agent on that provider would get. `None` when no usable
+/// default exists — the caller then fails the turn with the disabled
+/// provider's own "not enabled" rejection instead of spawning it.
+///
+/// `method` labels the (unused) rejection from the funnel and the model
+/// ownership check; the resolver never surfaces those errors, it only
+/// decides.
+pub(crate) fn resolve_disabled_provider_rehome(
+    services: &Services,
+    settings: &intent_core::settings_file::SettingsFile,
+    method: &str,
+) -> Option<DisabledProviderRehome> {
+    let provider = crate::agent_session::derived_default_provider(settings)?;
+    ensure_provider_available(method, &provider, &settings.providers).ok()?;
+    // Create-seam parity: a settings-chain model that provably belongs to
+    // another provider is dropped to the CLI default, never an error the
+    // user did not ask for (see `plan_agent_create`).
+    let model = resolve_default_model_from_settings(services, Some(&provider)).filter(|m| {
+        match ensure_bare_model_matches_provider(method, &services.cached_models(), &provider, m) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    model = %m,
+                    provider = %provider,
+                    error = %e,
+                    "configured default model belongs to another provider; \
+                     re-homing onto the CLI default"
+                );
+                false
+            }
+        }
+    });
+    Some(DisabledProviderRehome { provider, model })
 }
 
 /// Reject a known provider id that is disabled in settings, whose cached

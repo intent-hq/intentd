@@ -2038,6 +2038,39 @@ impl Store {
         Ok(())
     }
 
+    /// Metadata of the agent's newest `role: "system"` transcript row that
+    /// records a spawn-identity change — a `model_changed` or a
+    /// `provider_rehomed` notice — or `None` when the transcript carries
+    /// neither. The model-change notice path reads it to tell a re-home's
+    /// deferred last-turn commit (the newest such row is the
+    /// `provider_rehomed` notice for this very provider hop) from an
+    /// ordinary switch, durably across spawn retries, later turns and
+    /// daemon restarts (intent-hq/intent#5737). Newest-first over the
+    /// `(agent_id, role, seq DESC)` index; system rows are rare, so the
+    /// scan is short. Unparseable metadata reads as `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn latest_agent_identity_notice(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<serde_json::Value>> {
+        let raw = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT metadata FROM agent_message \
+             WHERE agent_id=? AND role='system' \
+               AND json_extract(metadata, '$.type') IN ('model_changed', 'provider_rehomed') \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&agent_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("latest agent identity notice failed: {e}")))?;
+        Ok(raw
+            .flatten()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok()))
+    }
+
     /// Read one session's `model`, `resolved_model` (D14 display identity of
     /// an explicit pick, if any), `provider`, and its persisted cumulative
     /// end-of-turn `token_usage` snapshot (§5.23) in a single row read. This
@@ -2362,6 +2395,67 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
         Ok(())
+    }
+
+    /// Re-home a session onto another provider at turn start
+    /// (intent-hq/intent#5737): a narrow write of `provider`, `model`,
+    /// `reasoning_effort` (cleared — the old provider's effort vocabulary
+    /// does not carry over) and `updated_at` only. The daemon-initiated
+    /// sibling of [`Store::set_agent_session_model`] for a session whose
+    /// provider was disabled in settings: like that writer it is allowed to
+    /// change `provider` after first real use (the case
+    /// [`Store::update_agent_session`]'s immutability guard rejects), and
+    /// unlike it the model may be `None` (the target provider's CLI default).
+    /// Compare-and-set on the `provider` column: the write lands only while
+    /// the row still carries `expected_provider` (the value the caller read
+    /// and found disabled; `None` matches a NULL column), so a concurrent
+    /// `agent.setModel` that moved the session elsewhere between the
+    /// caller's read and this write is never overwritten — the call then
+    /// returns `Ok(false)` and mutates nothing. Scoped to `workspace_id`
+    /// (defense-in-depth). `NotFound` if the session is absent or the
+    /// workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn rehome_agent_session_provider(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_provider: Option<&str>,
+        provider: &str,
+        model: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, updated_at=? \
+             WHERE id=? AND workspace_id=? AND provider IS ?",
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?
+        .rows_affected();
+        if rows > 0 {
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?;
+        if exists == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(false)
     }
 
     /// Persist the assembled system prompt (the spawn path): a narrow write
@@ -11337,6 +11431,253 @@ mod tests {
             "acp session id untouched"
         );
         assert_eq!(after.name, "Baseline", "unrelated columns untouched");
+    }
+
+    /// The narrow `rehome_agent_session_provider` writer
+    /// (intent-hq/intent#5737): a turn-start re-home off a disabled provider
+    /// lands after first real use, may clear `model` (target CLI default),
+    /// always clears `reasoning_effort`, and leaves `acp_session_id` and
+    /// unrelated columns untouched. Wrong-workspace writes are `NotFound` and
+    /// mutate nothing; a stale `expected_provider` (a concurrent
+    /// `agent.setModel` moved the row) returns `Ok(false)` and mutates
+    /// nothing.
+    #[tokio::test]
+    async fn rehome_agent_session_provider_switches_provider_and_clears_effort() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-rehome".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("auggie".to_string());
+        session.model = Some("opus4.7".to_string());
+        session.reasoning_effort = Some("high".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let err = store
+            .rehome_agent_session_provider(
+                &WorkspaceId("ws-other".to_string()),
+                &agent_id,
+                Some("auggie"),
+                "codex",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect_err("cross-workspace write must not mutate");
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("auggie"));
+        assert_eq!(unchanged.model.as_deref(), Some("opus4.7"));
+        assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
+
+        // Stale expectation (a concurrent setModel moved the row): no write.
+        let landed = store
+            .rehome_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                Some("claude-code"),
+                "codex",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("stale expected provider is not an error");
+        assert!(!landed, "compare-and-set must not land on a mismatch");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("auggie"));
+        assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
+
+        let updated_at = now_iso();
+        let landed = store
+            .rehome_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                Some("auggie"),
+                "codex",
+                None,
+                &updated_at,
+            )
+            .await
+            .expect("re-home after first real use");
+        assert!(landed);
+        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        assert_eq!(after.provider.as_deref(), Some("codex"));
+        assert_eq!(after.model, None, "target CLI default clears the model");
+        assert_eq!(after.reasoning_effort, None, "effort never carries over");
+        assert_eq!(after.updated_at, updated_at);
+        assert_eq!(after.acp_session_id.as_deref(), Some("acp-live"));
+        assert_eq!(after.name, "Baseline", "unrelated columns untouched");
+
+        let landed = store
+            .rehome_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                Some("codex"),
+                "mock",
+                Some("m-1"),
+                &now_iso(),
+            )
+            .await
+            .expect("re-home with a settings default model");
+        assert!(landed);
+        let with_model = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(with_model.provider.as_deref(), Some("mock"));
+        assert_eq!(with_model.model.as_deref(), Some("m-1"));
+
+        // A NULL provider column (session resolving to the disabled default)
+        // is matched by `expected_provider = None`.
+        let null_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut null_session = baseline_test_session(&null_id, &ws_id, &ts, None);
+        null_session.provider = None;
+        store
+            .insert_agent_session(&null_session)
+            .await
+            .expect("insert");
+        assert!(
+            !store
+                .rehome_agent_session_provider(
+                    &ws_id,
+                    &null_id,
+                    Some("codex"),
+                    "mock",
+                    None,
+                    &now_iso()
+                )
+                .await
+                .expect("mismatch is not an error"),
+            "Some(expected) never matches a NULL column"
+        );
+        assert!(
+            store
+                .rehome_agent_session_provider(&ws_id, &null_id, None, "mock", None, &now_iso())
+                .await
+                .expect("NULL column re-home"),
+            "None matches a NULL column"
+        );
+        let after = store.get_agent_session(&null_id).await.expect("get");
+        assert_eq!(after.provider.as_deref(), Some("mock"));
+    }
+
+    /// `latest_agent_identity_notice` (intent-hq/intent#5737) returns the
+    /// newest system `model_changed` / `provider_rehomed` row's metadata
+    /// only: other system rows, user/assistant rows carrying those types,
+    /// and other agents' rows never count; no such row reads as `None`.
+    #[tokio::test]
+    async fn latest_agent_identity_notice_returns_newest_identity_system_row() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-notice".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        store.insert_agent_session(&session).await.expect("insert");
+        let other_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let other = baseline_test_session(&other_id, &ws_id, &ts, None);
+        store.insert_agent_session(&other).await.expect("insert");
+
+        let text = serde_json::json!([{ "type": "text", "text": "x" }]);
+        let append = |agent: &AgentId, role: &str, metadata: serde_json::Value| {
+            let agent = agent.clone();
+            let role = role.to_string();
+            let text = text.clone();
+            let store = &store;
+            async move {
+                store
+                    .append_agent_message_with_metadata(
+                        &agent,
+                        &role,
+                        &text,
+                        Some(&metadata),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("append")
+            }
+        };
+
+        assert_eq!(
+            store
+                .latest_agent_identity_notice(&agent_id)
+                .await
+                .expect("read"),
+            None,
+            "empty transcript"
+        );
+        append(
+            &agent_id,
+            "user",
+            serde_json::json!({ "type": "provider_rehomed" }),
+        )
+        .await;
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "auto_unarchived" }),
+        )
+        .await;
+        append(
+            &other_id,
+            "system",
+            serde_json::json!({ "type": "model_changed", "toProvider": "other" }),
+        )
+        .await;
+        assert_eq!(
+            store
+                .latest_agent_identity_notice(&agent_id)
+                .await
+                .expect("read"),
+            None,
+            "only system rows of the two identity types count, per agent"
+        );
+
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "provider_rehomed", "fromProvider": "a", "toProvider": "b" }),
+        )
+        .await;
+        let latest = store
+            .latest_agent_identity_notice(&agent_id)
+            .await
+            .expect("read")
+            .expect("rehome row");
+        assert_eq!(latest["type"], "provider_rehomed");
+        assert_eq!(latest["toProvider"], "b");
+
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "model_changed", "fromProvider": "b", "toProvider": "a" }),
+        )
+        .await;
+        append(
+            &agent_id,
+            "assistant",
+            serde_json::json!({ "type": "provider_rehomed" }),
+        )
+        .await;
+        let latest = store
+            .latest_agent_identity_notice(&agent_id)
+            .await
+            .expect("read")
+            .expect("model_changed row");
+        assert_eq!(latest["type"], "model_changed", "newest identity row wins");
+        assert_eq!(latest["toProvider"], "a");
     }
 
     /// monorepo#1936 regression: the spawn path's system-prompt persist is a
