@@ -2323,6 +2323,14 @@ fn sh_squote(s: &str) -> String {
 /// [`kill_child_tree`], with `kill_on_drop` as a direct-child safety net), and
 /// the per-agent MCP bridge + generated config that back the agent→BE tool loop.
 ///
+/// Ownership invariant: a handle never drops while still owning its child.
+/// Every teardown path moves the child out first ([`DetachedChild::take`])
+/// and awaits its owned cleanup; a handle dropped any other way — the fresh
+/// local handle `create_agent` holds across the stale reap when that await
+/// is cancelled, or a map dropped wholesale — hands the child to the same
+/// owned cleanup from [`Drop`], so the tree is still swept before its npx
+/// launch dir goes away.
+///
 /// `spawned_model` and `spawned_provider` track the model/provider the child was
 /// spawned with, enabling `ensure_started` to detect model changes (via `agent.setModel`)
 /// and respawn the child with the new model before the next turn.
@@ -2342,11 +2350,11 @@ struct AgentHandle {
     /// Bundled pi-extension MCP delivery files (extension + wrapper script),
     /// removed when the handle drops (pi only).
     _pi_extension: Option<PiExtensionDelivery>,
-    /// The neutral directory an npx launch started in, removed when the
-    /// handle drops (intent-hq/intent#5738; `None` for other launch tiers).
-    /// Every teardown path takes the child out of the handle together with
-    /// this dir ([`DetachedChild::take`]) — it is the live tree's cwd, and
-    /// only the detached child's owned cleanup may release it.
+    /// The neutral directory an npx launch started in (intent-hq/intent#5738;
+    /// `None` for other launch tiers). It is the live tree's cwd, so it
+    /// always leaves the handle together with the child
+    /// ([`DetachedChild::take`], explicitly or from [`Drop`]) and only the
+    /// detached child's owned cleanup may release it.
     npx_launch_dir: Option<NpxLaunchDir>,
     antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
@@ -2381,6 +2389,10 @@ impl Drop for AgentHandle {
         if let Some(listener) = &self.wake_listener {
             listener.abort();
         }
+        // Cancellation-safe fallback for a handle that still owns its child:
+        // the detached child's own `Drop` starts the owned tree kill (no-op
+        // once a teardown path has already taken the child).
+        drop(DetachedChild::take(self));
     }
 }
 
@@ -3385,12 +3397,15 @@ impl AgentManager {
         };
         // Concurrency safety: fully reap any stale handle + child for this agent
         // BEFORE installing the new one, reusing the process-group teardown.
-        // A bare `insert` would only drop the old handle (aborting its serve
-        // loop, with `kill_on_drop` reaping just the direct child) — orphaning
-        // grandchildren and risking a lingering streamer from a lost/old session
-        // that could keep appending to the agentId-keyed transcript. The
-        // per-agent single-flight slot serializes turns; this closes the
-        // respawn-time window. (Drop the lock before awaiting the kill.)
+        // A bare `insert` would only drop the old handle, which starts the
+        // tree kill but does not wait for it — risking a lingering streamer
+        // from a lost/old session that could keep appending to the
+        // agentId-keyed transcript. The per-agent single-flight slot
+        // serializes turns; this closes the respawn-time window. (Drop the
+        // lock before awaiting the kill.) If this await is cancelled, the
+        // fresh `handle` above drops with its child still inside: its `Drop`
+        // hands that child to the owned cleanup too, so neither tree is
+        // orphaned and neither launch dir is removed early.
         let stale = self.handles.lock().unwrap().remove(&agent_id);
         if let Some(mut stale) = stale {
             if let Some(child) = DetachedChild::take(&mut stale) {
@@ -13747,6 +13762,42 @@ mod npx_launch_dir_lifetime_tests {
         drop(detached.expect("handle owned a child"));
 
         assert_dir_outlives_tree(&tree, "detached child dropped unkilled").await;
+    }
+
+    /// `create_agent`'s respawn window: the freshly spawned child already
+    /// sits in a local [`AgentHandle`] while the stale handle's owned kill is
+    /// awaited, before the fresh handle reaches the map. Cancelling that
+    /// await drops the fresh handle with its child still inside — the drop
+    /// must hand the child to the owned cleanup rather than `kill_on_drop`
+    /// just the leader and remove the launch dir from under its descendants.
+    #[tokio::test]
+    async fn cancelled_stale_reap_keeps_fresh_handles_launch_dir_until_its_tree_is_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-respawn-");
+        let mut stale = spawn_tree(tmp.path(), "respawn-stale").await;
+        let mut fresh = spawn_tree(tmp.path(), "respawn-fresh").await;
+        let (fresh_handle, fresh_ends) =
+            fake_handle_with_launch_dir(fresh.child.take(), fresh.launch_dir.take());
+        let stale_detached = detach_tree(&mut stale);
+
+        let respawning = intent_core::spawn_daemon(async move {
+            let _fresh_handle = fresh_handle;
+            let _fresh_ends = fresh_ends;
+            stale_detached.kill_tree().await;
+            unreachable!("the stale reap is cancelled before it completes");
+        });
+        wait_for_file(&stale.term_marker, "stale leader SIGTERM").await;
+        assert!(
+            fresh.launch_path.is_dir(),
+            "precondition: fresh dir present"
+        );
+        assert!(
+            pid_alive(fresh.grandchild),
+            "precondition: fresh descendant alive"
+        );
+        abort_and_settle(respawning, "create_agent stale reap").await;
+
+        assert_dir_outlives_tree(&stale, "stale tree, reap cancelled mid-kill").await;
+        assert_dir_outlives_tree(&fresh, "fresh handle dropped during the stale reap").await;
     }
 
     /// Detach `tree` the way every teardown path does: out of an
