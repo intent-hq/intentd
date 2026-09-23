@@ -2344,7 +2344,9 @@ struct AgentHandle {
     _pi_extension: Option<PiExtensionDelivery>,
     /// The neutral directory an npx launch started in, removed when the
     /// handle drops (intent-hq/intent#5738; `None` for other launch tiers).
-    _npx_launch_dir: Option<NpxLaunchDir>,
+    /// Teardown paths that hand the child out of the handle must move this
+    /// with it ([`DetachedChild`]): it is the live child's cwd.
+    npx_launch_dir: Option<NpxLaunchDir>,
     antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
@@ -3368,7 +3370,7 @@ impl AgentManager {
             _mcp_config: mcp_config,
             _rules_config: rules_config,
             _pi_extension: pi_extension,
-            _npx_launch_dir: npx_launch_dir,
+            npx_launch_dir,
             antigravity_profile,
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
@@ -4754,8 +4756,8 @@ impl AgentManager {
     /// `agent.stop` / hard-cancel cancel semantics.
     pub async fn stop(&self, agent_id: &AgentId) -> bool {
         let (removed, child) = self.detach(agent_id).await;
-        if let Some((child, spawn_pid)) = child {
-            kill_child_tree(child, spawn_pid).await;
+        if let Some(child) = child {
+            child.kill_tree().await;
         }
         removed
     }
@@ -4814,7 +4816,7 @@ impl AgentManager {
             tracing::warn!(error = %e, "stop-redelivery persistence sync failed for batch stop");
         }
         if !children.is_empty() {
-            kill_child_trees(children).await;
+            DetachedChild::kill_trees(children).await;
         }
         fence
     }
@@ -4825,7 +4827,7 @@ impl AgentManager {
     /// `stop()` kills the single tree inline (SIGTERM→grace→SIGKILL);
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
-    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<(Child, Option<u32>)>) {
+    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<DetachedChild>) {
         self.detach_with_redelivery(agent_id, None, true).await
     }
 
@@ -4850,7 +4852,7 @@ impl AgentManager {
         agent_id: &AgentId,
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
         sync_store: bool,
-    ) -> (bool, Option<(Child, Option<u32>)>) {
+    ) -> (bool, Option<DetachedChild>) {
         // Pin the live-turn slot BEFORE aborting the worker (the abort drops
         // LiveTurnGuard; the pin keeps the slot published until the flush
         // below persists the row — monorepo#2056), then flush the partial
@@ -4918,10 +4920,7 @@ impl AgentManager {
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
-        let child = handle.and_then(|mut h| {
-            let spawn_pid = h.child_pid;
-            h.child.take().map(|c| (c, spawn_pid))
-        });
+        let child = handle.and_then(|mut h| DetachedChild::take(&mut h));
         self.registry.deregister(agent_id);
         (removed, child)
     }
@@ -5550,8 +5549,8 @@ impl AgentManager {
         let (removed, child) = self
             .detach_with_redelivery(agent_id, redelivery, true)
             .await;
-        if let Some((child, spawn_pid)) = child {
-            kill_child_tree(child, spawn_pid).await;
+        if let Some(child) = child {
+            child.kill_tree().await;
         }
         removed
     }
@@ -8869,7 +8868,7 @@ impl AgentManager {
                 children.push(child);
             }
         }
-        kill_child_trees(children).await;
+        DetachedChild::kill_trees(children).await;
         // The daemon-managed Unsloth server is not an agent child — tear it
         // down explicitly so a clean shutdown never orphans it.
         self.unsloth.shutdown().await;
@@ -9154,15 +9153,23 @@ impl AgentManager {
                                 registry.deregister(&agent_id);
                                 Some((
                                     status,
-                                    dead.map(|mut h| (h.child.take(), Arc::clone(&h.connection))),
+                                    dead.map(|mut h| {
+                                        (
+                                            h.child.take(),
+                                            h.npx_launch_dir.take(),
+                                            Arc::clone(&h.connection),
+                                        )
+                                    }),
                                 ))
                             }
                         }
                     }
                 };
                 if let Some((status, dead)) = exited {
-                    let (dead_child, dead_conn) =
-                        dead.map_or((None, None), |(child, conn)| (child, Some(conn)));
+                    let (dead_child, dead_launch_dir, dead_conn) = dead
+                        .map_or((None, None, None), |(child, dir, conn)| {
+                            (child, dir, Some(conn))
+                        });
                     // The direct child is already reaped (`try_wait` above),
                     // but same-group descendants can survive it: sweep the
                     // process group via the spawn-time pid. Swept BEFORE the
@@ -9170,10 +9177,13 @@ impl AgentManager {
                     // write end open is killed first — EOF is then
                     // deterministic and the capture includes its last output,
                     // instead of the await burning its full bound and the
-                    // WARN underclaiming (monorepo#3570).
+                    // WARN underclaiming (monorepo#3570). The npx launch dir
+                    // is those descendants' cwd, so it is released only once
+                    // the sweep is done (intent-hq/intent#5738).
                     if let Some(dead_child) = dead_child {
                         kill_child_tree(dead_child, child_pid).await;
                     }
+                    drop(dead_launch_dir);
                     // Honest capture hint (monorepo#3570): bounded-await the
                     // stderr drain's settle (EOF + flush — the whole group is
                     // dead now, so EOF is normally immediate) and only name
@@ -9226,6 +9236,51 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 /// before returning (`SIGKILLed` children reap almost instantly).
 #[cfg(unix)]
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
+
+/// A provider child handed out of its [`AgentHandle`] for a bounded
+/// process-tree kill, together with the npx launch dir it runs in
+/// (intent-hq/intent#5738): that dir is the live tree's cwd, so its RAII
+/// guard must outlive [`kill_child_tree`] / [`kill_child_trees`] rather than
+/// drop with the handle before the tree has been signalled.
+struct DetachedChild {
+    child: Child,
+    spawn_pid: Option<u32>,
+    npx_launch_dir: Option<NpxLaunchDir>,
+}
+
+impl DetachedChild {
+    /// Move the child (and its launch dir) out of `handle`; `None` when the
+    /// handle owns no child.
+    fn take(handle: &mut AgentHandle) -> Option<Self> {
+        let child = handle.child.take()?;
+        Some(Self {
+            child,
+            spawn_pid: handle.child_pid,
+            npx_launch_dir: handle.npx_launch_dir.take(),
+        })
+    }
+
+    /// [`kill_child_tree`], releasing the launch dir only afterwards.
+    async fn kill_tree(self) {
+        kill_child_tree(self.child, self.spawn_pid).await;
+        drop(self.npx_launch_dir);
+    }
+
+    /// [`kill_child_trees`] over the batch, releasing every launch dir only
+    /// after the shared sweep completes.
+    async fn kill_trees(children: Vec<Self>) {
+        let mut launch_dirs = Vec::with_capacity(children.len());
+        let children = children
+            .into_iter()
+            .map(|detached| {
+                launch_dirs.push(detached.npx_launch_dir);
+                (detached.child, detached.spawn_pid)
+            })
+            .collect();
+        kill_child_trees(children).await;
+        drop(launch_dirs);
+    }
+}
 
 #[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Terminate a spawned provider's WHOLE process tree (§5.6). The child is its
@@ -13120,6 +13175,176 @@ async fn handle_terminal_turn_failure(
     .await;
 }
 
+#[cfg(all(test, unix))]
+mod npx_launch_dir_lifetime_tests {
+    //! The npx launch dir is a live child's cwd (intent-hq/intent#5738), so
+    //! its RAII guard must outlive the bounded process-tree kill on every
+    //! teardown path that hands the child out of its `AgentHandle`: `stop`,
+    //! `stop_many`, `shutdown`, and the idle-exit watcher's descendant sweep.
+    //! Each child reports, from inside its SIGTERM trap, whether its cwd still
+    //! existed when the kill reached it; the dir must be gone afterwards.
+
+    use super::dead_child_respawn_tests::install_fake_handle_with_launch_dir;
+    use super::role_reminder_tests::manager_with;
+    use super::*;
+
+    /// A child whose cwd is `dir`: on SIGTERM it writes `cwd-present` or
+    /// `cwd-gone` to `marker` (a path outside `dir`) and exits, so the kill's
+    /// `child.wait()` returns only after the verdict is on disk.
+    fn trap_reporting_child(dir: &Path, marker: &Path) -> Child {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "trap 'if [ -e ./package.json ]; then echo cwd-present > \"$0\"; \
+                 else echo cwd-gone > \"$0\"; fi; exit 0' TERM; \
+                 while :; do sleep 0.05; done",
+            )
+            .arg(marker)
+            .current_dir(dir)
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn trap-reporting child")
+    }
+
+    fn verdict(marker: &Path) -> String {
+        std::fs::read_to_string(marker)
+            .unwrap_or_else(|e| panic!("child never reported at {}: {e}", marker.display()))
+            .trim()
+            .to_string()
+    }
+
+    struct Installed {
+        agent_id: AgentId,
+        launch_path: PathBuf,
+        marker: PathBuf,
+        _ends: (tokio::io::DuplexStream, tokio::io::DuplexStream),
+    }
+
+    fn install(mgr: &AgentManager, root: &Path, tag: &str) -> Installed {
+        let launch_dir = NpxLaunchDir::create(Some(root)).expect("create launch dir");
+        let launch_path = launch_dir.path().to_path_buf();
+        let marker = root.join(format!("{tag}.verdict"));
+        let child = trap_reporting_child(&launch_path, &marker);
+        let agent_id = AgentId::from(format!("agent-npx-lifetime-{tag}"));
+        let ends =
+            install_fake_handle_with_launch_dir(mgr, &agent_id, Some(child), Some(launch_dir));
+        Installed {
+            agent_id,
+            launch_path,
+            marker,
+            _ends: ends,
+        }
+    }
+
+    fn assert_torn_down(installed: &Installed, path: &str) {
+        assert_eq!(
+            verdict(&installed.marker),
+            "cwd-present",
+            "{path}: launch dir was removed before the child was signalled"
+        );
+        assert!(
+            !installed.launch_path.exists(),
+            "{path}: launch dir must be removed once the tree kill completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_keeps_launch_dir_until_tree_kill_completes() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-lifetime-stop-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let a = install(&mgr, tmp.path(), "stop");
+        assert!(a.launch_path.join("package.json").is_file());
+
+        assert!(mgr.stop(&a.agent_id).await, "handle existed");
+        assert_torn_down(&a, "stop");
+    }
+
+    #[tokio::test]
+    async fn stop_many_keeps_launch_dirs_until_sweep_completes() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-lifetime-many-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let a = install(&mgr, tmp.path(), "many-a");
+        let b = install(&mgr, tmp.path(), "many-b");
+
+        let fence = mgr
+            .stop_many(&[a.agent_id.clone(), b.agent_id.clone()])
+            .await;
+        drop(fence);
+        assert_torn_down(&a, "stop_many");
+        assert_torn_down(&b, "stop_many");
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_launch_dirs_until_sweep_completes() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-lifetime-shutdown-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let a = install(&mgr, tmp.path(), "shutdown");
+
+        mgr.shutdown().await;
+        assert_torn_down(&a, "shutdown");
+    }
+
+    /// Idle-exit path: the leader exits on its own leaving a same-group
+    /// descendant behind. The watcher reaps the handle and sweeps the group;
+    /// the descendant re-checks its cwd every 10ms until it is killed, so the
+    /// last verdict on disk is what it saw just before the sweep reached it.
+    /// With the guard dropped before the sweep (the regression), the dir is
+    /// gone for the whole `ps` snapshot + signal window and the descendant
+    /// records `cwd-gone`; with the guard held across the sweep it can never
+    /// observe a missing cwd.
+    #[tokio::test]
+    async fn idle_exit_sweep_keeps_launch_dir_until_descendants_are_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-lifetime-idle-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let launch_dir = NpxLaunchDir::create(Some(tmp.path())).expect("create launch dir");
+        let launch_path = launch_dir.path().to_path_buf();
+        let marker = tmp.path().join("idle.verdict");
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "(trap '' TERM; while :; do if [ -e ./package.json ]; \
+                 then echo cwd-present > \"$0\"; else echo cwd-gone > \"$0\"; fi; \
+                 sleep 0.01; done) & exit 0",
+            )
+            .arg(&marker)
+            .current_dir(&launch_path)
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn exiting leader with lingering descendant");
+        let child_pid = child.id();
+        let agent_id = AgentId::from("agent-npx-lifetime-idle");
+        let _ends =
+            install_fake_handle_with_launch_dir(&mgr, &agent_id, Some(child), Some(launch_dir));
+
+        let fired = mgr
+            .arm_child_exit_watcher(agent_id.clone(), child_pid)
+            .await
+            .expect("watcher task joins");
+        assert!(fired, "watcher reaps the idle-exited leader");
+        assert!(
+            !mgr.handles.lock().unwrap().contains_key(&agent_id),
+            "handle removed by the watcher"
+        );
+        assert_eq!(
+            verdict(&marker),
+            "cwd-present",
+            "idle-exit: launch dir was removed before the descendant sweep"
+        );
+        assert!(
+            !launch_path.exists(),
+            "idle-exit: launch dir must be removed once the sweep completes"
+        );
+    }
+}
+
 #[cfg(test)]
 mod role_reminder_tests {
     //! Role-reminder injection cadence over [`AgentManager::build_turn_prompt`]
@@ -14767,6 +14992,17 @@ mod dead_child_respawn_tests {
         agent_id: &AgentId,
         child: Option<Child>,
     ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        install_fake_handle_with_launch_dir(mgr, agent_id, child, None)
+    }
+
+    /// [`install_fake_handle`] whose handle also owns an npx launch dir guard
+    /// (the child's cwd), for the teardown lifetime tests.
+    pub(super) fn install_fake_handle_with_launch_dir(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        child: Option<Child>,
+        npx_launch_dir: Option<NpxLaunchDir>,
+    ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
         let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
         let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
         let connection = Arc::new(Connection::new(
@@ -14775,7 +15011,7 @@ mod dead_child_respawn_tests {
             None,
             ConnectionHooks::default(),
         ));
-        install_handle_with_connection(mgr, agent_id, child, connection);
+        install_handle_parts(mgr, agent_id, child, connection, npx_launch_dir);
         (c2a_agent, a2c_agent)
     }
 
@@ -14787,6 +15023,16 @@ mod dead_child_respawn_tests {
         agent_id: &AgentId,
         child: Option<Child>,
         connection: Arc<Connection>,
+    ) {
+        install_handle_parts(mgr, agent_id, child, connection, None);
+    }
+
+    fn install_handle_parts(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        child: Option<Child>,
+        connection: Arc<Connection>,
+        npx_launch_dir: Option<NpxLaunchDir>,
     ) {
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let child_pid = child.as_ref().and_then(tokio::process::Child::id);
@@ -14800,7 +15046,7 @@ mod dead_child_respawn_tests {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
-            _npx_launch_dir: None,
+            npx_launch_dir,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -15793,13 +16039,15 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(rebuilt.npx_fallback_package, provider.fallback_npx_package);
 
         // Through build_command/build_args: the rebuilt opts must spawn npx
-        // with `-y <package>`, not the bare `codex-acp` command.
+        // with `--workspaces=false -y <package>`, not the bare `codex-acp`
+        // command.
         let cmd = intent_acp::spawn::build_command(&rebuilt);
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = intent_acp::spawn::build_args(&rebuilt);
-        assert_eq!(args[0], "-y");
+        assert_eq!(args[0], intent_acp::spawn::NPX_NO_WORKSPACES_ARG);
+        assert_eq!(args[1], "-y");
         assert_eq!(
-            args[1],
+            args[2],
             provider
                 .fallback_npx_package
                 .expect("codex has npx fallback")
