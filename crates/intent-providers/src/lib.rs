@@ -40,14 +40,15 @@ pub use config::{
     is_provider_authentication_error, login_command, provider_config, InjectionMechanism,
     ProviderConfig, ToolRemovalStyle, ACP_PROVIDERS, AUGGIE_CLI_MIN_VERSION,
     AUGGIE_CLI_REQUIREMENT, CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE,
-    CLAUDE_AGENT_ACP_VERSION, PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
+    CLAUDE_AGENT_ACP_VERSION, NPX_MIN_NPM_VERSION, NPX_NPM_REQUIREMENT, PI_ACP_NPX_PACKAGE,
+    PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
 };
 #[cfg(test)]
 pub(crate) use config::{
     always_enabled_providers, disableable_providers, first_provider_config, ProviderRuntime,
 };
 pub use discover::{
-    discover_providers_with_overrides, find_auggie_candidates, find_npx, find_pi_cli,
+    discover_providers_with_overrides, find_auggie_candidates, find_node, find_npx, find_pi_cli,
     find_provider_binary, gated_reason, gated_reason_with_env, not_installed_detail, probe_npx,
     provider_availability_for, resolve_npx_only_override, resolve_on_path, ProviderAvailability,
 };
@@ -58,7 +59,8 @@ pub(crate) use models::{
 };
 pub use models::{parse_grok_models_command_output, GrokModel};
 pub use version_gate::{
-    auggie_cli_gate, auggie_gate_reason, pi_cli_gate, pi_gate_reason, PiCliGate, PiCliProbe,
+    auggie_cli_gate, auggie_gate_reason, npx_gate, pi_cli_gate, pi_gate_reason, stale_npx_reason,
+    PiCliGate, PiCliProbe,
 };
 
 #[cfg(test)]

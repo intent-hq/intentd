@@ -707,6 +707,66 @@ fn enabled_gate_rejects_explicitly_disabled_providers() {
         .expect("absent map means enabled");
 }
 
+/// The turn-start re-home resolver (intent-hq/intent#5737): the
+/// settings-derived default is the target only when it passes the same
+/// availability funnel as the create/delegate front doors; the model is what
+/// a fresh agent on that provider would get (`model.providerDefaults[id]` →
+/// `model.default` → `None` for the CLI default). No default configured, a
+/// disabled default, or an unrunnable one (env gate) all yield `None`.
+#[tokio::test]
+async fn disabled_provider_rehome_targets_only_a_usable_default() {
+    let (_t, svc, _ws, _specialists, _cfg) = setup().await;
+    let env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    let resolve = |svc: &crate::Services| {
+        super::resolve_disabled_provider_rehome(svc, &svc.effective_settings(), "session/prompt")
+    };
+
+    assert_eq!(resolve(&svc), None, "no model.defaultProvider → no target");
+
+    set(&svc, "model.defaultProvider", json!("mock"));
+    assert_eq!(
+        resolve(&svc),
+        Some(super::DisabledProviderRehome {
+            provider: "mock".to_string(),
+            model: None,
+        }),
+        "available default with no settings model → CLI default"
+    );
+
+    set(&svc, "model.default", json!("global-default"));
+    assert_eq!(
+        resolve(&svc).and_then(|t| t.model).as_deref(),
+        Some("global-default"),
+        "model.default applies when nothing provider-specific is set"
+    );
+    set(
+        &svc,
+        "model.providerDefaults",
+        json!({ "mock": "mock-default" }),
+    );
+    assert_eq!(
+        resolve(&svc).and_then(|t| t.model).as_deref(),
+        Some("mock-default"),
+        "model.providerDefaults[mock] wins over model.default"
+    );
+
+    set(&svc, "providers.enabled", json!({ "mock": false }));
+    assert_eq!(resolve(&svc), None, "a disabled default is not a target");
+    set(&svc, "providers.enabled", json!({}));
+    assert!(
+        resolve(&svc).is_some(),
+        "re-enabled default is a target again"
+    );
+
+    drop(env);
+    let _unset = EnvGuard::apply(&[("MOCK_AGENT_SCRIPT_PATH", None)]);
+    assert_eq!(
+        resolve(&svc),
+        None,
+        "an unrunnable (env-gated) default is not a target"
+    );
+}
+
 /// End to end through `agent.delegate`: a provider that is installed and
 /// available but explicitly disabled in `providers.enabled` fails fast with
 /// the "not enabled" `-32602` — on the explicit `provider` param and on the

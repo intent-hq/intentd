@@ -42,7 +42,10 @@ pub(crate) mod traits;
 pub mod transfer;
 pub mod turn_attachments;
 
-pub use agent_configs::{agent_configs_root, create_agent_configs_dir, sweep_agent_configs};
+pub use agent_configs::{
+    agent_configs_root, create_agent_configs_dir, is_npx_launch_dir_name, sweep_agent_configs,
+    NPX_LAUNCH_DIR_PREFIX,
+};
 pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,

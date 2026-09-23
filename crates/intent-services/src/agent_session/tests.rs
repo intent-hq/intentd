@@ -9969,13 +9969,34 @@ fn prompt_auth_required_turn_error_matches_mapped_shape() {
             "{id}: {msg}"
         );
         assert!(
+            msg.contains(super::PROMPT_AUTH_REQUIRED_MARKER),
+            "{id}: {msg}"
+        );
+        assert!(
             super::prompt_auth_required_turn_error(&Error::InvalidParams(msg)),
             "{id}"
         );
     }
     // Other InvalidParams shapes, mid-string mentions, and Internal errors
-    // never classify — they still need the worker-emitted event pair.
+    // never classify — they still need the worker-emitted event pair. In
+    // particular the turn-start disabled-provider rejection
+    // (intent-hq/intent#5737) shares the `session/prompt: provider "` prefix
+    // but is raised BEFORE any spawn, with no pair emitted.
+    let disabled = crate::agent_ops::ensure_provider_enabled(
+        "session/prompt",
+        "codex",
+        Some(&std::collections::BTreeMap::from([(
+            "codex".to_string(),
+            false,
+        )])),
+    )
+    .expect_err("codex disabled");
+    assert!(
+        matches!(&disabled, Error::InvalidParams(m) if m.starts_with(super::PROMPT_AUTH_REQUIRED_PREFIX)),
+        "the disabled rejection shares the prefix, which is why the marker exists: {disabled:?}"
+    );
     for err in [
+        disabled,
         Error::InvalidParams("agent.create: provider \"pi\" is not authenticated".into()),
         Error::InvalidParams(format!(
             "bad params: {}session/prompt: provider \"pi\"",

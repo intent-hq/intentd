@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.103] - 2026-09-23
+
+### 🐛 Bug Fixes
+
+- *(providers)* Pair npx with the detected node and reject stale npm-6 npx ([#2090](https://github.com/intent-hq/intentd/pull/2090))
+
+
+## [0.9.102] - 2026-09-23
+
+### 🐛 Bug Fixes
+
+- Isolate npx provider startup from workspace package configuration ([#2092](https://github.com/intent-hq/intentd/pull/2092))
+
+
+## [0.9.101] - 2026-09-23
+
+### 🐛 Bug Fixes
+
+- *(agent)* Re-home sessions on a disabled provider at turn start ([#2091](https://github.com/intent-hq/intentd/pull/2091))
+
+
 ## [0.9.100] - 2026-09-22
 
 ### 🐛 Bug Fixes
