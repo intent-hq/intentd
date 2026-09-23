@@ -233,7 +233,7 @@ impl AcpAdapterCommand {
     }
 
     /// Root the npx launch dir under `root` instead of the OS temp dir.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn npx_launch_root(mut self, root: PathBuf) -> Self {
         self.npx_launch_root = Some(root);
         self
