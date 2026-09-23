@@ -10,15 +10,19 @@
 //! project root and disable npm's ancestor workspace-root adoption.
 //!
 //! Hermetic setup: the daemon child's `PATH` starts with a scratch `bin/`
-//! holding a fake `npx` that behaves like npm's project-root discovery — it
-//! records its cwd + argv, walks up from its cwd to the nearest
-//! `package.json` (and on to an ancestor declaring `workspaces` unless
-//! `--workspaces=false` is on its argv), fails with `EUNSUPPORTEDPROTOCOL`
-//! when that root's manifest uses `catalog:` or with `ENOENT` when its
-//! `.npmrc` names a missing `script-shell`, and otherwise execs the
-//! deterministic mock ACP fixture under `node`. Nothing is downloaded. The
-//! fixture's `MOCK_AGENT_SESSION_LOG` seam records the `session/new` `cwd`
-//! param and the child's actual process cwd.
+//! holding a fake `node` (a shim onto the host's node) and, beside it, a
+//! fake `npx` — the daemon pairs npx with the `node` it detects
+//! (intent-hq/intent#5725), so the fake pair is what a shim-only `bin/`
+//! would not be: the selected toolchain. The fake `npx` answers the
+//! spawn-time `--version` probe like npm ≥ 7 and otherwise behaves like
+//! npm's project-root discovery — it records its cwd + argv, walks up from
+//! its cwd to the nearest `package.json` (and on to an ancestor declaring
+//! `workspaces` unless `--workspaces=false` is on its argv), fails with
+//! `EUNSUPPORTEDPROTOCOL` when that root's manifest uses `catalog:` or with
+//! `ENOENT` when its `.npmrc` names a missing `script-shell`, and otherwise
+//! execs the deterministic mock ACP fixture under `node`. Nothing is
+//! downloaded. The fixture's `MOCK_AGENT_SESSION_LOG` seam records the
+//! `session/new` `cwd` param and the child's actual process cwd.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -322,17 +326,23 @@ fn make_source_repo(dir: &Path) -> PathBuf {
 }
 
 /// The fake `npx` body; `__REPORT__`, `__NODE__` and `__SCRIPT__` are
-/// substituted. It appends its cwd to `<report>.cwd` and its argv to
-/// `<report>.args`, then picks npm's project root the way `@npmcli/config`
-/// `loadLocalPrefix` does: the nearest `package.json` above its cwd, unless
-/// an ancestor further up declares `workspaces` (real npm adopts it only when
-/// a glob matches the cwd; the fake treats any `workspaces` field as matching)
-/// and `--workspaces=false` / `--no-workspaces` is absent from the argv. It
-/// fails like npm when that root's manifest uses `catalog:`
-/// (`EUNSUPPORTEDPROTOCOL`) or its `.npmrc` names a `script-shell` that does
-/// not exist (`ENOENT`, exit 254), and otherwise execs the mock fixture under
-/// `node`.
+/// substituted. `npx --version` (the daemon's spawn-time stale-npx probe,
+/// intent-hq/intent#5725) prints an npm ≥ 7 version and exits without
+/// recording anything, like the real npx. A launch appends its cwd to
+/// `<report>.cwd` and its argv to `<report>.args`, then picks npm's project
+/// root the way `@npmcli/config` `loadLocalPrefix` does: the nearest
+/// `package.json` above its cwd, unless an ancestor further up declares
+/// `workspaces` (real npm adopts it only when a glob matches the cwd; the
+/// fake treats any `workspaces` field as matching) and `--workspaces=false` /
+/// `--no-workspaces` is absent from the argv. It fails like npm when that
+/// root's manifest uses `catalog:` (`EUNSUPPORTEDPROTOCOL`) or its `.npmrc`
+/// names a `script-shell` that does not exist (`ENOENT`, exit 254), and
+/// otherwise execs the mock fixture under `node`.
 const FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
+if [ "$1" = --version ]; then
+  echo '10.9.2'
+  exit 0
+fi
 printf '%s\n' "$PWD" >> '__REPORT__.cwd'
 printf '%s\n' "$*" >> '__REPORT__.args'
 no_ws=0
@@ -375,10 +385,22 @@ fi
 exec '__NODE__' '__SCRIPT__'
 "#;
 
-/// Write [`FAKE_NPX_SCRIPT`] as an executable `npx` into `bin_dir`.
+/// Write [`FAKE_NPX_SCRIPT`] as an executable `npx` into `bin_dir`, beside
+/// a fake `node` that execs the host's node: `find_npx` follows the detected
+/// `node` to its sibling `npx` (intent-hq/intent#5725), so a lone `npx` shim
+/// on PATH would lose to the real node's own npx — the fake pair together is
+/// the toolchain the daemon selects.
 fn write_fake_npx(bin_dir: &Path, report: &Path, script: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
+    let fake_node = bin_dir.join("node");
+    std::fs::write(
+        &fake_node,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", node.display()),
+    )
+    .expect("write fake node");
+    std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod node");
     let npx = bin_dir.join("npx");
     std::fs::write(
         &npx,
@@ -470,8 +492,9 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
     let source_repo = make_source_repo(&data_dir);
     let session_log = data_dir.join("sessions.txt");
     let session_log_s = session_log.to_string_lossy().into_owned();
-    // `bin/` first: `find_npx` scans the inherited PATH ahead of the enriched
-    // tool dirs, so the fake npx wins over any real install on the host.
+    // `bin/` first: `find_npx` resolves `node` from the inherited PATH ahead
+    // of the enriched tool dirs and takes the npx beside it, so the fake
+    // node/npx pair wins over any real install on the host.
     let path = format!("{}:/usr/bin:/bin", bin_dir.display());
     let behavior = json!({ "response": "NPX_ISOLATION_E2E_REPLY" }).to_string();
     let env: [(&str, &str); 7] = [
