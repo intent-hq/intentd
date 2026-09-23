@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.102] - 2026-09-23
+
+### 🐛 Bug Fixes
+
+- Isolate npx provider startup from workspace package configuration ([#2092](https://github.com/intent-hq/intentd/pull/2092))
+
+
 ## [0.9.101] - 2026-09-23
 
 ### 🐛 Bug Fixes
