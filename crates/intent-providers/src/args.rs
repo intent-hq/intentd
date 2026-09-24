@@ -168,8 +168,17 @@ pub fn build_provider_args(config: &ProviderConfig, inputs: &ArgInputs) -> Vec<S
 /// `upsertCodexConfigArgs` (`provider-registry.ts`).
 pub(crate) fn upsert_codex_config_args(args: &[String], key: &str, value: &str) -> Vec<String> {
     let escaped = value.replace('"', "\\\"");
-    let config_value = format!("{key}=\"{escaped}\"");
-    let key_prefix = format!("{key}=");
+    upsert_codex_raw_config_args(args, key, &format!("\"{escaped}\""))
+}
+
+/// Upsert an already-serialized TOML value, preserving booleans as booleans.
+/// Recognize separate and attached `-c`/`--config` forms accepted by Codex.
+fn upsert_codex_raw_config_args(args: &[String], key: &str, value: &str) -> Vec<String> {
+    let matches_key = |value: &str| {
+        value
+            .split_once('=')
+            .is_some_and(|(candidate, _)| candidate.trim() == key)
+    };
 
     let mut next: Vec<String> = Vec::with_capacity(args.len() + 2);
     let mut i = 0;
@@ -177,22 +186,34 @@ pub(crate) fn upsert_codex_config_args(args: &[String], key: &str, value: &str) 
         let a = &args[i];
         if (a == "-c" || a == "--config") && i + 1 < args.len() {
             let v = &args[i + 1];
-            if v.trim_start().starts_with(&key_prefix) {
+            if matches_key(v) {
                 // Skip the old flag + its value.
                 i += 2;
                 continue;
             }
+        }
+        let attached = a
+            .strip_prefix("--config=")
+            .or_else(|| a.strip_prefix("-c="))
+            .or_else(|| a.strip_prefix("-c"));
+        if attached.is_some_and(matches_key) {
+            i += 1;
+            continue;
         }
         next.push(a.clone());
         i += 1;
     }
 
     next.push("-c".to_string());
-    next.push(config_value);
+    next.push(format!("{key}={value}"));
     next
 }
 
-/// Apply Codex model config args (`-c model=…`, `-c model_reasoning_effort=…`).
+/// Apply Codex's subagent policy and optional model / reasoning-effort args.
+///
+/// Always disable Codex-native subagents with `-c agents.enabled=false` so
+/// Intent owns delegation. This TOML boolean override replaces conflicting
+/// entries even when no model is selected.
 ///
 /// Mirrors the codex branch of `getACPWithProvider` (`provider-registry.ts`):
 /// when `raw_model` is set and not the `default` sentinel, the model id is split
@@ -205,13 +226,15 @@ pub(crate) fn upsert_codex_config_args(args: &[String], key: &str, value: &str) 
 /// config flags and ignores them; on that path the stored model takes effect
 /// via the post-session `session/set_config_option { configId: "model" }`
 /// call (`supports_config_option_model` on the codex `ProviderConfig`),
-/// which is idempotent on top of these args.
+/// which is idempotent on top of these args. The spawn layer enforces the
+/// npx subagent policy separately through daemon-owned `CODEX_CONFIG` JSON.
 #[must_use]
 pub fn apply_codex_config_args(
     args: Vec<String>,
     raw_model: Option<&str>,
     env_effort: Option<&str>,
 ) -> Vec<String> {
+    let args = upsert_codex_raw_config_args(&args, "agents.enabled", "false");
     let Some(model) = raw_model else {
         return args;
     };

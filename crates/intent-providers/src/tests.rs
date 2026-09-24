@@ -1092,6 +1092,8 @@ fn codex_apply_config_args_effort_resolution() {
         vec![
             "exec",
             "-c",
+            "agents.enabled=false",
+            "-c",
             "model=\"gpt-5.3-codex\"",
             "-c",
             "model_reasoning_effort=\"high\""
@@ -1104,20 +1106,114 @@ fn codex_apply_config_args_effort_resolution() {
         from_env,
         vec![
             "-c",
+            "agents.enabled=false",
+            "-c",
             "model=\"gpt-5.3-codex\"",
             "-c",
             "model_reasoning_effort=\"medium\""
         ]
     );
 
-    // The `default` sentinel and `None` are no-ops.
+    // The `default` sentinel and `None` still enforce the subagent policy.
     assert_eq!(
         apply_codex_config_args(vec!["exec".to_string()], Some("default"), None),
-        vec!["exec"]
+        vec!["exec", "-c", "agents.enabled=false"]
     );
     assert_eq!(
         apply_codex_config_args(vec!["exec".to_string()], None, Some("high")),
-        vec!["exec"]
+        vec!["exec", "-c", "agents.enabled=false"]
+    );
+}
+
+#[test]
+fn codex_policy_disables_subagents_for_every_model_and_effort() {
+    for model in [
+        None,
+        Some(""),
+        Some("default"),
+        Some("gpt-5.3-codex"),
+        Some("gpt-5.3-codex/high"),
+    ] {
+        for effort in [None, Some(""), Some("low")] {
+            let args = apply_codex_config_args(vec![], model, effort);
+            let values: Vec<_> = args
+                .windows(2)
+                .filter(|w| w[0] == "-c")
+                .filter_map(|w| w[1].strip_prefix("agents.enabled="))
+                .collect();
+            assert_eq!(values, ["false"], "model={model:?}, effort={effort:?}");
+            // The TOML boolean spelling also parses as a JSON boolean; a
+            // quoted string would not deserialize into bool.
+            assert!(!serde_json::from_str::<bool>(values[0]).unwrap());
+            assert_eq!(
+                apply_codex_config_args(args.clone(), model, effort),
+                args,
+                "policy must be idempotent for model={model:?}, effort={effort:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_policy_replaces_duplicate_config_forms_and_preserves_unrelated_args() {
+    let prior = [
+        "exec",
+        "-c",
+        "agents.enabled=true",
+        "--config",
+        " agents.enabled = true",
+        "--config=agents.enabled=true",
+        "-c=agents.enabled=\"false\"",
+        "-cagents.enabled=true",
+        "-c",
+        "agents.enabled=false",
+        "-c",
+        "model=\"unchanged\"",
+        "--config=model_reasoning_effort=\"high\"",
+        "-c=agents.max_threads=3",
+        "-cagents.interrupt_message=false",
+        "--config",
+        "agents.enabled_extra=true",
+        "--label",
+        "agents.enabled=true",
+    ]
+    .map(str::to_string);
+    let args = apply_codex_config_args(prior.to_vec(), None, None);
+    assert_eq!(
+        args,
+        [
+            "exec",
+            "-c",
+            "model=\"unchanged\"",
+            "--config=model_reasoning_effort=\"high\"",
+            "-c=agents.max_threads=3",
+            "-cagents.interrupt_message=false",
+            "--config",
+            "agents.enabled_extra=true",
+            "--label",
+            "agents.enabled=true",
+            "-c",
+            "agents.enabled=false",
+        ]
+    );
+    assert_eq!(apply_codex_config_args(args.clone(), None, None), args);
+}
+
+#[test]
+fn codex_upsert_string_config_replaces_attached_overrides() {
+    let prior = [
+        "--config=model=\"old\"",
+        "-c=model=\"old\"",
+        "-cmodel=\"old\"",
+        "--config",
+        " model = \"old\"",
+        "-c",
+        "agents.enabled=false",
+    ]
+    .map(str::to_string);
+    assert_eq!(
+        upsert_codex_config_args(&prior, "model", "new"),
+        ["-c", "agents.enabled=false", "-c", "model=\"new\""]
     );
 }
 

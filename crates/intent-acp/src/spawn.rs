@@ -2,7 +2,7 @@
 //!
 //! Resolves args/env from the `intent_providers` registry, enriches `PATH` so a
 //! `#!/usr/bin/env node` shebang resolves the right `node`, applies Codex
-//! `-c model=…` overrides, and spawns with all three pipes captured and
+//! model and subagent-policy overrides, and spawns with all three pipes captured and
 //! `kill_on_drop(true)`. The captured pipes are handed to a [`Connection`].
 //!
 //! Children start at reduced scheduling priority relative to the daemon's own
@@ -648,12 +648,21 @@ fn build_command_in(
     // The pinned codex-acp npx fallback is daemon-managed (not a user escape
     // hatch), so remove CODEX_PATH / CODEX_CONFIG from its inherited env — a
     // stray or hostile value could redirect the adapter away from the vendored
-    // binary (#555). Applies after the captured-env merge above, so a captured
-    // login-shell value is stripped too. Resolved binaries (providers.paths /
-    // PATH scan) keep the daemon env untouched.
+    // binary (#555). Applies after every env merge above, so captured and extra
+    // values cannot win. Replace CODEX_CONFIG with the daemon-owned subagent
+    // policy: this pinned adapter ignores -c argv but applies the JSON to every
+    // thread start/resume. Native launches enforce the same policy through argv
+    // while keeping their existing environment handling.
     if opts.provider.id == "codex" && via_npx {
         cmd.env_remove("CODEX_PATH");
         cmd.env_remove("CODEX_CONFIG");
+        cmd.env("CODEX_CONFIG", r#"{"agents":{"enabled":false}}"#);
+        tracing::debug!(mechanism = "CODEX_CONFIG", "applied Codex subagent policy");
+    } else if opts.provider.id == "codex" {
+        tracing::debug!(
+            mechanism = "-c agents.enabled=false",
+            "applied Codex subagent policy"
+        );
     }
 
     // The npx bootstrap targets the neutral launch dir only: an inherited (or
@@ -904,6 +913,50 @@ pub(crate) fn classify_not_found_with_path(
 #[cfg(test)]
 mod build_args_tests {
     use super::*;
+
+    #[test]
+    fn build_args_always_disables_codex_subagents() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        for model in [
+            None,
+            Some(""),
+            Some("default"),
+            Some("gpt-5.3-codex"),
+            Some("gpt-5.3-codex/high"),
+        ] {
+            for effort in [None, Some("xhigh")] {
+                let mut opts = SpawnOptions::new(codex);
+                opts.model = model;
+                opts.reasoning_effort = effort;
+                let args = build_args(&opts);
+                let policy: Vec<_> = args
+                    .windows(2)
+                    .filter(|w| w[0] == "-c" && w[1].starts_with("agents.enabled="))
+                    .map(|w| w[1].as_str())
+                    .collect();
+                assert_eq!(
+                    policy,
+                    ["agents.enabled=false"],
+                    "model={model:?}, effort={effort:?}, args={args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_args_keeps_codex_policy_out_of_other_providers() {
+        for provider in intent_providers::ACP_PROVIDERS {
+            if provider.id == "codex" {
+                continue;
+            }
+            let args = build_args(&SpawnOptions::new(provider));
+            assert!(
+                !args.iter().any(|arg| arg.contains("agents.enabled")),
+                "{} must not receive Codex config: {args:?}",
+                provider.id
+            );
+        }
+    }
 
     #[test]
     fn build_args_propagates_tools_to_remove_for_auggie() {
@@ -1566,7 +1619,7 @@ mod build_command_tests {
     }
 
     #[test]
-    fn build_command_strips_codex_env_on_npx_fallback_spawn() {
+    fn build_command_sets_codex_subagent_policy_on_npx_fallback_spawn() {
         // The pinned npx fallback is daemon-managed: a stray CODEX_PATH /
         // CODEX_CONFIG in the daemon env must not redirect the adapter (#555).
         let provider = intent_providers::find_provider("codex").unwrap();
@@ -1579,9 +1632,11 @@ mod build_command_tests {
             env_removed(&cmd, "CODEX_PATH"),
             "npx-fallback codex spawn must remove CODEX_PATH from the child env"
         );
-        assert!(
-            env_removed(&cmd, "CODEX_CONFIG"),
-            "npx-fallback codex spawn must remove CODEX_CONFIG from the child env"
+        let config = env_value(&cmd, "CODEX_CONFIG")
+            .expect("npx-fallback codex spawn must set daemon-owned CODEX_CONFIG");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&config).unwrap(),
+            serde_json::json!({"agents": {"enabled": false}})
         );
     }
 
@@ -1854,26 +1909,87 @@ mod captured_env_tests {
     }
 
     #[test]
-    fn codex_env_remove_strips_captured_values_on_npx_fallback() {
-        // The #555 hatch runs after the captured-env merge: even a captured
-        // login-shell CODEX_PATH / CODEX_CONFIG must be removed from the
-        // daemon-managed npx fallback spawn.
+    fn codex_subagent_policy_overrides_captured_and_extra_env_on_npx_fallback() {
+        // The daemon policy runs after every env merge, replacing arbitrary
+        // CODEX_CONFIG and keeping CODEX_PATH removed (#555).
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
         opts.npx_fallback_package = provider.fallback_npx_package;
-        let mut captured = BTreeMap::new();
-        captured.insert("CODEX_PATH".to_string(), "/tmp/evil".to_string());
-        captured.insert("CODEX_CONFIG".to_string(), "/tmp/evil.toml".to_string());
-        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
-        for key in ["CODEX_PATH", "CODEX_CONFIG"] {
+        let unrelated = absent_var_name();
+        for source in ["captured", "extra", "both"] {
+            let mut captured = BTreeMap::new();
+            opts.extra_env.clear();
+            for (key, value) in [
+                ("CODEX_PATH", "/untrusted/codex"),
+                (
+                    "CODEX_CONFIG",
+                    r#"{"agents":{"enabled":true},"model":"untrusted"}"#,
+                ),
+                (unrelated.as_str(), "preserved"),
+            ] {
+                if source != "extra" {
+                    captured.insert(key.to_string(), value.to_string());
+                }
+                if source != "captured" {
+                    opts.extra_env.insert(key.to_string(), value.to_string());
+                }
+            }
+            let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
             assert!(
                 cmd.as_std()
                     .get_envs()
-                    .any(|(k, v)| k == key && v.is_none()),
-                "{key} must be env_remove'd from the npx-fallback codex spawn even when captured"
+                    .any(|(k, v)| k == "CODEX_PATH" && v.is_none()),
+                "CODEX_PATH must stay removed for {source} env"
             );
+            let config = env_value(&cmd, "CODEX_CONFIG")
+                .expect("fallback must set the daemon-owned subagent policy");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&config).unwrap(),
+                serde_json::json!({"agents": {"enabled": false}}),
+                "policy must win over {source} env"
+            );
+            assert_eq!(env_value(&cmd, &unrelated).as_deref(), Some("preserved"));
+        }
+    }
+
+    #[test]
+    fn codex_policy_preserves_env_precedence_for_native_and_other_providers() {
+        let binary = PathBuf::from("/custom/provider");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        for id in ["codex", "claude-code", "auggie", "opencode", "droid"] {
+            let provider = intent_providers::find_provider(id).unwrap();
+            let mut opts = SpawnOptions::new(provider);
+            if id == "claude-code" {
+                opts.npx_fallback_binary = Some(&npx_path);
+                opts.npx_fallback_package = provider.npx_only_package;
+            } else {
+                opts.provider_binary = Some(&binary);
+            }
+            let captured = BTreeMap::from([
+                ("CODEX_PATH".to_string(), "/captured/codex".to_string()),
+                ("CODEX_CONFIG".to_string(), "captured-config".to_string()),
+            ]);
+            let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
+            for (key, value) in &captured {
+                if std::env::var_os(key).is_some() {
+                    assert!(
+                        !cmd.as_std().get_envs().any(|(k, _)| k == key.as_str()),
+                        "{id} must inherit {key} when present in the daemon env"
+                    );
+                } else {
+                    assert_eq!(env_value(&cmd, key).as_deref(), Some(value.as_str()));
+                }
+            }
+            opts.extra_env = BTreeMap::from([
+                ("CODEX_PATH".to_string(), "/extra/codex".to_string()),
+                ("CODEX_CONFIG".to_string(), "extra-config".to_string()),
+            ]);
+            let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
+            for (key, value) in &opts.extra_env {
+                assert_eq!(env_value(&cmd, key).as_deref(), Some(value.as_str()));
+            }
         }
     }
 }

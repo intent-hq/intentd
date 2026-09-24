@@ -45,6 +45,11 @@ pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
 /// Pinned npx package spec for the codex ACP fallback. intentd is the only
 /// pin site (cloudlands-fe no longer pins a managed codex-acp version);
 /// bumping the version is a deliberate code change.
+///
+/// This adapter ignores `-c` argv but reads `CODEX_CONFIG` JSON and applies
+/// it to every thread start/resume. The spawn layer relies on that contract
+/// to deny native subagents with `{"agents":{"enabled":false}}`; re-check
+/// that the adapter honors this environment override when bumping the pin.
 pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.9.0";
 
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
