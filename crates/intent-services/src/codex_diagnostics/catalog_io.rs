@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 
 use super::catalog::CatalogFailure;
@@ -214,10 +214,26 @@ pub(super) async fn private_file(path: &Path, bytes: &[u8]) -> Result<(), Catalo
         .open(path)
         .await
         .map_err(|_| CatalogFailure::IsolationFailed)?;
+    write_private_contents(&mut file, bytes).await
+}
+
+async fn write_private_contents(
+    file: &mut (impl AsyncWrite + Unpin),
+    bytes: &[u8],
+) -> Result<(), CatalogFailure> {
     file.write_all(bytes)
+        .await
+        .map_err(|_| CatalogFailure::IsolationFailed)?;
+    // Tokio can accept the final write before its blocking filesystem work
+    // completes. Observe completion/errors before handing these files to a child.
+    file.flush()
         .await
         .map_err(|_| CatalogFailure::IsolationFailed)
 }
+
+#[cfg(test)]
+#[path = "catalog_io_tests.rs"]
+mod tests;
 
 pub(super) struct Rpc {
     input: ChildStdin,

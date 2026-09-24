@@ -201,7 +201,7 @@ impl CodexLaunch {
     /// packages, or asks a provider for models/account/auth information.
     pub async fn inspect_local(&self) -> CodexInspection {
         match &self.selection {
-            ProviderLaunch::Local(binary) => self.inspect(&binary.path, None).await,
+            ProviderLaunch::Local(binary) => self.inspect(&binary.path, None, None).await,
             ProviderLaunch::Managed { .. } => {
                 self.unknown(UnknownReason::ManagedPackageNotInspected)
             }
@@ -214,9 +214,18 @@ impl CodexLaunch {
     /// The inspector also verifies the package name, bin identity, and exact pin.
     /// Local selections ignore this argument and inspect their selected binary.
     pub async fn inspect_materialized(&self, adapter: &Path) -> CodexInspection {
+        self.inspect_materialized_with_dependency(adapter, None)
+            .await
+    }
+
+    async fn inspect_materialized_with_dependency(
+        &self,
+        adapter: &Path,
+        dependency: Option<&process::ProbeDependency>,
+    ) -> CodexInspection {
         if let ProviderLaunch::Managed { package, .. } = &self.selection {
             let version = package.rsplit_once('@').map(|(_, version)| version);
-            self.inspect(adapter, version).await
+            self.inspect(adapter, version, dependency).await
         } else {
             self.inspect_local().await
         }
@@ -254,7 +263,12 @@ impl CodexLaunch {
         }
     }
 
-    async fn inspect(&self, adapter: &Path, pin: Option<&str>) -> CodexInspection {
+    async fn inspect(
+        &self,
+        adapter: &Path,
+        pin: Option<&str>,
+        dependency: Option<&process::ProbeDependency>,
+    ) -> CodexInspection {
         let mut result = self.unknown(UnknownReason::OpaqueAdapter);
         result.report.adapter_path = Some(safe_text(&adapter.to_string_lossy()));
         // Even --version on an opaque wrapper can install packages. Inspect
@@ -278,12 +292,17 @@ impl CodexLaunch {
                     .and_then(Option::as_deref)
                     .unwrap_or_else(|| Path::new("")),
             );
-        let package = match local_output(command, &self.path, LOCAL_TIMEOUT)
-            .await
-            .and_then(|bytes| {
-                serde_json::from_slice::<PackageInspection>(&bytes)
-                    .map_err(|_| UnknownReason::InspectionFailed)
-            }) {
+        let package = match local_output_with_dependency(
+            command,
+            &self.path,
+            LOCAL_TIMEOUT,
+            dependency.cloned(),
+        )
+        .await
+        .and_then(|bytes| {
+            serde_json::from_slice::<PackageInspection>(&bytes)
+                .map_err(|_| UnknownReason::InspectionFailed)
+        }) {
             Ok(package) => package,
             Err(reason) => {
                 result.report.runtime_version = VersionMeasurement::Unknown(reason);
@@ -306,7 +325,9 @@ impl CodexLaunch {
         };
         let mut command = Command::new(&node);
         command.arg(&adapter);
-        result.report.adapter_version = self.version(command, VersionKind::Adapter).await;
+        result.report.adapter_version = self
+            .version(command, VersionKind::Adapter, dependency)
+            .await;
         let runtime_override = match runtime_override {
             Ok(path) => path,
             Err(reason) => {
@@ -333,7 +354,9 @@ impl CodexLaunch {
             program: node,
             args: vec![path.into_os_string()],
         };
-        result.report.runtime_version = self.version(runtime.command(), VersionKind::Runtime).await;
+        result.report.runtime_version = self
+            .version(runtime.command(), VersionKind::Runtime, dependency)
+            .await;
         result.runtime = Some(runtime);
         result
     }
@@ -356,9 +379,14 @@ impl CodexLaunch {
         Ok(None)
     }
 
-    async fn version(&self, mut command: Command, kind: VersionKind) -> VersionMeasurement {
+    async fn version(
+        &self,
+        mut command: Command,
+        kind: VersionKind,
+        dependency: Option<&process::ProbeDependency>,
+    ) -> VersionMeasurement {
         command.arg("--version");
-        match local_output(command, &self.path, LOCAL_TIMEOUT)
+        match local_output_with_dependency(command, &self.path, LOCAL_TIMEOUT, dependency.cloned())
             .await
             .and_then(|bytes| parse_version(&bytes, kind).ok_or(UnknownReason::InvalidVersion))
         {
@@ -475,10 +503,11 @@ fn parse_version(bytes: &[u8], kind: VersionKind) -> Option<String> {
 
 /// A local check with no credentials, user config, or project cwd. The deadline
 /// covers both exit and bounded stdout; stderr is discarded rather than logged.
-async fn local_output(
+async fn local_output_with_dependency(
     mut command: Command,
     path: &OsStr,
     timeout: Duration,
+    dependency: Option<process::ProbeDependency>,
 ) -> Result<Vec<u8>, UnknownReason> {
     let directory = tempfile::Builder::new()
         .prefix("intentd-codex-diagnostic-")
@@ -497,7 +526,8 @@ async fn local_output(
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);
     }
-    let mut guard = process::ProbeProcess::spawn(command, directory).await?;
+    let mut guard =
+        process::ProbeProcess::spawn_with_dependency(command, directory, dependency).await?;
     drop(guard.stdin.take());
     let stdout = guard.stdout.take().ok_or(UnknownReason::SpawnFailed)?;
     let mut stderr = guard.stderr.take().ok_or(UnknownReason::SpawnFailed)?;
@@ -529,6 +559,15 @@ async fn local_output(
     .unwrap_or(Err(UnknownReason::TimedOut));
     guard.cleanup().await?;
     result
+}
+
+#[cfg(test)]
+async fn local_output(
+    command: Command,
+    path: &OsStr,
+    timeout: Duration,
+) -> Result<Vec<u8>, UnknownReason> {
+    local_output_with_dependency(command, path, timeout, None).await
 }
 
 #[cfg(test)]

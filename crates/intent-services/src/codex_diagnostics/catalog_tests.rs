@@ -50,6 +50,7 @@ fn malformed_empty_and_absent_catalogs_are_distinct() {
 
 #[cfg(unix)]
 mod unix {
+    use super::super::super::process::test_control::{self, Control, Stage};
     use super::super::super::{LaunchSource, RuntimeSource, VersionMeasurement};
     use super::*;
     use intent_providers::discover::{ProviderBinary, ProviderBinarySource};
@@ -433,10 +434,31 @@ child.on('exit',code=>process.exit(code||0));
             assert!(catalog(&report.raw).models.is_empty());
             assert_eq!(
                 report.observe("missing-model"),
-                ModelObservation::AbsentFromBothObservedCatalogs
+                if session.get("models").is_some() {
+                    ModelObservation::AbsentFromBothObservedCatalogs
+                } else {
+                    ModelObservation::Inconclusive
+                }
             );
             fixture.assert_clean();
         }
+    }
+
+    #[tokio::test]
+    async fn unadvertised_acp_cannot_establish_raw_only_membership() {
+        let fixture = Fixture::new(&json!({"session":{"sessionId":"fixture"}}));
+        let report = fixture.run(false).await;
+        assert!(!catalog(&report.acp).advertised);
+        assert!(catalog(&report.raw).advertised);
+        assert_eq!(
+            report.observe("fixture-model"),
+            ModelObservation::Inconclusive
+        );
+        assert_eq!(
+            report.observe("fixture-alias"),
+            ModelObservation::Inconclusive
+        );
+        fixture.assert_clean();
     }
 
     #[tokio::test]
@@ -628,6 +650,136 @@ child.on('exit',code=>process.exit(code||0));
         .await
         .expect("cancelled catalog guards complete cleanup");
         fixture.assert_clean();
+    }
+
+    fn managed_home(fixture: &Fixture) -> PathBuf {
+        let events = fixture.events();
+        PathBuf::from(
+            events.iter().find(|event| event["role"] == "npx").unwrap()["home"]
+                .as_str()
+                .unwrap(),
+        )
+    }
+
+    fn managed_package(home: &Path) -> PathBuf {
+        home.join("npm-cache/node_modules/@openai/codex/bin/codex.js")
+    }
+
+    #[tokio::test]
+    async fn cancelled_dependents_keep_installation_until_cleanup_confirms() {
+        for stage in [
+            Stage::Metadata,
+            Stage::AdapterVersion,
+            Stage::RuntimeVersion,
+            Stage::Raw,
+        ] {
+            let fixture = Fixture::new(&json!({"keepAlive":true}));
+            let launch = fixture.launch(true);
+            let auth = fixture.auth().await;
+            let (control, mut events) = Control::new(stage, false);
+            let scope = control.clone();
+            let task = tokio::spawn(async move {
+                scope
+                    .scope(launch.catalogs_with_auth(Ok(auth), Limits::default()))
+                    .await
+            });
+            let dependent = test_control::next(&mut events, stage, false).await;
+            let home = managed_home(&fixture);
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            test_control::next(&mut events, Stage::Acp, true).await;
+            // ACP is confirmed stopped while the dependent's cleanup is held.
+            let package_survived = managed_package(&home).is_file();
+            let dependent_home_survived = dependent.home.exists();
+            let raw_still_running = stage != Stage::Raw
+                || fixture
+                    .events()
+                    .iter()
+                    .find(|event| event["role"] == "raw" && event["started"] == true)
+                    .is_some_and(|event| {
+                        nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(
+                                i32::try_from(event["pid"].as_i64().unwrap()).unwrap(),
+                            ),
+                            None,
+                        )
+                        .is_ok()
+                    });
+            // Release and observe real teardown even when a regression fails.
+            control.release();
+            test_control::next(&mut events, stage, true).await;
+            fixture.assert_clean();
+            assert!(!dependent.home.exists());
+            assert!(
+                raw_still_running,
+                "raw fixture must still need its package at the barrier"
+            );
+            assert!(dependent_home_survived);
+            assert!(
+                package_survived,
+                "{stage:?}: installation removed before dependent cleanup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_dependent_cleanup_retains_managed_installation() {
+        for stage in [
+            Stage::Metadata,
+            Stage::AdapterVersion,
+            Stage::RuntimeVersion,
+            Stage::Raw,
+        ] {
+            let fixture = Fixture::new(&json!({}));
+            let (control, mut events) = Control::new(stage, true);
+            control.release();
+            let report = control.scope(fixture.run(true)).await;
+            let home = managed_home(&fixture);
+            let package_retained = managed_package(&home).is_file();
+            match stage {
+                Stage::Metadata | Stage::RuntimeVersion => assert_eq!(
+                    report.runtime.runtime_version,
+                    VersionMeasurement::Unknown(UnknownReason::CleanupFailed)
+                ),
+                Stage::AdapterVersion => assert_eq!(
+                    report.runtime.adapter_version,
+                    VersionMeasurement::Unknown(UnknownReason::CleanupFailed)
+                ),
+                Stage::Raw => assert_eq!(
+                    report.raw,
+                    CatalogOutcome::Failed(CatalogFailure::CleanupFailed)
+                ),
+                Stage::Acp => unreachable!(),
+            }
+            // The seam withholds confirmation only after real platform teardown;
+            // assert termination before deleting the deliberately retained files.
+            for event in fixture.events() {
+                if let Some(pid) = event["pid"].as_i64() {
+                    assert!(nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap()),
+                        None
+                    )
+                    .is_err());
+                }
+            }
+            let mut dependent_retained = false;
+            while let Ok(event) = events.try_recv() {
+                if event.finished {
+                    if event.stage == stage {
+                        dependent_retained = event.home.exists();
+                    }
+                    if event.home.exists() {
+                        std::fs::remove_dir_all(event.home).unwrap();
+                    }
+                }
+            }
+            fixture.assert_clean();
+            assert!(dependent_retained);
+            assert!(
+                package_retained,
+                "{stage:?}: unconfirmed dependent lost its installation"
+            );
+        }
     }
 
     #[tokio::test]

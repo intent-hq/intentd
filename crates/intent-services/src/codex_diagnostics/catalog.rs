@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use super::catalog_io::{self, Authentication, Rpc, PHASE_TIMEOUT};
-use super::process::ProbeProcess;
+use super::process::{ProbeDependency, ProbeProcess};
 use super::{CodexInspection, CodexLaunch, CodexRuntimeReport, ProviderLaunch, UnknownReason};
 
 const PAGE_LIMIT: usize = 10;
@@ -150,7 +150,7 @@ impl ModelObservation {
             Self::PresentInAcpOnly => "ID observed only in ACP; adapter choices may be synthesized",
             Self::PresentInRawOnly => "ID observed only in the selected runtime catalog",
             Self::AbsentFromBothObservedCatalogs => "ID absent from both observed catalogs; this does not establish an account restriction",
-            Self::Inconclusive => "comparison unavailable because a catalog failed or withheld model IDs",
+            Self::Inconclusive => "comparison unavailable because a catalog failed, was not advertised, or withheld model IDs",
         }
     }
 }
@@ -173,7 +173,11 @@ impl CodexCatalogReport {
         else {
             return ModelObservation::Inconclusive;
         };
-        if acp.withheld_model_count != 0 || raw.withheld_model_count != 0 {
+        if !acp.advertised
+            || !raw.advertised
+            || acp.withheld_model_count != 0
+            || raw.withheld_model_count != 0
+        {
             return ModelObservation::Inconclusive;
         }
         let contains = |catalog: &Catalog| {
@@ -295,13 +299,17 @@ impl CodexLaunch {
                     Ok(catalog)
                 })
                 .await;
-                // Keep the actual launch's private npm installation alive until
-                // inspection AND the raw probe have finished. All stdio has
-                // closed; the guard retains process ownership on every outcome.
+                // Each dependent guard also holds this installation through
+                // confirmed cleanup, even when this caller is cancelled.
                 if matches!(self.selection(), ProviderLaunch::Managed { .. }) {
                     if let Ok(bytes) = catalog_io::read_file(&home.join("entry.json")).await {
                         if let Ok(path) = serde_json::from_slice::<std::path::PathBuf>(&bytes) {
-                            inspection = self.inspect_materialized(&path).await;
+                            inspection = self
+                                .inspect_materialized_with_dependency(
+                                    &path,
+                                    process.dependency().as_ref(),
+                                )
+                                .await;
                         }
                     }
                 }
@@ -311,7 +319,18 @@ impl CodexLaunch {
             Err(reason) => Err(reason),
         };
         let raw = match inspection.runtime.as_ref() {
-            Some(runtime) => self.raw_catalog(runtime.command(), &mut auth, limits).await,
+            Some(runtime) => {
+                self.raw_catalog(
+                    runtime.command(),
+                    &mut auth,
+                    limits,
+                    guard
+                        .as_ref()
+                        .filter(|_| matches!(self.selection(), ProviderLaunch::Managed { .. }))
+                        .and_then(ProbeProcess::dependency),
+                )
+                .await
+            }
             None => Err(CatalogFailure::RuntimeUnverified),
         };
         let acp = if let Some(mut process) = guard {
@@ -365,6 +384,7 @@ impl CodexLaunch {
         mut command: Command,
         auth: &mut Authentication,
         limits: Limits,
+        dependency: Option<ProbeDependency>,
     ) -> Result<Catalog, CatalogFailure> {
         let deadline = tokio::time::Instant::now() + limits.timeout;
         let home = tokio::time::timeout_at(deadline, auth.home())
@@ -373,9 +393,12 @@ impl CodexLaunch {
         auth.isolate(&mut command, self, home.path());
         // app-server defaults to newline-delimited stdio; no thread/turn is created.
         command.arg("app-server");
-        let mut guard = tokio::time::timeout_at(deadline, ProbeProcess::spawn(command, home))
-            .await
-            .map_err(|_| CatalogFailure::TimedOut)??;
+        let mut guard = tokio::time::timeout_at(
+            deadline,
+            ProbeProcess::spawn_with_dependency(command, home, dependency),
+        )
+        .await
+        .map_err(|_| CatalogFailure::TimedOut)??;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let result = converse(&mut guard, remaining, |mut rpc| async move {
             rpc.request(

@@ -8,6 +8,13 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
 use super::UnknownReason;
 
+mod resources;
+pub(crate) use resources::ProbeDependency;
+use resources::ProbeHome;
+
+#[cfg(all(test, unix))]
+pub(super) mod test_control;
+
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
 mod platform;
@@ -31,20 +38,36 @@ pub(crate) struct ProbeProcess {
     pub stderr: Option<ChildStderr>,
     ownership: Option<platform::Ownership>,
     home: Option<ProbeHome>,
+    dependency: Option<ProbeHome>,
     cleanup_task: Option<tokio::task::JoinHandle<Result<(), UnknownReason>>>,
     cleanup_result: Option<Result<(), UnknownReason>>,
+    #[cfg(all(test, unix))]
+    cleanup_hook: Option<test_control::CleanupHook>,
 }
 
 impl ProbeProcess {
     /// The caller supplies isolated env/cwd. All three standard streams are
     /// piped; drop unused stdin and drain/discard unused output streams.
     pub(crate) async fn spawn(
-        mut command: Command,
+        command: Command,
         home: tempfile::TempDir,
     ) -> Result<Self, UnknownReason> {
+        Self::spawn_with_dependency(command, home, None).await
+    }
+
+    /// A dependent executable may live in another probe's temporary HOME.
+    /// Acquire its lease before platform startup and keep it through cleanup.
+    pub(crate) async fn spawn_with_dependency(
+        mut command: Command,
+        home: tempfile::TempDir,
+        dependency: Option<ProbeDependency>,
+    ) -> Result<Self, UnknownReason> {
+        #[cfg(all(test, unix))]
+        let cleanup_hook = test_control::capture(&command, home.path());
         // On cancellation during platform startup, keep the directory until
         // ownership can confirm cleanup instead of dropping it prematurely.
-        let home = ProbeHome(Some(home));
+        let home = ProbeHome::new(home);
+        let dependency = dependency.map(ProbeHome::from);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -57,8 +80,11 @@ impl ProbeProcess {
                 stderr: started.stderr,
                 ownership: Some(started.ownership),
                 home: Some(home),
+                dependency,
                 cleanup_task: None,
                 cleanup_result: None,
+                #[cfg(all(test, unix))]
+                cleanup_hook,
             })
         } else {
             // A bounded platform startup error may follow process creation
@@ -67,6 +93,10 @@ impl ProbeProcess {
             drop(home);
             Err(UnknownReason::SpawnFailed)
         }
+    }
+
+    pub(crate) fn dependency(&self) -> Option<ProbeDependency> {
+        self.home.as_ref().map(ProbeHome::dependency)
     }
 
     pub(crate) async fn wait(&mut self) -> Result<ExitStatus, UnknownReason> {
@@ -104,19 +134,41 @@ impl ProbeProcess {
             tokio::runtime::Handle::try_current().map_err(|_| UnknownReason::CleanupFailed)?;
         let ownership = self.ownership.take().ok_or(UnknownReason::CleanupFailed)?;
         let home = self.home.take();
+        let dependency = self.dependency.take();
+        #[cfg(all(test, unix))]
+        let hook = self.cleanup_hook.take();
         drop(self.stdin.take());
         drop(self.stdout.take());
         drop(self.stderr.take());
         self.cleanup_task = Some(handle.spawn(async move {
-            match tokio::time::timeout(Duration::from_secs(5), ownership.cleanup()).await {
+            #[cfg(all(test, unix))]
+            if let Some(hook) = &hook {
+                hook.before().await;
+            }
+            let cleaned = tokio::time::timeout(Duration::from_secs(5), ownership.cleanup()).await;
+            #[cfg(all(test, unix))]
+            let cleaned = if hook.as_ref().is_some_and(test_control::CleanupHook::fail) {
+                Ok(Err(std::io::Error::other(
+                    "test cleanup confirmation unavailable",
+                )))
+            } else {
+                cleaned
+            };
+            let result = match cleaned {
                 Ok(Ok(())) => {
-                    if let Some(home) = home {
-                        home.remove().map_err(|_| UnknownReason::CleanupFailed)?;
-                    }
-                    Ok(())
+                    let own = home.map(ProbeHome::remove).transpose();
+                    let shared = dependency.map(ProbeHome::remove).transpose();
+                    own.and(shared)
+                        .map(|_| ())
+                        .map_err(|_| UnknownReason::CleanupFailed)
                 }
                 _ => Err(UnknownReason::CleanupFailed),
+            };
+            #[cfg(all(test, unix))]
+            if let Some(hook) = &hook {
+                hook.after();
             }
+            result
         }));
         Ok(())
     }
@@ -127,26 +179,5 @@ impl Drop for ProbeProcess {
         // Cancellation of the awaiting caller must not cancel descendant
         // teardown or release its directory. The task owns both until settled.
         let _ = self.start_cleanup();
-    }
-}
-
-struct ProbeHome(Option<tempfile::TempDir>);
-
-impl ProbeHome {
-    fn remove(mut self) -> std::io::Result<()> {
-        match self.0.take() {
-            Some(home) => home.close(),
-            None => Ok(()),
-        }
-    }
-}
-
-impl Drop for ProbeHome {
-    fn drop(&mut self) {
-        if let Some(home) = self.0.take() {
-            // Runtime shutdown or unconfirmed cleanup is not proof that the
-            // process tree stopped. Never remove a still-used configuration.
-            let _ = home.keep();
-        }
     }
 }

@@ -30,6 +30,7 @@ record({started:true,pid:process.pid,home,auth:fs.existsSync(authFile),
   env:Object.keys(process.env),codexPath:process.env.CODEX_PATH || null});
 fs.writeFileSync(path.join(home, 'models_cache.json'), 'fixture-only');
 const mode = config[role] || 'ok';
+if (config.keepAlive) setInterval(() => {}, 1000);
 const send = value => process.stdout.write(JSON.stringify(value)+'\n');
 const error = (id,code) => send({id,error:{code,message:'credential-canary account-canary user@example.invalid',data:{access_token:'credential-canary'}}});
 process.stderr.write('credential-canary user@example.invalid\n');
