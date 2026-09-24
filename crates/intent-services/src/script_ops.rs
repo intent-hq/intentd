@@ -2604,6 +2604,184 @@ mod tests {
         assert_eq!(svc2.hydrate_scripts().await.expect("re-hydrate"), 0);
     }
 
+    /// Boot restores only auto-start services that were actually running;
+    /// repeated hydration must not launch another supervisor or process.
+    #[intent_test_macros::daemon_test]
+    async fn hydrate_restores_running_autostart_service_once() {
+        let mut h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "auto-start".into(),
+                command: SERVICE_CMD.into(),
+                mode: ScriptMode::Service,
+                auto_start: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        h.services.shutdown_pty_sessions().await;
+
+        let park = Arc::new(SupervisePark::default());
+        h.services = Services::new(h.services.store().clone())
+            .with_event_bus(h.bus.clone())
+            .with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
+        let starting = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            starting["status"], "starting",
+            "restore accepted: {starting}"
+        );
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("restore reached spawn");
+        assert_eq!(
+            h.services
+                .hydrate_scripts()
+                .await
+                .expect("rehydrate launching"),
+            0
+        );
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let running = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        assert!(running["pid"].as_u64().is_some(), "real process: {running}");
+        assert!(
+            running.get("previouslyRunning").is_none(),
+            "restored: {running}"
+        );
+        assert_eq!(
+            h.services
+                .hydrate_scripts()
+                .await
+                .expect("rehydrate running"),
+            0
+        );
+        assert_eq!(
+            h.services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .unwrap(),
+            running
+        );
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("cleanup");
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn hydrate_leaves_explicitly_stopped_autostart_service_idle() {
+        let mut h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "auto-start".into(),
+                command: SERVICE_CMD.into(),
+                mode: ScriptMode::Service,
+                auto_start: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        h.services
+            .script_stop(h.ws.clone(), id.clone())
+            .await
+            .expect("user stop");
+        h.services.shutdown_pty_sessions().await;
+        assert!(h
+            .services
+            .store()
+            .list_was_running_script_ids()
+            .await
+            .unwrap()
+            .is_empty());
+        h.services = Services::new(h.services.store().clone());
+        assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
+        let state = h.services.script_status(h.ws.clone(), id).await.unwrap();
+        assert_eq!(state["status"], "idle", "user stop respected: {state}");
+        assert!(state.get("previouslyRunning").is_none(), "{state}");
+        assert!(
+            h.services.pty().list_scope(h.ws.as_str()).is_empty(),
+            "no process launched"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn hydrate_autostart_failure_preserves_idle_marker() {
+        // Exercise both cwd validation and PTY spawn failure, before a process runs.
+        for spawn_failure in [false, true] {
+            let mut h = harness_with_worktree(true).await;
+            let id = create(
+                &h,
+                ScriptCreateParams {
+                    name: "auto-start".into(),
+                    command: SERVICE_CMD.into(),
+                    mode: ScriptMode::Service,
+                    auto_start: Some(true),
+                    cwd: (!spawn_failure).then(|| "../escape".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let store = h.services.store().clone();
+            store
+                .set_script_was_running(h.ws.as_str(), &id, true)
+                .await
+                .unwrap();
+            h.services = Services::new(store.clone()).with_event_bus(h.bus.clone());
+            if spawn_failure {
+                h.services.pty().kill_all_sync();
+            }
+            let mut sub = subscribe(&h);
+            assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
+            await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "idle").await;
+            let state = h
+                .services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .unwrap();
+            assert_eq!(state["status"], "idle", "failed restore: {state}");
+            assert_eq!(state["previouslyRunning"], true, "retry available: {state}");
+            assert!(
+                state.get("pid").is_none() && state.get("exitCode").is_none(),
+                "no process ran: {state}"
+            );
+            assert_eq!(
+                store.list_was_running_script_ids().await.unwrap(),
+                vec![(h.ws.to_string(), id)]
+            );
+            assert_eq!(
+                h.services
+                    .hydrate_scripts()
+                    .await
+                    .expect("rehydrate failed"),
+                0
+            );
+        }
+    }
+
     /// A service running when the daemon dies hydrates as `idle` with
     /// `previouslyRunning: true` (the stored-on-write `was_running` marker),
     /// and the marker persists across repeated restarts until the script is
@@ -2842,7 +3020,17 @@ mod tests {
     async fn command_running_at_daemon_death_hydrates_exited_lost() {
         let h = harness().await;
         let mut sub = subscribe(&h);
-        let id = create_simple(&h, "cmd", SERVICE_CMD, ScriptMode::Command).await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "cmd".into(),
+                command: SERVICE_CMD.into(),
+                mode: ScriptMode::Command,
+                auto_start: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
         h.services
             .script_start(h.ws.clone(), id.clone())
             .await
