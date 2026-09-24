@@ -71,7 +71,7 @@ mod unix {
     }
 
     impl Fixture {
-        fn new(config: Value) -> Self {
+        fn new(config: &Value) -> Self {
             let root = crate::test_support::test_tempdir("codex-catalog-fixture");
             let bin = root.path().join("bin");
             std::fs::create_dir(&bin).unwrap();
@@ -236,7 +236,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn command_isolation_replaces_inherited_configuration_and_preloads() {
-        let fixture = Fixture::new(json!({}));
+        let fixture = Fixture::new(&json!({}));
         let auth = fixture.auth().await;
         let home = auth.home().await.unwrap();
         let mut command = Command::new(&fixture.adapter);
@@ -270,7 +270,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn local_catalogs_are_isolated_prompt_free_paginated_and_observational() {
-        let fixture = Fixture::new(json!({}));
+        let fixture = Fixture::new(&json!({}));
         let report = fixture.run(false).await;
         assert!(
             matches!(report.acp, CatalogOutcome::Success(_)),
@@ -343,7 +343,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn managed_catalogs_use_actual_launched_package_until_raw_finishes() {
-        let fixture = Fixture::new(json!({}));
+        let fixture = Fixture::new(&json!({}));
         let launch = fixture.launch(true);
         let cold = launch.inspect_local().await;
         assert!(fixture.events().is_empty());
@@ -396,7 +396,7 @@ child.on('exit',code=>process.exit(code||0));
             ("acp", "peerRequest", CatalogFailure::UnsupportedCapability),
             ("raw", "exit", CatalogFailure::ProcessExited),
         ] {
-            let fixture = Fixture::new(json!({role:mode}));
+            let fixture = Fixture::new(&json!({role:mode}));
             let report = fixture.run(false).await;
             let (failed, success) = if role == "acp" {
                 (&report.acp, &report.raw)
@@ -423,7 +423,7 @@ child.on('exit',code=>process.exit(code||0));
             json!({"sessionId":"fixture","models":{"availableModels":[]}}),
         ] {
             let fixture =
-                Fixture::new(json!({"session":session,"pages":[{"data":[],"nextCursor":null}]}));
+                Fixture::new(&json!({"session":session,"pages":[{"data":[],"nextCursor":null}]}));
             let report = fixture.run(false).await;
             assert!(catalog(&report.acp).models.is_empty());
             assert_eq!(
@@ -441,7 +441,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn fresh_probes_ignore_and_preserve_user_cache() {
-        let fixture = Fixture::new(json!({"model":"first-model"}));
+        let fixture = Fixture::new(&json!({"model":"first-model"}));
         assert_eq!(
             fixture.run(false).await.observe("first-model"),
             ModelObservation::PresentInBoth
@@ -474,7 +474,7 @@ child.on('exit',code=>process.exit(code||0));
             ("raw", "repeatCursor", CatalogFailure::PaginationLimit),
             ("raw", "pages", CatalogFailure::PaginationLimit),
         ] {
-            let fixture = Fixture::new(json!({role:mode}));
+            let fixture = Fixture::new(&json!({role:mode}));
             let start = tokio::time::Instant::now();
             let report = fixture
                 .launch(false)
@@ -500,7 +500,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn missing_runtime_does_not_discard_acp_catalog() {
-        let fixture = Fixture::new(json!({}));
+        let fixture = Fixture::new(&json!({}));
         std::fs::remove_file(&fixture.runtime).unwrap();
         let report = fixture.run(false).await;
         assert!(!catalog(&report.acp).models.is_empty());
@@ -514,7 +514,7 @@ child.on('exit',code=>process.exit(code||0));
     #[tokio::test]
     async fn unsafe_ids_and_late_account_metadata_are_withheld() {
         let fixture = Fixture::new(
-            json!({"session":{"sessionId":"fixture","models":{"availableModels":[
+            &json!({"session":{"sessionId":"fixture","models":{"availableModels":[
             {"modelId":"account-canary"},{"modelId":"credential-canary"},{"modelId":"user@example.invalid"}]}},
             "pages":[{"data":[{"id":"valid-model","model":"account-canary"}],"nextCursor":null}]}),
         );
@@ -536,7 +536,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn managed_acp_failure_keeps_raw_result_and_pin_mismatch_is_unverified() {
-        let fixture = Fixture::new(json!({"acp":"auth"}));
+        let fixture = Fixture::new(&json!({"acp":"auth"}));
         let report = fixture.run(true).await;
         assert_eq!(
             report.acp,
@@ -545,7 +545,7 @@ child.on('exit',code=>process.exit(code||0));
         assert!(!catalog(&report.raw).models.is_empty());
         fixture.assert_clean();
 
-        let fixture = Fixture::new(json!({}));
+        let fixture = Fixture::new(&json!({}));
         std::fs::write(fixture.adapter.parent().unwrap().parent().unwrap().join("package.json"),
             json!({"name":"@agentclientprotocol/codex-acp","version":"0.0.0","bin":{"codex-acp":"dist/index.js"}}).to_string()).unwrap();
         let report = fixture.run(true).await;
@@ -563,7 +563,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn managed_launch_without_an_entrypoint_never_guesses_a_cached_runtime() {
-        let fixture = Fixture::new(json!({}));
+        let fixture = Fixture::new(&json!({}));
         executable(
             &fixture.root.path().join("bin/npx"),
             "#!/usr/bin/env node\nprocess.exit(7);\n",
@@ -587,7 +587,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn cancelling_raw_probe_cleans_both_private_homes() {
-        let fixture = Fixture::new(json!({"raw":"timeout"}));
+        let fixture = Fixture::new(&json!({"raw":"timeout"}));
         let launch = fixture.launch(true);
         let auth = fixture.auth().await;
         let task =
@@ -632,7 +632,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn notification_catalog_requires_successful_session() {
-        let fixture = Fixture::new(json!({"acp":"notification"}));
+        let fixture = Fixture::new(&json!({"acp":"notification"}));
         let report = fixture.run(false).await;
         assert_eq!(catalog(&report.acp).models[0].id, "notification-model");
         assert_eq!(catalog(&report.acp).models.len(), 1);
@@ -641,8 +641,8 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn local_runtime_override_is_used_by_both_phases() {
-        let fixture = Fixture::new(json!({}));
-        let custom = Fixture::new(json!({"model":"custom-model"}));
+        let fixture = Fixture::new(&json!({}));
+        let custom = Fixture::new(&json!({"model":"custom-model"}));
         let mut launch = fixture.launch(false);
         launch.codex_path = Some(custom.runtime.clone().into_os_string());
         let report = launch
