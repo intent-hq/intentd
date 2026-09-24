@@ -13,11 +13,18 @@ pub(super) struct Ownership {
     child: Child,
     pid: u32,
     status: pipe::Receiver,
+    ready_bytes: [u8; 11],
+    ready_length: usize,
     status_bytes: [u8; 4],
     status_length: usize,
     control: Option<pipe::Sender>,
     descendants: Vec<i32>,
     finished: bool,
+    #[cfg(test)]
+    snapshot_barrier: Option<(
+        tokio::sync::oneshot::Sender<Vec<i32>>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 }
 
 #[expect(clippy::unused_async)] // Common platform API also permits asynchronous startup.
@@ -51,11 +58,15 @@ pub(super) async fn spawn(command: Command) -> io::Result<super::Started> {
             child,
             pid,
             status,
+            ready_bytes: [0; 11],
+            ready_length: 0,
             status_bytes: [0; 4],
             status_length: 0,
             control: Some(control),
             descendants: Vec::new(),
             finished: false,
+            #[cfg(test)]
+            snapshot_barrier: None,
         },
     })
 }
@@ -104,19 +115,33 @@ fn supervisor(command: &Command, control: &OwnedFd, status: &OwnedFd) -> Command
 }
 
 impl Ownership {
+    async fn control_pid(&mut self) -> io::Result<i32> {
+        // The supervisor acknowledges only after its two forks. Until then an
+        // empty children file could mean startup has not launched the probe yet.
+        read_frame(
+            &mut self.status,
+            &mut self.ready_bytes,
+            &mut self.ready_length,
+        )
+        .await?;
+        std::str::from_utf8(&self.ready_bytes[..10])
+            .ok()
+            .and_then(|text| text.parse::<i32>().ok())
+            .filter(|pid| *pid > 1 && *pid != self.pid.cast_signed())
+            .filter(|_| self.ready_bytes[10] == b'\n')
+            .ok_or_else(|| io::ErrorKind::InvalidData.into())
+    }
+
     pub(super) async fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.control_pid().await?;
         // Keep partial data in the owner so cancelling a wait never discards
         // part of the private status frame. Provider stdio remains untouched.
-        while self.status_length < self.status_bytes.len() {
-            let read = self
-                .status
-                .read(&mut self.status_bytes[self.status_length..])
-                .await?;
-            if read == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            self.status_length += read;
-        }
+        read_frame(
+            &mut self.status,
+            &mut self.status_bytes,
+            &mut self.status_length,
+        )
+        .await?;
         let code = std::str::from_utf8(&self.status_bytes[..3])
             .ok()
             .and_then(|text| text.parse::<u8>().ok())
@@ -126,35 +151,70 @@ impl Ownership {
     }
 
     pub(super) async fn cleanup(mut self) -> io::Result<()> {
-        // The subreaper stays alive throughout the sweep, so a child's natural
-        // exit cannot hide its detached descendants from the next snapshot.
+        let control_pid = self.control_pid().await?;
+        // The first child is our non-forking control reader. It stays alive
+        // until we close its pipe, while the supervisor reaps adopted children.
         loop {
-            self.descendants = owned_children(self.pid)?;
-            if self
-                .descendants
+            let children = owned_children(self.pid)?;
+            self.descendants = children
                 .iter()
-                .map(|pid| terminated(*pid))
-                .collect::<io::Result<Vec<_>>>()?
-                .into_iter()
-                .all(|stopped| stopped)
-            {
+                .copied()
+                .filter(|pid| *pid != control_pid)
+                .collect();
+            #[cfg(test)]
+            if let Some((snapshot, resume)) = self.snapshot_barrier.take() {
+                let _ = snapshot.send(self.descendants.clone());
+                let _ = resume.await;
+            }
+            // Require the exact unfiltered singleton, including zombies.
+            // get_children_pid's first-child/next-child fast path observes this
+            // stable child is last under tasklist_lock. Its positional fallback
+            // can skip entries if earlier children die, so filtered live lists
+            // or absence from an earlier snapshot must NEVER prove completion.
+            // After startup neither this child nor the supervisor forks again;
+            // kernel reparenting precedes parent reaping, leaving no future donor.
+            if children == [control_pid] {
                 break;
             }
-            intent_acp::sweep_escaped_descendants(&self.descendants).await;
-        }
-        // The shell may defer reaping adopted zombies until it leaves read.
-        // First establish that none can execute, then release the supervisor
-        // and confirm that every remaining identity has actually been reaped.
-        drop(self.control.take());
-        self.child.wait().await?;
-        self.finished = true;
-        for pid in &self.descendants {
-            while std::fs::exists(format!("/proc/{pid}"))? {
-                tokio::task::yield_now().await;
+            if children.first() != Some(&control_pid) {
+                return Err(io::ErrorKind::InvalidData.into());
             }
+            let mut live = Vec::new();
+            for pid in &self.descendants {
+                if !terminated(*pid)? {
+                    live.push(*pid);
+                }
+            }
+            intent_acp::sweep_escaped_descendants(&live).await;
+            tokio::task::yield_now().await;
+        }
+        drop(self.control.take());
+        let status = self.child.wait().await?;
+        self.finished = true;
+        if !status.success() {
+            return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[path = "linux_tests.rs"]
+mod tests;
+
+async fn read_frame(
+    receiver: &mut pipe::Receiver,
+    bytes: &mut [u8],
+    length: &mut usize,
+) -> io::Result<()> {
+    while *length < bytes.len() {
+        let read = receiver.read(&mut bytes[*length..]).await?;
+        if read == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        *length += read;
+    }
+    Ok(())
 }
 
 fn terminated(pid: i32) -> io::Result<bool> {
