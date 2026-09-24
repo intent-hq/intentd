@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.106] - 2026-09-24
+
+### 🐛 Bug Fixes
+
+- *(identity)* Expose invite requirements and harden forge credentials ([#2042](https://github.com/intent-hq/intentd/pull/2042))
+
+
 ## [0.9.105] - 2026-09-24
 
 ### 🚀 Features
