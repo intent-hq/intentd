@@ -310,7 +310,7 @@ fn assert_observation(case: &Value, expectation: &Value, observed: &Value) {
 
 // Use the contract owner's serializer/normalizer, including its complete-row
 // freshness comparison. No duplicated hashing or broad recursive scrubbing.
-const VERIFY: &str = r#"
+const VERIFY: &str = r"
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -348,7 +348,7 @@ if (mode === 'check') {
   fs.writeFileSync(destination, JSON.stringify(artifact, null, 2) + '\n', {flag: mode === 'regenerate' ? 'w' : 'wx'});
   console.log(`emitted ${cases.length} public imports from ${revision}: ${destination}`);
 }
-"#;
+";
 
 fn verify(root: &Path, rows: &Path, mode: &str, output: &Path) -> std::process::Output {
     Command::new("node")
