@@ -215,14 +215,22 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": kind.as_str() })),
         },
-        // Gist identity-proof refusal (guest half): `-32603` with the stable
-        // `data.code` (`github-not-connected` / `github-scope-missing` /
-        // `github-unreachable`) so the join flow can route "sign in" vs
-        // "retry" without matching on prose.
+        // Identity-proof refusal (guest half): `-32603` with the stable
+        // `data.code` (`<provider>-not-connected` / `-scope-missing` /
+        // `-unreachable`) so the join flow can route "sign in" vs "retry"
+        // without matching on prose.
         ref e @ Error::IdentityProof(kind) => RpcErr {
             code: e.code(),
             message: e.to_string(),
             data: Some(json!({ "code": kind.as_str() })),
+        },
+        // Identity-proof refusal (host half, protocol 10.8): the forge will
+        // not serve the proof to this host — `data.host` names the instance
+        // so the guest can be told which connection the host lacks.
+        ref e @ Error::IdentityUnverifiable { ref host } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "identity-unverifiable", "host": host })),
         },
         // Forge rate limiting — every cause the source-control layer
         // classifies as `RateLimited` (REST primary 403/429, secondary-limit
@@ -3139,6 +3147,32 @@ async fn dispatch(
             let gist_id = require_str_param(params, "gistId")?;
             let r = api
                 .github_identity_proof_delete(gist_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // `sourceControl.identityProof.*` (protocol 10.8): the
+        // provider-generic form of the pair above — `provider` required
+        // (`github` | `gitlab`), `host` optional and gitlab-only, parsed
+        // strictly like the `sourceControl.*` auth methods; `proofId` is the
+        // gist id / snippet id `create` answered.
+        "sourceControl.identityProof.create" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let nonce = require_str_param(params, "nonce")?;
+            let host_label = require_str_param(params, "hostLabel")?;
+            let r = api
+                .source_control_identity_proof_create(provider, host, nonce, host_label)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.identityProof.delete" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let proof_id = require_str_param(params, "proofId")?;
+            let r = api
+                .source_control_identity_proof_delete(provider, host, proof_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

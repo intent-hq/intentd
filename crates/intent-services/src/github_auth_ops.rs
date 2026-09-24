@@ -286,32 +286,48 @@ pub(crate) async fn load_stored_token(
         .ok_or(Error::IdentityProof(IdentityProofErrorKind::NotConnected))
 }
 
-/// Map an engine identity-proof failure onto the bounded wire codes: a token
-/// GitHub rejects is reported like no token (`github-not-connected` — the
-/// remedy is the same sign-in), a missing `gist` scope is
-/// `github-scope-missing`, a transport failure `github-unreachable`; a
-/// `gistId` that names a gist other than an Intent proof gist is a caller
-/// error (`-32602`, nothing deleted); a GitHub rate limit (any cause the
+/// Map an engine identity-proof failure onto the bounded wire codes of
+/// `provider`: a token the forge rejects is reported like no token
+/// (`<provider>-not-connected` — the remedy is the same sign-in), a missing
+/// scope is `<provider>-scope-missing`, a transport failure
+/// `<provider>-unreachable`; a proof id that names a gist / snippet other
+/// than an Intent proof is a caller error (`-32602`, nothing deleted); the
+/// host-half outcomes map onto `-32004` (no such proof) and the typed
+/// `identity-unverifiable`; a forge rate limit (any cause the
 /// source-control layer classifies as [`Error::RateLimited`]: REST primary
 /// 403 / 429, secondary-limit 403s, GraphQL `RATE_LIMIT`) keeps that class
 /// via [`crate::pr_ops::map_sc_err`] — `-32603` with
-/// `data.code = "rate-limited"`, never `github-not-connected`, because a
+/// `data.code = "rate-limited"`, never `<provider>-not-connected`, because a
 /// fresh sign-in does not help (intent-hq/intent#5627); any other forge
 /// error stays a plain `-32603` with its message.
-pub(crate) fn map_identity_proof_err(e: IdentityProofError) -> Error {
+pub(crate) fn map_identity_proof_err_for(
+    provider: crate::source_control_auth_ops::Provider,
+    e: IdentityProofError,
+) -> Error {
+    use crate::source_control_auth_ops::Provider;
     match e {
-        IdentityProofError::ScopeMissing { .. } => {
-            Error::IdentityProof(IdentityProofErrorKind::ScopeMissing)
-        }
+        IdentityProofError::ScopeMissing { .. } => Error::IdentityProof(match provider {
+            Provider::Github => IdentityProofErrorKind::ScopeMissing,
+            Provider::Gitlab => IdentityProofErrorKind::GitlabScopeMissing,
+        }),
         IdentityProofError::NotProofGist { gist_id } => Error::InvalidParams(format!(
             "gistId {gist_id:?} does not name an Intent identity-proof gist (nothing deleted)"
         )),
-        IdentityProofError::Unauthorized(_) => {
-            Error::IdentityProof(IdentityProofErrorKind::NotConnected)
+        IdentityProofError::NotProofSnippet { snippet_id } => Error::InvalidParams(format!(
+            "proofId {snippet_id:?} does not name an Intent identity-proof snippet (nothing deleted)"
+        )),
+        IdentityProofError::NotFound { proof_id } => {
+            Error::NotFound(format!("identity proof {proof_id:?} not found"))
         }
-        IdentityProofError::Unreachable(_) => {
-            Error::IdentityProof(IdentityProofErrorKind::Unreachable)
-        }
+        IdentityProofError::Unverifiable { host } => Error::IdentityUnverifiable { host },
+        IdentityProofError::Unauthorized(_) => Error::IdentityProof(match provider {
+            Provider::Github => IdentityProofErrorKind::NotConnected,
+            Provider::Gitlab => IdentityProofErrorKind::GitlabNotConnected,
+        }),
+        IdentityProofError::Unreachable(_) => Error::IdentityProof(match provider {
+            Provider::Github => IdentityProofErrorKind::Unreachable,
+            Provider::Gitlab => IdentityProofErrorKind::GitlabUnreachable,
+        }),
         IdentityProofError::Other(other) => crate::pr_ops::map_sc_err(other),
     }
 }
@@ -550,6 +566,9 @@ mod tests {
 
     #[test]
     fn identity_proof_errors_map_onto_bounded_codes() {
+        let map_identity_proof_err = |e: IdentityProofError| {
+            map_identity_proof_err_for(crate::source_control_auth_ops::Provider::Github, e)
+        };
         let cases = [
             (
                 IdentityProofError::ScopeMissing {
@@ -590,6 +609,68 @@ mod tests {
             intent_sourcecontrol::Error::RateLimited("slow down".into()),
         ));
         assert!(matches!(limited, Error::RateLimited(_)), "{limited:?}");
+    }
+
+    #[test]
+    fn gitlab_identity_proof_errors_map_onto_their_own_codes() {
+        use crate::source_control_auth_ops::Provider;
+        let cases = [
+            (
+                IdentityProofError::ScopeMissing {
+                    granted: "insufficient_scope".into(),
+                },
+                "gitlab-scope-missing",
+            ),
+            (
+                IdentityProofError::Unauthorized("401".into()),
+                "gitlab-not-connected",
+            ),
+            (
+                IdentityProofError::Unreachable("connect refused".into()),
+                "gitlab-unreachable",
+            ),
+        ];
+        for (input, code) in cases {
+            let err = map_identity_proof_err_for(Provider::Gitlab, input);
+            assert_eq!(err.code(), -32603, "{code}");
+            assert!(
+                matches!(err, Error::IdentityProof(kind) if kind.as_str() == code),
+                "{code}: {err:?}"
+            );
+        }
+        let not_proof = map_identity_proof_err_for(
+            Provider::Gitlab,
+            IdentityProofError::NotProofSnippet {
+                snippet_id: "77".into(),
+            },
+        );
+        assert_eq!(not_proof.code(), -32602, "{not_proof:?}");
+        assert!(
+            matches!(&not_proof, Error::InvalidParams(msg) if msg.contains("proofId \"77\"") && msg.contains("nothing deleted")),
+            "{not_proof:?}"
+        );
+        let missing = map_identity_proof_err_for(
+            Provider::Gitlab,
+            IdentityProofError::NotFound {
+                proof_id: "78".into(),
+            },
+        );
+        assert!(matches!(missing, Error::NotFound(_)), "{missing:?}");
+        let unverifiable = map_identity_proof_err_for(
+            Provider::Gitlab,
+            IdentityProofError::Unverifiable {
+                host: "gitlab.example".into(),
+            },
+        );
+        assert_eq!(unverifiable.code(), -32603);
+        assert_eq!(
+            unverifiable.to_string(),
+            "cannot verify identity on gitlab.example"
+        );
+        assert!(
+            matches!(&unverifiable, Error::IdentityUnverifiable { host } if host == "gitlab.example"),
+            "{unverifiable:?}"
+        );
     }
 
     #[test]

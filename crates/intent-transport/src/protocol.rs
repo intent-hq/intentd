@@ -656,7 +656,18 @@
 //! `pinGithubUserId` / `pinLogin`. Identities are stored and resolved by
 //! the triple (`0130_principal_identity`), so an account on another
 //! provider or host with the same numeric id is a distinct principal.
-//! No method, error or event is added; the catalog is unchanged.
+//! The same version adds the provider-neutral guest half of the identity
+//! proof: `sourceControl.identityProof.create` / `delete` with `provider:
+//! "github" | "gitlab"` and an optional gitlab `host` (a public personal
+//! snippet on GitLab, the existing gist on GitHub; the result carries
+//! `proofId`, `provider`, `host`, `login`, `externalUserId`, `avatarUrl`
+//! and, for github, the compatibility `gistId`). The `github.identityProof.*`
+//! pair is served as byte-identical aliases. New typed errors:
+//! `gitlab-not-connected`, `gitlab-scope-missing`, `gitlab-unreachable` on
+//! the guest half and `identity-unverifiable { host }` when the host can
+//! read neither anonymously nor with its own connection to the same
+//! instance. No event is added. The catalog contains 336 router methods,
+//! 56 fast-path methods, and two aliases: 394 client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

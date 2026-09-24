@@ -23,6 +23,13 @@
 //! The host half reads the gist back through
 //! [`crate::SourceControl::get_proof_gist`] → [`ProofGistView`]; the
 //! comparison against the issued nonce is the service layer's.
+//!
+//! The GitLab twin (a public personal snippet) lives in [`gitlab`]; both sit
+//! behind the provider seam in [`provider`] ([`provider::ProofProvider`]),
+//! which is what the service layer drives.
+
+pub mod gitlab;
+pub mod provider;
 
 use serde_json::{json, Value};
 
@@ -104,11 +111,24 @@ pub enum IdentityProofError {
     /// (its files are not exactly one [`PROOF_FILE_NAME`]); nothing deleted.
     #[error("gist {gist_id:?} is not an Intent identity-proof gist")]
     NotProofGist { gist_id: String },
-    /// GitHub rejected the token (`401` / `403`).
-    #[error("github rejected the token: {0}")]
+    /// The GitLab snippet named for deletion exists but is not an Intent
+    /// proof snippet ([`gitlab::is_proof_snippet`]); nothing deleted.
+    #[error("snippet {snippet_id:?} is not an Intent identity-proof snippet")]
+    NotProofSnippet { snippet_id: String },
+    /// Host half: no proof has this id (the read answered `404`, or the id
+    /// is not shaped like one of the provider's ids).
+    #[error("identity proof {proof_id:?} not found")]
+    NotFound { proof_id: String },
+    /// Host half: the forge at `host` will not serve the proof to this host
+    /// — anonymous reads are restricted and the host holds no credential for
+    /// that instance (or it was refused too).
+    #[error("cannot verify identity on {host}")]
+    Unverifiable { host: String },
+    /// The forge rejected the token (`401` / `403`).
+    #[error("forge rejected the token: {0}")]
     Unauthorized(String),
-    /// GitHub could not be reached (connect / read / TLS failure).
-    #[error("github unreachable: {0}")]
+    /// The forge could not be reached (connect / read / TLS failure).
+    #[error("forge unreachable: {0}")]
     Unreachable(String),
     /// Any other forge / decode failure.
     #[error(transparent)]

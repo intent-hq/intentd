@@ -174,18 +174,30 @@ pub enum Error {
     #[error("{}", .0.message())]
     Invite(InviteErrorKind),
 
-    /// A guest-side gist identity-proof operation
-    /// (`github.identityProof.create` / `github.identityProof.delete`) was
-    /// refused for a reason the client must key off machine-readably: no
-    /// GitHub token is stored, the stored token lacks the `gist` scope, or
-    /// GitHub could not be reached. Surfaces as `-32603` with
+    /// A guest-side identity-proof operation
+    /// (`sourceControl.identityProof.create` / `.delete`, or the
+    /// `github.identityProof.*` aliases) was refused for a reason the client
+    /// must key off machine-readably: no token is stored for the provider,
+    /// the stored token lacks the scope the proof needs, or the forge could
+    /// not be reached. Surfaces as `-32603` with
     /// `error.data = { code: kind.as_str() }`.
     #[error("{}", .0.message())]
     IdentityProof(IdentityProofErrorKind),
+
+    /// Host half of the identity proof: the forge at `host` will not serve
+    /// the guest's proof to this daemon — anonymous reads are restricted on
+    /// that instance and the host holds no credential for it (or the one it
+    /// holds was refused) — so the claimed identity can be neither confirmed
+    /// nor denied. Surfaces as `-32603` with
+    /// `error.data = { code: "identity-unverifiable", host }` (protocol 10.8).
+    #[error("cannot verify identity on {host}")]
+    IdentityUnverifiable { host: String },
 }
 
-/// Machine-readable reason a gist identity-proof operation was refused,
-/// surfaced on the wire as `error.data.code`.
+/// Machine-readable reason an identity-proof operation was refused,
+/// surfaced on the wire as `error.data.code`. The GitHub kinds are the
+/// gist proof's original codes; the GitLab kinds are their snippet-proof
+/// twins (protocol 10.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityProofErrorKind {
     /// No GitHub token is stored (`github.connect` never completed, or the
@@ -196,6 +208,15 @@ pub enum IdentityProofErrorKind {
     ScopeMissing,
     /// GitHub could not be reached.
     Unreachable,
+    /// No GitLab token is stored for the instance (`sourceControl.connect`
+    /// never completed for it, the instance is not the bound one, or the
+    /// token was revoked / rejected).
+    GitlabNotConnected,
+    /// The stored GitLab token lacks the `api` scope snippets need; the user
+    /// must reconnect with a token that grants it.
+    GitlabScopeMissing,
+    /// The GitLab instance could not be reached.
+    GitlabUnreachable,
 }
 
 impl IdentityProofErrorKind {
@@ -206,6 +227,9 @@ impl IdentityProofErrorKind {
             IdentityProofErrorKind::NotConnected => "github-not-connected",
             IdentityProofErrorKind::ScopeMissing => "github-scope-missing",
             IdentityProofErrorKind::Unreachable => "github-unreachable",
+            IdentityProofErrorKind::GitlabNotConnected => "gitlab-not-connected",
+            IdentityProofErrorKind::GitlabScopeMissing => "gitlab-scope-missing",
+            IdentityProofErrorKind::GitlabUnreachable => "gitlab-unreachable",
         }
     }
 
@@ -222,6 +246,17 @@ impl IdentityProofErrorKind {
                  (github.connect) to grant it"
             }
             IdentityProofErrorKind::Unreachable => "internal error: GitHub could not be reached",
+            IdentityProofErrorKind::GitlabNotConnected => {
+                "internal error: GitLab is not connected for this host — sign in \
+                 (sourceControl.connect) before proving your identity"
+            }
+            IdentityProofErrorKind::GitlabScopeMissing => {
+                "internal error: the stored GitLab token lacks the `api` scope — reconnect \
+                 (sourceControl.connect) with a token that grants it"
+            }
+            IdentityProofErrorKind::GitlabUnreachable => {
+                "internal error: the GitLab instance could not be reached"
+            }
         }
     }
 }
@@ -470,6 +505,7 @@ impl Error {
             | Error::SourceControlUnauthorized { .. }
             | Error::RateLimited(_)
             | Error::IdentityProof(_)
+            | Error::IdentityUnverifiable { .. }
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,

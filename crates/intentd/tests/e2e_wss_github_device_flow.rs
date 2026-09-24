@@ -652,7 +652,9 @@ async fn github_cancel_auth_stops_the_background_poll_over_wss() {
 /// Gist identity proof over WSS (`github.identityProof.create` /
 /// `github.identityProof.delete`): with the device-flow token pre-seeded in
 /// the secrets file and the API host pointed at the mock, create returns the
-/// mock's `{ gistId, login }`, delete is idempotent (`{ ok: true }` for a
+/// mock's `{ gistId, login }` (and the generic
+/// `sourceControl.identityProof.create` with `provider: "github"` carries
+/// `gistId` = `proofId` next to the neutral fields), delete is idempotent (`{ ok: true }` for a
 /// live AND an unknown gist), a token that lacks the `gist` scope is refused
 /// with `github-scope-missing` on create and delete alike (on delete even for
 /// an unknown gist — the scope decides before the gist's 404), a gist that is
@@ -708,6 +710,33 @@ async fn github_identity_proof_create_and_delete_over_wss() {
         "create result is exactly {{ gistId, login }}"
     );
     // 🔒 Never the token on the wire.
+    assert!(!v.to_string().contains(ACCESS_TOKEN));
+
+    // 1b. The generic method with `provider: "github"` → the neutral shape
+    //     plus the compatibility `gistId` (= `proofId`), nothing else. The
+    //     gist create reports only the login, so the neutral owner fields
+    //     are null here.
+    let v = wss_rpc(
+        &mut rpc,
+        31,
+        "sourceControl.identityProof.create",
+        json!({ "provider": "github", "nonce": "n0nce-e2e", "hostLabel": "Host E2E" }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "generic create errored: {v}");
+    assert_eq!(
+        v["result"],
+        json!({
+            "proofId": GIST_ID,
+            "gistId": GIST_ID,
+            "provider": "github",
+            "host": "github.com",
+            "login": "octocat",
+            "externalUserId": null,
+            "avatarUrl": null,
+        }),
+        "generic github create result carries gistId = proofId"
+    );
     assert!(!v.to_string().contains(ACCESS_TOKEN));
 
     // 2. delete the live gist → { ok: true }.

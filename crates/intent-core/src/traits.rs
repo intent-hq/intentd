@@ -4431,6 +4431,52 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `sourceControl.identityProof.create` (protocol 10.8): the
+    /// provider-generic form of `github.identityProof.create`. `provider` is
+    /// `github` (a secret gist, as the alias) or `gitlab` (a **public**
+    /// personal snippet on `host` — the bound instance when omitted); the
+    /// proof is made with the stored token for that `(provider, host)` only.
+    /// → `{ proofId, provider, host, login, externalUserId, avatarUrl }`
+    /// (`externalUserId` / `avatarUrl` are `null` when the forge's create
+    /// does not report them — GitHub). Refused with `Error::IdentityProof`
+    /// (`<provider>-not-connected` / `-scope-missing` / `-unreachable`).
+    /// Owner-client only. Never returns the token.
+    fn source_control_identity_proof_create(
+        &self,
+        provider: String,
+        host: Option<String>,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, nonce, host_label);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_identity_proof_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.identityProof.delete` (protocol 10.8): delete the
+    /// proof `proofId` (a gist id / snippet id) created by
+    /// `sourceControl.identityProof.create` for the same `(provider, host)`
+    /// → `{ ok: true }`. Idempotent (an already-deleted proof is `ok`); the
+    /// proof is read back first and anything that is not an Intent proof is
+    /// refused with `-32602`, nothing deleted. Same bounded
+    /// `Error::IdentityProof` codes as create. Owner-client only.
+    fn source_control_identity_proof_delete(
+        &self,
+        provider: String,
+        host: Option<String>,
+        proof_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, proof_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_identity_proof_delete not implemented".to_string(),
+            ))
+        })
+    }
+
     // ========================================================================
     // sourceControl.* — provider-generic forge auth (PROTOCOL §5.27
     // "Provider-generic auth — `sourceControl.*`", v10.5). `provider` is

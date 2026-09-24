@@ -290,6 +290,8 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "sourceControl.cancelAuth",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.identityProof.create",
+    "sourceControl.identityProof.delete",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",

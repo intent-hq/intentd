@@ -387,10 +387,11 @@ pub fn resolve_client_id(configured: &str, host: &GitlabHost) -> Option<String> 
         .then(|| GITLAB_COM_OAUTH_CLIENT_ID.to_string())
 }
 
-/// Shared HTTP client for the auth endpoints: bounded connect and total
+/// Shared HTTP client for the auth endpoints (and the snippet identity
+/// proof, [`crate::identity_proof::gitlab`]): bounded connect and total
 /// request time so a dark connection fails instead of pending forever (same
 /// budgets and rationale as [`crate::github`], intent-hq/monorepo#1988).
-fn http_client() -> Result<reqwest::Client> {
+pub(crate) fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(READ_WRITE_TIMEOUT)
