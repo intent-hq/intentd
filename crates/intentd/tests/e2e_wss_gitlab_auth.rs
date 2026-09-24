@@ -76,6 +76,10 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
+    // The GitHub resolution chain ends at `gh auth token`; point the CLI at an
+    // empty config dir so a developer's own `gh auth login` is never borrowed.
+    let gh_config_dir = data_dir.join("gh-config");
+    std::fs::create_dir_all(&gh_config_dir).expect("mkdir hermetic gh config dir");
     let mut cmd = common::serve_command();
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
@@ -85,6 +89,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
         .env_remove("GITLAB_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
+        .env("GH_CONFIG_DIR", &gh_config_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {

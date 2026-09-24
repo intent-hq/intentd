@@ -133,8 +133,8 @@ pub use model::{
     BrowserTabVisibility,
 };
 pub use model::{
-    Principal, PrincipalCredential, PrincipalIdentity, WorkspaceInvite, WorkspaceMember,
-    WorkspaceMembership, WorkspaceRole,
+    InvitePin, InviteProofClaim, Principal, PrincipalCredential, PrincipalIdentity,
+    WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
 };
 pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,

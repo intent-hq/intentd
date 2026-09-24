@@ -16,17 +16,18 @@ use crate::model::{
     CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentResolveThreadResult,
     CommentRespondResult, ContextItem, Draft, EventQueryParams, EventSubscribeResult,
     EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
-    GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
-    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
-    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
-    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
+    GitMergeConflicts, GitPullResult, GitStatus, InvitePin, InviteProofClaim,
+    LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
+    NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
+    ScriptCreateParams, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceSetupStatus, WorkspaceTask,
+    WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -4836,19 +4837,21 @@ pub trait WorkspaceApi: Send + Sync {
     /// it exactly once, and afterwards it reaches the wire only inside the
     /// rebuilt `url` of `workspace_invite_list`. Owner-only.
     /// Refused with `InviteErrorKind::GithubIdentityRequired` unless the
-    /// owner's GitHub identity is linked; `pin_login` (a GitHub login) is
-    /// resolved to its account id and stored as the pin
-    /// (`InviteErrorKind::PinUnknown` when it names no account). The first
-    /// invite of a workspace sets its `legacy_author_principal_id` to the
-    /// owner when unset. `expires_in_secs` defaults to 7 days. The transport
-    /// wraps the result into the `intent://invite?…` link.
+    /// owner carries a linked forge identity (github or gitlab); `pin` names
+    /// the login to pin to on `pin.provider` / `pin.host` (both default to
+    /// the owner's own identity forge), resolved to its account and stored
+    /// as the pin triple (`InviteErrorKind::PinUnknown` when it names no
+    /// account). The first invite of a workspace sets its
+    /// `legacy_author_principal_id` to the owner when unset.
+    /// `expires_in_secs` defaults to 7 days. The transport wraps the result
+    /// into the `intent://invite?…` link.
     fn workspace_invite_create(
         &self,
         workspace_id: WorkspaceId,
-        pin_login: Option<String>,
+        pin: Option<InvitePin>,
         expires_in_secs: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, pin_login, expires_in_secs);
+        let _ = (workspace_id, pin, expires_in_secs);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_invite_create not implemented".to_string(),
@@ -4962,34 +4965,37 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `invite.prove` (gist identity-proof join, unauthenticated `/invite`
-    /// endpoint): the guest published `nonce` in a gist under its own
-    /// account and names it. The host reads `GET /gists/{gist_id}` and
-    /// requires the owner login to equal `login` (case-insensitively), the
-    /// file `intent-join-proof.txt` to start with the nonce and the gist to
-    /// have been created no earlier than the nonce was issued; then resolves
-    /// `GET /users/{login}` and commits the join → `{ status: "authorized",
-    /// token, principalId, login, workspaceId }`. Refusals:
+    /// `invite.prove` (forge identity-proof join, unauthenticated `/invite`
+    /// endpoint): the guest published `nonce` in a proof under its own
+    /// account — a gist on GitHub, a personal snippet on GitLab — and names
+    /// it in `claim` (`proof_id`, `login`, the forge `provider` / `host`;
+    /// protocol 10.8). The host reads the proof back through the provider
+    /// seam and requires the owner login to equal `login`
+    /// (case-insensitively), the proof file to start with the nonce and the
+    /// proof to have been created no earlier than the nonce was issued; then
+    /// resolves the account and commits the join → `{ status: "authorized",
+    /// token, principalId, login, workspaceId }`; the joined principal
+    /// carries the forge's identity triple. Refusals:
     /// [`crate::InviteErrorKind::ProofInvalid`]
-    /// (any mismatch, an unknown gist, or a nonce not issued for this invite
+    /// (any mismatch, an unknown proof, or a nonce not issued for this invite
     /// / already consumed), [`crate::InviteErrorKind::ProofExpired`],
-    /// [`crate::InviteErrorKind::GithubUnreachable`];
-    /// [`crate::InviteErrorKind::OwnerSelfJoin`] (`owner-self-join`) when
-    /// the proven account is the primary principal's own — the host owner
-    /// cannot join its own host as a guest and no credential is minted; a
-    /// closed invite, a pin
-    /// mismatch and a full workspace answer their existing kinds. The nonce
-    /// is consumed by the first attempt that reaches the verification,
-    /// except when GitHub was unreachable (the guest may retry).
+    /// [`crate::InviteErrorKind::GithubUnreachable`],
+    /// [`Error::IdentityUnverifiable`] (a GitLab instance that will not
+    /// serve the proof to this host); [`crate::InviteErrorKind::OwnerSelfJoin`]
+    /// (`owner-self-join`) when the proven account is the primary
+    /// principal's own — the host owner cannot join its own host as a guest
+    /// and no credential is minted; a closed invite, a pin mismatch and a
+    /// full workspace answer their existing kinds. The nonce is consumed by
+    /// the first attempt that reaches the verification, except when the
+    /// forge was unreachable (the guest may retry).
     fn invite_prove(
         &self,
         invite_id: String,
         secret: String,
         nonce: String,
-        gist_id: String,
-        login: String,
+        claim: InviteProofClaim,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret, nonce, gist_id, login);
+        let _ = (invite_id, secret, nonce, claim);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_prove not implemented".to_string(),

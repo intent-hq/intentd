@@ -728,6 +728,30 @@ impl crate::Services {
         }
     }
 
+    /// Host half: the daemon's own GitLab credential for `host` — the
+    /// stored slot, then `GITLAB_TOKEN` — when `host` is the bound instance;
+    /// `None` otherwise (every credential the daemon holds belongs to the
+    /// bound instance only). What `invite.prove` and the pin lookup send so
+    /// an instance that restricts anonymous reads still answers the host
+    /// that is connected to it. Read under the [`GitlabCredentialGate`].
+    pub(crate) async fn own_gitlab_token(&self, host: &GitlabHost) -> Option<String> {
+        let _gate = self.gitlab_credential_gate.lock().await;
+        if !self.gitlab_host_is_bound(host) {
+            return None;
+        }
+        match stored_access_token(&self.gitlab_secret_store).await {
+            Ok(Some(token)) => Some(token),
+            Ok(None) => std::env::var(GITLAB_TOKEN_ENV)
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
+            Err(e) => {
+                tracing::debug!(error = %e, host = host.host(), "gitlab token read failed");
+                None
+            }
+        }
+    }
+
     /// Guest half of `sourceControl.identityProof.create` (and its
     /// `github.identityProof.create` alias): validate the proof lines,
     /// resolve the target, and publish `nonce` with the stored token.

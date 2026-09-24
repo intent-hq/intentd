@@ -635,6 +635,8 @@ impl SettingDefinition {
             }
             SettingType::Enum(values) => match value.as_str() {
                 Some(s) if values.contains(&s) => {}
+                // A nullable enum (no default) accepts `null` as "unset".
+                None if value.is_null() && self.default_value.is_none() => {}
                 _ => {
                     return invalid(format!(
                         "{}: must be one of [{}]",
@@ -958,6 +960,28 @@ fn enumerated(
         category,
         ty: SettingType::Enum(values),
         default_value: Some(json!(default)),
+        sensitive: false,
+        read_only: false,
+        token_impact: None,
+    }
+}
+
+/// An [`enumerated`] setting without a default: unset (`null`) is a legal,
+/// distinct state, and a `null` write clears it.
+fn nullable_enumerated(
+    path: &'static str,
+    label: &'static str,
+    description: &'static str,
+    category: &'static str,
+    values: &'static [&'static str],
+) -> SettingDefinition {
+    SettingDefinition {
+        path,
+        label,
+        description,
+        category,
+        ty: SettingType::Enum(values),
+        default_value: None,
         sensitive: false,
         read_only: false,
         token_impact: None,
@@ -1388,6 +1412,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
              changes the reported host",
             "sourceControl",
             None,
+        ),
+        nullable_enumerated(
+            "identity.provider",
+            "Identity provider",
+            "The linked forge the primary user's identity is keyed by; unset means the only \
+             connected forge (github when both are). Changing it re-keys the primary identity",
+            "sourceControl",
+            &["github", "gitlab"],
         ),
         // --- Group A: Linear integration --------------------------------------
         secret(

@@ -5460,6 +5460,65 @@ impl PrincipalIdentity {
             .then(|| self.external_user_id.parse().ok())
             .flatten()
     }
+
+    /// Whether this identity lives on the forge `(provider, host)` — the
+    /// account itself aside.
+    #[must_use]
+    pub fn is_on(&self, provider: &str, host: &str) -> bool {
+        self.provider == provider && self.host == host
+    }
+}
+
+/// The account a `workspace.invite.create` pins its invite to, as the wire
+/// names it (protocol 10.8): `login` on the forge `provider` / `host`, both
+/// optional and defaulting to the inviting principal's own identity forge
+/// (`provider` is `"github"` | `"gitlab"`; `host` is gitlab-only, the bound
+/// instance when omitted).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InvitePin {
+    pub login: String,
+    pub provider: Option<String>,
+    pub host: Option<String>,
+}
+
+impl InvitePin {
+    /// A pin by `login` alone: the forge defaults to the inviter's.
+    #[must_use]
+    pub fn login(login: impl Into<String>) -> Self {
+        Self {
+            login: login.into(),
+            provider: None,
+            host: None,
+        }
+    }
+}
+
+/// What a first-time guest names on `invite.prove` (protocol 10.8): the
+/// proof it published (`proof_id` — a gist id on GitHub, a snippet id on
+/// GitLab; the wire spells it `proofId`, or `gistId` for a GitHub proof),
+/// the `login` it claims, and the forge the proof lives on (an omitted
+/// `provider` is `"github"` — never inferred from the invite's pin; `host`
+/// is gitlab-only and defaults to the pin host only when the pin's provider
+/// equals the chosen provider, else the bound instance).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteProofClaim {
+    pub proof_id: String,
+    pub login: String,
+    pub provider: Option<String>,
+    pub host: Option<String>,
+}
+
+impl InviteProofClaim {
+    /// A pre-10.8 claim: a GitHub gist `gist_id` owned by `login`.
+    #[must_use]
+    pub fn github(gist_id: impl Into<String>, login: impl Into<String>) -> Self {
+        Self {
+            proof_id: gist_id.into(),
+            login: login.into(),
+            provider: Some(PrincipalIdentity::GITHUB_PROVIDER.to_string()),
+            host: None,
+        }
+    }
 }
 
 /// A person known to the daemon (multiplayer w1). A principal is keyed by
@@ -5506,6 +5565,14 @@ impl Principal {
     pub fn set_github_user_id(&mut self, github_user_id: Option<i64>) {
         self.github_user_id = github_user_id;
         self.identity = github_user_id.map(PrincipalIdentity::github);
+    }
+
+    /// Link any forge account: sets the identity triple and derives the
+    /// legacy `github_user_id` projection from it (`None` for every
+    /// non-github.com identity), so the two never disagree.
+    pub fn set_identity(&mut self, identity: PrincipalIdentity) {
+        self.github_user_id = identity.github_user_id();
+        self.identity = Some(identity);
     }
 }
 

@@ -662,7 +662,10 @@
 //! snippet on GitLab, the existing gist on GitHub; the result carries
 //! `proofId`, `provider`, `host`, `login`, `externalUserId`, `avatarUrl`
 //! and, for github, the compatibility `gistId`). The `github.identityProof.*`
-//! pair is served as byte-identical aliases. New typed errors:
+//! pair is kept as aliases with `provider: "github"` pinned: the same
+//! params (`delete` spells the proof id `gistId`), with the `create` result
+//! projected to its documented `{ gistId, login }` — not byte-identical to
+//! the provider-neutral result. New typed errors:
 //! `gitlab-not-connected`, `gitlab-scope-missing`, `gitlab-unreachable` on
 //! the guest half and `identity-unverifiable { host }` when the host can
 //! read neither anonymously nor with its own connection to the same
