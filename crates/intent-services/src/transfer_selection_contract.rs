@@ -27,10 +27,12 @@ const BUILD_REVISION: Option<&str> = option_env!("TRANSFER_SELECTION_BUILD_REVIS
 
 fn sha256(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    Sha256::digest(bytes).iter().fold(String::with_capacity(64), |mut hex, byte| {
-        write!(&mut hex, "{byte:02x}").unwrap();
-        hex
-    })
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            write!(&mut hex, "{byte:02x}").unwrap();
+            hex
+        })
 }
 
 fn component_root() -> PathBuf {
