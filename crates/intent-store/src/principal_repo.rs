@@ -1,23 +1,38 @@
 //! Principal, workspace membership and bearer-credential repository
-//! (multiplayer w1, migration `0125_principals`). Principals are people
-//! (GitHub identities); the primary principal is minted by the migration and
-//! owns every pre-existing workspace. Credentials are keyed by the hex
-//! SHA-256 of the presented token — the service layer hashes, this module
-//! never sees plaintext.
+//! (multiplayer w1, migration `0125_principals`). Principals are people,
+//! keyed by the provider-neutral identity triple `(identity_provider,
+//! instance_host, external_user_id)` (migration `0130`; `github_user_id` is
+//! its github.com projection, dual-written); the primary principal is minted
+//! by the migration and owns every pre-existing workspace. Credentials are
+//! keyed by the hex SHA-256 of the presented token — the service layer
+//! hashes, this module never sees plaintext.
 
 use std::collections::HashMap;
 
 use intent_core::{
-    now_iso, Error, Principal, PrincipalCredential, PrincipalId, Result, WorkspaceId,
-    WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole, WorkspaceStatus,
+    now_iso, Error, Principal, PrincipalCredential, PrincipalId, PrincipalIdentity, Result,
+    WorkspaceId, WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+    WorkspaceStatus,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
 use crate::{enum_from_db, enum_to_db, Store};
 
-const PRINCIPAL_COLUMNS: &str =
-    "id, github_user_id, login, display_name, avatar_url, is_primary, created_at, updated_at";
+const PRINCIPAL_COLUMNS: &str = "id, github_user_id, login, display_name, avatar_url, \
+     is_primary, created_at, updated_at, identity_provider, instance_host, external_user_id";
+
+/// The `ON CONFLICT(id)` clause shared by every principal upsert: identity
+/// (triple and github projection) and cached profile fields are overwritten
+/// and `updated_at` bumped; `is_primary` / `created_at` are never touched.
+const PRINCIPAL_UPSERT_SET: &str = "github_user_id = excluded.github_user_id, \
+     login = excluded.login, \
+     display_name = excluded.display_name, \
+     avatar_url = excluded.avatar_url, \
+     updated_at = excluded.updated_at, \
+     identity_provider = excluded.identity_provider, \
+     instance_host = excluded.instance_host, \
+     external_user_id = excluded.external_user_id";
 
 const MEMBER_COLUMNS: &str = "workspace_id, principal_id, role, added_at";
 
@@ -26,14 +41,30 @@ const CREDENTIAL_COLUMNS: &str = "token_hash, principal_id, created_at, last_use
 pub(crate) const INVITE_COLUMNS: &str =
     "id, workspace_id, secret_hash, secret, created_by_principal_id, \
      pin_github_user_id, pin_login, created_at, expires_at, redeemed_at, \
-     redeemed_by_principal_id, revoked_at, redemption_count";
+     redeemed_by_principal_id, revoked_at, redemption_count, \
+     pin_identity_provider, pin_instance_host, pin_external_user_id";
 
 /// The SQL form of [`WorkspaceInvite::is_open_at`] on a `workspace_invite`
 /// row aliased `i`: not revoked, not expired (one `?` bound to now), and —
 /// for a pinned, single-use invite — not yet redeemed. An unpinned invite is
 /// reusable and stays open across redemptions (migration `0129`).
 const INVITE_OPEN: &str = "i.revoked_at IS NULL AND i.expires_at > ? \
-     AND (i.pin_github_user_id IS NULL OR i.redeemed_at IS NULL)";
+     AND ((i.pin_identity_provider IS NULL AND i.pin_github_user_id IS NULL) \
+          OR i.redeemed_at IS NULL)";
+
+/// The identity columns a principal row is written with: the triple the row
+/// resolves by ([`Principal::identity_key`]) and its github.com projection —
+/// `github_user_id` as given, else parsed back out of a github triple — so a
+/// caller that set either field alone still dual-writes both.
+fn principal_identity_columns(p: &Principal) -> (Option<PrincipalIdentity>, Option<i64>) {
+    let identity = p.identity_key();
+    let github_user_id = p.github_user_id.or_else(|| {
+        identity
+            .as_ref()
+            .and_then(PrincipalIdentity::github_user_id)
+    });
+    (identity, github_user_id)
+}
 
 /// The workspace columns an unstamped user message's author is resolved
 /// from (see [`Store::get_workspace_author_fallback`]).
@@ -220,8 +251,28 @@ impl Store {
             .ok_or_else(|| Error::Internal("primary principal missing".to_string()))
     }
 
-    /// Look up a principal by linked GitHub account id; `None` when no
-    /// principal has linked that account.
+    /// Look up a principal by its identity triple; `None` when no principal
+    /// has linked that account on that provider / host.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_principal_by_identity(
+        &self,
+        identity: &PrincipalIdentity,
+    ) -> Result<Option<Principal>> {
+        let sql =
+            format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
+        let row = bind_identity(sqlx::query(&sql), identity)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("find principal by identity failed: {e}")))?;
+        Ok(row.as_ref().map(map_principal_row))
+    }
+
+    /// Look up a principal by linked github.com account id — the
+    /// [`PrincipalIdentity::github`] case of
+    /// [`Self::find_principal_by_identity`].
     ///
     /// # Errors
     ///
@@ -230,13 +281,8 @@ impl Store {
         &self,
         github_user_id: i64,
     ) -> Result<Option<Principal>> {
-        let sql = format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE github_user_id = ?");
-        let row = sqlx::query(&sql)
-            .bind(github_user_id)
-            .fetch_optional(self.read_pool())
+        self.find_principal_by_identity(&PrincipalIdentity::github(github_user_id))
             .await
-            .map_err(|e| Error::Internal(format!("find principal by github id failed: {e}")))?;
-        Ok(row.as_ref().map(map_principal_row))
     }
 
     /// List every principal, primary first then by `created_at`.
@@ -278,34 +324,22 @@ impl Store {
         Ok(rows.iter().map(map_principal_row).collect())
     }
 
-    /// Insert or update a principal by id. On conflict the GitHub identity
-    /// and cached profile fields are overwritten and `updated_at` bumped;
-    /// `is_primary` and `created_at` are never changed by an upsert (the
-    /// primary flag is owned by the migration).
+    /// Insert or update a principal by id. On conflict the identity (triple
+    /// and github projection, see [`principal_identity_columns`]) and cached
+    /// profile fields are overwritten and `updated_at` bumped; `is_primary`
+    /// and `created_at` are never changed by an upsert (the primary flag is
+    /// owned by the migration).
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails (including
-    /// a `github_user_id` already linked to another principal).
+    /// an identity already linked to another principal).
     pub async fn upsert_principal(&self, p: &Principal) -> Result<()> {
         let sql = format!(
-            "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?) \
-             ON CONFLICT(id) DO UPDATE SET \
-                 github_user_id = excluded.github_user_id, \
-                 login = excluded.login, \
-                 display_name = excluded.display_name, \
-                 avatar_url = excluded.avatar_url, \
-                 updated_at = excluded.updated_at"
+            "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?) \
+             ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}"
         );
-        sqlx::query(&sql)
-            .bind(&p.id.0)
-            .bind(p.github_user_id)
-            .bind(&p.login)
-            .bind(&p.display_name)
-            .bind(&p.avatar_url)
-            .bind(i64::from(p.is_primary))
-            .bind(&p.created_at)
-            .bind(&p.updated_at)
+        bind_principal(sqlx::query(&sql), p)
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("upsert principal failed: {e}")))?;
@@ -994,15 +1028,24 @@ impl Store {
                 return Ok(InviteInsertOutcome::WorkspaceArchived);
             }
             let sql = format!(
-                "INSERT INTO workspace_invite ({INVITE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                "INSERT INTO workspace_invite ({INVITE_COLUMNS}) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
+            // The pin is dual-written like a principal's identity: the triple
+            // the row resolves by, plus its github.com projection.
+            let pin_identity = invite.pin_identity_key();
+            let pin_github_user_id = invite.pin_github_user_id.or_else(|| {
+                pin_identity
+                    .as_ref()
+                    .and_then(PrincipalIdentity::github_user_id)
+            });
             sqlx::query(&sql)
                 .bind(&invite.id)
                 .bind(&invite.workspace_id.0)
                 .bind(&invite.secret_hash)
                 .bind(&invite.secret)
                 .bind(&invite.created_by_principal_id.0)
-                .bind(invite.pin_github_user_id)
+                .bind(pin_github_user_id)
                 .bind(&invite.pin_login)
                 .bind(&invite.created_at)
                 .bind(&invite.expires_at)
@@ -1015,6 +1058,9 @@ impl Store {
                 )
                 .bind(&invite.revoked_at)
                 .bind(i64::try_from(invite.redemption_count).unwrap_or(i64::MAX))
+                .bind(pin_identity.as_ref().map(|i| i.provider.as_str()))
+                .bind(pin_identity.as_ref().map(|i| i.host.as_str()))
+                .bind(pin_identity.as_ref().map(|i| i.external_user_id.as_str()))
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("insert workspace invite failed: {e}")))?;
@@ -1223,15 +1269,17 @@ impl Store {
     }
 
     /// The invite join as ONE write transaction (multiplayer w4): resolve or
-    /// mint the principal keyed by `identity.github_user_id`, apply the
-    /// fetched profile, redeem the invite (the conditional `UPDATE` is the
-    /// single-use guard of a pinned invite; a reusable one stays open), add
-    /// the `collaborator` membership and record the credential hash. Either
-    /// every row lands or none does — a credential insert failure cannot
-    /// consume the link or leave a member without a credential — and, under
-    /// `BEGIN IMMEDIATE` on the single-connection write pool, two first
-    /// joins of the same account cannot both miss the lookup and race a
-    /// duplicate `github_user_id` insert.
+    /// mint the principal keyed by `identity`'s identity triple
+    /// ([`Principal::identity_key`] — the stored triple, or the github.com
+    /// one of a bare `github_user_id`; `github_user_id` is dual-written for
+    /// a github triple), apply the fetched profile, redeem the invite (the
+    /// conditional `UPDATE` is the single-use guard of a pinned invite; a
+    /// reusable one stays open), add the `collaborator` membership and
+    /// record the credential hash. Either every row lands or none does — a
+    /// credential insert failure cannot consume the link or leave a member
+    /// without a credential — and, under `BEGIN IMMEDIATE` on the
+    /// single-connection write pool, two first joins of the same account
+    /// cannot both miss the lookup and race a duplicate identity insert.
     ///
     /// `identity.id` is used only when no principal has linked the account;
     /// `identity.is_primary` / `created_at` likewise. Returns
@@ -1272,8 +1320,9 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails (including
-    /// a duplicate credential hash or an unknown invite / workspace) and
-    /// `Error::InvalidInput` for a one-owner violation on the membership.
+    /// a duplicate credential hash, an unknown invite / workspace, or an
+    /// `identity` carrying no identity key) and `Error::InvalidInput` for a
+    /// one-owner violation on the membership.
     pub async fn join_workspace_by_invite(
         &self,
         invite_id: &str,
@@ -1283,9 +1332,9 @@ impl Store {
         rotate_from_hash: Option<&str>,
         max_guests: u32,
     ) -> Result<InviteJoinOutcome> {
-        let github_user_id = identity
-            .github_user_id
-            .ok_or_else(|| Error::Internal("invite join requires a github_user_id".to_string()))?;
+        let identity_key = identity
+            .identity_key()
+            .ok_or_else(|| Error::Internal("invite join requires an identity key".to_string()))?;
         let mut conn = self
             .write_pool()
             .acquire()
@@ -1321,9 +1370,8 @@ impl Store {
                 return Ok(InviteJoinOutcome::Closed);
             }
             let lookup =
-                format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE github_user_id = ?");
-            let existing = sqlx::query(&lookup)
-                .bind(github_user_id)
+                format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
+            let existing = bind_identity(sqlx::query(&lookup), &identity_key)
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("invite join principal lookup failed: {e}")))?
@@ -1387,30 +1435,18 @@ impl Store {
                 }
             }
             let mut principal = existing.unwrap_or_else(|| identity.clone());
-            principal.github_user_id = Some(github_user_id);
+            principal.github_user_id = identity_key.github_user_id();
+            principal.identity = Some(identity_key.clone());
             principal.login.clone_from(&identity.login);
             principal.display_name.clone_from(&identity.display_name);
             principal.avatar_url.clone_from(&identity.avatar_url);
             principal.updated_at.clone_from(&now);
 
             let upsert = format!(
-                "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?) \
-                 ON CONFLICT(id) DO UPDATE SET \
-                     github_user_id = excluded.github_user_id, \
-                     login = excluded.login, \
-                     display_name = excluded.display_name, \
-                     avatar_url = excluded.avatar_url, \
-                     updated_at = excluded.updated_at"
+                "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?) \
+                 ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}"
             );
-            sqlx::query(&upsert)
-                .bind(&principal.id.0)
-                .bind(principal.github_user_id)
-                .bind(&principal.login)
-                .bind(&principal.display_name)
-                .bind(&principal.avatar_url)
-                .bind(i64::from(principal.is_primary))
-                .bind(&principal.created_at)
-                .bind(&principal.updated_at)
+            bind_principal(sqlx::query(&upsert), &principal)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| {
@@ -1482,6 +1518,12 @@ fn map_invite_row(r: &SqliteRow) -> WorkspaceInvite {
         secret_hash: r.get("secret_hash"),
         secret: r.get("secret"),
         created_by_principal_id: PrincipalId(r.get("created_by_principal_id")),
+        pin_identity: map_identity_columns(
+            r,
+            "pin_identity_provider",
+            "pin_instance_host",
+            "pin_external_user_id",
+        ),
         pin_github_user_id: r.get("pin_github_user_id"),
         pin_login: r.get("pin_login"),
         created_at: r.get("created_at"),
@@ -1524,9 +1566,60 @@ async fn sync_workspace_owner(
     Ok(())
 }
 
+/// `WHERE` body selecting a principal by its identity triple; bind the three
+/// parts with [`bind_identity`].
+const PRINCIPAL_BY_IDENTITY: &str =
+    "identity_provider = ? AND instance_host = ? AND external_user_id = ?";
+
+type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+
+fn bind_identity<'q>(query: SqliteQuery<'q>, identity: &'q PrincipalIdentity) -> SqliteQuery<'q> {
+    query
+        .bind(identity.provider.as_str())
+        .bind(identity.host.as_str())
+        .bind(identity.external_user_id.as_str())
+}
+
+/// Bind a principal's values in `PRINCIPAL_COLUMNS` order for an insert /
+/// upsert, with the identity columns dual-written
+/// ([`principal_identity_columns`]).
+fn bind_principal<'q>(query: SqliteQuery<'q>, p: &'q Principal) -> SqliteQuery<'q> {
+    let (identity, github_user_id) = principal_identity_columns(p);
+    query
+        .bind(&p.id.0)
+        .bind(github_user_id)
+        .bind(&p.login)
+        .bind(&p.display_name)
+        .bind(&p.avatar_url)
+        .bind(i64::from(p.is_primary))
+        .bind(&p.created_at)
+        .bind(&p.updated_at)
+        .bind(identity.as_ref().map(|i| i.provider.clone()))
+        .bind(identity.as_ref().map(|i| i.host.clone()))
+        .bind(identity.map(|i| i.external_user_id))
+}
+
+/// The identity triple stored in three nullable columns; `Some` only when
+/// the provider column is set (the partial unique index's predicate).
+fn map_identity_columns(
+    r: &SqliteRow,
+    provider: &str,
+    host: &str,
+    external_user_id: &str,
+) -> Option<PrincipalIdentity> {
+    Some(PrincipalIdentity {
+        provider: r.get::<Option<String>, _>(provider)?,
+        host: r.get::<Option<String>, _>(host).unwrap_or_default(),
+        external_user_id: r
+            .get::<Option<String>, _>(external_user_id)
+            .unwrap_or_default(),
+    })
+}
+
 fn map_principal_row(r: &SqliteRow) -> Principal {
     Principal {
         id: PrincipalId(r.get("id")),
+        identity: map_identity_columns(r, "identity_provider", "instance_host", "external_user_id"),
         github_user_id: r.get("github_user_id"),
         login: r.get("login"),
         display_name: r.get("display_name"),

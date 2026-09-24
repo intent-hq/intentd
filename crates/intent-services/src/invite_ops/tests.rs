@@ -25,6 +25,7 @@ struct Fixture {
 fn principal(login: &str, github_user_id: Option<i64>) -> Principal {
     Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id,
         login: Some(login.to_string()),
         display_name: Some(format!("{login} name")),
@@ -485,6 +486,7 @@ async fn identity_switch_rechecks_the_lock_after_a_concurrent_mint() {
         secret_hash: hash_secret("s"),
         secret: None,
         created_by_principal_id: primary.id.clone(),
+        pin_identity: None,
         pin_github_user_id: None,
         pin_login: None,
         created_at: now_iso(),
@@ -826,6 +828,7 @@ async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
         secret_hash: hash_secret(&legacy_secret),
         secret: None,
         created_by_principal_id: f.owner.clone(),
+        pin_identity: None,
         pin_github_user_id: None,
         pin_login: None,
         created_at: now_iso(),
@@ -952,7 +955,7 @@ async fn invite_create_guards() {
     assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
 
     let mut unlinked = f.store.get_principal(&f.owner).await.expect("owner");
-    unlinked.github_user_id = None;
+    unlinked.set_github_user_id(None);
     f.store.upsert_principal(&unlinked).await.expect("unlink");
     let r = with_caller(
         wire(&f.owner),
@@ -3275,7 +3278,7 @@ async fn administrator_comment_author_follows_the_attached_identity() {
     };
     let mut primary = f.store.get_primary_principal().await.expect("primary");
     primary.login = None;
-    primary.github_user_id = None;
+    primary.set_github_user_id(None);
     f.store.upsert_principal(&primary).await.expect("seed");
     with_caller(
         admin(),
@@ -3296,7 +3299,7 @@ async fn administrator_comment_author_follows_the_attached_identity() {
     .expect("legacy comment");
 
     primary.login = Some("primary-gh".into());
-    primary.github_user_id = Some(10);
+    primary.set_github_user_id(Some(10));
     f.store.upsert_principal(&primary).await.expect("attach");
     with_caller(
         admin(),
@@ -3421,6 +3424,64 @@ async fn member_removal_drops_only_the_guest_queue() {
     )
     .await;
     assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
+}
+
+/// `principal.me` and every `workspace.members.list` Member row carry the
+/// additive `identity` triple (`{ provider, host, externalUserId }`) exactly
+/// as `principal.list` does: a github.com principal projects the backfilled
+/// triple, a principal linked on another provider / host projects that
+/// triple verbatim, and an unlinked principal carries no `identity` key.
+#[tokio::test]
+async fn principal_me_and_members_list_carry_the_identity_triple() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let gitlab = PrincipalIdentity {
+        provider: "gitlab".to_string(),
+        host: "gitlab.example.com".to_string(),
+        external_user_id: "4242".to_string(),
+    };
+    let mut collaborator = f
+        .store
+        .get_principal(&f.collaborator)
+        .await
+        .expect("collaborator row");
+    collaborator.identity = Some(gitlab.clone());
+    collaborator.github_user_id = None;
+    f.store
+        .upsert_principal(&collaborator)
+        .await
+        .expect("relink collaborator");
+    let github = json!({ "provider": "github", "host": "github.com", "externalUserId": "1001" });
+    let gitlab = json!(gitlab);
+
+    for (principal, expected) in [
+        (&f.owner, Some(&github)),
+        (&f.collaborator, Some(&gitlab)),
+        (&f.primary, None),
+    ] {
+        let me = with_caller(wire(principal), f.services.principal_me_op())
+            .await
+            .expect("principal.me");
+        assert_eq!(me["id"], json!(principal), "{me}");
+        assert_eq!(me.get("identity"), expected, "principal.me: {me}");
+    }
+
+    let roster = with_caller(wire(&f.owner), f.services.workspace_members_list_op(&f.ws))
+        .await
+        .expect("members.list");
+    let members = roster["members"].as_array().expect("members");
+    assert_eq!(members.len(), 3, "{roster}");
+    for (principal, expected) in [
+        (&f.owner, Some(&github)),
+        (&f.collaborator, Some(&gitlab)),
+        (&f.primary, None),
+    ] {
+        let row = members
+            .iter()
+            .find(|m| m["principalId"] == json!(principal))
+            .expect("member row");
+        assert_eq!(row.get("identity"), expected, "members.list: {row}");
+    }
 }
 
 /// The API-base seam accepts loopback cleartext and https overrides and
