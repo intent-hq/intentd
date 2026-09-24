@@ -32,6 +32,7 @@ use intent_store::{Sandbox, SandboxStatus};
 use sha2::Digest as _;
 
 use crate::transfer_git::TransferRefsManifest;
+use crate::transfer_model_selection::{resolve_imported_selection, ImportedSelection};
 use crate::{publish_event, workspace_created_event, workspace_setup_completed_event, Services};
 
 /// Maximum DECODED bytes per `workspace.import.chunk` call. Base64 inflates
@@ -1235,7 +1236,13 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///   `conversation_bytes`) are zeroed: the target re-inserts the transferred
 ///   `agent_message` rows through the counter triggers, which rebuild them
 ///   from zero — importing the exported values would double-count (same
-///   rebuild-on-target approach as the FTS index).
+///   rebuild-on-target approach as the FTS index). The next-turn selection
+///   is normalized by
+///   [`crate::transfer_model_selection::resolve_imported_selection`]: a
+///   provider-less row (legacy archive, or a source with no default
+///   provider) keeps its model / effort only on last-turn evidence for the
+///   provider, else the selection is cleared so the target's defaults apply
+///   as a unit (intent-hq/intent#5815); `last_turn_*` history is untouched.
 /// - **sandbox**: `path` rewritten under the target root.
 /// - **script**: absolute `cwd` rewritten under the target root.
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
@@ -1294,6 +1301,22 @@ fn transform_rows(
                         "conversation_bytes",
                     ] {
                         map.insert(counter.into(), serde_json::json!(0));
+                    }
+                    match resolve_imported_selection(map) {
+                        ImportedSelection::Kept => {}
+                        ImportedSelection::RecoveredFromLastTurn(provider) => {
+                            tracing::info!(
+                                agent = map.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                                provider = %provider,
+                                "import: provider-less session selection recovered from its last turn"
+                            );
+                        }
+                        ImportedSelection::ClearedToDestinationDefault => {
+                            tracing::info!(
+                                agent = map.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                                "import: provider-less session selection cleared to the target defaults"
+                            );
+                        }
                     }
                     let status = map
                         .get("status")
@@ -1526,6 +1549,82 @@ mod tests {
         let row = &find(&outcome, "workspace")[0];
         assert_eq!(row["worktree_path"], serde_json::Value::Null);
         assert_eq!(row["repository_path"], "relative/path");
+    }
+
+    /// Next-turn selection normalization (intent-hq/intent#5815): an
+    /// explicit provider passes through with its model / effort; a legacy
+    /// provider-less row keeps its selection only when the last committed
+    /// turn ran exactly that model on a named provider (adopted); without
+    /// such evidence the model and effort are cleared as a unit so the
+    /// target's defaults apply — the provider is never inferred from the
+    /// target. `last_turn_*` history is preserved in every case.
+    #[test]
+    fn transform_normalizes_session_selection() {
+        let rows = vec![(
+            "agent_session".to_string(),
+            vec![
+                serde_json::json!({
+                    "id": "explicit", "status": "idle",
+                    "provider": "codex", "model": "gpt-6-astra", "reasoning_effort": "xhigh",
+                    "last_turn_provider": "auggie", "last_turn_model": "gpt6-astra"
+                }),
+                serde_json::json!({
+                    "id": "recovered", "status": "idle",
+                    "provider": null, "model": "gpt6-astra", "reasoning_effort": "high",
+                    "last_turn_provider": "auggie", "last_turn_model": "gpt6-astra"
+                }),
+                serde_json::json!({
+                    "id": "cleared", "status": "idle",
+                    "provider": null, "model": "gpt6-astra", "reasoning_effort": "high",
+                    "last_turn_provider": null, "last_turn_model": null
+                }),
+                serde_json::json!({
+                    "id": "auto", "status": "idle",
+                    "provider": null, "model": null, "reasoning_effort": null,
+                    "last_turn_provider": "auggie", "last_turn_model": null
+                }),
+            ],
+        )];
+        let outcome =
+            transform_rows(rows, &ws(), &root(), "2026-08-11T00:00:00Z").expect("transform");
+        let sessions = find(&outcome, "agent_session");
+        let by_id = |id: &str| {
+            sessions
+                .iter()
+                .find(|s| s["id"] == id)
+                .unwrap_or_else(|| panic!("session {id}"))
+        };
+        let explicit = by_id("explicit");
+        assert_eq!(explicit["provider"], "codex");
+        assert_eq!(explicit["model"], "gpt-6-astra");
+        assert_eq!(explicit["reasoning_effort"], "xhigh");
+        assert_eq!(explicit["last_turn_provider"], "auggie");
+        assert_eq!(explicit["last_turn_model"], "gpt6-astra");
+
+        let recovered = by_id("recovered");
+        assert_eq!(
+            recovered["provider"], "auggie",
+            "adopted from the last turn"
+        );
+        assert_eq!(recovered["model"], "gpt6-astra");
+        assert_eq!(recovered["reasoning_effort"], "high");
+        assert_eq!(recovered["last_turn_provider"], "auggie");
+        assert_eq!(recovered["last_turn_model"], "gpt6-astra");
+
+        let cleared = by_id("cleared");
+        assert_eq!(
+            cleared["provider"],
+            serde_json::Value::Null,
+            "never inferred"
+        );
+        assert_eq!(cleared["model"], serde_json::Value::Null);
+        assert_eq!(cleared["reasoning_effort"], serde_json::Value::Null);
+
+        let auto = by_id("auto");
+        assert_eq!(auto["provider"], serde_json::Value::Null);
+        assert_eq!(auto["model"], serde_json::Value::Null);
+        assert_eq!(auto["reasoning_effort"], serde_json::Value::Null);
+        assert_eq!(auto["last_turn_provider"], "auggie", "history untouched");
     }
 
     /// In-flight agent sessions (all three spellings) are forced idle with
