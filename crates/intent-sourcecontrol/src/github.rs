@@ -79,13 +79,11 @@ fn pr_read_quota(core: RateLimitStatus, graphql: RateLimitStatus) -> RateLimitSt
         (Some(rest), Some(gql), Some(rest_limit), Some(gql_limit)) => RateLimitStatus {
             remaining: Some(rest.min(gql)),
             limit: Some(rest_limit.max(gql_limit)),
-            reset_at: if rest == gql {
+            reset_at: match rest.cmp(&gql) {
+                std::cmp::Ordering::Less => core.reset_at,
+                std::cmp::Ordering::Greater => graphql.reset_at,
                 // Equal headroom remains constrained until both refill.
-                core.reset_at.max(graphql.reset_at)
-            } else if rest < gql {
-                core.reset_at
-            } else {
-                graphql.reset_at
+                std::cmp::Ordering::Equal => core.reset_at.max(graphql.reset_at),
             },
         },
         _ => RateLimitStatus::default(),
