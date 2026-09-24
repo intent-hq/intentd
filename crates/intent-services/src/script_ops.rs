@@ -2742,6 +2742,114 @@ mod tests {
             .expect("cleanup");
     }
 
+    /// A shutdown after the launch eligibility check, but before its marker
+    /// write completes, must preserve an interrupted restoration for next boot.
+    /// An explicit stop still dismisses it, and a first launch that never became
+    /// running must not acquire a recovery marker from the in-flight write.
+    #[intent_test_macros::daemon_test]
+    async fn hydrate_shutdown_during_marker_write_preserves_only_recovery() {
+        use std::future::Future;
+
+        for (restoring, user_stop) in [(true, false), (true, true), (false, false)] {
+            let mut h = harness().await;
+            let id = create(
+                &h,
+                ScriptCreateParams {
+                    name: "auto-start".into(),
+                    command: SERVICE_CMD.into(),
+                    mode: ScriptMode::Service,
+                    auto_start: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let store = h.services.store().clone();
+            store
+                .set_script_was_running(h.ws.as_str(), &id, restoring)
+                .await
+                .unwrap();
+            let park = Arc::new(SupervisePark::default());
+            h.services = Services::new(store.clone())
+                .with_event_bus(h.bus.clone())
+                .with_script_mark_running_park(park.clone());
+            assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
+            if !restoring {
+                h.services
+                    .script_start(h.ws.clone(), id.clone())
+                    .await
+                    .expect("first start");
+            }
+            tokio::time::timeout(LIVENESS, park.entered.notified())
+                .await
+                .expect("launch parked before marker write");
+            let state = h
+                .services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .unwrap();
+            assert_eq!(state["status"], "starting", "{state}");
+
+            let mut stop = Box::pin(async {
+                if user_stop {
+                    h.services
+                        .script_stop(h.ws.clone(), id.clone())
+                        .await
+                        .expect("explicit stop");
+                } else {
+                    h.services.shutdown_pty_sessions().await;
+                }
+            });
+            // Poll once: the synchronous stop flag is set before teardown
+            // awaits the parked supervisor. No timing sleep decides the race.
+            let first_poll =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(stop.as_mut().poll(cx))).await;
+            assert!(first_poll.is_pending(), "stop waits for the supervisor");
+            assert!(
+                h.services
+                    .script_manager()
+                    .scripts
+                    .lock()
+                    .unwrap()
+                    .get(&(h.ws.clone(), id.clone()))
+                    .unwrap()
+                    .stopped_by_user
+            );
+            park.release.notify_one();
+            tokio::time::timeout(LIVENESS, stop)
+                .await
+                .expect("stop settled");
+            assert_eq!(h.services.pty().count(), 0, "racing PTY reaped");
+
+            let should_restore = restoring && !user_stop;
+            let expected_markers = if should_restore {
+                vec![(h.ws.to_string(), id.clone())]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                store.list_was_running_script_ids().await.unwrap(),
+                expected_markers,
+                "restoring={restoring}, user_stop={user_stop}"
+            );
+
+            h.services = Services::new(store).with_event_bus(h.bus.clone());
+            let mut sub = subscribe(&h);
+            assert_eq!(h.services.hydrate_scripts().await.expect("next boot"), 1);
+            if should_restore {
+                await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+                h.services
+                    .script_stop(h.ws.clone(), id.clone())
+                    .await
+                    .expect("cleanup restored service");
+            } else {
+                let state = h.services.script_status(h.ws.clone(), id).await.unwrap();
+                assert_eq!(state["status"], "idle", "{state}");
+                assert!(state.get("previouslyRunning").is_none(), "{state}");
+                assert_eq!(h.services.pty().count(), 0, "next boot launched nothing");
+            }
+        }
+    }
+
     #[intent_test_macros::daemon_test]
     async fn hydrate_leaves_explicitly_stopped_autostart_service_idle() {
         let mut h = harness().await;
