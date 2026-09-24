@@ -155,8 +155,26 @@ impl crate::Services {
                 map.insert("effort_levels".into(), Value::Null);
                 // Legacy prefixes override the provider column on store
                 // reads; validate exactly the selection the first turn sees.
+                let stored_provider = column_str(map, "provider");
                 let (model, provider) =
-                    normalize_compound_model(column_str(map, "model"), column_str(map, "provider"));
+                    normalize_compound_model(column_str(map, "model"), stored_provider.clone());
+                if let Some(config) = provider
+                    .as_deref()
+                    .and_then(intent_providers::find_provider_or_legacy_alias)
+                {
+                    // Active aliases must not reach consumers that interpret
+                    // them as the destination default. Canonicalize the same
+                    // effective selection as store reads and spawn; history
+                    // and non-alias selections remain untouched.
+                    let has_alias = provider.as_deref() != Some(config.id)
+                        || stored_provider
+                            .as_deref()
+                            .is_some_and(|p| canonical_source_provider(p) != p);
+                    if has_alias {
+                        map.insert("provider".into(), serde_json::json!(config.id));
+                        map.insert("model".into(), serde_json::json!(model));
+                    }
+                }
                 let source = provider
                     .as_deref()
                     .map(canonical_source_provider)

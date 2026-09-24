@@ -2561,15 +2561,13 @@ mod tests {
 
     async fn assert_imported_legacy_alias(alias: &str, mode: &str, disabled: bool) {
         let (svc, _root, _assets) = selection_fixture().await;
-        if disabled {
-            svc.settings_registry()
-                .unwrap()
-                .apply(&[(
-                    "providers.enabled".into(),
-                    serde_json::json!({"auggie":false}),
-                )])
-                .unwrap();
-        }
+        svc.settings_registry()
+            .unwrap()
+            .apply(&[(
+                "providers.enabled".into(),
+                serde_json::json!({"auggie": !disabled, "codex": disabled}),
+            )])
+            .unwrap();
         let inherited = matches!(mode, "history" | "prefix");
         let model = match mode {
             "auto" => None,
@@ -2588,6 +2586,16 @@ mod tests {
             assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
             return;
         }
+        // Consumers must receive the same canonical identity as spawn, even
+        // when the destination application default is disabled.
+        let public = svc.agent_get_session_op(session.id.clone()).await.unwrap();
+        assert_selection(
+            &svc,
+            &public,
+            "auggie",
+            (mode != "auto").then_some("gpt6-astra"),
+            effort,
+        );
         let rows = svc
             .store
             .transfer_export_rows(&session.workspace_id)
@@ -2598,8 +2606,11 @@ mod tests {
             .find(|(table, _)| table == "agent_session")
             .unwrap()
             .1[0];
-        assert_eq!(stored["provider"], if inherited { "auggie" } else { alias });
-        assert_eq!(stored["model"], selection["model"]);
+        assert_eq!(stored["provider"], "auggie");
+        assert_eq!(
+            stored["model"],
+            serde_json::json!((mode != "auto").then_some("gpt6-astra"))
+        );
         assert_eq!(stored["reasoning_effort"], selection["reasoning_effort"]);
         assert_eq!(
             intent_providers::provider_config(session.provider.as_deref().unwrap()).id,
