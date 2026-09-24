@@ -81,6 +81,17 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-afg-")
 }
 
+fn received_prompts(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .expect("read mock agent prompt log")
+        .lines()
+        .map(|line| {
+            let row: Value = serde_json::from_str(line).expect("prompt log JSON");
+            row["text"].as_str().expect("prompt text").to_string()
+        })
+        .collect()
+}
+
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
@@ -464,6 +475,8 @@ async fn agent_features_gate_new_sessions_only() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let behavior = json!({ "response": "done" }).to_string();
+    let prompt_log = data_dir.join("prompt-log.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
 
     let mut _daemon = Daemon {
         child: spawn_serve(
@@ -472,6 +485,7 @@ async fn agent_features_gate_new_sessions_only() {
                 ("INTENTD_AUTH_TOKEN", TOKEN),
                 ("MOCK_AGENT_SCRIPT_PATH", &script),
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
+                ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
             ],
         ),
         data_dir: data_dir.clone(),
@@ -566,6 +580,27 @@ async fn agent_features_gate_new_sessions_only() {
         prompt_a.contains("## Raising Attention"),
         "full prompt must contain the attentionRequests section"
     );
+    for guidance in [
+        "ordinary conversation or the normal question flow",
+        "back-and-forth, routine clarification, and plan approval",
+        "concrete assigned work",
+        "an issue encountered during that work",
+        "a user or coordinator decision before continuing",
+        "direct user assignments and delegated work",
+        "a formal task note is not required",
+    ] {
+        assert!(
+            prompt_a.contains(guidance),
+            "full prompt missing {guidance}"
+        );
+    }
+    assert_eq!(session_a["result"]["session"]["harnessVersion"], "2.8");
+    let prompts = received_prompts(&prompt_log);
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].contains(prompt_a),
+        "the mock agent receives the composed prompt"
+    );
     // `taskGraph` defaults on: the task-relations teaching is present in the
     // prompt (intent-hq/monorepo#2445, default since flipped).
     assert!(
@@ -589,6 +624,11 @@ async fn agent_features_gate_new_sessions_only() {
     let mut bridge_a = BridgeClient::connect(&addr_a).await;
 
     let desc_a = bridge_a.workspace_api_description().await;
+    assert!(desc_a.contains("only when concrete assigned work encounters an issue"));
+    let (err, agent_help) = bridge_a.call_js("return ws.help('agent')").await;
+    assert!(!err, "agent help must succeed: {agent_help}");
+    assert!(agent_help.contains("only when concrete assigned work encounters an issue"));
+    assert!(agent_help.contains("back-and-forth, routine clarification, and plan approval"));
     for marker in [
         "ws.host.exec(",
         "ws.hook.schedule(",
@@ -709,6 +749,16 @@ async fn agent_features_gate_new_sessions_only() {
         !prompt_b.contains("## Raising Attention"),
         "gated prompt must NOT contain the attentionRequests section"
     );
+    assert!(!prompt_b.contains("ws.agent.requestDiscussion"));
+    assert!(!prompt_b.contains("ws.agent.reportBlocker"));
+    assert!(!prompt_b.contains("concrete assigned work"));
+    let prompts = received_prompts(&prompt_log);
+    assert_eq!(prompts.len(), 2);
+    assert!(
+        prompts[1].contains(prompt_b),
+        "the mock agent receives the pruned prompt"
+    );
+    assert!(!prompts[1].contains("ws.agent.requestDiscussion"));
     assert!(
         prompt_b.contains("## Response Organization"),
         "ungated common sections must survive pruning"
@@ -906,6 +956,10 @@ async fn agent_features_gate_new_sessions_only() {
     let prompt_a2 = session_a2["result"]["session"]["systemPrompt"]
         .as_str()
         .expect("systemPrompt still populated for A");
+    assert_eq!(
+        prompt_a2, prompt_a,
+        "the existing session keeps its guidance"
+    );
     assert!(
         prompt_a2.contains("## Waiting on External Conditions")
             && prompt_a2.contains("## Rich Chat Rendering")

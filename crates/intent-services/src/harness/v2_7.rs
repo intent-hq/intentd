@@ -22,9 +22,9 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn v2_7_is_latest_and_keeps_v2_6_doctrine() {
+    fn v2_7_keeps_v2_6_doctrine() {
         let previous = super::super::resolve_entry("2.6");
-        let current = super::super::latest_entry();
+        let current = super::super::resolve_entry("2.7");
         assert_eq!(current.version, "2.7");
         assert!(std::ptr::eq(
             current.doctrine.instructions,

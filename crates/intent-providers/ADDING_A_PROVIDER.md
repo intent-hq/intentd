@@ -213,10 +213,11 @@ certainly needs new normalization arms:
     `OPENCODE_CONFIG_CONTENT` (`build_provider_env`, `crates/intent-providers/src/args.rs`).
   - claude-code: `disallowedTools: ["Task"]` in the `session/new` `_meta`
     (`build_session_meta`, `crates/intent-services/src/agent_session.rs`).
-  - codex: every daemon entrypoint selects
-    `npx -y @agentclientprotocol/codex-acp@1.9.0`, including persistent agents,
-    model probes, one-shot requests, and test prompts. Installed native or JS
-    `codex-acp` binaries and `providers.paths.codex` overrides are bypassed.
+  - codex: every daemon entrypoint selects the reviewed `CODEX_ACP_NPX_PACKAGE`
+    from `crates/intent-providers/src/config.rs` through `npx -y`, including
+    persistent agents, model probes, one-shot requests, and test prompts.
+    Installed native or JS `codex-acp` binaries and `providers.paths.codex`
+    overrides are bypassed.
     After all environment merges, the shared `CODEX_SUBAGENT_POLICY_CONFIG`
     policy (`crates/intent-providers/src/config.rs`) removes
     `CODEX_PATH` and replaces `CODEX_CONFIG` with

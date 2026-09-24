@@ -330,7 +330,9 @@ fn owner_row(result: &Value) -> &Value {
 }
 
 /// The documented `workspace.members.list` row keys — the shape this change
-/// leaves untouched.
+/// leaves untouched. The additive `identity` triple (protocol 10.8) is
+/// present exactly when the row is linked (`login` is a string) and absent
+/// otherwise.
 fn assert_member_row_shape(row: &Value) {
     let mut keys: Vec<&str> = row
         .as_object()
@@ -339,18 +341,35 @@ fn assert_member_row_shape(row: &Value) {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(
-        keys,
-        [
+    let linked = row["login"].is_string();
+    let expected: &[&str] = if linked {
+        &[
+            "addedAt",
+            "avatarUrl",
+            "displayName",
+            "identity",
+            "login",
+            "principalId",
+            "role",
+        ]
+    } else {
+        &[
             "addedAt",
             "avatarUrl",
             "displayName",
             "login",
             "principalId",
-            "role"
-        ],
-        "{row}"
-    );
+            "role",
+        ]
+    };
+    assert_eq!(keys, expected, "{row}");
+    if linked {
+        assert_eq!(
+            row["identity"],
+            json!({ "provider": "github", "host": "github.com", "externalUserId": OWNER_ID.to_string() }),
+            "{row}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

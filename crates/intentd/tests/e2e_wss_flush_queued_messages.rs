@@ -321,6 +321,7 @@ async fn seed_workspace_with_guest(data_dir: &Path) -> (String, intent_core::Pri
         .expect("insert ws");
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: Some("Guest User".to_string()),

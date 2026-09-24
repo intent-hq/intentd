@@ -1340,6 +1340,71 @@ fn parse_codex_models_collapse_live_1_9_0_new_model_catalog() {
 }
 
 #[test]
+fn codex_sol_and_luna_catalog_preserves_model_specific_effort_selection() {
+    use crate::agent_ops::{ensure_bare_model_matches_provider, ensure_effort_supported_by_model};
+    use crate::model_catalog::{source_for, ModelCatalogCache};
+
+    // The 1.13.1 ACP shape was captured with an authenticated account on
+    // 2026-09-24 (GPT-5.6 Sol/Luna). GPT-6 rows are fixtures: their IDs and
+    // effort sets come from Codex rust-v0.156.1 models-manager/models.json,
+    // not a claim that the test account can execute those models.
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-6-sol[low]", "name": "6 Sol (low)" },
+            { "modelId": "gpt-6-sol[medium]", "name": "6 Sol (medium)" },
+            { "modelId": "gpt-6-sol[high]", "name": "6 Sol (high)" },
+            { "modelId": "gpt-6-sol[xhigh]", "name": "6 Sol (xhigh)" },
+            { "modelId": "gpt-6-sol[max]", "name": "6 Sol (max)" },
+            { "modelId": "gpt-6-sol[ultra]", "name": "6 Sol (ultra)" },
+            { "modelId": "gpt-6-luna[low]", "name": "6 Luna (low)" },
+            { "modelId": "gpt-6-luna[medium]", "name": "6 Luna (medium)" },
+            { "modelId": "gpt-6-luna[high]", "name": "6 Luna (high)" },
+            { "modelId": "gpt-6-luna[xhigh]", "name": "6 Luna (xhigh)" },
+            { "modelId": "gpt-6-luna[max]", "name": "6 Luna (max)" }
+        ] },
+        "configOptions": [
+            { "id": "model", "category": "model", "type": "select", "options": [
+                { "value": "gpt-6-sol", "name": "6 Sol" },
+                { "value": "gpt-6-luna", "name": "6 Luna" }
+            ] }
+        ]
+    });
+    let levels = ["low", "medium", "high", "xhigh", "max", "ultra"];
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(
+        rows,
+        vec![
+            json!({ "id": "gpt-6-sol", "name": "6 Sol", "provider": "codex",
+                    "effortLevels": levels }),
+            json!({ "id": "gpt-6-luna", "name": "6 Luna", "provider": "codex",
+                    "effortLevels": levels[..5] }),
+        ]
+    );
+
+    // Drive the same catalog-backed guards used by agent creation and
+    // delegation. Sol's ultra must not leak into Luna's allowed efforts.
+    let cache = ModelCatalogCache::new(None);
+    let version = (source_for("codex").unwrap().version_key)();
+    cache.store_for_test("codex", &version, rows);
+    let reader = cache.reader(None);
+    for (model, supported) in [("gpt-6-sol", &levels[..]), ("gpt-6-luna", &levels[..5])] {
+        ensure_bare_model_matches_provider("agent.create", &reader, "codex", model).unwrap();
+        let scoped = format!("codex:{model}");
+        for effort in supported {
+            ensure_effort_supported_by_model("agent.create", &reader, Some(&scoped), effort)
+                .unwrap();
+        }
+    }
+    assert!(ensure_effort_supported_by_model(
+        "agent.create",
+        &reader,
+        Some("codex:gpt-6-luna"),
+        "ultra",
+    )
+    .is_err());
+}
+
+#[test]
 fn parse_codex_models_none_only_variant_has_no_effort_evidence() {
     let payload = json!({
         "models": { "availableModels": [

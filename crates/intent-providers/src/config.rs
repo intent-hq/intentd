@@ -44,10 +44,11 @@ pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
 
 /// Pinned npx package for every daemon-managed Codex launch. Native and
 /// arbitrary PATH adapters are not selected: their config contracts differ.
+/// intentd is the only managed pin site; updates are reviewed code changes.
 /// This adapter ignores `-c` argv and applies `CODEX_CONFIG` JSON on each
-/// thread start/resume. Its Codex dependency permits 0.153.x patch releases;
+/// thread start/resume. Its Codex dependency permits patch releases;
 /// verify actual runtime versions and policy precedence when updating the pin.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.9.0";
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.13.1";
 
 /// Daemon-owned Codex subagent denial shared by persistent agents, model
 /// probes, and one-shot launches. V2 feature enabling takes precedence over

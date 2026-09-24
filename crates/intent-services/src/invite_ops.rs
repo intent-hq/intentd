@@ -40,7 +40,8 @@ use std::time::{Duration, SystemTime};
 
 use intent_core::{
     current_caller, iso_ms_from_now, now_iso, Caller, Error, InviteErrorKind, InviteLinkEnvelope,
-    Principal, PrincipalId, Result, Workspace, WorkspaceId, WorkspaceInvite, WorkspaceRole,
+    Principal, PrincipalId, PrincipalIdentity, Result, Workspace, WorkspaceId, WorkspaceInvite,
+    WorkspaceRole,
 };
 use intent_sourcecontrol::identity_proof::ProofGistView;
 use intent_sourcecontrol::{SourceControl, UserIdentity};
@@ -200,9 +201,10 @@ fn iso_after(secs: u64) -> String {
     iso_ms_from_now(secs.saturating_mul(1000))
 }
 
-/// Map a resolved GitHub account onto a principal row (fresh or existing).
+/// Map a resolved GitHub account onto a principal row (fresh or existing):
+/// the identity triple and its `github_user_id` projection together.
 fn apply_identity(p: &mut Principal, user: &UserIdentity) {
-    p.github_user_id = user.id.and_then(|id| i64::try_from(id).ok());
+    p.set_github_user_id(user.id.and_then(|id| i64::try_from(id).ok()));
     p.login = Some(user.login.clone());
     p.display_name.clone_from(&user.name);
     p.avatar_url.clone_from(&user.avatar_url);
@@ -426,6 +428,7 @@ impl Services {
             secret_hash: hash_secret(&secret),
             secret: Some(secret.clone()),
             created_by_principal_id: creator.id.clone(),
+            pin_identity: pin_github_user_id.map(PrincipalIdentity::github),
             pin_github_user_id,
             pin_login,
             created_at: now_iso(),
@@ -885,6 +888,7 @@ impl Services {
         }
         let mut identity = Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: None,
             display_name: None,

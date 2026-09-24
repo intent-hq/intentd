@@ -416,14 +416,18 @@ impl Services {
             .iter()
             .map(|m| {
                 let p = principals.get(&m.principal_id);
-                json!({
+                let row = json!({
                     "principalId": m.principal_id,
                     "login": p.and_then(|p| p.login.clone()),
                     "displayName": p.and_then(|p| p.display_name.clone()),
                     "avatarUrl": p.and_then(|p| p.avatar_url.clone()),
                     "role": m.role,
                     "addedAt": m.added_at,
-                })
+                });
+                match p {
+                    Some(p) => crate::principal_ops::with_principal_identity(row, p),
+                    None => row,
+                }
             })
             .collect();
         Ok(json!({
@@ -732,6 +736,7 @@ mod tests {
     fn principal(login: &str) -> Principal {
         Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some(login.to_string()),
             display_name: Some(format!("{login} name")),

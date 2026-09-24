@@ -8,9 +8,9 @@ use intent_core::{
     events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientHostInfo,
     ClientId, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType,
     Error, EventActor, Hook, HookId, HookListRow, HookState, Note, NoteId, NoteMetadata,
-    NoteVersionAuthor, NoteVisibility, Principal, PrincipalId, TaskMetadata, TaskStatus, Workspace,
-    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceInvite, WorkspaceRole,
-    WorkspaceStatus,
+    NoteVersionAuthor, NoteVisibility, Principal, PrincipalId, PrincipalIdentity, TaskMetadata,
+    TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceInvite,
+    WorkspaceRole, WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -8123,6 +8123,7 @@ async fn primary_principal_is_minted_once() {
     // A second primary is rejected by the partial unique index.
     let dup = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: None,
         display_name: None,
@@ -8146,8 +8147,13 @@ async fn principals_migration_backfills_existing_workspaces() {
     let ws_b = WorkspaceId::from("ws-mig-b");
     {
         let store = Store::open(&tmp.path).await.expect("open store");
+        // 0130 re-widens the recreated `principal` (and `workspace_invite`),
+        // so it is rewound too.
         for sql in [
-            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126)",
+            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126, 130)",
+            "ALTER TABLE workspace_invite DROP COLUMN pin_identity_provider",
+            "ALTER TABLE workspace_invite DROP COLUMN pin_instance_host",
+            "ALTER TABLE workspace_invite DROP COLUMN pin_external_user_id",
             "DROP TRIGGER workspace_owner_default_ai",
             "DROP TABLE principal_credential",
             "DROP TABLE workspace_member",
@@ -8175,6 +8181,7 @@ async fn principals_migration_backfills_existing_workspaces() {
     let status = store.migration_status().await.expect("status");
     assert!(status.is_current(), "all migrations applied: {status:?}");
     let primary = store.get_primary_principal().await.expect("primary");
+    assert_eq!(primary.identity, None, "0130 re-applied on the fresh table");
     for ws in [&ws_a, &ws_b] {
         assert_eq!(
             store
@@ -8264,7 +8271,7 @@ async fn principal_upsert_links_github_identity() {
         .expect("find")
         .is_none());
 
-    primary.github_user_id = Some(42);
+    primary.set_github_user_id(Some(42));
     primary.login = Some("octocat".to_string());
     primary.display_name = Some("The Octocat".to_string());
     primary.avatar_url = Some("https://avatars.example/42".to_string());
@@ -8285,6 +8292,7 @@ async fn principal_upsert_links_github_identity() {
 
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: Some(7),
         login: Some("guest".to_string()),
         display_name: None,
@@ -8331,6 +8339,7 @@ async fn workspace_membership_add_set_role_remove() {
     }
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: Some(7),
         login: Some("guest".to_string()),
         display_name: None,
@@ -8528,6 +8537,7 @@ async fn workspace_membership_add_set_role_remove() {
     );
     let outsider = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: Some(8),
         login: Some("outsider".to_string()),
         display_name: None,
@@ -8580,6 +8590,7 @@ async fn workspace_owner_mirror_keeps_current_owner_on_promotion() {
         .expect("insert ws");
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: Some(9),
         login: Some("guest".to_string()),
         display_name: None,
@@ -8666,6 +8677,7 @@ async fn one_owner_migration_repairs_duplicate_owners_before_indexing() {
     }
     let guest = |login: &str| Principal {
         id: PrincipalId::from(format!("p-{login}")),
+        identity: None,
         github_user_id: None,
         login: Some(login.to_string()),
         display_name: None,
@@ -8781,6 +8793,7 @@ async fn workspace_membership_summaries_scoped_to_requested_ids() {
     }
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: Some(9),
         login: Some("guest".to_string()),
         display_name: None,
@@ -8974,6 +8987,7 @@ async fn list_credentialed_guest_principals_filters_primary_and_revoked() {
 
     let guest = |login: &str, github_user_id: i64, created_at: &str| Principal {
         id: PrincipalId::new(),
+        identity: Some(PrincipalIdentity::github(github_user_id)),
         github_user_id: Some(github_user_id),
         login: Some(login.to_string()),
         display_name: Some(format!("{login} name")),
@@ -9121,6 +9135,7 @@ async fn workspace_invite_secret_round_trips_and_legacy_rows_read_none() {
         secret_hash: "a".repeat(64),
         secret: Some("b".repeat(64)),
         created_by_principal_id: primary.id.clone(),
+        pin_identity: None,
         pin_github_user_id: None,
         pin_login: None,
         created_at: "2020-01-01T00:00:00.000Z".to_string(),
@@ -9182,6 +9197,7 @@ fn guest_invite(id: &str, ws: &WorkspaceId, by: &PrincipalId) -> WorkspaceInvite
         secret_hash: format!("{id:0>64}"),
         secret: None,
         created_by_principal_id: by.clone(),
+        pin_identity: None,
         pin_github_user_id: None,
         pin_login: None,
         created_at: now_iso(),
@@ -9196,6 +9212,7 @@ fn guest_invite(id: &str, ws: &WorkspaceId, by: &PrincipalId) -> WorkspaceInvite
 fn guest_identity(github_user_id: i64) -> Principal {
     Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: Some(github_user_id),
         login: Some(format!("guest-{github_user_id}")),
         display_name: None,
@@ -9442,6 +9459,218 @@ async fn invite_reusable_migration_keeps_pre_upgrade_redeemed_links_exhausted() 
     assert_eq!(pre_open.revoked_at, None);
     assert_eq!(pre_open.redemption_count, 1);
     assert!(pre_open.is_open_at(&now_iso()));
+}
+
+/// Migration 0130 backfills the identity triple on a populated database
+/// without loss: after rewinding to the 0129 schema and seeding principals
+/// and a pinned invite with `github_user_id` only, reopening the store
+/// applies the migration and every row resolves to the same principal id by
+/// the triple and by `github_user_id` (which stays populated), an unlinked
+/// row stays unlinked, the pin gains its triple, the partial unique index
+/// rejects a duplicate triple, and a gitlab triple carrying the same numeric
+/// id as a github one is a distinct, coexisting principal.
+#[tokio::test]
+async fn principal_identity_migration_backfills_github_rows() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::from("ws-identity-mig");
+    let seeded: [(&str, i64); 3] = [("p-octo", 583_231), ("p-hub", 42), ("p-mona", 7)];
+    {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let primary = store.get_primary_principal().await.expect("primary").id;
+        for sql in [
+            "DELETE FROM _sqlx_migrations WHERE version = 130",
+            "DROP INDEX principal_identity_uq",
+            "ALTER TABLE principal DROP COLUMN identity_provider",
+            "ALTER TABLE principal DROP COLUMN instance_host",
+            "ALTER TABLE principal DROP COLUMN external_user_id",
+            "ALTER TABLE workspace_invite DROP COLUMN pin_identity_provider",
+            "ALTER TABLE workspace_invite DROP COLUMN pin_instance_host",
+            "ALTER TABLE workspace_invite DROP COLUMN pin_external_user_id",
+        ] {
+            sqlx::query(sql)
+                .execute(store.write_pool())
+                .await
+                .unwrap_or_else(|e| panic!("rewind `{sql}`: {e}"));
+        }
+        store
+            .insert_workspace(&sample_workspace(&ws, "Identity", false))
+            .await
+            .expect("insert ws");
+        for (id, github_user_id) in seeded {
+            sqlx::query(
+                "INSERT INTO principal (id, github_user_id, login, is_primary, created_at, \
+                 updated_at) VALUES (?, ?, ?, 0, ?, ?)",
+            )
+            .bind(id)
+            .bind(github_user_id)
+            .bind(format!("login-{github_user_id}"))
+            .bind(now_iso())
+            .bind(now_iso())
+            .execute(store.write_pool())
+            .await
+            .expect("seed pre-0130 principal");
+        }
+        for (id, pin) in [("inv-pinned", Some(42_i64)), ("inv-open", None)] {
+            sqlx::query(
+                "INSERT INTO workspace_invite (id, workspace_id, secret_hash, \
+                 created_by_principal_id, pin_github_user_id, pin_login, created_at, \
+                 expires_at, redemption_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            )
+            .bind(id)
+            .bind(&ws.0)
+            .bind(format!("{id:0>64}"))
+            .bind(&primary.0)
+            .bind(pin)
+            .bind(pin.map(|_| "login-42"))
+            .bind(now_iso())
+            .bind("2999-01-01T00:00:00.000Z")
+            .execute(store.write_pool())
+            .await
+            .expect("seed pre-0130 invite");
+        }
+        store.close().await;
+    }
+
+    let store = Store::open(&tmp.path).await.expect("reopen applies 0130");
+    let status = store.migration_status().await.expect("status");
+    assert!(status.is_current(), "all migrations applied: {status:?}");
+
+    for (id, github_user_id) in seeded {
+        let expected = PrincipalIdentity::github(github_user_id);
+        let row = store
+            .get_principal(&PrincipalId::from(id))
+            .await
+            .expect("get");
+        assert_eq!(
+            row.identity,
+            Some(expected.clone()),
+            "{id} triple backfilled"
+        );
+        assert_eq!(
+            row.github_user_id,
+            Some(github_user_id),
+            "{id} keeps github_user_id"
+        );
+        let by_identity = store
+            .find_principal_by_identity(&expected)
+            .await
+            .expect("find by identity")
+            .map(|p| p.id);
+        let by_github = store
+            .find_principal_by_github_user_id(github_user_id)
+            .await
+            .expect("find by github id")
+            .map(|p| p.id);
+        assert_eq!(
+            by_identity,
+            Some(PrincipalId::from(id)),
+            "{id} resolves by triple"
+        );
+        assert_eq!(by_identity, by_github, "{id}: both lookups agree");
+    }
+    let primary = store.get_primary_principal().await.expect("primary");
+    assert_eq!(primary.identity, None, "an unlinked row gains no triple");
+    assert_eq!(primary.github_user_id, None);
+
+    let pinned = store
+        .get_workspace_invite("inv-pinned")
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(pinned.pin_identity, Some(PrincipalIdentity::github(42)));
+    assert_eq!(pinned.pin_github_user_id, Some(42));
+    assert!(!pinned.is_reusable());
+    let open = store
+        .get_workspace_invite("inv-open")
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(open.pin_identity, None);
+    assert!(open.is_reusable());
+
+    // The partial unique index rejects a second row with the same triple,
+    // whether it is given as the triple or as the bare github id.
+    let mut dup = guest_identity(42);
+    assert!(
+        store.upsert_principal(&dup).await.is_err(),
+        "duplicate github_user_id 42 refused"
+    );
+    dup.github_user_id = None;
+    dup.identity = Some(PrincipalIdentity::github(42));
+    assert!(
+        store.upsert_principal(&dup).await.is_err(),
+        "duplicate github triple refused"
+    );
+
+    // A gitlab account with the same numeric id is a different principal.
+    let gitlab_identity = PrincipalIdentity {
+        provider: "gitlab".to_string(),
+        host: "gitlab.com".to_string(),
+        external_user_id: "42".to_string(),
+    };
+    let gitlab = Principal {
+        id: PrincipalId::from("p-gitlab-42"),
+        identity: Some(gitlab_identity.clone()),
+        github_user_id: None,
+        login: Some("lab".to_string()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store
+        .upsert_principal(&gitlab)
+        .await
+        .expect("gitlab coexists");
+    let stored = store.get_principal(&gitlab.id).await.expect("get gitlab");
+    assert_eq!(stored, gitlab, "a non-github triple gets no github_user_id");
+    assert_eq!(
+        store
+            .find_principal_by_identity(&gitlab_identity)
+            .await
+            .expect("find")
+            .map(|p| p.id),
+        Some(gitlab.id.clone())
+    );
+    assert_eq!(
+        store
+            .find_principal_by_github_user_id(42)
+            .await
+            .expect("find")
+            .map(|p| p.id),
+        Some(PrincipalId::from("p-hub")),
+        "the github lookup still names the github principal"
+    );
+
+    // The join transaction resolves by the triple too: a gitlab identity
+    // with numeric id 42 mints its own principal rather than reusing p-hub.
+    let mut invite = guest_invite("inv-join", &ws, &primary.id);
+    invite.pin_identity = Some(gitlab_identity.clone());
+    store
+        .insert_workspace_invite(&invite)
+        .await
+        .expect("insert invite");
+    let joined = store
+        .join_workspace_by_invite("inv-join", &ws, &gitlab, "cred-lab", None, 8)
+        .await
+        .expect("join");
+    assert!(
+        matches!(joined, crate::InviteJoinOutcome::Joined(_)),
+        "gitlab join refused: {joined:?}"
+    );
+    let members: Vec<PrincipalId> = store
+        .list_workspace_members(&ws)
+        .await
+        .expect("members")
+        .into_iter()
+        .map(|m| m.principal_id)
+        .collect();
+    assert!(members.contains(&gitlab.id), "{members:?}");
+    assert!(
+        !members.contains(&PrincipalId::from("p-hub")),
+        "{members:?}"
+    );
 }
 
 /// The join transaction refuses a new collaborator once the workspace holds
@@ -9893,7 +10122,7 @@ async fn archived_workspace_refuses_member_add_invite_mint_and_join() {
         "a refused mint leaves no row"
     );
     sqlx::query(&format!(
-        "INSERT INTO workspace_invite ({}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO workspace_invite ({}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         crate::principal_repo::INVITE_COLUMNS
     ))
     .bind("smuggled")
@@ -9909,6 +10138,9 @@ async fn archived_workspace_refuses_member_add_invite_mint_and_join() {
     .bind(Option::<String>::None)
     .bind(Option::<String>::None)
     .bind(0_i64)
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
+    .bind(Option::<String>::None)
     .execute(store.write_pool())
     .await
     .expect("smuggle an open invite");

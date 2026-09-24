@@ -6534,6 +6534,7 @@ async fn collaborator_steer_runs_host_exec_through_bound_bridge_over_wss() {
     let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: Some("Guest User".to_string()),
@@ -9718,6 +9719,7 @@ async fn workspace_create_by_collaborator_is_forbidden_over_wss() {
     let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: Some("Guest User".to_string()),
@@ -16334,7 +16336,7 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
         );
         assert_eq!(
             argv.iter()
-                .filter(|arg| **arg == "@agentclientprotocol/codex-acp@1.9.0")
+                .filter(|arg| **arg == intent_providers::CODEX_ACP_NPX_PACKAGE)
                 .count(),
             1,
             "each launch must use the selected adapter exactly once: {argv:?}"

@@ -12098,6 +12098,7 @@ mod change_event_parity {
             is_primary: false,
             created_at: now_iso(),
             updated_at: now_iso(),
+            identity: None,
         };
         h.store.upsert_principal(&p).await.expect("principal");
         p.id
@@ -12124,6 +12125,7 @@ mod change_event_parity {
             created_by_principal_id: primary.id,
             pin_github_user_id: None,
             pin_login: None,
+            pin_identity: None,
             created_at: now_iso(),
             expires_at: intent_core::iso_ms_from_now(3_600_000),
             redeemed_at: None,

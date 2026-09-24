@@ -646,12 +646,23 @@
 //! carries the union. An `image` block gains `width?` / `height?` (the
 //! original's intrinsic dimensions, kept by the slim projection). Both are
 //! computed on the write path and stored; no method-catalog change.
+//!
+//! Version 10.8 is an additive minor bump over 10.7: the provider-neutral
+//! identity key. Every projected principal gains an optional `identity:
+//! { provider, host, externalUserId }` object (`principal.list` rows
+//! alongside the kept `githubUserId`; a github.com account carries both,
+//! `identity.externalUserId` being the decimal `githubUserId`), and a
+//! pinned invite gains the matching optional `pinIdentity` next to the kept
+//! `pinGithubUserId` / `pinLogin`. Identities are stored and resolved by
+//! the triple (`0130_principal_identity`), so an account on another
+//! provider or host with the same numeric id is a distinct principal.
+//! No method, error or event is added; the catalog is unchanged.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.7";
+pub const PROTOCOL_VERSION: &str = "10.8";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

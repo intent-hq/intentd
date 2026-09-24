@@ -917,7 +917,7 @@ mod build_args_tests {
                     [
                         NPX_NO_WORKSPACES_ARG,
                         "-y",
-                        "@agentclientprotocol/codex-acp@1.9.0"
+                        intent_providers::CODEX_ACP_NPX_PACKAGE
                     ],
                     "model={model:?}, effort={effort:?}"
                 );
