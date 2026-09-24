@@ -268,9 +268,10 @@ pub(crate) fn one_shot_launch(
         OneShotCommand::npx(npx?, pkg).args(args)
     };
     if provider.id == "codex" {
-        if via_npx {
-            cmd = cmd.codex_runtime(intent_providers::codex::host_codex_path().as_deref());
-        }
+        cmd = cmd.codex_runtime(
+            intent_providers::codex::host_codex_path().as_deref(),
+            via_npx,
+        );
         // Share persistent-session mode policy without importing unrelated
         // provider env defaults. Explicit inherited modes remain untouched.
         if let Some(mode) = intent_providers::build_provider_env_for_spawn(
@@ -1121,23 +1122,11 @@ rl.on('line', (line) => {
             let runtime = cmd.env_vars().iter().find(|(key, _)| key == "CODEX_PATH");
             assert_eq!(
                 runtime.map(|(_, value)| value.as_os_str()),
-                host.as_deref()
-                    .filter(|_| via_npx)
-                    .map(std::path::Path::as_os_str)
+                host.as_deref().map(std::path::Path::as_os_str)
             );
             let removed: Vec<_> = cmd.removed_env_vars().iter().map(String::as_str).collect();
-            assert_eq!(
-                removed,
-                if via_npx {
-                    if host.is_some() {
-                        vec!["CODEX_CONFIG"]
-                    } else {
-                        vec!["CODEX_CONFIG", "CODEX_PATH"]
-                    }
-                } else {
-                    vec![]
-                }
-            );
+            assert_eq!(removed.contains(&"CODEX_CONFIG"), via_npx);
+            assert_eq!(removed.contains(&"CODEX_PATH"), host.is_none());
         }
         for id in intent_providers::all_provider_ids()
             .into_iter()

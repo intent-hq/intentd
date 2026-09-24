@@ -645,12 +645,12 @@ fn build_command_in(
         cmd.env(key, value);
     }
 
-    // Apply runtime selection after all env merges. Explicit adapter overrides
-    // retain control of their own runtime and configuration.
-    if opts.provider.id == "codex" && via_npx {
+    // Select the host runtime after env merging, independently of which adapter won.
+    if opts.provider.id == "codex" {
         intent_providers::codex::configure_runtime(
             cmd.as_std_mut(),
             intent_providers::codex::host_codex_path().as_deref(),
+            via_npx,
         );
     }
 
@@ -1273,14 +1273,15 @@ mod build_command_tests {
 
     #[test]
     fn build_command_prefers_provider_binary_over_npx_fallback() {
-        // An explicit adapter override wins over the managed package.
+        // Uses codex (a fallback-npx provider) — claude-code only resolves a
+        // provider binary from an explicit override (monorepo#4352).
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let provider_binary = PathBuf::from("/custom/codex-acp");
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.provider_binary = Some(&provider_binary);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.npx_only_package;
+        opts.npx_fallback_package = provider.fallback_npx_package;
         let cmd = build_command(&opts);
         let program = cmd.as_std().get_program();
         // Should use provider_binary, not npx
@@ -1320,7 +1321,7 @@ mod build_command_tests {
         let mut opts = SpawnOptions::new(codex);
         opts.cwd = Some(&workspace);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = codex.npx_only_package;
+        opts.npx_fallback_package = codex.fallback_npx_package;
         assert!(opts.via_npx());
         let cmd = build_command(&opts);
         assert_ne!(
@@ -1344,7 +1345,7 @@ mod build_command_tests {
         opts.cwd = Some(&workspace);
         opts.provider_binary = Some(&resolved);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = codex.npx_only_package;
+        opts.npx_fallback_package = codex.fallback_npx_package;
         assert!(!opts.via_npx());
         let cmd = build_command(&opts);
         assert_eq!(cmd.as_std().get_current_dir(), Some(workspace.as_path()));
@@ -1415,11 +1416,11 @@ mod build_command_tests {
     }
 
     #[test]
-    fn codex_managed_npx_package_is_pinned() {
+    fn codex_fallback_npx_package_is_pinned() {
         let provider = intent_providers::find_provider("codex").unwrap();
         let pkg = provider
-            .npx_only_package
-            .expect("codex should have npx_only_package configured");
+            .fallback_npx_package
+            .expect("codex should have fallback_npx_package configured");
         assert_eq!(pkg, intent_providers::config::CODEX_ACP_NPX_PACKAGE);
         assert!(
             pkg.starts_with("@agentclientprotocol/codex-acp@"),
@@ -1459,7 +1460,7 @@ mod build_command_tests {
             let mut opts = SpawnOptions::new(provider);
             opts.provider_binary = (!via_npx).then_some(provider_binary.as_path());
             opts.npx_fallback_binary = Some(&npx_path);
-            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_fallback_package = provider.fallback_npx_package;
             let cmd = build_command(&opts);
             // Provider tests cover each inherited value hermetically. Here
             // inspect the real command without mutating process-global env.
@@ -1496,7 +1497,7 @@ mod build_command_tests {
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.npx_only_package;
+        opts.npx_fallback_package = provider.fallback_npx_package;
         let cmd = build_command(&opts);
         let node_options = env_value(&cmd, "NODE_OPTIONS");
         if std::env::var("NODE_OPTIONS").is_ok_and(|v| v.contains("--max-old-space-size")) {
@@ -1554,7 +1555,7 @@ mod build_command_tests {
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.provider_binary = Some(&provider_binary);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.npx_only_package;
+        opts.npx_fallback_package = provider.fallback_npx_package;
         let cmd = build_command(&opts);
         assert!(
             env_value(&cmd, "NODE_OPTIONS").is_none(),
@@ -1563,13 +1564,12 @@ mod build_command_tests {
     }
 
     #[test]
-    fn build_command_selects_host_codex_on_managed_spawn() {
-        // Managed launches select the host runtime and discard inherited config.
+    fn build_command_selects_host_codex_on_npx_fallback_spawn() {
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.npx_only_package;
+        opts.npx_fallback_package = provider.fallback_npx_package;
         let cmd = build_command(&opts);
         assert_eq!(
             env_value(&cmd, "CODEX_PATH"),
@@ -1582,24 +1582,23 @@ mod build_command_tests {
     }
 
     #[test]
-    fn build_command_keeps_codex_env_for_resolved_binary_spawn() {
-        // A resolved codex-acp binary (providers.paths override or PATH scan)
-        // is the user's escape hatch — its env must be left untouched.
+    fn build_command_selects_host_codex_for_resolved_adapter() {
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let provider_binary = PathBuf::from("/custom/codex-acp");
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.provider_binary = Some(&provider_binary);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.npx_only_package;
+        opts.npx_fallback_package = provider.fallback_npx_package;
         let cmd = build_command(&opts);
-        let touched = cmd
-            .as_std()
-            .get_envs()
-            .any(|(k, _)| k == "CODEX_PATH" || k == "CODEX_CONFIG");
+        let touched = cmd.as_std().get_envs().any(|(k, _)| k == "CODEX_CONFIG");
         assert!(
             !touched,
-            "resolved-binary codex spawn must inherit CODEX_PATH/CODEX_CONFIG untouched"
+            "resolved adapter must inherit CODEX_CONFIG untouched"
+        );
+        assert_eq!(
+            env_value(&cmd, "CODEX_PATH"),
+            intent_providers::codex::host_codex_path().map(|p| p.to_string_lossy().into_owned())
         );
     }
 
@@ -1670,7 +1669,7 @@ mod build_command_tests {
         let codex = intent_providers::find_provider("codex").unwrap();
         for (provider, package) in [
             (claude, claude.npx_only_package),
-            (codex, codex.npx_only_package),
+            (codex, codex.fallback_npx_package),
         ] {
             let mut opts = SpawnOptions::new(provider);
             opts.npx_fallback_binary = Some(&npx_path);
@@ -1722,7 +1721,7 @@ mod build_command_tests {
         let mut resolved = SpawnOptions::new(codex);
         resolved.provider_binary = Some(&provider_binary);
         resolved.npx_fallback_binary = Some(&npx_path);
-        resolved.npx_fallback_package = codex.npx_only_package;
+        resolved.npx_fallback_package = codex.fallback_npx_package;
         let auggie = intent_providers::find_provider("auggie").unwrap();
         let bare = SpawnOptions::new(auggie);
         for mut opts in [resolved, bare] {
@@ -1855,7 +1854,7 @@ mod captured_env_tests {
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.npx_only_package;
+        opts.npx_fallback_package = provider.fallback_npx_package;
         let mut captured = BTreeMap::new();
         captured.insert("CODEX_PATH".to_string(), "/tmp/evil".to_string());
         captured.insert("CODEX_CONFIG".to_string(), "/tmp/evil.toml".to_string());

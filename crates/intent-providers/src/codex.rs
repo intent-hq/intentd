@@ -1,4 +1,4 @@
-//! Runtime selection for the managed Codex ACP adapter.
+//! Host runtime selection independent of Codex ACP adapter selection.
 
 use std::path::{Path, PathBuf};
 
@@ -10,8 +10,10 @@ pub fn host_codex_path() -> Option<PathBuf> {
 
 /// Replace inherited overrides with the selected host runtime, or the adapter's
 /// bundled fallback when Codex is absent. Never trust inherited `CODEX_PATH`.
-pub fn configure_runtime(command: &mut std::process::Command, host: Option<&Path>) {
-    command.env_remove("CODEX_CONFIG");
+pub fn configure_runtime(command: &mut std::process::Command, host: Option<&Path>, managed: bool) {
+    if managed {
+        command.env_remove("CODEX_CONFIG");
+    }
     if let Some(path) = host {
         command.env("CODEX_PATH", path);
     } else {
@@ -44,7 +46,7 @@ mod tests {
         for host in [Some(Path::new("/host with spaces/codex")), None] {
             command.env("CODEX_PATH", "/stale/codex");
             command.env("CODEX_CONFIG", "untrusted");
-            configure_runtime(&mut command, host);
+            configure_runtime(&mut command, host, true);
             let env = command
                 .get_envs()
                 .collect::<std::collections::BTreeMap<_, _>>();
@@ -54,6 +56,25 @@ mod tests {
             );
             assert_eq!(env[std::ffi::OsStr::new("CODEX_CONFIG")], None);
         }
+    }
+
+    #[test]
+    fn installed_adapter_uses_host_runtime_and_keeps_its_configuration() {
+        let mut command = std::process::Command::new("adapter");
+        command.env("CODEX_PATH", "/stale/codex");
+        command.env("CODEX_CONFIG", "custom-config");
+        configure_runtime(&mut command, Some(Path::new("/host/codex")), false);
+        let env = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            env[std::ffi::OsStr::new("CODEX_PATH")],
+            Some(std::ffi::OsStr::new("/host/codex"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("CODEX_CONFIG")],
+            Some(std::ffi::OsStr::new("custom-config"))
+        );
     }
 
     #[test]

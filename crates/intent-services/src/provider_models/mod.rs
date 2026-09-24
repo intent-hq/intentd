@@ -11,8 +11,13 @@
 //! Sources:
 //! - `claude-code` — ACP probe via the pinned npx adapter
 //!   ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
-//! - `codex` — pinned ACP adapter using the host Codex CLI when installed.
-//!   Base models carry reasoning levels as `effortLevels`.
+//! - `codex` — ACP probe via a resolved `codex-acp` binary, falling back to
+//!   the pinned npx package. Base models with reasoning-effort support carry
+//!   their levels as `effortLevels` (parity with the FE). The FE
+//!   additionally tries a `codex app-server` transport first, but that path
+//!   exists to reuse its Electron-managed codex runtime; daemon-side the
+//!   codex-acp probe reaches the same catalog (codex-acp itself queries the
+//!   codex CLI), so probe-only is sufficient here.
 //! - `pi` — ACP probe via the pinned npx adapter
 //!   ([`intent_providers::PI_ACP_NPX_PACKAGE`]).
 //! - `droid` — ACP probe via a resolved `droid` binary
@@ -217,8 +222,8 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
     )
 }
 
-/// Codex: managed ACP adapter with the host CLI, or its bundled fallback.
-/// Effort-capable base models carry `effortLevels` on one row.
+/// codex: ACP probe via a resolved `codex-acp` binary, else the pinned npx
+/// fallback. Effort-capable base models carry `effortLevels` on one row.
 ///
 /// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
 /// dir, removed after the probe) so the user's `~/.codex/config.toml` — and
@@ -229,12 +234,13 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
 /// model appears in the reported catalog.
 pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
     let Some(cmd) = codex_probe_launch(
+        find_provider_binary("codex", "codex-acp", None),
         find_npx(),
         intent_providers::codex::host_codex_path().as_deref(),
     ) else {
         return ProviderModelsFetch::unavailable(
             "codex",
-            "npx unavailable for the managed Codex adapter",
+            "codex-acp binary not found and npx unavailable for the pinned fallback",
         );
     };
     let (cmd, codex_home) = match with_isolated_codex_home(cmd) {
@@ -251,12 +257,20 @@ pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
     finish("codex", outcome)
 }
 
-/// Managed probes use the same host runtime as managed sessions.
-fn codex_probe_launch(npx: Option<PathBuf>, host: Option<&Path>) -> Option<AcpProbeCommand> {
-    npx.map(|npx| {
-        AcpProbeCommand::npx(npx, intent_providers::config::CODEX_ACP_NPX_PACKAGE)
-            .codex_runtime(host)
-    })
+/// Preserve adapter precedence while both launch paths use the host Codex runtime.
+fn codex_probe_launch(
+    resolved_bin: Option<PathBuf>,
+    npx: Option<PathBuf>,
+    host: Option<&Path>,
+) -> Option<AcpProbeCommand> {
+    if let Some(bin) = resolved_bin {
+        Some(AcpProbeCommand::binary(bin, Vec::new()).codex_runtime(host, false))
+    } else {
+        npx.map(|npx| {
+            AcpProbeCommand::npx(npx, intent_providers::config::CODEX_ACP_NPX_PACKAGE)
+                .codex_runtime(host, true)
+        })
+    }
 }
 
 /// Attach a freshly created isolated `CODEX_HOME` to an ephemeral codex

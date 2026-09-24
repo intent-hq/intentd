@@ -237,16 +237,27 @@ fn claude_code_version() -> String {
     intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE.to_string()
 }
 
-/// Codex source: managed ACP adapter using the host runtime when installed.
+/// codex source: ACP probe via a resolved `codex-acp` binary, else the pinned
+/// npx fallback.
 fn codex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     provider_models_fetch("codex")
 }
 
-/// Invalidate the catalog when either the adapter or host runtime changes.
+/// codex is pinned only when the probe falls back to the npx adapter; a
+/// resolved `codex-acp` binary has no pin (mirrors the fetch dispatch in
+/// [`crate::provider_models::fetch_codex_models`]). The binary is resolved
+/// here and again inside the fetch — intentionally independent: the two
+/// resolutions are milliseconds apart, so at worst an install/uninstall
+/// mid-request stores one cache entry under the other branch's key, which
+/// the next request's key mismatch simply treats as a miss.
 fn codex_version() -> String {
+    let adapter = if intent_providers::find_provider_binary("codex", "codex-acp", None).is_some() {
+        String::new()
+    } else {
+        intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
+    };
     format!(
-        "{}:{}",
-        intent_providers::config::CODEX_ACP_NPX_PACKAGE,
+        "{adapter}:{}",
         intent_providers::codex::runtime_cache_key(
             intent_providers::codex::host_codex_path().as_deref()
         )
@@ -495,7 +506,7 @@ impl ModelCatalogReader<'_> {
     /// entry, or a catalog with no marked row all return `None` (the provider
     /// CLI default applies). The registry version-key function runs only when
     /// a cached entry with a marked row exists — for codex it resolves the
-    /// `codex` binary (an enhanced-PATH scan whose first call can block on
+    /// `codex-acp` binary (an enhanced-PATH scan whose first call can block on
     /// the login-shell PATH capture), a cost the cold-cache fall-through must
     /// not pay; it also runs outside the cache lock so a slow first capture
     /// never stalls other cache readers.

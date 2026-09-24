@@ -432,7 +432,16 @@ fn seed_catalog_workspace(dir: &Path) {
 }
 
 #[tokio::test]
-async fn codex_models_use_host_runtime_and_refresh_after_host_upgrade() {
+async fn pinned_codex_adapter_refreshes_models_after_host_cli_upgrade() {
+    codex_host_upgrade(false).await;
+}
+
+#[tokio::test]
+async fn installed_codex_adapter_refreshes_models_after_host_cli_upgrade() {
+    codex_host_upgrade(true).await;
+}
+
+async fn codex_host_upgrade(installed_adapter: bool) {
     use std::os::unix::fs::PermissionsExt;
     let Some(script) = gate("WSS host Codex E2E") else {
         return;
@@ -444,10 +453,19 @@ async fn codex_models_use_host_runtime_and_refresh_after_host_upgrade() {
     std::fs::create_dir_all(&home).unwrap();
     let report = data.path().join("runtime-report");
     let npx = write_fake_npx(&bin, &report, &script);
-    std::fs::write(&npx, format!(
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 10.9.2; exit 0; fi\nprintf '%s\\n' \"$CODEX_PATH\" >> '{}'\n[ -z \"${{CODEX_CONFIG+x}}\" ] || exit 9\nexec \"$CODEX_PATH\" app-server\n",
-        report.display()
-    )).unwrap();
+    let adapter_script = format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 10.9.2; exit 0; fi\nprintf '%s\\n' \"$CODEX_PATH\" >> '{}'\n{}\nexec \"$CODEX_PATH\" app-server\n",
+        report.display(),
+        if installed_adapter { "[ \"$CODEX_CONFIG\" = 'custom config' ] || exit 9" } else { "[ -z \"${CODEX_CONFIG+x}\" ] || exit 9" }
+    );
+    if installed_adapter {
+        let adapter = bin.join("codex-acp");
+        std::fs::write(&adapter, &adapter_script).unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&npx, "#!/bin/sh\nexit 99\n").unwrap();
+    } else {
+        std::fs::write(&npx, &adapter_script).unwrap();
+    }
     let node = intent_providers::resolve_on_path("node").unwrap();
     let codex = bin.join("codex");
     let install = |model: &str| {
@@ -466,9 +484,6 @@ async fn codex_models_use_host_runtime_and_refresh_after_host_upgrade() {
         std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
     };
     install("host-original");
-    let stale = bin.join("codex-acp");
-    std::fs::write(&stale, "#!/bin/sh\nexit 99\n").unwrap();
-    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!("{}:/usr/bin:/bin", bin.display());
     let child = spawn_serve(
         data.path(),
@@ -478,7 +493,7 @@ async fn codex_models_use_host_runtime_and_refresh_after_host_upgrade() {
             ("HOME", home.to_str().unwrap()),
             ("SHELL", "/bin/sh"),
             ("CODEX_PATH", "/stale/override"),
-            ("CODEX_CONFIG", "invalid json"),
+            ("CODEX_CONFIG", "custom config"),
         ],
     );
     let socket = data.path().join("intentd.sock");

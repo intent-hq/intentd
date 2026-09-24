@@ -275,9 +275,9 @@ impl AcpAdapterCommand {
         self
     }
 
-    pub(crate) fn codex_runtime(mut self, host: Option<&Path>) -> Self {
+    pub(crate) fn codex_runtime(mut self, host: Option<&Path>, managed: bool) -> Self {
         let mut command = std::process::Command::new(&self.program);
-        intent_providers::codex::configure_runtime(&mut command, host);
+        intent_providers::codex::configure_runtime(&mut command, host, managed);
         for (key, value) in command.get_envs() {
             let key = key.to_string_lossy().into_owned();
             self = match value {
