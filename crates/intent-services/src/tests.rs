@@ -23394,8 +23394,7 @@ pub(crate) mod pr {
     }
 
     /// A paused PR-refresh tick whose probe reports the quota recovered
-    /// lifts the pause and refreshes in the SAME tick: the forge is called
-    /// again (here re-tripping the limit, which re-pauses — a fresh window).
+    /// lifts the pause and successfully refreshes in the SAME tick.
     #[tokio::test]
     async fn pr_refresh_sweep_lifts_the_pause_early_when_the_quota_recovered() {
         let tmp = TempDb::new();
@@ -23411,7 +23410,7 @@ pub(crate) mod pr {
         let sc = Arc::new(StubForge {
             rate_limited: true,
             rate_limit_reset: Some(u64::MAX / 2),
-            rate_limit_remaining: Some(5_000),
+            rate_limit_remaining: Some(0),
             rate_limit_limit: Some(5_000),
             ..Default::default()
         });
@@ -23420,21 +23419,27 @@ pub(crate) mod pr {
         svc.refresh_all_workspace_prs(0).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
-        let first_deadline = svc.sweep_rate_limit_paused_until().unwrap();
+        assert!(svc.sweeps_rate_limited(), "exhaustion opened the pause");
 
-        // Tick 1: the early-lift probe reports a full window → the gate
-        // lifts and the workspace is refreshed in this tick; its fetch trips
-        // the limit again, opening a NEW window (its own reset probe).
+        // Keep the service and its existing gate, but let the forge report
+        // a genuinely recovered window and successful PR reads on tick 1.
+        let recovered = Arc::new(StubForge {
+            rate_limit_remaining: Some(5_000),
+            rate_limit_limit: Some(5_000),
+            ..Default::default()
+        });
+        let svc = svc.with_source_control(recovered.clone());
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(
-            sc.seen_get_pr.lock().unwrap().len(),
-            2,
+            *recovered.seen_get_pr.lock().unwrap(),
+            vec![42],
             "the lifted tick refreshes instead of skipping"
         );
-        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 3);
-        assert!(
-            svc.sweep_rate_limit_paused_until().unwrap() >= first_deadline,
-            "the re-trip opened a fresh window"
+        assert_eq!(*recovered.seen_reset_probes.lock().unwrap(), 1);
+        assert!(!svc.sweeps_rate_limited(), "successful recovery stays open");
+        assert_eq!(
+            svc.store().get_workspace(&ws_id).await.unwrap().pr_status,
+            Some(intent_core::PullRequestStatus::Open)
         );
     }
 
