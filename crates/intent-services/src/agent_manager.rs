@@ -4243,7 +4243,7 @@ impl AgentManager {
     /// Legacy Codex slash ids retain their existing parsing. Bracket ids
     /// split only for recognized catalog effort levels; arbitrary/malformed
     /// brackets must reach the adapter unchanged and be rejected there.
-    fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
+    pub(crate) fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
         if let Some((base, effort)) = model.split_once('/') {
             return (base, Some(effort));
         }
@@ -4263,7 +4263,7 @@ impl AgentManager {
     /// The explicit field is canonical. Embedded legacy Codex effort is a
     /// fallback only when that field is absent/empty, both at startup and
     /// when reusing a child; otherwise reuse would reset suffix-only effort.
-    fn session_model_effort(
+    pub(crate) fn session_model_effort(
         provider: &ProviderConfig,
         model: Option<&str>,
         explicit: Option<&str>,

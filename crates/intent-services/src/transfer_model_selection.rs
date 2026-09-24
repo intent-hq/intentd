@@ -77,6 +77,18 @@ fn selection_unavailable(
     let explicit_model = model
         .map(|m| m.split_once(':').map_or(m, |(_, bare)| bare))
         .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace) && *m != "default");
+    // Reuse spawn's provider-specific legacy effort interpretation, including
+    // explicit-field precedence. Other providers may use slash model ids.
+    let config = intent_providers::provider_config(provider);
+    let effort =
+        crate::agent_manager::AgentManager::session_model_effort(config, explicit_model, effort);
+    let explicit_model = explicit_model.map(|model| {
+        if config.config_option_model_strips_effort {
+            crate::agent_manager::AgentManager::split_codex_model_effort(model).0
+        } else {
+            model
+        }
+    });
     if let Some(model) = explicit_model {
         if cache.cached_catalog_claims(provider, model) == Some(false) {
             return Err(intent_core::Error::InvalidParams(format!(
@@ -84,7 +96,7 @@ fn selection_unavailable(
             )));
         }
     }
-    if let Some(effort) = effort.filter(|e| !e.trim().is_empty()) {
+    if let Some(effort) = effort.as_deref() {
         let default_model = catalog
             .iter()
             .find(|row| row.get("isDefault").and_then(Value::as_bool) == Some(true))

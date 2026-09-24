@@ -2392,6 +2392,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_selection_codex_legacy_slash_effort_survives() {
+        assert_imported_codex_legacy_selection("gpt-6-astra/low", None, "low").await;
+    }
+
+    #[tokio::test]
+    async fn import_selection_codex_legacy_bracket_effort_survives() {
+        for model in ["gpt-6-astra[low]", "gpt-6-astra[LOW]"] {
+            assert_imported_codex_legacy_selection(model, None, "low").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_codex_legacy_explicit_effort_overrides_suffix() {
+        for model in [
+            "gpt-6-astra/high",
+            "gpt-6-astra[high]",
+            "gpt-6-astra/medium",
+            "gpt-6-astra[medium]",
+        ] {
+            assert_imported_codex_legacy_selection(model, Some("low"), "low").await;
+        }
+    }
+
+    async fn assert_imported_codex_legacy_selection(
+        model: &str,
+        explicit_effort: Option<&str>,
+        effective_effort: &str,
+    ) {
+        let (svc, _root, _assets) = selection_fixture().await;
+        let session = import_selection(
+            &svc,
+            serde_json::json!({
+                "provider":"codex", "model":model, "reasoning_effort":explicit_effort
+            }),
+        )
+        .await;
+        let rows = svc
+            .store
+            .transfer_export_rows(&session.workspace_id)
+            .await
+            .unwrap();
+        let stored = &rows
+            .iter()
+            .find(|(table, _)| table == "agent_session")
+            .unwrap()
+            .1[0];
+        assert_eq!(stored["provider"], "codex");
+        assert_eq!(stored["model"], model);
+        assert_eq!(stored["reasoning_effort"].as_str(), explicit_effort);
+        assert_eq!(session.provider.as_deref(), Some("codex"));
+        assert_eq!(session.model.as_deref(), Some(model));
+        assert_eq!(session.reasoning_effort.as_deref(), explicit_effort);
+        assert!(session.effort_levels.is_none());
+        assert!(session.attention_request_kind.is_none());
+        assert_eq!(
+            crate::agent_manager::imported_spawn_selection_for_test(
+                &session,
+                &svc.effective_settings()
+            ),
+            (
+                "codex".into(),
+                Some("gpt-6-astra".into()),
+                Some(effective_effort.into())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn import_selection_codex_legacy_unsupported_embedded_effort_falls_back() {
+        for model in ["gpt-6-astra/medium", "gpt-6-astra[medium]"] {
+            let (svc, _root, _assets) = selection_fixture().await;
+            let session = import_selection(
+                &svc,
+                serde_json::json!({
+                    "provider":"codex", "model":model, "reasoning_effort":null
+                }),
+            )
+            .await;
+            assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_non_codex_slash_model_is_not_effort() {
+        let (svc, _root, _assets) = selection_fixture().await;
+        let model = "gpt-6-astra/low";
+        seed_selection_catalog(
+            &svc,
+            "auggie",
+            model,
+            crate::model_catalog::ModelCatalogCache::now_ms(),
+        );
+        let session = import_selection(
+            &svc,
+            serde_json::json!({
+                "provider":"auggie", "model":model, "reasoning_effort":null
+            }),
+        )
+        .await;
+        assert_selection(&svc, &session, "auggie", Some(model), None);
+    }
+
+    #[tokio::test]
     async fn import_selection_disabled_legacy_prefix_replaces_conflicting_provider() {
         let (svc, _root, _assets) = selection_fixture().await;
         svc.settings_registry()
