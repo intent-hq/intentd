@@ -40,6 +40,50 @@ async fn fresh_services(db_root: &Path, workspaces_root: &Path, assets_root: &Pa
         .with_assets_root(assets_root.to_path_buf())
 }
 
+/// [`fresh_services`] with a settings registry whose `model.defaultProvider`
+/// is `default_provider` — the two stacks of the round trip deliberately
+/// disagree on it (intent-hq/intent#5815).
+async fn fresh_services_with_default_provider(
+    db_root: &Path,
+    workspaces_root: &Path,
+    assets_root: &Path,
+    default_provider: &str,
+) -> Services {
+    let registry = std::sync::Arc::new(
+        crate::SettingsRegistry::load(db_root.join("config.toml")).expect("load registry"),
+    );
+    registry
+        .apply(&[
+            (
+                "providers.paths".to_string(),
+                serde_json::json!({
+                    "auggie": std::env::current_exe().unwrap(),
+                    "claude-code": std::env::current_exe().unwrap()
+                }),
+            ),
+            (
+                "model.defaultProvider".to_string(),
+                serde_json::json!(default_provider),
+            ),
+            (
+                "model.default".to_string(),
+                serde_json::json!(format!("{default_provider}-settings-default")),
+            ),
+            (
+                "model.providerDefaults".to_string(),
+                serde_json::json!({default_provider: format!("{default_provider}-settings-model")}),
+            ),
+            (
+                "model.defaultReasoningEffort".to_string(),
+                serde_json::json!("low"),
+            ),
+        ])
+        .expect("apply settings");
+    fresh_services(db_root, workspaces_root, assets_root)
+        .await
+        .with_settings_registry(registry)
+}
+
 fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSession {
     AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -199,6 +243,11 @@ struct Seeded {
 const AGENT_LIVE: &str = "agent-live";
 const AGENT_IDLE: &str = "agent-idle";
 const AGENT_SB: &str = "agent-sb";
+/// The source stack's `model.defaultProvider`; the target's is
+/// [`TARGET_DEFAULT_PROVIDER`], so an unpinned selection would re-resolve.
+const SOURCE_DEFAULT_PROVIDER: &str = "auggie";
+const TARGET_DEFAULT_PROVIDER: &str = "codex";
+const SOURCE_MODEL: &str = "gpt6-astra";
 
 /// Seed the source stack with the full transfer inventory: two notes, three
 /// agents (one in-flight with nulled-on-import session ids, one with message
@@ -276,14 +325,28 @@ async fn seed_source(
         .insert_agent_session(&live_session)
         .await
         .expect("live session");
+    // Next-turn selections (intent-hq/intent#5815): the idle agent inherits
+    // the source default provider with an explicit model + effort and one
+    // committed turn; the sandbox owner picked its provider explicitly; the
+    // live agent is all-Auto.
     let idle = AgentId::from(AGENT_IDLE);
+    let mut idle_session = session(&idle, id, AgentStatus::RuntimeIdle);
+    idle_session.model = Some(SOURCE_MODEL.to_string());
+    idle_session.reasoning_effort = Some("high".to_string());
     svc.store
-        .insert_agent_session(&session(&idle, id, AgentStatus::RuntimeIdle))
+        .insert_agent_session(&idle_session)
         .await
         .expect("idle session");
-    let sb_agent = AgentId::from(AGENT_SB);
     svc.store
-        .insert_agent_session(&session(&sb_agent, id, AgentStatus::RuntimeIdle))
+        .set_agent_session_last_turn_model(id, &idle, Some(SOURCE_MODEL), SOURCE_DEFAULT_PROVIDER)
+        .await
+        .expect("idle last turn");
+    let sb_agent = AgentId::from(AGENT_SB);
+    let mut sb_session = session(&sb_agent, id, AgentStatus::RuntimeIdle);
+    sb_session.provider = Some("claude-code".to_string());
+    sb_session.model = Some("claude-fable-5".to_string());
+    svc.store
+        .insert_agent_session(&sb_session)
         .await
         .expect("sb session");
 
@@ -545,8 +608,20 @@ async fn transfer_round_trip_between_two_stacks() {
     let dst_db = TempDir::new("rt-dst-db");
     let dst_ws_root = TempDir::new("rt-dst-ws");
     let dst_assets_root = TempDir::new("rt-dst-assets");
-    let source = fresh_services(&src_db.0, &src_ws_root.0, &src_assets_root.0).await;
-    let target = fresh_services(&dst_db.0, &dst_ws_root.0, &dst_assets_root.0).await;
+    let source = fresh_services_with_default_provider(
+        &src_db.0,
+        &src_ws_root.0,
+        &src_assets_root.0,
+        SOURCE_DEFAULT_PROVIDER,
+    )
+    .await;
+    let target = fresh_services_with_default_provider(
+        &dst_db.0,
+        &dst_ws_root.0,
+        &dst_assets_root.0,
+        TARGET_DEFAULT_PROVIDER,
+    )
+    .await;
 
     let id = WorkspaceId("ws-roundtrip".to_string());
     let seeded = seed_source(&source, &src_ws_root.0, &src_assets_root.0, &id).await;
@@ -665,6 +740,53 @@ async fn transfer_round_trip_between_two_stacks() {
     assert_eq!(interrupted.len(), 1);
     assert_eq!(interrupted[0].agent_id.0, AGENT_LIVE);
     assert_eq!(interrupted[0].prev_status, "active");
+
+    // ---- next-turn selections survive the default-provider mismatch ---------
+    // (intent-hq/intent#5815) The target defaults to another provider; every
+    // session still carries the selection it had on the source.
+    assert_eq!(
+        live.provider.as_deref(),
+        Some(SOURCE_DEFAULT_PROVIDER),
+        "all-Auto session pinned to its source provider"
+    );
+    assert_eq!(live.model, None, "Auto model stays Auto");
+    assert_eq!(live.reasoning_effort, None);
+    let idle = target
+        .store
+        .get_agent_session(&AgentId::from(AGENT_IDLE))
+        .await
+        .expect("idle session on target");
+    assert_eq!(idle.provider.as_deref(), Some(SOURCE_DEFAULT_PROVIDER));
+    assert_eq!(idle.model.as_deref(), Some(SOURCE_MODEL));
+    assert_eq!(idle.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        target
+            .store
+            .get_agent_session_last_turn_model(&id, &AgentId::from(AGENT_IDLE))
+            .await
+            .expect("idle last turn on target"),
+        (
+            Some(SOURCE_MODEL.to_string()),
+            Some(SOURCE_DEFAULT_PROVIDER.to_string())
+        ),
+        "last-turn history rides separately from the selection"
+    );
+    let sb = target
+        .store
+        .get_agent_session(&AgentId::from(AGENT_SB))
+        .await
+        .expect("sb session on target");
+    assert_eq!(sb.provider.as_deref(), Some("claude-code"));
+    assert_eq!(sb.model.as_deref(), Some("claude-fable-5"));
+    assert_eq!(sb.reasoning_effort, None);
+    // The source rows were never written by the export.
+    let src_idle = source
+        .store
+        .get_agent_session(&AgentId::from(AGENT_IDLE))
+        .await
+        .expect("idle session on source");
+    assert_eq!(src_idle.provider, None, "source row untouched");
+    assert_eq!(src_idle.model.as_deref(), Some(SOURCE_MODEL));
 
     // ---- path rewrites + git materialization ---------------------------------
     let imported = target.store.get_workspace(&id).await.expect("workspace");

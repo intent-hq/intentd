@@ -672,13 +672,25 @@ pub fn first_provider_id() -> &'static str {
 /// suppression list in `getProviderConfig`.
 const DEFAULT_PROVIDER_ALIASES: &[&str] = &["default", "acp", "augment"];
 
+/// Resolve a registered id or a recognized legacy alias without treating an
+/// unknown id as the default provider. Legacy aliases name the first registered
+/// provider, independently of application settings.
+#[must_use]
+pub fn find_provider_or_legacy_alias(provider_id: &str) -> Option<&'static ProviderConfig> {
+    find_provider(provider_id).or_else(|| {
+        DEFAULT_PROVIDER_ALIASES
+            .contains(&provider_id)
+            .then(first_provider_config)
+    })
+}
+
 /// Resolve a provider by id, falling back to the first registered provider
 /// when unknown. Unknown ids warn (see [`warns_on_unknown_provider`]) so
 /// registry gaps surface in logs instead of silently spawning the fallback
 /// agent. Port of `getProviderConfig`.
 #[must_use]
 pub fn provider_config(provider_id: &str) -> &'static ProviderConfig {
-    find_provider(provider_id).unwrap_or_else(|| {
+    find_provider_or_legacy_alias(provider_id).unwrap_or_else(|| {
         let fallback = first_provider_config();
         if warns_on_unknown_provider(provider_id) {
             tracing::warn!(
