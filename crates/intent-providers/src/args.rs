@@ -230,11 +230,11 @@ fn upsert_codex_raw_config_args(args: &[String], key: &str, value: &str) -> Vec<
 /// npx subagent policy separately through daemon-owned `CODEX_CONFIG` JSON.
 #[must_use]
 pub fn apply_codex_config_args(
-    args: Vec<String>,
+    args: &[String],
     raw_model: Option<&str>,
     env_effort: Option<&str>,
 ) -> Vec<String> {
-    let args = upsert_codex_raw_config_args(&args, "agents.enabled", "false");
+    let args = upsert_codex_raw_config_args(args, "agents.enabled", "false");
     let Some(model) = raw_model else {
         return args;
     };

@@ -346,7 +346,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
             .ok()
             .or_else(|| std::env::var("CODEX_MODEL_REASONING_EFFORT").ok());
         let effort = opts.reasoning_effort.or(env_effort.as_deref());
-        provider_args = apply_codex_config_args(provider_args, opts.model, effort);
+        provider_args = apply_codex_config_args(&provider_args, opts.model, effort);
     }
     args.extend(provider_args);
     args

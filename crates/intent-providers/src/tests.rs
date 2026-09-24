@@ -1083,7 +1083,7 @@ fn codex_upsert_config_args_quotes_and_replaces() {
 fn codex_apply_config_args_effort_resolution() {
     // Effort embedded in the model id wins over the env fallback.
     let from_model = apply_codex_config_args(
-        vec!["exec".to_string()],
+        &["exec".to_string()],
         Some("gpt-5.3-codex/high"),
         Some("low"),
     );
@@ -1101,7 +1101,7 @@ fn codex_apply_config_args_effort_resolution() {
     );
 
     // Bare model id falls back to env effort.
-    let from_env = apply_codex_config_args(vec![], Some("gpt-5.3-codex"), Some("medium"));
+    let from_env = apply_codex_config_args(&[], Some("gpt-5.3-codex"), Some("medium"));
     assert_eq!(
         from_env,
         vec![
@@ -1116,11 +1116,11 @@ fn codex_apply_config_args_effort_resolution() {
 
     // The `default` sentinel and `None` still enforce the subagent policy.
     assert_eq!(
-        apply_codex_config_args(vec!["exec".to_string()], Some("default"), None),
+        apply_codex_config_args(&["exec".to_string()], Some("default"), None),
         vec!["exec", "-c", "agents.enabled=false"]
     );
     assert_eq!(
-        apply_codex_config_args(vec!["exec".to_string()], None, Some("high")),
+        apply_codex_config_args(&["exec".to_string()], None, Some("high")),
         vec!["exec", "-c", "agents.enabled=false"]
     );
 }
@@ -1135,7 +1135,7 @@ fn codex_policy_disables_subagents_for_every_model_and_effort() {
         Some("gpt-5.3-codex/high"),
     ] {
         for effort in [None, Some(""), Some("low")] {
-            let args = apply_codex_config_args(vec![], model, effort);
+            let args = apply_codex_config_args(&[], model, effort);
             let values: Vec<_> = args
                 .windows(2)
                 .filter(|w| w[0] == "-c")
@@ -1146,7 +1146,7 @@ fn codex_policy_disables_subagents_for_every_model_and_effort() {
             // quoted string would not deserialize into bool.
             assert!(!serde_json::from_str::<bool>(values[0]).unwrap());
             assert_eq!(
-                apply_codex_config_args(args.clone(), model, effort),
+                apply_codex_config_args(&args, model, effort),
                 args,
                 "policy must be idempotent for model={model:?}, effort={effort:?}"
             );
@@ -1178,7 +1178,7 @@ fn codex_policy_replaces_duplicate_config_forms_and_preserves_unrelated_args() {
         "agents.enabled=true",
     ]
     .map(str::to_string);
-    let args = apply_codex_config_args(prior.to_vec(), None, None);
+    let args = apply_codex_config_args(&prior, None, None);
     assert_eq!(
         args,
         [
@@ -1196,7 +1196,7 @@ fn codex_policy_replaces_duplicate_config_forms_and_preserves_unrelated_args() {
             "agents.enabled=false",
         ]
     );
-    assert_eq!(apply_codex_config_args(args.clone(), None, None), args);
+    assert_eq!(apply_codex_config_args(&args, None, None), args);
 }
 
 #[test]
