@@ -16168,6 +16168,235 @@ async fn usage_update_cost_captured_over_wss() {
     );
 }
 
+/// Observe Codex's real child argv, including after an idle child is lost.
+/// Drive the selected npx package even when an explicit custom adapter and
+/// a PATH adapter are present. The fake npx captures the actual launch argv.
+async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(script) = gate("WSS Codex selected npx subagent policy E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path();
+    let ws_id = seed_workspace_only(data_dir).await;
+    let toolchain = common::codex_npx::install(data_dir, &script);
+    let wrapper = data_dir.join("fake-codex-acp");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nexec \"$MOCK_AGENT_NODE\" \"$MOCK_AGENT_SCRIPT_PATH\" \"$@\"\n",
+    )
+    .expect("write Codex wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod Codex wrapper");
+    // A genuine native executable and a JS adapter must both lose to the
+    // selected package. The explicit custom path must also be ignored.
+    let installed = data_dir.join("codex-toolchain/codex-acp");
+    if advertise_load {
+        std::fs::write(&installed, "#!/usr/bin/env node\nprocess.exit(91);\n")
+            .expect("write installed JS adapter");
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod installed JS adapter");
+    } else {
+        std::os::unix::fs::symlink("/bin/false", &installed).expect("install native tripwire");
+    }
+    std::fs::write(
+        data_dir.join("config.toml"),
+        format!("[providers.paths]\ncodex = {}\n", json!(wrapper)),
+    )
+    .expect("seed custom path that selected npx must ignore");
+    let session_log = data_dir.join("sessions.jsonl");
+    let behavior = json!({
+        "response": "Codex policy turn complete",
+        "advertiseLoadSession": advertise_load,
+    })
+    .to_string();
+    let mut env: Vec<(&str, &str)> = toolchain
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    env.extend([
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_LOG_CODEX_POLICY", "1"),
+        ("CODEX_PATH", "/must-not-be-used/codex"),
+        (
+            "CODEX_CONFIG",
+            r#"{"agents":{"enabled":true},"features":{"multi_agent_v2":true}}"#,
+        ),
+        (
+            "MOCK_AGENT_SESSION_LOG",
+            session_log.to_str().expect("log path"),
+        ),
+    ]);
+    let child = spawn_serve(data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("port fits u16");
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let subscribed = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string());
+    let mut rpc = connect_ws(port, cfg).await;
+    // Deliberately omit model and reasoningEffort: the launch policy must
+    // apply even when there are no model config overrides to assemble.
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Codex policy", "provider": "codex" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().expect("agent id");
+    assert!(
+        created["agent"]["model"].is_null(),
+        "no explicit model: {created}"
+    );
+
+    let mut first_pid = None;
+    for turn in 0..2 {
+        let sent = wss_rpc(
+            &mut rpc,
+            3 + turn,
+            "agent.sendMessage",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id,
+                "content": format!("Codex policy turn {turn}"),
+            }),
+        )
+        .await;
+        assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut ended = false;
+        let mut idle = false;
+        while !(ended && idle) {
+            let frame = wss_event_opt_until(&mut sub, deadline)
+                .await
+                .expect("Codex policy turn completed and became idle");
+            let event = &frame["params"]["event"];
+            if event["data"]["agentId"].as_str() != Some(agent_id) {
+                continue;
+            }
+            match event["type"].as_str() {
+                Some("agent:failed") => panic!("Codex policy turn failed: {event}"),
+                Some("agent:stream:end") => {
+                    assert_eq!(
+                        event["data"]["lastAgentResponse"], "Codex policy turn complete",
+                        "{event}"
+                    );
+                    ended = true;
+                }
+                Some("agent:status-changed") if event["data"]["status"] == "idle" => idle = true,
+                _ => {}
+            }
+        }
+
+        let entries: Vec<Value> = std::fs::read_to_string(&session_log)
+            .expect("read session log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("session log JSON"))
+            .collect();
+        assert_eq!(entries.len(), usize::try_from(turn + 1).unwrap());
+        let session = entries.last().expect("session log entry");
+        assert_eq!(
+            session["method"],
+            if turn > 0 && advertise_load {
+                "session/load"
+            } else {
+                "session/new"
+            },
+            "expected create/recreate or resume path: {entries:?}"
+        );
+        let argv: Vec<&str> = session["argv"]
+            .as_array()
+            .expect("fixture captured child argv")
+            .iter()
+            .map(|arg| arg.as_str().expect("argv string"))
+            .collect();
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("model=")),
+            "launch must exercise the no-model path: {argv:?}"
+        );
+        assert!(
+            argv.contains(&"-y"),
+            "npx must select the pinned package: {argv:?}"
+        );
+        assert_eq!(
+            argv.iter()
+                .filter(|arg| **arg == intent_providers::CODEX_ACP_NPX_PACKAGE)
+                .count(),
+            1,
+            "each launch must use the selected adapter exactly once: {argv:?}"
+        );
+        assert_eq!(
+            session["codexPolicy"],
+            json!({"config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}, "pathPresent": false}),
+            "daemon policy must replace enabling environment on every launch: {session}"
+        );
+        let pid = session["pid"].as_u64().expect("mock child pid");
+        if turn == 0 {
+            first_pid = Some(pid);
+            // As in the Codex session-title regression, wait for the daemon's
+            // exit watcher to reap the idle child before sending the next turn.
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid fits i32")),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .expect("kill idle mock child");
+            timeout(Duration::from_secs(15), async {
+                let mut interval = tokio::time::interval(Duration::from_millis(25));
+                loop {
+                    interval.tick().await;
+                    if tokio::fs::read_to_string(data_dir.join("daemon.log"))
+                        .await
+                        .expect("daemon log")
+                        .contains("idle agent child exited unexpectedly; handle reaped")
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("daemon reaped the idle mock child");
+        } else {
+            assert_ne!(
+                Some(pid),
+                first_pid,
+                "second turn must launch a fresh process"
+            );
+            if advertise_load {
+                assert_eq!(
+                    session["sessionId"], entries[0]["sessionId"],
+                    "resume original session"
+                );
+            }
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn codex_npx_subagent_policy_without_model_survives_recreate_over_wss() {
+    assert_codex_npx_subagent_policy_over_wss(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn codex_npx_subagent_policy_without_model_survives_resume_over_wss() {
+    assert_codex_npx_subagent_policy_over_wss(true).await;
+}
+
 /// Pin the `grok` provider binary to a wrapper around the mock ACP fixture
 /// via the highest-precedence `providers.paths` config tier, so the test is
 /// hermetic even when a real grok install exists. Mirrors the cross-provider

@@ -6918,7 +6918,7 @@ async fn report_provider_availability(config: &Config) {
             println!("  [--] {} ({})", provider.id, reason);
             continue;
         }
-        // npx-only providers (claude-code, pi) never resolve a local binary;
+        // npx-only providers (claude-code, codex, pi) never resolve a local binary;
         // report npx availability instead (the auth probe would need a package
         // download, so it is skipped — auth is the external `claude` CLI).
         // A valid `providers.paths` adapter override (claude-code opts in,
@@ -6959,15 +6959,14 @@ async fn report_provider_availability(config: &Config) {
                             println!("  [--] {} unavailable{verdict}", provider.id);
                         }
                         None => {
-                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display());
+                            println!(
+                                "{}",
+                                npx_provider_availability_line(provider.id, pkg, Some(npx))
+                            );
                         }
                     }
                 }
-                None => println!(
-                    "  [--] {} unavailable (npx not found — {} is required)",
-                    provider.id,
-                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
-                ),
+                None => println!("{}", npx_provider_availability_line(provider.id, pkg, None)),
             }
             continue;
         }
@@ -7003,6 +7002,21 @@ async fn report_provider_availability(config: &Config) {
         );
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
+    }
+}
+
+/// Format the ordinary npx doctor line from discovery's result without probing again.
+fn npx_provider_availability_line(id: &str, package: &str, npx: Option<&Path>) -> String {
+    match npx {
+        Some(npx) => format!("  [ok] {id} via npx: {} -y {package}", npx.display()),
+        None if id == "codex" => format!(
+            "  [--] {id} unavailable ({})",
+            intent_providers::CODEX_ACP_PREREQUISITE_ERROR
+        ),
+        None => format!(
+            "  [--] {id} unavailable (npx not found — {} is required)",
+            intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+        ),
     }
 }
 
@@ -7269,6 +7283,52 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_codex_unavailable_names_both_runtime_prerequisites() {
+        // Codex discovery returns None when Node is missing even if npx
+        // exists, as well as when npx or both are missing. The provider
+        // resolver tests cover that executable matrix without touching PATH.
+        let line =
+            npx_provider_availability_line("codex", intent_providers::CODEX_ACP_NPX_PACKAGE, None);
+        assert_eq!(
+            line,
+            format!(
+                "  [--] codex unavailable ({})",
+                intent_providers::CODEX_ACP_PREREQUISITE_ERROR
+            )
+        );
+        assert!(!line.contains("npx not found"));
+    }
+
+    #[test]
+    fn doctor_npx_unavailable_keeps_other_provider_diagnostics() {
+        for id in ["claude-code", "pi"] {
+            let provider = intent_providers::find_provider(id).unwrap();
+            assert_eq!(
+                npx_provider_availability_line(id, provider.npx_only_package.unwrap(), None),
+                format!(
+                    "  [--] {id} unavailable (npx not found — {} is required)",
+                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_available_npx_provider_keeps_selected_package_and_path() {
+        let npx = Path::new("/toolchain/npx");
+        for id in ["codex", "claude-code"] {
+            let package = intent_providers::find_provider(id)
+                .unwrap()
+                .npx_only_package
+                .unwrap();
+            assert_eq!(
+                npx_provider_availability_line(id, package, Some(npx)),
+                format!("  [ok] {id} via npx: {} -y {package}", npx.display())
+            );
+        }
+    }
 
     /// Regression guard for [`WORKER_THREAD_STACK_BYTES`]: a task whose
     /// frame needs more than the 2 MiB std default must still complete on a

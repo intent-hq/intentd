@@ -620,14 +620,39 @@ fn registry_version_keys_follow_adapter_pins() {
     assert_eq!(key("opencode"), "");
     assert_eq!(key("grok"), "");
     assert_eq!(key("unsloth"), "");
-    // codex mirrors the fetch dispatch: pinned to the npx fallback only when
-    // no codex-acp binary resolves on this machine.
-    let expected = if intent_providers::find_provider_binary("codex", "codex-acp", None).is_some() {
-        String::new()
-    } else {
-        intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
-    };
-    assert_eq!(key("codex"), expected);
+    // Codex always uses the pinned adapter, including hosts with native or
+    // JavaScript codex-acp executables installed.
+    assert_eq!(
+        key("codex"),
+        intent_providers::config::CODEX_ACP_NPX_PACKAGE
+    );
+}
+
+#[test]
+fn codex_catalog_does_not_reuse_native_adapter_cache() {
+    let cache = ModelCatalogCache::new(None);
+    let models = vec![json!({"id": "gpt-5.5", "provider": "codex", "isDefault": true})];
+    cache.store("codex", "", models.clone(), 1_000);
+    assert_eq!(cache.reader(None).cached_default_model("codex"), None);
+    assert_eq!(
+        cache.reader(None).cached_catalog_claims("codex", "gpt-5.5"),
+        None
+    );
+
+    cache.store(
+        "codex",
+        intent_providers::config::CODEX_ACP_NPX_PACKAGE,
+        models,
+        1_000,
+    );
+    assert_eq!(
+        cache.reader(None).cached_default_model("codex"),
+        Some("gpt-5.5".to_string())
+    );
+    assert_eq!(
+        cache.reader(None).cached_catalog_claims("codex", "gpt-5.5"),
+        Some(true)
+    );
 }
 
 #[tokio::test]
