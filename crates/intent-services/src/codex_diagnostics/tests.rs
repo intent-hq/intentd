@@ -83,6 +83,8 @@ mod unix {
             .unwrap();
             let runtime = root.path().join("node_modules/@openai/codex/bin/codex.js");
             executable(&runtime, &format!("#!/usr/bin/env node\nif (process.argv[2] !== '--version') process.exit(91);\nconsole.log('codex-cli {runtime_version}');\n"));
+            std::fs::write(root.path().join("node_modules/@openai/codex/package.json"),
+                serde_json::to_vec(&serde_json::json!({"name":"@openai/codex", "version":runtime_version, "bin":{"codex":"bin/codex.js"}})).unwrap()).unwrap();
             let path_marker = root.path().join("unrelated-path-codex-ran");
             executable(
                 &bin.join("codex"),
@@ -201,7 +203,7 @@ mod unix {
                 .root
                 .path()
                 .join("node_modules/@openai/codex/package.json"),
-            r#"{"name":"@openai/codex","version":"0.1.2"}"#,
+            r#"{"name":"@openai/codex","version":"0.1.2","bin":{"codex":"bin/codex.js"}}"#,
         )
         .unwrap();
         let result = fixture
@@ -222,11 +224,11 @@ mod unix {
     #[tokio::test]
     async fn recognized_local_adapter_retains_actual_runtime_override() {
         let fixture = Fixture::new("2.4.6", "0.222.3");
-        let runtime = fixture.root.path().join("custom-runtime");
-        executable(
-            &runtime,
-            "#!/bin/sh\n[ \"$1\" = --version ] || exit 92\nprintf 'codex-cli 0.444.5\\n'\n",
-        );
+        let custom = Fixture::new("8.8.8", "0.444.5");
+        let runtime = custom
+            .root
+            .path()
+            .join("node_modules/@openai/codex/bin/codex.js");
         let mut launch = fixture.local(ProviderBinarySource::LocalDiscovery);
         launch.codex_path = Some(runtime.into_os_string());
         let result = launch.inspect_local().await;
@@ -272,17 +274,10 @@ mod unix {
                 codex_path: Some(fixture.root.path().join("bin/codex").into_os_string()),
             };
             let result = launch.inspect_local().await;
-            if name == "opaque-wrapper" {
-                assert_eq!(
-                    result.report.adapter_version,
-                    VersionMeasurement::Measured("3.5.7".into())
-                );
-            } else {
-                assert_eq!(
-                    result.report.adapter_version,
-                    VersionMeasurement::Unknown(UnknownReason::InvalidVersion)
-                );
-            }
+            assert_eq!(
+                result.report.adapter_version,
+                VersionMeasurement::Unknown(UnknownReason::OpaqueAdapter)
+            );
             assert_eq!(
                 result.report.runtime_version,
                 VersionMeasurement::Unknown(UnknownReason::OpaqueAdapter)
@@ -400,9 +395,48 @@ mod unix {
     }
 
     #[tokio::test]
+    async fn offline_inspection_does_not_execute_opaque_adapter_wrappers() {
+        let fixture = Fixture::new("2.4.6", "0.222.3");
+        for (name, body) in [
+            ("wrapper", "#!/bin/sh\nexec npx --yes codex-acp \"$@\"\n"),
+            ("wrapper.js", "#!/usr/bin/env node\nrequire('node:child_process').spawnSync('npx', ['--yes', 'codex-acp', ...process.argv.slice(2)]);\n"),
+        ] {
+            let wrapper = fixture.adapter.parent().unwrap().join(name);
+            executable(&wrapper, body);
+            let mut launch = fixture.local(ProviderBinarySource::SettingsOverride);
+            launch.selection = ProviderLaunch::Local(ProviderBinary {
+                path: wrapper,
+                source: ProviderBinarySource::SettingsOverride,
+            });
+            let result = launch.inspect_local().await;
+            assert!(!fixture.npx_marker.exists(), "default inspection executed npm through {name}");
+            assert!(matches!(result.report.adapter_version, VersionMeasurement::Unknown(_)));
+            assert!(result.runtime.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_inspection_does_not_execute_opaque_runtime_overrides() {
+        let fixture = Fixture::new("2.4.6", "0.222.3");
+        for (name, body) in [
+            ("runtime", "#!/bin/sh\nexec npx --yes codex \"$@\"\n"),
+            ("runtime.js", "#!/usr/bin/env node\nrequire('node:child_process').spawnSync('npx', ['--yes', 'codex', ...process.argv.slice(2)]);\n"),
+        ] {
+            let wrapper = fixture.root.path().join(name);
+            executable(&wrapper, body);
+            let mut launch = fixture.local(ProviderBinarySource::SettingsOverride);
+            launch.codex_path = Some(wrapper.into_os_string());
+            let result = launch.inspect_local().await;
+            assert!(!fixture.npx_marker.exists(), "default inspection executed npm through {name}");
+            assert!(matches!(result.report.runtime_version, VersionMeasurement::Unknown(_)));
+            assert!(result.runtime.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn version_errors_do_not_leak_into_serialized_report() {
         let fixture = Fixture::new("2.4.6", "0.222.3");
-        executable(&fixture.adapter, "#!/bin/sh\nprintf 'account=user@example.com token=secret\\n'\nprintf 'secret error\\n' >&2\nexit 1\n");
+        executable(&fixture.adapter, "#!/usr/bin/env node\nconsole.log('account=user@example.com token=secret');\nconsole.error('secret error');\nprocess.exit(1);\n");
         let result = fixture
             .local(ProviderBinarySource::SettingsOverride)
             .inspect_local()
@@ -414,6 +448,49 @@ mod unix {
         );
         assert!(!json.contains("secret"));
         assert!(!json.contains("user@example.com"));
+    }
+
+    #[tokio::test]
+    async fn probe_process_preserves_stdio_and_keeps_home_until_cleanup() {
+        use tokio::io::AsyncWriteExt;
+
+        let fixture = Fixture::new("2.4.6", "0.222.3");
+        let home = crate::test_support::test_tempdir("codex-stdio-probe");
+        let home_path = home.path().to_path_buf();
+        let mut command = Command::new(fixture.root.path().join("bin/node"));
+        command.env_clear().env("PATH", &fixture.path)
+            .env("HOME", &home_path).current_dir(&home_path)
+            // Host-wide instrumentation must not add output to this stdio fixture.
+            .env("DD_TRACE_ENABLED", "false").env("DD_TRACE_STARTUP_LOGS", "false")
+            .args(["-e", "const rl = require('node:readline').createInterface({input:process.stdin}); rl.once('line', line => { console.log(line); console.error('private stderr'); rl.close(); process.exitCode = 7; });"]);
+        let mut probe = process::ProbeProcess::spawn(command, home).await.unwrap();
+        let mut stdin = probe.stdin.take().unwrap();
+        let mut stdout = probe.stdout.take().unwrap();
+        let mut stderr = probe.stderr.take().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            stdin
+                .write_all(b"{\"request\":\"fixture\"}\n")
+                .await
+                .unwrap();
+            drop(stdin);
+            let mut out = String::new();
+            let mut err = String::new();
+            tokio::try_join!(
+                stdout.read_to_string(&mut out),
+                stderr.read_to_string(&mut err)
+            )
+            .unwrap();
+            let status = probe.wait().await.unwrap();
+            (out, err, status)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.0, "{\"request\":\"fixture\"}\n");
+        assert_eq!(result.1, "private stderr\n");
+        assert_eq!(result.2.code(), Some(7));
+        assert!(home_path.is_dir(), "leader exit must not release its home");
+        probe.cleanup().await.unwrap();
+        assert!(!home_path.exists());
     }
 
     #[tokio::test]
@@ -448,6 +525,126 @@ mod unix {
     #[tokio::test]
     async fn cancellation_during_teardown_keeps_the_escaped_descendant_snapshot() {
         cancellation_case(true).await;
+    }
+
+    #[tokio::test]
+    async fn early_exit_reaps_detached_child_before_removing_home() {
+        early_exit_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn early_exit_with_inherited_stdout_reaps_detached_child_on_timeout() {
+        early_exit_case(true).await;
+    }
+
+    async fn early_exit_case(inherit_stdout: bool) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        struct ProbeCleanup {
+            task: tokio::task::AbortHandle,
+            observation: PathBuf,
+        }
+
+        impl Drop for ProbeCleanup {
+            fn drop(&mut self) {
+                self.task.abort();
+                if let Ok(text) = std::fs::read_to_string(&self.observation) {
+                    for pid in text.lines().filter_map(|line| line.parse().ok()) {
+                        drop(Cleanup(pid));
+                    }
+                }
+            }
+        }
+
+        let fixture = Fixture::new("2.4.6", "0.222.3");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let observation = fixture.root.path().join("child-pid");
+        let mut command = Command::new(fixture.root.path().join("bin/node"));
+        command.args(["-e", r"
+const fs = require('node:fs');
+const child = require('node:child_process').spawn(process.execPath,
+  ['-e', String.raw`
+    process.on('SIGTERM', () => {
+      const socket = require('node:net').connect(Number(process.argv[1]), '127.0.0.1');
+      socket.on('connect', () => socket.end(JSON.stringify({homeExists: require('node:fs').existsSync(process.cwd())}) + '\n', () => process.exit(0)));
+    });
+    process.send('ready');
+    process.disconnect();
+    setInterval(() => {}, 1000);
+  `, process.argv[1]],
+  {detached: true, stdio: ['ignore', process.argv[3] === 'true' ? 'inherit' : 'ignore', 'ignore', 'ipc']});
+fs.writeFileSync(process.argv[2], child.pid + '\n' + process.pid);
+child.unref();
+child.once('message', () => {
+  const socket = require('node:net').connect(Number(process.argv[1]), '127.0.0.1');
+  socket.on('connect', () => socket.write(JSON.stringify({pid: child.pid, leader: process.pid, home: process.cwd()}) + '\n'));
+  socket.once('data', () => { console.log('codex-acp 5.6.7'); process.exit(0); });
+});
+"])
+            .arg(port.to_string())
+            .arg(&observation)
+            .arg(inherit_stdout.to_string());
+        let path = fixture.path.clone();
+        let task =
+            tokio::spawn(async move { local_output(command, &path, Duration::from_secs(2)).await });
+        let _cleanup = ProbeCleanup {
+            task: task.abort_handle(),
+            observation,
+        };
+        let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), socket.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let observed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let pid = i32::try_from(observed["pid"].as_i64().unwrap()).unwrap();
+        let leader = i32::try_from(observed["leader"].as_i64().unwrap()).unwrap();
+        let home = PathBuf::from(observed["home"].as_str().unwrap());
+        assert_ne!(
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid))).unwrap(),
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(leader))).unwrap(),
+            "fixture must actually escape the leader's process group"
+        );
+        assert!(home.is_dir());
+        socket.get_mut().write_all(b"exit").await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        if inherit_stdout {
+            assert_eq!(result, Err(UnknownReason::TimedOut));
+        } else {
+            assert_eq!(result.unwrap(), b"codex-acp 5.6.7\n");
+        }
+        assert!(
+            !home.exists(),
+            "completed probe retained its temporary home"
+        );
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "detached child {pid} was not reaped before its temporary home disappeared"
+        );
+        let (mut notice, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), notice.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let notice: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            notice["homeExists"], true,
+            "probe home disappeared before its descendant stopped"
+        );
     }
 
     async fn cancellation_case(during_teardown: bool) {
@@ -510,13 +707,10 @@ setInterval(() => {}, 1000);
         })
         .await
         .expect("cancelled local check must finish reaping and remove its home");
-        // A zombie has terminated but can remain visible until the host's
-        // reaper runs. On Linux, distinguish it from a surviving executable.
-        #[cfg(target_os = "linux")]
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            assert!(stat.split_once(") ").unwrap().1.starts_with('Z'));
-        }
-        #[cfg(not(target_os = "linux"))]
-        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "cancelled probe must reap descendants before removing its home"
+        );
     }
 }

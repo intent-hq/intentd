@@ -8,7 +8,6 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use intent_acp::spawn::{build_command, SpawnOptions};
@@ -17,7 +16,9 @@ use intent_providers::config::CODEX_ACP_NPX_PACKAGE;
 use intent_providers::discover::{resolve_fallback_launch, ProviderBinarySource, ProviderLaunch};
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
+
+pub(crate) mod process;
 
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_LIMIT: usize = 16 * 1024;
@@ -40,6 +41,7 @@ pub enum UnknownReason {
     AdapterNotFound,
     NodeNotFound,
     OpaqueAdapter,
+    OpaqueRuntime,
     PackageMismatch,
     PackageUnreadable,
     RuntimeNotFound,
@@ -50,6 +52,7 @@ pub enum UnknownReason {
     UnsuccessfulExit,
     InvalidVersion,
     InspectionFailed,
+    CleanupFailed,
 }
 
 impl UnknownReason {
@@ -62,20 +65,24 @@ impl UnknownReason {
             Self::AdapterNotFound => "adapter and npm fallback are unavailable",
             Self::NodeNotFound => "Node is unavailable for local package inspection",
             Self::OpaqueAdapter => {
-                "wrapper or native adapter does not establish its underlying runtime"
+                "wrapper or native adapter cannot be inspected without executing unverified code"
             }
+            Self::OpaqueRuntime => "runtime entrypoint cannot be verified for offline inspection",
             Self::PackageMismatch => "inspected package does not match the selected npm pin",
             Self::PackageUnreadable => "selected adapter package could not be inspected",
             Self::RuntimeNotFound => "selected adapter's runtime could not be resolved",
             Self::RelativeRuntimeOverride => {
                 "relative runtime override depends on the agent working directory"
             }
-            Self::SpawnFailed => "local version process could not start",
+            Self::SpawnFailed => "diagnostic process could not start safely",
             Self::TimedOut => "local check exceeded its deadline",
             Self::OutputLimit => "local check exceeded its output limit",
             Self::UnsuccessfulExit => "local version process exited unsuccessfully",
             Self::InvalidVersion => "local output was not a recognized version",
             Self::InspectionFailed => "local package inspection failed",
+            Self::CleanupFailed => {
+                "probe cleanup could not be confirmed; temporary configuration was retained"
+            }
         }
     }
 }
@@ -243,26 +250,27 @@ impl CodexLaunch {
     async fn inspect(&self, adapter: &Path, pin: Option<&str>) -> CodexInspection {
         let mut result = self.unknown(UnknownReason::OpaqueAdapter);
         result.report.adapter_path = Some(safe_text(&adapter.to_string_lossy()));
-        // A local opaque adapter can report its own version, but cannot
-        // establish a runtime simply because CODEX_PATH happens to be set.
-        if pin.is_none() {
-            result.report.adapter_version = self
-                .version(Command::new(adapter), VersionKind::Adapter)
-                .await;
-        }
+        // Even --version on an opaque wrapper can install packages. Inspect
+        // package/bin identity without importing it before executing anything.
         let Some(node) = executable_on_path("node", &self.path) else {
             result.report.runtime_version =
                 VersionMeasurement::Unknown(UnknownReason::NodeNotFound);
-            if pin.is_some() {
-                result.report.adapter_version = result.report.runtime_version.clone();
-            }
+            result.report.adapter_version = result.report.runtime_version.clone();
             return result;
         };
+        let runtime_override = self.runtime_override_path();
         let mut command = Command::new(&node);
         command
             .args(["-e", include_str!("inspect.cjs")])
             .arg(adapter)
-            .arg(pin.unwrap_or(""));
+            .arg(pin.unwrap_or(""))
+            .arg(
+                runtime_override
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_deref)
+                    .unwrap_or_else(|| Path::new("")),
+            );
         let package = match local_output(command, &self.path, LOCAL_TIMEOUT)
             .await
             .and_then(|bytes| {
@@ -272,9 +280,7 @@ impl CodexLaunch {
             Ok(package) => package,
             Err(reason) => {
                 result.report.runtime_version = VersionMeasurement::Unknown(reason);
-                if pin.is_some() {
-                    result.report.adapter_version = VersionMeasurement::Unknown(reason);
-                }
+                result.report.adapter_version = VersionMeasurement::Unknown(reason);
                 return result;
             }
         };
@@ -285,40 +291,47 @@ impl CodexLaunch {
                 _ => UnknownReason::PackageUnreadable,
             };
             result.report.runtime_version = VersionMeasurement::Unknown(reason);
-            if pin.is_some() {
-                result.report.adapter_version = VersionMeasurement::Unknown(reason);
-            }
+            result.report.adapter_version = VersionMeasurement::Unknown(reason);
             return result;
         }
         let Some(adapter) = package.adapter else {
             return result;
         };
-        if pin.is_some() {
-            let mut command = Command::new(&node);
-            command.arg(&adapter);
-            result.report.adapter_version = self.version(command, VersionKind::Adapter).await;
-        }
-        let runtime = match self.runtime_executable(&node, package.runtime) {
-            Ok((source, path, executable)) => {
-                result.report.runtime_source = source;
-                result.report.runtime_path = Some(safe_text(&path.to_string_lossy()));
-                executable
-            }
+        let mut command = Command::new(&node);
+        command.arg(&adapter);
+        result.report.adapter_version = self.version(command, VersionKind::Adapter).await;
+        let runtime_override = match runtime_override {
+            Ok(path) => path,
             Err(reason) => {
                 result.report.runtime_version = VersionMeasurement::Unknown(reason);
                 return result;
             }
+        };
+        let Some(path) = package.runtime else {
+            let reason = if package.runtime_reason.as_deref() == Some("opaque") {
+                UnknownReason::OpaqueRuntime
+            } else {
+                UnknownReason::RuntimeNotFound
+            };
+            result.report.runtime_version = VersionMeasurement::Unknown(reason);
+            return result;
+        };
+        result.report.runtime_source = if runtime_override.is_some() {
+            RuntimeSource::EnvironmentOverride
+        } else {
+            RuntimeSource::AdapterDependency
+        };
+        result.report.runtime_path = Some(safe_text(&path.to_string_lossy()));
+        let runtime = DiagnosticExecutable {
+            program: node,
+            args: vec![path.into_os_string()],
         };
         result.report.runtime_version = self.version(runtime.command(), VersionKind::Runtime).await;
         result.runtime = Some(runtime);
         result
     }
 
-    fn runtime_executable(
-        &self,
-        node: &Path,
-        dependency: Option<PathBuf>,
-    ) -> Result<(RuntimeSource, PathBuf, DiagnosticExecutable), UnknownReason> {
+    fn runtime_override_path(&self) -> Result<Option<PathBuf>, UnknownReason> {
         if let Some(value) = self.codex_path.as_ref().filter(|value| !value.is_empty()) {
             let configured = PathBuf::from(value);
             let program = if configured.is_absolute() {
@@ -331,24 +344,9 @@ impl CodexLaunch {
             if !intent_core::path_utils::is_executable_file(&program) {
                 return Err(UnknownReason::RuntimeNotFound);
             }
-            return Ok((
-                RuntimeSource::EnvironmentOverride,
-                program.clone(),
-                DiagnosticExecutable {
-                    program,
-                    args: vec![],
-                },
-            ));
+            return Ok(Some(program));
         }
-        let dependency = dependency.ok_or(UnknownReason::RuntimeNotFound)?;
-        Ok((
-            RuntimeSource::AdapterDependency,
-            dependency.clone(),
-            DiagnosticExecutable {
-                program: node.to_path_buf(),
-                args: vec![dependency.into_os_string()],
-            },
-        ))
+        Ok(None)
     }
 
     async fn version(&self, mut command: Command, kind: VersionKind) -> VersionMeasurement {
@@ -407,6 +405,7 @@ struct PackageInspection {
     reason: Option<String>,
     adapter: Option<PathBuf>,
     runtime: Option<PathBuf>,
+    runtime_reason: Option<String>,
 }
 
 /// Strip control/bidi formatting and cap path text. Version and reason text
@@ -486,88 +485,43 @@ async fn local_output(
         .env("CODEX_HOME", directory.path())
         .env("XDG_CONFIG_HOME", directory.path())
         .env("NODE_DISABLE_COMPILE_CACHE", "1")
-        .current_dir(directory.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .current_dir(directory.path());
     #[cfg(windows)]
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);
     }
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().map_err(|_| UnknownReason::SpawnFailed)?;
-    let pid = child.id().ok_or(UnknownReason::SpawnFailed)?;
-    let stdout = child.stdout.take().ok_or(UnknownReason::SpawnFailed)?;
-    let mut guard = LocalChild {
-        child: Some(child),
-        pid,
-        directory: Some(directory),
-    };
+    let mut guard = process::ProbeProcess::spawn(command, directory).await?;
+    drop(guard.stdin.take());
+    let stdout = guard.stdout.take().ok_or(UnknownReason::SpawnFailed)?;
+    let mut stderr = guard.stderr.take().ok_or(UnknownReason::SpawnFailed)?;
     let result = tokio::time::timeout(timeout, async {
-        let mut bytes = Vec::new();
-        stdout
-            .take((OUTPUT_LIMIT + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|_| UnknownReason::InspectionFailed)?;
-        if bytes.len() > OUTPUT_LIMIT {
-            return Err(UnknownReason::OutputLimit);
-        }
-        let status = guard
-            .child
-            .as_mut()
-            .expect("owned child")
-            .wait()
-            .await
-            .map_err(|_| UnknownReason::InspectionFailed)?;
-        if !status.success() {
+        let read_stdout = async {
+            let mut bytes = Vec::new();
+            stdout
+                .take((OUTPUT_LIMIT + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| UnknownReason::InspectionFailed)?;
+            if bytes.len() > OUTPUT_LIMIT {
+                return Err(UnknownReason::OutputLimit);
+            }
+            Ok(bytes)
+        };
+        let discard_stderr = async {
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink())
+                .await
+                .map_err(|_| UnknownReason::InspectionFailed)
+        };
+        let (bytes, _) = tokio::try_join!(read_stdout, discard_stderr)?;
+        if !guard.wait().await?.success() {
             return Err(UnknownReason::UnsuccessfulExit);
         }
         Ok(bytes)
     })
     .await
     .unwrap_or(Err(UnknownReason::TimedOut));
-    if let Some(cleanup) = guard.start_cleanup() {
-        let _ = cleanup.await;
-    }
+    guard.cleanup().await?;
     result
-}
-
-struct LocalChild {
-    child: Option<Child>,
-    pid: u32,
-    directory: Option<tempfile::TempDir>,
-}
-
-impl LocalChild {
-    // As with AdapterChild, move teardown to an owned task: cancellation
-    // during the TERM grace must not discard the escaped-descendant snapshot.
-    fn start_cleanup(&mut self) -> Option<tokio::task::JoinHandle<()>> {
-        let mut child = self.child.take()?;
-        let pid = self.pid;
-        let directory = self.directory.take();
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            #[cfg(unix)]
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid.cast_signed()),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            let _ = child.start_kill();
-            return None;
-        };
-        Some(handle.spawn(async move {
-            crate::acp_adapter::reap_child(&mut child, pid).await;
-            drop(directory);
-        }))
-    }
-}
-
-impl Drop for LocalChild {
-    fn drop(&mut self) {
-        drop(self.start_cleanup());
-    }
 }
 
 #[cfg(test)]
