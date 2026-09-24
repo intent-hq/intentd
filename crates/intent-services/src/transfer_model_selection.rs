@@ -56,6 +56,12 @@ use crate::agent_ops::{
 
 const IMPORT_METHOD: &str = "workspace.import.commit";
 
+/// Legacy aliases identify the registry's provider, never the destination's
+/// configured default. Unknown ids remain unknown for availability validation.
+fn canonical_source_provider(provider: &str) -> &str {
+    intent_providers::find_provider_or_legacy_alias(provider).map_or(provider, |config| config.id)
+}
+
 /// Only destination evidence participates here. Unknown/expired auth verdicts
 /// and missing/stale/failed catalogs stay permissive, as at agent creation.
 /// A non-empty fresh catalog can disprove an explicit model or effort. Auto
@@ -151,20 +157,23 @@ impl crate::Services {
                 // reads; validate exactly the selection the first turn sees.
                 let (model, provider) =
                     normalize_compound_model(column_str(map, "model"), column_str(map, "provider"));
-                let source = provider.as_deref().map_or_else(
-                    || Err("the source provider is unknown".to_string()),
-                    |p| {
-                        available(p).and_then(|()| {
-                            selection_unavailable(
-                                self,
-                                p,
-                                model.as_deref(),
-                                column_str(map, "reasoning_effort").as_deref(),
-                            )
-                            .map_err(|e| e.to_string())
-                        })
-                    },
-                );
+                let source = provider
+                    .as_deref()
+                    .map(canonical_source_provider)
+                    .map_or_else(
+                        || Err("the source provider is unknown".to_string()),
+                        |p| {
+                            available(p).and_then(|()| {
+                                selection_unavailable(
+                                    self,
+                                    p,
+                                    model.as_deref(),
+                                    column_str(map, "reasoning_effort").as_deref(),
+                                )
+                                .map_err(|e| e.to_string())
+                            })
+                        },
+                    );
                 let Err(source_reason) = source else { continue };
                 let fallback = destination_default.get_or_insert_with(|| {
                     let provider = crate::agent_session::derived_default_provider(&settings)
@@ -249,7 +258,10 @@ pub(crate) fn pin_source_selection(
             else {
                 continue;
             };
-            map.insert("provider".into(), Value::String(provider.to_string()));
+            map.insert(
+                "provider".into(),
+                Value::String(canonical_source_provider(provider).to_string()),
+            );
             pinned += 1;
         }
     }
@@ -283,6 +295,7 @@ pub(crate) fn resolve_imported_selection(map: &mut Map<String, Value>) -> Import
     }
     let (model, legacy_provider) = normalize_compound_model(column_str(map, "model"), None);
     if let Some(provider) = legacy_provider {
+        let provider = canonical_source_provider(&provider).to_string();
         map.insert("provider".into(), Value::String(provider.clone()));
         return ImportedSelection::RecoveredFromModelPrefix(provider);
     }
@@ -300,6 +313,7 @@ pub(crate) fn resolve_imported_selection(map: &mut Map<String, Value>) -> Import
     );
     if let Some(provider) = last_turn_provider {
         if last_turn_model == model {
+            let provider = canonical_source_provider(&provider).to_string();
             map.insert("provider".into(), Value::String(provider.clone()));
             return ImportedSelection::RecoveredFromLastTurn(provider);
         }
@@ -321,6 +335,32 @@ mod tests {
             ),
             ("agent_session".to_string(), objects),
         ]
+    }
+
+    #[test]
+    fn legacy_alias_export_pinning_uses_effective_source_identity() {
+        for alias in ["acp", "augment", "default"] {
+            let mut rows = session_rows(vec![serde_json::json!({
+                "provider": null, "model": "gpt6-astra", "reasoning_effort": "low",
+                "last_turn_provider": alias, "last_turn_model": "gpt6-astra"
+            })]);
+            assert_eq!(pin_source_selection(&mut rows, Some(alias)), 1);
+            assert_eq!(rows[1].1[0]["provider"], "auggie");
+            assert_eq!(rows[1].1[0]["last_turn_provider"], alias);
+            let model = format!("{alias}:gpt6-astra");
+            let mut prefix = session_rows(vec![serde_json::json!({
+                "provider": null, "model": model, "reasoning_effort": "low"
+            })]);
+            assert_eq!(pin_source_selection(&mut prefix, Some("codex")), 1);
+            assert_eq!(prefix[1].1[0]["provider"], "auggie");
+            assert_eq!(prefix[1].1[0]["model"], model);
+            let mut explicit = session_rows(vec![serde_json::json!({
+                "provider": alias, "model": "gpt6-astra", "reasoning_effort": "low"
+            })]);
+            let original = explicit.clone();
+            assert_eq!(pin_source_selection(&mut explicit, Some("codex")), 0);
+            assert_eq!(explicit, original);
+        }
     }
 
     #[test]

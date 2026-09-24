@@ -2237,6 +2237,8 @@ mod tests {
         row.as_object_mut()
             .unwrap()
             .extend(selection.as_object().unwrap().clone());
+        let historical_model = row["last_turn_model"].clone();
+        let historical_provider = row["last_turn_provider"].clone();
         let manifest = manifest(&ws);
         let archive = build_archive_full(&manifest, &rows, None, &[]);
         let begin = svc
@@ -2257,13 +2259,19 @@ mod tests {
         assert!(!session.is_active);
         assert!(session.acp_session_id.is_none());
         assert!(session.backend_session_id.is_none());
+        let persisted = svc.store.transfer_export_rows(&ws).await.unwrap();
+        let raw = &persisted
+            .iter()
+            .find(|(table, _)| table == "agent_session")
+            .unwrap()
+            .1[0];
         assert_eq!(
-            svc.store
-                .get_agent_session_last_turn_model(&ws, &agent)
-                .await
-                .unwrap(),
-            (Some("gpt6-astra".into()), Some("auggie".into())),
-            "import must not start a turn or rewrite history"
+            raw["last_turn_model"], historical_model,
+            "import must not rewrite history"
+        );
+        assert_eq!(
+            raw["last_turn_provider"], historical_provider,
+            "import must not rewrite history"
         );
         assert_eq!(
             svc.store
@@ -2512,6 +2520,104 @@ mod tests {
         )
         .await;
         assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn import_selection_legacy_alias_direct_survives() {
+        for alias in ["acp", "augment", "default"] {
+            assert_imported_legacy_alias(alias, "direct", false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_legacy_alias_history_survives() {
+        for alias in ["acp", "augment", "default"] {
+            assert_imported_legacy_alias(alias, "history", false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_legacy_alias_prefix_survives() {
+        for alias in ["acp", "augment", "default"] {
+            assert_imported_legacy_alias(alias, "prefix", false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_legacy_alias_auto_survives() {
+        for alias in ["acp", "augment", "default"] {
+            assert_imported_legacy_alias(alias, "auto", false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_legacy_alias_disabled_canonical_provider_falls_back() {
+        for alias in ["acp", "augment", "default"] {
+            for mode in ["direct", "history", "prefix", "auto"] {
+                assert_imported_legacy_alias(alias, mode, true).await;
+            }
+        }
+    }
+
+    async fn assert_imported_legacy_alias(alias: &str, mode: &str, disabled: bool) {
+        let (svc, _root, _assets) = selection_fixture().await;
+        if disabled {
+            svc.settings_registry()
+                .unwrap()
+                .apply(&[(
+                    "providers.enabled".into(),
+                    serde_json::json!({"auggie":false}),
+                )])
+                .unwrap();
+        }
+        let inherited = matches!(mode, "history" | "prefix");
+        let model = match mode {
+            "auto" => None,
+            "prefix" => Some(format!("{alias}:gpt6-astra")),
+            _ => Some("gpt6-astra".into()),
+        };
+        let effort = (mode != "auto").then_some("low");
+        let selection = serde_json::json!({
+            "provider": if inherited { None } else { Some(alias) },
+            "model":model, "reasoning_effort":effort,
+            "last_turn_provider":alias,
+            "last_turn_model": if mode == "auto" { None } else { Some("gpt6-astra") }
+        });
+        let session = import_selection(&svc, selection.clone()).await;
+        if disabled {
+            assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
+            return;
+        }
+        let rows = svc
+            .store
+            .transfer_export_rows(&session.workspace_id)
+            .await
+            .unwrap();
+        let stored = &rows
+            .iter()
+            .find(|(table, _)| table == "agent_session")
+            .unwrap()
+            .1[0];
+        assert_eq!(stored["provider"], if inherited { "auggie" } else { alias });
+        assert_eq!(stored["model"], selection["model"]);
+        assert_eq!(stored["reasoning_effort"], selection["reasoning_effort"]);
+        assert_eq!(
+            intent_providers::provider_config(session.provider.as_deref().unwrap()).id,
+            "auggie"
+        );
+        assert_eq!(
+            crate::agent_manager::imported_spawn_selection_for_test(
+                &session,
+                &svc.effective_settings()
+            ),
+            (
+                "auggie".into(),
+                model.map(|_| "gpt6-astra".into()),
+                effort.map(str::to_string)
+            )
+        );
+        assert!(session.attention_request_kind.is_none());
+        assert!(session.effort_levels.is_none());
     }
 
     #[tokio::test]

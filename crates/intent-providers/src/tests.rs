@@ -35,6 +35,23 @@ fn registry_first_provider_and_lookups() {
 /// (behavior unchanged), and the warn gate fires only for genuinely unknown
 /// ids — not for empty ids or legacy default aliases.
 #[test]
+fn legacy_alias_lookup_retains_unknown_provider_distinction() {
+    for id in all_provider_ids() {
+        assert_eq!(find_provider_or_legacy_alias(id).unwrap().id, id);
+    }
+    for alias in ["default", "acp", "augment"] {
+        assert_eq!(
+            find_provider_or_legacy_alias(alias).unwrap().id,
+            provider_config(alias).id
+        );
+        assert_eq!(find_provider_or_legacy_alias(alias).unwrap().id, "auggie");
+    }
+    for unknown in ["", "nope", "pi-typo"] {
+        assert!(find_provider_or_legacy_alias(unknown).is_none());
+    }
+}
+
+#[test]
 fn unknown_provider_fallback_warn_gate() {
     // Fallback behavior is preserved for every suppressed alias and for
     // genuinely unknown ids.
