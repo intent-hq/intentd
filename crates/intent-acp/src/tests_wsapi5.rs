@@ -907,6 +907,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
             last_seen_message_id: None,
             is_initial_agent: None,
             sponsor_agent_id: None,
+            chief_prompt_version: None,
         },
     }
 }

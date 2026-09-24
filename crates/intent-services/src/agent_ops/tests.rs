@@ -9783,7 +9783,24 @@ async fn worst_case_agent_list_row(
     };
     let parent = create_agent(svc, ws, "Parent").await;
     let child = create_agent(svc, ws, "Child").await;
-    let id = create_agent(svc, ws, "Worst-case row").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Worst-case row".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                metadata: Some(json!({"chiefPromptVersion": u32::MAX})),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create versioned budget row");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
     let user = json!([{ "type": "text", "text": format!("ask {}", "u".repeat(BUDGET * 3)) }]);
     svc.store()
@@ -9861,6 +9878,7 @@ async fn worst_case_agent_list_row(
         },
         "isInitialAgent": true,
         "sponsorAgentId": parent.0,
+        "chiefPromptVersion": u32::MAX,
     }));
     svc.store()
         .update_agent_session(ws, &s)

@@ -93,6 +93,7 @@ pub use model::{
     AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS,
     SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
+pub use model::{chief_prompt_version, CHIEF_PROMPT_VERSION_KEY};
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
 pub use model::{lift_from_principal_id, FROM_PRINCIPAL_ID_KEY};

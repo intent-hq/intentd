@@ -2788,6 +2788,7 @@ mod agent_delta_list_projection {
             "lastSeenMessageId": "msg-seen",
             "isInitialAgent": true,
             "sponsorAgentId": "agent-sponsor",
+            "chiefPromptVersion": u32::MAX,
         });
         serde_json::from_value(json!({
             "id": "agent-1",

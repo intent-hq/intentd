@@ -2255,13 +2255,20 @@ impl Store {
         // a user toggle whose only post-insert mutator is
         // `set_agent_notifications_muted`, so a concurrent or long-lived
         // in-memory session persisted here can never revert the user's mute.
+        // The creation-only Assistant marker is monotonic: once absent or
+        // invalidated, a stale full-row write cannot resurrect it. Evaluate
+        // the stored value in this UPDATE, not in the earlier invariant read.
+        let metadata = encode_metadata(s.metadata.as_ref())?;
         let rows = sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, file_blocks=?, \
-             is_background=?, metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
+             is_background=?, metadata=CASE \
+                 WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
+                 THEN json_remove(?, '$.chiefPromptVersion') ELSE ? END, \
+             sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
              stop_reason=?, stop_reason_timestamp=?, reasoning_effort=? \
              WHERE id=? AND workspace_id=?",
         )
@@ -2287,7 +2294,8 @@ impl Store {
         .bind(json_col_to_db(s.image_blocks.as_ref())?)
         .bind(json_col_to_db(s.file_blocks.as_ref())?)
         .bind(i64::from(s.is_background))
-        .bind(encode_metadata(s.metadata.as_ref())?)
+        .bind(&metadata)
+        .bind(&metadata)
         .bind(&s.sandbox_id)
         .bind(&s.sandbox_path)
         .bind(&s.sandbox_branch)
@@ -12688,6 +12696,129 @@ mod tests {
             Err(Error::NotFound(_)) => {}
             other => panic!("expected NotFound on unknown id, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn chief_prompt_version_survives_reopen_and_all_summary_paths() {
+        use intent_core::{chief_prompt_version, AgentListRowScope, AgentLite};
+        use serde_json::json;
+
+        let tmp = TempDb::new("chief-prompt-version");
+        let store = Store::open(&tmp).await.unwrap();
+        let ws = WorkspaceId::from("ws-prompt-version");
+        let ts = intent_core::now_iso();
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        for (index, metadata) in [
+            None,
+            Some(json!({})),
+            Some(json!({"chiefPromptVersion": null})),
+            Some(json!({"chiefPromptVersion": 3})),
+            Some(json!({"chiefPromptVersion": u32::MAX})),
+            Some(json!({"chiefPromptVersion": "3"})),
+            Some(json!({"chiefPromptVersion": -1})),
+            Some(json!({"chiefPromptVersion": 3.0})),
+            Some(json!({"chiefPromptVersion": u64::MAX})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = AgentId::from(format!("agent-version-{index}"));
+            let mut session = baseline_test_session(&id, &ws, &ts, None);
+            session.metadata = metadata;
+            store.insert_agent_session(&session).await.unwrap();
+        }
+        drop(store);
+        let store = Store::open(&tmp).await.unwrap();
+        let mut paths = vec![
+            store.list_agent_session_summaries(&ws).await.unwrap(),
+            store
+                .list_active_agent_session_summaries(&ws)
+                .await
+                .unwrap(),
+            store
+                .list_scoped_agent_session_summaries(&ws, &AgentListRowScope::TopLevel)
+                .await
+                .unwrap(),
+            store
+                .list_agent_session_summaries_by_workspace(std::slice::from_ref(&ws))
+                .await
+                .unwrap()
+                .remove(&ws)
+                .unwrap(),
+        ];
+        let full = store.list_agent_sessions(&ws).await.unwrap();
+        let mut individual = Vec::new();
+        for session in &full {
+            individual.push(store.get_agent_session_summary(&session.id).await.unwrap());
+        }
+        paths.push(individual);
+        for rows in paths {
+            assert_eq!(rows.len(), full.len());
+            for row in rows {
+                let original = full.iter().find(|s| s.id == row.id).unwrap();
+                assert_eq!(row.metadata, original.metadata);
+                let expected = original.metadata.as_ref().and_then(chief_prompt_version);
+                let lite = AgentLite::from_session(row, 0, None, None, None, None, None);
+                assert_eq!(lite.metadata.chief_prompt_version, expected);
+                assert_eq!(
+                    serde_json::to_value(lite).unwrap()["metadata"]
+                        .get("chiefPromptVersion")
+                        .cloned(),
+                    expected.map(|v| json!(v))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chief_prompt_version_cannot_be_resurrected_by_stale_full_row_write() {
+        use serde_json::json;
+
+        let tmp = TempDb::new("chief-version-stale-write");
+        let store = Store::open(&tmp).await.unwrap();
+        let ws = WorkspaceId::from("ws-version-stale");
+        let id = AgentId::from("agent-version-stale");
+        let ts = intent_core::now_iso();
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        let mut stale = baseline_test_session(&id, &ws, &ts, None);
+        stale.metadata = Some(json!({"chiefPromptVersion": 3, "behaviorPrompt": "Assistant"}));
+        store.insert_agent_session(&stale).await.unwrap();
+        store.update_agent_session(&ws, &stale).await.unwrap();
+        assert_eq!(
+            store
+                .get_agent_session(&id)
+                .await
+                .unwrap()
+                .metadata
+                .as_ref()
+                .and_then(intent_core::chief_prompt_version),
+            Some(3)
+        );
+
+        let mut invalidated = stale.clone();
+        invalidated
+            .metadata
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("chiefPromptVersion");
+        store.update_agent_session(&ws, &invalidated).await.unwrap();
+        stale.name = "Renamed by stale writer".into();
+        stale.metadata.as_mut().unwrap()["unrelated"] = json!("preserved");
+        store.update_agent_session(&ws, &stale).await.unwrap();
+        let after = store.get_agent_session(&id).await.unwrap();
+        assert_eq!(after.name, stale.name);
+        assert_eq!(
+            after.metadata,
+            Some(json!({"behaviorPrompt": "Assistant", "unrelated": "preserved"}))
+        );
     }
 
     /// `set_agent_session_metadata_key` writes exactly one key in SQL:
