@@ -19434,7 +19434,7 @@ pub(crate) mod pr {
         // Gate open at the start, paused by the last forge read.
         let gate = svc.sweep_rate_limit.clone();
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
-            assert!(gate.pause_for(std::time::Duration::from_secs(3600)));
+            assert!(gate.pause_for(std::time::Duration::from_secs(3600), true));
         }));
         let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
         let until = svc
@@ -23354,7 +23354,7 @@ pub(crate) mod pr {
     /// workspace refresh pauses the forge work for every subsequent
     /// workspace in this and later sweeps (until the window resets), while
     /// the sweep itself keeps running its local, forge-free steps. A paused
-    /// tick spends exactly one quota-free probe on the early-lift check; a
+    /// tick spends exactly one shared quota probe on the early-lift check; a
     /// host without a `remaining` signal never lifts early.
     #[tokio::test]
     async fn pr_refresh_sweep_rate_limit_pauses_all_workspaces() {
@@ -23386,7 +23386,7 @@ pub(crate) mod pr {
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
 
         // The next tick is still inside the pause window: zero forge calls,
-        // one free probe for the early lift (no `remaining` → deadline kept).
+        // one probe for the early lift (no `remaining` → deadline kept).
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 2);

@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant, SystemTime};
 
 /// Fallback pause when the forge cannot report its reset timestamp (host
-/// without the signal, or the free `rate_limit` probe itself failed).
+/// without the signal, or the quota probe itself failed).
 pub(crate) const RATE_LIMIT_FALLBACK_PAUSE: Duration = Duration::from_secs(5 * 60);
 
 /// Safety margin added past the reported reset so the first post-pause sweep
@@ -63,7 +63,7 @@ pub(crate) fn lift_floor(limit: Option<u64>) -> u64 {
     RATE_LIMIT_LIFT_MIN_REMAINING.max(limit.unwrap_or(0) / 10)
 }
 
-/// Whether the forge's quota-free probe reports the quota recovered enough
+/// Whether the forge's quota probe reports the quota recovered enough
 /// to lift the pause before its deadline: a REPORTED `remaining` at or
 /// above [`lift_floor`]. A host without the signal (`remaining: None`)
 /// never lifts early — the deadline stands, as before the probe existed.
@@ -90,6 +90,16 @@ pub(crate) use intent_store::{
 struct PauseDeadline {
     at: Instant,
     wall: SystemTime,
+    /// A rejection contradicted by an already-healthy probe cannot be
+    /// explained by these counters (e.g. a secondary limit). Its fallback
+    /// deadline must elapse instead of repeatedly trusting that same health.
+    allow_early_lift: bool,
+}
+
+struct QuotaProbe {
+    at: Instant,
+    provider: &'static str,
+    status: Option<intent_sourcecontrol::RateLimitStatus>,
 }
 
 /// The shared pause state. Interior-mutable so one instance can sit in an
@@ -111,9 +121,45 @@ struct PauseDeadline {
 pub(crate) struct RateLimitGate {
     paused_until: std::sync::Mutex<Option<PauseDeadline>>,
     reconcile: tokio::sync::Mutex<()>,
+    quota_probe: tokio::sync::Mutex<Option<QuotaProbe>>,
 }
 
 impl RateLimitGate {
+    /// One metered probe per provider interval across every sweep and
+    /// recovery caller, including concurrent callers and failed probes.
+    /// Holding this separate lock through the bounded request makes the
+    /// first caller do the work; followers reuse its evidence. No PR-read
+    /// cache or on-demand read behavior is affected.
+    pub(crate) async fn probe_status(
+        &self,
+        sc: &dyn intent_sourcecontrol::SourceControl,
+    ) -> Option<intent_sourcecontrol::RateLimitStatus> {
+        let mut probe = self.quota_probe.lock().await;
+        if let Some(previous) = probe.as_ref().filter(|p| {
+            p.provider == sc.provider_id() && p.at.elapsed() < sc.rate_limit_probe_interval()
+        }) {
+            return previous.status;
+        }
+        let status = match sc.rate_limit_status().await {
+            Ok(status) => Some(status),
+            Err(error) => {
+                tracing::debug!(%error, "forge quota probe failed; quota remains unknown");
+                None
+            }
+        };
+        *probe = Some(QuotaProbe {
+            at: Instant::now(),
+            provider: sc.provider_id(),
+            status,
+        });
+        status
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn expire_probe(&self) {
+        *self.quota_probe.lock().await = None;
+    }
+
     /// Hold the gate's transition-and-reconciliation critical section: a
     /// transition ([`Self::pause_for`], [`Self::lift`], or a read that
     /// decides a clear) and the statement reconciling the rows to it run
@@ -142,23 +188,32 @@ impl RateLimitGate {
         self.active_deadline().map(|d| d.wall)
     }
 
+    pub(crate) fn allows_early_lift(&self) -> bool {
+        self.active_deadline().is_some_and(|d| d.allow_early_lift)
+    }
+
     /// Pause forge-touching sweep work for `duration` from now. Returns
     /// `true` when this call opened a NEW pause window (the caller should
     /// log its one WARN); `false` when a pause was already active — the
     /// deadline is extended if the new one is later, but reporting stays
     /// coalesced to the window's first trigger.
-    pub(crate) fn pause_for(&self, duration: Duration) -> bool {
+    pub(crate) fn pause_for(&self, duration: Duration, allow_early_lift: bool) -> bool {
         let now = Instant::now();
         let deadline = PauseDeadline {
             at: now + duration,
             wall: SystemTime::now() + duration,
+            allow_early_lift,
         };
         let mut slot = self.paused_until.lock().expect("gate lock");
         match *slot {
             Some(existing) if existing.at > now => {
-                if deadline.at > existing.at {
-                    *slot = Some(deadline);
-                }
+                let mut merged = if deadline.at > existing.at {
+                    deadline
+                } else {
+                    existing
+                };
+                merged.allow_early_lift &= existing.allow_early_lift && allow_early_lift;
+                *slot = Some(merged);
                 false
             }
             _ => {
@@ -168,7 +223,7 @@ impl RateLimitGate {
         }
     }
 
-    /// Re-open the gate now, before its deadline — the forge's quota-free
+    /// Re-open the gate now, before its deadline — the forge's quota
     /// probe reported the quota recovered ([`quota_recovered`]). Returns
     /// `true` when a pause was active and is now lifted (the caller logs
     /// its one INFO and reconciles the persisted pause annotations);
@@ -243,14 +298,14 @@ mod tests {
         // First trigger opens the window (caller logs); a second trigger
         // while paused is coalesced (no second WARN).
         let before = SystemTime::now();
-        assert!(gate.pause_for(Duration::from_secs(60)));
+        assert!(gate.pause_for(Duration::from_secs(60), true));
         assert!(gate.paused_remaining().is_some());
         let until = gate.paused_until().expect("wall-clock deadline");
         assert!(until >= before + Duration::from_secs(60));
-        assert!(!gate.pause_for(Duration::from_secs(60)));
+        assert!(!gate.pause_for(Duration::from_secs(60), true));
 
         // A later deadline extends silently, on both clocks.
-        assert!(!gate.pause_for(Duration::from_secs(120)));
+        assert!(!gate.pause_for(Duration::from_secs(120), true));
         assert!(gate.paused_remaining().unwrap() > Duration::from_secs(60));
         assert!(gate.paused_until().unwrap() > until);
     }
@@ -258,12 +313,28 @@ mod tests {
     #[test]
     fn gate_reopens_once_the_deadline_elapses() {
         let gate = RateLimitGate::default();
-        assert!(gate.pause_for(Duration::from_millis(5)));
+        assert!(gate.pause_for(Duration::from_millis(5), true));
         std::thread::sleep(Duration::from_millis(10));
         assert!(gate.paused_remaining().is_none());
         assert!(gate.paused_until().is_none());
         // The next trigger is a NEW window and warns again.
-        assert!(gate.pause_for(Duration::from_secs(60)));
+        assert!(gate.pause_for(Duration::from_secs(60), true));
+    }
+
+    #[test]
+    fn contradictory_evidence_disables_early_lift_even_without_a_deadline_extension() {
+        let gate = RateLimitGate::default();
+        gate.pause_for(Duration::from_secs(120), true);
+        assert!(gate.allows_early_lift());
+        let deadline = gate.paused_until();
+        gate.pause_for(Duration::from_secs(60), false);
+        assert_eq!(gate.paused_until(), deadline);
+        assert!(!gate.allows_early_lift());
+        gate.pause_for(Duration::from_secs(180), true);
+        assert!(
+            !gate.allows_early_lift(),
+            "a later trigger cannot undo the contradiction"
+        );
     }
 
     /// An explicit lift re-opens a paused gate before its deadline and
@@ -275,7 +346,7 @@ mod tests {
         let gate = RateLimitGate::default();
         assert!(!gate.lift(), "an open gate has nothing to lift");
 
-        assert!(gate.pause_for(Duration::from_secs(3600)));
+        assert!(gate.pause_for(Duration::from_secs(3600), true));
         assert!(gate.paused_remaining().is_some());
         assert!(gate.lift(), "the active pause is lifted");
         assert!(gate.paused_remaining().is_none());
@@ -283,14 +354,14 @@ mod tests {
         assert!(!gate.lift(), "a second lift finds the gate open");
 
         assert!(
-            gate.pause_for(Duration::from_secs(60)),
+            gate.pause_for(Duration::from_secs(60), true),
             "the next trigger after a lift opens a fresh window (and warns)"
         );
 
         // A lift racing the deadline: the window already elapsed on its
         // own, so there was nothing to lift — no INFO for the caller.
         let gate = RateLimitGate::default();
-        assert!(gate.pause_for(Duration::from_millis(5)));
+        assert!(gate.pause_for(Duration::from_millis(5), true));
         std::thread::sleep(Duration::from_millis(10));
         assert!(!gate.lift());
     }

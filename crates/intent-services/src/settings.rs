@@ -1854,7 +1854,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "prMonitor.quotaSharePercent",
             "PR monitor quota share percent",
-            "Share of the forge's REMAINING core quota (read once per tick from its quota-free rate_limit probe) the centralized loop may plan to spend before the window resets — the per-PR interval stretches above the hourly-budget cadence once PRs × 3 × secondsToReset would exceed that share of the remaining quota, so the monitor slows down before the shared rate-limit pause has to stop it; never below pollSeconds. A host without the signal uses the hourly budget alone (minimum 1, maximum 100)",
+            "Share of the forge's REMAINING PR-read quota (from shared authoritative probes) the centralized loop may plan to spend before the window resets — the per-PR interval stretches above the hourly-budget cadence once PRs × 3 × secondsToReset would exceed that share of the remaining quota, so the monitor slows down before the shared rate-limit pause has to stop it; never below pollSeconds. A host without the signal uses the hourly budget alone (minimum 1, maximum 100)",
             "prMonitor",
             Some(1.0),
             Some(100.0),

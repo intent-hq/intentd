@@ -26,6 +26,7 @@ struct MockGraphql {
 
 /// Per-request responder: raw request text (head + body) → `(status, body)`.
 type Responder = Arc<dyn Fn(&str) -> (u16, String) + Send + Sync>;
+type HeaderResponder = Arc<dyn Fn(&str) -> (u16, String, String) + Send + Sync>;
 
 async fn spawn_mock_graphql(body: Value) -> MockGraphql {
     let body = serde_json::to_string(&body).expect("serialize mock body");
@@ -44,6 +45,14 @@ async fn spawn_mock_graphql_with(
 /// Loopback HTTP stub whose responder picks the status code too — the REST
 /// error paths (422 / 404 / 403) need it.
 async fn spawn_mock_with(respond: Responder) -> MockGraphql {
+    spawn_mock_with_headers(Arc::new(move |request| {
+        let (status, body) = respond(request);
+        (status, String::new(), body)
+    }))
+    .await
+}
+
+async fn spawn_mock_with_headers(respond: HeaderResponder) -> MockGraphql {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind mock graphql host");
@@ -68,7 +77,7 @@ async fn spawn_mock_with(respond: Responder) -> MockGraphql {
 /// answer with the responder's status + JSON, and close.
 async fn serve_conn(
     mut stream: TcpStream,
-    respond: &(dyn Fn(&str) -> (u16, String) + Send + Sync),
+    respond: &(dyn Fn(&str) -> (u16, String, String) + Send + Sync),
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -100,7 +109,7 @@ async fn serve_conn(
         buf.extend_from_slice(&tmp[..n]);
     }
     let request = String::from_utf8_lossy(&buf).to_string();
-    let (status, body) = respond(&request);
+    let (status, headers, body) = respond(&request);
     let reason = match status {
         200 => "OK",
         403 => "Forbidden",
@@ -109,12 +118,127 @@ async fn serve_conn(
         _ => "Status",
     };
     let resp = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} {reason}\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body
     );
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await
+}
+
+/// intent#5837: `/rate_limit` can disagree with the counters GitHub actually
+/// enforces, even with a current Date and no-cache. A healthy overview must
+/// not hide either exhausted PR-read resource, or supply its reset deadline.
+#[tokio::test]
+async fn quota_probe_uses_enforced_core_and_graphql_counters_not_the_overview() {
+    for exhausted in ["core", "graphql"] {
+        let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = recovered.clone();
+        let mock = spawn_mock_with_headers(Arc::new(move |request| {
+            let target = request_target(request);
+            if target.starts_with("/rate_limit") {
+                return (200, String::new(), json!({"resources": {
+                    "core": {"remaining": 4999, "limit": 5000, "reset": 9999},
+                    "graphql": {"remaining": 5000, "limit": 5000, "reset": 9999}
+                }}).to_string());
+            }
+            let resource = match target.as_str() {
+                "/user" => "core",
+                "/graphql" => "graphql",
+                other => panic!("unexpected quota probe {other}"),
+            };
+            let limited = resource == exhausted
+                && !state.load(std::sync::atomic::Ordering::SeqCst);
+            let remaining = if limited { 0 } else { 4500 };
+            let reset = if resource == exhausted { 1200 } else { 1800 };
+            let headers = format!(
+                "x-ratelimit-resource: {resource}\r\nx-ratelimit-remaining: {remaining}\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-reset: {reset}\r\n"
+            );
+            let status = if limited && resource == "core" { 403 } else { 200 };
+            (status, headers, json!({}).to_string())
+        }))
+        .await;
+        let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri))
+            .expect("build github client");
+        let status = sc.rate_limit_status().await.expect("quota probe");
+        assert_eq!(status.remaining, Some(0), "{exhausted} is exhausted");
+        assert_eq!(
+            status.reset_at,
+            Some(1200),
+            "the exhausted resource's reset"
+        );
+        assert_eq!(status.limit, Some(5000));
+
+        recovered.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            sc.rate_limit_status()
+                .await
+                .expect("recovered quota")
+                .remaining,
+            Some(4500),
+            "fresh evidence permits genuine recovery"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quota_probe_requires_valid_headers_for_both_resources() {
+    for bad_headers in [
+        String::new(),
+        "x-ratelimit-resource: search\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-limit: 5000\r\n".into(),
+        "x-ratelimit-resource: graphql\r\nx-ratelimit-remaining: 6000\r\nx-ratelimit-limit: 5000\r\n".into(),
+    ] {
+        let mock = spawn_mock_with_headers(Arc::new(move |request| {
+            let headers = if request_target(request) == "/user" {
+                "x-ratelimit-resource: core\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-reset: 1800\r\n".into()
+            } else {
+                bad_headers.clone()
+            };
+            (200, headers, "{}".into())
+        })).await;
+        let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+        assert_eq!(sc.rate_limit_status().await.unwrap().remaining, None);
+    }
+}
+
+#[tokio::test]
+async fn quota_probe_keeps_the_later_reset_when_both_resources_are_exhausted() {
+    let mock = spawn_mock_with_headers(Arc::new(|request| {
+        let (resource, reset) = if request_target(request) == "/user" {
+            ("core", 1200)
+        } else {
+            ("graphql", 1800)
+        };
+        (200, format!("x-ratelimit-resource: {resource}\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-reset: {reset}\r\n"), "{}".into())
+    })).await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+    let status = sc.rate_limit_status().await.unwrap();
+    assert_eq!(status.remaining, Some(0));
+    assert_eq!(status.reset_at, Some(1800));
+}
+
+#[tokio::test]
+async fn quota_probes_never_multiply_requests_with_immediate_http_retries() {
+    for status in [429, 503] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let mock = spawn_mock_with_headers(Arc::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (status, String::new(), "{}".into())
+        }))
+        .await;
+        let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+        assert_eq!(
+            sc.rate_limit_probe_interval(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(sc.rate_limit_status().await.unwrap().remaining, None);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one request per resource for HTTP {status}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
