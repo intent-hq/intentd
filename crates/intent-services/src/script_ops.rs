@@ -101,9 +101,9 @@ pub(crate) struct ManagedScript {
     /// start (whether its launch succeeds or fails), or by a `stop` (the
     /// dismiss).
     lost_at_daemon_stop: bool,
-    /// Set by `stop_all` on every entry that was `running` when the shutdown
-    /// sweep began: `mark_exited` then leaves the `was_running` marker set
-    /// (instead of clearing it) so the next boot reads the run as lost. This
+    /// Set by `stop_all` on entries that were running or still carried a
+    /// previous boot's recovery marker when shutdown began. Exit and refused
+    /// registration then preserve that marker for the next boot. This
     /// is what covers a `script.run` command — its completion task has no
     /// supervisor handle for the sweep to await, so its exit could otherwise
     /// land after the sweep's marker write and erase it.
@@ -829,6 +829,8 @@ impl ScriptManager {
     /// `script.run` completion task's — which has no handle to await) leaves
     /// the marker set; the sweep re-persists it afterwards as a backstop for
     /// a supervisor that never settles.
+    /// A previous boot's recovery marker is also protected while restoration
+    /// is still starting: refusing its registration must not erase the marker.
     pub(crate) async fn stop_all(&self) -> (usize, usize) {
         struct Stopped {
             ws: WorkspaceId,
@@ -843,7 +845,7 @@ impl ScriptManager {
                 .map(|((ws, id), m)| {
                     m.stopped_by_user = true;
                     let running = m.state.status == ScriptStatus::Running;
-                    m.running_at_shutdown = running;
+                    m.running_at_shutdown = running || m.state.previously_running == Some(true);
                     Stopped {
                         ws: ws.clone(),
                         id: id.clone(),
@@ -1313,8 +1315,9 @@ impl ScriptManager {
     /// The eligibility check therefore runs twice: once to decide whether to
     /// write, once under the flip. A same-generation entry that a
     /// `stop`/`stop_all` flagged during the write is refused with the marker
-    /// cleared again (the fresh PTY is reaped by the caller, so nothing is
-    /// running); a removed or recreated entry is left alone — `script.remove`
+    /// cleared again, unless shutdown is preserving an undismissed recovery
+    /// marker (the fresh PTY is reaped by the caller, so nothing is running).
+    /// A removed or recreated entry is left alone — `script.remove`
     /// and the create-upsert await this supervisor and then delete/reset the
     /// row themselves.
     async fn mark_running(
@@ -1362,7 +1365,10 @@ impl ScriptManager {
                     m.state.previously_running = None;
                     Ok(m.state.clone())
                 }
-                None => Err(guard.get(&key).is_some_and(|m| m.generation == generation)),
+                None => Err(guard.get(&key).is_some_and(|m| {
+                    m.generation == generation
+                        && !(m.running_at_shutdown && m.state.previously_running == Some(true))
+                })),
             }
         };
         match flipped {
@@ -1370,8 +1376,8 @@ impl ScriptManager {
                 self.emit_state(ws, script_id, &state).await;
                 true
             }
-            Err(same_incarnation) => {
-                if same_incarnation {
+            Err(clear_marker) => {
+                if clear_marker {
                     self.persist_was_running(ws, script_id, false).await;
                 }
                 false
@@ -2750,7 +2756,12 @@ mod tests {
     async fn hydrate_shutdown_during_marker_write_preserves_only_recovery() {
         use std::future::Future;
 
-        for (restoring, user_stop) in [(true, false), (true, true), (false, false)] {
+        for (restoring, user_stop, shutdown_first) in [
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+            (false, false, false),
+        ] {
             let mut h = harness().await;
             let id = create(
                 &h,
@@ -2790,7 +2801,7 @@ mod tests {
             assert_eq!(state["status"], "starting", "{state}");
 
             let mut stop = Box::pin(async {
-                if user_stop {
+                if user_stop && !shutdown_first {
                     h.services
                         .script_stop(h.ws.clone(), id.clone())
                         .await
@@ -2814,6 +2825,19 @@ mod tests {
                     .unwrap()
                     .stopped_by_user
             );
+            if shutdown_first {
+                // Shutdown already owns the supervisor handle. A later user
+                // stop can dismiss the marker before its write resumes.
+                h.services
+                    .script_stop(h.ws.clone(), id.clone())
+                    .await
+                    .expect("explicit stop after shutdown started");
+                assert!(store
+                    .list_was_running_script_ids()
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
             park.release.notify_one();
             tokio::time::timeout(LIVENESS, stop)
                 .await
@@ -2829,7 +2853,7 @@ mod tests {
             assert_eq!(
                 store.list_was_running_script_ids().await.unwrap(),
                 expected_markers,
-                "restoring={restoring}, user_stop={user_stop}"
+                "restoring={restoring}, user_stop={user_stop}, shutdown_first={shutdown_first}"
             );
 
             h.services = Services::new(store).with_event_bus(h.bus.clone());
