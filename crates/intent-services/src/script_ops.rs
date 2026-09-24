@@ -350,8 +350,10 @@ impl ScriptManager {
     /// registry with a fresh idle state (runtime state is never persisted,
     /// except the stored-on-write `was_running` marker — the script was
     /// running when the previous daemon process stopped). A marked service
-    /// hydrates `idle` with `previouslyRunning: true` (the restore-tab
-    /// affordance); a marked command-mode script hydrates as a terminal
+    /// starts automatically only when `auto_start` is enabled; otherwise it
+    /// stays `idle` with `previouslyRunning: true` (the restore-tab
+    /// affordance). A failed automatic launch retains that idle marker.
+    /// A marked command-mode script hydrates as a terminal
     /// `exited` with [`EXIT_CODE_UNOBSERVABLE`] and
     /// [`LOST_AT_DAEMON_STOP_ERROR`] — its run is gone and nothing can be
     /// restored, so a watcher waiting on `exited` settles instead of waiting
@@ -365,38 +367,52 @@ impl ScriptManager {
             .await?
             .into_iter()
             .collect();
-        let mut guard = self.scripts.lock().unwrap();
         let mut loaded = 0;
-        for def in defs {
-            let key = (WorkspaceId::from(def.workspace_id.as_str()), def.id.clone());
-            guard.entry(key).or_insert_with(|| {
-                loaded += 1;
-                let marked = was_running.contains(&(def.workspace_id.clone(), def.id.clone()));
-                let lost = marked && def.mode == ScriptMode::Command;
-                let state = if lost {
-                    ScriptRuntimeState {
-                        status: ScriptStatus::Exited,
-                        exit_code: Some(EXIT_CODE_UNOBSERVABLE),
-                        error: Some(LOST_AT_DAEMON_STOP_ERROR.to_string()),
-                        ..Default::default()
+        let mut restore = Vec::new();
+        {
+            let mut guard = self.scripts.lock().unwrap();
+            for def in defs {
+                let key = (WorkspaceId::from(def.workspace_id.as_str()), def.id.clone());
+                guard.entry(key.clone()).or_insert_with(|| {
+                    loaded += 1;
+                    let marked = was_running.contains(&(def.workspace_id.clone(), def.id.clone()));
+                    let lost = marked && def.mode == ScriptMode::Command;
+                    if marked && def.mode == ScriptMode::Service && def.auto_start == Some(true) {
+                        restore.push(key);
                     }
-                } else {
-                    ScriptRuntimeState {
-                        previously_running: marked.then_some(true),
-                        ..Default::default()
+                    let state = if lost {
+                        ScriptRuntimeState {
+                            status: ScriptStatus::Exited,
+                            exit_code: Some(EXIT_CODE_UNOBSERVABLE),
+                            error: Some(LOST_AT_DAEMON_STOP_ERROR.to_string()),
+                            ..Default::default()
+                        }
+                    } else {
+                        ScriptRuntimeState {
+                            previously_running: marked.then_some(true),
+                            ..Default::default()
+                        }
+                    };
+                    ManagedScript {
+                        def,
+                        state,
+                        pty_id: None,
+                        stopped_by_user: false,
+                        supervisor: None,
+                        generation: next_generation(),
+                        lost_at_daemon_stop: lost,
+                        running_at_shutdown: false,
                     }
-                };
-                ManagedScript {
-                    def,
-                    state,
-                    pty_id: None,
-                    stopped_by_user: false,
-                    supervisor: None,
-                    generation: next_generation(),
-                    lost_at_daemon_stop: lost,
-                    running_at_shutdown: false,
-                }
-            });
+                });
+            }
+        }
+        // Only newly hydrated entries are eligible. Launch through the normal
+        // supervisor after releasing the registry lock; one failure must not
+        // prevent other services (or the daemon itself) from starting.
+        for (ws, id) in restore {
+            if let Err(error) = self.start_inner(&ws, &id, true) {
+                tracing::warn!(workspace = %ws, script = %id, %error, "restore auto-start script failed");
+            }
         }
         Ok(loaded)
     }
@@ -663,11 +679,24 @@ impl ScriptManager {
     /// `stop` inside the window settles the status back to `idle`. The
     /// `script.restart` gap keeps its own `restarting` status.
     pub(crate) fn start(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
+        self.start_inner(workspace_id, script_id, false)
+    }
+
+    fn start_inner(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        restoring: bool,
+    ) -> Result<Value> {
         let key = (workspace_id.clone(), script_id.to_string());
         let mut guard = self.scripts.lock().unwrap();
         let m = guard
             .get_mut(&key)
             .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
+        // A stop/upsert racing boot hydration must not be undone by restoration.
+        if restoring && (m.stopped_by_user || m.state.previously_running != Some(true)) {
+            return Ok(json!({ "ok": true, "scriptId": script_id }));
+        }
         if matches!(
             m.state.status,
             ScriptStatus::Running | ScriptStatus::Starting
@@ -696,7 +725,7 @@ impl ScriptManager {
             if let Some(state) = launching {
                 mgr.emit_state(&ws, &sid, &state).await;
             }
-            mgr.supervise(ws, sid, def, generation).await;
+            mgr.supervise(ws, sid, def, generation, restoring).await;
         }));
         drop(guard);
         Ok(json!({ "ok": true, "scriptId": script_id }))
@@ -952,7 +981,8 @@ impl ScriptManager {
             Ok(cwd) => cwd,
             Err(e) => {
                 reservation.armed = false;
-                self.fail(&ws, script_id, generation, &e.to_string()).await;
+                self.fail(&ws, script_id, generation, &e.to_string(), false)
+                    .await;
                 return Err(e);
             }
         };
@@ -960,7 +990,8 @@ impl ScriptManager {
             Ok(id) => id,
             Err(e) => {
                 reservation.armed = false;
-                self.fail(&ws, script_id, generation, &e.to_string()).await;
+                self.fail(&ws, script_id, generation, &e.to_string(), false)
+                    .await;
                 return Err(e);
             }
         };
@@ -1034,11 +1065,19 @@ impl ScriptManager {
     /// of the entry this supervisor was started for; every status write
     /// validates it so a stale supervisor can never mutate a recreated entry
     /// (monorepo#1194).
-    async fn supervise(self, ws: WorkspaceId, script_id: String, def: Script, generation: u64) {
+    async fn supervise(
+        self,
+        ws: WorkspaceId,
+        script_id: String,
+        def: Script,
+        generation: u64,
+        mut restoring: bool,
+    ) {
         let cwd = match self.resolve_cwd(&ws, &def).await {
             Ok(c) => c,
             Err(e) => {
-                self.fail(&ws, &script_id, generation, &e.to_string()).await;
+                self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
+                    .await;
                 return;
             }
         };
@@ -1051,7 +1090,8 @@ impl ScriptManager {
             let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
                 Ok(id) => id,
                 Err(e) => {
-                    self.fail(&ws, &script_id, generation, &e.to_string()).await;
+                    self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
+                        .await;
                     return;
                 }
             };
@@ -1074,6 +1114,7 @@ impl ScriptManager {
                 self.pty.kill(pty_id).await;
                 return;
             }
+            restoring = false;
             let exit = self.run_one(&ws, &script_id, pty_id, detect).await;
             // The too-fast decision is based on the shell's actual runtime:
             // capture it before the straggler reap below, whose TERM-grace
@@ -1409,8 +1450,16 @@ impl ScriptManager {
     /// flag and the persisted `was_running` marker are cleared, so the next
     /// boot hydrates it as plain `idle` rather than resurrecting the daemon
     /// loss. A service's `previouslyRunning` marker is untouched — the
-    /// restore affordance stays until `mark_running` or a dismiss.
-    async fn fail(&self, ws: &WorkspaceId, script_id: &str, generation: u64, err: &str) {
+    /// restore affordance stays until `mark_running` or a dismiss. Boot-time
+    /// restoration failures are logged and return to that marked idle state.
+    async fn fail(
+        &self,
+        ws: &WorkspaceId,
+        script_id: &str,
+        generation: u64,
+        err: &str,
+        restoring: bool,
+    ) {
         let (state, lost_superseded) = {
             let mut guard = self.scripts.lock().unwrap();
             let Some(m) = guard
@@ -1419,10 +1468,18 @@ impl ScriptManager {
             else {
                 return;
             };
-            m.state.status = ScriptStatus::Exited;
-            m.state.exit_code = Some(EXIT_CODE_UNOBSERVABLE);
-            m.state.error = Some(err.to_string());
-            m.state.stopped_at = Some(now_iso());
+            if restoring {
+                tracing::warn!(workspace = %ws, script = %script_id, error = %err, "restore auto-start script failed");
+                m.state = ScriptRuntimeState {
+                    previously_running: m.state.previously_running,
+                    ..Default::default()
+                };
+            } else {
+                m.state.status = ScriptStatus::Exited;
+                m.state.exit_code = Some(EXIT_CODE_UNOBSERVABLE);
+                m.state.error = Some(err.to_string());
+                m.state.stopped_at = Some(now_iso());
+            }
             m.pty_id = None;
             (m.state.clone(), std::mem::take(&mut m.lost_at_daemon_stop))
         };
