@@ -90,6 +90,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "sourceControl.gitlab.host",
     "sourceControl.gitlab.oauthClientId",
     "sourceControl.gitlab.apiBaseUrl",
+    "identity.provider",
     "accounts.sentry.organization",
     "voice.provider",
     "voice.language",

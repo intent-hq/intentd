@@ -143,11 +143,24 @@ impl WorkspaceApi for RedeemStub {
         invite_id: String,
         secret: String,
         nonce: String,
-        gist_id: String,
-        login: String,
+        claim: InviteProofClaim,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+        let InviteProofClaim {
+            proof_id,
+            login,
+            provider,
+            host,
+        } = claim;
+        let forge = match (provider, host) {
+            (None, None) => String::new(),
+            (provider, host) => format!(
+                ":{}@{}",
+                provider.unwrap_or_default(),
+                host.unwrap_or_default()
+            ),
+        };
         self.calls.lock().unwrap().push(format!(
-            "prove:{invite_id}:{secret}:{nonce}:{gist_id}:{login}"
+            "prove:{invite_id}:{secret}:{nonce}:{proof_id}:{login}{forge}"
         ));
         Box::pin(async move {
             match nonce.as_str() {
@@ -162,6 +175,9 @@ impl WorkspaceApi for RedeemStub {
                 "down" => Err(intent_core::Error::Invite(
                     InviteErrorKind::GithubUnreachable,
                 )),
+                "unverifiable" => Err(intent_core::Error::IdentityUnverifiable {
+                    host: "gitlab.example".to_string(),
+                }),
                 _ => Err(intent_core::Error::Invite(InviteErrorKind::ProofInvalid)),
             }
         })
@@ -291,6 +307,23 @@ async fn prove_returns_the_authorized_shape_and_maps_proof_errors() {
         assert_eq!(frame["error"]["data"]["code"], json!(code), "{frame}");
         assert_eq!(frame["error"]["code"], json!(rpc), "{frame}");
     }
+    // 10.8: the host-half proof refusal keeps its typed `data` on `/invite`
+    // too — `host` names the instance the guest must be told about.
+    let unverifiable = intent_core::Error::IdentityUnverifiable {
+        host: "gitlab.example".to_string(),
+    };
+    let frame: Value =
+        serde_json::from_str(&handle_prove(prove(2, "unverifiable"), &api).await.unwrap()).unwrap();
+    assert_eq!(
+        frame["error"]["code"],
+        json!(unverifiable.code()),
+        "{frame}"
+    );
+    assert_eq!(
+        frame["error"]["data"],
+        json!({ "code": "identity-unverifiable", "host": "gitlab.example" }),
+        "{frame}"
+    );
 
     let req = classify(&json!({
         "jsonrpc": "2.0", "id": 3, "method": "invite.prove",
@@ -302,7 +335,47 @@ async fn prove_returns_the_authorized_shape_and_maps_proof_errors() {
     assert!(
         frame["error"]["message"]
             .as_str()
-            .is_some_and(|m| m.contains("gistId")),
+            .is_some_and(|m| m.contains("gistId") && m.contains("proofId")),
+        "{frame}"
+    );
+
+    // 10.8: `proofId` aliases `gistId`; `provider` / `host` ride along.
+    // Both spellings at once are a caller error before any service call —
+    // even when they agree (exactly one of the two).
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 4, "method": "invite.prove",
+        "params": {
+            "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest",
+            "proofId": "77", "provider": "gitlab", "host": "gitlab.example",
+        }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["result"]["status"], json!("authorized"), "{frame}");
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 5, "method": "invite.prove",
+        "params": {
+            "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest",
+            "proofId": "77", "gistId": "abc123",
+        }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602), "{frame}");
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 6, "method": "invite.prove",
+        "params": {
+            "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest",
+            "proofId": "abc123", "gistId": "abc123",
+        }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602), "{frame}");
+    assert!(
+        frame["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("exactly one")),
         "{frame}"
     );
 
@@ -313,6 +386,8 @@ async fn prove_returns_the_authorized_shape_and_maps_proof_errors() {
             format!("prove:inv:{GOOD_SECRET}:bogus:abc123:guest"),
             format!("prove:inv:{GOOD_SECRET}:expired:abc123:guest"),
             format!("prove:inv:{GOOD_SECRET}:down:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:unverifiable:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:{GOOD_NONCE}:77:guest:gitlab@gitlab.example"),
         ]
     );
 }
@@ -755,7 +830,7 @@ impl WorkspaceApi for CreateStub {
     fn workspace_invite_create(
         &self,
         workspace_id: WorkspaceId,
-        _pin_login: Option<String>,
+        _pin: Option<InvitePin>,
         _expires_in_secs: Option<u64>,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

@@ -38,8 +38,8 @@ use crate::host_env::HostEnvironment;
 use crate::pairing::encode_query_value;
 use crate::server::ServerPairingInfo;
 use intent_core::{
-    Error, InviteErrorKind, InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope,
-    Result, WorkspaceApi, WorkspaceId,
+    Error, InviteErrorKind, InviteLinkBuilder, InviteLinkEnvelope, InvitePin, InviteProofClaim,
+    ResolvedInviteLinkEnvelope, Result, WorkspaceApi, WorkspaceId,
 };
 
 /// Version of the `intent://invite` payload format (`v` query parameter and
@@ -153,6 +153,14 @@ fn respond(req: &InviteRequest, result: Result<Value>) -> Option<String> {
             e.code(),
             &e.to_string(),
             &json!({ "code": "tunnel-down" }),
+        ),
+        // Identity-proof refusal (host half, protocol 10.8): `data.host`
+        // names the instance the host has no connection to.
+        Err(ref e @ Error::IdentityUnverifiable { ref host }) => error_frame_with_data(
+            &req.id_echo,
+            e.code(),
+            &e.to_string(),
+            &json!({ "code": "identity-unverifiable", "host": host }),
         ),
         Err(e) => error_frame(&req.id_echo, e.code(), &e.to_string()),
     })
@@ -389,11 +397,26 @@ async fn create_json(
     provider: Option<&Arc<dyn ServerPairingInfo>>,
 ) -> Result<Value> {
     let workspace_id = WorkspaceId::from(str_param(params, "workspaceId")?.as_str());
-    let pin_login = opt_str_param(params, "pinLogin")?;
+    let pin = if let Some(login) = opt_str_param(params, "pinLogin")? {
+        Some(InvitePin {
+            login,
+            provider: opt_str_param(params, "pinProvider")?,
+            host: opt_str_param(params, "pinHost")?,
+        })
+    } else {
+        if params.get("pinProvider").is_some_and(|v| !v.is_null())
+            || params.get("pinHost").is_some_and(|v| !v.is_null())
+        {
+            return Err(Error::InvalidParams(
+                "`pinProvider` / `pinHost` require `pinLogin`".to_string(),
+            ));
+        }
+        None
+    };
     let expires_in_secs = opt_u64_param(params, "expiresInSecs")?;
     let envelope = link_envelope(provider).await?;
     let mut result = api
-        .workspace_invite_create(workspace_id, pin_login, expires_in_secs)
+        .workspace_invite_create(workspace_id, pin, expires_in_secs)
         .await?;
     let invite_id = result
         .pointer("/invite/id")
@@ -524,10 +547,14 @@ async fn challenge_json(
 }
 
 /// Handle a classified `invite.prove` on the `/invite` endpoint: params
-/// `{ inviteId, secret, nonce, gistId, login }` → the `authorized` shape
+/// `{ inviteId, secret, nonce, login, gistId? | proofId?, provider?, host? }`
+/// (`proofId` aliases `gistId`, exactly one of the two — never both, even
+/// spelling the same id; `provider` defaults in the service layer to
+/// github, `host` to the forge's default instance — protocol 10.8) → the
+/// `authorized` shape
 /// `{ status, token, principalId, login, workspaceId }` as the service
-/// answers it (no host identity: the client already
-/// saw it on the challenge).
+/// answers it (no host identity: the client already saw it on the
+/// challenge).
 pub(crate) async fn handle_prove(
     req: InviteRequest,
     api: &Arc<dyn WorkspaceApi>,
@@ -540,10 +567,30 @@ async fn prove_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Value
     let invite_id = str_param(params, "inviteId")?;
     let secret = str_param(params, "secret")?;
     let nonce = str_param(params, "nonce")?;
-    let gist_id = str_param(params, "gistId")?;
     let login = str_param(params, "login")?;
-    api.invite_prove(invite_id, secret, nonce, gist_id, login)
-        .await
+    let proof_id = match (
+        opt_str_param(params, "proofId")?,
+        opt_str_param(params, "gistId")?,
+    ) {
+        (Some(proof_id), None) | (None, Some(proof_id)) => proof_id,
+        (Some(_), Some(_)) => {
+            return Err(Error::InvalidParams(
+                "`proofId` and `gistId` are aliases; pass exactly one".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(Error::InvalidParams(
+                "`proofId` (or its alias `gistId`) is required".to_string(),
+            ));
+        }
+    };
+    let claim = InviteProofClaim {
+        proof_id,
+        login,
+        provider: opt_str_param(params, "provider")?,
+        host: opt_str_param(params, "host")?,
+    };
+    api.invite_prove(invite_id, secret, nonce, claim).await
 }
 
 /// Handle any classified `/invite` request

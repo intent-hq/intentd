@@ -1040,6 +1040,10 @@ pub struct Services {
     /// minting (multiplayer w4): see
     /// [`principal_ops::IdentityTransitionLock`]. Shared across clones.
     identity_transition: principal_ops::IdentityTransitionLock,
+    /// Bumped by every `identity.provider` write; an in-flight re-key
+    /// commits only when it still holds the current generation (see
+    /// [`principal_ops::IdentityRekeyGeneration`]). Shared across clones.
+    identity_rekey_generation: principal_ops::IdentityRekeyGeneration,
     /// Outstanding `invite.challenge` nonces awaiting their `invite.prove`
     /// (gist identity proof), keyed by nonce; shared across clones.
     invite_nonces: invite_ops::InviteNonceState,
@@ -1448,6 +1452,7 @@ impl Services {
             gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
+            identity_rekey_generation: Arc::new(AtomicU64::new(0)),
             invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invite_nonce_permits: invite_ops::new_nonce_permits(),
             principal_revocations: tokio::sync::broadcast::channel(
@@ -11472,6 +11477,28 @@ pub(crate) fn system_actor() -> intent_core::EventActor {
     }
 }
 
+/// Build a `principal:identity-changed { principalId, identity }` event
+/// (protocol 10.8, §6.5; `identity` is `null` when the selected forge is
+/// not connected and the primary is left unlinked) — global like
+/// `sourceControl:auth-changed` (empty workspace id, so the event fan-out
+/// delivers it to the owner only).
+pub(crate) fn principal_identity_changed_event(
+    principal_id: &intent_core::PrincipalId,
+    identity: Option<&intent_core::PrincipalIdentity>,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: WorkspaceId::from_string(String::new()),
+        timestamp: now_iso(),
+        event_type: intent_core::events::PRINCIPAL_IDENTITY_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({ "principalId": principal_id, "identity": identity }),
+    }
+}
+
 /// Process-level guard mirroring the TS `repoRegistrySynced` flag: the
 /// workspace→registry sync runs at most once per daemon lifetime, on the first
 /// `repo.list` call.
@@ -16211,6 +16238,7 @@ impl Services {
             settings_changed_event(&applied, revision),
         )
         .await;
+        self.on_settings_applied(&applied);
     }
 
     /// Default-provider settings self-heal (monorepo#3044). When no default
@@ -16727,6 +16755,7 @@ impl WorkspaceApi for Services {
                     settings_changed_event(&applied, revision),
                 )
                 .await;
+                self.on_settings_applied(&applied);
                 return Ok(serde_json::json!({ "applied": applied, "revision": revision }));
             }
             Ok(serde_json::json!({
@@ -16748,6 +16777,7 @@ impl WorkspaceApi for Services {
                     settings_changed_event(std::slice::from_ref(&result), revision),
                 )
                 .await;
+                self.on_settings_applied(std::slice::from_ref(&result));
                 revision
             } else {
                 self.settings_revision.load(Ordering::SeqCst)
@@ -31731,11 +31761,11 @@ impl WorkspaceApi for Services {
     fn workspace_invite_create(
         &self,
         workspace_id: WorkspaceId,
-        pin_login: Option<String>,
+        pin: Option<intent_core::InvitePin>,
         expires_in_secs: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.workspace_invite_create_op(&workspace_id, pin_login, expires_in_secs)
+            self.workspace_invite_create_op(&workspace_id, pin, expires_in_secs)
                 .await
         })
     }
@@ -31791,11 +31821,10 @@ impl WorkspaceApi for Services {
         invite_id: String,
         secret: String,
         nonce: String,
-        gist_id: String,
-        login: String,
+        claim: intent_core::InviteProofClaim,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.invite_prove_op(&invite_id, &secret, &nonce, &gist_id, &login)
+            self.invite_prove_op(&invite_id, &secret, &nonce, claim)
                 .await
         })
     }

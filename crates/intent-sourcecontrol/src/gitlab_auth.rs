@@ -872,6 +872,77 @@ pub async fn validate_pat(host: &GitlabHost, token: &str) -> Result<GitlabUser> 
     Ok(user)
 }
 
+/// Resolve the account named `username` on `host` (`GET
+/// /api/v4/users?username=…`, exact match) — the GitLab twin of GitHub's
+/// `GET /users/{login}`, used to pin an invite to a GitLab login. Public on
+/// gitlab.com; `token` (the daemon's own credential for the instance, if
+/// any) is sent when given so instances that restrict anonymous user lookups
+/// still answer.
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] when no such account exists, [`Error::Auth`]
+/// for a 401/403 (the instance will not serve the lookup to this caller),
+/// [`Error::RateLimited`] on 429, [`Error::Api`] / [`Error::Decode`] for
+/// other failures.
+pub async fn lookup_user_by_username(
+    host: &GitlabHost,
+    token: Option<&str>,
+    username: &str,
+) -> Result<GitlabUser> {
+    let client = http_client()?;
+    let api = host.api_base();
+    let mut request = client
+        .get(format!("{api}/users"))
+        .query(&[("username", username)]);
+    if let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|e| transport(&e))?;
+    let status = response.status();
+    match status.as_u16() {
+        401 | 403 => {
+            return Err(Error::Auth(format!(
+                "gitlab refused the user lookup on {} ({status})",
+                host.host()
+            )))
+        }
+        404 => {
+            return Err(Error::NotFound(format!(
+                "gitlab user {username} not found on {}",
+                host.host()
+            )))
+        }
+        429 => {
+            return Err(Error::RateLimited(format!(
+                "gitlab rate limited the user lookup on {}",
+                host.host()
+            )))
+        }
+        _ if !status.is_success() => {
+            return Err(Error::Api(format!(
+                "gitlab user lookup on {} failed ({status})",
+                host.host()
+            )))
+        }
+        _ => {}
+    }
+    let users: Vec<GitlabUser> = response
+        .json()
+        .await
+        .map_err(|e| Error::Decode(format!("unrecognized gitlab users response: {e}")))?;
+    users
+        .into_iter()
+        // repo-slug-fold: allow — a GitLab username (case-insensitive on GitLab), not a repo slug
+        .find(|u| u.username.eq_ignore_ascii_case(username))
+        .ok_or_else(|| {
+            Error::NotFound(format!(
+                "gitlab user {username} not found on {}",
+                host.host()
+            ))
+        })
+}
+
 /// The `scopes` array of a `personal_access_tokens/self` body, or `None`
 /// when the body does not report one.
 fn reported_scopes(body: &Value) -> Option<Vec<String>> {

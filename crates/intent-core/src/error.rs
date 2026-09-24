@@ -360,8 +360,8 @@ impl InviteErrorKind {
                 "invalid params: pinLogin does not name a GitHub account"
             }
             InviteErrorKind::GithubIdentityRequired => {
-                "unsupported: inviting requires a linked GitHub identity — connect GitHub \
-                 (github.connect) before creating an invite"
+                "unsupported: inviting requires a linked forge identity — connect GitHub \
+                 (github.connect) or GitLab (sourceControl.connect) before creating an invite"
             }
             InviteErrorKind::IdentityLocked => {
                 "unsupported: the primary GitHub identity cannot change while other \

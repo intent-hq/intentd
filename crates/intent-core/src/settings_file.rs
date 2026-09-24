@@ -70,6 +70,7 @@ pub struct SettingsFile {
     pub server: ServerSettings,
     pub sharing: SharingSettings,
     pub source_control: SourceControlSettings,
+    pub identity: IdentitySettings,
     pub accounts: AccountsSettings,
     pub voice: VoiceSettings,
     pub context: ContextSettings,
@@ -594,6 +595,20 @@ pub enum GithubTokenSource {
     Env,
     GhCli,
     Explicit,
+}
+
+/// `[identity]` — which linked forge account keys the primary principal
+/// (`identity.*`, protocol 10.8).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct IdentitySettings {
+    /// `identity.provider` — `"github"` | `"gitlab"`, or unset: the forge the
+    /// primary principal's identity triple is refreshed from. Unset, the
+    /// daemon uses the only connected forge (github when both are). Setting
+    /// it while the primary carries another forge's identity is the explicit
+    /// re-key (`principal:identity-changed`).
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub provider: Option<String>,
 }
 
 /// `[accounts]` — external account config (`accounts.*`). The Sentry API
@@ -1774,6 +1789,12 @@ oauthClientId = ""
 # GitLab API base URL -- optional origin override for API calls to the bound
 # host (test seam); never changes the reported host. Unset means the host.
 # apiBaseUrl = "https://gitlab.acme.internal"
+
+[identity]
+# Identity provider -- the linked forge the primary user's identity is keyed
+# by: "github" or "gitlab". Unset means the only connected forge (github when
+# both are connected). Changing it re-keys the primary identity.
+# provider = "gitlab"
 
 [accounts.sentry]
 # Sentry organization -- Sentry organization slug (non-secret companion of the

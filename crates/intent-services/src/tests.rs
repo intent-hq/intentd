@@ -17482,7 +17482,9 @@ pub(crate) mod pr {
     }
 
     impl StubForge {
-        /// A forge whose `check_auth` reports `authenticated: false`.
+        /// A forge whose `check_auth` reports `authenticated: false` and
+        /// whose `get_user` rejects the credential (`Auth`), as the real
+        /// client does on a 401.
         pub(crate) fn unauthenticated() -> Self {
             Self {
                 unauthenticated: true,
@@ -17573,6 +17575,9 @@ pub(crate) mod pr {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(gate) = &self.get_user_gate {
                 gate.acquire().await.expect("gate open").forget();
+            }
+            if self.unauthenticated {
+                return Err(ScError::Auth("Bad credentials".into()));
             }
             Ok(UserIdentity {
                 login: "octocat".into(),
