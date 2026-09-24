@@ -4771,7 +4771,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
         Some(json!({
             "type": "chief_message",
             "fromAgentId": chief.0,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": chief_ws.0,
             "sourceMessageId": source_id,
             "sourceUrl": source_url,
@@ -4834,7 +4834,7 @@ async fn app_agents_send_delivers_despite_target_pending_questions() {
     let expected_metadata = json!({
         "type": "chief_message",
         "fromAgentId": chief.0,
-        "fromAgentName": "Chief of Staff",
+        "fromAgentName": "Assistant",
         "fromWorkspaceId": chief_ws.0,
         "sourceMessageId": source_id,
         "sourceUrl": source_url,

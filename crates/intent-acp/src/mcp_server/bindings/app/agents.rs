@@ -66,7 +66,7 @@ async fn dispatch_inner(
     // Chief-workspace gating: all ws.app.* methods require the caller to be
     // in the Chief workspace.
     if !workspace_id.is_chief() {
-        return Err("ws.app.* is only available in the Chief of Staff workspace".to_string());
+        return Err("ws.app.* is only available in the Assistant workspace".to_string());
     }
 
     match method {
@@ -153,7 +153,7 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
     let workspaces = if let Some(ws_id) = filter_workspace_id {
         // Single workspace request
         if ws_id.is_chief() {
-            return Err("Chief workspace has no agent threads".to_string());
+            return Err("Assistant workspace has no agent threads".to_string());
         }
         let ws = api.get_workspace(ws_id.clone()).await.map_err(map_err)?;
         vec![ws]
@@ -934,7 +934,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "ws.app.* is only available in the Chief of Staff workspace"
+            "ws.app.* is only available in the Assistant workspace"
         );
     }
 
@@ -1351,7 +1351,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "ws.app.* is only available in the Chief of Staff workspace"
+            "ws.app.* is only available in the Assistant workspace"
         );
     }
 

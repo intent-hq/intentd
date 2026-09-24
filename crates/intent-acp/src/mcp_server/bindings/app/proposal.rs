@@ -36,7 +36,7 @@ pub(crate) fn dispatch(
 ) -> Result<Value, String> {
     // Chief-workspace gating
     if !workspace_id.is_chief() {
-        return Err("ws.app.* is only available in the Chief of Staff workspace".to_string());
+        return Err("ws.app.* is only available in the Assistant workspace".to_string());
     }
 
     match method {

@@ -10971,12 +10971,12 @@ impl Services {
     ) -> Result<Value> {
         if !workspace_id.is_chief() {
             return Err(Error::InvalidParams(
-                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+                "ws.app.* is only available in the Assistant workspace".to_string(),
             ));
         }
         if caller_agent_id == target_agent_id {
             return Err(Error::InvalidParams(
-                "Chief of Staff cannot send a message to itself".to_string(),
+                "Assistant cannot send a message to itself".to_string(),
             ));
         }
 
@@ -10988,13 +10988,13 @@ impl Services {
             || !caller.workspace_id.is_chief()
         {
             return Err(Error::InvalidParams(format!(
-                "caller agent {} is not an active Chief of Staff agent",
+                "caller agent {} is not an active Assistant agent",
                 caller_agent_id.0
             )));
         }
         let source_message_id = caller.last_message_id.ok_or_else(|| {
             Error::InvalidParams(
-                "Chief conversation has no persisted source message to link".to_string(),
+                "Assistant conversation has no persisted source message to link".to_string(),
             )
         })?;
 
@@ -11007,7 +11007,8 @@ impl Services {
         }
         if target.workspace_id.is_chief() {
             return Err(Error::InvalidParams(
-                "Chief messages can only target agents outside the Chief workspace".to_string(),
+                "Assistant messages can only target agents outside the Assistant workspace"
+                    .to_string(),
             ));
         }
 
@@ -11018,7 +11019,7 @@ impl Services {
         let metadata = json!({
             "type": "chief_message",
             "fromAgentId": caller_agent_id.0,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": workspace_id.0,
             "sourceMessageId": source_message_id,
             "sourceUrl": source_url,
@@ -11069,7 +11070,7 @@ impl Services {
     ) -> Result<Value> {
         if !workspace_id.is_chief() {
             return Err(Error::InvalidParams(
-                "ws.app.* is only available in the Chief of Staff workspace".to_string(),
+                "ws.app.* is only available in the Assistant workspace".to_string(),
             ));
         }
         let caller = self.require_agent_session(&caller_agent_id).await?;
@@ -11086,7 +11087,9 @@ impl Services {
             .get("workspaceId")
             .and_then(Value::as_str)
             .map(WorkspaceId::from)
-            .ok_or_else(|| Error::Internal("Chief send omitted target workspace".to_string()))?;
+            .ok_or_else(|| {
+                Error::Internal("Assistant send omitted target workspace".to_string())
+            })?;
         let subscription_id = self
             .register_completion_watch_strict_durable(
                 &workspace_id,
@@ -11107,7 +11110,7 @@ impl Services {
         let target_name = sent
             .get("agentName")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::Internal("Chief send omitted target name".to_string()))?
+            .ok_or_else(|| Error::Internal("Assistant send omitted target name".to_string()))?
             .to_string();
         Ok(json!({
             "ok": true,

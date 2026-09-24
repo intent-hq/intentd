@@ -738,7 +738,7 @@ pub const CHIEF_WORKSPACE_TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
 pub fn chief_workspace() -> Workspace {
     Workspace {
         id: WorkspaceId::chief(),
-        title: "Chief of Staff".to_string(),
+        title: "Assistant".to_string(),
         branch: String::new(),
         base_ref: None,
         base_commit_sha: None,

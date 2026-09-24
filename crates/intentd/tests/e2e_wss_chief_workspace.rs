@@ -344,7 +344,7 @@ async fn chief_workspace_over_wss() {
     assert!(resp.get("error").is_none(), "workspace.get errored: {resp}");
     let chief = &resp["result"]["workspace"];
     assert_eq!(chief["id"], json!(CHIEF_WORKSPACE_ID));
-    assert_eq!(chief["title"], json!("Chief of Staff"));
+    assert_eq!(chief["title"], json!("Assistant"));
     assert_eq!(chief["branch"], json!(""));
     assert_eq!(chief["status"], json!("Active"));
     assert_eq!(chief["attention"], json!("none"));
@@ -2042,7 +2042,7 @@ async fn non_chief_waitfor_gated_over_wss() {
     );
     let error_msg = gate_result["error"].as_str().expect("error string");
     assert!(
-        error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
+        error_msg.contains("ws.app.* is only available in the Assistant workspace"),
         "clear chief-gating error, got: {error_msg}"
     );
 
@@ -2323,7 +2323,7 @@ async fn chief_workspace_archive_gated_over_wss() {
         );
         let msg = outcome["error"].as_str().expect("error string");
         assert!(
-            msg.contains("chief-of-staff"),
+            msg.contains("Assistant workspace"),
             "clear chief-gating error for {method}, got: {msg}"
         );
     }
@@ -2462,7 +2462,7 @@ async fn chief_agent_send_cross_workspace_over_wss() {
     assert_eq!(
         delivered["contentBlocks"][0]["text"],
         json!(format!(
-            "[MESSAGE FROM AGENT Chief of Staff ({chief_id})]\n\nPlease report your status"
+            "[MESSAGE FROM AGENT Assistant ({chief_id})]\n\nPlease report your status"
         ))
     );
     assert_eq!(
@@ -2470,7 +2470,7 @@ async fn chief_agent_send_cross_workspace_over_wss() {
         json!({
             "type": "chief_message",
             "fromAgentId": chief_id,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": CHIEF_WORKSPACE_ID,
             "sourceMessageId": source_message_id,
             "sourceUrl": source_url,
