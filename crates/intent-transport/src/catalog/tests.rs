@@ -171,12 +171,16 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Direct member add: +2 router methods (`principal.list`, the owner-only
 /// roster of credentialed guests; `workspace.members.add`, the owner-only
 /// direct attach of one of them).
-const EXPECTED_TOTAL_METHODS: usize = 387;
+///
+/// Provider-generic auth (protocol 10.5, §5.27): +5 router methods
+/// (`sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
+/// `getUser`); the `github.*` auth quintet stays as byte-identical aliases.
+const EXPECTED_TOTAL_METHODS: usize = 392;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 329;
+const EXPECTED_ROUTER_METHODS: usize = 334;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -781,6 +785,11 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "settings.reset",
     "settings.update",
     "skill.list",
+    "sourceControl.authStatus",
+    "sourceControl.cancelAuth",
+    "sourceControl.connect",
+    "sourceControl.getUser",
+    "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
     "specialist.edit",
@@ -1286,6 +1295,11 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "settings.list",
     "settings.reset",
     "settings.update",
+    "sourceControl.authStatus",
+    "sourceControl.cancelAuth",
+    "sourceControl.connect",
+    "sourceControl.getUser",
+    "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
     "specialist.edit",
@@ -1919,6 +1933,11 @@ mod unbound_owner_only_methods {
             ("settings.list", json!({})),
             ("settings.reset", json!({ "path": "model.defaultProvider" })),
             ("settings.update", json!({ "changes": {} })),
+            ("sourceControl.authStatus", json!({ "provider": "github" })),
+            ("sourceControl.cancelAuth", json!({ "provider": "github" })),
+            ("sourceControl.connect", json!({ "provider": "github" })),
+            ("sourceControl.getUser", json!({ "provider": "github" })),
+            ("sourceControl.revoke", json!({ "provider": "github" })),
             ("specialist.create", json!({ "id": "s", "spec": {} })),
             ("specialist.delete", json!({ "id": "s", "scope": "global" })),
             (

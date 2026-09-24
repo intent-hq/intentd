@@ -248,6 +248,7 @@ const COLLABORATOR_REFUSED_EVENT_TYPES: &[&str] = &[
     "script:output",
     "script:state",
     "settings:changed",
+    "sourceControl:auth-changed",
     "terminal:command",
     "terminal:cwd",
     "terminal:data",

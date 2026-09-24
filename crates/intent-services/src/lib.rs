@@ -95,6 +95,7 @@ mod github_ops;
 
 mod github_auth_ops;
 mod github_browse_ops;
+mod source_control_auth_ops;
 
 mod agent_list_cache;
 mod harness;
@@ -1018,6 +1019,19 @@ pub struct Services {
     /// Unit tests inject an invalid/mock URI so `github.connect` never
     /// reaches github.com.
     github_login_base_uri: Option<String>,
+    /// The GitLab device-grant slot + unsupported-host memory backing the
+    /// `sourceControl.*` auth methods for `provider: "gitlab"` (§5.27, v10.5).
+    /// Shared across clones like [`Self::github_auth_flow`].
+    gitlab_auth: source_control_auth_ops::GitlabAuthStateHandle,
+    /// The file-backed secret store the GitLab engine persists its credential
+    /// pair into (`sourceControl.gitlab.token` + refresh token + expiry).
+    /// Production wiring uses the daemon default (`$INTENTD_SECRETS_FILE`);
+    /// tests inject a scratch path.
+    gitlab_secret_store: intent_core::FileSecretStore,
+    /// Serialises refresh / persist / delete of the GitLab credential pair
+    /// (see [`source_control_auth_ops::GitlabCredentialGate`]). Shared across
+    /// clones.
+    gitlab_credential_gate: source_control_auth_ops::GitlabCredentialGate,
     /// When the primary principal's GitHub profile was last refreshed from
     /// `GET /user` on a `principal.me` read (multiplayer w1); shared across
     /// clones so the rate limit spans every RPC handle.
@@ -1429,6 +1443,9 @@ impl Services {
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
+            gitlab_auth: source_control_auth_ops::new_gitlab_state(),
+            gitlab_secret_store: intent_core::FileSecretStore::new(),
+            gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
             invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1642,6 +1659,15 @@ impl Services {
     #[must_use]
     pub fn with_github_login_base_uri(mut self, base_uri: impl Into<String>) -> Self {
         self.github_login_base_uri = Some(base_uri.into());
+        self
+    }
+
+    /// Point the GitLab credential store at `store` (§5.27 test seam) so
+    /// `sourceControl.connect { provider: "gitlab" }` never touches the real
+    /// `~/intent/.secrets.json`.
+    #[must_use]
+    pub fn with_gitlab_secret_store(mut self, store: intent_core::FileSecretStore) -> Self {
+        self.gitlab_secret_store = store;
         self
     }
 
@@ -31162,7 +31188,13 @@ impl WorkspaceApi for Services {
                 *slot = None;
             }
             github_auth_ops::delete_stored_token(&secrets).await?;
-            publish_event(bus.as_ref(), github_auth_ops::auth_changed_event("revoked")).await;
+            source_control_auth_ops::publish_auth_changed(
+                bus.as_ref(),
+                source_control_auth_ops::Provider::Github,
+                source_control_auth_ops::GITHUB_HOST,
+                "revoked",
+            )
+            .await;
             if logout_gh {
                 // Detached + fail-soft (same pattern as the login sync): a
                 // logout failure can never fail or delay the revoke.
@@ -31258,6 +31290,304 @@ impl WorkspaceApi for Services {
             .await
             .map_err(github_auth_ops::map_identity_proof_err)?;
             Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
+    // ========================================================================
+    // sourceControl.* — provider-generic auth (§5.27, v10.5); see
+    // `source_control_auth_ops`. The `github.*` quintet above is the
+    // byte-identical legacy projection of these with `provider: "github"`.
+    // ========================================================================
+
+    fn source_control_auth_status(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("sourceControl.authStatus")?;
+            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            match target {
+                source_control_auth_ops::Target::Github => {
+                    let base = self.github_auth_status().await?;
+                    let is_configured = base["isConfigured"].as_bool().unwrap_or(false);
+                    let (method, user) = if is_configured {
+                        let user = match pr_ops::resolve_source_control(self.source_control.clone())
+                            .await
+                        {
+                            Ok(sc) => sc
+                                .get_user()
+                                .await
+                                .ok()
+                                .map(|u| source_control_auth_ops::github_user_to_wire(&u)),
+                            Err(_) => None,
+                        };
+                        (Some(self.github_credential_method().await), user)
+                    } else {
+                        (None, None)
+                    };
+                    let client_id = self
+                        .effective_settings()
+                        .source_control
+                        .github
+                        .oauth_client_id;
+                    Ok(source_control_auth_ops::auth_status_to_wire(
+                        base,
+                        source_control_auth_ops::Provider::Github,
+                        source_control_auth_ops::GITHUB_HOST,
+                        method,
+                        user,
+                        !client_id.trim().is_empty(),
+                    ))
+                }
+                source_control_auth_ops::Target::Gitlab { host, .. } => {
+                    let client_id = self.gitlab_client_id(&host);
+                    let probe = source_control_auth_ops::probe_gitlab(
+                        &host,
+                        &|| self.gitlab_host_is_bound(&host),
+                        client_id.as_deref(),
+                        self.gitlab_secret_store.clone(),
+                        &self.gitlab_credential_gate,
+                        self.event_bus.as_ref(),
+                    )
+                    .await?;
+                    let (is_configured, method, user) = match probe {
+                        source_control_auth_ops::ProbeOutcome::Configured { user, method } => (
+                            true,
+                            Some(method),
+                            Some(source_control_auth_ops::gitlab_user_to_wire(&user)),
+                        ),
+                        source_control_auth_ops::ProbeOutcome::NotConfigured
+                        | source_control_auth_ops::ProbeOutcome::Rejected => (false, None, None),
+                    };
+                    let guard = self.gitlab_auth.lock().await;
+                    let slot = guard
+                        .flow
+                        .as_ref()
+                        .filter(|f| f.host == host.host())
+                        .map(|f| &f.slot);
+                    let device_grant_supported =
+                        client_id.is_some() && !guard.unsupported_hosts.contains(host.host());
+                    Ok(source_control_auth_ops::auth_status_to_wire(
+                        github_auth_ops::auth_status_to_wire(is_configured, slot),
+                        source_control_auth_ops::Provider::Gitlab,
+                        host.host(),
+                        method,
+                        user,
+                        device_grant_supported,
+                    ))
+                }
+            }
+        })
+    }
+
+    fn source_control_connect(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("sourceControl.connect")?;
+            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let use_pat = match method.as_deref().map(str::trim) {
+                None | Some("device") => false,
+                Some("pat") => true,
+                Some(other) => {
+                    return Err(Error::InvalidParams(format!(
+                        "method must be \"device\" or \"pat\" (got {other:?})"
+                    )))
+                }
+            };
+            // 🔒 `token` is only ever read here and handed to the engine; it
+            // is never logged, echoed or embedded in an error.
+            let token = token.filter(|t| !t.trim().is_empty());
+            if !use_pat && token.is_some() {
+                return Err(Error::InvalidParams(
+                    "token is only accepted with method \"pat\"".to_string(),
+                ));
+            }
+            match target {
+                source_control_auth_ops::Target::Github if use_pat => Err(Error::InvalidParams(
+                    "method \"pat\" is not accepted for provider \"github\"; \
+                     set sourceControl.github.token via settings.update"
+                        .to_string(),
+                )),
+                source_control_auth_ops::Target::Github => self.github_connect().await,
+                source_control_auth_ops::Target::Gitlab { host, .. } if use_pat => {
+                    let Some(token) = token else {
+                        return Err(Error::InvalidParams(
+                            "token is required with method \"pat\"".to_string(),
+                        ));
+                    };
+                    self.gitlab_connect_pat(host, token).await
+                }
+                source_control_auth_ops::Target::Gitlab { host, .. } => {
+                    self.gitlab_connect_device(host).await
+                }
+            }
+        })
+    }
+
+    fn source_control_cancel_auth(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("sourceControl.cancelAuth")?;
+            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            match target {
+                // Unscoped cancel: `sourceControl.cancelAuth` carries no
+                // `flowId`, so it cancels whichever GitHub flow is pending
+                // (same as `github.cancelAuth` with `flowId` omitted).
+                source_control_auth_ops::Target::Github => self.github_cancel_auth(None).await,
+                source_control_auth_ops::Target::Gitlab { host, .. } => {
+                    // Host-scoped: only a pending flow for exactly this host
+                    // is cancelled; a terminal slot stays until the next
+                    // connect replaces it (same rule as `github.cancelAuth`).
+                    let mut guard = self.gitlab_auth.lock().await;
+                    let cancelled = matches!(
+                        guard.flow.as_ref(),
+                        Some(f) if f.host == host.host()
+                            && f.slot.phase == github_auth_ops::FlowPhase::Pending
+                    );
+                    if cancelled {
+                        guard.flow = None;
+                    }
+                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled }))
+                }
+            }
+        })
+    }
+
+    fn source_control_revoke(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("sourceControl.revoke")?;
+            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            match target {
+                source_control_auth_ops::Target::Github => self.github_revoke().await,
+                source_control_auth_ops::Target::Gitlab { host, .. } => {
+                    // Slot clear, binding read, credential read, delete and
+                    // event ride one hold of the gate: a device completion
+                    // in flight for another host cannot bind it and commit
+                    // between this call's checks, and subscribers observe
+                    // events in store order. The slot clear aborts a flow
+                    // for exactly this host (its poll task exits
+                    // cooperatively at its next tick).
+                    let _gate = self.gitlab_credential_gate.lock().await;
+                    {
+                        let mut guard = self.gitlab_auth.lock().await;
+                        if guard.flow.as_ref().is_some_and(|f| f.host == host.host()) {
+                            guard.flow = None;
+                        }
+                    }
+                    // Only the bound instance owns the stored token — read
+                    // NOW, under the gate, not at resolve time: revoking
+                    // another host is a successful no-op that never deletes
+                    // it and never emits `revoked` for it. With nothing
+                    // stored (never connected / already revoked) there is no
+                    // connection to end either: ok, no delete, no event.
+                    if self.gitlab_host_is_bound(&host) {
+                        let stored = intent_sourcecontrol::gitlab_auth::stored_credential(
+                            self.gitlab_secret_store.clone(),
+                        )
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                        if stored != intent_sourcecontrol::StoredCredential::None {
+                            intent_sourcecontrol::gitlab_auth::revoke_gitlab_token(
+                                self.gitlab_secret_store.clone(),
+                            )
+                            .await
+                            .map_err(pr_ops::map_sc_err)?;
+                            source_control_auth_ops::publish_auth_changed(
+                                self.event_bus.as_ref(),
+                                source_control_auth_ops::Provider::Gitlab,
+                                host.host(),
+                                "revoked",
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+            }
+        })
+    }
+
+    fn source_control_get_user(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("sourceControl.getUser")?;
+            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            match target {
+                source_control_auth_ops::Target::Github => {
+                    // An absent credential is `{ user: null }`, a rejected one
+                    // is the typed `source-control-unauthorized` error.
+                    let sc = match self.source_control.clone() {
+                        Some(sc) => sc,
+                        None => match intent_sourcecontrol::SourceControlRegistry::from_settings(
+                            &intent_sourcecontrol::SourceControlSettings::default(),
+                        )
+                        .await
+                        {
+                            Ok(sc) => sc,
+                            Err(intent_sourcecontrol::Error::NotConfigured(_)) => {
+                                return Ok(serde_json::json!({ "user": serde_json::Value::Null }))
+                            }
+                            Err(e) => return Err(pr_ops::map_sc_err(e)),
+                        },
+                    };
+                    match sc.get_user().await {
+                        Ok(user) => Ok(serde_json::json!({
+                            "user": source_control_auth_ops::github_user_to_wire(&user)
+                        })),
+                        Err(intent_sourcecontrol::Error::Auth(_)) => {
+                            Err(Error::SourceControlUnauthorized {
+                                provider: "github".to_string(),
+                                host: source_control_auth_ops::GITHUB_HOST.to_string(),
+                            })
+                        }
+                        Err(e) => Err(pr_ops::map_sc_err(e)),
+                    }
+                }
+                source_control_auth_ops::Target::Gitlab { host, .. } => {
+                    let client_id = self.gitlab_client_id(&host);
+                    let probe = source_control_auth_ops::probe_gitlab(
+                        &host,
+                        &|| self.gitlab_host_is_bound(&host),
+                        client_id.as_deref(),
+                        self.gitlab_secret_store.clone(),
+                        &self.gitlab_credential_gate,
+                        self.event_bus.as_ref(),
+                    )
+                    .await?;
+                    match probe {
+                        source_control_auth_ops::ProbeOutcome::Configured { user, .. } => {
+                            Ok(serde_json::json!({
+                                "user": source_control_auth_ops::gitlab_user_to_wire(&user)
+                            }))
+                        }
+                        source_control_auth_ops::ProbeOutcome::NotConfigured => {
+                            Ok(serde_json::json!({ "user": serde_json::Value::Null }))
+                        }
+                        source_control_auth_ops::ProbeOutcome::Rejected => {
+                            Err(Error::SourceControlUnauthorized {
+                                provider: "gitlab".to_string(),
+                                host: host.host().to_string(),
+                            })
+                        }
+                    }
+                }
+            }
         })
     }
 

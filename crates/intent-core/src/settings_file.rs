@@ -494,7 +494,8 @@ impl Default for AuthSettings {
 }
 
 /// `[sourceControl]` — forge integration (`sourceControl.*`). The GitHub PAT
-/// (`sourceControl.github.token`) is a secret and lives in `.secrets.json`.
+/// (`sourceControl.github.token`) and the GitLab credential
+/// (`sourceControl.gitlab.token`) are secrets and live in `.secrets.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SourceControlSettings {
@@ -502,6 +503,42 @@ pub struct SourceControlSettings {
     pub active_provider: SourceControlProvider,
     /// `[sourceControl.github]` — GitHub client config.
     pub github: GithubSettings,
+    /// `[sourceControl.gitlab]` — GitLab instance config (§5.27
+    /// "Provider-generic auth — `sourceControl.*`").
+    pub gitlab: GitlabSettings,
+}
+
+/// Default `sourceControl.gitlab.host`: the hosted instance.
+pub const DEFAULT_GITLAB_HOST: &str = "gitlab.com";
+
+/// `[sourceControl.gitlab]` — GitLab instance config (`sourceControl.gitlab.*`).
+/// One bound instance per daemon; the credential itself is the
+/// `sourceControl.gitlab.token` secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct GitlabSettings {
+    /// `sourceControl.gitlab.host` — the bound instance as a bare
+    /// `host[:port]` (no scheme). Written by a successful
+    /// `sourceControl.connect { provider: "gitlab" }`.
+    pub host: String,
+    /// `sourceControl.gitlab.oauthClientId` — public OAuth application id for
+    /// the device authorization grant against `host`. Empty ⇒ the compiled
+    /// gitlab.com default applies on gitlab.com only.
+    pub oauth_client_id: String,
+    /// `sourceControl.gitlab.apiBaseUrl` — optional origin override for the
+    /// API calls to the bound host (test seam); never changes the reported
+    /// `host`.
+    pub api_base_url: Option<String>,
+}
+
+impl Default for GitlabSettings {
+    fn default() -> Self {
+        Self {
+            host: DEFAULT_GITLAB_HOST.to_string(),
+            oauth_client_id: String::new(),
+            api_base_url: None,
+        }
+    }
 }
 
 /// `sourceControl.activeProvider` values.
@@ -1726,6 +1763,18 @@ oauthClientId = "Ov23li8bvmPsd4B4pW38"
 # github.com-only credential helper (never raw GITHUB_TOKEN/GH_TOKEN).
 exposeGitCredentialToChildren = true
 
+[sourceControl.gitlab]
+# GitLab host -- the bound instance as a bare host[:port], no scheme. Written
+# by a successful sourceControl.connect { provider: "gitlab" }.
+host = "gitlab.com"
+# GitLab OAuth client ID -- public OAuth application id for the device
+# authorization grant against the host (empty: the built-in gitlab.com id
+# applies on gitlab.com only; self-managed instances need their own).
+oauthClientId = ""
+# GitLab API base URL -- optional origin override for API calls to the bound
+# host (test seam); never changes the reported host. Unset means the host.
+# apiBaseUrl = "https://gitlab.acme.internal"
+
 [accounts.sentry]
 # Sentry organization -- Sentry organization slug (non-secret companion of the
 # accounts.sentry.token secret).
@@ -2037,6 +2086,9 @@ mod tests {
             DEFAULT_GITHUB_OAUTH_CLIENT_ID
         );
         assert!(d.source_control.github.expose_git_credential_to_children);
+        assert_eq!(d.source_control.gitlab.host, DEFAULT_GITLAB_HOST);
+        assert!(d.source_control.gitlab.oauth_client_id.is_empty());
+        assert_eq!(d.source_control.gitlab.api_base_url, None);
         assert_eq!(d.accounts.sentry.organization, None);
         assert_eq!(d.voice.provider, VoiceProvider::Elevenlabs);
         assert_eq!(d.voice.language, None);

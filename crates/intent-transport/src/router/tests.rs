@@ -6574,6 +6574,266 @@ mod mark_seen_dispatch {
     }
 }
 
+/// `sourceControl.*` (PROTOCOL §5.27) optional-field parsing is strict: an
+/// absent or `null` `host` / `method` / `token` is forwarded as `None`, but a
+/// present non-string is `-32602` before the API is called. Regression for the
+/// lax `opt_str` path where `{"provider":"gitlab","host":123}` was routed as
+/// host-omitted — on `revoke`, acting on the bound credential instead of failing.
+mod source_control_optional_fields_strict {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{BoxFuture, Result, WorkspaceApi};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    type HostCall = (&'static str, String, Option<String>);
+    type Connect = (String, Option<String>, Option<String>, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingApi {
+        calls: Arc<Mutex<Vec<HostCall>>>,
+        connects: Arc<Mutex<Vec<Connect>>>,
+    }
+
+    impl RecordingApi {
+        fn record(
+            &self,
+            method: &'static str,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push((method, provider, host));
+                Ok(json!({ "ok": true }))
+            })
+        }
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        fn source_control_auth_status(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("authStatus", provider, host)
+        }
+        fn source_control_connect(
+            &self,
+            provider: String,
+            host: Option<String>,
+            method: Option<String>,
+            token: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let connects = self.connects.clone();
+            Box::pin(async move {
+                connects
+                    .lock()
+                    .unwrap()
+                    .push((provider, host, method, token));
+                Ok(json!({ "status": "pending" }))
+            })
+        }
+        fn source_control_cancel_auth(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("cancelAuth", provider, host)
+        }
+        fn source_control_revoke(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("revoke", provider, host)
+        }
+        fn source_control_get_user(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("getUser", provider, host)
+        }
+    }
+
+    async fn rpc(api: &RecordingApi, method: &str, params: Value) -> Value {
+        let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+        let out = handle_message(api, &msg.to_string())
+            .await
+            .expect("response");
+        serde_json::from_str(&out).unwrap()
+    }
+
+    const HOST_METHODS: [&str; 4] = [
+        "sourceControl.authStatus",
+        "sourceControl.cancelAuth",
+        "sourceControl.revoke",
+        "sourceControl.getUser",
+    ];
+
+    fn wrong_types() -> Vec<Value> {
+        vec![json!(123), json!(1.5), json!(true), json!([]), json!({})]
+    }
+
+    #[tokio::test]
+    async fn revoke_with_numeric_host_is_invalid_params_and_binding_untouched() {
+        let api = RecordingApi::default();
+        let v = rpc(
+            &api,
+            "sourceControl.revoke",
+            json!({ "provider": "gitlab", "host": 123 }),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], json!(-32602), "{v}");
+        assert_eq!(v["error"]["data"]["code"], json!("invalid-params"));
+        assert_eq!(v["error"]["message"], json!("host must be a string"));
+        assert!(v.get("result").is_none());
+        assert!(
+            api.calls.lock().unwrap().is_empty(),
+            "revoke must not reach the service on a non-string host"
+        );
+    }
+
+    #[tokio::test]
+    async fn present_non_string_host_is_invalid_params_on_every_host_method() {
+        let api = RecordingApi::default();
+        for method in HOST_METHODS {
+            for bad in wrong_types() {
+                let v = rpc(&api, method, json!({ "provider": "gitlab", "host": bad })).await;
+                assert_eq!(v["error"]["code"], json!(-32602), "{method} host={bad}");
+                assert_eq!(v["error"]["message"], json!("host must be a string"));
+            }
+        }
+        for bad in wrong_types() {
+            let v = rpc(
+                &api,
+                "sourceControl.connect",
+                json!({ "provider": "gitlab", "host": bad.clone() }),
+            )
+            .await;
+            assert_eq!(v["error"]["code"], json!(-32602), "connect host={bad}");
+        }
+        assert!(api.calls.lock().unwrap().is_empty());
+        assert!(api.connects.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_with_non_string_method_or_token_is_invalid_params_no_flow_started() {
+        let api = RecordingApi::default();
+        for (params, expected) in [
+            (
+                json!({ "provider": "gitlab", "method": 1 }),
+                "method must be a string",
+            ),
+            (
+                json!({ "provider": "gitlab", "method": ["pat"] }),
+                "method must be a string",
+            ),
+            (
+                json!({ "provider": "gitlab", "method": "pat", "token": 42 }),
+                "token must be a string",
+            ),
+            (
+                json!({ "provider": "gitlab", "method": "pat", "token": { "v": "x" } }),
+                "token must be a string",
+            ),
+            (
+                json!({ "provider": "github", "method": true }),
+                "method must be a string",
+            ),
+        ] {
+            let v = rpc(&api, "sourceControl.connect", params.clone()).await;
+            assert_eq!(v["error"]["code"], json!(-32602), "params: {params}");
+            assert_eq!(v["error"]["data"]["code"], json!("invalid-params"));
+            assert_eq!(v["error"]["message"], json!(expected), "params: {params}");
+        }
+        assert!(
+            api.connects.lock().unwrap().is_empty(),
+            "no device flow / PAT exchange may start on malformed params"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_and_null_optional_fields_are_forwarded_as_none() {
+        let api = RecordingApi::default();
+        for method in HOST_METHODS {
+            let v = rpc(&api, method, json!({ "provider": "gitlab" })).await;
+            assert_eq!(v["result"]["ok"], json!(true), "{method} absent");
+            let v = rpc(&api, method, json!({ "provider": "gitlab", "host": null })).await;
+            assert_eq!(v["result"]["ok"], json!(true), "{method} null");
+        }
+        let calls = api.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), HOST_METHODS.len() * 2);
+        assert!(calls.iter().all(|(_, p, h)| p == "gitlab" && h.is_none()));
+
+        let v = rpc(
+            &api,
+            "sourceControl.connect",
+            json!({ "provider": "gitlab", "host": null, "method": null, "token": null }),
+        )
+        .await;
+        assert_eq!(v["result"]["status"], json!("pending"));
+        let v = rpc(
+            &api,
+            "sourceControl.connect",
+            json!({ "provider": "gitlab" }),
+        )
+        .await;
+        assert_eq!(v["result"]["status"], json!("pending"));
+        let connects = api.connects.lock().unwrap().clone();
+        assert_eq!(
+            connects,
+            vec![
+                ("gitlab".to_string(), None, None, None),
+                ("gitlab".to_string(), None, None, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn string_optional_fields_are_forwarded_verbatim() {
+        let api = RecordingApi::default();
+        let v = rpc(
+            &api,
+            "sourceControl.revoke",
+            json!({ "provider": "gitlab", "host": "gitlab.example.com" }),
+        )
+        .await;
+        assert_eq!(v["result"]["ok"], json!(true));
+        let v = rpc(
+            &api,
+            "sourceControl.connect",
+            json!({
+                "provider": "gitlab",
+                "host": "gitlab.example.com",
+                "method": "pat",
+                "token": "glpat-x"
+            }),
+        )
+        .await;
+        assert_eq!(v["result"]["status"], json!("pending"));
+        assert_eq!(
+            api.calls.lock().unwrap().clone(),
+            vec![(
+                "revoke",
+                "gitlab".to_string(),
+                Some("gitlab.example.com".to_string())
+            )]
+        );
+        assert_eq!(
+            api.connects.lock().unwrap().clone(),
+            vec![(
+                "gitlab".to_string(),
+                Some("gitlab.example.com".to_string()),
+                Some("pat".to_string()),
+                Some("glpat-x".to_string()),
+            )]
+        );
+    }
+}
+
 /// `repoConfig.*` namespace tests (additive intentd-only surface, FE parity
 /// with `packages/cloudlands-fe/src/features/workspace/main/repo-config.ipc.ts`).
 #[tokio::test]

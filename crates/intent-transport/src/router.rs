@@ -167,6 +167,33 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 "limit": limit,
             })),
         },
+        // Provider-generic auth typed errors (§5.27): -32603 with the stable
+        // `data = { code, provider, host }` so the FE keys its PAT fallback
+        // and "credential rejected" presentation on `data.code`, not prose.
+        ref e @ Error::DeviceGrantUnsupported {
+            ref provider,
+            ref host,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "device-grant-unsupported",
+                "provider": provider,
+                "host": host,
+            })),
+        },
+        ref e @ Error::SourceControlUnauthorized {
+            ref provider,
+            ref host,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "source-control-unauthorized",
+                "provider": provider,
+                "host": host,
+            })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
@@ -3112,6 +3139,61 @@ async fn dispatch(
             let gist_id = require_str_param(params, "gistId")?;
             let r = api
                 .github_identity_proof_delete(gist_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // Provider-generic auth (§5.27 "Provider-generic auth —
+        // `sourceControl.*`", v10.5): `provider` is required on every method
+        // (`github` | `gitlab`), `host` is optional and gitlab-only; both are
+        // validated by the service so the `-32602` messages stay in one place.
+        // The optional fields are parsed strictly: absent / `null` ⇒ omitted,
+        // but a present non-string is `-32602` before the service runs — a
+        // lax `host` would otherwise route `{"host": 123}` as host-omitted
+        // and, on `revoke`, act on the bound credential instead of failing.
+        "sourceControl.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let r = api
+                .source_control_auth_status(provider, host)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
+            let r = api
+                .source_control_connect(provider, host, method, token)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let r = api
+                .source_control_cancel_auth(provider, host)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let r = api
+                .source_control_revoke(provider, host)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let r = api
+                .source_control_get_user(provider, host)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

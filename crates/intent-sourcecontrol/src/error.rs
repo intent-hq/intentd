@@ -48,6 +48,13 @@ pub enum Error {
     /// Response (de)serialization failure.
     #[error("source control decode error: {0}")]
     Decode(String),
+
+    /// The instance does not offer the OAuth device authorization grant
+    /// (GitLab < 17.1 answers 404 on `/oauth/authorize_device`; no client id
+    /// is configured for a self-managed host). Carries the canonical host so
+    /// the caller can offer the PAT path for that instance instead.
+    #[error("device authorization grant unsupported on {0}; use a personal access token")]
+    DeviceGrantUnsupported(String),
 }
 
 /// Result alias used throughout the crate.

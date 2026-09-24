@@ -14,6 +14,8 @@ pub mod device_flow;
 pub mod error;
 pub mod gh_sync;
 pub mod github;
+pub mod gitlab_auth;
+pub mod gitlab_token;
 pub mod identity_proof;
 pub mod model;
 pub mod registry;
@@ -24,6 +26,11 @@ use async_trait::async_trait;
 pub use device_flow::{DeviceFlow, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
+pub use gitlab_auth::{
+    GitlabDeviceAuthorization, GitlabDeviceFlow, GitlabExchange, GitlabGrant, GitlabHost,
+    GitlabPollStatus, GitlabUser, StoredCredential,
+};
+pub use gitlab_token::GitlabTokenSource;
 pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
@@ -32,7 +39,10 @@ pub use model::{
     ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
     ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
-pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
+pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
+/// Re-exported so callers can hand [`gitlab_auth::persist_gitlab_token`] a
+/// redacted token without depending on `secrecy` themselves.
+pub use secrecy::SecretString;
 pub use token::TokenSource;
 
 /// The provider-agnostic forge API (§7.2).

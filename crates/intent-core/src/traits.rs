@@ -4432,6 +4432,103 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     // ========================================================================
+    // sourceControl.* — provider-generic forge auth (PROTOCOL §5.27
+    // "Provider-generic auth — `sourceControl.*`", v10.5). `provider` is
+    // `"github"` | `"gitlab"` (anything else → `-32602`); `host` is
+    // gitlab-only (a non-empty host with `provider: "github"` → `-32602`).
+    // The `github.authStatus` / `connect` / `cancelAuth` / `revoke` /
+    // `getUser` quintet above is served as aliases of these with
+    // `provider: "github"` pinned and the additive fields projected away.
+    // ========================================================================
+
+    /// `sourceControl.authStatus { provider, host? }`: the `github.authStatus`
+    /// shape plus additive `provider`, `host`, `method`
+    /// (`"device" | "pat" | "env" | null`), `user?` (iff `isConfigured`) and
+    /// `deviceGrantSupported`.
+    fn source_control_auth_status(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_auth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.connect { provider, host?, method?, token? }`: start (or
+    /// return the still-pending) device grant for `(provider, host)` →
+    /// `{ ok, userCode, verificationUri, expiresIn, interval }`, or with
+    /// `method: "pat"` validate + persist the in-band `token` →
+    /// `{ ok: true, method: "pat" }`. 🔒 `token` is never logged or echoed.
+    /// A provider holds one credential for one bound host, so a connect that
+    /// binds `host` — device or PAT — supersedes a device flow still pending
+    /// for any host (its late completion is discarded: no write, no event).
+    fn source_control_connect(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, method, token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_connect not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.cancelAuth { provider, host? }`: abort the pending device
+    /// grant for `(provider, host)` → `{ ok: true, cancelled }`.
+    fn source_control_cancel_auth(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_cancel_auth not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.revoke { provider, host? }`: delete the stored
+    /// `sourceControl.<provider>.token`, abort any in-flight grant and emit
+    /// `sourceControl:auth-changed { status: "revoked" }` → `{ ok: true }`.
+    fn source_control_revoke(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_revoke not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.getUser { provider, host? }`: the authenticated identity
+    /// from the host's user probe → `{ user: SourceControlUser | null }`; a
+    /// rejected credential → `source-control-unauthorized`.
+    fn source_control_get_user(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_get_user not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ========================================================================
     // principal.* (multiplayer w1)
     // ========================================================================
 

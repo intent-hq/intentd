@@ -623,6 +623,16 @@
 //! first sample lands. The catalog contains 325 router methods, 53
 //! fast-path methods, and two aliases: 380 client-callable names.
 //!
+//! Version 10.5 adds the provider-generic auth surface (§5.27):
+//! `sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
+//! `getUser` with `provider: "github" | "gitlab"` and an optional gitlab
+//! `host`, the `device-grant-unsupported` / `source-control-unauthorized`
+//! typed errors, the `sourceControl:auth-changed { provider, host, status }`
+//! event and the `sourceControl.gitlab.*` settings. The `github.*` auth
+//! quintet is served as byte-identical aliases. The catalog contains 334
+//! router methods, 56 fast-path methods, and two aliases: 392
+//! client-callable names.
+//!
 //! Versions 10.5 (`sourceControl.*` forge auth) and 10.6 (provider-neutral
 //! principal identity) are documented in the monorepo's
 //! `docs/protocol/versioning.md`.
