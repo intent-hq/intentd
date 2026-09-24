@@ -280,9 +280,8 @@ pub fn get_tools_to_remove(is_orchestrator: bool, agent_type: &str) -> Vec<&'sta
 ///   for orchestrators here — non-orchestrator droid agents keep native
 ///   sub-agent spawning until a follow-up extends the denylist.
 /// - `codex`: no removal list. Its native-subagent denial is configuration-based:
-///   [`crate::spawn::build_args`] always supplies `-c agents.enabled=false` for
-///   the native adapter; [`crate::spawn::build_command`] supplies daemon-owned
-///   `CODEX_CONFIG` JSON for the npx fallback.
+///   [`crate::spawn::build_command`] supplies daemon-owned `CODEX_CONFIG`
+///   JSON to the pinned npx adapter, disabling both agents and multi-agent V2.
 /// - every other provider: nothing. claude-code delivers its orchestrator
 ///   denylist via `session/new` `_meta` instead (see
 ///   [`CLAUDE_CODE_ORCHESTRATOR_DISALLOWED_TOOLS`]); grok has no reachable
@@ -385,7 +384,7 @@ mod tests {
 
     #[test]
     fn native_resolution_other_providers_get_nothing() {
-        // Codex stays empty here because build_args/build_command enforce
+        // Codex stays empty here because build_command enforces
         // its subagent denial through configuration, not a tool-removal list.
         // grok included: its `--disallowed-tools` flag is headless-only and
         // unreachable from `agent stdio`, so grok must resolve to nothing
