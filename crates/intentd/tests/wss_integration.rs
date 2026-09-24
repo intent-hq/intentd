@@ -12275,6 +12275,11 @@ fn fake_acp_adapter_script(tag: &str, behavior: &str) -> (tempfile::TempDir, std
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() {
+    if common::codex_npx::in_subprocess(
+        "wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp",
+    ) {
+        return;
+    }
     // Provider-neutral routing (§5.32): with codex as the effective default
     // provider the daemon runs an EPHEMERAL ACP session (initialize →
     // session/new → one session/prompt → reap) against the mock agent and
@@ -12288,10 +12293,7 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
         fake_acp_adapter_script("complete", r#"{"response":"🤖\nfix-login-flow"}"#);
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&bin);
 
     let resp = wss_call(
         srv.port,
@@ -12392,6 +12394,11 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
+    if common::codex_npx::in_subprocess(
+        "wss_agent_complete_once_acp_adapter_failure_is_internal_error",
+    ) {
+        return;
+    }
     // A RESOLVED adapter that dies before completing the turn is a hard
     // -32603 (§5.32), not `{ available: false }` — the unavailable result is
     // reserved for routing/resolution, and the reason is prefixed with the
@@ -12403,10 +12410,7 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&bin);
 
     let resp = wss_call(
         srv.port,
@@ -12424,6 +12428,11 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
+    if common::codex_npx::in_subprocess(
+        "wss_host_provider_test_prompt_success_and_auth_required_paths",
+    ) {
+        return;
+    }
     // host.providerTestPrompt (§5.14) over the real wire, both terminal
     // shapes against the mock ACP fixture. A provider whose adapter answers
     // the live "say hello" turn is `{ ok: true }` and the cached
@@ -12446,10 +12455,7 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
         r#"{"promptRpcError":{"code":-32000,"message":"Authentication required"}}"#,
     );
     let srv = start(WsOptions::default()).await;
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": ok_bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&ok_bin);
 
     let resp = wss_call(
         srv.port,
@@ -12476,10 +12482,7 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
 
     // Same provider, now behind an adapter that rejects the prompt with the
     // claude-code auth-required shape (-32000 + auth-pattern message).
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": auth_bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&auth_bin);
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -12673,6 +12676,11 @@ async fn wss_acp_node_max_old_space_mb_setting_reaches_provider_test_prompt_chil
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
+    if common::codex_npx::in_subprocess(
+        "wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete",
+    ) {
+        return;
+    }
     // Adapters that hold their slot for ~10s before answering the turn, so the
     // bound is saturated for a wide, non-racy window. The wrapper records one
     // line per adapter actually launched: the assertions below count it rather
@@ -12722,10 +12730,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
     };
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&bin);
 
     // The bound is a process-global installed once; ask for 1 and fill
     // whatever is actually in force, so this holds under any test runner.
@@ -12830,14 +12835,12 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
     // The resolution tier of the gate: a one-shot-capable provider whose
-    // adapter resolves to nothing (no binary, no npx for the pinned fallback
+    // adapter resolves to nothing (no Node/npx for the pinned
     // package) returns `{ available: false, reason }`, never an error.
-    // Environment-gated — npx or an installed codex-acp both make the launch
-    // resolvable, and neither can be hidden hermetically.
-    if intent_providers::find_npx().is_some()
-        || intent_providers::find_provider_binary("codex", "codex-acp", None).is_some()
-    {
-        eprintln!("skipping unresolvable-adapter e2e: npx or codex-acp is installed");
+    // Environment-gated — missing prerequisites are covered hermetically
+    // by service tests; native codex-acp cannot substitute for Node/npx.
+    if intent_providers::find_codex_npx().is_some() {
+        eprintln!("skipping unresolvable-adapter e2e: Codex Node/npx is installed");
         return;
     }
     let srv = start(WsOptions::default()).await;
@@ -12853,7 +12856,7 @@ async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "codex: no adapter could be resolved (binary not found and npx unavailable)"
+            "reason": intent_providers::CODEX_ACP_PREREQUISITE_ERROR
         })
     );
     srv.ws.stop().await;
@@ -13017,6 +13020,11 @@ async fn wss_agent_complete_once_resolves_quick_action_settings() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_provider() {
+    if common::codex_npx::in_subprocess(
+        "wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_provider",
+    ) {
+        return;
+    }
     // A user-authored `quickActions.defaultModel = "codex:gpt-5"` (legacy
     // compound; the wire rejects compounds but user files are never
     // rejected) splits on read into a (codex, gpt-5) pair and routes the
@@ -13029,6 +13037,7 @@ async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_prov
     }
     let (_adapter_dir, bin) =
         fake_acp_adapter_script("compound-quick", r#"{"response":"🤖\ncompound-routed"}"#);
+    common::codex_npx::select_adapter(&bin);
     let srv = start(WsOptions::default()).await;
     // Seed via reload() — the live-reload watcher path for an externally
     // edited config.toml — since settings.update rejects compound values.

@@ -16167,17 +16167,18 @@ async fn usage_update_cost_captured_over_wss() {
 }
 
 /// Observe Codex's real child argv, including after an idle child is lost.
-/// The wrapper forwards every argument to the deterministic ACP fixture;
-/// provider resolution and process launch still follow the native Codex path.
-async fn assert_codex_native_subagent_policy_over_wss(advertise_load: bool) {
+/// Drive the selected npx package even when an explicit custom adapter and
+/// a PATH adapter are present. The fake npx captures the actual launch argv.
+async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(script) = gate("WSS Codex native subagent policy E2E") else {
+    let Some(script) = gate("WSS Codex selected npx subagent policy E2E") else {
         return;
     };
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path();
     let ws_id = seed_workspace_only(data_dir).await;
+    let toolchain = common::codex_npx::install(data_dir, &script);
     let wrapper = data_dir.join("fake-codex-acp");
     std::fs::write(
         &wrapper,
@@ -16186,28 +16187,46 @@ async fn assert_codex_native_subagent_policy_over_wss(advertise_load: bool) {
     .expect("write Codex wrapper");
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
         .expect("chmod Codex wrapper");
+    // A genuine native executable and a JS adapter must both lose to the
+    // selected package. The explicit custom path must also be ignored.
+    let installed = data_dir.join("codex-toolchain/codex-acp");
+    if advertise_load {
+        std::fs::write(&installed, "#!/usr/bin/env node\nprocess.exit(91);\n")
+            .expect("write installed JS adapter");
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod installed JS adapter");
+    } else {
+        std::os::unix::fs::symlink("/bin/false", &installed).expect("install native tripwire");
+    }
     std::fs::write(
         data_dir.join("config.toml"),
         format!("[providers.paths]\ncodex = {}\n", json!(wrapper)),
     )
-    .expect("pin native Codex binary to mock wrapper");
-    let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
+    .expect("seed custom path that selected npx must ignore");
     let session_log = data_dir.join("sessions.jsonl");
     let behavior = json!({
         "response": "Codex policy turn complete",
         "advertiseLoadSession": advertise_load,
     })
     .to_string();
-    let env = [
+    let mut env: Vec<(&str, &str)> = toolchain
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    env.extend([
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
-        ("MOCK_AGENT_NODE", node.to_str().expect("node path")),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_LOG_CODEX_POLICY", "1"),
+        ("CODEX_PATH", "/must-not-be-used/codex"),
+        (
+            "CODEX_CONFIG",
+            r#"{"agents":{"enabled":true},"features":{"multi_agent_v2":true}}"#,
+        ),
         (
             "MOCK_AGENT_SESSION_LOG",
             session_log.to_str().expect("log path"),
         ),
-    ];
+    ]);
     let child = spawn_serve(data_dir, "both", &env);
     let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
@@ -16309,21 +16328,21 @@ async fn assert_codex_native_subagent_policy_over_wss(advertise_load: bool) {
             !argv.iter().any(|arg| arg.starts_with("model=")),
             "launch must exercise the no-model path: {argv:?}"
         );
-        let policy: Vec<_> = argv
-            .iter()
-            .filter(|arg| arg.starts_with("agents.enabled="))
-            .collect();
-        assert_eq!(
-            policy,
-            vec![&"agents.enabled=false"],
-            "each native launch needs exactly one unquoted boolean policy: {argv:?}"
+        assert!(
+            argv.contains(&"-y"),
+            "npx must select the pinned package: {argv:?}"
         );
         assert_eq!(
-            argv.windows(2)
-                .filter(|pair| *pair == ["-c", "agents.enabled=false"])
+            argv.iter()
+                .filter(|arg| **arg == "@agentclientprotocol/codex-acp@1.9.0")
                 .count(),
             1,
-            "policy must be delivered as a -c override: {argv:?}"
+            "each launch must use the selected adapter exactly once: {argv:?}"
+        );
+        assert_eq!(
+            session["codexPolicy"],
+            json!({"config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}, "pathPresent": false}),
+            "daemon policy must replace enabling environment on every launch: {session}"
         );
         let pid = session["pid"].as_u64().expect("mock child pid");
         if turn == 0 {
@@ -16367,13 +16386,13 @@ async fn assert_codex_native_subagent_policy_over_wss(advertise_load: bool) {
 }
 
 #[intent_test_macros::daemon_test]
-async fn codex_native_subagent_policy_without_model_survives_recreate_over_wss() {
-    assert_codex_native_subagent_policy_over_wss(false).await;
+async fn codex_npx_subagent_policy_without_model_survives_recreate_over_wss() {
+    assert_codex_npx_subagent_policy_over_wss(false).await;
 }
 
 #[intent_test_macros::daemon_test]
-async fn codex_native_subagent_policy_without_model_survives_resume_over_wss() {
-    assert_codex_native_subagent_policy_over_wss(true).await;
+async fn codex_npx_subagent_policy_without_model_survives_resume_over_wss() {
+    assert_codex_npx_subagent_policy_over_wss(true).await;
 }
 
 /// Pin the `grok` provider binary to a wrapper around the mock ACP fixture

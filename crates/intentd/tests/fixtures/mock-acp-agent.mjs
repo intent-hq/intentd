@@ -78,7 +78,8 @@ function log(msg) {
 // working directory, so tests can prove the two are decoupled for npx
 // launches (intent-hq/intent#5738). `argv` records only the arguments passed
 // to this fixture, excluding the Node executable and script path, so tests
-// can verify native provider launch policy without capturing environment.
+// can verify provider selection. MOCK_AGENT_LOG_CODEX_POLICY opts into only
+// the daemon-owned policy JSON and CODEX_PATH presence, never other env values.
 function logSessionCall(method, sessionId, meta, cwd) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
@@ -94,6 +95,12 @@ function logSessionCall(method, sessionId, meta, cwd) {
         cwd: cwd ?? null,
         processCwd: process.cwd(),
         argv: process.argv.slice(2),
+        ...(process.env.MOCK_AGENT_LOG_CODEX_POLICY === '1'
+          ? { codexPolicy: {
+              config: process.env.CODEX_CONFIG ? JSON.parse(process.env.CODEX_CONFIG) : null,
+              pathPresent: Object.hasOwn(process.env, 'CODEX_PATH'),
+            } }
+          : {}),
       }) + '\n'
     );
   } catch (err) {
