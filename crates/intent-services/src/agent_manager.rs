@@ -10203,6 +10203,20 @@ struct ResolvedSpawn {
     unsloth_endpoint: Option<intent_providers::UnslothEndpoint>,
 }
 
+/// Exercise the real first-turn resolver without starting a provider process.
+#[cfg(test)]
+pub(crate) fn imported_spawn_selection_for_test(
+    session: &AgentSession,
+    settings: &intent_core::settings_file::SettingsFile,
+) -> (String, Option<String>, Option<String>) {
+    let resolved = resolve_spawn(session, None, settings, None).expect("imported spawn resolves");
+    (
+        resolved.provider.id.to_string(),
+        resolved.model,
+        resolved.reasoning_effort,
+    )
+}
+
 /// Resolve the provider config, model, cwd, and extra env for spawning an
 /// The default agent type for an agent with no specialist-declared `agentType`
 /// (the foreground/interactive type, which has no internal tool denylist).

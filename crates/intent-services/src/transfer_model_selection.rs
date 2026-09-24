@@ -17,8 +17,9 @@
 //!
 //! - [`pin_source_selection`] (export side): every exported session row
 //!   whose `provider` is unset gains the source's effective default
-//!   provider, so the archive carries the provider the source would use
-//!   for its next turn. `model` / `reasoning_effort` stay as stored — they already
+//!   provider (or its legacy model prefix), so the archive carries the
+//!   provider the source would use for its next turn.
+//!   `model` / `reasoning_effort` stay as stored — they already
 //!   ARE the effective selection: the spawn path (`resolve_spawn`) passes
 //!   `session.model` / `session.reasoning_effort` through verbatim, and a
 //!   NULL means no `--model` / effort flag, i.e. the provider's CLI default.
@@ -33,8 +34,9 @@
 //! - [`resolve_imported_selection`] (import side): archives written before
 //!   this pin — or by a source with no default provider — can still carry
 //!   a provider-less row. Such a row keeps its `model` / `reasoning_effort`
-//!   only when the last committed turn is evidence for a provider (the
-//!   `last_turn_provider` that ran exactly this `model`); otherwise the
+//!   only when its legacy model prefix names the provider or the last
+//!   committed turn is evidence for a provider (the `last_turn_provider`
+//!   that ran exactly this `model`); otherwise the
 //!   whole selection is cleared so the destination applies its defaults as
 //!   a unit. A missing provider is never inferred from the destination
 //!   default while a foreign model id is retained.
@@ -42,9 +44,158 @@
 //! Contract for the rows that leave the import transform: an `agent_session`
 //! row either names its `provider` (a concrete selection the destination may
 //! reconcile against its own availability) or has all three selection
-//! fields unset (the destination's default selection, Auto).
+//! fields unset (awaiting destination application-default resolution).
 
+use intent_store::normalize_compound_model;
 use serde_json::{Map, Value};
+
+use crate::agent_ops::{
+    ensure_effort_supported_by_model, ensure_known_provider, ensure_provider_available,
+    resolve_agent_default_model_with_source, resolve_settings_default_reasoning_effort,
+};
+
+const IMPORT_METHOD: &str = "workspace.import.commit";
+
+/// Only destination evidence participates here. Unknown/expired auth verdicts
+/// and missing/stale/failed catalogs stay permissive, as at agent creation.
+/// A non-empty fresh catalog can disprove an explicit model or effort. Auto
+/// stays Auto; its explicit effort, if any, is checked against the advertised
+/// default model when the catalog identifies one.
+fn selection_unavailable(
+    services: &crate::Services,
+    provider: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> intent_core::Result<()> {
+    let cache = services.cached_models();
+    let Some(catalog) = cache.fresh_catalog(provider) else {
+        return Ok(());
+    };
+    // Match resolve_spawn's interpretation of old archives: a compound id
+    // passes its bare part, while a historical display label means Auto.
+    // Validation never rewrites a supported stored selection.
+    let explicit_model = model
+        .map(|m| m.split_once(':').map_or(m, |(_, bare)| bare))
+        .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace) && *m != "default");
+    if let Some(model) = explicit_model {
+        if cache.cached_catalog_claims(provider, model) == Some(false) {
+            return Err(intent_core::Error::InvalidParams(format!(
+                "{IMPORT_METHOD}: model {model} is not available from provider {provider}"
+            )));
+        }
+    }
+    if let Some(effort) = effort.filter(|e| !e.trim().is_empty()) {
+        let default_model = catalog
+            .iter()
+            .find(|row| row.get("isDefault").and_then(Value::as_bool) == Some(true))
+            .and_then(|row| row.get("id"))
+            .and_then(Value::as_str);
+        // Scope effort evidence to this provider: bare ids may be shared
+        // across providers with different effort vocabularies.
+        let scoped = explicit_model.or(default_model).map(|model| {
+            if model.starts_with(&format!("{provider}:")) {
+                model.to_string()
+            } else {
+                format!("{provider}:{model}")
+            }
+        });
+        ensure_effort_supported_by_model(IMPORT_METHOD, &cache, scoped.as_deref(), effort)?;
+    }
+    Ok(())
+}
+
+impl crate::Services {
+    /// Run on the blocking pool before `transfer_import_rows`. Discovery and
+    /// catalog reads are destination-local and never spawn a turn or probe.
+    pub(crate) fn reconcile_imported_selections(&self, rows: &mut [(String, Vec<Value>)]) {
+        let settings = self.effective_settings();
+        // One discovery per provider, not per imported agent.
+        let mut availability = std::collections::HashMap::new();
+        let mut available = |provider: &str| -> Result<(), String> {
+            availability
+                .entry(provider.to_string())
+                .or_insert_with(|| {
+                    ensure_known_provider(IMPORT_METHOD, provider)
+                        .and_then(|()| {
+                            ensure_provider_available(IMPORT_METHOD, provider, &settings.providers)
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .clone()
+        };
+        let mut destination_default = None;
+        let now = intent_core::now_iso();
+        for (_, sessions) in rows
+            .iter_mut()
+            .filter(|(table, _)| table == "agent_session")
+        {
+            for session in sessions {
+                let Some(map) = session.as_object_mut() else {
+                    continue;
+                };
+                // Runtime capabilities were learned on the source machine.
+                map.insert("effort_levels".into(), Value::Null);
+                // Legacy prefixes override the provider column on store
+                // reads; validate exactly the selection the first turn sees.
+                let (model, provider) =
+                    normalize_compound_model(column_str(map, "model"), column_str(map, "provider"));
+                let source = provider.as_deref().map_or_else(
+                    || Err("the source provider is unknown".to_string()),
+                    |p| {
+                        available(p).and_then(|()| {
+                            selection_unavailable(
+                                self,
+                                p,
+                                model.as_deref(),
+                                column_str(map, "reasoning_effort").as_deref(),
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                    },
+                );
+                let Err(source_reason) = source else { continue };
+                let fallback = destination_default.get_or_insert_with(|| {
+                    let provider = crate::agent_session::derived_default_provider(&settings)
+                        .ok_or_else(|| "no default provider is configured".to_string())?;
+                    available(&provider)?;
+                    // The same model/effort default chain as plain creation;
+                    // imported specialist and runtime state never select it.
+                    let (model, model_source) =
+                        resolve_agent_default_model_with_source(self, None, None, Some(&provider));
+                    let effort = resolve_settings_default_reasoning_effort(
+                        self,
+                        model_source,
+                        model.as_deref(),
+                    );
+                    selection_unavailable(self, &provider, model.as_deref(), effort.as_deref())
+                        .map_err(|e| e.to_string())?;
+                    Ok::<_, String>((provider, model, effort))
+                });
+                match fallback {
+                    Ok((provider, model, effort)) => {
+                        map.insert("provider".into(), Value::String(provider.clone()));
+                        map.insert("model".into(), serde_json::json!(model));
+                        map.insert("reasoning_effort".into(), serde_json::json!(effort));
+                        tracing::info!(agent = ?map.get("id"), %provider, %source_reason,
+                            "import: applied destination selection defaults");
+                    }
+                    Err(reason) => {
+                        // Keep history and the original selection, surface the
+                        // actionable failure through existing attention UI.
+                        map.insert(
+                            "attention_request_kind".into(),
+                            serde_json::json!("blocker"),
+                        );
+                        map.insert("attention_request_reason".into(), serde_json::json!(format!(
+                            "Imported agent needs configuration: {source_reason}; destination default cannot be used: {reason}. Choose an available provider, model and effort in Settings > Agents before sending a message."
+                        )));
+                        map.insert("attention_request_timestamp".into(), serde_json::json!(now));
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// A JSON column that is absent, `null`, or an empty string reads as unset —
 /// the same leniency [`crate::agent_session::resolve_provider_id`] applies.
@@ -55,20 +206,17 @@ fn column_str(map: &Map<String, Value>, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Pin the source's effective default provider into every exported
+/// Pin the source's effective provider into every exported
 /// `agent_session` row object whose `provider` is unset. Operates on the
 /// in-memory archive rows only — the source table is never written — and
 /// leaves rows with an explicit provider, and every other column, untouched.
-/// With no resolvable source default (`None`) nothing changes: the import
-/// side then applies its legacy resolution. Returns the number of rows
-/// pinned.
+/// A legacy compound model prefix precedes the source default, matching
+/// session reads. Without either, the import side applies its legacy
+/// resolution. Returns the number of rows pinned.
 pub(crate) fn pin_source_selection(
     rows: &mut [(String, Vec<Value>)],
     source_default_provider: Option<&str>,
 ) -> usize {
-    let Some(default_provider) = source_default_provider.filter(|p| !p.is_empty()) else {
-        return 0;
-    };
     let mut pinned = 0;
     for (table, objects) in rows.iter_mut() {
         if table.as_str() != "agent_session" {
@@ -81,10 +229,15 @@ pub(crate) fn pin_source_selection(
             if column_str(map, "provider").is_some() {
                 continue;
             }
-            map.insert(
-                "provider".into(),
-                Value::String(default_provider.to_string()),
-            );
+            let (_, legacy_provider) = normalize_compound_model(column_str(map, "model"), None);
+            let Some(provider) = legacy_provider
+                .as_deref()
+                .or(source_default_provider)
+                .filter(|p| !p.is_empty())
+            else {
+                continue;
+            };
+            map.insert("provider".into(), Value::String(provider.to_string()));
             pinned += 1;
         }
     }
@@ -97,6 +250,8 @@ pub(crate) enum ImportedSelection {
     /// The row already named its provider (or had nothing to resolve):
     /// nothing changed.
     Kept,
+    /// A provider-less legacy row names its provider in the model prefix.
+    RecoveredFromModelPrefix(String),
     /// A provider-less row adopted the named provider from its last
     /// committed turn, which ran exactly the stored model.
     RecoveredFromLastTurn(String),
@@ -114,7 +269,11 @@ pub(crate) fn resolve_imported_selection(map: &mut Map<String, Value>) -> Import
     if column_str(map, "provider").is_some() {
         return ImportedSelection::Kept;
     }
-    let model = column_str(map, "model");
+    let (model, legacy_provider) = normalize_compound_model(column_str(map, "model"), None);
+    if let Some(provider) = legacy_provider {
+        map.insert("provider".into(), Value::String(provider.clone()));
+        return ImportedSelection::RecoveredFromModelPrefix(provider);
+    }
     let effort = column_str(map, "reasoning_effort");
     if model.is_none() && effort.is_none() {
         return ImportedSelection::Kept;
@@ -123,8 +282,10 @@ pub(crate) fn resolve_imported_selection(map: &mut Map<String, Value>) -> Import
     // stored model (both NULL = the provider default ran, which also
     // matches). A turn that ran a different model says nothing about which
     // provider the current selection was made against.
-    let last_turn_provider = column_str(map, "last_turn_provider");
-    let last_turn_model = column_str(map, "last_turn_model");
+    let (last_turn_model, last_turn_provider) = normalize_compound_model(
+        column_str(map, "last_turn_model"),
+        column_str(map, "last_turn_provider"),
+    );
     if let Some(provider) = last_turn_provider {
         if last_turn_model == model {
             map.insert("provider".into(), Value::String(provider.clone()));
@@ -148,6 +309,36 @@ mod tests {
             ),
             ("agent_session".to_string(), objects),
         ]
+    }
+
+    #[test]
+    fn legacy_prefix_pinning_uses_identity_before_source_default() {
+        for default in [Some("codex"), None] {
+            let mut rows = session_rows(vec![serde_json::json!({
+                "provider": null, "model": "auggie:gpt6-astra", "reasoning_effort": "high"
+            })]);
+            assert_eq!(pin_source_selection(&mut rows, default), 1);
+            assert_eq!(rows[1].1[0]["provider"], "auggie");
+            assert_eq!(rows[1].1[0]["model"], "auggie:gpt6-astra");
+            assert_eq!(rows[1].1[0]["reasoning_effort"], "high");
+        }
+    }
+
+    #[test]
+    fn legacy_prefix_history_recovers_effective_provider() {
+        let mut row = serde_json::json!({
+            "provider": null, "model": "gpt6-astra", "reasoning_effort": "high",
+            "last_turn_provider": "codex", "last_turn_model": "auggie:gpt6-astra"
+        });
+        assert_eq!(
+            resolve_imported_selection(row.as_object_mut().unwrap()),
+            ImportedSelection::RecoveredFromLastTurn("auggie".into())
+        );
+        assert_eq!(row["provider"], "auggie");
+        assert_eq!(row["model"], "gpt6-astra");
+        assert_eq!(row["reasoning_effort"], "high");
+        assert_eq!(row["last_turn_provider"], "codex");
+        assert_eq!(row["last_turn_model"], "auggie:gpt6-astra");
     }
 
     /// Missing, NULL, and empty providers are pinned to the source default;

@@ -465,6 +465,15 @@ impl Services {
             .clone()
             .unwrap_or_else(crate::default_workspaces_root);
         let mut outcome = transform_rows(rows, &workspace_id, &target_root, &now_iso())?;
+        // Provider discovery inspects the filesystem / enhanced PATH. Keep
+        // it off the async runtime, and reconcile before any rows are visible.
+        let services = self.clone();
+        outcome = tokio::task::spawn_blocking(move || {
+            services.reconcile_imported_selections(&mut outcome.rows);
+            outcome
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("import selection resolution failed: {e}")))?;
 
         // Materialize the git payload BEFORE the rows land, so the seam can
         // rewrite the transformed workspace/sandbox rows to the target
@@ -1240,8 +1249,8 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///   is normalized by
 ///   [`crate::transfer_model_selection::resolve_imported_selection`]: a
 ///   provider-less row (legacy archive, or a source with no default
-///   provider) keeps its model / effort only on last-turn evidence for the
-///   provider, else the selection is cleared so the target's defaults apply
+///   provider) keeps its model / effort on legacy model-prefix or last-turn
+///   evidence for the provider, else the selection is cleared so the target's defaults apply
 ///   as a unit (intent-hq/intent#5815); `last_turn_*` history is untouched.
 /// - **sandbox**: `path` rewritten under the target root.
 /// - **script**: absolute `cwd` rewritten under the target root.
@@ -1304,6 +1313,13 @@ fn transform_rows(
                     }
                     match resolve_imported_selection(map) {
                         ImportedSelection::Kept => {}
+                        ImportedSelection::RecoveredFromModelPrefix(provider) => {
+                            tracing::info!(
+                                agent = map.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                                provider = %provider,
+                                "import: provider-less session selection recovered from its legacy model prefix"
+                            );
+                        }
                         ImportedSelection::RecoveredFromLastTurn(provider) => {
                             tracing::info!(
                                 agent = map.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
@@ -2152,6 +2168,416 @@ mod tests {
                 ],
             ),
         ]
+    }
+
+    async fn selection_fixture() -> (Services, TempDir, TempDir) {
+        let root = TempDir::new("import-selection");
+        let assets = TempDir::new("import-selection-assets");
+        let registry =
+            std::sync::Arc::new(crate::SettingsRegistry::load(root.0.join("config.toml")).unwrap());
+        // Discovery and resolve_spawn only inspect these executable paths;
+        // importing must never execute them or open an ACP session.
+        registry
+            .apply(&[
+                ("model.defaultProvider".into(), serde_json::json!("codex")),
+                ("model.default".into(), serde_json::json!("global-default")),
+                (
+                    "model.providerDefaults".into(),
+                    serde_json::json!({"codex": "gpt-6-astra"}),
+                ),
+                (
+                    "model.defaultReasoningEffort".into(),
+                    serde_json::json!("high"),
+                ),
+                (
+                    "providers.paths".into(),
+                    serde_json::json!({
+                        "auggie": std::env::current_exe().unwrap(),
+                        "codex": std::env::current_exe().unwrap()
+                    }),
+                ),
+            ])
+            .unwrap();
+        let svc = fresh_services(&root.0, &assets.0)
+            .await
+            .with_settings_registry(registry);
+        for (provider, model) in [("codex", "gpt-6-astra"), ("auggie", "gpt6-astra")] {
+            seed_selection_catalog(
+                &svc,
+                provider,
+                model,
+                crate::model_catalog::ModelCatalogCache::now_ms(),
+            );
+        }
+        (svc, root, assets)
+    }
+
+    fn seed_selection_catalog(svc: &Services, provider: &str, model: &str, now: u64) {
+        let source = crate::model_catalog::source_for(provider).unwrap();
+        svc.models_catalog.test_store(provider, &(source.version_key)(), vec![serde_json::json!({
+            "id": model, "provider": provider, "isDefault": true, "effortLevels": ["low", "high"]
+        })], now);
+    }
+
+    async fn import_selection(
+        svc: &Services,
+        selection: serde_json::Value,
+    ) -> intent_core::AgentSession {
+        let ws = WorkspaceId::from("ws-selection");
+        let mut rows = fixture_rows(&ws);
+        let row = &mut rows
+            .iter_mut()
+            .find(|(table, _)| *table == "agent_session")
+            .unwrap()
+            .1[0];
+        row["status"] = serde_json::json!("idle");
+        row["last_turn_provider"] = serde_json::json!("auggie");
+        row["last_turn_model"] = serde_json::json!("gpt6-astra");
+        row["effort_levels"] = serde_json::json!("[\"source-only-effort\"]");
+        row.as_object_mut()
+            .unwrap()
+            .extend(selection.as_object().unwrap().clone());
+        let manifest = manifest(&ws);
+        let archive = build_archive_full(&manifest, &rows, None, &[]);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(manifest).unwrap(),
+                archive.len() as u64,
+                sha256_hex(&archive),
+            )
+            .await
+            .unwrap();
+        let id = begin["importId"].as_str().unwrap().to_string();
+        svc.workspace_import_chunk_op(id.clone(), 0, b64(&archive))
+            .await
+            .unwrap();
+        svc.workspace_import_commit_op(id).await.unwrap();
+        let agent = intent_core::AgentId::from("agent-live");
+        let session = svc.store.get_agent_session(&agent).await.unwrap();
+        assert!(!session.is_active);
+        assert!(session.acp_session_id.is_none());
+        assert!(session.backend_session_id.is_none());
+        assert_eq!(
+            svc.store
+                .get_agent_session_last_turn_model(&ws, &agent)
+                .await
+                .unwrap(),
+            (Some("gpt6-astra".into()), Some("auggie".into())),
+            "import must not start a turn or rewrite history"
+        );
+        assert_eq!(
+            svc.store
+                .transfer_table_stats(&ws)
+                .await
+                .unwrap()
+                .iter()
+                .find(|s| s.name == "agent_message")
+                .unwrap()
+                .row_count,
+            2
+        );
+        session
+    }
+
+    fn assert_selection(
+        svc: &Services,
+        session: &intent_core::AgentSession,
+        provider: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) {
+        assert_eq!(
+            (
+                session.provider.as_deref(),
+                session.model.as_deref(),
+                session.reasoning_effort.as_deref()
+            ),
+            (Some(provider), model, effort)
+        );
+        assert_eq!(
+            crate::agent_manager::imported_spawn_selection_for_test(
+                session,
+                &svc.effective_settings()
+            ),
+            (
+                provider.into(),
+                model.map(str::to_string),
+                effort.map(str::to_string)
+            )
+        );
+        assert!(
+            session.effort_levels.is_none(),
+            "source capabilities are not destination evidence"
+        );
+        assert!(session.attention_request_kind.is_none());
+    }
+
+    #[tokio::test]
+    async fn import_selection_disabled_auggie_uses_destination_defaults() {
+        let (svc, _root, _assets) = selection_fixture().await;
+        svc.settings_registry()
+            .unwrap()
+            .apply(&[(
+                "providers.enabled".into(),
+                serde_json::json!({"auggie": false}),
+            )])
+            .unwrap();
+        let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"gpt6-astra", "reasoning_effort":"low"})).await;
+        assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn import_selection_missing_model_uses_destination_defaults() {
+        let (svc, _root, _assets) = selection_fixture().await;
+        let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"removed-model", "reasoning_effort":"low"})).await;
+        assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn import_selection_unsupported_effort_replaces_entire_selection() {
+        let (svc, _root, _assets) = selection_fixture().await;
+        let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"gpt6-astra", "reasoning_effort":"source-only-effort"})).await;
+        assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn import_selection_supported_explicit_and_auto_survive() {
+        for selection in [
+            serde_json::json!({"provider":"auggie", "model":"gpt6-astra", "reasoning_effort":"HIGH"}),
+            serde_json::json!({"provider":"auggie", "model":null, "reasoning_effort":null}),
+        ] {
+            let (svc, _root, _assets) = selection_fixture().await;
+            let session = import_selection(&svc, selection.clone()).await;
+            assert_selection(
+                &svc,
+                &session,
+                "auggie",
+                selection["model"].as_str(),
+                selection["reasoning_effort"].as_str(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_supported_legacy_compound_survives() {
+        for provider in [Some("auggie"), Some("codex"), None] {
+            let (svc, _root, _assets) = selection_fixture().await;
+            let session = import_selection(&svc, serde_json::json!({"provider":provider, "model":"auggie:gpt6-astra", "reasoning_effort":"high"})).await;
+            // The store's legacy read backstop splits compound ids. Verify the
+            // unchanged persisted selection independently of normalized reads.
+            let rows = svc
+                .store
+                .transfer_export_rows(&session.workspace_id)
+                .await
+                .unwrap();
+            let stored = &rows
+                .iter()
+                .find(|(table, _)| table == "agent_session")
+                .unwrap()
+                .1[0];
+            assert_eq!(
+                (
+                    stored["provider"].as_str(),
+                    stored["model"].as_str(),
+                    stored["reasoning_effort"].as_str()
+                ),
+                (
+                    provider.or(Some("auggie")),
+                    Some("auggie:gpt6-astra"),
+                    Some("high")
+                )
+            );
+            assert_selection(&svc, &session, "auggie", Some("gpt6-astra"), Some("high"));
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_disabled_legacy_prefix_replaces_conflicting_provider() {
+        let (svc, _root, _assets) = selection_fixture().await;
+        svc.settings_registry()
+            .unwrap()
+            .apply(&[(
+                "providers.enabled".into(),
+                serde_json::json!({"auggie": false}),
+            )])
+            .unwrap();
+        let session = import_selection(
+            &svc,
+            serde_json::json!({
+                "provider":"codex", "model":"auggie:gpt-6-astra", "reasoning_effort":"low"
+            }),
+        )
+        .await;
+        assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn import_selection_unknown_identity_uses_configured_defaults() {
+        for selection in [
+            serde_json::json!({"provider":null, "model":"unknown-old-model", "reasoning_effort":"low"}),
+            serde_json::json!({"provider":null, "model":null, "reasoning_effort":null}),
+            serde_json::json!({"provider":"foreign-provider", "model":"foreign-model", "reasoning_effort":"low"}),
+        ] {
+            let (svc, _root, _assets) = selection_fixture().await;
+            let session = import_selection(&svc, selection).await;
+            assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_no_viable_default_requests_configuration() {
+        for setting in [
+            ("model.defaultProvider", serde_json::Value::Null),
+            ("providers.enabled", serde_json::json!({"codex":false})),
+            (
+                "model.providerDefaults",
+                serde_json::json!({"codex":"missing-default-model"}),
+            ),
+        ] {
+            let (svc, _root, _assets) = selection_fixture().await;
+            svc.settings_registry()
+                .unwrap()
+                .apply(&[(setting.0.into(), setting.1)])
+                .unwrap();
+            let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"missing-model", "reasoning_effort":"low"})).await;
+            assert_eq!(session.attention_request_kind.as_deref(), Some("blocker"));
+            assert!(session
+                .attention_request_reason
+                .as_deref()
+                .unwrap()
+                .contains("Settings > Agents"));
+            assert_eq!(
+                session.model.as_deref(),
+                Some("missing-model"),
+                "do not persist an unusable fallback"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_temporary_catalog_uncertainty_preserves_source() {
+        for uncertainty in ["cold", "stale", "version", "failed-refresh"] {
+            let (mut svc, _root, _assets) = selection_fixture().await;
+            let source = crate::model_catalog::source_for("auggie").unwrap();
+            let version = (source.version_key)();
+            match uncertainty {
+                "cold" => {
+                    svc.models_catalog =
+                        std::sync::Arc::new(crate::model_catalog::ModelCatalogCache::new(None));
+                }
+                "stale" => seed_selection_catalog(&svc, "auggie", "different-model", 0),
+                "version" => svc.models_catalog.store_for_test(
+                    "auggie",
+                    "old-adapter",
+                    vec![serde_json::json!({"id":"different-model"})],
+                ),
+                "failed-refresh" => {
+                    crate::model_catalog::resolve_with_cache(
+                        &svc.models_catalog,
+                        "auggie",
+                        &version,
+                        true,
+                        crate::model_catalog::ModelCatalogCache::now_ms(),
+                        || {
+                            Box::pin(async {
+                                crate::model_catalog::ModelFetchResult {
+                                    models: None,
+                                    warning: Some("temporary authentication probe failure".into()),
+                                }
+                            })
+                        },
+                    )
+                    .await;
+                }
+                _ => unreachable!(),
+            }
+            crate::provider_auth::seed_auth_verdict_for_tests("auggie", None);
+            let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"new-model", "reasoning_effort":"new-effort"})).await;
+            assert_selection(
+                &svc,
+                &session,
+                "auggie",
+                Some("new-model"),
+                Some("new-effort"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_fallback_uses_auto_when_default_effort_is_unset() {
+        let (svc, _root, _assets) = selection_fixture().await;
+        svc.settings_registry()
+            .unwrap()
+            .apply(&[(
+                "model.defaultReasoningEffort".into(),
+                serde_json::Value::Null,
+            )])
+            .unwrap();
+        let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"removed-model", "reasoning_effort":"high"})).await;
+        assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), None);
+    }
+
+    #[tokio::test]
+    async fn import_selection_fallback_uses_global_default_then_catalog_then_cli() {
+        for tier in ["global", "catalog", "cli"] {
+            let (mut svc, _root, _assets) = selection_fixture().await;
+            let mut settings = vec![("model.providerDefaults".into(), serde_json::json!({}))];
+            settings.push((
+                "model.default".into(),
+                if tier == "global" {
+                    serde_json::json!("gpt-6-astra")
+                } else {
+                    serde_json::Value::Null
+                },
+            ));
+            svc.settings_registry().unwrap().apply(&settings).unwrap();
+            if tier == "cli" {
+                svc.models_catalog =
+                    std::sync::Arc::new(crate::model_catalog::ModelCatalogCache::new(None));
+            }
+            let session = import_selection(&svc, serde_json::json!({"provider":"unknown-provider", "model":"foreign-model", "reasoning_effort":"low"})).await;
+            assert_selection(
+                &svc,
+                &session,
+                "codex",
+                (tier != "cli").then_some("gpt-6-astra"),
+                (tier == "global").then_some("high"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_selection_effort_evidence_is_scoped_to_source_provider() {
+        let (svc, _root, _assets) = selection_fixture().await;
+        // The same bare id can have different effort vocabularies. Auggie
+        // precedes Codex in the catalog registry but cannot reject its effort.
+        seed_selection_catalog(
+            &svc,
+            "auggie",
+            "gpt-6-astra",
+            crate::model_catalog::ModelCatalogCache::now_ms(),
+        );
+        let source = crate::model_catalog::source_for("codex").unwrap();
+        svc.models_catalog.store_for_test(
+            "codex",
+            &(source.version_key)(),
+            vec![serde_json::json!({
+                "id":"gpt-6-astra", "effortLevels":["xhigh"]
+            })],
+        );
+        let session = import_selection(&svc, serde_json::json!({"provider":"codex", "model":"gpt-6-astra", "reasoning_effort":"xhigh"})).await;
+        assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("xhigh"));
+    }
+
+    #[tokio::test]
+    async fn import_selection_auto_with_unsupported_explicit_effort_falls_back() {
+        let (svc, _root, _assets) = selection_fixture().await;
+        let session = import_selection(
+            &svc,
+            serde_json::json!({"provider":"auggie", "model":null, "reasoning_effort":"xhigh"}),
+        )
+        .await;
+        assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
     }
 
     /// Full lifecycle: begin → two chunks (out of order, one retried) →

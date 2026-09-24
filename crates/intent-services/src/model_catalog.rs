@@ -444,6 +444,26 @@ impl ModelCatalogReader<'_> {
         }
     }
 
+    /// Destination evidence for a destructive import fallback. Unlike the
+    /// ownership guards, an aged last-good list or a failed refresh must not
+    /// prove that a transferred model/effort has disappeared. Cache-only:
+    /// import never starts a provider or makes a model request.
+    pub(crate) fn fresh_catalog(&self, provider_id: &str) -> Option<Vec<Value>> {
+        let source = source_for(provider_id)?;
+        let version = self.version_key(source);
+        let now = ModelCatalogCache::now_ms();
+        if self
+            .cache
+            .negative_reason(provider_id, &version, now)
+            .is_some()
+        {
+            return None;
+        }
+        self.cache
+            .fresh_hit(provider_id, &version, now)
+            .filter(|rows| !rows.is_empty())
+    }
+
     /// Cached-catalog ownership evidence for one provider (monorepo#607):
     /// `Some(claims)` when `provider_id` holds an in-memory last-good entry
     /// under its **current** registry version key ([`source_for`]), `None`

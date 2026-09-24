@@ -3526,7 +3526,8 @@ fn map_session_row_with_heavy_cols(
 /// model to (provider `b`, model `c`), discarding the migrated provider. No
 /// real model id contains a ':' (the wire rejects compound ids), so this is
 /// accepted rather than special-cased.
-fn normalize_compound_model(
+#[must_use]
+pub fn normalize_compound_model(
     model: Option<String>,
     provider: Option<String>,
 ) -> (Option<String>, Option<String>) {

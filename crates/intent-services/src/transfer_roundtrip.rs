@@ -55,6 +55,13 @@ async fn fresh_services_with_default_provider(
     registry
         .apply(&[
             (
+                "providers.paths".to_string(),
+                serde_json::json!({
+                    "auggie": std::env::current_exe().unwrap(),
+                    "claude-code": std::env::current_exe().unwrap()
+                }),
+            ),
+            (
                 "model.defaultProvider".to_string(),
                 serde_json::json!(default_provider),
             ),
