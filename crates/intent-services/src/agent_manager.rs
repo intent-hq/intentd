@@ -10553,33 +10553,21 @@ fn resolve_spawn(
     // managed-server lifecycle (`ensure_started`'s unsloth spawn gate).
     let binary_provider_id = provider.primary_binary_provider_id();
     let explicit_path = read_provider_path_setting(settings, binary_provider_id);
-    let provider_binary = intent_providers::find_provider_binary(
-        binary_provider_id,
-        provider.command,
-        explicit_path.as_deref(),
-    );
-
-    // When the provider binary is not found but the provider has a fallback npx
-    // package, resolve npx itself and record the fallback decision
-    let (npx_fallback_binary, npx_fallback_package) = if provider_binary.is_none() {
-        if let Some(pkg) = provider.fallback_npx_package {
-            if let Some(npx_path) = intent_providers::find_npx() {
-                tracing::info!(
-                    provider_id = provider_id,
-                    npx_path = ?npx_path,
-                    package = pkg,
-                    "provider binary not found; falling back to npx"
-                );
-                (Some(npx_path), Some(pkg))
-            } else {
-                (None, None)
+    let (provider_binary, npx_fallback_binary, npx_fallback_package) =
+        match intent_providers::discover::resolve_fallback_launch(
+            &provider,
+            explicit_path.as_deref(),
+        ) {
+            intent_providers::discover::ProviderLaunch::Local(binary) => {
+                (Some(binary.path), None, None)
             }
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
+            intent_providers::discover::ProviderLaunch::Managed { npx, package } => {
+                tracing::info!(provider_id, npx_path = ?npx, package,
+                    "provider binary not found; falling back to npx");
+                (None, Some(npx), Some(package))
+            }
+            intent_providers::discover::ProviderLaunch::Bare { .. } => (None, None, None),
+        };
 
     Ok(ResolvedSpawn {
         provider,
