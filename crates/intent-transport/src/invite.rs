@@ -481,7 +481,7 @@ fn with_host_identity(mut result: Value, what: &str, host: HostEnvironment) -> R
 
 /// Handle a classified `invite.inspect` on the `/invite` endpoint: params
 /// `{ inviteId, secret }` → the service result `{ workspaceId,
-/// workspaceTitle }` extended with the host's `hostname` / `prettyHostname`
+/// workspaceTitle, pinIdentity }` extended with the host's `hostname` / `prettyHostname`
 /// exactly like an `invite.challenge`, without issuing a nonce.
 pub(crate) async fn handle_inspect(
     req: InviteRequest,

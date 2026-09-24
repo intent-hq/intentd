@@ -256,7 +256,9 @@ async fn snippet_json(response: reqwest::Response) -> Result<Value> {
 ///
 /// [`IdentityProofError::NotProofSnippet`] when `snippet_id` names a snippet
 /// that is not an Intent proof snippet (nothing deleted);
-/// [`IdentityProofError::Unauthorized`] when the instance rejects the token;
+/// [`IdentityProofError::Unauthorized`] when the instance rejects the token
+/// (`401`); [`IdentityProofError::ScopeMissing`] when it refuses the delete
+/// (`403` — a token without the `api` scope, same as `create`);
 /// [`IdentityProofError::Unreachable`] on transport failure.
 pub async fn delete_proof_snippet(host: &GitlabHost, token: &str, snippet_id: &str) -> Result<()> {
     if !valid_snippet_id(snippet_id) {
@@ -287,10 +289,21 @@ pub async fn delete_proof_snippet(host: &GitlabHost, token: &str, snippet_id: &s
     let status = response.status();
     match status.as_u16() {
         404 => Ok(()),
-        401 | 403 => Err(IdentityProofError::Unauthorized(format!(
+        401 => Err(IdentityProofError::Unauthorized(format!(
             "gitlab rejected the token for {} ({status})",
             host.host()
         ))),
+        403 => {
+            let detail: Value = response.json().await.unwrap_or(Value::Null);
+            Err(IdentityProofError::ScopeMissing {
+                granted: detail
+                    .get("error")
+                    .or_else(|| detail.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("forbidden")
+                    .to_string(),
+            })
+        }
         _ if !status.is_success() => Err(api_error(host, "snippet delete", status)),
         _ => Ok(()),
     }
@@ -691,6 +704,42 @@ mod tests {
         let err = delete_proof_snippet(&host, "revoked", "5")
             .await
             .expect_err("rejected");
+        assert!(
+            matches!(err, IdentityProofError::Unauthorized(_)),
+            "{err:?}"
+        );
+    }
+
+    /// A token that can read the snippet (`read_api`) but lacks the `api`
+    /// scope gets `403` on the `DELETE`: that is `ScopeMissing` (the wire
+    /// `gitlab-scope-missing`), exactly like `create`, while `401` on the
+    /// `DELETE` stays `Unauthorized`.
+    #[tokio::test]
+    async fn delete_maps_401_and_403_onto_unauthorized_and_scope_missing() {
+        let (host, _) = spawn_mock(|line, bearer| match (line, bearer) {
+            ("GET /api/v4/snippets/7", Some("read-only" | "expiring")) => {
+                json_answer(200, &snippet_body(7, &[PROOF_FILE_NAME]))
+            }
+            ("DELETE /api/v4/snippets/7", Some("read-only")) => json_answer(
+                403,
+                &json!({ "error": "insufficient_scope", "error_description": "api" }),
+            ),
+            ("DELETE /api/v4/snippets/7", Some("expiring")) => {
+                json_answer(401, &json!({ "message": "401 Unauthorized" }))
+            }
+            _ => json_answer(500, &json!({ "message": format!("unexpected {line}") })),
+        })
+        .await;
+        let err = delete_proof_snippet(&host, "read-only", "7")
+            .await
+            .expect_err("scope missing");
+        assert!(
+            matches!(&err, IdentityProofError::ScopeMissing { granted } if granted == "insufficient_scope"),
+            "{err:?}"
+        );
+        let err = delete_proof_snippet(&host, "expiring", "7")
+            .await
+            .expect_err("rejected token");
         assert!(
             matches!(err, IdentityProofError::Unauthorized(_)),
             "{err:?}"

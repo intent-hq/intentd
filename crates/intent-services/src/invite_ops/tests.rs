@@ -1458,7 +1458,7 @@ async fn inspect_previews_an_open_invite_without_a_nonce() {
         .expect("inspect");
     assert_eq!(
         r,
-        json!({ "workspaceId": ws2.0, "workspaceTitle": "Second" }),
+        json!({ "workspaceId": ws2.0, "workspaceTitle": "Second", "pinIdentity": null }),
         "{r}"
     );
     assert_eq!(
@@ -1495,6 +1495,166 @@ async fn inspect_previews_an_open_invite_without_a_nonce() {
         .expect("revoke");
     let r = f.services.invite_inspect_op(&invite_id, &secret).await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
+}
+
+/// Both preview methods must expose the stored requirement, including legacy
+/// GitHub pins, without a configured forge or any guest credentials.
+async fn assert_preview_pin_identity(challenge: bool) {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let template = f
+        .store
+        .get_workspace_invite(&id_of(&created))
+        .await
+        .unwrap()
+        .unwrap();
+    for (name, pin, legacy, expected) in [
+        (
+            "gitlab",
+            Some(PrincipalIdentity {
+                provider: "gitlab".into(),
+                host: "gitlab.com".into(),
+                external_user_id: "4242".into(),
+            }),
+            None,
+            json!({"provider": "gitlab", "host": "gitlab.com", "externalUserId": "4242"}),
+        ),
+        (
+            "self-managed",
+            Some(PrincipalIdentity {
+                provider: "gitlab".into(),
+                host: "gitlab.example:8443".into(),
+                external_user_id: "4242".into(),
+            }),
+            None,
+            json!({"provider": "gitlab", "host": "gitlab.example:8443", "externalUserId": "4242"}),
+        ),
+        (
+            "github",
+            Some(PrincipalIdentity::github(4242)),
+            Some(4242),
+            json!({"provider": "github", "host": "github.com", "externalUserId": "4242"}),
+        ),
+        (
+            "legacy",
+            None,
+            Some(4242),
+            json!({"provider": "github", "host": "github.com", "externalUserId": "4242"}),
+        ),
+        ("unpinned", None, None, Value::Null),
+    ] {
+        let invite = WorkspaceInvite {
+            id: name.into(),
+            secret_hash: hash_secret(name),
+            pin_identity: pin,
+            pin_github_user_id: legacy,
+            ..template.clone()
+        };
+        f.store.insert_workspace_invite(&invite).await.unwrap();
+        if name == "legacy" {
+            // The current insert dual-writes the triple; reproduce an old row.
+            sqlx::query("UPDATE workspace_invite SET pin_identity_provider = NULL, pin_instance_host = NULL, pin_external_user_id = NULL WHERE id = ?")
+                .bind(&invite.id).execute(f.store.write_pool()).await.unwrap();
+            assert!(f
+                .store
+                .get_workspace_invite(&invite.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pin_identity
+                .is_none());
+        }
+        let secret = name;
+        let result = if challenge {
+            f.services.invite_challenge_op(&invite.id, secret).await
+        } else {
+            f.services.invite_inspect_op(&invite.id, secret).await
+        }
+        .expect("preview without a forge");
+        assert_eq!(
+            result.get("pinIdentity"),
+            Some(&expected),
+            "{name}: {result}"
+        );
+        assert_eq!(result["workspaceId"], json!(f.ws));
+        assert_eq!(result["workspaceTitle"], json!("WS"));
+        assert_eq!(
+            result.as_object().unwrap().len(),
+            if challenge { 5 } else { 3 }
+        );
+        if challenge {
+            assert!(result["nonce"].is_string());
+            assert!(result["nonceExpiresAt"].is_string());
+        }
+    }
+}
+
+#[tokio::test]
+async fn inspect_exposes_pin_identity_including_legacy_and_unpinned() {
+    assert_preview_pin_identity(false).await;
+}
+
+#[tokio::test]
+async fn challenge_exposes_pin_identity_including_legacy_and_unpinned() {
+    assert_preview_pin_identity(true).await;
+}
+
+#[tokio::test]
+async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let template = f
+        .store
+        .get_workspace_invite(&id_of(&created))
+        .await
+        .unwrap()
+        .unwrap();
+    for (state, kind) in [
+        ("missing", InviteErrorKind::NotFound),
+        ("bad-secret", InviteErrorKind::NotFound),
+        ("expired", InviteErrorKind::Expired),
+        ("revoked", InviteErrorKind::Revoked),
+        ("redeemed", InviteErrorKind::Redeemed),
+    ] {
+        let mut invite = WorkspaceInvite {
+            id: state.into(),
+            secret_hash: hash_secret(state),
+            pin_identity: Some(PrincipalIdentity {
+                provider: "gitlab".into(),
+                host: "private.example".into(),
+                external_user_id: "4242".into(),
+            }),
+            ..template.clone()
+        };
+        match state {
+            "expired" => invite.expires_at = "2000-01-01T00:00:00.000Z".into(),
+            "revoked" => invite.revoked_at = Some(now_iso()),
+            "redeemed" => invite.redeemed_at = Some(now_iso()),
+            _ => {}
+        }
+        if state != "missing" {
+            f.store.insert_workspace_invite(&invite).await.unwrap();
+        }
+        let presented = if state == "bad-secret" {
+            "wrong"
+        } else {
+            state
+        };
+        // The typed error contains only its kind, no preview payload or pin.
+        for result in [
+            f.services.invite_inspect_op(&invite.id, presented).await,
+            f.services.invite_challenge_op(&invite.id, presented).await,
+        ] {
+            assert_eq!(invite_kind(&result), kind, "{state}: {result:?}");
+        }
+    }
+    assert!(f.services.invite_nonces.lock().await.is_empty());
+    assert_eq!(
+        f.services.invite_nonce_permits.available_permits(),
+        MAX_OUTSTANDING_NONCES
+    );
 }
 
 /// `invite.accept` with the credential a prior join minted: the same

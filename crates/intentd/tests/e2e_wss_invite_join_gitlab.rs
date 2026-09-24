@@ -342,6 +342,8 @@ type Snippets = Arc<Mutex<Vec<(String, Value, String)>>>;
 /// here.
 struct MockForge {
     base_uri: String,
+    /// All connections to the mock, including anonymous requests.
+    requests: Arc<AtomicUsize>,
     /// When set, the GitLab snippet routes refuse anonymous reads (`401`),
     /// answering only a bearer the instance knows.
     private_snippets: Arc<AtomicBool>,
@@ -493,6 +495,8 @@ async fn spawn_mock_forge() -> MockForge {
         .await
         .expect("bind mock forge");
     let port = listener.local_addr().expect("mock addr").port();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let request_count = requests.clone();
     let private_snippets = Arc::new(AtomicBool::new(false));
     let snippet_server_error = Arc::new(AtomicBool::new(false));
     let github_user = GithubUser::new();
@@ -510,6 +514,7 @@ async fn spawn_mock_forge() -> MockForge {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            request_count.fetch_add(1, Ordering::SeqCst);
             let (private, snip_err, gh_user, snips, auth_reads) = (
                 private.clone(),
                 snip_err.clone(),
@@ -524,6 +529,7 @@ async fn spawn_mock_forge() -> MockForge {
     });
     MockForge {
         base_uri: format!("http://127.0.0.1:{port}"),
+        requests,
         private_snippets,
         snippet_server_error,
         github_user,
@@ -645,7 +651,7 @@ async fn serve_conn(
 
 /// A booted daemon reachable over WSS.
 struct Host {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     _daemon: Daemon,
     port: u16,
     cfg: Arc<ClientConfig>,
@@ -681,7 +687,7 @@ async fn boot(mock: &MockForge, credentials: &[(&str, &str)]) -> Host {
         .to_string();
     let cfg = client_config(&fingerprint);
     Host {
-        _dir: dir,
+        dir,
         _daemon: daemon,
         port,
         cfg,
@@ -801,6 +807,273 @@ async fn set_identity_provider(owner: &mut Ws, id: i64, value: Value) {
     )
     .await;
     assert!(v.get("error").is_none(), "settings.update: {v}");
+}
+
+fn preview_secret_hash(secret: &str) -> String {
+    use std::fmt::Write as _;
+    Sha256::digest(secret.as_bytes())
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+}
+
+/// Seed stored requirements directly: legacy rows cannot be minted by the
+/// current API, and previewing must work without any forge connection.
+fn preview_invite_row(
+    workspace_id: &str,
+    owner: &intent_core::PrincipalId,
+    id: &str,
+) -> intent_core::WorkspaceInvite {
+    intent_core::WorkspaceInvite {
+        id: id.into(),
+        workspace_id: intent_core::WorkspaceId(workspace_id.into()),
+        created_by_principal_id: owner.clone(),
+        secret_hash: preview_secret_hash(id),
+        secret: None,
+        pin_identity: None,
+        pin_github_user_id: None,
+        pin_login: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+        redeemed_at: None,
+        redeemed_by_principal_id: None,
+        revoked_at: None,
+        redemption_count: 0,
+    }
+}
+
+async fn assert_preview_pin_identity_over_wss(method: &str) {
+    let mock = spawn_mock_forge().await;
+    let host = boot(&mock, &[]).await;
+    let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
+    let ws_id = create_workspace(&mut owner, 1, "Preview requirements").await;
+    let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    let mut preview = connect_invite(host.port, host.cfg.clone()).await;
+    for (name, expected) in [
+        ("gitlab", gitlab_identity(GUEST_GL_ID)),
+        (
+            "self-managed",
+            json!({"provider": "gitlab", "host": "gitlab.example:8443", "externalUserId": "7777"}),
+        ),
+        ("github", github_identity(GUEST_GL_ID)),
+        ("legacy", github_identity(GUEST_GL_ID)),
+        ("unpinned", Value::Null),
+    ] {
+        let mut invite = preview_invite_row(&ws_id, &primary.id, name);
+        invite.pin_identity = serde_json::from_value(expected.clone()).unwrap();
+        store.insert_workspace_invite(&invite).await.unwrap();
+        if name == "legacy" {
+            sqlx::query("UPDATE workspace_invite SET pin_identity_provider = NULL, pin_instance_host = NULL, pin_external_user_id = NULL WHERE id = ?")
+                .bind(name).execute(store.write_pool()).await.unwrap();
+            let legacy = store.get_workspace_invite(name).await.unwrap().unwrap();
+            assert!(legacy.pin_identity.is_none());
+            assert_eq!(legacy.pin_github_user_id, Some(7777));
+        }
+        let v = admitted_rpc(
+            &mut preview,
+            10,
+            method,
+            json!({"inviteId": name, "secret": name}),
+        )
+        .await;
+        assert_eq!(v["id"], json!(10));
+        assert_eq!(v["jsonrpc"], json!("2.0"));
+        assert_eq!(v.as_object().unwrap().len(), 3, "envelope: {v}");
+        assert!(v.get("error").is_none(), "{method} {name}: {v}");
+        let r = &v["result"];
+        assert_eq!(
+            r.get("pinIdentity"),
+            Some(&expected),
+            "{method} {name}: {r}"
+        );
+        let mut expected_result = json!({
+            "workspaceId": ws_id, "workspaceTitle": "Preview requirements",
+            "hostname": r["hostname"], "prettyHostname": r["prettyHostname"],
+            "pinIdentity": expected,
+        });
+        assert!(r["hostname"].is_string(), "{r}");
+        assert!(
+            r["prettyHostname"].is_string() || r["prettyHostname"].is_null(),
+            "{r}"
+        );
+        if method == "invite.challenge" {
+            assert_eq!(r["nonce"].as_str().unwrap().len(), 43);
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(r["nonceExpiresAt"].as_str().unwrap()).is_ok()
+            );
+            expected_result["nonce"] = r["nonce"].clone();
+            expected_result["nonceExpiresAt"] = r["nonceExpiresAt"].clone();
+        }
+        assert_eq!(
+            *r, expected_result,
+            "exact response shape for {method} {name}"
+        );
+    }
+    assert_eq!(
+        mock.requests.load(Ordering::SeqCst),
+        0,
+        "preview never calls a forge"
+    );
+}
+
+#[tokio::test]
+async fn inspect_exposes_pin_identity_including_legacy_and_unpinned_over_wss() {
+    assert_preview_pin_identity_over_wss("invite.inspect").await;
+}
+
+#[tokio::test]
+async fn challenge_exposes_pin_identity_including_legacy_and_unpinned_over_wss() {
+    assert_preview_pin_identity_over_wss("invite.challenge").await;
+}
+
+#[tokio::test]
+async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_wss() {
+    use intent_core::InviteErrorKind;
+    let mock = spawn_mock_forge().await;
+    let host = boot(&mock, &[]).await;
+    let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
+    let ws_id = create_workspace(&mut owner, 1, "Private requirements").await;
+    let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    let mut preview = connect_invite(host.port, host.cfg.clone()).await;
+    for (state, kind) in [
+        ("missing", InviteErrorKind::NotFound),
+        ("bad-secret", InviteErrorKind::NotFound),
+        ("expired", InviteErrorKind::Expired),
+        ("revoked", InviteErrorKind::Revoked),
+        ("redeemed", InviteErrorKind::Redeemed),
+    ] {
+        let mut invite = preview_invite_row(&ws_id, &primary.id, state);
+        invite.pin_identity = Some(intent_core::PrincipalIdentity {
+            provider: "gitlab".into(),
+            host: "private.example".into(),
+            external_user_id: "7777".into(),
+        });
+        match state {
+            "expired" => invite.expires_at = "2000-01-01T00:00:00.000Z".into(),
+            "revoked" => invite.revoked_at = Some(chrono::Utc::now().to_rfc3339()),
+            "redeemed" => invite.redeemed_at = Some(chrono::Utc::now().to_rfc3339()),
+            _ => {}
+        }
+        if state != "missing" {
+            store.insert_workspace_invite(&invite).await.unwrap();
+        }
+        for method in ["invite.inspect", "invite.challenge"] {
+            let secret = if state == "bad-secret" {
+                "wrong"
+            } else {
+                state
+            };
+            let v = admitted_rpc(
+                &mut preview,
+                20,
+                method,
+                json!({"inviteId": state, "secret": secret}),
+            )
+            .await;
+            assert_eq!(
+                v,
+                json!({"jsonrpc": "2.0", "id": 20, "error": {
+                    "code": -32602, "message": kind.message(), "data": {"code": kind.as_str()},
+                }}),
+                "{method} {state}: errors disclose no pin or preview payload"
+            );
+        }
+    }
+    assert_eq!(
+        mock.requests.load(Ordering::SeqCst),
+        0,
+        "invalid preview never calls a forge"
+    );
+}
+
+#[tokio::test]
+async fn preview_pin_identity_keeps_provider_host_and_account_enforcement_over_wss() {
+    let mock = spawn_mock_forge().await;
+    let host = boot(&mock, &[]).await;
+    let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
+    let ws_id = create_workspace(&mut owner, 1, "Pin enforcement").await;
+    let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    let mut invite = preview_invite_row(&ws_id, &primary.id, "pinned");
+    invite.pin_identity = serde_json::from_value(gitlab_identity(GUEST_GL_ID)).unwrap();
+    store.insert_workspace_invite(&invite).await.unwrap();
+    let mut guest_ws = connect_invite(host.port, host.cfg.clone()).await;
+    let preview = admitted_rpc(
+        &mut guest_ws,
+        2,
+        "invite.inspect",
+        json!({"inviteId": "pinned", "secret": "pinned"}),
+    )
+    .await;
+    assert_eq!(
+        preview["result"]["pinIdentity"],
+        gitlab_identity(GUEST_GL_ID)
+    );
+    for (name, identity) in [
+        ("wrong-provider", github_identity(GUEST_GL_ID)),
+        (
+            "wrong-host",
+            json!({"provider": "gitlab", "host": "other.example", "externalUserId": "7777"}),
+        ),
+        ("wrong-account", gitlab_identity(INTRUDER_GL_ID)),
+        ("matching", gitlab_identity(GUEST_GL_ID)),
+    ] {
+        let principal = intent_core::Principal {
+            id: intent_core::PrincipalId::new(),
+            identity: serde_json::from_value(identity).unwrap(),
+            github_user_id: None,
+            login: Some(GUEST_GL_LOGIN.into()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.upsert_principal(&principal).await.unwrap();
+        store
+            .insert_principal_credential(&principal.id, &preview_secret_hash(name))
+            .await
+            .unwrap();
+        let result = admitted_rpc(
+            &mut guest_ws,
+            3,
+            "invite.accept",
+            json!({
+                "inviteId": "pinned", "secret": "pinned", "credential": name,
+            }),
+        )
+        .await;
+        if name == "matching" {
+            assert_eq!(result["result"]["status"], json!("authorized"), "{result}");
+            assert_eq!(result["result"]["principalId"], json!(principal.id));
+        } else {
+            assert_eq!(result["error"]["code"], json!(-32602), "{name}: {result}");
+            assert_eq!(
+                result["error"]["data"],
+                json!({"code": "invite-pin-mismatch"}),
+                "{name}: {result}"
+            );
+            assert!(result.get("result").is_none());
+            assert!(store
+                .get_workspace_invite("pinned")
+                .await
+                .unwrap()
+                .unwrap()
+                .redeemed_at
+                .is_none());
+        }
+    }
+    assert_eq!(mock.requests.load(Ordering::SeqCst), 0);
 }
 
 /// (a) + (c): a GitLab-only host mints invites and admits a GitLab guest;

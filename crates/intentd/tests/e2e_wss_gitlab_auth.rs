@@ -195,6 +195,9 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> Ws {
 
 /// One WSS JSON-RPC round-trip returning the full envelope (so callers can
 /// assert on `result` OR `error`). Out-of-band notifications are skipped.
+/// The JSON-RPC 2.0 response envelope (PROTOCOL §1) is asserted on the
+/// matched frame: `jsonrpc == "2.0"`, the echoed `id`, no `method` member,
+/// and exactly one of `result` / `error`.
 async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
@@ -208,6 +211,19 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
+                    assert_eq!(
+                        v["jsonrpc"],
+                        json!("2.0"),
+                        "{method}: envelope jsonrpc: {v}"
+                    );
+                    assert!(
+                        v.get("method").is_none(),
+                        "{method}: a response carries no method member: {v}"
+                    );
+                    assert!(
+                        v.get("result").is_some() ^ v.get("error").is_some(),
+                        "{method}: envelope must carry exactly one of result/error: {v}"
+                    );
                     return v;
                 }
             }
@@ -1307,6 +1323,142 @@ async fn gitlab_token_refresh_and_expiry_over_wss() {
     assert_eq!(v["result"], json!({ "user": null }));
 }
 
+/// Regression (intentd#2037 review): the identity-proof token read runs the
+/// same proactive refresh as the auth-status probe. A device grant whose
+/// access token is near expiry is rotated by `sourceControl.identityProof.create`
+/// itself — no other RPC in between — and the snippet is made with the
+/// rotated token; a grant whose refresh the instance refuses clears the
+/// connection (`expired`) and the create is `gitlab-not-connected` with
+/// nothing published; a PAT is used as is, never refreshed.
+#[tokio::test]
+async fn gitlab_identity_proof_refreshes_a_near_expiry_device_grant_over_wss() {
+    let mock = spawn_mock_gitlab().await;
+    mock.flags.short_lived.store(true, Ordering::SeqCst);
+    let h = boot(&mock).await;
+    let mut sub = subscriber(&h).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let gitlab = json!({ "provider": "gitlab" });
+    let create = json!({ "provider": "gitlab", "nonce": "n-refresh", "hostLabel": "h" });
+
+    // 1. A near-expiry device grant; nothing has probed it yet.
+    let v = wss_rpc(&mut rpc, 10, "sourceControl.connect", gitlab.clone()).await;
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE), "{v}");
+    mock.flags.authorize.store(true, Ordering::SeqCst);
+    await_auth_changed(&mut sub, "authorized", 30).await;
+    assert_eq!(
+        read_secrets(&h.secrets_file)["sourceControl.gitlab.token"],
+        json!(ACCESS_TOKEN)
+    );
+    assert_eq!(mock.flags.refresh_exchanges.load(Ordering::SeqCst), 0);
+
+    // 2. The proof create rotates the pair first and signs with the rotated
+    // token.
+    let v = wss_rpc(
+        &mut rpc,
+        11,
+        "sourceControl.identityProof.create",
+        create.clone(),
+    )
+    .await;
+    assert_eq!(v["result"]["proofId"], json!("1"), "{v}");
+    assert_eq!(v["result"]["login"], json!("glab-octocat"), "{v}");
+    assert_eq!(mock.flags.refresh_exchanges.load(Ordering::SeqCst), 1);
+    {
+        let snippets = mock.flags.snippets.lock().unwrap();
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(
+            snippets[0].1, ROTATED_ACCESS_TOKEN,
+            "made with the rotated token"
+        );
+    }
+    let secrets = read_secrets(&h.secrets_file);
+    assert_eq!(
+        secrets["sourceControl.gitlab.token"],
+        json!(ROTATED_ACCESS_TOKEN),
+        "rotated access token persisted: {secrets}"
+    );
+    assert_eq!(
+        secrets["sourceControl.gitlab.refreshToken"],
+        json!(ROTATED_REFRESH_TOKEN)
+    );
+
+    // The rotated grant is not near expiry: delete needs no refresh.
+    let v = wss_rpc(
+        &mut rpc,
+        12,
+        "sourceControl.identityProof.delete",
+        json!({ "provider": "gitlab", "proofId": "1" }),
+    )
+    .await;
+    assert_eq!(v["result"], json!({ "ok": true }), "{v}");
+    assert_eq!(mock.flags.refresh_exchanges.load(Ordering::SeqCst), 1);
+    assert!(mock.flags.snippets.lock().unwrap().is_empty());
+
+    // 3. A fresh near-expiry grant whose refresh the instance refuses (the
+    // mock rotates exactly once): the create clears the connection and is
+    // `gitlab-not-connected`; nothing is published.
+    let v = wss_rpc(&mut rpc, 20, "sourceControl.revoke", gitlab.clone()).await;
+    assert!(v.get("error").is_none(), "{v}");
+    await_auth_changed(&mut sub, "revoked", 15).await;
+    let v = wss_rpc(&mut rpc, 21, "sourceControl.connect", gitlab.clone()).await;
+    assert_eq!(v["result"]["userCode"], json!(USER_CODE), "{v}");
+    await_auth_changed(&mut sub, "authorized", 30).await;
+    assert_eq!(
+        read_secrets(&h.secrets_file)["sourceControl.gitlab.refreshToken"],
+        json!(REFRESH_TOKEN)
+    );
+    let v = wss_rpc(
+        &mut rpc,
+        22,
+        "sourceControl.identityProof.create",
+        create.clone(),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32603), "envelope: {v}");
+    assert_eq!(
+        v["error"]["data"],
+        json!({ "code": "gitlab-not-connected" }),
+        "envelope: {v}"
+    );
+    let ev = await_auth_changed(&mut sub, "expired", 15).await;
+    assert_eq!(
+        ev,
+        json!({ "provider": "gitlab", "host": HOST, "status": "expired" })
+    );
+    assert_eq!(mock.flags.refresh_exchanges.load(Ordering::SeqCst), 2);
+    assert!(mock.flags.snippets.lock().unwrap().is_empty());
+    let secrets = read_secrets(&h.secrets_file);
+    for account in [
+        "sourceControl.gitlab.token",
+        "sourceControl.gitlab.refreshToken",
+        "sourceControl.gitlab.tokenExpiresAt",
+    ] {
+        assert!(
+            secrets.get(account).is_none(),
+            "{account} cleared: {secrets}"
+        );
+    }
+
+    // 4. A PAT is returned as is: no refresh exchange, signed with the PAT.
+    let v = wss_rpc(
+        &mut rpc,
+        30,
+        "sourceControl.connect",
+        json!({ "provider": "gitlab", "method": "pat", "token": PAT_TOKEN }),
+    )
+    .await;
+    assert_eq!(v["result"], json!({ "ok": true, "method": "pat" }), "{v}");
+    let v = wss_rpc(&mut rpc, 31, "sourceControl.identityProof.create", create).await;
+    assert_eq!(v["result"]["login"], json!("glab-octocat"), "{v}");
+    assert_eq!(mock.flags.refresh_exchanges.load(Ordering::SeqCst), 2);
+    {
+        let snippets = mock.flags.snippets.lock().unwrap();
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].1, PAT_TOKEN, "made with the pat");
+    }
+    assert!(!v.to_string().contains(PAT_TOKEN), "🔒 {v}");
+}
+
 /// Contract decision (PR Context, 2026-09-20): `sourceControl.revoke` is
 /// idempotent and host-scoped. With host A bound, `revoke(gitlab, host B)`
 /// is a successful no-op — A's token stays, no `auth-changed` is emitted for
@@ -1970,6 +2122,17 @@ enum Action {
     Probe(&'static str, bool),
     /// `settings.update sourceControl.gitlab.host` (not gated: applies now).
     Rebind(&'static str),
+    /// `settings.update sourceControl.gitlab.token = PAT_TOKEN` (gated: the
+    /// PAT and its sibling cleanup land after the holder, never under it).
+    SettingsPat,
+    /// `settings.reset sourceControl.gitlab.token` (gated: the token and its
+    /// siblings are cleared after the holder committed, never under it).
+    SettingsReset,
+    /// `settings.get` + `settings.update` of `git.autoCommit` (not gated, and
+    /// not held up by a gated settings write queued ahead of it: the credential
+    /// gate is taken BEFORE the revision gate, so a parked holder only delays
+    /// GitLab token batches, never unrelated settings traffic).
+    UnrelatedSettings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2019,6 +2182,36 @@ static INTERLEAVINGS: &[Case] = &[
         stored: Stored::Pat,
         bound: OTHER,
         events: &[AUTHORIZED_HOST, AUTHORIZED_OTHER],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ settings pat: completion commits, the settings PAT replaces it",
+        holder: Holder::Authorize,
+        actions: &[Action::SettingsPat],
+        stored: Stored::Pat,
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ settings reset: completion commits, the reset clears the pair",
+        holder: Holder::Authorize,
+        actions: &[Action::SettingsReset],
+        stored: Stored::Nothing,
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 0,
+    },
+    Case {
+        name: "authorize ∥ settings pat + unrelated settings: unrelated traffic is not held up",
+        holder: Holder::Authorize,
+        actions: &[Action::SettingsPat, Action::UnrelatedSettings],
+        stored: Stored::Pat,
+        bound: HOST,
+        events: &[AUTHORIZED_HOST],
         flow_superseded: false,
         refreshes: 0,
     },
@@ -2090,6 +2283,36 @@ static INTERLEAVINGS: &[Case] = &[
         stored: Stored::Pat,
         bound: HOST,
         events: &[AUTHORIZED_HOST],
+        flow_superseded: false,
+        refreshes: 1,
+    },
+    Case {
+        name: "refresh ∥ settings pat: rotation commits, the settings PAT replaces it",
+        holder: Holder::Refresh,
+        actions: &[Action::SettingsPat],
+        stored: Stored::Pat,
+        bound: HOST,
+        events: &[],
+        flow_superseded: false,
+        refreshes: 1,
+    },
+    Case {
+        name: "refresh ∥ settings reset: rotation commits, the reset clears the pair",
+        holder: Holder::Refresh,
+        actions: &[Action::SettingsReset],
+        stored: Stored::Nothing,
+        bound: HOST,
+        events: &[],
+        flow_superseded: false,
+        refreshes: 1,
+    },
+    Case {
+        name: "refresh ∥ settings reset + unrelated settings: unrelated traffic is not held up",
+        holder: Holder::Refresh,
+        actions: &[Action::SettingsReset, Action::UnrelatedSettings],
+        stored: Stored::Nothing,
+        bound: HOST,
+        events: &[],
         flow_superseded: false,
         refreshes: 1,
     },
@@ -2327,6 +2550,73 @@ async fn run_interleaving(case: &'static Case) {
                     tokio::spawn(async move { wss_rpc(&mut conn, id, method, params).await }),
                 ));
             }
+            Action::SettingsPat | Action::SettingsReset => {
+                let (method, params) = match *action {
+                    Action::SettingsPat => (
+                        "settings.update",
+                        json!({ "changes": [{ "path": "sourceControl.gitlab.token", "value": PAT_TOKEN }] }),
+                    ),
+                    _ => (
+                        "settings.reset",
+                        json!({ "path": "sourceControl.gitlab.token" }),
+                    ),
+                };
+                let mut conn = connect_ws(h.port, h.cfg.clone()).await;
+                let mut handle =
+                    tokio::spawn(async move { wss_rpc(&mut conn, id, method, params).await });
+                // The settings write queues behind the holder: it must not
+                // answer while the holder is parked (a bounded wait in the
+                // safe direction — the gate never lets it through early), and
+                // the PAT must not be in the secrets file.
+                assert!(
+                    timeout(Duration::from_millis(750), &mut handle)
+                        .await
+                        .is_err(),
+                    "{name}: {action:?} landed while the gate was held"
+                );
+                assert_ne!(
+                    read_secrets(&h.secrets_file)["sourceControl.gitlab.token"],
+                    json!(PAT_TOKEN),
+                    "{name}: settings PAT stored under a held gate"
+                );
+                queued.push((*action, handle));
+            }
+            Action::UnrelatedSettings => {
+                // Issued while the holder is parked AND a gated settings
+                // write is queued behind it: neither may hold up unrelated
+                // settings traffic. A bounded wait in the unsafe direction is
+                // the point here — under the inverted lock order the queued
+                // write would sit on the revision gate while waiting for the
+                // credential gate, and every settings.get / update would hang
+                // behind it.
+                let unrelated = async {
+                    let v = wss_rpc(
+                        &mut rpc,
+                        id,
+                        "settings.get",
+                        json!({ "path": "git.autoCommit" }),
+                    )
+                    .await;
+                    assert!(v.get("error").is_none(), "{name}: unrelated get: {v}");
+                    let v = wss_rpc(
+                        &mut rpc,
+                        id + 100,
+                        "settings.update",
+                        json!({ "changes": [{ "path": "git.autoCommit", "value": true }] }),
+                    )
+                    .await;
+                    assert!(v.get("error").is_none(), "{name}: unrelated update: {v}");
+                };
+                assert!(
+                    timeout(Duration::from_secs(5), unrelated).await.is_ok(),
+                    "{name}: unrelated settings traffic waited behind the credential gate"
+                );
+                assert_ne!(
+                    read_secrets(&h.secrets_file)["sourceControl.gitlab.token"],
+                    json!(PAT_TOKEN),
+                    "{name}: settings PAT stored under a held gate"
+                );
+            }
         }
     }
 
@@ -2360,7 +2650,12 @@ async fn run_interleaving(case: &'static Case) {
                     "{name}: {action:?}: {v}"
                 );
             }
-            Action::Cancel(..) | Action::Rebind(_) => unreachable!(),
+            Action::SettingsPat | Action::SettingsReset => {
+                assert!(v.get("error").is_none(), "{name}: {action:?}: {v}");
+            }
+            Action::Cancel(..) | Action::Rebind(_) | Action::UnrelatedSettings => {
+                unreachable!()
+            }
         }
     }
     if let Some(handle) = held_probe {
@@ -2440,7 +2735,8 @@ async fn run_interleaving(case: &'static Case) {
 }
 
 /// Every credential mutation (PAT connect, device completion, cancelAuth,
-/// revoke, refresh rotation) takes the credential gate, re-reads the host
+/// revoke, refresh rotation, a `settings.update` / `settings.reset` of the
+/// token — intentd#2042 review) takes the credential gate, re-reads the host
 /// binding and the generation it was started for (slot residency, the stored
 /// token) inside the hold, acts only while that still holds, and commits the
 /// store write, the slot / binding update and the event in the same hold.

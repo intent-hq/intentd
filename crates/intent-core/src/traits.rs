@@ -4897,8 +4897,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
     /// endpoint): validate `(invite_id, secret)` — the
     /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
-    /// revoked / (pinned and) redeemed link — and answer `{ workspaceId, workspaceTitle }`
-    /// without touching GitHub or issuing a nonce. The `/invite` transport
+    /// revoked / (pinned and) redeemed link — and answer
+    /// `{ workspaceId, workspaceTitle, pinIdentity }` without contacting a
+    /// forge or issuing a nonce. `pinIdentity` is the required
+    /// `{ provider, host, externalUserId }` triple (including legacy GitHub
+    /// pins), or explicit `null` for an unpinned link; older daemons omit it.
+    /// Errors disclose no pin. The `/invite` transport
     /// extends the result with the host's `hostname` / `prettyHostname`
     /// (same sources as `system.status`), so a client can show the consent
     /// prompt before it decides between `invite.accept` and
@@ -4947,10 +4951,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// `invite.challenge` (gist identity-proof join, unauthenticated
     /// `/invite` endpoint): validate `(invite_id, secret)` exactly like
     /// [`Self::invite_inspect`] and issue a single-use nonce bound to the
-    /// invite → `{ workspaceId, workspaceTitle, nonce, nonceExpiresAt }`.
+    /// invite → `{ workspaceId, workspaceTitle, pinIdentity, nonce, nonceExpiresAt }`.
+    /// `pinIdentity` has the same triple-or-null semantics as `inspect`.
     /// The nonce is 32 random bytes (base64url, unpadded), lives 10 minutes
     /// and is consumed by the first [`Self::invite_prove`] that names it.
-    /// GitHub is never contacted. The `/invite` transport extends the result
+    /// No forge is contacted. The `/invite` transport extends the result
     /// with the host's `hostname` / `prettyHostname`.
     fn invite_challenge(
         &self,

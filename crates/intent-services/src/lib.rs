@@ -16344,6 +16344,19 @@ impl Services {
         }))
     }
 
+    /// Whether a `settings.update` batch writes the GitLab credential
+    /// ([`intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT`]), i.e. must
+    /// run under [`Self::gitlab_credential_gate`]. Placeholder entries count:
+    /// the gate is cheap and the apply decides the no-op.
+    fn batch_touches_gitlab_credential(changes: &serde_json::Value) -> bool {
+        changes.as_array().is_some_and(|entries| {
+            entries.iter().any(|e| {
+                e.get("path").and_then(|v| v.as_str())
+                    == Some(intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
+            })
+        })
+    }
+
     /// Default-model re-resolution on a default-provider switch
     /// (monorepo#3177). When a `settings.update` batch writes
     /// `model.defaultProvider` to a registered provider that differs from
@@ -16487,6 +16500,23 @@ impl WorkspaceApi for Services {
                 Registry,
             }
             Self::require_administrator("settings.update")?;
+            // A GitLab credential write is serialized with the credential
+            // mutations that run under the credential gate (auth-status
+            // probe refresh, identity-proof refresh, device completion): an
+            // in-flight refresh must not re-store the old device grant after
+            // the PAT and its sibling cleanup landed. Lock order is
+            // credential gate → revision gate: the credential gate is taken
+            // BEFORE the revision gate so a slow gate holder (a secret-store
+            // read under the gate has no timeout) only delays GitLab token
+            // batches, never every settings.get / getAll / update / reset.
+            // No credential-gate holder takes the revision gate. The
+            // default-model injection below never adds a credential path, so
+            // inspecting the caller's batch here is sufficient.
+            let _credential_guard = if Self::batch_touches_gitlab_credential(&changes) {
+                Some(self.gitlab_credential_gate.lock().await)
+            } else {
+                None
+            };
             let _revision_guard = self.settings_revision_gate.write().await;
             // A default-provider switch re-resolves `model.default` for the
             // new provider (monorepo#3177). Appended BEFORE the old-value
@@ -16529,22 +16559,30 @@ impl WorkspaceApi for Services {
                             if def.sensitive {
                                 // Sensitive setting: capture from secrets store.
                                 // Fail closed: timeout/backing-error -> abort before applying anything.
-                                match self.secrets.load(path).await {
-                                    Ok(Some(secret_val)) => {
-                                        old.push((
-                                            path.to_string(),
-                                            Some(secret_val),
-                                            OldStore::Secret,
-                                        ));
-                                    }
-                                    Ok(None) => {
-                                        // Confirmed absent; mark for deletion on rollback.
-                                        old.push((path.to_string(), None, OldStore::Secret));
-                                    }
-                                    Err(e) => {
-                                        return Err(Error::Internal(format!(
-                                            "settings.update: failed to read secret {path} during snapshot capture: {e}"
-                                        )));
+                                // The forge-token siblings the apply clears
+                                // are captured too, so a rollback restores
+                                // the credential with its grant metadata.
+                                let mut secret_paths = vec![path];
+                                secret_paths
+                                    .extend(crate::settings::forge_token_secret_siblings(path));
+                                for path in secret_paths {
+                                    match self.secrets.load(path).await {
+                                        Ok(Some(secret_val)) => {
+                                            old.push((
+                                                path.to_string(),
+                                                Some(secret_val),
+                                                OldStore::Secret,
+                                            ));
+                                        }
+                                        Ok(None) => {
+                                            // Confirmed absent; mark for deletion on rollback.
+                                            old.push((path.to_string(), None, OldStore::Secret));
+                                        }
+                                        Err(e) => {
+                                            return Err(Error::Internal(format!(
+                                                "settings.update: failed to read secret {path} during snapshot capture: {e}"
+                                            )));
+                                        }
                                     }
                                 }
                             } else if let Some(reg) =
@@ -16768,6 +16806,15 @@ impl WorkspaceApi for Services {
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("settings.reset")?;
+            // Same serialization and lock order as `settings.update`
+            // (credential gate → revision gate): a GitLab credential reset
+            // must not race an in-flight refresh under the gate, and waiting
+            // on that gate must not hold up unrelated settings traffic.
+            let _credential_guard = if path == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT {
+                Some(self.gitlab_credential_gate.lock().await)
+            } else {
+                None
+            };
             let _revision_guard = self.settings_revision_gate.write().await;
             let (result, changed) = self.settings_service().reset_with_change(&path).await?;
             let revision = if changed {

@@ -762,6 +762,7 @@ impl Services {
         Ok(json!({
             "workspaceId": invite.workspace_id,
             "workspaceTitle": ws.title,
+            "pinIdentity": invite.pin_identity_key(),
         }))
     }
 
@@ -864,6 +865,7 @@ impl Services {
         Ok(json!({
             "workspaceId": invite.workspace_id,
             "workspaceTitle": ws.title,
+            "pinIdentity": invite.pin_identity_key(),
             "nonce": nonce,
             "nonceExpiresAt": nonce_expires_at,
         }))
