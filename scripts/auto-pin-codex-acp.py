@@ -7,6 +7,7 @@ index, and local branches are untouched. Normal PR CI tests the proposed pin.
 """
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -83,12 +84,19 @@ def title(target):
     return f"fix: bump Codex ACP fallback to v{target}"
 
 
-def message(current, target):
+def message(current, target, previous_metadata_hash=None):
     return (
         f"{title(target)}\n\n"
         f"Managed Codex ACP pin: {current} -> {target}.\n"
         "Auto-pin-Codex-ACP: v1\n"
-    )
+    ) + (f"Previous-PR-Metadata-SHA256: {previous_metadata_hash}\n"
+         if previous_metadata_hash else "")
+
+
+def pr_metadata_hash(pr):
+    return hashlib.sha256(
+        json.dumps([pr["number"], pr["title"], pr["body"]]).encode()
+    ).hexdigest()
 
 
 def body(current, target):
@@ -165,6 +173,9 @@ def inspect_branch(head, base):
     git("merge-base", "--is-ancestor", parent, base)
     before, after = config_at(parent), config_at(head)
     current, target = read_pin(before), read_pin(after)
+    commit_message = git("show", "-s", "--format=%B", head).strip()
+    receipt = re.search(r"\nPrevious-PR-Metadata-SHA256: ([0-9a-f]{64})$", commit_message)
+    previous_metadata_hash = receipt[1] if receipt else None
     identity = git("show", "-s", "--format=%an%n%ae%n%cn%n%ce", head).splitlines()
     expected_identity = [BOT_NAME, BOT_EMAIL, BOT_NAME, BOT_EMAIL]
     if (
@@ -175,13 +186,13 @@ def inspect_branch(head, base):
         or git("ls-tree", parent, CONFIG).split()[0]
         != git("ls-tree", head, CONFIG).split()[0]
         or identity != expected_identity
-        or git("show", "-s", "--format=%B", head).strip() != message(current, target).strip()
+        or commit_message != message(current, target, previous_metadata_hash).strip()
     ):
         raise Refusal("Rolling branch has unexpected edits; preserving them for human review.")
-    return current, target
+    return current, target, previous_metadata_hash
 
 
-def make_commit(base, content, current, target):
+def make_commit(base, content, current, target, previous_metadata_hash=None):
     # A private index keeps staging and the caller's working tree untouched.
     with tempfile.TemporaryDirectory(prefix="codex-acp-pin-") as directory:
         env = os.environ | {"GIT_INDEX_FILE": str(Path(directory) / "index")}
@@ -195,7 +206,7 @@ def make_commit(base, content, current, target):
             "GIT_AUTHOR_EMAIL": BOT_EMAIL, "GIT_COMMITTER_EMAIL": BOT_EMAIL,
         }
         return git("-c", "commit.gpgsign=false", "commit-tree", tree, "-p", base,
-                   input=message(current, target), env=env).strip()
+                   input=message(current, target, previous_metadata_hash), env=env).strip()
 
 
 def main():
@@ -232,21 +243,33 @@ def main():
         print("Rolling PR has hold-release; leaving it unchanged.")
         return
     head = branch_head()
-    previous, proposed = inspect_branch(head, base) if head else (current, None)
+    previous, proposed, recorded_metadata_hash = (
+        inspect_branch(head, base) if head else (current, None, None)
+    )
+    metadata_matches = pr is not None and (
+        pr["title"] == title(proposed) and pr["body"] == body(previous, proposed)
+    )
+    # A push may have succeeded before gh pr edit failed. The new bot commit
+    # records the exact generated metadata verified before that push. Accept
+    # only that recorded state, not arbitrary older/generated-looking text.
+    recover_metadata = pr is not None and recorded_metadata_hash == pr_metadata_hash(pr)
     if pr and (
         not head or pr["user"]["login"] != viewer or pr["head"]["sha"] != head
-        or pr["title"] != title(proposed) or pr["body"] != body(previous, proposed)
+        or not (metadata_matches or recover_metadata)
         or pr["draft"]
     ):
         raise Refusal("Rolling PR has unexpected ownership or edits; preserving it.")
     if proposed and version(proposed) > version(target):
         print(f"Rolling branch already proposes newer version {proposed}; nothing to do.")
         return
-    if proposed == target and pr:
+    if proposed == target and pr and metadata_matches:
         print(f"Rolling PR already proposes {target}; no commit, push, or PR edit needed.")
         return
     if args.dry_run:
-        print(f"dry-run: would propose {current} -> {target} on {BRANCH}; no publication.")
+        if proposed == target and recover_metadata:
+            print(f"dry-run: would repair PR metadata for {target}; no publication.")
+        else:
+            print(f"dry-run: would propose {current} -> {target} on {BRANCH}; no publication.")
         return
 
     # Re-read metadata and the remote refs before creating or publishing a commit.
@@ -261,7 +284,9 @@ def main():
     if branch_head() != head:
         raise Refusal("Rolling branch changed during this run; preserving concurrent edits.")
 
-    commit = head if proposed == target else make_commit(base, content, current, target)
+    commit = head if proposed == target else make_commit(
+        base, content, current, target, pr_metadata_hash(pr) if pr else None,
+    )
     if commit != head:
         git("push", f"--force-with-lease={REF}:{head}", "origin", f"{commit}:{REF}")
     with tempfile.TemporaryDirectory(prefix="codex-acp-pr-") as directory:

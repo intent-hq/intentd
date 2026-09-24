@@ -439,6 +439,85 @@ class PinAutomationTests(unittest.TestCase):
         self.assertFalse(any("commit-tree" in call or call[:2] == ["git", "push"]
                              for call in self.state["calls"]))
 
+    def test_failed_existing_pr_edit_recovers_without_commit_or_push(self):
+        self.invoke()
+        previous_head = self.head()
+        self.state["manifest"]["version"] = "1.14.0"
+        self.state["pr_write_error"] = True
+        self.invoke(ok=False)
+        pushed_head = self.head()
+        self.assertNotEqual(pushed_head, previous_head)
+        self.assertIn("v1.13.1", self.state["pr"]["title"])
+
+        # A later workflow run starts in a fresh clone, without local recovery
+        # state or the previous branch's now-unreachable commit.
+        self.repo = self.directory / "retry-checkout"
+        subprocess.run([REAL_GIT, "clone", "-q", "--no-local", "--branch", "main",
+                        str(self.remote), str(self.repo)], env=self.env, check=True)
+        self.git("remote", "set-url", "origin", ORIGIN)
+        self.git("config", f"url.{self.remote}.insteadOf", ORIGIN)
+        self.clear_calls()
+        self.assertIn("would repair PR metadata", self.invoke("--dry-run"))
+        self.assert_no_publication()
+        self.clear_calls()
+        self.invoke(ok=False)
+        self.assertEqual(self.head(), pushed_head)
+        self.assert_no_publication()
+        self.clear_calls()
+        del self.state["pr_write_error"]
+        self.invoke()
+        self.assertEqual(self.head(), pushed_head)
+        self.assertEqual(self.state["writes"], ["edit"])
+        self.assertIn("v1.14.0", self.state["pr"]["title"])
+        self.assertIn("releases/tag/v1.14.0", self.state["pr"]["body"])
+        self.assertFalse(any("commit-tree" in call or call[:2] == ["git", "push"]
+                             for call in self.state["calls"]))
+
+        self.clear_calls()
+        self.invoke()
+        self.assertEqual(self.head(), pushed_head)
+        self.assert_no_publication()
+
+    def test_recovery_preserves_human_edits_to_stale_metadata(self):
+        self.invoke()
+        self.state["manifest"]["version"] = "1.14.0"
+        self.state["pr_write_error"] = True
+        self.invoke(ok=False)
+        pushed_head = self.head()
+        stale = json.loads(json.dumps(self.state["pr"]))
+        del self.state["pr_write_error"]
+        for field, value in (("title", stale["title"] + " (human edit)"),
+                             ("body", stale["body"] + "Human review notes\n"),
+                             ("number", 99), ("user", {"login": "someone-else"}),
+                             ("draft", True), ("labels", [{"name": "hold-release"}])):
+            with self.subTest(field=field):
+                self.clear_calls()
+                self.state["pr"] = {**stale, field: value}
+                self.invoke(ok=field == "labels")
+                self.assertEqual(self.head(), pushed_head)
+                self.assertEqual(self.state["pr"][field], value)
+                self.assert_no_publication()
+
+    def test_recovery_rejects_unrecorded_generated_older_metadata(self):
+        self.invoke()
+        older_metadata = json.loads(json.dumps(self.state["pr"]))
+        self.state["manifest"]["version"] = "1.14.0"
+        self.invoke()
+        self.state["manifest"]["version"] = "1.15.0"
+        self.state["pr_write_error"] = True
+        self.invoke(ok=False)
+        recorded_metadata = json.loads(json.dumps(self.state["pr"]))
+        del self.state["pr_write_error"]
+        self.state["pr"] = older_metadata
+        self.clear_calls()
+        self.invoke(ok=False)
+        self.assert_no_publication()
+        # Positive control: only the immediately recorded generated state
+        # remains eligible for automatic repair on this branch commit.
+        self.state["pr"] = recorded_metadata
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["edit"])
+
     def test_failed_push_never_creates_a_pr(self):
         self.state["push_error"] = True
         self.invoke(ok=False)
