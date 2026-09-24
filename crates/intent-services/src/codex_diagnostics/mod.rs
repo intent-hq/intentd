@@ -1,5 +1,5 @@
-//! Bounded, local Codex diagnostics. Selection comes from production discovery
-//! and ACP spawn policy; no npm process or model catalog is invoked here.
+//! Bounded Codex diagnostics. Selection comes from production discovery and ACP
+//! spawn policy. Only the explicit `fresh_catalogs` API invokes live catalogs.
 //!
 //! `CodexLaunch::discover` snapshots the selected launch. `inspect_local` is
 //! suitable for ordinary doctor output. An opt-in caller that establishes the
@@ -18,7 +18,14 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+mod catalog;
+mod catalog_io;
 pub(crate) mod process;
+
+pub use catalog::{
+    Catalog, CatalogFailure, CatalogModel, CatalogOutcome, CatalogSource, CodexCatalogReport,
+    ModelObservation,
+};
 
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_LIMIT: usize = 16 * 1024;
