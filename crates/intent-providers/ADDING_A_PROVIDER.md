@@ -19,7 +19,8 @@ touch; treat the full list as the definition of done for a new provider.
       (`workspace_naming_tool_reference`, `crates/intent-services/src/agent_manager.rs`)
 - [ ] Tool-name/kind derivation extended from captured ACP traffic
       (`derive_tool_name` / `tool_kind_word`, `crates/intent-acp/src/session.rs`)
-- [ ] Policy items: native-subagent denial, V8 heap cap (`runtime`), model-id resolution
+- [x] Codex native-subagent denial on native and npx launches (§6)
+- [ ] Policy items for new providers: native-subagent denial, V8 heap cap (`runtime`), model-id resolution
 - [ ] Unit tests per area + WSS e2e (`crates/intentd/tests/`), gates green
       (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`)
 - [ ] End-to-end smoke test via `make dev` (see last section)
@@ -213,6 +214,15 @@ certainly needs new normalization arms:
     `OPENCODE_CONFIG_CONTENT` (`build_provider_env`, `crates/intent-providers/src/args.rs`).
   - claude-code: `disallowedTools: ["Task"]` in the `session/new` `_meta`
     (`build_session_meta`, `crates/intent-services/src/agent_session.rs`).
+  - codex: native `codex-acp` launches always receive exactly one
+    `-c agents.enabled=false` argv override, with an unquoted TOML boolean,
+    regardless of model or reasoning effort. Conflicting overrides are replaced.
+    The pinned npx fallback ignores `-c`, so `crates/intent-acp/src/spawn.rs`
+    sets `CODEX_CONFIG={"agents":{"enabled":false}}` after all environment
+    merges and the inherited `CODEX_PATH` / `CODEX_CONFIG` cleanup. This JSON
+    policy applies to new and resumed adapter threads; `CODEX_PATH` stays
+    removed. Both mechanisms are mandatory for Intent launches and leave the
+    user's Codex configuration files unchanged.
   Audit the new provider for an equivalent (config key, CLI flag, or `_meta` option) and
   wire it into whichever delivery mechanism the provider already uses. Independent of
   this, the MCP-side denylist (`WorkspaceMcpServer::for_agent_type` →
