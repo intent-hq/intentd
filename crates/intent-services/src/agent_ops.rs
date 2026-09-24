@@ -740,7 +740,7 @@ pub(crate) fn ensure_bare_model_matches_provider(
 /// passes through unvalidated, since providers own the effort vocabulary
 /// (PROTOCOL §5.5). Matching is case-insensitive; the stored value is the
 /// caller's spelling.
-fn ensure_effort_supported_by_model(
+pub(crate) fn ensure_effort_supported_by_model(
     method: &str,
     cache: &crate::model_catalog::ModelCatalogReader<'_>,
     model_id: Option<&str>,
@@ -774,7 +774,7 @@ fn ensure_effort_supported_by_model(
 /// is dropped with a warn, never a `-32602` — only caller-supplied efforts
 /// reject. With no cached evidence the level passes through, matching
 /// [`ensure_effort_supported_by_model`].
-fn resolve_settings_default_reasoning_effort(
+pub(crate) fn resolve_settings_default_reasoning_effort(
     services: &Services,
     model_source: DefaultModelSource,
     resolved_model: Option<&str>,
@@ -1020,7 +1020,7 @@ pub(crate) fn resolve_disabled_provider_rehome(
 /// the spawn path can actually run: a provider whose only runnable path is
 /// its npx fallback (`fallback_npx_package`, e.g. codex) counts as runnable
 /// when npx resolves — exactly like `resolve_spawn`'s fallback tier.
-fn ensure_provider_available(
+pub(crate) fn ensure_provider_available(
     method: &str,
     provider_id: &str,
     providers: &intent_core::settings_file::ProvidersSettings,

@@ -36,9 +36,9 @@ pub use args::{
     build_provider_env_with_unsloth, enhanced_path, ArgInputs, UnslothEndpoint, UnslothModelLimit,
 };
 pub use config::{
-    all_provider_ids, auth_error_message, find_provider, first_provider_id,
-    is_provider_authentication_error, login_command, provider_config, InjectionMechanism,
-    ProviderConfig, ToolRemovalStyle, ACP_PROVIDERS, AUGGIE_CLI_MIN_VERSION,
+    all_provider_ids, auth_error_message, find_provider, find_provider_or_legacy_alias,
+    first_provider_id, is_provider_authentication_error, login_command, provider_config,
+    InjectionMechanism, ProviderConfig, ToolRemovalStyle, ACP_PROVIDERS, AUGGIE_CLI_MIN_VERSION,
     AUGGIE_CLI_REQUIREMENT, CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE,
     CLAUDE_AGENT_ACP_VERSION, NPX_MIN_NPM_VERSION, NPX_NPM_REQUIREMENT, PI_ACP_NPX_PACKAGE,
     PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,

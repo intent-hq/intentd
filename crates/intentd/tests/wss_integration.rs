@@ -19833,6 +19833,14 @@ async fn wss_workspace_import_lifecycle() {
     use std::io::Write as _;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.enabled", serde_json::json!({"auggie":false}));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({"codex":std::env::current_exe().unwrap()}),
+    );
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
+    srv.set_setting("model.default", serde_json::json!("gpt-6-astra"));
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let ws_id = "ws-wss-imported";
     let t = "2026-08-11T00:00:00Z";
 
@@ -19876,6 +19884,9 @@ async fn wss_workspace_import_lifecycle() {
             serde_json::json!({
                 "id": "agent-wss-import", "workspace_id": ws_id, "name": "A",
                 "status": "active", "is_active": 1, "acp_session_id": "acp-stale",
+                "provider": "auggie", "model": "gpt6-astra", "reasoning_effort": "low",
+                "effort_levels": "[\"source-only\"]",
+                "last_turn_provider": "auggie", "last_turn_model": "gpt6-astra",
                 "created_at": t, "updated_at": t
             })
         )
@@ -19979,6 +19990,30 @@ async fn wss_workspace_import_lifecycle() {
         "in-flight agent surfaced as interrupted: {committed}"
     );
     assert!(committed["result"]["importedRows"].as_u64().unwrap() >= 2);
+
+    // Import persists the destination triple before it is visible to the
+    // renderer. History remains separate and no provider session was opened.
+    let selected = wss_call(srv.port, srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":60,"method":"agent.getSession","params":{"agentId":"agent-wss-import"}}"#).await;
+    assert_eq!(selected["jsonrpc"], "2.0");
+    assert_eq!(selected["id"], 60);
+    let session = &selected["result"]["session"];
+    assert_eq!(session["provider"], "codex", "{selected}");
+    assert_eq!(session["model"], "gpt-6-astra", "{selected}");
+    assert_eq!(session["reasoningEffort"], "high", "{selected}");
+    assert!(session["effortLevels"].is_null(), "{selected}");
+    assert!(session["acpSessionId"].is_null(), "{selected}");
+    assert_eq!(session["isActive"], false, "{selected}");
+    assert_eq!(
+        srv.store
+            .get_agent_session_last_turn_model(
+                &intent_core::WorkspaceId::from(ws_id),
+                &intent_core::AgentId::from("agent-wss-import")
+            )
+            .await
+            .unwrap(),
+        (Some("gpt6-astra".into()), Some("auggie".into()))
+    );
 
     // The commit's `workspace:created` event reaches the subscriber (§6.3).
     let evt = tokio::time::timeout(Duration::from_secs(10), async {

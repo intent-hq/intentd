@@ -339,7 +339,24 @@ impl Services {
         self.emit_export_progress(&id, export_id, "exporting-rows", None)
             .await;
         let manifest = self.workspace_transfer_plan_op(id.clone()).await?.manifest;
-        let rows = self.store.transfer_export_rows(&id).await?;
+        let mut rows = self.store.transfer_export_rows(&id).await?;
+        // Pin the source's effective default provider into the exported
+        // session rows (archive copy only; the table is never written), so
+        // a session that inherited `model.defaultProvider` here keeps that
+        // selection on the target instead of re-resolving to the target's
+        // default next to a foreign model id (intent-hq/intent#5815).
+        let pinned = crate::transfer_model_selection::pin_source_selection(
+            &mut rows,
+            crate::agent_session::derived_default_provider(&self.effective_settings()).as_deref(),
+        );
+        if pinned > 0 {
+            tracing::info!(
+                workspace = %id.as_str(),
+                export = %export_id,
+                sessions = pinned,
+                "export: pinned the source default provider into inherited session selections"
+            );
+        }
         // Resolve the attachment files the manifest promises (`exists: true`)
         // to their canonical on-disk paths for the archive writer. Rows whose
         // file is already gone carry no entry — deleted-is-deleted transfers
@@ -1060,6 +1077,144 @@ mod tests {
             ExportState::Ready(r) => (r.size_bytes, r.sha256.clone()),
             ExportState::Building { .. } => panic!("session not ready"),
         }
+    }
+
+    /// The archive's session rows carry the source's effective next-turn
+    /// selection (intent-hq/intent#5815): a session that inherited
+    /// `model.defaultProvider` gains that provider (its model / effort ride
+    /// as stored, NULL = Auto), an explicit provider is kept, and the
+    /// `last_turn_*` history is untouched — while the source table is never
+    /// written.
+    #[intent_test_macros::daemon_test]
+    async fn export_pins_inherited_provider_without_mutating_source() {
+        let ws_root = TempDir::new("export-pin-ws-root");
+        let assets_root = TempDir::new("export-pin-assets-root");
+        let store = Store::open(&ws_root.0.join("export-pin.db"))
+            .await
+            .expect("open store");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(ws_root.0.join("config.toml")).expect("load registry"),
+        );
+        // Current settings defaults must not replace an existing Auto
+        // choice or a concrete model/effort pinned at creation time.
+        registry
+            .apply(&[
+                (
+                    "model.defaultProvider".to_string(),
+                    serde_json::json!("auggie"),
+                ),
+                (
+                    "model.default".to_string(),
+                    serde_json::json!("settings-default-model"),
+                ),
+                (
+                    "model.providerDefaults".to_string(),
+                    serde_json::json!({"auggie": "settings-provider-model"}),
+                ),
+                (
+                    "model.defaultReasoningEffort".to_string(),
+                    serde_json::json!("low"),
+                ),
+            ])
+            .expect("apply settings");
+        let svc = Services::new(store)
+            .with_workspaces_root(ws_root.0.clone())
+            .with_assets_root(assets_root.0.clone())
+            .with_settings_registry(registry);
+        let id = WorkspaceId("ws-export-pin".to_string());
+        let mut ws = crate::tests::workspace(&id);
+        let ws_dir = ws_root.0.join("checkout");
+        std::fs::create_dir_all(&ws_dir).expect("ws dir");
+        ws.worktree_path = Some(ws_dir.to_string_lossy().to_string());
+        svc.store.insert_workspace(&ws).await.expect("workspace");
+
+        // Inherited: provider unset, explicit model + effort, one committed
+        // turn under the source default.
+        let inherited = AgentId("agent-inherited".to_string());
+        let mut s = session(&inherited, &id, AgentStatus::RuntimeIdle);
+        s.model = Some("gpt6-astra".to_string());
+        s.reasoning_effort = Some("high".to_string());
+        svc.store.insert_agent_session(&s).await.expect("inherited");
+        svc.store
+            .set_agent_session_last_turn_model(&id, &inherited, Some("gpt6-astra"), "auggie")
+            .await
+            .expect("last turn");
+        // Explicit: the user picked another provider outright.
+        let explicit = AgentId("agent-explicit".to_string());
+        let mut s = session(&explicit, &id, AgentStatus::RuntimeIdle);
+        s.provider = Some("claude-code".to_string());
+        s.model = Some("claude-fable-5".to_string());
+        svc.store.insert_agent_session(&s).await.expect("explicit");
+        // Auto: nothing chosen at all.
+        let auto = AgentId("agent-auto".to_string());
+        svc.store
+            .insert_agent_session(&session(&auto, &id, AgentStatus::RuntimeIdle))
+            .await
+            .expect("auto");
+
+        let started = svc
+            .workspace_export_start_op(id.clone())
+            .await
+            .expect("start");
+        let export_id = started["exportId"].as_str().expect("exportId").to_string();
+        assert!(wait_ready(&svc, &export_id).await, "build must succeed");
+        let archive_path = {
+            let exports = svc.transfer_exports.lock().unwrap();
+            match &exports.get(&export_id).expect("session").state {
+                ExportState::Ready(r) => r.archive_path.clone(),
+                ExportState::Building { .. } => panic!("session not ready"),
+            }
+        };
+        let file = std::fs::File::open(&archive_path).expect("archive file");
+        let mut zip = zip::ZipArchive::new(file).expect("valid zip");
+        let mut jsonl = String::new();
+        zip.by_name("rows/agent_session.jsonl")
+            .expect("session rows")
+            .read_to_string(&mut jsonl)
+            .expect("read rows");
+        let rows: std::collections::HashMap<String, serde_json::Value> = jsonl
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).expect("row json");
+                (v["id"].as_str().expect("id").to_string(), v)
+            })
+            .collect();
+        assert_eq!(rows.len(), 3);
+        let row = &rows["agent-inherited"];
+        assert_eq!(row["provider"], "auggie", "source default pinned");
+        assert_eq!(row["model"], "gpt6-astra");
+        assert_eq!(row["reasoning_effort"], "high");
+        assert_eq!(row["last_turn_provider"], "auggie");
+        assert_eq!(row["last_turn_model"], "gpt6-astra");
+        let row = &rows["agent-explicit"];
+        assert_eq!(row["provider"], "claude-code", "explicit provider kept");
+        assert_eq!(row["model"], "claude-fable-5");
+        assert_eq!(row["reasoning_effort"], serde_json::Value::Null);
+        let row = &rows["agent-auto"];
+        assert_eq!(
+            row["provider"], "auggie",
+            "Auto session pinned to its source provider"
+        );
+        assert_eq!(
+            row["model"],
+            serde_json::Value::Null,
+            "Auto model stays Auto"
+        );
+        assert_eq!(row["reasoning_effort"], serde_json::Value::Null);
+
+        // The source table is never written by the export.
+        let src = svc.store.get_agent_session(&inherited).await.expect("src");
+        assert_eq!(src.provider, None);
+        assert_eq!(src.model.as_deref(), Some("gpt6-astra"));
+        assert_eq!(src.reasoning_effort.as_deref(), Some("high"));
+        let src = svc.store.get_agent_session(&auto).await.expect("src");
+        assert_eq!(src.provider, None);
+        assert_eq!(src.model, None);
+
+        svc.workspace_export_abort_op(export_id)
+            .await
+            .expect("abort");
     }
 
     /// Happy path (repo-less workspace): start → ready; chunked reads
