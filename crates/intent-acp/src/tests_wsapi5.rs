@@ -981,7 +981,7 @@ async fn workspace_archive_refuses_in_chief_workspace() {
     let (srv, api) = chief_server();
     let resp = call(&srv, "return await ws.workspace.archive();").await;
     assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("chief-of-staff"));
+    assert!(text(&resp).contains("Assistant"));
     assert!(api.archive_calls.lock().unwrap().is_empty());
 }
 
@@ -990,7 +990,7 @@ async fn workspace_unarchive_refuses_in_chief_workspace() {
     let (srv, api) = chief_server();
     let resp = call(&srv, "return await ws.workspace.unarchive();").await;
     assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("chief-of-staff"));
+    assert!(text(&resp).contains("Assistant"));
     assert!(api.unarchive_calls.lock().unwrap().is_empty());
 }
 
@@ -1001,7 +1001,7 @@ async fn workspace_set_status_image_refuses_in_chief_workspace() {
         "return await ws.workspace.setStatusImage({ data: 'aGVsbG8=', mimeType: 'image/png' });";
     let resp = call(&srv, code).await;
     assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("chief-of-staff"));
+    assert!(text(&resp).contains("Assistant"));
     assert!(api.save_asset_calls.lock().unwrap().is_empty());
     assert!(api.update_calls.lock().unwrap().is_empty());
 }
