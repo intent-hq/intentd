@@ -4115,6 +4115,8 @@ mod tests {
         rate_limit_limit: Option<u64>,
         /// `rate_limit_status` itself fails (the quota probe erroring).
         fail_rate_limit_status: bool,
+        /// A quota probe pends until its caller cancels the request.
+        hang_rate_limit_status: bool,
         /// Metered hosts share a bounded probe cadence across all sweeps.
         rate_limit_probe_interval: Duration,
         /// A real RFC 3339 `updatedAt` for the PR record, overriding the
@@ -4202,6 +4204,7 @@ mod tests {
                 rate_limit_remaining: None,
                 rate_limit_limit: None,
                 fail_rate_limit_status: false,
+                hang_rate_limit_status: false,
                 rate_limit_probe_interval: Duration::ZERO,
                 updated_at: None,
                 folded: None,
@@ -4417,6 +4420,10 @@ mod tests {
         }
         async fn rate_limit_status(&self) -> intent_sourcecontrol::Result<RateLimitStatus> {
             self.count_sub_fetch("rate_limit_status");
+            let hangs = self.state.lock().unwrap().hang_rate_limit_status;
+            if hangs {
+                std::future::pending::<()>().await;
+            }
             let s = self.state.lock().unwrap();
             if s.fail_rate_limit_status {
                 return Err(intent_sourcecontrol::Error::Api(
@@ -10577,6 +10584,45 @@ mod tests {
         svc.sweep_rate_limit.expire_probe().await;
         assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
         assert_eq!(forge.sub_fetches("rate_limit_status"), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_metered_probe_keeps_the_interval_and_cannot_claim_recovery() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| {
+            s.rate_limit_probe_interval = Duration::from_secs(60);
+            s.hang_rate_limit_status = true;
+            s.rate_limit_remaining = Some(5_000);
+            s.rate_limit_limit = Some(5_000);
+        });
+        svc.sweep_rate_limit
+            .pause_for(Duration::from_secs(300), true);
+
+        // Start a recovery probe, then cancel its caller while the network
+        // read is pending, as a workspace API evaluation timeout can do.
+        let mut request = Box::pin(svc.maybe_lift_rate_limit_pause(&sc));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(request.as_mut(), &mut context).is_pending());
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+        drop(request);
+
+        forge.edit(|s| s.hang_rate_limit_status = false);
+        for _ in 0..3 {
+            assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+        }
+        assert!(svc.sweeps_rate_limited(), "cancellation is not recovery");
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+
+        svc.sweep_rate_limit.expire_probe().await;
+        assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_some());
+        assert!(!svc.sweeps_rate_limited());
+        svc.pr_monitor_quota_window(&sc, None).await;
+        assert_eq!(
+            forge.sub_fetches("rate_limit_status"),
+            2,
+            "completed evidence retains its own shared interval"
+        );
     }
 
     /// While paused, each sweep tick spends exactly one quota
