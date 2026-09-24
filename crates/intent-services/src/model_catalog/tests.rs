@@ -387,6 +387,30 @@ async fn version_key_bump_invalidates_cached_entry() {
 }
 
 #[tokio::test]
+async fn managed_codex_upgrade_reprobes_persisted_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(MODELS_CACHE_FILE);
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    // The old adapter omitted GPT-6 Sol and Luna. A daemon upgrade must
+    // invalidate that persisted list even while it is inside the 24h TTL.
+    cache.store(
+        "codex",
+        "@agentclientprotocol/codex-acp@1.9.0",
+        rows("old-catalog"),
+        1_000,
+    );
+    let reloaded = Arc::new(ModelCatalogCache::new(Some(path)));
+    let key = intent_providers::config::CODEX_ACP_NPX_PACKAGE;
+    let result =
+        resolve_with_cache(&reloaded, "codex", key, false, 1_001, ok_fetch("gpt-6-sol")).await;
+    assert_eq!(result.models, Some(rows("gpt-6-sol")));
+    assert!(!result.stale);
+    // The refreshed entry is now reusable without another provider call.
+    let cached = resolve_with_cache(&reloaded, "codex", key, false, 1_002, panicking_fetch()).await;
+    assert_eq!(cached.models, result.models);
+}
+
+#[tokio::test]
 async fn force_refresh_bypasses_cache() {
     let cache = Arc::new(ModelCatalogCache::new(None));
     cache.store("p", "v1", rows("cached"), 1_000);
