@@ -2704,6 +2704,23 @@ impl<'a> SettingsService<'a> {
         Ok(out)
     }
 
+    /// Capture ordinary server values while the revision gate is held. Hook
+    /// compensation compares these again after secret rollback releases the
+    /// gate, so it cannot undo a newer server-settings commit.
+    pub(crate) async fn server_values(&self) -> Result<Map<String, Value>> {
+        let mut values = Map::new();
+        for def in definitions()
+            .into_iter()
+            .filter(|def| def.path.starts_with("server.") && !def.sensitive)
+        {
+            values.insert(
+                def.path.to_string(),
+                self.get(def.path).await?["value"].clone(),
+            );
+        }
+        Ok(values)
+    }
+
     /// Validate every setting and the registry's typed schema/pins before
     /// starting secret persistence. The commit revalidates after awaited I/O;
     /// placeholder presence is checked by `update_secrets` before any write.
@@ -7587,5 +7604,305 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod rollback_order_tests {
+    use super::*;
+    use intent_core::{ServerControl, WorkspaceApi};
+    use std::{
+        future::{poll_fn, Future},
+        pin::Pin,
+        task::Poll,
+    };
+    fn settings_subscription(store: &Store) -> (crate::EventBus, crate::events::Subscription) {
+        let bus = crate::EventBus::new(store.clone());
+        let sub = bus.subscribe(crate::events::SubscriptionFilter {
+            event_types: vec!["settings:changed".into()],
+            ..Default::default()
+        });
+        (bus, sub)
+    }
+
+    async fn assert_no_settings_events(sub: &mut crate::events::Subscription) {
+        let mut next = Box::pin(sub.recv());
+        assert!(
+            poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await,
+            "a failed settings batch must not emit settings events"
+        );
+    }
+
+    async fn assert_next_commit_is_revision_one(
+        services: &crate::Services,
+        sub: &mut crate::events::Subscription,
+    ) {
+        let next = services
+            .settings_update(json!([{"path":"git.autoCommit","value":false}]))
+            .await
+            .unwrap();
+        assert_eq!(next["revision"], json!(1));
+        let events = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["revision"], json!(1));
+        assert_eq!(events[0].data["changes"], next["applied"]);
+        assert_no_settings_events(sub).await;
+    }
+
+    struct ParkCompensatingHook {
+        parked: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ServerControl for ParkCompensatingHook {
+        fn start_ws_listener(&self) -> Pin<Box<dyn Future<Output = Result<u16>> + Send + '_>> {
+            Box::pin(async {
+                Err(Error::Internal(
+                    "injected first listener start failure".into(),
+                ))
+            })
+        }
+        fn stop_ws_listener(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.parked.notify_one();
+                self.release.notified().await;
+            })
+        }
+        fn ws_listener_port(&self) -> Pin<Box<dyn Future<Output = Option<u16>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+        fn is_tcp_connection(&self) -> bool {
+            false
+        }
+    }
+
+    async fn compensating_hook_case(revoke: bool) {
+        let dir = crate::test_support::test_tempdir("b68g-compensating-hook-order");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let (bus, mut sub) = settings_subscription(&store);
+        let raw = InMemorySecretStore::default();
+        raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
+            .unwrap();
+        raw.store(
+            crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT,
+            "device",
+        )
+        .unwrap();
+        let services = Arc::new(
+            crate::Services::new(store)
+                .with_settings_registry(registry)
+                .with_secret_store(Arc::new(raw.clone()))
+                .with_event_bus(bus)
+                .with_github_login_base_uri("http://127.0.0.1:1"),
+        );
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        services.attach_server_control(Arc::new(ParkCompensatingHook {
+            parked: parked.clone(),
+            release: release.clone(),
+        }));
+        let writer = services.clone();
+        let update = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    {"path":crate::github_auth_ops::SECRET_ACCOUNT,"value":"settings-pat"},
+                    {"path":"server.wsApi.enabled","value":true}
+                ]))
+                .await
+        });
+        timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .unwrap();
+        eprintln!(
+            "at compensating hook: token={:?}; method={:?}",
+            raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap(),
+            raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
+                .unwrap()
+        );
+        if revoke {
+            let revoked = timeout(Duration::from_secs(5), services.github_revoke())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(revoked["ok"], json!(true));
+        } else {
+            raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "oauth-completed")
+                .unwrap();
+            raw.store(
+                crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT,
+                "device",
+            )
+            .unwrap();
+        }
+        release.notify_one();
+        let error = timeout(Duration::from_secs(5), update)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("start failed");
+        let ordinary = services
+            .settings_get("server.wsApi.enabled".into())
+            .await
+            .unwrap();
+        assert_eq!(ordinary["value"], json!(false));
+        assert_eq!(ordinary["revision"], json!(0));
+        assert_no_settings_events(&mut sub).await;
+        eprintln!("after compensating hook: revoke={revoke}; error={error}; token={:?}; method={:?}; ordinary={ordinary}; settings_events=0",
+            raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap(),
+            raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT).unwrap());
+        assert_next_commit_is_revision_one(&services, &mut sub).await;
+        assert_eq!(raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap().as_deref(),
+            if revoke {None} else {Some("oauth-completed")},
+            "secret rollback must finish before compensating runtime hooks can admit later GitHub mutations");
+        assert_eq!(
+            raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
+                .unwrap()
+                .as_deref(),
+            if revoke { None } else { Some("device") }
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn compensating_hook_preserves_newer_github_revoke() {
+        compensating_hook_case(true).await;
+    }
+    #[intent_test_macros::daemon_test]
+    async fn compensating_hook_preserves_newer_github_flow() {
+        compensating_hook_case(false).await;
+    }
+
+    struct PausedRollbackStore {
+        raw: InMemorySecretStore,
+        parked: Arc<tokio::sync::Notify>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl SecretStore for PausedRollbackStore {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.raw.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            self.raw.store(account, value)?;
+            if account == crate::github_auth_ops::SECRET_ACCOUNT && value == "original-device" {
+                self.parked.notify_one();
+                let _ = self.release.lock().unwrap().recv();
+            }
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.raw.delete(account)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecoverableControl {
+        starts: std::sync::atomic::AtomicUsize,
+        stops: std::sync::atomic::AtomicUsize,
+        running: std::sync::atomic::AtomicBool,
+    }
+    impl ServerControl for RecoverableControl {
+        fn start_ws_listener(&self) -> Pin<Box<dyn Future<Output = Result<u16>> + Send + '_>> {
+            Box::pin(async move {
+                if self
+                    .starts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    return Err(Error::Internal("injected first start failure".into()));
+                }
+                self.running
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(5181)
+            })
+        }
+        fn stop_ws_listener(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+        fn ws_listener_port(&self) -> Pin<Box<dyn Future<Output = Option<u16>> + Send + '_>> {
+            Box::pin(async move {
+                self.running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then_some(5181)
+            })
+        }
+        fn is_tcp_connection(&self) -> bool {
+            false
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_rollback_preserves_newer_runtime_commit() {
+        let dir = crate::test_support::test_tempdir("settings-rollback-runtime-commit");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let (bus, mut sub) = settings_subscription(&store);
+        let raw = InMemorySecretStore::default();
+        raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "original-device")
+            .unwrap();
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let services = Arc::new(
+            crate::Services::new(store)
+                .with_settings_registry(registry)
+                .with_secret_store(Arc::new(PausedRollbackStore {
+                    raw,
+                    parked: parked.clone(),
+                    release: Mutex::new(release_rx),
+                }))
+                .with_event_bus(bus),
+        );
+        let control = Arc::new(RecoverableControl::default());
+        services.attach_server_control(control.clone());
+        let writer = services.clone();
+        let failed = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    {"path":crate::github_auth_ops::SECRET_ACCOUNT,"value":"settings-pat"},
+                    {"path":"server.wsApi.enabled","value":true}
+                ]))
+                .await
+        });
+        timeout(Duration::from_secs(5), parked.notified())
+            .await
+            .unwrap();
+        let newer = timeout(
+            Duration::from_secs(3),
+            services.settings_update(json!([
+                {"path":"server.wsApi.enabled","value":true}
+            ])),
+        )
+        .await
+        .expect("secret compensation must not hold the revision gate")
+        .unwrap();
+        assert_eq!(newer["revision"], json!(1));
+        release_tx.send(()).unwrap();
+        failed.await.unwrap().expect_err("first start failed");
+        let current = services
+            .settings_get("server.wsApi.enabled".into())
+            .await
+            .unwrap();
+        assert_eq!(current["value"], json!(true));
+        assert_eq!(current["revision"], json!(1));
+        assert_eq!(
+            control.ws_listener_port().await,
+            Some(5181),
+            "stale compensation must not stop the newer listener"
+        );
+        let events = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data,
+            json!({"revision":1,"changes":newer["applied"]})
+        );
+        assert_no_settings_events(&mut sub).await;
     }
 }

@@ -16530,7 +16530,7 @@ impl WorkspaceApi for Services {
                 .collect();
             let has_secrets = !secret_paths.is_empty();
             let _secret_guards = self.settings_secret_gates.write(&secret_paths).await;
-            let mut revision_guard = self.settings_revision_gate.write().await;
+            let mut revision_guard = Some(self.settings_revision_gate.write().await);
             let caller_changes = changes.clone();
             // A default-provider switch re-resolves `model.default` for the
             // new provider (monorepo#3177). Appended BEFORE the old-value
@@ -16562,9 +16562,9 @@ impl WorkspaceApi for Services {
             // Reject malformed/pinned mixed batches before any secret write.
             self.settings_service().validate_update(&changes)?;
             let secrets = if has_secrets {
-                drop(revision_guard);
+                drop(revision_guard.take());
                 let secrets = self.settings_service().update_secrets(&changes).await?;
-                revision_guard = self.settings_revision_gate.write().await;
+                revision_guard = Some(self.settings_revision_gate.write().await);
                 secrets
             } else {
                 settings::SecretSettingsUpdate::default()
@@ -16574,6 +16574,7 @@ impl WorkspaceApi for Services {
             // only now, so failure compensation cannot erase its commit.
             let mut changes = caller_changes;
             self.reresolve_default_model_on_provider_switch(&mut changes);
+            let mut secrets_compensated = false;
             let result = async {
                 // Capture ordinary priors for hook-failure compensation. Secret
                 // priors were captured under their account guards before I/O;
@@ -16638,8 +16639,8 @@ impl WorkspaceApi for Services {
                         // hooks so a failed batch (e.g. a restart-on-new-value hook
                         // that stopped one of them and then failed to start it) can
                         // put them back up after the persistence rollback.
-                        let listener_was_running = control.ws_listener_port().await.is_some();
-                        let tunnel_was_running = control.tunnel_address().await.is_some();
+                        let mut listener_was_running = control.ws_listener_port().await.is_some();
+                        let mut tunnel_was_running = control.tunnel_address().await.is_some();
                         if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                             // Rollback: restore old values for ALL settings in the batch.
                             // Log rollback failures but don't let them mask the original hook error.
@@ -16711,6 +16712,45 @@ impl WorkspaceApi for Services {
                                             "settings.update registry rollback batch failed"
                                         );
                                         rollback_failed = true;
+                                    }
+                                }
+                            }
+
+                            // Restore credentials before compensating runtime hooks, as in
+                            // the original ordering. A GitHub revoke/device completion during
+                            // those hooks must not be overwritten by a later secret restore.
+                            if has_secrets {
+                                let runtime_before = self.settings_service().server_values().await;
+                                drop(revision_guard.take());
+                                rollback_failed |= secrets.rollback(&self.secrets).await;
+                                secrets_compensated = true;
+                                revision_guard = Some(self.settings_revision_gate.write().await);
+                                let runtime_after = self.settings_service().server_values().await;
+                                match (runtime_before, runtime_after) {
+                                    (Ok(before), Ok(after)) => {
+                                        // Ordinary rollback finished before the gate was released.
+                                        // Another writer may since have committed a server value;
+                                        // its runtime hook takes precedence over this old recovery.
+                                        compensating_changes.retain(|change| {
+                                            let path = change["path"].as_str().unwrap_or("");
+                                            !path.starts_with("server.")
+                                                || before.get(path) == after.get(path)
+                                        });
+                                        if before.get("server.wsApi.enabled") != after.get("server.wsApi.enabled") {
+                                            listener_was_running = after.get("server.wsApi.enabled")
+                                                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+                                        }
+                                        if before.get("server.tunnel.enabled") != after.get("server.tunnel.enabled") {
+                                            tunnel_was_running = after.get("server.tunnel.enabled")
+                                                .and_then(serde_json::Value::as_bool).unwrap_or(false);
+                                        }
+                                    }
+                                    (Err(error), _) | (_, Err(error)) => {
+                                        tracing::error!(%error, "settings.update could not verify runtime settings during rollback");
+                                        rollback_failed = true;
+                                        compensating_changes.clear();
+                                        listener_was_running = false;
+                                        tunnel_was_running = false;
                                     }
                                 }
                             }
@@ -16794,11 +16834,12 @@ impl WorkspaceApi for Services {
                     "revision": self.settings_revision.load(Ordering::SeqCst),
                 }))
             }.await;
-            // Ordinary rollback and compensating runtime hooks have finished;
-            // credential compensation can wait without holding the revision gate.
+            // Validation/persistence failures have no runtime hooks to recover.
+            // Compensate their staged secrets without the revision gate too;
+            // a hook failure already restored them before runtime recovery.
             drop(revision_guard);
             if let Err(error) = result {
-                if secrets.rollback(&self.secrets).await {
+                if !secrets_compensated && secrets.rollback(&self.secrets).await {
                     return Err(Error::Internal(format!(
                         "settings.update failed ({error}), and secret rollback was incomplete (see logs)"
                     )));
