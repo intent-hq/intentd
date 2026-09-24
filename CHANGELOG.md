@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.105] - 2026-09-24
+
+### 🐛 Bug Fixes
+
+- Preserve agent selections across workspace transfers ([#2099](https://github.com/intent-hq/intentd/pull/2099))
+- Reflect workspace branch renames in the UI ([#2053](https://github.com/intent-hq/intentd/pull/2053))
+
+
 ## [0.9.104] - 2026-09-23
 
 ### ⚙️ Miscellaneous Tasks
