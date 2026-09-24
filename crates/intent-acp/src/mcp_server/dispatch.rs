@@ -752,11 +752,14 @@ fn collect_binding_attachments(value: &mut Value, pending: &PendingAttachments, 
 }
 
 /// The dispatch-layer denial for a sub-agent's `app.question.*` frame —
-/// names the two methods a sub-agent should use instead.
+/// routes routine questions to conversation and reserves attention for stalled work.
 pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
-    "ws.app.question.ask is only available to top-level agents — raise \
-     ws.agent.requestDiscussion when you need user/coordinator input, or report \
-     progress with ws.agent.reportToParent";
+    "ws.app.question.ask is only available to top-level agents — use ordinary conversation \
+     with your parent for routine clarification and plan approval; reserve \
+     ws.agent.requestDiscussion for an issue in concrete assigned work that leaves you \
+     unsure how to proceed without a user/coordinator decision. Check available context \
+     and use your judgment for routine choices first; report completed or progressing \
+     work with ws.agent.reportToParent";
 
 /// The dispatch-layer denial for a sub-agent's sibling-workspace proposal.
 pub(super) const SUB_AGENT_PROPOSE_SIBLING_DENIED: &str =

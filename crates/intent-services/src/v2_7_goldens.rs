@@ -26,9 +26,8 @@ fn v2_7() -> &'static dyn Harness {
 }
 
 #[test]
-fn v2_7_is_the_latest_harness() {
-    assert_eq!(crate::harness::latest_entry().version, "2.7");
-    assert_eq!(intent_core::CURRENT_HARNESS_VERSION, "2.7");
+fn v2_7_remains_registered() {
+    assert_eq!(crate::harness::resolve_entry("2.7").version, "2.7");
 }
 
 /// The Spec's target wording: two hooks and one PR monitor, plural form,

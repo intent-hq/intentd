@@ -247,8 +247,8 @@ API:
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history. Served under the slim projection: oversized tool/image block bodies arrive truncated (`inputTruncated`/`outputTruncated`) with stable block ids — hydrate one in full with `ws.agent.getMessageBlock`. A mid-turn read includes the in-flight turn's partial assistant message (tool calls/blocks streamed so far) as a trailing `inProgress: true` row, so a busy agent's latest activity is visible without waiting for the turn to end.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — the on-demand hydration counterpart to the slim `readConversation` truncation markers.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
-  ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
-  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
+  ws.agent.reportToParent(report) → { ok, ... }  // Report completed or progressing work to your parent. Use `ws.agent.reportBlocker` for infrastructure/environment problems you cannot resolve, or `ws.agent.requestDiscussion` only when an issue in assigned work leaves you unsure how to proceed without a decision. Only works for delegated agents; user-created agents will get an error.
+  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise attention only when concrete assigned work encounters an issue that leaves you unsure how to proceed without a user or coordinator decision; use ordinary conversation for back-and-forth, routine clarification, and plan approval. Check available context and use your judgment for routine choices first. Applies to direct user assignments and delegated work; a formal task note is not required. `reason` must name the issue and the specific decision needed. Call it BEFORE ending your turn, then end the turn normally. If you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
   ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session — TERMINAL for you: the call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
 
@@ -503,8 +503,8 @@ API:
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history. Slim projection: oversized tool/image block bodies arrive truncated with stable block ids. Mid-turn reads append the in-flight turn's partial message as a trailing `inProgress: true` row.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — hydrates the truncated slim blocks from `readConversation`.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
-  ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
-  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
+  ws.agent.reportToParent(report) → { ok, ... }  // Report completed or progressing work to your parent. Use `ws.agent.reportBlocker` for infrastructure/environment problems you cannot resolve, or `ws.agent.requestDiscussion` only when an issue in assigned work leaves you unsure how to proceed without a decision. Only works for delegated agents; user-created agents will get an error.
+  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise attention only when concrete assigned work encounters an issue that leaves you unsure how to proceed without a user or coordinator decision; use ordinary conversation for back-and-forth, routine clarification, and plan approval. Check available context and use your judgment for routine choices first. Applies to direct user assignments and delegated work; a formal task note is not required. `reason` must name the issue and the specific decision needed. Call it BEFORE ending your turn, then end the turn normally. If you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
   ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session — TERMINAL for you: the call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
 
@@ -686,7 +686,7 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
 /// attention-request methods, scrubbed from the assembled description when
 /// `agentFeatures.attentionRequests` is off (a unit test guards that this
 /// clause still matches both description variants verbatim).
-const REPORT_TO_PARENT_ATTENTION_XREF: &str = " — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead";
+const REPORT_TO_PARENT_ATTENTION_XREF: &str = " Use `ws.agent.reportBlocker` for infrastructure/environment problems you cannot resolve, or `ws.agent.requestDiscussion` only when an issue in assigned work leaves you unsure how to proceed without a decision.";
 
 /// The base variant's cross-references to `ws.host.exec` inside the
 /// `ws.hook.*` docs (the Namespaces index hint and the `ws.hook.schedule`
@@ -1721,6 +1721,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn discussion_guidance_survives_full_condensed_and_namespace_help() {
+        for is_chief in [false, true] {
+            for attention_requests in [true, false] {
+                let features = AgentFeaturesSettings {
+                    attention_requests,
+                    ..AgentFeaturesSettings::default()
+                };
+                for (description, includes_details) in [
+                    (
+                        workspace_api_description(is_chief, &features).into_owned(),
+                        true,
+                    ),
+                    (
+                        condensed_workspace_api_description(is_chief, &features, &[]),
+                        false,
+                    ),
+                    (
+                        help_namespace(is_chief, &features, false, "agent").unwrap(),
+                        true,
+                    ),
+                    (
+                        help_namespace(is_chief, &features, true, "agent").unwrap(),
+                        true,
+                    ),
+                ] {
+                    let discussion = description
+                        .lines()
+                        .find(|line| line.trim_start().starts_with("ws.agent.requestDiscussion("));
+                    assert_eq!(discussion.is_some(), attention_requests);
+                    if let Some(line) = discussion {
+                        for guidance in [
+                            "only when concrete assigned work encounters an issue",
+                            "unsure how to proceed without a user or coordinator decision",
+                            "ordinary conversation",
+                            "back-and-forth, routine clarification, and plan approval",
+                        ] {
+                            assert!(line.contains(guidance), "missing {guidance}: {line}");
+                        }
+                    }
+                    let report = description
+                        .lines()
+                        .find(|line| line.trim_start().starts_with("ws.agent.reportToParent("))
+                        .unwrap();
+                    assert!(!report.contains("if you are blocked or need input"));
+                    assert_eq!(
+                        report.contains("only when an issue in assigned work"),
+                        attention_requests && includes_details
+                    );
+                    if !attention_requests {
+                        assert!(!description.contains("ws.agent.requestDiscussion"));
+                        assert!(!description.contains("ws.agent.reportBlocker"));
+                    }
+                }
+            }
+        }
+    }
+
     // ws.help("agent") serves the `create` entry — `topLevel` continuation
     // included — identically on top-level and sub-agent bridges; no
     // spawnPeer entry exists on either.
@@ -2273,6 +2331,15 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("disabled in settings"), "{err}");
+        for guidance in [
+            "ordinary conversation with your parent",
+            "routine clarification and plan approval",
+            "an issue in concrete assigned work",
+            "unsure how to proceed without a user/coordinator decision",
+            "Check available context and use your judgment for routine choices first",
+        ] {
+            assert!(err.contains(guidance), "missing {guidance}: {err}");
+        }
         // Genuine settings-off on a top-level bridge keeps the toggle error.
         let err = help_namespace(false, &forced_off, false, "app.question").unwrap_err();
         assert!(err.contains("agentFeatures.structuredQuestions"), "{err}");

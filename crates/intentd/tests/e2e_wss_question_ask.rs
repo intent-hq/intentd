@@ -1691,6 +1691,14 @@ async fn sub_agent_question_ask_denied_over_wss() {
             && text.contains("ws.agent.reportToParent"),
         "expected top-level-only redirect denial, got: {text}"
     );
+    for guidance in [
+        "ordinary conversation with your parent",
+        "routine clarification and plan approval",
+        "an issue in concrete assigned work",
+        "unsure how to proceed without a user/coordinator decision",
+    ] {
+        assert!(text.contains(guidance), "missing {guidance}: {text}");
+    }
     assert!(
         !text.contains("disabled in settings"),
         "sub-agent denial must not masquerade as a settings gate: {text}"
