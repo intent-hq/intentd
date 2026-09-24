@@ -34,8 +34,8 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, `"2.2"`,
-//! `"2.3"`, `"2.4"`, or `"2.5"`) to the pair, so a session keeps assembling the exact doctrine
+//! session `harnessVersion` (`"1.0"` through `"2.8"`) to the pair, so a session
+//! keeps assembling the exact doctrine
 //! it was created with even after the binary ships a newer set. All past
 //! versions stay bundled.
 
@@ -49,6 +49,7 @@ pub(crate) mod v2_4;
 pub(crate) mod v2_5;
 pub(crate) mod v2_6;
 pub(crate) mod v2_7;
+pub(crate) mod v2_8;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -495,6 +496,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2_5::ENTRY,
     &v2_6::ENTRY,
     &v2_7::ENTRY,
+    &v2_8::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -551,7 +553,7 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "2.7");
+        assert_eq!(entry.version, "2.8");
         assert_eq!(next_steps(entry.harness), next_steps(&v2_4::V2_4));
         assert_ne!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
         assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));
