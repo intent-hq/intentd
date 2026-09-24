@@ -17,11 +17,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use intent_core::events::SOURCE_CONTROL_AUTH_CHANGED;
-use intent_core::{now_iso, Error, FileSecretStore, Result, WorkspaceId};
+use intent_core::{now_iso, Error, FileSecretStore, IdentityProofErrorKind, Result, WorkspaceId};
 use intent_sourcecontrol::gitlab_auth::{
     refresh_access_token, revoke_gitlab_token, stored_credential, validate_pat,
 };
 use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT as GITLAB_SECRET_ACCOUNT;
+use intent_sourcecontrol::identity_proof::provider::{CreatedProof, ProofProvider};
 use intent_sourcecontrol::{
     GitlabDeviceFlow, GitlabExchange, GitlabHost, GitlabUser, StoredCredential, UserIdentity,
 };
@@ -684,6 +685,101 @@ impl crate::Services {
     pub(crate) fn gitlab_host_is_bound(&self, host: &GitlabHost) -> bool {
         parse_gitlab_host(&self.effective_settings().source_control.gitlab.host)
             .is_ok_and(|bound| bound.host() == host.host())
+    }
+
+    /// The identity-proof provider of a `(provider, host)` target
+    /// (`sourceControl.identityProof.*`, protocol 10.8): the GitHub gist
+    /// proof against the same API host the reconnect guard uses, or the
+    /// GitLab snippet proof on the resolved instance.
+    pub(crate) fn proof_provider(&self, target: &Target) -> ProofProvider {
+        match target {
+            Target::Github => ProofProvider::Github {
+                api_base_url: crate::invite_ops::resolve_api_base_uri(
+                    self.github_api_base_uri.as_deref(),
+                ),
+            },
+            Target::Gitlab { host } => ProofProvider::Gitlab { host: host.clone() },
+        }
+    }
+
+    /// The **stored** credential the guest half signs a proof with. Only the
+    /// stored token counts for either provider — never the env / `gh`
+    /// fallbacks — so the proof is always made with the account the user
+    /// signed in with; for GitLab the token applies to the bound instance
+    /// only, so a `host` that is not bound is `gitlab-not-connected` like an
+    /// absent token. Read under the [`GitlabCredentialGate`] so a rebind or
+    /// revoke in flight is not raced.
+    pub(crate) async fn stored_proof_token(&self, target: &Target) -> Result<String> {
+        match target {
+            Target::Github => github_auth_ops::load_stored_token(&self.secrets).await,
+            Target::Gitlab { host } => {
+                let _gate = self.gitlab_credential_gate.lock().await;
+                if !self.gitlab_host_is_bound(host) {
+                    return Err(Error::IdentityProof(
+                        IdentityProofErrorKind::GitlabNotConnected,
+                    ));
+                }
+                stored_access_token(&self.gitlab_secret_store)
+                    .await?
+                    .ok_or(Error::IdentityProof(
+                        IdentityProofErrorKind::GitlabNotConnected,
+                    ))
+            }
+        }
+    }
+
+    /// Guest half of `sourceControl.identityProof.create` (and its
+    /// `github.identityProof.create` alias): validate the proof lines,
+    /// resolve the target, and publish `nonce` with the stored token.
+    /// 🔒 Returns the proof id and the owner identity only, never the token.
+    pub(crate) async fn identity_proof_create(
+        &self,
+        provider: &str,
+        host: Option<&str>,
+        nonce: &str,
+        host_label: &str,
+    ) -> Result<(ProofProvider, CreatedProof)> {
+        let nonce = github_auth_ops::proof_line_param("nonce", nonce)?;
+        let host_label = github_auth_ops::proof_line_param("hostLabel", host_label)?;
+        let kind = Provider::parse(provider)?;
+        let target = self.resolve_source_control_target(provider, host)?;
+        let proof = self.proof_provider(&target);
+        let token = self.stored_proof_token(&target).await?;
+        let created = proof
+            .create(&token, &nonce, &host_label)
+            .await
+            .map_err(|e| github_auth_ops::map_identity_proof_err_for(kind, e))?;
+        Ok((proof, created))
+    }
+
+    /// Guest half of `sourceControl.identityProof.delete` (and its
+    /// `github.identityProof.delete` alias): the id is shape-checked as
+    /// `id_param` (`-32602`) before any credential is read; the engine then
+    /// reads the proof back and refuses anything that is not an Intent proof.
+    pub(crate) async fn identity_proof_delete(
+        &self,
+        provider: &str,
+        host: Option<&str>,
+        id_param: &str,
+        proof_id: &str,
+    ) -> Result<()> {
+        let kind = Provider::parse(provider)?;
+        let target = self.resolve_source_control_target(provider, host)?;
+        let proof = self.proof_provider(&target);
+        let proof_id = proof_id.trim();
+        if !proof.valid_proof_id(proof_id) {
+            return Err(Error::InvalidParams(match kind {
+                Provider::Github => {
+                    format!("{id_param} must be a non-empty alphanumeric gist id")
+                }
+                Provider::Gitlab => format!("{id_param} must be a numeric snippet id"),
+            }));
+        }
+        let token = self.stored_proof_token(&target).await?;
+        proof
+            .delete(&token, proof_id)
+            .await
+            .map_err(|e| github_auth_ops::map_identity_proof_err_for(kind, e))
     }
 
     /// The OAuth client id the GitLab device grant uses for `host`

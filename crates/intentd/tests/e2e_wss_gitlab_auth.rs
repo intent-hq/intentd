@@ -19,7 +19,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -48,6 +48,9 @@ const ROTATED_ACCESS_TOKEN: &str = "glo_e2e_rotated_access_token";
 const ROTATED_REFRESH_TOKEN: &str = "glr_e2e_rotated_refresh";
 const PAT_TOKEN: &str = "glpat-e2e-valid-personal-token";
 const BAD_PAT: &str = "glpat-e2e-rejected-token";
+/// A PAT the mock accepts on `/api/v4/user` but refuses snippet creation
+/// for (`403 insufficient_scope`: no `api` scope).
+const READ_ONLY_PAT: &str = "glpat-e2e-read-only-token";
 
 /// The bound instance: `sourceControl.gitlab.host` defaults to gitlab.com,
 /// whose device grant uses the compiled client id, so no settings are needed.
@@ -297,6 +300,37 @@ struct MockFlags {
     hold_poll: AtomicBool,
     poll_held: Notify,
     release_poll: Notify,
+    /// Personal snippets by id: `(author bearer, create body as posted)`.
+    /// Ids are handed out from 1 in creation order.
+    snippets: Mutex<Vec<(u64, String, Value)>>,
+    /// When set, snippet reads require a bearer (the instance restricts
+    /// anonymous access) — the host-side fallback scenario.
+    private_snippets: AtomicBool,
+}
+
+/// The mock's `GET /api/v4/snippets/:id` body for a stored snippet.
+fn snippet_json(id: u64, posted: &Value) -> Value {
+    let files = posted["files"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| json!({ "path": f["file_path"], "raw_url": format!("https://gitlab.com/-/snippets/{id}/raw/main/x") }))
+        .collect::<Vec<_>>();
+    json!({
+        "id": id,
+        "title": posted["title"],
+        "visibility": posted["visibility"],
+        "created_at": "2026-09-21T02:00:00.000Z",
+        "author": {
+            "id": 4242,
+            "username": "glab-octocat",
+            "name": "GitLab Octocat",
+            "avatar_url": "https://gitlab.com/uploads/avatar.png",
+        },
+        "file_name": files.first().map_or(Value::Null, |f| f["path"].clone()),
+        "files": files,
+    })
 }
 
 struct MockGitlab {
@@ -378,13 +412,58 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
     let is_refresh = form_field("grant_type").as_deref() == Some("refresh_token");
     let bearer_ok = bearer == ACCESS_TOKEN
         || bearer == PAT_TOKEN
+        || bearer == READ_ONLY_PAT
         || (bearer == ROTATED_ACCESS_TOKEN && !flags.reject_rotated.load(Ordering::SeqCst));
     let route = path.split('?').next().unwrap_or_default();
     if method == "GET" && route == "/api/v4/user" {
         flags.user_requests.fetch_add(1, Ordering::SeqCst);
         flags.user_hit.notify_one();
     }
+    // `/api/v4/snippets/:id[/raw]` → `(id, is_raw)`.
+    let snippet_route =
+        route
+            .strip_prefix("/api/v4/snippets/")
+            .map(|rest| match rest.strip_suffix("/raw") {
+                Some(id) => (id.parse::<u64>().ok(), true),
+                None => (rest.parse::<u64>().ok(), false),
+            });
+    let snippets_readable = bearer_ok || !flags.private_snippets.load(Ordering::SeqCst);
     let (status, body) = match (method, route) {
+        ("POST", "/api/v4/snippets") if bearer == READ_ONLY_PAT => (
+            403,
+            json!({ "error": "insufficient_scope", "error_description": "api" }),
+        ),
+        ("POST", "/api/v4/snippets") if bearer_ok => {
+            let posted: Value = serde_json::from_str(&form).unwrap_or(Value::Null);
+            let mut snippets = flags.snippets.lock().unwrap();
+            let id = snippets.len() as u64 + 1;
+            snippets.push((id, bearer.clone(), posted.clone()));
+            (201, snippet_json(id, &posted))
+        }
+        ("GET", _) if snippet_route.is_some() && !snippets_readable => {
+            (401, json!({ "message": "401 Unauthorized" }))
+        }
+        ("GET", _) if snippet_route.is_some() => {
+            let (id, is_raw) = snippet_route.unwrap();
+            let snippets = flags.snippets.lock().unwrap();
+            match id.and_then(|id| snippets.iter().find(|(sid, _, _)| *sid == id)) {
+                Some((id, _, posted)) if is_raw => (200, posted["files"][0]["content"].clone()),
+                Some((id, _, posted)) => (200, snippet_json(*id, posted)),
+                None => (404, json!({ "message": "404 Snippet Not Found" })),
+            }
+        }
+        ("DELETE", _) if snippet_route.is_some() && bearer_ok => {
+            let (id, _) = snippet_route.unwrap();
+            let mut snippets = flags.snippets.lock().unwrap();
+            match id.and_then(|id| snippets.iter().position(|(sid, _, _)| *sid == id)) {
+                Some(pos) => {
+                    snippets.remove(pos);
+                    (204, Value::Null)
+                }
+                None => (404, json!({ "message": "404 Snippet Not Found" })),
+            }
+        }
+        ("DELETE", _) if snippet_route.is_some() => (401, json!({ "message": "401 Unauthorized" })),
         ("POST", "/oauth/authorize_device") if flags.unsupported.load(Ordering::SeqCst) => {
             (404, json!({ "error": "Not Found" }))
         }
@@ -440,7 +519,9 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
                 "email": "hidden@example.com",
             }),
         ),
-        ("GET", "/api/v4/user") => (401, json!({ "message": "401 Unauthorized" })),
+        ("POST", "/api/v4/snippets") | ("GET", "/api/v4/user") => {
+            (401, json!({ "message": "401 Unauthorized" }))
+        }
         _ => (404, json!({ "error": "not_found" })),
     };
     if method == "POST" && route == "/oauth/token" && status == 200 {
@@ -462,10 +543,17 @@ async fn serve_conn(mut stream: TcpStream, flags: Arc<MockFlags>) -> std::io::Re
         flags.poll_held.notify_one();
         flags.release_poll.notified().await;
     }
-    let payload = body.to_string();
+    // A snippet's raw read answers the file text itself; `204` has no body.
+    let is_raw_read = matches!(snippet_route, Some((_, true))) && status == 200;
+    let payload = match &body {
+        Value::String(text) if is_raw_read => text.clone(),
+        _ if status == 204 => String::new(),
+        other => other.to_string(),
+    };
     let response = format!(
-        "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        if status == 200 { "OK" } else { "Error" },
+        "HTTP/1.1 {status} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        if (200..300).contains(&status) { "OK" } else { "Error" },
+        if is_raw_read { "text/plain" } else { "application/json" },
         payload.len(),
         payload
     );
@@ -800,6 +888,255 @@ async fn gitlab_pat_connect_over_wss() {
         json!(PAT_TOKEN),
         "refusals left the stored token alone"
     );
+}
+
+/// The GitLab snippet identity proof, guest half, over WSS (protocol 10.8,
+/// `sourceControl.identityProof.create` / `delete`): refused with the typed
+/// `gitlab-not-connected` before a connection exists (and for a host that is
+/// not the bound instance) → param refusals are `-32602` and touch nothing →
+/// a connected PAT publishes the nonce as a **public** single-file personal
+/// snippet with the stored token, the owner identity coming from the
+/// snippet's `author` with no follow-up user call → delete reads the snippet
+/// back, deletes it, is idempotent, and refuses a snippet that is not an
+/// Intent proof → a token without the `api` scope is `gitlab-scope-missing`
+/// → the `github.identityProof.*` aliases still answer `github-not-connected`
+/// on this GitHub-less daemon → revoke returns create to `gitlab-not-connected`.
+/// 🔒 No response ever carries the token.
+#[tokio::test]
+async fn gitlab_snippet_identity_proof_over_wss() {
+    let mock = spawn_mock_gitlab().await;
+    let h = boot(&mock).await;
+    let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
+    let create = |nonce: &str| json!({ "provider": "gitlab", "nonce": nonce, "hostLabel": "Clement's Mac Studio" });
+    let expect_proof_error = |v: &Value, code: &str| {
+        assert_eq!(v["error"]["code"], json!(-32603), "envelope: {v}");
+        assert_eq!(v["error"]["data"], json!({ "code": code }), "envelope: {v}");
+    };
+
+    // 1. Nothing connected → typed refusal, nothing created.
+    let v = wss_rpc(
+        &mut rpc,
+        1,
+        "sourceControl.identityProof.create",
+        create("n-0"),
+    )
+    .await;
+    expect_proof_error(&v, "gitlab-not-connected");
+    let v = wss_rpc(
+        &mut rpc,
+        2,
+        "sourceControl.identityProof.delete",
+        json!({ "provider": "gitlab", "proofId": "1" }),
+    )
+    .await;
+    expect_proof_error(&v, "gitlab-not-connected");
+
+    // 2. Param refusals (all -32602, none reach the forge).
+    let refusals = [
+        json!({ "provider": "bitbucket", "nonce": "n", "hostLabel": "h" }),
+        json!({ "provider": "github", "host": HOST, "nonce": "n", "hostLabel": "h" }),
+        json!({ "provider": "gitlab", "host": "https://gitlab.com", "nonce": "n", "hostLabel": "h" }),
+        json!({ "provider": "gitlab", "hostLabel": "h" }),
+        json!({ "provider": "gitlab", "nonce": "n" }),
+        json!({ "provider": "gitlab", "nonce": "line1\nline2", "hostLabel": "h" }),
+        json!({ "provider": "gitlab", "nonce": "   ", "hostLabel": "h" }),
+    ];
+    for (id, params) in (10i64..).zip(refusals) {
+        let v = wss_rpc(
+            &mut rpc,
+            id,
+            "sourceControl.identityProof.create",
+            params.clone(),
+        )
+        .await;
+        expect_invalid_params(&v);
+    }
+    for (id, proof_id) in (20i64..).zip(["", "abc", "1/raw", "-1"]) {
+        let v = wss_rpc(
+            &mut rpc,
+            id,
+            "sourceControl.identityProof.delete",
+            json!({ "provider": "gitlab", "proofId": proof_id }),
+        )
+        .await;
+        expect_invalid_params(&v);
+    }
+    assert!(mock.flags.snippets.lock().unwrap().is_empty());
+
+    // 3. Connect with a PAT, then prove.
+    let v = wss_rpc(
+        &mut rpc,
+        30,
+        "sourceControl.connect",
+        json!({ "provider": "gitlab", "method": "pat", "token": PAT_TOKEN }),
+    )
+    .await;
+    assert_eq!(v["result"], json!({ "ok": true, "method": "pat" }), "{v}");
+
+    // A host other than the bound instance has no credential.
+    let v = wss_rpc(
+        &mut rpc,
+        31,
+        "sourceControl.identityProof.create",
+        json!({ "provider": "gitlab", "host": "gitlab.example.org", "nonce": "n-1", "hostLabel": "h" }),
+    )
+    .await;
+    expect_proof_error(&v, "gitlab-not-connected");
+
+    let user_calls_before = mock.flags.user_requests.load(Ordering::SeqCst);
+    let v = wss_rpc(
+        &mut rpc,
+        32,
+        "sourceControl.identityProof.create",
+        create(" n-1 "),
+    )
+    .await;
+    assert_eq!(
+        v["result"],
+        json!({
+            "proofId": "1",
+            "provider": "gitlab",
+            "host": HOST,
+            "login": "glab-octocat",
+            "externalUserId": "4242",
+            "avatarUrl": "https://gitlab.com/uploads/avatar.png",
+        }),
+        "{v}"
+    );
+    assert!(!v.to_string().contains(PAT_TOKEN), "🔒 {v}");
+    assert_eq!(
+        mock.flags.user_requests.load(Ordering::SeqCst),
+        user_calls_before,
+        "identity comes from the snippet author: no follow-up user call"
+    );
+    {
+        let snippets = mock.flags.snippets.lock().unwrap();
+        assert_eq!(snippets.len(), 1);
+        let (_, bearer, posted) = &snippets[0];
+        assert_eq!(bearer, PAT_TOKEN, "made with the stored token");
+        assert_eq!(posted["visibility"], json!("public"));
+        assert_eq!(
+            posted["title"],
+            json!("Intent identity proof for Clement's Mac Studio (safe to delete)")
+        );
+        let files = posted["files"].as_array().expect("files");
+        assert_eq!(files.len(), 1, "exactly one file: {posted}");
+        assert_eq!(files[0]["file_path"], json!("intent-join-proof.txt"));
+        let content = files[0]["content"].as_str().expect("content");
+        assert_eq!(
+            content.lines().next(),
+            Some("n-1"),
+            "nonce is the first line"
+        );
+    }
+
+    // 4. Delete: reads back, deletes, idempotent, refuses non-proof snippets.
+    // A second, non-proof snippet of the account (seeded straight into the mock).
+    mock.flags.snippets.lock().unwrap().push((
+        2,
+        PAT_TOKEN.to_string(),
+        json!({
+            "title": "my notes",
+            "visibility": "private",
+            "files": [{ "file_path": "notes.md", "content": "hello" }],
+        }),
+    ));
+    let v = wss_rpc(
+        &mut rpc,
+        40,
+        "sourceControl.identityProof.delete",
+        json!({ "provider": "gitlab", "host": HOST, "proofId": "1" }),
+    )
+    .await;
+    assert_eq!(v["result"], json!({ "ok": true }), "{v}");
+    let v = wss_rpc(
+        &mut rpc,
+        41,
+        "sourceControl.identityProof.delete",
+        json!({ "provider": "gitlab", "proofId": "1" }),
+    )
+    .await;
+    assert_eq!(
+        v["result"],
+        json!({ "ok": true }),
+        "already deleted is ok: {v}"
+    );
+    let v = wss_rpc(
+        &mut rpc,
+        42,
+        "sourceControl.identityProof.delete",
+        json!({ "provider": "gitlab", "proofId": "2" }),
+    )
+    .await;
+    expect_invalid_params(&v);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("nothing deleted")),
+        "{v}"
+    );
+    {
+        let snippets = mock.flags.snippets.lock().unwrap();
+        assert_eq!(snippets.len(), 1, "the non-proof snippet survives");
+        assert_eq!(snippets[0].0, 2);
+    }
+
+    // 5. A token without the `api` scope → `gitlab-scope-missing`.
+    let v = wss_rpc(
+        &mut rpc,
+        50,
+        "sourceControl.connect",
+        json!({ "provider": "gitlab", "method": "pat", "token": READ_ONLY_PAT }),
+    )
+    .await;
+    assert_eq!(v["result"], json!({ "ok": true, "method": "pat" }), "{v}");
+    let v = wss_rpc(
+        &mut rpc,
+        51,
+        "sourceControl.identityProof.create",
+        create("n-2"),
+    )
+    .await;
+    expect_proof_error(&v, "gitlab-scope-missing");
+    assert!(!v.to_string().contains(READ_ONLY_PAT), "🔒 {v}");
+
+    // 6. The GitHub aliases are untouched by the GitLab connection: this
+    // daemon has no GitHub token, and the gitlab path never consulted one.
+    let v = wss_rpc(
+        &mut rpc,
+        60,
+        "github.identityProof.create",
+        json!({ "nonce": "n", "hostLabel": "h" }),
+    )
+    .await;
+    expect_proof_error(&v, "github-not-connected");
+    let v = wss_rpc(
+        &mut rpc,
+        61,
+        "sourceControl.identityProof.create",
+        json!({ "provider": "github", "nonce": "n", "hostLabel": "h" }),
+    )
+    .await;
+    expect_proof_error(&v, "github-not-connected");
+
+    // 7. Revoke → back to not connected.
+    let v = wss_rpc(
+        &mut rpc,
+        70,
+        "sourceControl.revoke",
+        json!({ "provider": "gitlab", "host": HOST }),
+    )
+    .await;
+    assert!(v.get("error").is_none(), "{v}");
+    let v = wss_rpc(
+        &mut rpc,
+        71,
+        "sourceControl.identityProof.create",
+        create("n-3"),
+    )
+    .await;
+    expect_proof_error(&v, "gitlab-not-connected");
+    assert_eq!(mock.flags.snippets.lock().unwrap().len(), 1);
 }
 
 /// An instance without the device grant (404 on `/oauth/authorize_device`)

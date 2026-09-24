@@ -31244,26 +31244,16 @@ impl WorkspaceApi for Services {
         nonce: String,
         host_label: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        // Guest half of the gist identity-proof join flow: the proof gist is
-        // made with the STORED device-flow token only (never the env / `gh`
-        // fallbacks), against the same API host the reconnect guard uses.
-        // 🔒 The token stays server-side; only `{ gistId, login }` crosses.
-        let secrets = self.secrets.clone();
-        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
+        // Guest half of the gist identity-proof join flow: the legacy
+        // projection of `sourceControl.identityProof.create` with
+        // `provider: "github"` pinned; byte-identical `{ gistId, login }`.
+        // 🔒 The token stays server-side.
         Box::pin(async move {
             Self::require_administrator("github.identityProof.create")?;
-            let nonce = github_auth_ops::proof_line_param("nonce", &nonce)?;
-            let host_label = github_auth_ops::proof_line_param("hostLabel", &host_label)?;
-            let token = github_auth_ops::load_stored_token(&secrets).await?;
-            let gist = intent_sourcecontrol::identity_proof::create_proof_gist(
-                &token,
-                api_base.as_deref(),
-                &nonce,
-                &host_label,
-            )
-            .await
-            .map_err(github_auth_ops::map_identity_proof_err)?;
-            Ok(serde_json::json!({ "gistId": gist.gist_id, "login": gist.login }))
+            let (_, created) = self
+                .identity_proof_create("github", None, &nonce, &host_label)
+                .await?;
+            Ok(serde_json::json!({ "gistId": created.proof_id, "login": created.owner.login }))
         })
     }
 
@@ -31271,24 +31261,54 @@ impl WorkspaceApi for Services {
         &self,
         gist_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let secrets = self.secrets.clone();
-        let api_base = invite_ops::resolve_api_base_uri(self.github_api_base_uri.as_deref());
         Box::pin(async move {
             Self::require_administrator("github.identityProof.delete")?;
-            let gist_id = gist_id.trim();
-            if gist_id.is_empty() || !gist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
-                return Err(Error::InvalidParams(
-                    "gistId must be a non-empty alphanumeric gist id".to_string(),
-                ));
+            self.identity_proof_delete("github", None, "gistId", &gist_id)
+                .await?;
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
+    fn source_control_identity_proof_create(
+        &self,
+        provider: String,
+        host: Option<String>,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // 🔒 The token stays server-side; only the proof id and the owner's
+        // identity as the forge reported it cross. A github proof also
+        // carries the id under the legacy `gistId` key (§5.x compatibility).
+        Box::pin(async move {
+            Self::require_administrator("sourceControl.identityProof.create")?;
+            let (proof, created) = self
+                .identity_proof_create(&provider, host.as_deref(), &nonce, &host_label)
+                .await?;
+            let mut result = serde_json::json!({
+                "proofId": created.proof_id,
+                "provider": proof.wire_name(),
+                "host": proof.host(),
+                "login": created.owner.login,
+                "externalUserId": created.owner.external_user_id,
+                "avatarUrl": created.owner.avatar_url,
+            });
+            if proof.wire_name() == "github" {
+                result["gistId"] = serde_json::Value::String(created.proof_id);
             }
-            let token = github_auth_ops::load_stored_token(&secrets).await?;
-            intent_sourcecontrol::identity_proof::delete_proof_gist(
-                &token,
-                api_base.as_deref(),
-                gist_id,
-            )
-            .await
-            .map_err(github_auth_ops::map_identity_proof_err)?;
+            Ok(result)
+        })
+    }
+
+    fn source_control_identity_proof_delete(
+        &self,
+        provider: String,
+        host: Option<String>,
+        proof_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("sourceControl.identityProof.delete")?;
+            self.identity_proof_delete(&provider, host.as_deref(), "proofId", &proof_id)
+                .await?;
             Ok(serde_json::json!({ "ok": true }))
         })
     }

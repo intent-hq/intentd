@@ -175,12 +175,17 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Provider-generic auth (protocol 10.5, §5.27): +5 router methods
 /// (`sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
 /// `getUser`); the `github.*` auth quintet stays as byte-identical aliases.
-const EXPECTED_TOTAL_METHODS: usize = 392;
+///
+/// Provider-generic identity proof (protocol 10.8): +2 router methods
+/// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
+/// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
+/// stays as byte-identical aliases.
+const EXPECTED_TOTAL_METHODS: usize = 394;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 334;
+const EXPECTED_ROUTER_METHODS: usize = 336;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -789,6 +794,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.cancelAuth",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.identityProof.create",
+    "sourceControl.identityProof.delete",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -1299,6 +1306,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sourceControl.cancelAuth",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.identityProof.create",
+    "sourceControl.identityProof.delete",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -1937,6 +1946,14 @@ mod unbound_owner_only_methods {
             ("sourceControl.cancelAuth", json!({ "provider": "github" })),
             ("sourceControl.connect", json!({ "provider": "github" })),
             ("sourceControl.getUser", json!({ "provider": "github" })),
+            (
+                "sourceControl.identityProof.create",
+                json!({ "provider": "github", "nonce": "n", "hostLabel": "h" }),
+            ),
+            (
+                "sourceControl.identityProof.delete",
+                json!({ "provider": "github", "proofId": "g" }),
+            ),
             ("sourceControl.revoke", json!({ "provider": "github" })),
             ("specialist.create", json!({ "id": "s", "spec": {} })),
             ("specialist.delete", json!({ "id": "s", "scope": "global" })),

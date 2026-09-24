@@ -1345,6 +1345,52 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move { Ok(serde_json::json!({ "ok": true, "echoGistId": gist_id })) })
     }
 
+    fn source_control_identity_proof_create(
+        &self,
+        provider: String,
+        host: Option<String>,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            // Sentinel nonces exercise the two typed refusals' wire shapes.
+            if nonce == "no-scope" {
+                return Err(Error::IdentityProof(
+                    intent_core::IdentityProofErrorKind::GitlabScopeMissing,
+                ));
+            }
+            if nonce == "unverifiable" {
+                return Err(Error::IdentityUnverifiable {
+                    host: "gitlab.example".to_string(),
+                });
+            }
+            Ok(serde_json::json!({
+                "proofId": "77",
+                "login": "glab-octocat",
+                "echoProvider": provider,
+                "echoHost": host,
+                "echoNonce": nonce,
+                "echoHostLabel": host_label,
+            }))
+        })
+    }
+
+    fn source_control_identity_proof_delete(
+        &self,
+        provider: String,
+        host: Option<String>,
+        proof_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "echoProvider": provider,
+                "echoHost": host,
+                "echoProofId": proof_id,
+            }))
+        })
+    }
+
     fn git_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -4829,6 +4875,95 @@ async fn github_identity_proof_delete_routes_gist_id_and_requires_it() {
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn source_control_identity_proof_create_routes_provider_host_nonce_and_host_label() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"gitlab","host":"gitlab.example","nonce":"n1","hostLabel":"Studio"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["proofId"], serde_json::json!("77"));
+    assert_eq!(v["result"]["echoProvider"], serde_json::json!("gitlab"));
+    assert_eq!(v["result"]["echoHost"], serde_json::json!("gitlab.example"));
+    assert_eq!(v["result"]["echoNonce"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["echoHostLabel"], serde_json::json!("Studio"));
+    // `host` is optional (absent / null ⇒ omitted) but strictly typed.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"github","host":null,"nonce":"n1","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoHost"], Value::Null, "{v}");
+    for params in [
+        "{}",
+        r#"{"nonce":"n1","hostLabel":"h"}"#,
+        r#"{"provider":"gitlab","hostLabel":"h"}"#,
+        r#"{"provider":"gitlab","nonce":"n1"}"#,
+        r#"{"provider":"gitlab","host":123,"nonce":"n1","hostLabel":"h"}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
+}
+
+#[tokio::test]
+async fn source_control_identity_proof_refusals_carry_bounded_data() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"gitlab","nonce":"no-scope","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "gitlab-scope-missing" })
+    );
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"gitlab","nonce":"unverifiable","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "identity-unverifiable", "host": "gitlab.example" })
+    );
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("cannot verify identity on gitlab.example")
+    );
+}
+
+#[tokio::test]
+async fn source_control_identity_proof_delete_routes_proof_id_and_requires_it() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.delete","params":{"provider":"gitlab","host":"gitlab.example","proofId":"77"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["echoProvider"], serde_json::json!("gitlab"));
+    assert_eq!(v["result"]["echoHost"], serde_json::json!("gitlab.example"));
+    assert_eq!(v["result"]["echoProofId"], serde_json::json!("77"));
+    for params in [
+        "{}",
+        r#"{"proofId":"77"}"#,
+        r#"{"provider":"gitlab"}"#,
+        r#"{"provider":"gitlab","gistId":"77"}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.delete","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
 }
 
 #[tokio::test]
