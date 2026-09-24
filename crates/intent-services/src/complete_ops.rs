@@ -290,7 +290,7 @@ pub(crate) fn one_shot_launch(
 }
 
 /// Apply daemon-owned launch policy after caller-specific environment merges.
-/// The adapter command applies removals after sets, so CODEX_CONFIG is replaced
+/// The adapter command applies removals after sets, so `CODEX_CONFIG` is replaced
 /// without adding it to the removal list.
 pub(crate) fn apply_one_shot_launch_policy(
     provider: &intent_providers::ProviderConfig,
