@@ -99,7 +99,7 @@ async fn chief_prompt_version_validates_creation_without_inference() {
         json!(true),
         json!({}),
         json!([]),
-        json!(4294967296_u64),
+        json!(4_294_967_296_u64),
     ] {
         let result =
             create_versioned_chief(&svc, &ws, json!({"chiefPromptVersion": version})).await;
