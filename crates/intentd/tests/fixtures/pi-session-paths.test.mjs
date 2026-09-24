@@ -5,9 +5,10 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import {
   chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync,
-  readdirSync, rmSync, writeFileSync,
+  readdirSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createServer } from 'node:net';
@@ -15,6 +16,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { assertCleanupComplete, finishCleanup } from './pi-session-cleanup.mjs';
 
 assert.ok(process.env.PI_ACP_TEST_ENTRY, 'PI_ACP_TEST_ENTRY must select the adapter under test');
 const adapterEntry = resolve(process.env.PI_ACP_TEST_ENTRY);
@@ -126,17 +128,39 @@ const cases = [
 // Native .cmd/.bat tests are always registered on Windows; no skip/xfail mode.
 // Unix executable and extension wrappers are controls, not Windows emulation.
 const launchers = windows ? ['cmd', 'bat'] : ['executable', 'extension'];
+const runId = randomUUID();
+const completedEvidence = new Map();
+const expectedEvidence = new Map();
+const caseRuns = [];
 
 for (const launcherKind of launchers) {
   for (const [caseName, directoryName] of cases) {
-    test(`${launcherKind}: ACP create, restart, load and resume (${caseName})`, { timeout: 90_000 }, async t => {
+    const caseId = `${launcherKind}-${caseName}`;
+    caseRuns.push(test(`${launcherKind}: ACP create, restart, load and resume (${caseName})`, { timeout: 90_000 }, async t => {
       const root = mkdtempSync(join(tmpdir(), 'intent-pi-'));
+      const clients = [];
+      const sessions = [];
+      const evidence = { runId, root, platform: process.platform, node: process.version,
+        adapterEntry, launcherKind, caseName, sessions };
+      expectedEvidence.set(caseId, { runId, root });
       let closeLifetime = async () => {};
-      t.after(async () => {
-        try { await closeLifetime(); } finally {
-          rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      t.after(() => finishCleanup(evidence, {
+        async stopClients() {
+          const results = await Promise.allSettled(clients.map(async client => {
+            if (client.child.exitCode === null && client.child.signalCode === null) await client.stop();
+          }));
+          const errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+          if (errors.length) throw new AggregateError(errors, 'Adapter shutdown failed');
+        },
+        closeLifetime: () => closeLifetime(),
+      }, record => {
+        if (process.env.PI_ACP_EVIDENCE_DIR) {
+          mkdirSync(process.env.PI_ACP_EVIDENCE_DIR, { recursive: true });
+          writeFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, `${caseId}.json`), JSON.stringify(record, null, 2));
         }
-      });
+        completedEvidence.set(caseId, record);
+        t.diagnostic(JSON.stringify({ caseId, runId, root, cleanup: record.cleanup }));
+      }));
       const fixtureSockets = new Set();
       const lifetime = createServer(socket => {
         fixtureSockets.add(socket);
@@ -149,7 +173,8 @@ for (const launcherKind of launchers) {
           socket.end();
           await closed;
         })), 'orphaned fixture shutdown');
-        await new Promise((resolve, reject) => lifetime.close(error => error ? reject(error) : resolve()));
+        await bounded(new Promise((resolve, reject) => lifetime.close(error => error ? reject(error) : resolve())),
+          'fixture lifetime listener shutdown');
       };
       lifetime.listen(0, '127.0.0.1');
       await bounded(once(lifetime, 'listening'), 'fixture lifetime listener');
@@ -185,15 +210,12 @@ for (const launcherKind of launchers) {
         PI_TEST_LIFETIME_PORT: String(lifetime.address().port),
         PATH: `${cwd}${windows ? ';' : ':'}${process.env.PATH ?? ''}`,
       };
-      const clients = [];
       const start = async () => {
         const client = new AcpClient(cwd, env);
         clients.push(client);
         await client.initialize();
         return client;
       };
-      const sessions = [];
-      const evidence = { platform: process.platform, node: process.version, adapterEntry, launcherKind, caseName, sessions };
       try {
         let client = await start();
         for (const label of ['first', 'second']) {
@@ -245,20 +267,27 @@ for (const launcherKind of launchers) {
         evidence.error = String(error.stack ?? error);
         throw error;
       } finally {
-        for (const client of clients) {
-          if (client.child.exitCode === null && client.child.signalCode === null) await client.stop();
-        }
         evidence.pi = readJsonLines(journal);
         evidence.acp = clients.map(client => ({ transcript: client.transcript, stderr: client.stderr }));
         evidence.files = filesUnder(root);
         evidence.histories = sessions.map(session => ({ ...session, entries: readJsonLines(session.sessionFile) }));
         t.diagnostic(JSON.stringify({ platform: process.platform, node: process.version, adapterEntry, launcherKind, caseName,
           result: evidence.result, spawns: evidence.pi.filter(row => row.event === 'spawn') }));
-        if (process.env.PI_ACP_EVIDENCE_DIR) {
-          mkdirSync(process.env.PI_ACP_EVIDENCE_DIR, { recursive: true });
-          writeFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, `${launcherKind}-${caseName}.json`), JSON.stringify(evidence, null, 2));
-        }
       }
-    });
+    }));
   }
 }
+
+// This is a separate test, not an after hook on an already-failing path test.
+// It rejects missing/stale output and failed cleanup even for the expected old
+// Windows pin failures. CI always runs the full file, including this audit.
+test('independent cleanup audit for every Pi session case', async () => {
+  await Promise.all(caseRuns);
+  assert.equal(expectedEvidence.size, launchers.length * cases.length, 'Missing case cleanup registration');
+  for (const [caseId, expected] of expectedEvidence) {
+    const evidence = process.env.PI_ACP_EVIDENCE_DIR
+      ? JSON.parse(readFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, `${caseId}.json`), 'utf8'))
+      : completedEvidence.get(caseId);
+    assertCleanupComplete(evidence, expected);
+  }
+});

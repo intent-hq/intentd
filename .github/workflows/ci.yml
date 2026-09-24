@@ -1669,6 +1669,9 @@ jobs:
           PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
           PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
         run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs | tee pi-path-evidence/test.tap
+      - name: Test cleanup failure observability
+        if: ${{ !cancelled() }}
+        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs | tee pi-path-evidence/cleanup-checks.tap
       - uses: actions/upload-artifact@v6
         if: always()
         with:
