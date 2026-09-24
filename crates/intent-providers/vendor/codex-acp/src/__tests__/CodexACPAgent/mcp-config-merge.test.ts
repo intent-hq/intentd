@@ -8,7 +8,8 @@ import type {McpServerStdio} from "@agentclientprotocol/sdk";
 import {startCodexConnection} from "../../CodexJsonRpcConnection";
 import {createBaseTestFixture, removeDirectoryWithRetry, type TestFixture} from "../acp-test-utils";
 
-describe('MCP config merge across configured MCP servers and ACP request', { timeout: 40_000 }, () => {
+// Modified by Intent: tests requiring a real host Codex are opt-in.
+describe.skipIf(process.env['RUN_HOST_CODEX_TESTS'] !== 'true')('MCP config merge across configured MCP servers and ACP request', { timeout: 40_000 }, () => {
 
     let codexHome: string;
     let projectPath: string;
