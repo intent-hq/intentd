@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.104] - 2026-09-23
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump pinned claude-agent-acp to 0.81.1 ([#2097](https://github.com/intent-hq/intentd/pull/2097))
+
+
 ## [0.9.103] - 2026-09-23
 
 ### 🐛 Bug Fixes
