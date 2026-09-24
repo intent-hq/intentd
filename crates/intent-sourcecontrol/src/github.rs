@@ -79,7 +79,10 @@ fn pr_read_quota(core: RateLimitStatus, graphql: RateLimitStatus) -> RateLimitSt
         (Some(rest), Some(gql), Some(rest_limit), Some(gql_limit)) => RateLimitStatus {
             remaining: Some(rest.min(gql)),
             limit: Some(rest_limit.max(gql_limit)),
-            reset_at: if rest < gql {
+            reset_at: if rest == gql {
+                // Equal headroom remains constrained until both refill.
+                core.reset_at.max(graphql.reset_at)
+            } else if rest < gql {
                 core.reset_at
             } else {
                 graphql.reset_at

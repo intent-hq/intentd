@@ -126,7 +126,7 @@ pub(crate) struct RateLimitGate {
 
 impl RateLimitGate {
     /// One metered probe per provider interval across every sweep and
-    /// recovery caller, including concurrent callers and failed probes.
+    /// recovery caller, including concurrent callers and failed/cancelled probes.
     /// Holding this separate lock through the bounded request makes the
     /// first caller do the work; followers reuse its evidence. No PR-read
     /// cache or on-demand read behavior is affected.
@@ -140,6 +140,15 @@ impl RateLimitGate {
         }) {
             return previous.status;
         }
+        // Reserve the attempt before the cancellable network await. A
+        // dropped caller leaves unknown evidence until this interval ends,
+        // rather than letting the next caller start another metered probe.
+        // Completion below starts a full interval from the final result.
+        *probe = Some(QuotaProbe {
+            at: Instant::now(),
+            provider: sc.provider_id(),
+            status: None,
+        });
         let status = match sc.rate_limit_status().await {
             Ok(status) => Some(status),
             Err(error) => {

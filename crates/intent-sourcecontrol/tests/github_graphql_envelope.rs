@@ -218,6 +218,28 @@ async fn quota_probe_keeps_the_later_reset_when_both_resources_are_exhausted() {
 }
 
 #[tokio::test]
+async fn quota_probe_keeps_the_later_reset_when_resource_balances_are_equal() {
+    for (core_reset, graphql_reset) in [(1200, 1800), (1800, 1200)] {
+        let mock = spawn_mock_with_headers(Arc::new(move |request| {
+            let (resource, reset) = if request_target(request) == "/user" {
+                ("core", core_reset)
+            } else {
+                ("graphql", graphql_reset)
+            };
+            (200, format!("x-ratelimit-resource: {resource}\r\nx-ratelimit-remaining: 200\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-reset: {reset}\r\n"), "{}".into())
+        })).await;
+        let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+        let status = sc.rate_limit_status().await.unwrap();
+        assert_eq!(status.remaining, Some(200));
+        assert_eq!(
+            status.reset_at,
+            Some(1800),
+            "equal headroom cannot refill before both resources reset"
+        );
+    }
+}
+
+#[tokio::test]
 async fn quota_probes_never_multiply_requests_with_immediate_http_retries() {
     for status in [429, 503] {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
