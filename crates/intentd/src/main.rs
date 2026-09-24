@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 mod client;
+mod doctor_codex;
 mod exact_update;
 mod git_credential;
 mod import;
@@ -109,7 +110,17 @@ enum Command {
     Stop,
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
-    Doctor,
+    Doctor {
+        /// Compare fresh ACP and selected-runtime model catalogs. May download
+        /// the managed npm package; uses existing file/environment authentication
+        /// in isolated state, without prompts, login or token refresh. Each
+        /// catalog allows 30 seconds, plus local inspection/startup/cleanup
+        /// budgets. Missing models and partial failures remain advisory; catalog
+        /// membership does not verify account entitlement. Without this flag,
+        /// Codex checks only local provenance/versions and never resolves npm.
+        #[arg(long)]
+        codex_models: bool,
+    },
     /// Read or change daemon settings (§5.12) on a running daemon. With no
     /// arguments, lists every setting with its type and current value
     /// (`settings.list`); with `<name>`, prints that setting (`settings.get`);
@@ -341,7 +352,7 @@ async fn async_main(cli: Cli) -> ExitCode {
             Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
             Command::Status => cmd_status().await,
             Command::Stop => cmd_stop().await,
-            Command::Doctor => cmd_doctor().await,
+            Command::Doctor { codex_models } => cmd_doctor(codex_models).await,
             Command::Settings { name, value, stdin } => {
                 to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
             }
@@ -6568,7 +6579,7 @@ impl Signaller for NixSignaller {
     }
 }
 
-async fn cmd_doctor() -> ExitCode {
+async fn cmd_doctor(codex_models: bool) -> ExitCode {
     // `resolve_config` parses config.toml strictly — the same gate `serve`
     // applies. A malformed file exits non-zero here with the offending key.
     let config = match resolve_config() {
@@ -6628,7 +6639,7 @@ async fn cmd_doctor() -> ExitCode {
         }
     }
 
-    report_provider_availability(&config).await;
+    report_provider_availability(&config, codex_models).await;
 
     // §5.7 additions: ports-free window, cert validity, GitHub token presence,
     // context-engine availability, and host display/locality. The first two are
@@ -6900,13 +6911,12 @@ fn report_cow_support(config: &Config) {
 /// `providers.paths` override — monorepo#1065) and, best-effort, which are
 /// authenticated. Provider availability never fails `doctor` — a host with no
 /// providers installed is a valid (if limited) state.
-async fn report_provider_availability(config: &Config) {
+async fn report_provider_availability(config: &Config, codex_models: bool) {
     // Same settings source `serve` uses; a missing/unreadable file degrades
     // to no overrides (auto-detection only) rather than failing doctor.
-    let provider_paths =
-        intent_core::settings_file::SettingsFile::load_or_init(&config.config_path)
-            .map(|f| f.providers.paths)
-            .unwrap_or_default();
+    let settings = intent_core::settings_file::SettingsFile::load_or_init(&config.config_path)
+        .unwrap_or_default();
+    let provider_paths = &settings.providers.paths;
     println!("providers:");
     for provider in intent_providers::discover_providers_with_overrides(&|key| {
         provider_paths
@@ -6916,6 +6926,21 @@ async fn report_provider_availability(config: &Config) {
     }) {
         if let Some(reason) = &provider.gated_off {
             println!("  [--] {} ({})", provider.id, reason);
+            continue;
+        }
+        if provider.id == "codex" {
+            // Binary discovery alone says nothing about the fallback package's
+            // runtime. Only the safe diagnostic report supplies that evidence;
+            // do not run an opaque adapter as a generic auth/version probe.
+            println!(
+                "  [--] codex-acp named binary: {} (availability only)",
+                if provider.installed {
+                    "found"
+                } else {
+                    "not found"
+                }
+            );
+            doctor_codex::report(settings.clone(), codex_models).await;
             continue;
         }
         // npx-only providers (claude-code, codex, pi) never resolve a local binary;

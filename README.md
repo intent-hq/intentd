@@ -381,6 +381,51 @@ Paths are resolved via the `directories` crate and can be overridden with the
 `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment variables. The data dir holds the SQLite
 database (`intentd.db`) and the socket (`intentd.sock`).
 
+### Codex diagnostics
+
+`intentd doctor` reports the Codex adapter Intent selects: a `providers.paths.codex`
+override, local discovery, or the managed npm fallback. The configured managed package
+pin is configuration, not a measured version. Adapter and runtime versions are measured
+separately when their local package entrypoints can be verified; opaque wrappers,
+missing runtimes, and failed checks remain explicitly unknown. Named-binary availability
+does not establish runtime provenance. An unrelated `codex` on PATH is never used as
+evidence of the selected adapter's bundled runtime. Managed launches remove `CODEX_PATH`
+and `CODEX_CONFIG`; local launches retain production's runtime override policy.
+
+Ordinary doctor adds no npm resolution or live model request. To compare fresh catalogs:
+
+```bash
+intentd doctor --codex-models
+```
+
+This opt-in can resolve/download the selected managed npm package. It reports ACP
+advertisements and the verified runtime's `model/list` separately, preserving original
+IDs, raw model aliases, hidden flags, and each row's source. ACP choices may be
+synthesized by the adapter. Missing advertisements, explicitly empty catalogs, withheld
+IDs, and failed probes are distinct results; either side can succeed independently.
+Membership uses exact IDs/aliases without guessing effort suffixes. Model presence does
+not verify entitlement, and absence does not establish an account restriction or fix
+model access. No prompts, login, or token-refresh requests are sent.
+
+The probe copies existing file authentication from `CODEX_HOME/auth.json` (otherwise
+`$HOME/.codex/auth.json`, with `USERPROFILE` as the home fallback) and selected
+`OPENAI_API_KEY`, `CODEX_API_KEY`, or `CODEX_ACCESS_TOKEN` environment credentials into
+private temporary state. It does not import keyring-only credentials, user/project
+configuration, MCP servers, or cached model catalogs. Authentication may therefore be
+unavailable even when an ordinary session is logged in. Do not paste credentials into
+diagnostic commands. Output contains safe report fields and fixed failure messages,
+never raw provider errors or account metadata.
+
+Each local inspection/version operation has a three-second deadline and a 16 KiB stdout
+limit. ACP startup/conversation and raw startup/conversation each have their own
+30-second deadline and 1 MiB limit per output stream. Catalogs are bounded to 2,000 rows;
+raw pagination allows at most ten pages and rejects repeated cursors. Authentication and
+entrypoint files are bounded to 64 KiB. Local inspection, process startup and cleanup
+have separate budgets (cleanup confirmation allows five seconds), so the whole command
+can take longer than 30 seconds. Unconfirmed cleanup retains temporary state and reports
+that fact. All provider diagnostic failures remain advisory; existing daemon-health
+failures, such as an unusable database or occupied port, still make doctor exit nonzero.
+
 ### Settings
 
 `intentd settings` reads and changes daemon settings on a running daemon — a friendlier
@@ -632,4 +677,3 @@ The design docs live in the monorepo under `docs/`:
 
 - [intent-hq/intent](https://github.com/intent-hq/intent) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
-
