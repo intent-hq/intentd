@@ -851,9 +851,11 @@ pub struct Services {
     /// Incremented only after a mutation has committed successfully, then
     /// copied into both its response and `settings:changed` event.
     settings_revision: Arc<AtomicU64>,
-    /// Orders settings snapshots against every mutation from persistence
-    /// through revision allocation and event publication.
+    /// Orders ordinary settings persistence, revision allocation and event
+    /// publication against snapshots. Secret I/O uses per-setting gates and
+    /// finishes before acquiring this gate to commit the ordinary subset.
     settings_revision_gate: Arc<tokio::sync::RwLock<()>>,
+    settings_secret_gates: Arc<settings::SecretSettingsGates>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -1422,6 +1424,7 @@ impl Services {
             settings_registry: None,
             settings_revision: Arc::new(AtomicU64::new(0)),
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
+            settings_secret_gates: Arc::new(settings::SecretSettingsGates::default()),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub,
@@ -16470,6 +16473,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // Daemon settings are host state: administrator-only in the matrix.
             Self::require_administrator("settings.list")?;
+            let _secret_guards = self.settings_secret_gates.read(None).await;
             let _revision_guard = self.settings_revision_gate.read().await;
             let mut result = self.settings_service().list().await?;
             result["revision"] = serde_json::json!(self.settings_revision.load(Ordering::SeqCst));
@@ -16480,6 +16484,7 @@ impl WorkspaceApi for Services {
     fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("settings.get")?;
+            let _secret_guards = self.settings_secret_gates.read(Some(&path)).await;
             let _revision_guard = self.settings_revision_gate.read().await;
             let mut result = self.settings_service().get(&path).await?;
             result["revision"] = serde_json::json!(self.settings_revision.load(Ordering::SeqCst));
@@ -16495,7 +16500,6 @@ impl WorkspaceApi for Services {
             /// Which store a captured old value belongs to, so the rollback
             /// path restores it through the same seam that persisted it.
             enum OldStore {
-                Secret,
                 Db,
                 Registry,
             }
@@ -16509,7 +16513,7 @@ impl WorkspaceApi for Services {
             // BEFORE the revision gate so a slow gate holder (a secret-store
             // read under the gate has no timeout) only delays GitLab token
             // batches, never every settings.get / getAll / update / reset.
-            // No credential-gate holder takes the revision gate. The
+            // Other credential operations do not take the revision gate. The
             // default-model injection below never adds a credential path, so
             // inspecting the caller's batch here is sufficient.
             let _credential_guard = if Self::batch_touches_gitlab_credential(&changes) {
@@ -16517,7 +16521,17 @@ impl WorkspaceApi for Services {
             } else {
                 None
             };
-            let _revision_guard = self.settings_revision_gate.write().await;
+            let secret_paths: Vec<&str> = changes
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
+                .filter(|path| settings::find_definition(path).is_some_and(|def| def.sensitive))
+                .collect();
+            let has_secrets = !secret_paths.is_empty();
+            let _secret_guards = self.settings_secret_gates.write(&secret_paths).await;
+            let mut revision_guard = self.settings_revision_gate.write().await;
+            let caller_changes = changes.clone();
             // A default-provider switch re-resolves `model.default` for the
             // new provider (monorepo#3177). Appended BEFORE the old-value
             // snapshot below so a hook-failure rollback also restores the
@@ -16545,261 +16559,253 @@ impl WorkspaceApi for Services {
                     ));
                 }
             }
-            // Capture old values for ALL settings in the batch so we can rollback on hook failure.
-            // Registry holds the TOML-backed keys; store holds the remaining non-sensitive
-            // settings; secrets holds sensitive ones (§9.8).
-            // Fail closed: any read error during snapshot capture aborts the whole batch.
-            let registry = self.settings_registry.as_deref();
-            let old_values = if let Some(entries) = changes.as_array() {
-                let mut old = Vec::new();
-                for entry in entries {
-                    if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
-                        // Look up the definition to check if this setting is sensitive
-                        if let Some(def) = crate::settings::find_definition(path) {
-                            if def.sensitive {
-                                // Sensitive setting: capture from secrets store.
-                                // Fail closed: timeout/backing-error -> abort before applying anything.
-                                // The forge-token siblings the apply clears
-                                // are captured too, so a rollback restores
-                                // the credential with its grant metadata.
-                                let mut secret_paths = vec![path];
-                                secret_paths
-                                    .extend(crate::settings::forge_token_secret_siblings(path));
-                                for path in secret_paths {
-                                    match self.secrets.load(path).await {
-                                        Ok(Some(secret_val)) => {
-                                            old.push((
-                                                path.to_string(),
-                                                Some(secret_val),
-                                                OldStore::Secret,
-                                            ));
+            // Reject malformed/pinned mixed batches before any secret write.
+            self.settings_service().validate_update(&changes)?;
+            let secrets = if has_secrets {
+                drop(revision_guard);
+                let secrets = self.settings_service().update_secrets(&changes).await?;
+                revision_guard = self.settings_revision_gate.write().await;
+                secrets
+            } else {
+                settings::SecretSettingsUpdate::default()
+            };
+            // Another writer or file reload may have committed during secret
+            // I/O. Re-resolve against that snapshot and capture ordinary priors
+            // only now, so failure compensation cannot erase its commit.
+            let mut changes = caller_changes;
+            self.reresolve_default_model_on_provider_switch(&mut changes);
+            let result = async {
+                // Capture ordinary priors for hook-failure compensation. Secret
+                // priors were captured under their account guards before I/O;
+                // ordinary priors must reflect commits made while it was in flight.
+                // Fail closed on snapshot reads and compensate the staged secrets.
+                let registry = self.settings_registry.as_deref();
+                let old_values = if let Some(entries) = changes.as_array() {
+                    let mut old = Vec::new();
+                    for entry in entries {
+                        if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
+                            // Look up the definition to check if this setting is sensitive
+                            if let Some(_def) = crate::settings::find_definition(path).filter(|def| !def.sensitive) {
+                                if let Some(reg) =
+                                    registry.filter(|_| KNOWN_PATHS.contains(&path))
+                                {
+                                    // TOML-backed setting: capture the file-layer
+                                    // value from the registry snapshot. Origin
+                                    // `file` → present (restore that value);
+                                    // `default` → absent (rollback removes the
+                                    // key). A pinned key rejects the apply, so it
+                                    // never needs a rollback.
+                                    let snap = reg.snapshot();
+                                    let raw = match snap.origin(path) {
+                                        Some(SettingOrigin::File) => {
+                                            snap.get(path).map(|v| v.to_string())
+                                        }
+                                        _ => None,
+                                    };
+                                    old.push((path.to_string(), raw, OldStore::Registry));
+                                } else {
+                                    // Non-sensitive setting: capture from DB
+                                    match self.store.get_setting(path).await {
+                                        Ok(Some(raw)) => {
+                                            old.push((path.to_string(), Some(raw), OldStore::Db));
                                         }
                                         Ok(None) => {
                                             // Confirmed absent; mark for deletion on rollback.
-                                            old.push((path.to_string(), None, OldStore::Secret));
+                                            old.push((path.to_string(), None, OldStore::Db));
                                         }
                                         Err(e) => {
                                             return Err(Error::Internal(format!(
-                                                "settings.update: failed to read secret {path} during snapshot capture: {e}"
+                                                "settings.update: failed to read setting {path} during snapshot capture: {e}"
                                             )));
                                         }
                                     }
                                 }
-                            } else if let Some(reg) =
-                                registry.filter(|_| KNOWN_PATHS.contains(&path))
-                            {
-                                // TOML-backed setting: capture the file-layer
-                                // value from the registry snapshot. Origin
-                                // `file` → present (restore that value);
-                                // `default` → absent (rollback removes the
-                                // key). A pinned key rejects the apply, so it
-                                // never needs a rollback.
-                                let snap = reg.snapshot();
-                                let raw = match snap.origin(path) {
-                                    Some(SettingOrigin::File) => {
-                                        snap.get(path).map(|v| v.to_string())
-                                    }
-                                    _ => None,
-                                };
-                                old.push((path.to_string(), raw, OldStore::Registry));
-                            } else {
-                                // Non-sensitive setting: capture from DB
-                                match self.store.get_setting(path).await {
-                                    Ok(Some(raw)) => {
-                                        old.push((path.to_string(), Some(raw), OldStore::Db));
-                                    }
-                                    Ok(None) => {
-                                        // Confirmed absent; mark for deletion on rollback.
-                                        old.push((path.to_string(), None, OldStore::Db));
-                                    }
-                                    Err(e) => {
-                                        return Err(Error::Internal(format!(
-                                            "settings.update: failed to read setting {path} during snapshot capture: {e}"
-                                        )));
-                                    }
-                                }
                             }
                         }
                     }
-                }
-                old
-            } else {
-                Vec::new()
-            };
+                    old
+                } else {
+                    Vec::new()
+                };
 
-            let applied = self.settings_service().update(&changes).await?;
-            if !applied.is_empty() {
-                // Apply server runtime hooks (§5.12): start/stop the WSS listener
-                // when server.wsApi.enabled changes, restart it when
-                // server.wsApi.port changes while running.
-                if let Some(control) = self.server_control.get() {
-                    // Remember whether the listener/tunnel were up before the
-                    // hooks so a failed batch (e.g. a restart-on-new-value hook
-                    // that stopped one of them and then failed to start it) can
-                    // put them back up after the persistence rollback.
-                    let listener_was_running = control.ws_listener_port().await.is_some();
-                    let tunnel_was_running = control.tunnel_address().await.is_some();
-                    if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
-                        // Rollback: restore old values for ALL settings in the batch.
-                        // Log rollback failures but don't let them mask the original hook error.
-                        // Registry-backed restores are collected and applied as ONE batch
-                        // (a single config.toml rewrite + one change publication) instead of
-                        // per-key applies.
-                        let mut rollback_failed = false;
-                        let mut compensating_changes = Vec::new();
-                        let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
-                        for (path, old_val, old_store) in old_values {
-                            let rollback_result = match old_store {
-                                OldStore::Secret => {
-                                    // Sensitive setting: restore to secrets store or delete
-                                    if let Some(val) = &old_val {
-                                        self.secrets.store(&path, val).await
-                                    } else {
-                                        self.secrets.delete(&path).await
+                let applied = secrets.merge_applied(self.settings_service().update_non_secrets(&changes).await?);
+                if !applied.is_empty() {
+                    // Apply server runtime hooks (§5.12): start/stop the WSS listener
+                    // when server.wsApi.enabled changes, restart it when
+                    // server.wsApi.port changes while running.
+                    if let Some(control) = self.server_control.get() {
+                        // Remember whether the listener/tunnel were up before the
+                        // hooks so a failed batch (e.g. a restart-on-new-value hook
+                        // that stopped one of them and then failed to start it) can
+                        // put them back up after the persistence rollback.
+                        let listener_was_running = control.ws_listener_port().await.is_some();
+                        let tunnel_was_running = control.tunnel_address().await.is_some();
+                        if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
+                            // Rollback: restore old values for ALL settings in the batch.
+                            // Log rollback failures but don't let them mask the original hook error.
+                            // Registry-backed restores are collected and applied as ONE batch
+                            // (a single config.toml rewrite + one change publication) instead of
+                            // per-key applies.
+                            let mut rollback_failed = false;
+                            let mut compensating_changes = Vec::new();
+                            let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
+                            for (path, old_val, old_store) in old_values {
+                                let rollback_result = match old_store {
+                                    OldStore::Registry => {
+                                        // TOML-backed setting: restore the prior file
+                                        // value (or remove the key when it was absent);
+                                        // `Null` clears back to the schema default.
+                                        // Deferred into one registry batch below.
+                                        let value = old_val
+                                            .as_deref()
+                                            .and_then(|raw| serde_json::from_str(raw).ok())
+                                            .unwrap_or(serde_json::Value::Null);
+                                        registry_restores.push((path.clone(), value));
+                                        Ok(())
                                     }
-                                }
-                                OldStore::Registry => {
-                                    // TOML-backed setting: restore the prior file
-                                    // value (or remove the key when it was absent);
-                                    // `Null` clears back to the schema default.
-                                    // Deferred into one registry batch below.
-                                    let value = old_val
-                                        .as_deref()
-                                        .and_then(|raw| serde_json::from_str(raw).ok())
-                                        .unwrap_or(serde_json::Value::Null);
-                                    registry_restores.push((path.clone(), value));
-                                    Ok(())
-                                }
-                                OldStore::Db => {
-                                    // Non-sensitive setting: restore to DB or delete
-                                    if let Some(val) = &old_val {
-                                        self.store.set_setting(&path, val).await
-                                    } else {
-                                        self.store.delete_setting(&path).await.map(|_| ())
+                                    OldStore::Db => {
+                                        // Non-sensitive setting: restore to DB or delete
+                                        if let Some(val) = &old_val {
+                                            self.store.set_setting(&path, val).await
+                                        } else {
+                                            self.store.delete_setting(&path).await.map(|_| ())
+                                        }
                                     }
-                                }
-                            };
-                            if let Err(rollback_err) = rollback_result {
-                                tracing::error!(
-                                    path = %path,
-                                    error = %rollback_err,
-                                    "settings.update rollback failed for key"
-                                );
-                                rollback_failed = true;
-                            } else {
-                                // Build a change record for compensating hook application.
-                                // For settings with a prior persisted value, use that value.
-                                // For unset settings (old_val == None), use the schema default
-                                // so the compensating hook can restore runtime state (e.g., if
-                                // server.wsApi.enabled was unset/defaulting to false, and the
-                                // batch temporarily enabled it before failing, compensating hook
-                                // with default=false will stop the listener).
-                                let val_json = if let Some(val) = old_val {
-                                    serde_json::from_str(&val).unwrap_or(serde_json::Value::Null)
-                                } else if let Some(def) = crate::settings::find_definition(&path) {
-                                    def.default_value.unwrap_or(serde_json::Value::Null)
-                                } else {
-                                    serde_json::Value::Null
                                 };
-                                compensating_changes.push(serde_json::json!({
-                                    "path": path,
-                                    "value": val_json
-                                }));
-                            }
-                        }
-
-                        // Restore all TOML-backed keys as one atomic registry batch
-                        // (single config.toml rewrite, single change publication).
-                        if !registry_restores.is_empty() {
-                            if let Some(reg) = registry {
-                                if let Err(rollback_err) = reg.apply(&registry_restores) {
+                                if let Err(rollback_err) = rollback_result {
                                     tracing::error!(
+                                        path = %path,
                                         error = %rollback_err,
-                                        "settings.update registry rollback batch failed"
+                                        "settings.update rollback failed for key"
                                     );
                                     rollback_failed = true;
+                                } else {
+                                    // Build a change record for compensating hook application.
+                                    // For settings with a prior persisted value, use that value.
+                                    // For unset settings (old_val == None), use the schema default
+                                    // so the compensating hook can restore runtime state (e.g., if
+                                    // server.wsApi.enabled was unset/defaulting to false, and the
+                                    // batch temporarily enabled it before failing, compensating hook
+                                    // with default=false will stop the listener).
+                                    let val_json = if let Some(val) = old_val {
+                                        serde_json::from_str(&val).unwrap_or(serde_json::Value::Null)
+                                    } else if let Some(def) = crate::settings::find_definition(&path) {
+                                        def.default_value.unwrap_or(serde_json::Value::Null)
+                                    } else {
+                                        serde_json::Value::Null
+                                    };
+                                    compensating_changes.push(serde_json::json!({
+                                        "path": path,
+                                        "value": val_json
+                                    }));
                                 }
                             }
-                        }
 
-                        // Apply compensating hooks: re-apply the prior values through the same
-                        // hook path to restore runtime state (e.g., stop a listener that was
-                        // started before a later hook in the batch failed). This reuses the
-                        // deterministic priority-sorted dispatch from apply_server_setting_hooks.
-                        if !compensating_changes.is_empty() {
-                            if let Err(compensating_err) = self
-                                .apply_server_setting_hooks(&compensating_changes, control)
-                                .await
-                            {
-                                tracing::error!(
-                                    error = ?compensating_err,
-                                    "settings.update compensating hook application failed during rollback"
-                                );
-                                // Log but don't fail — the persistence rollback succeeded
+                            // Restore all TOML-backed keys as one atomic registry batch
+                            // (single config.toml rewrite, single change publication).
+                            if !registry_restores.is_empty() {
+                                if let Some(reg) = registry {
+                                    if let Err(rollback_err) = reg.apply(&registry_restores) {
+                                        tracing::error!(
+                                            error = %rollback_err,
+                                            "settings.update registry rollback batch failed"
+                                        );
+                                        rollback_failed = true;
+                                    }
+                                }
                             }
-                        }
 
-                        // A restart-on-new-value hook (port / bindAddress) stops the
-                        // listener before starting it, so a start failure leaves it
-                        // down even though the compensating hooks saw nothing to
-                        // restart. The persisted values are rolled back by now and
-                        // start re-reads them, so bring the listener back up if it
-                        // was running when the batch began.
-                        if listener_was_running && control.ws_listener_port().await.is_none() {
-                            match control.start_ws_listener().await {
-                                Ok(port) => tracing::info!(
-                                    port,
-                                    "settings.update rollback: restarted WSS listener on prior settings"
-                                ),
-                                Err(restart_err) => tracing::error!(
-                                    error = ?restart_err,
-                                    "settings.update rollback: failed to restart WSS listener on prior settings"
-                                ),
+                            // Apply compensating hooks: re-apply the prior values through the same
+                            // hook path to restore runtime state (e.g., stop a listener that was
+                            // started before a later hook in the batch failed). This reuses the
+                            // deterministic priority-sorted dispatch from apply_server_setting_hooks.
+                            if !compensating_changes.is_empty() {
+                                if let Err(compensating_err) = self
+                                    .apply_server_setting_hooks(&compensating_changes, control)
+                                    .await
+                                {
+                                    tracing::error!(
+                                        error = ?compensating_err,
+                                        "settings.update compensating hook application failed during rollback"
+                                    );
+                                    // Log but don't fail — the persistence rollback succeeded
+                                }
                             }
-                        }
 
-                        // Same for the tunnel: a restart-on-new-value hook
-                        // (derpUrl / port) stops the sidecar before starting
-                        // it, so a start failure (e.g. a bad new DERP URL)
-                        // leaves it down. The persisted values are rolled back
-                        // by now and start re-reads them, so bring the sidecar
-                        // back up if it was running when the batch began.
-                        if tunnel_was_running && control.tunnel_address().await.is_none() {
-                            match control.start_tunnel().await {
-                                Ok(address) => tracing::info!(
-                                    address = %address,
-                                    "settings.update rollback: restarted tailcat tunnel on prior settings"
-                                ),
-                                Err(restart_err) => tracing::error!(
-                                    error = ?restart_err,
-                                    "settings.update rollback: failed to restart tailcat tunnel on prior settings"
-                                ),
+                            // A restart-on-new-value hook (port / bindAddress) stops the
+                            // listener before starting it, so a start failure leaves it
+                            // down even though the compensating hooks saw nothing to
+                            // restart. The persisted values are rolled back by now and
+                            // start re-reads them, so bring the listener back up if it
+                            // was running when the batch began.
+                            if listener_was_running && control.ws_listener_port().await.is_none() {
+                                match control.start_ws_listener().await {
+                                    Ok(port) => tracing::info!(
+                                        port,
+                                        "settings.update rollback: restarted WSS listener on prior settings"
+                                    ),
+                                    Err(restart_err) => tracing::error!(
+                                        error = ?restart_err,
+                                        "settings.update rollback: failed to restart WSS listener on prior settings"
+                                    ),
+                                }
                             }
-                        }
 
-                        // Return an error that indicates incomplete rollback if any writes failed
-                        if rollback_failed {
-                            return Err(Error::Internal(format!(
-                                "settings.update hook failed ({e}), and rollback was incomplete (see logs)"
-                            )));
+                            // Same for the tunnel: a restart-on-new-value hook
+                            // (derpUrl / port) stops the sidecar before starting
+                            // it, so a start failure (e.g. a bad new DERP URL)
+                            // leaves it down. The persisted values are rolled back
+                            // by now and start re-reads them, so bring the sidecar
+                            // back up if it was running when the batch began.
+                            if tunnel_was_running && control.tunnel_address().await.is_none() {
+                                match control.start_tunnel().await {
+                                    Ok(address) => tracing::info!(
+                                        address = %address,
+                                        "settings.update rollback: restarted tailcat tunnel on prior settings"
+                                    ),
+                                    Err(restart_err) => tracing::error!(
+                                        error = ?restart_err,
+                                        "settings.update rollback: failed to restart tailcat tunnel on prior settings"
+                                    ),
+                                }
+                            }
+
+                            // Return an error that indicates incomplete rollback if any writes failed
+                            if rollback_failed {
+                                return Err(Error::Internal(format!(
+                                    "settings.update hook failed ({e}), and rollback was incomplete (see logs)"
+                                )));
+                            }
+                            // Return the hook error to the caller
+                            return Err(e);
                         }
-                        // Return the hook error to the caller
-                        return Err(e);
                     }
+                    let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+                    publish_event(
+                        self.event_bus.as_ref(),
+                        settings_changed_event(&applied, revision),
+                    )
+                    .await;
+                    self.on_settings_applied(&applied);
+                    return Ok(serde_json::json!({ "applied": applied, "revision": revision }));
                 }
-                let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-                publish_event(
-                    self.event_bus.as_ref(),
-                    settings_changed_event(&applied, revision),
-                )
-                .await;
-                self.on_settings_applied(&applied);
-                return Ok(serde_json::json!({ "applied": applied, "revision": revision }));
+                Ok(serde_json::json!({
+                    "applied": applied,
+                    "revision": self.settings_revision.load(Ordering::SeqCst),
+                }))
+            }.await;
+            // Ordinary rollback and compensating runtime hooks have finished;
+            // credential compensation can wait without holding the revision gate.
+            drop(revision_guard);
+            if let Err(error) = result {
+                if secrets.rollback(&self.secrets).await {
+                    return Err(Error::Internal(format!(
+                        "settings.update failed ({error}), and secret rollback was incomplete (see logs)"
+                    )));
+                }
+                return Err(error);
             }
-            Ok(serde_json::json!({
-                "applied": applied,
-                "revision": self.settings_revision.load(Ordering::SeqCst),
-            }))
+            result
         })
     }
 
@@ -16815,8 +16821,18 @@ impl WorkspaceApi for Services {
             } else {
                 None
             };
-            let _revision_guard = self.settings_revision_gate.write().await;
+            let _secret_guards = self.settings_secret_gates.write(&[&path]).await;
+            let sensitive = settings::find_definition(&path).is_some_and(|def| def.sensitive);
+            let mut revision_guard = if sensitive {
+                None
+            } else {
+                Some(self.settings_revision_gate.write().await)
+            };
             let (result, changed) = self.settings_service().reset_with_change(&path).await?;
+            if revision_guard.is_none() {
+                revision_guard = Some(self.settings_revision_gate.write().await);
+            }
+            let _revision_guard = revision_guard;
             let revision = if changed {
                 let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
                 publish_event(

@@ -188,7 +188,7 @@ const DEFAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// `delete` on the same account to finish ([`AsyncSecretStore::settle_detached`]).
 /// Three write budgets: long enough for a slow disk or a keychain prompt that
 /// is answered promptly, short enough that a wedged backing store cannot hold
-/// the settings gates (and every `settings.*` caller) indefinitely. Past the
+/// that credential's settings/forge gates indefinitely. Past the
 /// cap the credential state is unknown and the caller must not blind-restore.
 const DEFAULT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -2479,6 +2479,102 @@ pub(crate) struct SettingsService<'a> {
     registry: Option<&'a SettingsRegistry>,
 }
 
+/// Settings readers/writers of one secret wait for its whole mutation,
+/// including compensation and publication, without owning the global gate.
+/// The catalog bounds the map; sorted acquisition also orders mixed batches.
+pub(crate) struct SecretSettingsGates(
+    std::collections::BTreeMap<&'static str, Arc<tokio::sync::RwLock<()>>>,
+);
+
+impl Default for SecretSettingsGates {
+    fn default() -> Self {
+        Self(
+            definitions()
+                .into_iter()
+                .filter(|def| def.sensitive)
+                .map(|def| (def.path, Arc::new(tokio::sync::RwLock::new(()))))
+                .collect(),
+        )
+    }
+}
+
+impl SecretSettingsGates {
+    pub(crate) async fn write(
+        &self,
+        paths: &[&str],
+    ) -> Vec<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        let mut guards = Vec::new();
+        for (path, gate) in &self.0 {
+            if paths.contains(path) {
+                guards.push(gate.clone().write_owned().await);
+            }
+        }
+        guards
+    }
+
+    pub(crate) async fn read(
+        &self,
+        path: Option<&str>,
+    ) -> Vec<tokio::sync::OwnedRwLockReadGuard<()>> {
+        // A list needs all credentials, but must not keep earlier locks while
+        // waiting for a later one: that would let a parked account indirectly
+        // block unrelated secret updates. The revision gate is taken AFTER
+        // this succeeds, so a waiting snapshot cannot queue ahead of commits.
+        loop {
+            let mut guards = Vec::new();
+            let mut blocked = None;
+            for (key, gate) in &self.0 {
+                if path.is_some_and(|path| path != *key) {
+                    continue;
+                }
+                if let Ok(guard) = gate.clone().try_read_owned() {
+                    guards.push(guard);
+                } else {
+                    blocked = Some(gate);
+                    break;
+                }
+            }
+            let Some(gate) = blocked else {
+                return guards;
+            };
+            drop(guards);
+            drop(gate.read().await);
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SecretSettingsUpdate {
+    applied: Vec<(usize, Value)>,
+    prior: Vec<(String, Option<String>)>,
+}
+
+impl SecretSettingsUpdate {
+    pub(crate) fn merge_applied(&self, mut ordinary: Vec<(usize, Value)>) -> Vec<Value> {
+        ordinary.extend(self.applied.iter().cloned());
+        ordinary.sort_by_key(|(index, _)| *index);
+        ordinary.into_iter().map(|(_, entry)| entry).collect()
+    }
+
+    /// Only used after ALL secret writes succeeded. A timed-out write's own
+    /// settlement/rollback stays in `store_secret_and_clear_siblings`; never
+    /// blind-restore here after its unknown-state error.
+    pub(crate) async fn rollback(&self, secrets: &AsyncSecretStore) -> bool {
+        let mut failed = false;
+        for (path, prior) in &self.prior {
+            let restored = match prior {
+                Some(value) => secrets.store(path, value).await,
+                None => secrets.delete(path).await,
+            };
+            if let Err(error) = restored {
+                tracing::error!(path, %error, "settings.update secret rollback failed");
+                failed = true;
+            }
+        }
+        failed
+    }
+}
+
 impl<'a> SettingsService<'a> {
     pub(crate) fn new(
         store: &'a Store,
@@ -2608,27 +2704,13 @@ impl<'a> SettingsService<'a> {
         Ok(out)
     }
 
-    /// `settings.update` — validate the whole batch first (unknown path,
-    /// read-only path, or type/enum/min/max failure → `-32602`, nothing
-    /// applied), then persist. TOML-backed keys go through the registry as
-    /// **one atomic apply** (typed-schema + pin validation, single
-    /// comment-preserving `config.toml` rewrite; a flag-pinned key rejects the
-    /// whole batch with `-32602` before anything mutates) and never touch the
-    /// `SQLite` `settings` table. Secrets and state-blob keys keep their
-    /// existing stores. If a later secret/DB write in a mixed batch fails,
-    /// the already-applied registry batch is compensated (prior values
-    /// restored, config.toml rewritten back) so an error return never leaves
-    /// a durable file change without a `settings:changed` event. Returns the
-    /// **redacted** applied `{ path, value, origin? }` pairs for the response +
-    /// `settings:changed` payload.
-    ///
-    /// A sensitive entry whose value is the [`REDACTED_PLACEHOLDER`] is what a
-    /// client echoes back from `settings.list`/`settings.get` for a secret it
-    /// did not touch (intent#4383): with a stored secret it is a no-op for
-    /// that path (the secret is left as is; the entry is still echoed
-    /// redacted), without one it is `-32602` and the whole batch is rejected
-    /// before anything is applied — the placeholder is never stored.
-    pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
+    /// Validate every setting and the registry's typed schema/pins before
+    /// starting secret persistence. The commit revalidates after awaited I/O;
+    /// placeholder presence is checked by `update_secrets` before any write.
+    pub(crate) fn validate_update(
+        &self,
+        changes: &Value,
+    ) -> Result<Vec<(SettingDefinition, Value)>> {
         let entries = changes
             .as_array()
             .ok_or_else(|| Error::InvalidParams("'changes' must be an array".to_string()))?;
@@ -2667,18 +2749,90 @@ impl<'a> SettingsService<'a> {
             }
             def.validate(&value)?;
             validate_bare_model_id(path, &value)?;
-            if def.sensitive
-                && value.as_str() == Some(REDACTED_PLACEHOLDER)
-                && self.secrets.load(def.path).await?.is_none()
-            {
-                return Err(Error::InvalidParams(format!(
-                    "{path}: the redaction placeholder cannot be stored as a secret \
-                     (no secret is currently stored for this setting)"
-                )));
-            }
             planned.push((def, value));
         }
 
+        if let Some(reg) = self.registry {
+            let changes = planned
+                .iter()
+                .filter(|(def, _)| KNOWN_PATHS.contains(&def.path))
+                .map(|(def, value)| (def.path.to_string(), registry_value(def, value)))
+                .collect::<Vec<_>>();
+            reg.validate(&changes)?;
+        }
+        Ok(planned)
+    }
+
+    /// Persist only credentials, with their per-setting write guards held by
+    /// the caller. No ordinary setting is changed until the final commit.
+    pub(crate) async fn update_secrets(&self, changes: &Value) -> Result<SecretSettingsUpdate> {
+        let planned = self.validate_update(changes)?;
+        let mut update = SecretSettingsUpdate::default();
+        for (def, _) in planned.iter().filter(|(def, _)| def.sensitive) {
+            for path in std::iter::once(def.path)
+                .chain(forge_token_secret_siblings(def.path).iter().copied())
+            {
+                if !update.prior.iter().any(|(p, _)| p == path) {
+                    update
+                        .prior
+                        .push((path.to_string(), self.secrets.load_fresh(path).await?));
+                }
+            }
+        }
+        // Validate every placeholder before the first write, including when
+        // it appears after another secret in a mixed batch.
+        for (def, value) in &planned {
+            if def.sensitive
+                && value.as_str() == Some(REDACTED_PLACEHOLDER)
+                && update
+                    .prior
+                    .iter()
+                    .any(|(p, v)| p == def.path && v.is_none())
+            {
+                return Err(Error::InvalidParams(format!(
+                    "{}: the redaction placeholder cannot be stored as a secret (no secret is currently stored for this setting)", def.path
+                )));
+            }
+        }
+        for (index, (def, value)) in planned
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (def, _))| def.sensitive)
+        {
+            if value.as_str() != Some(REDACTED_PLACEHOLDER) {
+                let desired = match &value {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let unchanged = update
+                    .prior
+                    .iter()
+                    .any(|(p, v)| p == def.path && v.as_deref() == Some(&desired))
+                    && forge_token_secret_siblings(def.path).iter().all(|sibling| {
+                        update
+                            .prior
+                            .iter()
+                            .any(|(p, v)| p == sibling && v.is_none())
+                    });
+                if unchanged {
+                    continue;
+                }
+                self.store_secret_and_clear_siblings(def.path, &desired)
+                    .await?;
+            }
+            update.applied.push((
+                index,
+                json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }),
+            ));
+        }
+        Ok(update)
+    }
+
+    /// Called with the revision gate held after secret persistence succeeds.
+    /// Re-check ordinary values here: another settings call or a config-file
+    /// reload may have committed while the secret store was busy.
+    pub(crate) async fn update_non_secrets(&self, changes: &Value) -> Result<Vec<(usize, Value)>> {
+        let planned = self.validate_update(changes)?;
         // Keep validated entries only when persisting them would change the
         // observable setting state. For TOML-backed keys, origin is part of
         // that state: writing an effective default while the key is absent is
@@ -2686,32 +2840,12 @@ impl<'a> SettingsService<'a> {
         // value is a no-op. Flag-pinned entries remain in the plan so the
         // registry preserves its read-only rejection semantics.
         let mut mutations = Vec::with_capacity(planned.len());
-        for (def, value) in planned {
-            let unchanged = if def.sensitive {
-                // The placeholder stays in the plan so the entry is echoed
-                // (redacted) even though the secret itself is left untouched.
-                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
-                    false
-                } else {
-                    let desired = match &value {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    // Decided against the backing store, not the TTL cache:
-                    // a device grant may have replaced the token behind the
-                    // cache. A forge token whose device-grant siblings are
-                    // still stored is a change even when the token repeats —
-                    // the write reclassifies the credential as a PAT.
-                    let mut unchanged = self.secrets.load_fresh(def.path).await?.as_deref()
-                        == Some(desired.as_str());
-                    for sibling in forge_token_secret_siblings(def.path) {
-                        if unchanged && self.secrets.load_fresh(sibling).await?.is_some() {
-                            unchanged = false;
-                        }
-                    }
-                    unchanged
-                }
-            } else if let Some(reg) = self.registry_for(def.path) {
+        for (index, (def, value)) in planned
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (def, _))| !def.sensitive)
+        {
+            let unchanged = if let Some(reg) = self.registry_for(def.path) {
                 match reg.origin(def.path) {
                     Some(SettingOrigin::File) => reg
                         .get(def.path)
@@ -2725,22 +2859,20 @@ impl<'a> SettingsService<'a> {
                 }
             };
             if !unchanged {
-                mutations.push((def, value));
+                mutations.push((index, def, value));
             }
         }
         let planned = mutations;
 
-        // Apply the TOML-backed subset first, as one atomic registry batch:
-        // unknown/pinned keys and typed-schema violations reject here with
-        // `-32602` before ANY store (secret, DB, file) has been touched.
-        // Capture the prior effective values so a later secret/DB failure in
-        // a mixed batch can compensate (restore + rewrite config.toml back).
+        // Commit the TOML-backed subset as one atomic registry batch after
+        // secret persistence. Capture current ordinary priors under the
+        // revision gate so a DB failure compensates only this commit.
         let mut registry_rollback: Vec<(String, Value)> = Vec::new();
         if let Some(reg) = self.registry {
             let registry_changes: Vec<(String, Value)> = planned
                 .iter()
-                .filter(|(def, _)| KNOWN_PATHS.contains(&def.path))
-                .map(|(def, value)| (def.path.to_string(), registry_value(def, value)))
+                .filter(|(_, def, _)| KNOWN_PATHS.contains(&def.path))
+                .map(|(_, def, value)| (def.path.to_string(), registry_value(def, value)))
                 .collect();
             if !registry_changes.is_empty() {
                 registry_rollback = registry_changes
@@ -2760,22 +2892,8 @@ impl<'a> SettingsService<'a> {
         }
 
         let mut applied = Vec::with_capacity(planned.len());
-        for (def, value) in planned {
-            let persisted = if def.sensitive {
-                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
-                    // Presence was verified during validation: keep the
-                    // stored secret, echo the redacted entry.
-                    Ok(json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
-                } else {
-                    let secret_value = match &value {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    self.store_secret_and_clear_siblings(def.path, &secret_value)
-                        .await
-                        .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
-                }
-            } else if self.registry_for(def.path).is_some() {
+        for (index, def, value) in planned {
+            let persisted = if self.registry_for(def.path).is_some() {
                 // Already applied via the registry batch above. Normalize the
                 // echoed value so number-typed settings keep the float wire
                 // shape (`5181.0`) that `settings.get`/`settings.list` report.
@@ -2795,7 +2913,7 @@ impl<'a> SettingsService<'a> {
                     if let Some(origin) = self.origin_for(def.path) {
                         entry["origin"] = json!(origin);
                     }
-                    applied.push(entry);
+                    applied.push((index, entry));
                 }
                 Err(e) => {
                     // Compensate the registry batch: without this, the TOML
@@ -2807,7 +2925,7 @@ impl<'a> SettingsService<'a> {
                                 tracing::error!(
                                     error = %rollback_err,
                                     "settings.update registry rollback failed after \
-                                     secret/DB persistence error"
+                                     DB persistence error"
                                 );
                             }
                         }
@@ -2817,6 +2935,18 @@ impl<'a> SettingsService<'a> {
             }
         }
         Ok(applied)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
+        let secrets = self.update_secrets(changes).await?;
+        match self.update_non_secrets(changes).await {
+            Ok(applied) => Ok(secrets.merge_applied(applied)),
+            Err(error) => {
+                secrets.rollback(self.secrets).await;
+                Err(error)
+            }
+        }
     }
 
     /// Persist `value` for the secret at `path`, then clear its
@@ -3740,6 +3870,538 @@ mod tests {
                 return Ok(());
             }
             self.inner.delete(account)
+        }
+    }
+
+    /// A timed-out credential mutation must not keep the global revision gate
+    /// while it waits for settlement. Ordinary settings still commit, and a
+    /// failed mixed batch must not roll back a concurrent ordinary update.
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_write_does_not_block_unrelated_settings() {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::{REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT};
+
+        let dir = crate::test_support::test_tempdir("settings-parked-write");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let raw = InMemorySecretStore::default();
+        raw.store(SECRET_ACCOUNT, "glo_device").unwrap();
+        raw.store(REFRESH_SECRET_ACCOUNT, "glr_device").unwrap();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, _done_rx) = std::sync::mpsc::channel();
+        let secrets = Arc::new(AsyncSecretStore::with_timings(
+            Arc::new(ParkedDeleteSecretStore {
+                inner: raw.clone(),
+                park_delete_for: REFRESH_SECRET_ACCOUNT,
+                parked: parked_tx,
+                release: Mutex::new(release_rx),
+                done: done_tx,
+            }),
+            Duration::from_secs(1),
+            Duration::from_millis(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let mut services = crate::Services::new(store).with_settings_registry(registry);
+        services.secrets = secrets.clone();
+        let writer = services.clone();
+        let update = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    { "path": SECRET_ACCOUNT, "value": "glpat-new" },
+                    { "path": "git.autoCommit", "value": false }
+                ]))
+                .await
+        });
+        tokio::task::spawn_blocking(move || parked_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("sibling delete parked");
+        timeout(Duration::from_secs(5), async {
+            while !secrets.timed_out(REFRESH_SECRET_ACCOUNT) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("write timeout fired");
+        assert!(
+            !update.is_finished(),
+            "the mutation is waiting for settlement"
+        );
+
+        let read = timeout(
+            secrets.load_timeout,
+            services.settings_get("git.autoCommit".into()),
+        )
+        .await;
+        let concurrent = timeout(
+            secrets.load_timeout,
+            services.settings_update(json!([
+                { "path": "git.autoCommit", "value": false }
+            ])),
+        )
+        .await;
+        // Release before asserting, so RED never strands a blocking worker.
+        release_tx.send(()).unwrap();
+        let failure = update.await.unwrap().expect_err("sibling delete timed out");
+        assert!(matches!(failure, Error::Internal(_)));
+        let read = read
+            .expect("unrelated settings.get must finish within the read timeout")
+            .unwrap();
+        assert_eq!(
+            read["value"],
+            json!(true),
+            "uncommitted mixed changes stay hidden"
+        );
+        assert_eq!(read["revision"], json!(0));
+        let concurrent = concurrent
+            .expect("unrelated settings.update must finish within the read timeout")
+            .unwrap();
+        assert_eq!(concurrent["revision"], json!(1));
+        let after = services
+            .settings_get("git.autoCommit".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            after["value"],
+            json!(false),
+            "rollback preserves the concurrent commit"
+        );
+        assert_eq!(after["revision"], json!(1));
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glo_device")
+        );
+        assert_eq!(
+            raw.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glr_device")
+        );
+    }
+
+    struct ReleaseWrite(Option<std::sync::mpsc::Sender<()>>);
+
+    impl ReleaseWrite {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ReleaseWrite {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    struct ParkedSettingsWrite {
+        inner: InMemorySecretStore,
+        delete: bool,
+        entered: Arc<tokio::sync::Notify>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        once: std::sync::atomic::AtomicBool,
+    }
+
+    impl ParkedSettingsWrite {
+        fn park(&self, account: &str, delete: bool) {
+            if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT
+                && self.delete == delete
+                && self.once.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                // Drop of the test's sender also releases the blocking worker
+                // on an assertion failure, so runtime shutdown cannot hang.
+                let _ = self.release.lock().unwrap().recv();
+            }
+        }
+    }
+
+    impl SecretStore for ParkedSettingsWrite {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.inner.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            self.inner.store(account, value)?;
+            self.park(account, false);
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.inner.delete(account)?;
+            self.park(account, true);
+            Ok(())
+        }
+    }
+
+    async fn parked_settings_harness(
+        delete: bool,
+    ) -> (
+        tempfile::TempDir,
+        crate::Services,
+        InMemorySecretStore,
+        Arc<tokio::sync::Notify>,
+        ReleaseWrite,
+        crate::events::Subscription,
+    ) {
+        let dir = crate::test_support::test_tempdir("settings-staged-write");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let bus = crate::EventBus::new(store.clone());
+        let sub = bus.subscribe(crate::events::SubscriptionFilter::default());
+        let raw = InMemorySecretStore::default();
+        raw.store(
+            intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT,
+            "old-token",
+        )
+        .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let secrets = Arc::new(ParkedSettingsWrite {
+            inner: raw.clone(),
+            delete,
+            entered: entered.clone(),
+            release: Mutex::new(rx),
+            once: std::sync::atomic::AtomicBool::new(true),
+        });
+        let services = crate::Services::new(store)
+            .with_secret_store(secrets)
+            .with_settings_registry(registry)
+            .with_event_bus(bus);
+        (dir, services, raw, entered, ReleaseWrite(Some(tx)), sub)
+    }
+
+    async fn parked_settings_success(delete: bool) {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT;
+        use std::task::Poll;
+
+        let (_dir, services, raw, entered, mut release, mut sub) =
+            parked_settings_harness(delete).await;
+        let writer = services.clone();
+        let mutation = intent_core::spawn_daemon(async move {
+            if delete {
+                writer.settings_reset(SECRET_ACCOUNT.into()).await
+            } else {
+                writer
+                    .settings_update(json!([
+                        { "path": "notifications.volume", "value": 0.75 },
+                        { "path": SECRET_ACCOUNT, "value": "new-token" }
+                    ]))
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("write parked");
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            if delete { None } else { Some("new-token") }
+        );
+
+        // Drive snapshots until they actually wait on the in-flight secret.
+        // Neither may return its backing value under the old revision, and a
+        // waiting list must release earlier account locks before it parks.
+        let mut list = services.settings_list();
+        let mut get_secret = services.settings_get(SECRET_ACCOUNT.into());
+        assert!(std::future::poll_fn(|cx| Poll::Ready(list.as_mut().poll(cx).is_pending())).await);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(get_secret.as_mut().poll(cx).is_pending())).await
+        );
+        let ordinary = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_get("notifications.volume".into()),
+        )
+        .await
+        .expect("ordinary read is not blocked")
+        .unwrap();
+        assert_eq!(ordinary["value"], json!(0.5));
+        assert_eq!(ordinary["revision"], json!(0));
+        let ordinary_update = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_update(json!([
+                { "path": "git.autoCommit", "value": false }
+            ])),
+        )
+        .await
+        .expect("ordinary write is not blocked")
+        .unwrap();
+        assert_eq!(ordinary_update["revision"], json!(1));
+        let other_secret = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_update(json!([
+                { "path": "linear.token", "value": "linear-new" }
+            ])),
+        )
+        .await
+        .expect("the waiting list does not block another account")
+        .unwrap();
+        assert_eq!(other_secret["revision"], json!(2));
+        let other_get = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_get("linear.token".into()),
+        )
+        .await
+        .expect("another account can be read")
+        .unwrap();
+        assert_eq!(other_get["value"], json!(REDACTED_PLACEHOLDER));
+        assert_eq!(other_get["revision"], json!(2));
+
+        release.release();
+        let committed = mutation.await.unwrap().unwrap();
+        assert_eq!(committed["revision"], json!(3));
+        let (list, get_secret) = tokio::join!(list, get_secret);
+        let list = list.unwrap();
+        let get_secret = get_secret.unwrap();
+        assert_eq!(list["revision"], json!(3));
+        assert_eq!(get_secret["revision"], json!(3));
+        assert_eq!(
+            get_secret["value"],
+            if delete {
+                Value::Null
+            } else {
+                json!(REDACTED_PLACEHOLDER)
+            }
+        );
+        let volume = list["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == "notifications.volume")
+            .unwrap();
+        assert_eq!(
+            volume["value"],
+            if delete { json!(0.5) } else { json!(0.75) }
+        );
+        let expected = if delete {
+            json!([{ "path": SECRET_ACCOUNT, "value": null }])
+        } else {
+            json!([
+                { "path": "notifications.volume", "value": 0.75, "origin": "file" },
+                { "path": SECRET_ACCOUNT, "value": REDACTED_PLACEHOLDER }
+            ])
+        };
+        if !delete {
+            assert_eq!(committed["applied"], expected);
+        }
+        for (revision, changes) in [
+            (1, ordinary_update["applied"].clone()),
+            (2, other_secret["applied"].clone()),
+            (3, expected),
+        ] {
+            let events = timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "settings:changed");
+            assert_eq!(
+                events[0].data,
+                json!({ "revision": revision, "changes": changes })
+            );
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_update_preserves_snapshot_revision_and_event_order() {
+        parked_settings_success(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_reset_does_not_block_other_accounts_or_settings() {
+        parked_settings_success(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn secret_update_revalidates_after_io_and_restores_on_commit_rejection() {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT;
+        let (_dir, services, raw, entered, mut release, mut sub) =
+            parked_settings_harness(false).await;
+        let writer = services.clone();
+        let mutation = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    { "path": SECRET_ACCOUNT, "value": "new-token" },
+                    { "path": "notifications.volume", "value": 0.75 }
+                ]))
+                .await
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        {
+            let _revision = services.settings_revision_gate.write().await;
+            services
+                .settings_registry
+                .as_ref()
+                .unwrap()
+                .pin("notifications.volume", json!(0.5), "TEST_PIN")
+                .unwrap();
+        }
+        release.release();
+        assert!(matches!(
+            mutation.await.unwrap(),
+            Err(Error::InvalidParams(_))
+        ));
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("old-token")
+        );
+        let snapshot = services
+            .settings_get("notifications.volume".into())
+            .await
+            .unwrap();
+        assert_eq!(snapshot["value"], json!(0.5));
+        assert_eq!(snapshot["origin"], json!("flag"));
+        assert_eq!(snapshot["revision"], json!(0));
+        // A sentinel commit must be the first event: the rejected mixed batch
+        // never announces its temporary credential or consumes a revision.
+        services
+            .settings_update(json!([{ "path": "git.autoCommit", "value": false }]))
+            .await
+            .unwrap();
+        let events = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(events[0].data["revision"], json!(1));
+        assert_eq!(
+            events[0].data["changes"][0]["path"],
+            json!("git.autoCommit")
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn parked_secret_compensation_keeps_account_ownership_without_global_gate() {
+        use intent_core::WorkspaceApi;
+        use intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT;
+        struct RejectThenParkRollback {
+            inner: InMemorySecretStore,
+            registry: Arc<SettingsRegistry>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl SecretStore for RejectThenParkRollback {
+            fn load(&self, path: &str) -> Result<Option<String>> {
+                self.inner.load(path)
+            }
+            fn delete(&self, path: &str) -> Result<()> {
+                self.inner.delete(path)
+            }
+            fn store(&self, path: &str, value: &str) -> Result<()> {
+                if path == SECRET_ACCOUNT && value == "first-write" {
+                    // Invalidate preflight after secret persistence started,
+                    // forcing the final commit to compensate this credential.
+                    self.registry
+                        .pin("notifications.volume", json!(0.5), "TEST_PIN")?;
+                } else if path == SECRET_ACCOUNT && value == "old-token" {
+                    self.entered.notify_one();
+                    let _ = self.release.lock().unwrap().recv();
+                }
+                self.inner.store(path, value)
+            }
+        }
+        let dir = crate::test_support::test_tempdir("settings-parked-compensation");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        let raw = InMemorySecretStore::default();
+        raw.store(SECRET_ACCOUNT, "old-token").unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut release = ReleaseWrite(Some(tx));
+        let services = crate::Services::new(store)
+            .with_settings_registry(registry.clone())
+            .with_secret_store(Arc::new(RejectThenParkRollback {
+                inner: raw.clone(),
+                registry,
+                entered: entered.clone(),
+                release: Mutex::new(rx),
+            }));
+        let writer = services.clone();
+        let first = intent_core::spawn_daemon(async move {
+            writer
+                .settings_update(json!([
+                    { "path": SECRET_ACCOUNT, "value": "first-write" },
+                    { "path": "notifications.volume", "value": 0.75 }
+                ]))
+                .await
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("rollback parked");
+        let mut second = services.settings_update(json!([
+            { "path": SECRET_ACCOUNT, "value": "second-write" }
+        ]));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                second.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        let unrelated = timeout(
+            DEFAULT_LOAD_TIMEOUT,
+            services.settings_update(json!([
+                { "path": "git.autoCommit", "value": false }
+            ])),
+        )
+        .await
+        .expect("compensation must not hold the global gate")
+        .unwrap();
+        assert_eq!(unrelated["revision"], json!(1));
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("first-write")
+        );
+        release.release();
+        assert!(matches!(first.await.unwrap(), Err(Error::InvalidParams(_))));
+        assert_eq!(second.await.unwrap()["revision"], json!(2));
+        assert_eq!(
+            raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("second-write"),
+            "the first rollback must finish before a newer credential commits"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn mixed_settings_validation_rejects_before_any_secret_write() {
+        use intent_core::WorkspaceApi;
+        struct CountWrites(std::sync::atomic::AtomicUsize);
+        impl SecretStore for CountWrites {
+            fn load(&self, _: &str) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn store(&self, _: &str, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = crate::test_support::test_tempdir("settings-preflight");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+        registry
+            .pin("notifications.volume", json!(0.5), "TEST_PIN")
+            .unwrap();
+        let raw = Arc::new(CountWrites(std::sync::atomic::AtomicUsize::new(0)));
+        let services = crate::Services::new(store)
+            .with_secret_store(raw.clone())
+            .with_settings_registry(registry);
+        for entry in [
+            json!({ "path": "git.autoCommit", "value": "invalid" }),
+            json!({ "path": "notifications.volume", "value": 0.75 }),
+            json!({ "path": "providers.paths", "value": { "auggie": 42 } }),
+        ] {
+            let error = services
+                .settings_update(json!([
+                    { "path": "linear.token", "value": "must-not-be-written" }, entry
+                ]))
+                .await
+                .expect_err("mixed batch rejects");
+            assert!(matches!(error, Error::InvalidParams(_)), "{error:?}");
+            assert_eq!(raw.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 

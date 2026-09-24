@@ -498,6 +498,29 @@ impl SettingsRegistry {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn apply(&self, changes: &[(String, Value)]) -> Result<SettingsChanged> {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        let candidate = Self::validate_changes(&inner, changes)?;
+
+        for (path, value) in changes {
+            doc_set(&mut inner.doc, path, value)?;
+        }
+        inner.file = candidate;
+
+        let text = inner.doc.to_string();
+        atomic_write(&self.path, &text)?;
+        inner.record_write(&text);
+
+        self.publish(&inner)
+    }
+
+    /// Check a mixed settings batch before secret I/O without adopting or
+    /// publishing anything. `apply` validates again under its own lock: this
+    /// preflight is not a reservation across an awaited secret-store write.
+    pub(crate) fn validate(&self, changes: &[(String, Value)]) -> Result<()> {
+        let inner = self.inner.lock().expect("settings registry lock poisoned");
+        Self::validate_changes(&inner, changes).map(|_| ())
+    }
+
+    fn validate_changes(inner: &Inner, changes: &[(String, Value)]) -> Result<SettingsFile> {
         for (path, _) in changes {
             if !KNOWN_PATHS.contains(&path.as_str()) {
                 return Err(Error::InvalidParams(format!("unknown setting: {path}")));
@@ -527,16 +550,7 @@ impl SettingsRegistry {
             candidate = typed_from_json(json.clone(), path)?;
         }
 
-        for (path, value) in changes {
-            doc_set(&mut inner.doc, path, value)?;
-        }
-        inner.file = candidate;
-
-        let text = inner.doc.to_string();
-        atomic_write(&self.path, &text)?;
-        inner.record_write(&text);
-
-        self.publish(&inner)
+        Ok(candidate)
     }
 
     /// Re-parse externally edited file `text` (strict schema) and adopt it as
