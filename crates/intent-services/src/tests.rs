@@ -19439,7 +19439,7 @@ pub(crate) mod pr {
         // Gate open at the start, paused by the last forge read.
         let gate = svc.sweep_rate_limit.clone();
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
-            assert!(gate.pause_for(std::time::Duration::from_secs(3600)));
+            assert!(gate.pause_for(std::time::Duration::from_secs(3600), true));
         }));
         let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
         let until = svc
@@ -23359,7 +23359,7 @@ pub(crate) mod pr {
     /// workspace refresh pauses the forge work for every subsequent
     /// workspace in this and later sweeps (until the window resets), while
     /// the sweep itself keeps running its local, forge-free steps. A paused
-    /// tick spends exactly one quota-free probe on the early-lift check; a
+    /// tick spends exactly one shared quota probe on the early-lift check; a
     /// host without a `remaining` signal never lifts early.
     #[tokio::test]
     async fn pr_refresh_sweep_rate_limit_pauses_all_workspaces() {
@@ -23391,7 +23391,7 @@ pub(crate) mod pr {
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
 
         // The next tick is still inside the pause window: zero forge calls,
-        // one free probe for the early lift (no `remaining` → deadline kept).
+        // one probe for the early lift (no `remaining` → deadline kept).
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 2);
@@ -23399,8 +23399,7 @@ pub(crate) mod pr {
     }
 
     /// A paused PR-refresh tick whose probe reports the quota recovered
-    /// lifts the pause and refreshes in the SAME tick: the forge is called
-    /// again (here re-tripping the limit, which re-pauses — a fresh window).
+    /// lifts the pause and successfully refreshes in the SAME tick.
     #[tokio::test]
     async fn pr_refresh_sweep_lifts_the_pause_early_when_the_quota_recovered() {
         let tmp = TempDb::new();
@@ -23416,7 +23415,7 @@ pub(crate) mod pr {
         let sc = Arc::new(StubForge {
             rate_limited: true,
             rate_limit_reset: Some(u64::MAX / 2),
-            rate_limit_remaining: Some(5_000),
+            rate_limit_remaining: Some(0),
             rate_limit_limit: Some(5_000),
             ..Default::default()
         });
@@ -23425,21 +23424,27 @@ pub(crate) mod pr {
         svc.refresh_all_workspace_prs(0).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
-        let first_deadline = svc.sweep_rate_limit_paused_until().unwrap();
+        assert!(svc.sweeps_rate_limited(), "exhaustion opened the pause");
 
-        // Tick 1: the early-lift probe reports a full window → the gate
-        // lifts and the workspace is refreshed in this tick; its fetch trips
-        // the limit again, opening a NEW window (its own reset probe).
+        // Keep the service and its existing gate, but let the forge report
+        // a genuinely recovered window and successful PR reads on tick 1.
+        let recovered = Arc::new(StubForge {
+            rate_limit_remaining: Some(5_000),
+            rate_limit_limit: Some(5_000),
+            ..Default::default()
+        });
+        let svc = svc.with_source_control(recovered.clone());
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(
-            sc.seen_get_pr.lock().unwrap().len(),
-            2,
+            *recovered.seen_get_pr.lock().unwrap(),
+            vec![42],
             "the lifted tick refreshes instead of skipping"
         );
-        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 3);
-        assert!(
-            svc.sweep_rate_limit_paused_until().unwrap() >= first_deadline,
-            "the re-trip opened a fresh window"
+        assert_eq!(*recovered.seen_reset_probes.lock().unwrap(), 1);
+        assert!(!svc.sweeps_rate_limited(), "successful recovery stays open");
+        assert_eq!(
+            svc.store().get_workspace(&ws_id).await.unwrap().pr_status,
+            Some(intent_core::PullRequestStatus::Open)
         );
     }
 

@@ -395,7 +395,7 @@ pub struct AuthStatus {
     pub scopes: Vec<String>,
 }
 
-/// The host's REST core quota as reported by its quota-free probe
+/// Conservative headroom for the resources used by PR reads, from the host's probe
 /// ([`crate::SourceControl::rate_limit_status`]); every field is `None`
 /// when the host lacks the signal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -2083,7 +2083,7 @@ async fn cmd_serve(
     // each PR on an effective interval stretched to fit the `[prMonitor]
     // hourlyRequestBudget` cost model (a cadence planner, not a request
     // limiter) and stretched further ahead of exhaustion when the tick's
-    // quota-free probe shows the remaining quota would not cover the
+    // shared quota probe shows the remaining quota would not cover the
     // projected spend to reset within `quotaSharePercent`, a capped
     // oldest-first subset per tick — diff each
     // against its persisted baseline, and deliver one consolidated wake once

@@ -35,8 +35,8 @@
 //! request is counted or blocked against it, and actual spend can differ
 //! (the 3-call unit is a single-page estimate: a multi-page review list or
 //! a degraded-path REST fallback costs more; GraphQL reads ride their own
-//! quota). Ahead of genuine exhaustion, each due-sweep tick also spends one
-//! quota-free `rate_limit` probe and stretches the interval further when
+//! quota). Ahead of genuine exhaustion, each due-sweep tick also consults the
+//! shared quota probe and stretches the interval further when
 //! the projected spend to the window's reset would exceed
 //! `prMonitor.quotaSharePercent` of the REMAINING quota
 //! ([`plan_quota_cadence`]) — and defers every poll until the window
@@ -137,7 +137,7 @@ pub(crate) fn effective_pr_monitor_interval_secs(
     poll_secs.max(needed)
 }
 
-/// The forge's remaining quota as read by the tick's quota-free probe,
+/// The forge's remaining quota as read by the tick's quota probe,
 /// reduced to what the cadence math needs: the requests left in the window
 /// and how long the window still runs. Absent whenever the probe failed or
 /// the host lacks either signal, in which case the cadence falls back to
@@ -1780,7 +1780,7 @@ impl Services {
             )
     }
 
-    /// The tick's one quota-free `rate_limit` probe, reduced to the window
+    /// The tick's one shared quota probe, reduced to the window
     /// the cadence plans on ([`QuotaWindow`]). `probed` is a status an
     /// earlier step of the same tick already paid for (the early lift,
     /// [`Services::maybe_lift_rate_limit_pause`]) — reused rather than
@@ -1794,16 +1794,7 @@ impl Services {
     ) -> Option<QuotaWindow> {
         let status = match probed {
             Some(status) => status,
-            None => match sc.rate_limit_status().await {
-                Ok(status) => status,
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "pr monitor sweep: quota probe failed; planning the cadence on the hourly budget alone"
-                    );
-                    return None;
-                }
-            },
+            None => self.sweep_rate_limit.probe_status(sc.as_ref()).await?,
         };
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2199,7 +2190,7 @@ impl Services {
     /// the PR's fresh snapshot, or `None` when the fetch is DEFERRED
     /// because the forge quota is exhausted. The gate is the same global
     /// rate-limit pause the sweeps share (monorepo#2961): while it is
-    /// closed the call spends one quota-free `rate_limit` probe
+    /// closed the call consults the shared quota probe
     /// ([`Services::maybe_lift_rate_limit_pause`]) — exactly like a sweep
     /// tick — and fetches only if that lifts the pause; and a fetch that
     /// fails with [`Error::RateLimited`] opens (or extends) the pause
@@ -2933,7 +2924,7 @@ impl Services {
     ///
     /// The sweep honours the global forge rate-limit gate shared with the
     /// PR-refresh and git-root sweeps (monorepo#2961): while the gate is
-    /// paused the tick spends one quota-free `rate_limit` probe
+    /// paused the tick consults the shared quota probe
     /// ([`Services::maybe_lift_rate_limit_pause`]) and, unless that lifts
     /// the pause early, is skipped before any forge call (no `lastError`
     /// churn; catch-up markers survive for the post-pause sweep), and a
@@ -4122,8 +4113,12 @@ mod tests {
         /// `None` is the host-without-signal default (no early lift).
         rate_limit_remaining: Option<u64>,
         rate_limit_limit: Option<u64>,
-        /// `rate_limit_status` itself fails (the free probe erroring).
+        /// `rate_limit_status` itself fails (the quota probe erroring).
         fail_rate_limit_status: bool,
+        /// A quota probe pends until its caller cancels the request.
+        hang_rate_limit_status: bool,
+        /// Metered hosts share a bounded probe cadence across all sweeps.
+        rate_limit_probe_interval: Duration,
         /// A real RFC 3339 `updatedAt` for the PR record, overriding the
         /// opaque `rev-N` stand-in when a test needs a comparable timestamp.
         updated_at: Option<String>,
@@ -4209,6 +4204,8 @@ mod tests {
                 rate_limit_remaining: None,
                 rate_limit_limit: None,
                 fail_rate_limit_status: false,
+                hang_rate_limit_status: false,
+                rate_limit_probe_interval: Duration::ZERO,
                 updated_at: None,
                 folded: None,
                 in_merge_queue: None,
@@ -4423,6 +4420,10 @@ mod tests {
         }
         async fn rate_limit_status(&self) -> intent_sourcecontrol::Result<RateLimitStatus> {
             self.count_sub_fetch("rate_limit_status");
+            let hangs = self.state.lock().unwrap().hang_rate_limit_status;
+            if hangs {
+                std::future::pending::<()>().await;
+            }
             let s = self.state.lock().unwrap();
             if s.fail_rate_limit_status {
                 return Err(intent_sourcecontrol::Error::Api(
@@ -4434,6 +4435,9 @@ mod tests {
                 remaining: s.rate_limit_remaining,
                 limit: s.rate_limit_limit,
             })
+        }
+        fn rate_limit_probe_interval(&self) -> Duration {
+            self.state.lock().unwrap().rate_limit_probe_interval
         }
         async fn get_pr(
             &self,
@@ -9466,7 +9470,7 @@ mod tests {
     /// opens the shared rate-limit pause, and the outcome carries no
     /// checklist. While the gate stays closed, a re-register of a monitor
     /// that already has a baseline defers the same way — clearing the
-    /// baseline instead of keeping a stale one — and spends one quota-free
+    /// baseline instead of keeping a stale one — and spends one quota
     /// probe and no PR fetch; the MCP payload reports `requirements: null`
     /// plus the pause deadline as `pausedUntil`.
     #[tokio::test]
@@ -9512,7 +9516,7 @@ mod tests {
             "both monitors are active"
         );
 
-        // Re-registering the armed monitor while paused: one free probe, no
+        // Re-registering the armed monitor while paused: one quota probe, no
         // PR fetch, the same row re-armed WITHOUT its now-unobservable
         // baseline, still naming the pause.
         let (rearmed, requirements) = svc
@@ -9774,7 +9778,7 @@ mod tests {
         // shared gate while it is in flight.
         let gate = Arc::clone(&svc.sweep_rate_limit);
         forge.set_on_get_pr(Some(Box::new(move |_| {
-            gate.pause_for(Duration::from_secs(300));
+            gate.pause_for(Duration::from_secs(300), true);
         })));
         forge.edit(|s| s.conversation_comments = 7);
         svc.poll_due_pr_monitors().await;
@@ -10293,7 +10297,8 @@ mod tests {
 
         // Schedule 2 — the pause EXTENDS after the gate read: the gate says
         // T1 (the capture composes T1), the row already names T2.
-        svc.sweep_rate_limit.pause_for(Duration::from_secs(600));
+        svc.sweep_rate_limit
+            .pause_for(Duration::from_secs(600), true);
         let gate_t1 = expected_pause_error(&svc);
         assert!(gate_t1 >= t1, "{gate_t1} >= {t1}");
         let t2 = pause_at(1800);
@@ -10432,7 +10437,195 @@ mod tests {
         assert_eq!(terminal.last_error.as_deref(), Some("old failure"));
     }
 
-    /// While paused, each sweep tick spends exactly one quota-free
+    #[tokio::test]
+    async fn preview_reads_keep_the_fresh_cache_and_ungated_refresh_contract() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let repo = RepoRef::new("o", "r");
+        svc.serve_pr(&repo, 42).await.expect("prime fresh cache");
+        forge.take_fetched_numbers();
+        forge.edit(|s| {
+            s.rate_limit_get_pr = true;
+            s.rate_limit_remaining = Some(0);
+            s.rate_limit_limit = Some(5000);
+        });
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        svc.pause_sweeps_for_rate_limit(&sc, "API rate limit exceeded")
+            .await;
+        let probes = forge.sub_fetches("rate_limit_status");
+
+        let (_, fetched) = svc.serve_pr(&repo, 42).await.expect("fresh cache survives");
+        assert!(!fetched);
+        assert!(forge.take_fetched_numbers().is_empty());
+        assert!(matches!(
+            svc.serve_pr(&repo, 43).await,
+            Err(Error::RateLimited(_))
+        ));
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![43],
+            "on-demand misses remain ungated"
+        );
+
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + Duration::from_secs(1));
+        assert!(matches!(
+            svc.serve_pr(&repo, 42).await,
+            Err(Error::RateLimited(_))
+        ));
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![42],
+            "expired cache must refresh"
+        );
+        assert_eq!(
+            forge.sub_fetches("rate_limit_status"),
+            probes,
+            "hovers never probe quota"
+        );
+
+        forge.edit(|s| s.rate_limit_get_pr = false);
+        let (_, fetched) = svc
+            .serve_pr(&repo, 43)
+            .await
+            .expect("later success resumes previews");
+        assert!(fetched);
+        assert!(
+            svc.sweeps_rate_limited(),
+            "one-shot success does not lift the background gate"
+        );
+        assert_eq!(forge.take_fetched_numbers(), vec![43]);
+    }
+
+    /// A quota rejection followed immediately by a healthy probe is not
+    /// evidence of recovery: the rejection may be a secondary limit or a
+    /// resource the probe cannot measure. Keep the fallback pause instead
+    /// of resuming and re-opening it on every tick (intent#5837).
+    #[tokio::test]
+    async fn a_healthy_probe_contradicting_a_rejection_cannot_lift_its_pause() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(4999);
+            s.rate_limit_limit = Some(5000);
+            s.rate_limit_reset_at = Some(u64::MAX);
+        });
+        svc.pause_sweeps_for_rate_limit(&sc, "API rate limit exceeded")
+            .await;
+        let until = svc.sweep_rate_limit_paused_until();
+        for _ in 0..2 {
+            assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+            assert_eq!(svc.sweep_rate_limit_paused_until(), until);
+        }
+        assert!(
+            svc.sweep_rate_limit.paused_remaining().unwrap()
+                <= crate::rate_limit::RATE_LIMIT_FALLBACK_PAUSE
+        );
+    }
+
+    #[tokio::test]
+    async fn metered_quota_probes_are_shared_across_concurrent_sweeps_and_recovery() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| {
+            s.rate_limit_probe_interval = Duration::from_secs(60);
+            s.rate_limit_remaining = Some(0);
+            s.rate_limit_limit = Some(5000);
+        });
+        svc.pause_sweeps_for_rate_limit(&sc, "API rate limit exceeded")
+            .await;
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..12 {
+            let (svc, sc) = (svc.clone(), sc.clone());
+            calls.spawn(async move {
+                assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+                svc.pr_monitor_quota_window(&sc, None).await;
+                svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+            });
+        }
+        while let Some(result) = calls.join_next().await {
+            result.expect("probe caller");
+        }
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+
+        forge.edit(|s| s.rate_limit_remaining = Some(4500));
+        assert!(
+            svc.maybe_lift_rate_limit_pause(&sc).await.is_none(),
+            "respect the probe interval"
+        );
+        svc.sweep_rate_limit.expire_probe().await;
+        assert!(
+            svc.maybe_lift_rate_limit_pause(&sc).await.is_some(),
+            "a later healthy probe lifts"
+        );
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 2);
+        assert!(!svc.sweeps_rate_limited());
+
+        // A cached healthy cadence result cannot lift a NEW rejection.
+        svc.pause_sweeps_for_rate_limit(&sc, "secondary rate limit")
+            .await;
+        assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 2);
+        assert!(svc.sweeps_rate_limited());
+    }
+
+    #[tokio::test]
+    async fn metered_probe_failures_also_keep_the_shared_probe_interval() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| {
+            s.rate_limit_probe_interval = Duration::from_secs(60);
+            s.fail_rate_limit_status = true;
+        });
+        svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+        for _ in 0..3 {
+            assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+            assert!(svc.pr_monitor_quota_window(&sc, None).await.is_none());
+        }
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+        svc.sweep_rate_limit.expire_probe().await;
+        assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_metered_probe_keeps_the_interval_and_cannot_claim_recovery() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| {
+            s.rate_limit_probe_interval = Duration::from_secs(60);
+            s.hang_rate_limit_status = true;
+            s.rate_limit_remaining = Some(5_000);
+            s.rate_limit_limit = Some(5_000);
+        });
+        svc.sweep_rate_limit
+            .pause_for(Duration::from_secs(300), true);
+
+        // Start a recovery probe, then cancel its caller while the network
+        // read is pending, as a workspace API evaluation timeout can do.
+        let mut request = Box::pin(svc.maybe_lift_rate_limit_pause(&sc));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(request.as_mut(), &mut context).is_pending());
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+        drop(request);
+
+        forge.edit(|s| s.hang_rate_limit_status = false);
+        for _ in 0..3 {
+            assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+        }
+        assert!(svc.sweeps_rate_limited(), "cancellation is not recovery");
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+
+        svc.sweep_rate_limit.expire_probe().await;
+        assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_some());
+        assert!(!svc.sweeps_rate_limited());
+        svc.pr_monitor_quota_window(&sc, None).await;
+        assert_eq!(
+            forge.sub_fetches("rate_limit_status"),
+            2,
+            "completed evidence retains its own shared interval"
+        );
+    }
+
+    /// While paused, each sweep tick spends exactly one quota
     /// `rate_limit` probe and lifts the gate EARLY — before the `reset +
     /// margin` deadline — once the probe reports the quota recovered
     /// (`remaining ≥ max(500, 10% of limit)`): the lifted tick polls right
@@ -10679,7 +10872,7 @@ mod tests {
     /// not from `lastPolledAt`: rows older than the reset horizon and
     /// catch-up-marked rows (which bypass the interval) are not fetched
     /// either, and the deferral holds as the horizon shrinks tick after
-    /// tick. Each tick still spends its single quota-free probe, the
+    /// tick. Each tick still spends its single quota probe, the
     /// catch-up markers survive, and the first tick under a fresh window
     /// polls the stale and catch-up rows.
     #[tokio::test]
