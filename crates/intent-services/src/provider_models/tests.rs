@@ -1861,32 +1861,37 @@ async fn acp_probe_child_receives_env_overrides() {
 }
 
 #[test]
-fn codex_probe_launch_npx_fallback_strips_codex_env() {
-    // The pinned npx fallback is daemon-managed: CODEX_PATH / CODEX_CONFIG
-    // must be removed from its child env (#555).
-    let cmd = super::codex_probe_launch(None, Some(std::path::PathBuf::from("/usr/local/bin/npx")))
-        .expect("npx fallback must produce a probe command");
+fn codex_probe_launch_enforces_both_subagent_settings() {
+    let cmd = super::codex_probe_launch(Some(std::path::PathBuf::from("/usr/local/bin/npx")))
+        .expect("npx must produce a probe command");
     let removed = cmd.removed_env_vars();
     assert!(removed.iter().any(|k| k == "CODEX_PATH"));
-    assert!(removed.iter().any(|k| k == "CODEX_CONFIG"));
+    assert!(!removed.iter().any(|k| k == "CODEX_CONFIG"));
+    let config = cmd
+        .env_vars()
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CODEX_CONFIG");
+    let value = config.map(|(_, value)| {
+        serde_json::from_str::<serde_json::Value>(value.to_str().unwrap()).unwrap()
+    });
+    assert_eq!(
+        value,
+        Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
+    );
 }
 
 #[test]
-fn codex_probe_launch_resolved_binary_keeps_codex_env() {
-    // A resolved codex-acp binary (providers.paths override / PATH scan) is
-    // the user's escape hatch — its env must be left untouched.
-    let cmd = super::codex_probe_launch(
-        Some(std::path::PathBuf::from("/custom/codex-acp")),
-        Some(std::path::PathBuf::from("/usr/local/bin/npx")),
-    )
-    .expect("resolved binary must produce a probe command");
-    assert!(cmd.removed_env_vars().is_empty());
-    assert!(cmd.env_vars().is_empty());
+fn codex_probe_launch_uses_selected_npx() {
+    let npx = std::path::PathBuf::from("/usr/local/bin/npx");
+    let cmd =
+        super::codex_probe_launch(Some(npx.clone())).expect("npx must produce a probe command");
+    assert_eq!(cmd.program(), npx.as_path());
 }
 
 #[test]
-fn codex_probe_launch_without_binary_or_npx_is_none() {
-    assert!(super::codex_probe_launch(None, None).is_none());
+fn codex_probe_launch_without_npx_is_none() {
+    assert!(super::codex_probe_launch(None).is_none());
 }
 
 #[cfg(unix)]

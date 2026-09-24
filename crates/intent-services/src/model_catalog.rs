@@ -237,25 +237,15 @@ fn claude_code_version() -> String {
     intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE.to_string()
 }
 
-/// codex source: ACP probe via a resolved `codex-acp` binary, else the pinned
-/// npx fallback.
+/// codex source: ACP probe via the pinned npx adapter.
 fn codex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     provider_models_fetch("codex")
 }
 
-/// codex is pinned only when the probe falls back to the npx adapter; a
-/// resolved `codex-acp` binary has no pin (mirrors the fetch dispatch in
-/// [`crate::provider_models::fetch_codex_models`]). The binary is resolved
-/// here and again inside the fetch — intentionally independent: the two
-/// resolutions are milliseconds apart, so at worst an install/uninstall
-/// mid-request stores one cache entry under the other branch's key, which
-/// the next request's key mismatch simply treats as a miss.
+/// Codex always uses this adapter pin. Native/custom adapter installations
+/// cannot change the model source or reuse their old unpinned cache entries.
 fn codex_version() -> String {
-    if intent_providers::find_provider_binary("codex", "codex-acp", None).is_some() {
-        String::new()
-    } else {
-        intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
-    }
+    intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
 }
 
 /// pi source: ACP probe via the pinned npx adapter.
@@ -499,11 +489,8 @@ impl ModelCatalogReader<'_> {
     /// or trigger a fetch — an unregistered provider, cold cache, stale-pin
     /// entry, or a catalog with no marked row all return `None` (the provider
     /// CLI default applies). The registry version-key function runs only when
-    /// a cached entry with a marked row exists — for codex it resolves the
-    /// `codex-acp` binary (an enhanced-PATH scan whose first call can block on
-    /// the login-shell PATH capture), a cost the cold-cache fall-through must
-    /// not pay; it also runs outside the cache lock so a slow first capture
-    /// never stalls other cache readers.
+    /// a cached entry with a marked row exists, and outside the cache lock so
+    /// executable-based source resolution never stalls other cache readers.
     pub(crate) fn cached_default_model(&self, provider_id: &str) -> Option<String> {
         let source = source_for(provider_id)?;
         let (entry_version_key, default_id) = {

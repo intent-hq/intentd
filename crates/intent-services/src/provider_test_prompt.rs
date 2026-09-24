@@ -144,15 +144,16 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
     // An npx launch runs a Node child whatever the provider's declared
     // runtime — thread the signal into the env builder (STAB-50 heap cap).
     let via_npx = resolved_bin.is_none();
-    let npx = intent_providers::find_npx();
+    let npx = if provider_id == "codex" {
+        intent_providers::find_codex_npx()
+    } else {
+        intent_providers::find_npx()
+    };
     let Some(mut cmd) = crate::complete_ops::one_shot_launch(provider, resolved_bin, npx, model)
     else {
         return Ok(failure(
             "not-installed",
-            format!(
-                "{provider_id}: no adapter could be resolved \
-                 (binary not found and npx unavailable)"
-            ),
+            crate::complete_ops::missing_one_shot_adapter_message(provider_id),
         ));
     };
     // Provider env parity with real ACP spawns: `one_shot_launch` builds
@@ -171,6 +172,7 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
     ) {
         cmd = cmd.env(key, value);
     }
+    let cmd = crate::complete_ops::apply_one_shot_launch_policy(provider, cmd);
     // codex loads MCP servers from its inherited CODEX_HOME regardless of the
     // empty ACP `mcpServers` list; the probe child gets the same isolated
     // throwaway home the one-shot completion path uses — a test prompt must

@@ -4074,7 +4074,7 @@ impl AgentManager {
     /// `session/set_config_option { configId: "model" }` for providers that
     /// expose the model as a session config option
     /// (`supports_config_option_model`; claude-code, pi, and codex today —
-    /// codex's npx-fallback adapter ignores `-c model=…` argv overrides and
+    /// codex's pinned npx adapter ignores `-c model=…` argv overrides and
     /// its `session/set_model` handler rejects our id formats, but it
     /// advertises a bare-id `configOptions[id="model"]` select). Compound ids
     /// are honored only when their provider prefix matches the running
@@ -8874,7 +8874,7 @@ impl AgentManager {
             resolved.provider_binary = Some(selected);
         }
         // npx version gate (intent-hq/intent#5725): before a fresh child spawns
-        // through npx (npx-only providers and the codex npx fallback), reject
+        // through npx (npx-only providers and optional npx fallbacks), reject
         // an npm-6 npx with an actionable error instead of three doomed
         // `npx -y` attempts. Only for a fresh spawn — a reused live child
         // never re-runs npx, so a later stale or hanging probe must not fail
@@ -10477,13 +10477,13 @@ fn resolve_spawn(
     // never starts the managed server.
     let unsloth_endpoint = None;
 
-    // npx-only providers (claude-code, pi) are spawned via
+    // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
     // skipped entirely. For providers that opt in
     // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
     // override (absolute, executable) is the one exception: it is exec'd
     // directly in place of the pinned npx spawn (monorepo#4352); an invalid
-    // override — or any override for pi — is ignored.
+    // override — or any override for codex/pi — is ignored.
     if provider.npx_only_package.is_some() {
         let explicit_path = read_provider_path_setting(settings, &provider_id);
         if let Some(binary) =
@@ -10506,7 +10506,12 @@ fn resolve_spawn(
                 unsloth_endpoint,
             });
         }
-        let (npx_binary, npx_package) = resolve_npx_only(&provider, intent_providers::find_npx())?;
+        let npx = if provider.id == "codex" {
+            intent_providers::find_codex_npx()
+        } else {
+            intent_providers::find_npx()
+        };
+        let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
         return Ok(ResolvedSpawn {
             provider,
             model,
@@ -10589,6 +10594,9 @@ fn resolve_npx_only(
         // InvalidInput (not Internal): this is an environment misconfiguration,
         // and its Display survives the JSON-RPC envelope (`domain_to_rpc` masks
         // Internal messages behind a literal "Internal error").
+        if provider.id == "codex" {
+            return Error::InvalidInput(intent_providers::CODEX_ACP_PREREQUISITE_ERROR.to_string());
+        }
         Error::InvalidInput(format!(
             "npx not found — {} is required to run {}. Install Node.js (which provides npx) and try again.",
             intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT,
@@ -10611,7 +10619,7 @@ fn resolve_npx_only(
 /// would otherwise retry three times and surface only "agent stdout closed".
 /// Permissive when the probe fails or its output does not parse (same policy
 /// as the pi/auggie gates). Runs from `ensure_started` for every fresh
-/// npx-backed spawn (npx-only providers and the codex npx fallback); blocking
+/// npx-backed spawn (npx-only providers and optional npx fallbacks); blocking
 /// (subprocess), so callers run it off the runtime.
 fn guard_npx_version(npx: &Path, node: Option<&Path>) -> Result<()> {
     let gate = intent_providers::npx_gate(&probe_npx_version_cached(npx));
@@ -10748,7 +10756,7 @@ fn run_npx_version_probe(npx: &Path) -> Option<String> {
 /// generated rules/MCP config paths while preserving every other field of the
 /// incoming opts. Notably the npx fallback pair must survive: dropping it
 /// makes `build_command` fall back to the bare provider command and fail with
-/// ENOENT when no local provider binary exists (codex fallback / claude-code
+/// ENOENT when no local provider binary exists (codex / claude-code
 /// npx-only spawns).
 fn rebuild_spawn_opts<'a>(
     opts: &SpawnOptions<'a>,
@@ -15865,7 +15873,7 @@ mod role_reminder_tests {
             None
         );
 
-        // Codex opted into the config-option path (its npx-fallback adapter
+        // Codex opted into the config-option path (its pinned npx adapter
         // ignores `-c model=…` argv overrides, and its `session/set_model`
         // handler rejects both bare and `{base}/{effort}` ids). The
         // adapter's model select values are bare base ids, so a
@@ -17653,10 +17661,22 @@ mod thought_level_tests {
 mod rebuild_spawn_opts_tests {
     //! Regression tests for the `create_agent` [`SpawnOptions`] reconstruction:
     //! it must preserve the npx fallback pair, otherwise providers without a
-    //! local binary (codex fallback / claude-code npx-only) spawn the bare
+    //! local binary (codex / claude-code npx-only) spawn the bare
     //! provider command and fail with ENOENT.
 
     use super::*;
+
+    #[test]
+    fn codex_npx_prerequisite_error_is_actionable() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let error = resolve_npx_only(provider, None).unwrap_err();
+        let Error::InvalidInput(message) = error else {
+            panic!("missing Codex prerequisites must be user-visible: {error}");
+        };
+        for expected in ["Node.js", "npx", "Install"] {
+            assert!(message.contains(expected), "{message}");
+        }
+    }
 
     #[test]
     fn rebuild_preserves_npx_fallback_and_targets_npx() {
@@ -17664,11 +17684,11 @@ mod rebuild_spawn_opts_tests {
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         let mut opts = SpawnOptions::new(provider);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
+        opts.npx_fallback_package = provider.npx_only_package;
 
         let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
         assert_eq!(rebuilt.npx_fallback_binary, Some(npx_path.as_path()));
-        assert_eq!(rebuilt.npx_fallback_package, provider.fallback_npx_package);
+        assert_eq!(rebuilt.npx_fallback_package, provider.npx_only_package);
 
         // Through build_command/build_args: the rebuilt opts must spawn npx
         // with `--workspaces=false -y <package>`, not the bare `codex-acp`
@@ -17680,9 +17700,7 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(args[1], "-y");
         assert_eq!(
             args[2],
-            provider
-                .fallback_npx_package
-                .expect("codex has npx fallback")
+            provider.npx_only_package.expect("codex is npx-only")
         );
     }
 
@@ -17950,7 +17968,7 @@ mod provider_path_override_tests {
     }
 
     #[test]
-    fn codex_spawn_normalizes_legacy_model_and_explicit_effort_before_cli_args() {
+    fn codex_spawn_normalizes_legacy_model_and_effort_for_session_config() {
         let dir = tempfile::tempdir().unwrap();
         let stub = exec_stub(dir.path(), "codex-acp");
         let settings = settings_with_paths(&[("codex", &stub)]);
@@ -17967,15 +17985,22 @@ mod provider_path_override_tests {
                 let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
                 assert_eq!(resolved.model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(resolved.reasoning_effort.as_deref(), Some(expected));
+                assert!(
+                    resolved.provider_binary.is_none(),
+                    "custom adapter cannot bypass npx"
+                );
+                assert_eq!(
+                    resolved.npx_fallback_package,
+                    Some(intent_providers::config::CODEX_ACP_NPX_PACKAGE)
+                );
                 let mut opts = SpawnOptions::new(&resolved.provider);
                 opts.model = resolved.model.as_deref();
                 opts.reasoning_effort = resolved.reasoning_effort.as_deref();
                 let args = intent_acp::spawn::build_args(&opts);
                 assert!(
-                    args.contains(&format!("model_reasoning_effort=\"{expected}\"")),
-                    "{args:?}"
+                    !args.iter().any(|arg| arg == "-c" || arg == "--config"),
+                    "model/effort use ACP config options: {args:?}"
                 );
-                assert!(args.contains(&"model=\"gpt-5.5\"".to_string()), "{args:?}");
             }
         }
     }

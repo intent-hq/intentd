@@ -232,8 +232,9 @@ fn resolve_quick_action_model(
 }
 
 /// Pick the one-shot launch for `provider`, mirroring `resolve_spawn`: a
-/// `resolved_bin` wins — for an `npx_only_package` provider that is ONLY the
-/// validated `providers.paths` adapter override
+/// `resolved_bin` wins unless the provider forbids overrides — for an
+/// `npx_only_package` provider that is ONLY an opted-in, validated
+/// `providers.paths` adapter override
 /// ([`intent_providers::resolve_npx_only_override`], monorepo#4352), with the
 /// pinned package via `npx -y` otherwise; for other providers it is the
 /// discovered binary, with the pinned `fallback_npx_package` as the fallback.
@@ -258,6 +259,8 @@ pub(crate) fn one_shot_launch(
         ..Default::default()
     };
     let args = intent_providers::build_provider_args(provider, &inputs);
+    let resolved_bin = resolved_bin
+        .filter(|_| provider.npx_only_package.is_none() || provider.npx_only_honors_path_override);
     let via_npx = resolved_bin.is_none();
     let mut cmd = if let Some(bin) = resolved_bin {
         OneShotCommand::binary(bin, args)
@@ -283,14 +286,41 @@ pub(crate) fn one_shot_launch(
             cmd = cmd.env("INITIAL_AGENT_MODE", mode);
         }
     }
-    Some(cmd)
+    Some(apply_one_shot_launch_policy(provider, cmd))
+}
+
+/// Apply daemon-owned launch policy after caller-specific environment merges.
+/// The adapter command applies removals after sets, so CODEX_CONFIG is replaced
+/// without adding it to the removal list.
+pub(crate) fn apply_one_shot_launch_policy(
+    provider: &intent_providers::ProviderConfig,
+    cmd: OneShotCommand,
+) -> OneShotCommand {
+    if provider.id == "codex" {
+        cmd.env_remove("CODEX_PATH").env(
+            "CODEX_CONFIG",
+            intent_providers::CODEX_SUBAGENT_POLICY_CONFIG,
+        )
+    } else {
+        cmd
+    }
+}
+
+pub(crate) fn missing_one_shot_adapter_message(provider_id: &str) -> String {
+    if provider_id == "codex" {
+        intent_providers::CODEX_ACP_PREREQUISITE_ERROR.to_string()
+    } else {
+        format!(
+            "{provider_id}: no adapter could be resolved (binary not found and npx unavailable)"
+        )
+    }
 }
 
 /// Resolve the adapter binary a one-shot launch (`agent.completeOnce`, the
 /// live test prompt) runs for `provider`, matching `resolve_spawn`'s
 /// precedence: an npx-only provider honors ONLY a valid `providers.paths`
 /// adapter override, and only when it opts in (never auto-discovery —
-/// monorepo#4352; pi resolves nothing), any other provider walks
+/// monorepo#4352; codex and pi resolve nothing), any other provider walks
 /// `find_provider_binary`'s tiers. `explicit_path` is the raw
 /// `providers.paths[primary_binary_provider_id]` value (blank = unset).
 pub(crate) fn resolve_one_shot_binary(
@@ -519,12 +549,11 @@ impl Services {
         // hermetically on hosts where npx is installed.
         let npx = match &self.one_shot_npx {
             Some(pinned) => pinned.clone(),
+            None if provider_id == "codex" => intent_providers::find_codex_npx(),
             None => intent_providers::find_npx(),
         };
         let Some(cmd) = one_shot_launch(provider, resolved_bin, npx, model) else {
-            return Ok(unavailable(format!(
-                "{provider_id}: no adapter could be resolved (binary not found and npx unavailable)"
-            )));
+            return Ok(unavailable(missing_one_shot_adapter_message(provider_id)));
         };
         let cmd = match cwd {
             Some(dir) => cmd.cwd(dir),
@@ -734,9 +763,7 @@ rl.on('line', (line) => {{
     #[cfg(unix)]
     #[tokio::test]
     async fn complete_once_routes_acp_provider_to_one_shot_runner() {
-        // codex resolves its adapter through `providers.paths["codex"]`
-        // (`find_provider_binary`'s explicit tier), so the whole route runs
-        // against the mock adapter with no provider install.
+        // The npx seam runs the mock adapter without npm or model access.
         let (_dir, bin) = fake_acp_adapter("ok", "🤖\nslug-from-acp");
         let (_tmp, services) = services_with_settings(&[
             ("model.defaultProvider", serde_json::json!("codex")),
@@ -747,6 +774,7 @@ rl.on('line', (line) => {{
         ])
         .await;
         let v = services
+            .with_one_shot_npx(Some(bin))
             .agent_complete_once_op("make a slug".into(), None, None, None, None, None)
             .await
             .unwrap();
@@ -771,13 +799,15 @@ rl.on('line', (line) => {{
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 let sessionNew = null;
+let selectedModel = null;
 rl.on('line', (line) => {
   if (!line.trim()) return;
   const msg = JSON.parse(line);
   if (msg.method === 'initialize') return send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
   if (msg.method === 'session/new') { sessionNew = msg.params; return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }); }
+  if (msg.method === 'session/set_config_option') { selectedModel = msg.params.value; return send({ jsonrpc: '2.0', id: msg.id, result: {} }); }
   if (msg.method === 'session/prompt') {
-    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text });
+    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env });
     send({
       jsonrpc: '2.0',
       method: 'session/update',
@@ -818,6 +848,11 @@ rl.on('line', (line) => {
             ),
         ])
         .await;
+        let services = if provider == "codex" {
+            services.with_one_shot_npx(Some(bin.to_path_buf()))
+        } else {
+            services
+        };
         let v = services
             .agent_complete_once_op(
                 "summarize".into(),
@@ -1016,6 +1051,7 @@ rl.on('line', (line) => {
         ])
         .await;
         let v = services
+            .with_one_shot_npx(Some(bin))
             .agent_complete_once_op("echo home".into(), None, None, None, None, None)
             .await
             .unwrap();
@@ -1071,6 +1107,135 @@ rl.on('line', (line) => {
     }
 
     #[test]
+    fn one_shot_codex_uses_pinned_runtime_even_with_resolved_adapter() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let npx = PathBuf::from("/test/node/bin/npx");
+        for model in [None, Some("gpt-5.5"), Some("gpt-5.5/high")] {
+            let cmd = one_shot_launch(
+                codex,
+                Some(PathBuf::from("/custom/codex-acp")),
+                Some(npx.clone()),
+                model,
+            )
+            .unwrap();
+            assert_eq!(cmd.program(), npx.as_path());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_shot_codex_policy_replaces_enabling_env_in_child() {
+        let (_dir, npx) = fake_acp_adapter_echoing_session("codex-policy");
+        let codex = intent_providers::find_provider("codex").unwrap();
+        for model in [None, Some("gpt-5.5"), Some("gpt-5.5/high")] {
+            for enabled in [json!(true), json!({"enabled": true})] {
+                let cmd = one_shot_launch(
+                    codex,
+                    Some(PathBuf::from("/custom/forbidden-codex-acp")),
+                    Some(npx.clone()),
+                    model,
+                )
+                .unwrap()
+                .env("CODEX_PATH", "/custom/forbidden-codex")
+                .env(
+                    "CODEX_CONFIG",
+                    json!({"agents": {"enabled": true}, "features": {"multi_agent_v2": enabled}})
+                        .to_string(),
+                );
+                // Test prompts finalize policy after their provider env merge.
+                let cmd = apply_one_shot_launch_policy(codex, cmd);
+                let reply = run_one_shot_acp(
+                    cmd,
+                    "hello",
+                    config_option_model(codex, model),
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+                let observed: Value = serde_json::from_str(&reply).unwrap();
+                assert_eq!(
+                    observed["argv"],
+                    json!([
+                        "--workspaces=false",
+                        "-y",
+                        intent_providers::config::CODEX_ACP_NPX_PACKAGE
+                    ])
+                );
+                assert_eq!(observed["hasCodexPath"], false);
+                let config: Value =
+                    serde_json::from_str(observed["config"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    config,
+                    json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}})
+                );
+                assert_eq!(
+                    observed["selectedModel"],
+                    json!(config_option_model(codex, model))
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_codex_reports_missing_npx_despite_custom_adapter() {
+        let (_dir, adapter) = fake_acp_adapter("native-only", "must not run");
+        let (_tmp, services) = services_with_settings(&[
+            ("model.defaultProvider", json!("codex")),
+            ("providers.paths", json!({"codex": adapter})),
+        ])
+        .await;
+        let result = services
+            .with_one_shot_npx(None)
+            .agent_complete_once_op("hello".into(), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result["available"], false);
+        let reason = result["reason"].as_str().unwrap();
+        for expected in ["Node.js", "npx", "Install"] {
+            assert!(reason.contains(expected), "{reason}");
+        }
+    }
+
+    #[test]
+    fn one_shot_codex_requires_npx_even_with_resolved_adapter() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        assert!(
+            one_shot_launch(codex, Some(PathBuf::from("/custom/codex-acp")), None, None,).is_none()
+        );
+    }
+
+    #[test]
+    fn one_shot_codex_enforces_both_subagent_settings() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let cmd = one_shot_launch(codex, None, Some(PathBuf::from("/test/npx")), None).unwrap();
+        let config = cmd
+            .env_vars()
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "CODEX_CONFIG")
+            .map(|(_, value)| value.to_str().unwrap());
+        assert_eq!(
+            config.map(|value| serde_json::from_str::<Value>(value).unwrap()),
+            Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
+        );
+        assert!(cmd.removed_env_vars().iter().any(|key| key == "CODEX_PATH"));
+        assert!(!cmd
+            .removed_env_vars()
+            .iter()
+            .any(|key| key == "CODEX_CONFIG"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_one_shot_codex_ignores_explicit_adapter() {
+        let (_dir, adapter) = fake_acp_adapter("codex-ignored", "must not run");
+        let codex = intent_providers::find_provider("codex").unwrap();
+        assert_eq!(resolve_one_shot_binary(codex, adapter.to_str()), None);
+    }
+
+    #[test]
     fn one_shot_launch_resolution_precedence() {
         let npx = PathBuf::from("/usr/bin/npx");
         let bin = PathBuf::from("/opt/bin/codex-acp");
@@ -1088,16 +1253,15 @@ rl.on('line', (line) => {
         assert_eq!(launch.program(), npx.as_path());
         assert!(one_shot_launch(claude, None, None, None).is_none());
 
-        // codex: resolved binary first, pinned npx fallback second, nothing
-        // when neither resolves (the `{ available: false }` path).
+        // Codex ignores resolved adapters and always requires npx.
         let codex = intent_providers::find_provider("codex").unwrap();
-        assert!(one_shot_launch(codex, Some(bin), None, None).is_some());
+        assert!(one_shot_launch(codex, Some(bin), None, None).is_none());
         assert!(one_shot_launch(codex, None, Some(npx), None).is_some());
         assert!(one_shot_launch(codex, None, None, None).is_none());
     }
 
     #[test]
-    fn one_shot_codex_mode_matches_spawn_policy_without_changing_other_env() {
+    fn one_shot_codex_mode_and_policy_preserve_other_providers() {
         let codex = intent_providers::find_provider("codex").unwrap();
         for via_npx in [false, true] {
             let cmd = one_shot_launch(
@@ -1109,27 +1273,31 @@ rl.on('line', (line) => {
             .unwrap();
             // The provider suite covers the explicit-value matrix under its
             // env lock; do not mutate process-global env in service tests.
-            let expected = std::env::var_os("INITIAL_AGENT_MODE")
+            let mut expected: Vec<_> = std::env::var_os("INITIAL_AGENT_MODE")
                 .is_none()
-                .then(|| ("INITIAL_AGENT_MODE".to_string(), "agent-full-access".into()));
+                .then(|| ("INITIAL_AGENT_MODE".to_string(), "agent-full-access".into()))
+                .into_iter()
+                .collect();
+            expected.push((
+                "CODEX_CONFIG".to_string(),
+                intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into(),
+            ));
             assert_eq!(cmd.env_vars(), expected.as_slice());
             let removed: Vec<_> = cmd.removed_env_vars().iter().map(String::as_str).collect();
-            assert_eq!(
-                removed,
-                if via_npx {
-                    vec!["CODEX_PATH", "CODEX_CONFIG"]
-                } else {
-                    vec![]
-                }
-            );
+            assert_eq!(removed, vec!["CODEX_PATH"]);
         }
         for id in intent_providers::all_provider_ids()
             .into_iter()
             .filter(|id| *id != "codex")
         {
             let provider = intent_providers::find_provider(id).unwrap();
-            let cmd = one_shot_launch(provider, Some(PathBuf::from("/mock/adapter")), None, None)
-                .unwrap();
+            let cmd = one_shot_launch(
+                provider,
+                Some(PathBuf::from("/mock/adapter")),
+                Some(PathBuf::from("/mock/npx")),
+                None,
+            )
+            .unwrap();
             assert!(
                 cmd.env_vars().is_empty(),
                 "{id} must not acquire a Codex mode"
