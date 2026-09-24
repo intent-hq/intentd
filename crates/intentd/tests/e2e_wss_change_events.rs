@@ -56,8 +56,12 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     common::enable_ws_api(data_dir);
     common::seed_default_provider(data_dir);
     let mut cmd = common::serve_command();
+    // Keep author assertions independent of the host's GitHub identity refresh
+    // (intent-hq/intent#5645), including tokens from its secrets store.
+    common::hermetic_github_identity(&mut cmd, data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
