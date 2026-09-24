@@ -656,6 +656,12 @@
 //! `pinGithubUserId` / `pinLogin`. Identities are stored and resolved by
 //! the triple (`0130_principal_identity`), so an account on another
 //! provider or host with the same numeric id is a distinct principal.
+//! `invite.inspect` and `invite.challenge` return the required `pinIdentity`
+//! triple (including a legacy GitHub pin) or explicit `null` when unpinned,
+//! after validating the open invite and secret, with no forge call. Errors
+//! disclose no pin; older daemons omit the field. Guests can select the
+//! matching connected account before publishing a proof, while the host
+//! retains its final provider/host/account pin enforcement.
 //! The same version adds the provider-neutral guest half of the identity
 //! proof: `sourceControl.identityProof.create` / `delete` with `provider:
 //! "github" | "gitlab"` and an optional gitlab `host` (a public personal

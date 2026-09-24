@@ -207,6 +207,7 @@ pub(crate) fn new_gitlab_state() -> GitlabAuthStateHandle {
 /// | `cancelAuth` | no — slot only, never the store, no event | slot host + phase | a pending flow for that host |
 /// | `revoke` | yes | binding, stored credential | host bound now and something stored |
 /// | proactive / 401 refresh (`probe_gitlab`) | yes, across the exchange | binding, stored pair | bound and the stored token is the one it read |
+/// | proactive refresh on the proof token read (`stored_proof_token`) | yes, across the exchange | binding, stored pair | bound and a device grant is near / past expiry |
 /// | disconnect on failed refresh | yes | binding, stored token | bound and the stored token is the rejected one |
 ///
 /// Held across the device poll's token exchange and the refresh exchange but
@@ -449,6 +450,44 @@ async fn disconnect_gitlab_if_current(
     Ok(())
 }
 
+/// The proactive half of the device-grant refresh policy, shared by
+/// [`probe_gitlab`] and the identity-proof token read: classify the stored
+/// credential and, when it is a device grant whose recorded expiry is near /
+/// past, refresh it and re-classify. Returns the credential to use plus
+/// whether a refresh happened; `None` when the refresh was refused
+/// (`invalid_grant` / no client id) — the connection has been cleared
+/// ([`disconnect_gitlab`], `status: "expired"`) and nothing is usable. A
+/// transient refresh failure keeps the stored pair. A PAT / absent
+/// credential is never refreshed. The caller holds the
+/// [`GitlabCredentialGate`] and has checked the binding.
+async fn refresh_stored_credential_if_needed(
+    host: &GitlabHost,
+    client_id: Option<&str>,
+    store: &FileSecretStore,
+    bus: Option<&EventBus>,
+) -> Result<Option<(StoredCredential, bool)>> {
+    let mut credential = stored_credential(store.clone())
+        .await
+        .map_err(crate::pr_ops::map_sc_err)?;
+    let mut refreshed = false;
+    if credential.needs_refresh() {
+        match try_refresh(host, client_id, store.clone()).await {
+            Ok(()) => {
+                refreshed = true;
+                credential = stored_credential(store.clone())
+                    .await
+                    .map_err(crate::pr_ops::map_sc_err)?;
+            }
+            Err(RefreshFailure::Unrecoverable) => {
+                disconnect_gitlab(store.clone(), bus, host.host()).await;
+                return Ok(None);
+            }
+            Err(RefreshFailure::Transient) => {}
+        }
+    }
+    Ok(Some((credential, refreshed)))
+}
+
 /// Probe the credential in use for `host` against `GET /api/v4/user`, running
 /// the device-grant refresh policy around it: a stored device credential is
 /// refreshed **proactively** when its recorded expiry is near / past, and
@@ -492,25 +531,11 @@ pub(crate) async fn probe_gitlab(
         if !bound() {
             return Ok(ProbeOutcome::NotConfigured);
         }
-        let mut credential = stored_credential(store.clone())
-            .await
-            .map_err(crate::pr_ops::map_sc_err)?;
-        let mut refreshed = false;
-        if credential.needs_refresh() {
-            match try_refresh(host, client_id, store.clone()).await {
-                Ok(()) => {
-                    refreshed = true;
-                    credential = stored_credential(store.clone())
-                        .await
-                        .map_err(crate::pr_ops::map_sc_err)?;
-                }
-                Err(RefreshFailure::Unrecoverable) => {
-                    disconnect_gitlab(store, bus, host.host()).await;
-                    return Ok(ProbeOutcome::NotConfigured);
-                }
-                Err(RefreshFailure::Transient) => {}
-            }
-        }
+        let Some((credential, refreshed)) =
+            refresh_stored_credential_if_needed(host, client_id, &store, bus).await?
+        else {
+            return Ok(ProbeOutcome::NotConfigured);
+        };
         let Some((token, method)) = load_gitlab_token(&store, credential).await? else {
             return Ok(ProbeOutcome::NotConfigured);
         };
@@ -707,14 +732,37 @@ impl crate::Services {
     /// fallbacks — so the proof is always made with the account the user
     /// signed in with; for GitLab the token applies to the bound instance
     /// only, so a `host` that is not bound is `gitlab-not-connected` like an
-    /// absent token. Read under the [`GitlabCredentialGate`] so a rebind or
-    /// revoke in flight is not raced.
+    /// absent token. A GitLab device grant goes through the same proactive
+    /// refresh step as [`probe_gitlab`]
+    /// ([`refresh_stored_credential_if_needed`]): an expired access token
+    /// with a valid refresh token yields the rotated one, a PAT is returned
+    /// as is, and a refresh the instance refuses clears the connection and
+    /// is `gitlab-not-connected`. Read under the [`GitlabCredentialGate`] so
+    /// a rebind, revoke or peer refresh in flight is not raced.
     pub(crate) async fn stored_proof_token(&self, target: &Target) -> Result<String> {
         match target {
             Target::Github => github_auth_ops::load_stored_token(&self.secrets).await,
             Target::Gitlab { host } => {
                 let _gate = self.gitlab_credential_gate.lock().await;
                 if !self.gitlab_host_is_bound(host) {
+                    return Err(Error::IdentityProof(
+                        IdentityProofErrorKind::GitlabNotConnected,
+                    ));
+                }
+                let client_id = self.gitlab_client_id(host);
+                let Some((credential, _)) = refresh_stored_credential_if_needed(
+                    host,
+                    client_id.as_deref(),
+                    &self.gitlab_secret_store,
+                    self.event_bus.as_ref(),
+                )
+                .await?
+                else {
+                    return Err(Error::IdentityProof(
+                        IdentityProofErrorKind::GitlabNotConnected,
+                    ));
+                };
+                if credential == StoredCredential::None {
                     return Err(Error::IdentityProof(
                         IdentityProofErrorKind::GitlabNotConnected,
                     ));
