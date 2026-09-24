@@ -124,11 +124,12 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace (full row replace, except `id`, the
-    /// guarded `last_activity` and the archive lifecycle columns, see
-    /// below), or `NotFound`. `activity` is derived and never persisted
-    /// (§9.9).
+    /// Update an existing workspace, preserving `branch`, `id`, the
+    /// guarded `last_activity` and archive lifecycle columns, or return
+    /// `NotFound`. Returns the stored branch.
+    /// `activity` is derived and never persisted (§9.9).
     ///
+    /// Explicit branch changes use [`Self::update_workspace_with_branch`].
     /// `last_activity` is one exception to the full-row replace
     /// (monorepo#1585): it goes through the same monotonic guard as
     /// [`Self::bump_workspace_last_activity`] — the candidate writes only when
@@ -137,7 +138,7 @@ impl Store {
     /// read predated a concurrent bump can never silently revert it (the
     /// `attention` clobber shape fixed by #1481).
     ///
-    /// The archive lifecycle is the other exception: `archived` /
+    /// The archive lifecycle is another exception: `archived` /
     /// `archived_at` are NEVER written here, and `status` holds whenever the
     /// row is archived or the candidate is `Archived`. Those columns move
     /// only through the scoped, fenced flips
@@ -150,10 +151,23 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
-    pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
+    pub async fn update_workspace(&self, ws: &Workspace) -> Result<String> {
+        self.update_workspace_with_branch(ws, None).await
+    }
+
+    /// Update workspace fields and optionally apply an explicit branch edit.
+    /// Returns the stored branch so responses cannot echo a stale snapshot.
+    ///
+    /// # Errors
+    /// Returns `Error::NotFound` for a missing workspace or an error on database failure.
+    pub async fn update_workspace_with_branch(
+        &self,
+        ws: &Workspace,
+        branch: Option<&str>,
+    ) -> Result<String> {
         let status = enum_to_db(&ws.status)?;
-        let res = sqlx::query(
-            "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, \
+        let row = sqlx::query(
+            "UPDATE workspace SET title=?, branch=COALESCE(?, branch), base_ref=?, base_commit_sha=?, \
              status=CASE WHEN archived = 1 OR ? = ? THEN status ELSE ? END, \
              status_message=?, status_image_asset_id=?, attention=?, path=?, repository_path=?, \
              repository_owner=?, repository_name=?, worktree_path=?, scope=?, skip_worktree=?, \
@@ -163,10 +177,10 @@ impl Store {
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, checkout_mode=? WHERE id=?",
+             token_usage=?, setup_script=?, checkout_mode=? WHERE id=? RETURNING branch",
         )
         .bind(&ws.title)
-        .bind(&ws.branch)
+        .bind(branch)
         .bind(&ws.base_ref)
         .bind(&ws.base_commit_sha)
         .bind(&status)
@@ -200,13 +214,40 @@ impl Store {
         .bind(setup_script_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
         .bind(&ws.id.0)
-        .execute(self.write_pool())
+        .fetch_optional(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update workspace failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("workspace {}", ws.id)));
+        match row {
+            Some(row) => col(&row, "branch"),
+            None => Err(Error::NotFound(format!("workspace {}", ws.id))),
         }
-        Ok(())
+    }
+
+    /// Reconcile an observed branch without overwriting concurrent workspace edits.
+    /// A renamed or switched branch is no longer eligible for automatic deletion.
+    ///
+    /// # Errors
+    /// Returns an error if the database write fails.
+    pub async fn reconcile_workspace_branch(
+        &self,
+        expected: &Workspace,
+        branch: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE workspace SET branch = ?, branch_auto_generated = 0 \
+             WHERE id = ? AND branch = ? AND branch <> ? \
+             AND worktree_path IS ? AND repository_path IS ? AND is_remote = 0",
+        )
+        .bind(branch)
+        .bind(&expected.id.0)
+        .bind(&expected.branch)
+        .bind(branch)
+        .bind(&expected.worktree_path)
+        .bind(&expected.repository_path)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("reconcile workspace branch failed: {e}")))?;
+        Ok(result.rows_affected() != 0)
     }
 
     /// Scoped PR-linkage write: set ONLY the PR columns (`pr_number`,

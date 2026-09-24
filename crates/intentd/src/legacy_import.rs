@@ -886,8 +886,11 @@ async fn import_one(
             if opts.dry_run {
                 Outcome::Updated
             } else {
-                match store.update_workspace(&ws).await {
-                    Ok(()) => Outcome::Updated,
+                match store
+                    .update_workspace_with_branch(&ws, Some(&ws.branch))
+                    .await
+                {
+                    Ok(_) => Outcome::Updated,
                     Err(e) => Outcome::Skipped(format!("update failed: {e}")),
                 }
             }

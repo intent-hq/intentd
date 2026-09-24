@@ -153,13 +153,13 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 /// `changes:git-status` event. Remote workspaces and workspaces without a
 /// resolvable worktree are skipped (their status cannot change via local
 /// `file:*` events). Failures are logged, never fatal to the loop.
-async fn refresh_workspace(
+pub(crate) async fn refresh_workspace(
     bus: &EventBus,
     services: &dyn WorkspaceApi,
     status_cache: &GitStatusCache,
     ws_id: &WorkspaceId,
 ) {
-    let ws = match services.get_workspace(ws_id.clone()).await {
+    let mut ws = match services.get_workspace(ws_id.clone()).await {
         Ok(ws) => ws,
         Err(e) => {
             tracing::debug!(workspace = %ws_id, error = %e, "git-status refresh skipped: workspace lookup failed");
@@ -190,6 +190,9 @@ async fn refresh_workspace(
         status_cache.invalidate(&worktree);
         None
     };
+    if let Some(status) = &scanned {
+        crate::workspace_branch::reconcile_workspace_branch(bus, &mut ws, &status.branch).await;
+    }
     // Bounded history walk + remote/trunk resolution (libgit2) — run on the
     // blocking pool so a slow repo cannot stall the runtime (parity with
     // `accept-changes.getStatus`). The working-tree scan itself was already
