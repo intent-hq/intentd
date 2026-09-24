@@ -1,0 +1,28 @@
+name: Transfer selection fixtures
+description: Acquire one explicit monorepo contract revision, including its validator and golden.
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v7
+      with:
+        repository: intent-hq/intent
+        # Provisional definition revision. The connected integration task replaces
+        # this with the approved contract + real golden commit before publication.
+        ref: c79e439ef112fb4c049556a73ecc605139eaf7e8
+        path: .transfer-selection-contract
+        persist-credentials: false
+        sparse-checkout: |
+          docs/protocol/fixtures/transfer-selection
+          scripts/check-transfer-selection-contract.mjs
+        sparse-checkout-cone-mode: false
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+    - name: Validate and expose the required shared fixtures
+      shell: bash
+      run: |
+        set -euo pipefail
+        contract_root="$GITHUB_WORKSPACE/.transfer-selection-contract"
+        echo "TRANSFER_SELECTION_FIXTURE_ROOT=$contract_root/docs/protocol/fixtures/transfer-selection" >> "$GITHUB_ENV"
+        git -C "$contract_root" rev-parse HEAD
+        node "$contract_root/scripts/check-transfer-selection-contract.mjs"

@@ -436,6 +436,10 @@ jobs:
           shared-key: gh-burst-check
       - name: Format check
         run: cargo fmt --check
+      - name: Acquire the shared transfer selection contract
+        uses: ./.github/actions/transfer-selection-fixtures
+      - name: Real import and public session contract
+        run: "cargo test -p intent-services --lib transfer_selection_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
       # tinybox slots rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
@@ -1142,6 +1146,8 @@ jobs:
       - uses: taiki-e/install-action@nextest
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Acquire the shared transfer selection contract
+        uses: ./.github/actions/transfer-selection-fixtures
       - name: Run combined coverage
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
@@ -1375,6 +1381,9 @@ jobs:
         if: steps.select.outputs.has_selection == 'true'
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Acquire the shared transfer selection contract
+        if: steps.select.outputs.has_selection == 'true'
+        uses: ./.github/actions/transfer-selection-fixtures
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
         # Armed bound-caller seam — see coverage-e2e's run step. The plan
