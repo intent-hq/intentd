@@ -1,4 +1,4 @@
-//! Host runtime selection independent of Codex ACP adapter selection.
+//! Vendored Codex ACP adapter assets and host runtime cache identity.
 
 use std::path::{Path, PathBuf};
 
@@ -8,23 +8,40 @@ pub fn host_codex_path() -> Option<PathBuf> {
     crate::find_provider_binary("codex", "codex", None)
 }
 
-/// Replace inherited overrides with the selected host runtime, or the adapter's
-/// bundled fallback when Codex is absent. Never trust inherited `CODEX_PATH`.
-pub fn configure_runtime(command: &mut std::process::Command, host: Option<&Path>, managed: bool) {
-    if managed {
-        command.env_remove("CODEX_CONFIG");
+/// Only an explicit override can replace the shipped adapter.
+#[must_use]
+pub fn adapter_override(explicit: Option<&str>) -> Option<PathBuf> {
+    explicit.and_then(|path| crate::discover::resolve_explicit_path("codex", path))
+}
+
+/// Content identity of the shipped adapter, including local patches.
+pub const ADAPTER_VERSION: &str = include_str!("../vendor/codex-acp/dist/version");
+
+/// Materialize the self-contained adapter in a caller-owned private launch directory.
+///
+/// # Errors
+/// Returns the filesystem error if an embedded asset cannot be written.
+pub fn write_adapter(directory: &Path) -> std::io::Result<PathBuf> {
+    for (name, content) in [
+        (
+            "codex-acp.mjs",
+            include_str!("../vendor/codex-acp/dist/codex-acp.mjs"),
+        ),
+        ("LICENSE", include_str!("../vendor/codex-acp/LICENSE")),
+        (
+            "THIRD_PARTY_LICENSES",
+            include_str!("../vendor/codex-acp/dist/THIRD_PARTY_LICENSES"),
+        ),
+    ] {
+        std::fs::write(directory.join(name), content)?;
     }
-    if let Some(path) = host {
-        command.env("CODEX_PATH", path);
-    } else {
-        command.env_remove("CODEX_PATH");
-    }
+    Ok(directory.join("codex-acp.mjs"))
 }
 
 /// File identity avoids spawning a CLI from a cached model-catalog read.
 pub fn runtime_cache_key(host: Option<&Path>) -> String {
     let Some(path) = host else {
-        return "bundled".into();
+        return "missing-host-codex".into();
     };
     let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let metadata = std::fs::metadata(&target).ok();
@@ -39,43 +56,6 @@ pub fn runtime_cache_key(host: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn runtime_overrides_inherited_values_and_supports_bundled_fallback() {
-        let mut command = std::process::Command::new("adapter");
-        for host in [Some(Path::new("/host with spaces/codex")), None] {
-            command.env("CODEX_PATH", "/stale/codex");
-            command.env("CODEX_CONFIG", "untrusted");
-            configure_runtime(&mut command, host, true);
-            let env = command
-                .get_envs()
-                .collect::<std::collections::BTreeMap<_, _>>();
-            assert_eq!(
-                env[std::ffi::OsStr::new("CODEX_PATH")],
-                host.map(Path::as_os_str)
-            );
-            assert_eq!(env[std::ffi::OsStr::new("CODEX_CONFIG")], None);
-        }
-    }
-
-    #[test]
-    fn installed_adapter_uses_host_runtime_and_keeps_its_configuration() {
-        let mut command = std::process::Command::new("adapter");
-        command.env("CODEX_PATH", "/stale/codex");
-        command.env("CODEX_CONFIG", "custom-config");
-        configure_runtime(&mut command, Some(Path::new("/host/codex")), false);
-        let env = command
-            .get_envs()
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(
-            env[std::ffi::OsStr::new("CODEX_PATH")],
-            Some(std::ffi::OsStr::new("/host/codex"))
-        );
-        assert_eq!(
-            env[std::ffi::OsStr::new("CODEX_CONFIG")],
-            Some(std::ffi::OsStr::new("custom-config"))
-        );
-    }
 
     #[test]
     fn cache_identity_changes_when_host_runtime_is_replaced_or_removed() {

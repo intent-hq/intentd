@@ -222,8 +222,8 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
     )
 }
 
-/// codex: ACP probe via a resolved `codex-acp` binary, else the pinned npx
-/// fallback. Effort-capable base models carry `effortLevels` on one row.
+/// codex: ACP probe via a resolved `codex-acp` binary, else the vendored
+/// adapter running on Node. Effort-capable models carry `effortLevels` on one row.
 ///
 /// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
 /// dir, removed after the probe) so the user's `~/.codex/config.toml` — and
@@ -233,14 +233,10 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
 /// only the user's configured `model` / `model_reasoning_effort` so that
 /// model appears in the reported catalog.
 pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
-    let Some(cmd) = codex_probe_launch(
-        find_provider_binary("codex", "codex-acp", None),
-        find_npx(),
-        intent_providers::codex::host_codex_path().as_deref(),
-    ) else {
+    let Some(cmd) = codex_probe_launch(None, intent_providers::find_node()) else {
         return ProviderModelsFetch::unavailable(
             "codex",
-            "codex-acp binary not found and npx unavailable for the pinned fallback",
+            "codex-acp binary not found and Node.js unavailable for the bundled adapter",
         );
     };
     let (cmd, codex_home) = match with_isolated_codex_home(cmd) {
@@ -257,19 +253,15 @@ pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
     finish("codex", outcome)
 }
 
-/// Preserve adapter precedence while both launch paths use the host Codex runtime.
+/// Preserve installed adapter precedence; the fallback is embedded in intentd.
 fn codex_probe_launch(
     resolved_bin: Option<PathBuf>,
-    npx: Option<PathBuf>,
-    host: Option<&Path>,
+    node: Option<PathBuf>,
 ) -> Option<AcpProbeCommand> {
     if let Some(bin) = resolved_bin {
-        Some(AcpProbeCommand::binary(bin, Vec::new()).codex_runtime(host, false))
+        Some(AcpProbeCommand::binary(bin, Vec::new()))
     } else {
-        npx.map(|npx| {
-            AcpProbeCommand::npx(npx, intent_providers::config::CODEX_ACP_NPX_PACKAGE)
-                .codex_runtime(host, true)
-        })
+        node.map(AcpProbeCommand::bundled_codex)
     }
 }
 

@@ -8964,6 +8964,7 @@ impl AgentManager {
         // always launches bare `node`.
         if resolved.provider_binary.is_none()
             && resolved.npx_fallback_binary.is_none()
+            && resolved.bundled_codex_node.is_none()
             && resolved.provider.id != "mock"
         {
             let override_configured = read_provider_path_setting(
@@ -8986,6 +8987,7 @@ impl AgentManager {
         opts.provider_binary = resolved.provider_binary.as_deref();
         opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
         opts.npx_fallback_package = resolved.npx_fallback_package;
+        opts.bundled_codex_node = resolved.bundled_codex_node.as_deref();
         opts.extra_env = resolved.extra_env.clone();
         opts.unsloth_endpoint = resolved.unsloth_endpoint.as_ref();
         // monorepo#884 Phase 2.2: offer the daemon-backed
@@ -10195,6 +10197,7 @@ struct ResolvedSpawn {
     npx_fallback_binary: Option<PathBuf>,
     /// The package name to pass to npx when `npx_fallback_binary` is set.
     npx_fallback_package: Option<&'static str>,
+    bundled_codex_node: Option<PathBuf>,
     /// Unsloth-managed server endpoint for the `unsloth` provider, filled in
     /// by [`AgentManager::ensure_started`] via
     /// [`crate::unsloth_server::UnslothServerManager::ensure_endpoint`]
@@ -10456,6 +10459,7 @@ fn resolve_spawn(
             extra_env,
             npx_fallback_binary: None,
             npx_fallback_package: None,
+            bundled_codex_node: None,
             unsloth_endpoint: None,
         });
     }
@@ -10503,6 +10507,7 @@ fn resolve_spawn(
                 extra_env,
                 npx_fallback_binary: None,
                 npx_fallback_package: None,
+                bundled_codex_node: None,
                 unsloth_endpoint,
             });
         }
@@ -10516,6 +10521,7 @@ fn resolve_spawn(
             extra_env,
             npx_fallback_binary: Some(npx_binary),
             npx_fallback_package: Some(npx_package),
+            bundled_codex_node: None,
             unsloth_endpoint,
         });
     }
@@ -10529,11 +10535,15 @@ fn resolve_spawn(
     // managed-server lifecycle (`ensure_started`'s unsloth spawn gate).
     let binary_provider_id = provider.primary_binary_provider_id();
     let explicit_path = read_provider_path_setting(settings, binary_provider_id);
-    let provider_binary = intent_providers::find_provider_binary(
-        binary_provider_id,
-        provider.command,
-        explicit_path.as_deref(),
-    );
+    let provider_binary = if provider.id == "codex" {
+        intent_providers::codex::adapter_override(explicit_path.as_deref())
+    } else {
+        intent_providers::find_provider_binary(
+            binary_provider_id,
+            provider.command,
+            explicit_path.as_deref(),
+        )
+    };
 
     // When the provider binary is not found but the provider has a fallback npx
     // package, resolve npx itself and record the fallback decision
@@ -10557,6 +10567,13 @@ fn resolve_spawn(
         (None, None)
     };
 
+    let bundled_codex_node = if provider.id == "codex" && provider_binary.is_none() {
+        Some(intent_providers::find_node().ok_or_else(|| {
+            Error::InvalidInput("Node.js is required to run the bundled Codex ACP adapter".into())
+        })?)
+    } else {
+        None
+    };
     Ok(ResolvedSpawn {
         provider,
         model,
@@ -10566,6 +10583,7 @@ fn resolve_spawn(
         extra_env,
         npx_fallback_binary,
         npx_fallback_package,
+        bundled_codex_node,
         unsloth_endpoint,
     })
 }
@@ -10756,22 +10774,10 @@ fn rebuild_spawn_opts<'a>(
     mcp_config_path: Option<&'a str>,
     env_mcp_config: Option<&'a str>,
 ) -> SpawnOptions<'a> {
-    let mut spawn_opts = SpawnOptions::new(opts.provider);
-    spawn_opts.model = opts.model;
-    spawn_opts.reasoning_effort = opts.reasoning_effort;
-    spawn_opts.cwd = opts.cwd;
+    let mut spawn_opts = opts.clone();
     spawn_opts.rules_file = opts.rules_file.or(rules_file_path);
-    spawn_opts.quiet = opts.quiet;
-    spawn_opts.provider_binary = opts.provider_binary;
-    spawn_opts.npx_fallback_binary = opts.npx_fallback_binary;
-    spawn_opts.npx_fallback_package = opts.npx_fallback_package;
-    spawn_opts.extra_env = opts.extra_env.clone();
-    spawn_opts.tools_to_remove.clone_from(&opts.tools_to_remove);
     spawn_opts.mcp_config_file = mcp_config_path;
     spawn_opts.env_mcp_config = env_mcp_config;
-    spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
-    spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
-    spawn_opts.npx_launch_root = opts.npx_launch_root;
     spawn_opts
 }
 
@@ -17660,15 +17666,15 @@ mod rebuild_spawn_opts_tests {
 
     #[test]
     fn rebuild_preserves_npx_fallback_and_targets_npx() {
-        let provider = intent_providers::find_provider("codex").unwrap();
+        let provider = intent_providers::find_provider("claude-code").unwrap();
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         let mut opts = SpawnOptions::new(provider);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
+        opts.npx_fallback_package = provider.npx_only_package;
 
         let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
         assert_eq!(rebuilt.npx_fallback_binary, Some(npx_path.as_path()));
-        assert_eq!(rebuilt.npx_fallback_package, provider.fallback_npx_package);
+        assert_eq!(rebuilt.npx_fallback_package, provider.npx_only_package);
 
         // Through build_command/build_args: the rebuilt opts must spawn npx
         // with `--workspaces=false -y <package>`, not the bare `codex-acp`
@@ -17681,9 +17687,23 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(
             args[2],
             provider
-                .fallback_npx_package
-                .expect("codex has npx fallback")
+                .npx_only_package
+                .expect("claude has an npx package")
         );
+    }
+
+    #[test]
+    fn rebuild_preserves_bundled_codex_launch() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.bundled_codex_node = Some(Path::new("/runtime/node"));
+        let rebuilt = rebuild_spawn_opts(&opts, Some("/rules"), None, None);
+        let cmd = intent_acp::spawn::build_command(&rebuilt);
+        assert_eq!(cmd.as_std().get_program(), "/runtime/node");
+        assert!(cmd.as_std().get_args().any(|arg| Path::new(arg)
+            .file_name()
+            .is_some_and(|name| name == "codex-acp.mjs")));
+        assert!(!rebuilt.via_npx());
     }
 
     #[test]

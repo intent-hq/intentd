@@ -243,19 +243,10 @@ fn codex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     provider_models_fetch("codex")
 }
 
-/// codex is pinned only when the probe falls back to the npx adapter; a
-/// resolved `codex-acp` binary has no pin (mirrors the fetch dispatch in
-/// [`crate::provider_models::fetch_codex_models`]). The binary is resolved
-/// here and again inside the fetch — intentionally independent: the two
-/// resolutions are milliseconds apart, so at worst an install/uninstall
-/// mid-request stores one cache entry under the other branch's key, which
-/// the next request's key mismatch simply treats as a miss.
+/// The catalog depends on the vendored adapter and the selected host runtime.
+/// Replacing either invalidates the saved ACP model catalog.
 fn codex_version() -> String {
-    let adapter = if intent_providers::find_provider_binary("codex", "codex-acp", None).is_some() {
-        String::new()
-    } else {
-        intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
-    };
+    let adapter = intent_providers::codex::ADAPTER_VERSION;
     format!(
         "{adapter}:{}",
         intent_providers::codex::runtime_cache_key(

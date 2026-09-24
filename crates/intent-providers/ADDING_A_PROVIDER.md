@@ -70,7 +70,7 @@ needs. Fields that matter most:
   `parse_grok_models_command_output` in `crates/intent-providers/src/models.rs`),
   `auth_error_patterns` (stderr matching), `login_command_hint`, `login_docs_url`.
 - **npx fields** — `fallback_npx_package` (spawn `npx -y <pkg>` only when no local binary
-  resolves; codex) vs `npx_only_package` (spawn via npx with a version we pin, skipping
+  resolves) vs `npx_only_package` (spawn via npx with a version we pin, skipping
   auto-discovery entirely; claude-code, pi). The one npx-only exception, for providers
   that opt in via `npx_only_honors_path_override` (claude-code), is a valid
   `providers.paths[id]` override (absolute + executable): it is exec'd directly in place
@@ -82,16 +82,24 @@ needs. Fields that matter most:
   semantics. Resolution:
   `resolve_npx_only` in `crates/intent-services/src/agent_manager.rs` and the
   `npx_fallback_*` fields on `SpawnOptions` (`crates/intent-acp/src/spawn.rs`).
-- **Codex runtime** — adapter selection stays independent of runtime selection.
-  Both discovered codex-acp and the pinned npm fallback receive the host `codex`
-  executable as `CODEX_PATH` for sessions, model discovery, and one-shot requests.
-  The npm adapter queries that runtime's `model/list`; new model IDs do not require
-  an adapter pin bump. Without a host CLI, the adapter uses its bundled runtime.
-  Discovered adapters keep `CODEX_CONFIG`; managed launches clear it. Older native
-  adapters that do not support `CODEX_PATH` retain their own runtime behavior.
+- **Codex adapter** — `crates/intent-providers/vendor/codex-acp` contains upstream source, its Apache license,
+  an npm lockfile, and `upstream.json` recording the imported commit and local changes.
+  Intent embeds the self-contained JavaScript bundle and runs it with host Node.js;
+  it does not install codex-acp from npm. The adapter itself resolves `codex` on the
+  enriched host PATH for app-server, login, and CLI operations. The `@openai/codex`
+  package dependency is removed. Node.js 22+ and a host Codex installation are required.
+  Model discovery still uses ACP `initialize` and `session/new` against this adapter.
+  A global codex-acp does not shadow the shipped copy; an explicit `providers.paths.codex`
+  override replaces it for sessions and one-shots. Managed launches clear inherited
+  `CODEX_PATH` and `CODEX_CONFIG`; explicit adapter overrides keep their configuration.
   Model caches include the host executable's resolved path, size, and modification
   time. Custom launchers that change a runtime behind an unchanged script may need
   a forced refresh. Existing sessions keep their running process until restarted.
+  To refresh the vendor, import a reviewed upstream source revision, retain the
+  `HostCodex` launch changes, and update `upstream.json`. Run `npm ci --ignore-scripts`,
+  `npm run typecheck`, `npm test`, and `npm run build` in `crates/intent-providers/vendor/codex-acp`, then commit
+  the source, lockfile, and `dist` assets together. CI rebuilds and compares the bundle.
+  Rust builds consume the checked-in assets and do not require npm or network access.
 
 **Binary discovery** — `find_provider_binary` (`crates/intent-providers/src/discover.rs`)
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute

@@ -20387,6 +20387,7 @@ mod model_change_notice_tests {
 
     fn resolved(provider_id: &str, model: Option<&str>) -> ResolvedSpawn {
         ResolvedSpawn {
+            bundled_codex_node: None,
             provider: *intent_providers::provider_config(provider_id),
             model: model.map(str::to_string),
             reasoning_effort: None,

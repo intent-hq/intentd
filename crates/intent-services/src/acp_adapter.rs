@@ -23,7 +23,7 @@
 //! panic and early-return paths a call-site guard would have to re-derive.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -192,6 +192,7 @@ pub(crate) struct AcpAdapterCommand {
     /// npx-run adapters get the longer cold-install timeout budget and start
     /// in a neutral [`NpxLaunchDir`] rather than `cwd`.
     via_npx: bool,
+    bundled_codex: bool,
     /// Parent of the per-launch [`NpxLaunchDir`]; `None` is the OS temp dir.
     npx_launch_root: Option<PathBuf>,
 }
@@ -214,6 +215,7 @@ impl AcpAdapterCommand {
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: true,
+            bundled_codex: false,
             npx_launch_root: None,
         }
     }
@@ -228,6 +230,7 @@ impl AcpAdapterCommand {
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: false,
+            bundled_codex: false,
             npx_launch_root: None,
         }
     }
@@ -275,17 +278,12 @@ impl AcpAdapterCommand {
         self
     }
 
-    pub(crate) fn codex_runtime(mut self, host: Option<&Path>, managed: bool) -> Self {
-        let mut command = std::process::Command::new(&self.program);
-        intent_providers::codex::configure_runtime(&mut command, host, managed);
-        for (key, value) in command.get_envs() {
-            let key = key.to_string_lossy().into_owned();
-            self = match value {
-                Some(value) => self.env(key, value),
-                None => self.env_remove(key),
-            };
-        }
-        self
+    pub(crate) fn bundled_codex(node: PathBuf) -> Self {
+        let mut command = Self::binary(node, Vec::new())
+            .env_remove("CODEX_PATH")
+            .env_remove("CODEX_CONFIG");
+        command.bundled_codex = true;
+        command
     }
 
     /// Recognize the controlled browser helper's immediate auth signal.
@@ -534,7 +532,7 @@ fn spawn_admitted_adapter(
     cmd: &AcpAdapterCommand,
     slot: OwnedSemaphorePermit,
 ) -> Result<SpawnedAdapter, String> {
-    let npx_launch_dir = if cmd.via_npx {
+    let npx_launch_dir = if cmd.via_npx || cmd.bundled_codex {
         Some(
             NpxLaunchDir::create(cmd.npx_launch_root.as_deref())
                 .map_err(|e| format!("{}: npx launch dir: {e}", cmd.program.display()))?,
@@ -546,10 +544,23 @@ fn spawn_admitted_adapter(
         .as_ref()
         .map_or_else(|| cmd.working_dir(), |dir| dir.path().to_path_buf());
     let mut command = tokio::process::Command::new(&cmd.program);
+    if let Some(directory) = npx_launch_dir.as_ref().filter(|_| cmd.bundled_codex) {
+        command.arg(
+            intent_providers::codex::write_adapter(directory.path())
+                .map_err(|e| format!("cannot prepare vendored Codex ACP: {e}"))?,
+        );
+    }
     command
         .args(&cmd.args)
         .current_dir(process_cwd)
-        .env("PATH", enhanced_path(Some(&cmd.program)))
+        .env(
+            "PATH",
+            enhanced_path(if cmd.bundled_codex {
+                None
+            } else {
+                Some(&cmd.program)
+            }),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

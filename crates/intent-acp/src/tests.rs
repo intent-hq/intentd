@@ -1132,11 +1132,11 @@ async fn spawn_provider_npx_launch_does_not_depend_on_the_workspace_existing() {
     let report = tmp.path().join("npx-report");
     let npx = write_fake_npx(tmp.path(), &report);
 
-    let provider = *intent_providers::find_provider("codex").unwrap();
+    let provider = *intent_providers::find_provider("claude-code").unwrap();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&gone);
     opts.npx_fallback_binary = Some(&npx);
-    opts.npx_fallback_package = provider.fallback_npx_package;
+    opts.npx_fallback_package = provider.npx_only_package;
     assert!(opts.via_npx());
 
     let mut agent = spawn_provider(&opts, ConnectionHooks::default())

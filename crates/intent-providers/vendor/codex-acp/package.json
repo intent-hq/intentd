@@ -1,0 +1,38 @@
+{
+  "name": "@intent/codex-acp",
+  "private": true,
+  "version": "1.13.1-intent.1",
+  "description": "Intent vendored Codex ACP adapter using the device Codex CLI",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/codex-acp.mjs",
+  "bin": {
+    "codex-acp": "dist/codex-acp.mjs"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node --import tsx src/index.ts",
+    "generate-types": "codex app-server generate-ts --out src/app-server",
+    "test": "vitest run --no-file-parallelism --retry=2",
+    "test:bundle": "node --test test/adapter-check.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "esbuild": "^0.28.2",
+    "mcp-hello-world": "^1.1.2",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.5.0",
+    "diff": "^9.0.0",
+    "open": "^11.0.1",
+    "vscode-jsonrpc": "^9.0.1",
+    "zod": "^4.0.0"
+  }
+}

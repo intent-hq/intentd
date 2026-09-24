@@ -250,7 +250,7 @@ fn resolve_quick_action_model(
 pub(crate) fn one_shot_launch(
     provider: &intent_providers::ProviderConfig,
     resolved_bin: Option<PathBuf>,
-    npx: Option<PathBuf>,
+    fallback_runtime: Option<PathBuf>,
     model: Option<&str>,
 ) -> Option<OneShotCommand> {
     let inputs = intent_providers::ArgInputs {
@@ -261,17 +261,15 @@ pub(crate) fn one_shot_launch(
     let via_npx = resolved_bin.is_none();
     let mut cmd = if let Some(bin) = resolved_bin {
         OneShotCommand::binary(bin, args)
+    } else if provider.id == "codex" {
+        OneShotCommand::bundled_codex(fallback_runtime?)
     } else if let Some(pkg) = provider.npx_only_package {
-        OneShotCommand::npx(npx?, pkg).args(args)
+        OneShotCommand::npx(fallback_runtime?, pkg).args(args)
     } else {
         let pkg = provider.fallback_npx_package?;
-        OneShotCommand::npx(npx?, pkg).args(args)
+        OneShotCommand::npx(fallback_runtime?, pkg).args(args)
     };
     if provider.id == "codex" {
-        cmd = cmd.codex_runtime(
-            intent_providers::codex::host_codex_path().as_deref(),
-            via_npx,
-        );
         // Share persistent-session mode policy without importing unrelated
         // provider env defaults. Explicit inherited modes remain untouched.
         if let Some(mode) = intent_providers::build_provider_env_for_spawn(
@@ -296,7 +294,9 @@ pub(crate) fn resolve_one_shot_binary(
     provider: &intent_providers::ProviderConfig,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
-    if provider.npx_only_package.is_some() {
+    if provider.id == "codex" {
+        intent_providers::codex::adapter_override(explicit_path)
+    } else if provider.npx_only_package.is_some() {
         intent_providers::resolve_npx_only_override(provider, explicit_path)
     } else {
         intent_providers::find_provider_binary(
@@ -518,11 +518,17 @@ impl Services {
         // hermetically on hosts where npx is installed.
         let npx = match &self.one_shot_npx {
             Some(pinned) => pinned.clone(),
+            None if provider.id == "codex" => intent_providers::find_node(),
             None => intent_providers::find_npx(),
         };
         let Some(cmd) = one_shot_launch(provider, resolved_bin, npx, model) else {
+            let reason = if provider_id == "codex" {
+                "check the configured adapter and Node.js installation"
+            } else {
+                "binary not found and npx unavailable"
+            };
             return Ok(unavailable(format!(
-                "{provider_id}: no adapter could be resolved (binary not found and npx unavailable)"
+                "{provider_id}: no adapter could be resolved ({reason})"
             )));
         };
         let cmd = match cwd {
@@ -1118,15 +1124,11 @@ rl.on('line', (line) => {
                 .cloned()
                 .collect();
             assert_eq!(mode, expected.as_slice());
-            let host = intent_providers::codex::host_codex_path();
             let runtime = cmd.env_vars().iter().find(|(key, _)| key == "CODEX_PATH");
-            assert_eq!(
-                runtime.map(|(_, value)| value.as_os_str()),
-                host.as_deref().map(std::path::Path::as_os_str)
-            );
+            assert!(runtime.is_none());
             let removed: Vec<_> = cmd.removed_env_vars().iter().map(String::as_str).collect();
             assert_eq!(removed.contains(&"CODEX_CONFIG"), via_npx);
-            assert_eq!(removed.contains(&"CODEX_PATH"), host.is_none());
+            assert_eq!(removed.contains(&"CODEX_PATH"), via_npx);
         }
         for id in intent_providers::all_provider_ids()
             .into_iter()

@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/agentclientprotocol/codex-acp",
+  "tag": "v1.13.1",
+  "commit": "b1b8490cd165c18626dc3fe83836cdacdef94cd3",
+  "license": "Apache-2.0",
+  "changes": "Resolve the device Codex executable for app-server, authentication and CLI commands; remove the bundled @openai/codex dependency. Bundle the adapter and its JavaScript dependencies for offline distribution with intentd."
+}

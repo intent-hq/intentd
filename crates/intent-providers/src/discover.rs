@@ -249,6 +249,8 @@ fn availability_for(
 ) -> ProviderAvailability {
     let resolved_path = if gated_off.is_some() {
         None
+    } else if provider.id == "codex" {
+        crate::codex::adapter_override(override_path("codex").as_deref())
     } else if provider.npx_only_package.is_some() {
         find_npx()
     } else {
@@ -291,7 +293,11 @@ fn availability_for(
     };
     let installed = gated_off.is_none()
         && installed_with_secondary(
-            resolved_path.is_some() || primary_override.is_some(),
+            resolved_path.is_some()
+                || primary_override.is_some()
+                || (provider.id == "codex"
+                    && resolve_auto("codex", "codex").is_some()
+                    && resolve_auto("node", "node").is_some()),
             provider.requires_secondary_binary,
             |_| secondary_binary.as_ref().is_some_and(|s| s.resolved),
         );
@@ -1650,7 +1656,7 @@ mod find_provider_binary_tests {
         fs::create_dir_all(&v20_bin).unwrap();
         fs::create_dir_all(&v24_bin).unwrap();
         make_executable(&v20_bin.join("node"));
-        let codex = v24_bin.join("codex-acp");
+        let codex = v24_bin.join("codex");
         make_executable(&codex);
         let dirs = vec![v20_bin, v24_bin];
 
@@ -1660,7 +1666,7 @@ mod find_provider_binary_tests {
         let availability = providers.iter().find(|p| p.id == "codex").unwrap();
 
         assert!(availability.installed);
-        assert_eq!(availability.resolved_path.as_deref(), Some(codex.as_path()));
+        assert!(availability.resolved_path.is_none());
     }
 
     /// intent-hq/intent#5725: `/usr/local/bin/node` is a symlink into the nvm

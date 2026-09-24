@@ -400,7 +400,7 @@ async fn managed_codex_upgrade_reprobes_persisted_catalog() {
         1_000,
     );
     let reloaded = Arc::new(ModelCatalogCache::new(Some(path)));
-    let key = intent_providers::config::CODEX_ACP_NPX_PACKAGE;
+    let key = intent_providers::codex::ADAPTER_VERSION;
     let result =
         resolve_with_cache(&reloaded, "codex", key, false, 1_001, ok_fetch("gpt-6-sol")).await;
     assert_eq!(result.models, Some(rows("gpt-6-sol")));
@@ -622,11 +622,7 @@ fn registry_version_keys_follow_adapter_pins() {
     assert_eq!(key("unsloth"), "");
     // codex mirrors the fetch dispatch: pinned to the npx fallback only when
     // no codex-acp binary resolves on this machine.
-    let expected = if intent_providers::find_provider_binary("codex", "codex-acp", None).is_some() {
-        String::new()
-    } else {
-        intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
-    };
+    let expected = intent_providers::codex::ADAPTER_VERSION;
     assert_eq!(
         key("codex"),
         format!(

@@ -432,16 +432,7 @@ fn seed_catalog_workspace(dir: &Path) {
 }
 
 #[tokio::test]
-async fn pinned_codex_adapter_refreshes_models_after_host_cli_upgrade() {
-    codex_host_upgrade(false).await;
-}
-
-#[tokio::test]
-async fn installed_codex_adapter_refreshes_models_after_host_cli_upgrade() {
-    codex_host_upgrade(true).await;
-}
-
-async fn codex_host_upgrade(installed_adapter: bool) {
+async fn vendored_codex_adapter_refreshes_models_after_host_cli_upgrade() {
     use std::os::unix::fs::PermissionsExt;
     let Some(script) = gate("WSS host Codex E2E") else {
         return;
@@ -453,31 +444,22 @@ async fn codex_host_upgrade(installed_adapter: bool) {
     std::fs::create_dir_all(&home).unwrap();
     let report = data.path().join("runtime-report");
     let npx = write_fake_npx(&bin, &report, &script);
-    let adapter_script = format!(
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 10.9.2; exit 0; fi\nprintf '%s\\n' \"$CODEX_PATH\" >> '{}'\n{}\nexec \"$CODEX_PATH\" app-server\n",
-        report.display(),
-        if installed_adapter { "[ \"$CODEX_CONFIG\" = 'custom config' ] || exit 9" } else { "[ -z \"${CODEX_CONFIG+x}\" ] || exit 9" }
-    );
-    if installed_adapter {
-        let adapter = bin.join("codex-acp");
-        std::fs::write(&adapter, &adapter_script).unwrap();
-        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::write(&npx, "#!/bin/sh\nexit 99\n").unwrap();
-    } else {
-        std::fs::write(&npx, &adapter_script).unwrap();
-    }
+    std::fs::write(&npx, "#!/bin/sh\nexit 99\n").unwrap();
+    let adapter = bin.join("codex-acp");
+    std::fs::write(&adapter, "#!/bin/sh\nexit 99\n").unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
     let node = intent_providers::resolve_on_path("node").unwrap();
+    let mock = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../intent-providers/vendor/codex-acp/test/mock-codex.mjs");
     let codex = bin.join("codex");
     let install = |model: &str| {
-        let result = json!({"models": {"currentModelId": model,
-            "availableModels": [{"modelId": model, "name": model}]}});
         std::fs::write(
             &codex,
             format!(
-                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 17\nMOCK_AGENT_SESSION_RESULT='{}' exec '{}' '{}'\n",
-                result,
+                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 17\n[ -z \"${{CODEX_PATH+x}}\" ] || exit 18\n[ -z \"${{CODEX_CONFIG+x}}\" ] || exit 19\nexec '{}' '{}' app-server '{}'\n",
                 node.display(),
-                script
+                mock.display(),
+                model
             ),
         )
         .unwrap();
@@ -494,6 +476,7 @@ async fn codex_host_upgrade(installed_adapter: bool) {
             ("SHELL", "/bin/sh"),
             ("CODEX_PATH", "/stale/override"),
             ("CODEX_CONFIG", "custom config"),
+            ("MOCK_CODEX_REPORT", report.to_str().unwrap()),
         ],
     );
     let socket = data.path().join("intentd.sock");
@@ -518,8 +501,23 @@ async fn codex_host_upgrade(installed_adapter: bool) {
         assert_eq!(result["source"], "codex", "{result}");
         assert_eq!(result["models"][0]["id"], model, "{result}");
         let launches = std::fs::read_to_string(&report).unwrap();
-        assert_eq!(launches.lines().count(), if id == 3 { 2 } else { 1 });
-        assert!(launches.lines().all(|line| line == codex.to_str().unwrap()));
+        let calls: Vec<Value> = launches
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "initialize")
+                .count(),
+            if id == 3 { 2 } else { 1 }
+        );
+        assert!(calls
+            .iter()
+            .any(|call| call["method"] == "model/list" && call["model"] == model));
+        assert!(calls
+            .iter()
+            .any(|call| call["method"] == "thread/start" && call["model"] == model));
     }
 }
 
