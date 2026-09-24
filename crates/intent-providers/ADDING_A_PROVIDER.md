@@ -70,9 +70,9 @@ needs. Fields that matter most:
   `parse_grok_models_command_output` in `crates/intent-providers/src/models.rs`),
   `auth_error_patterns` (stderr matching), `login_command_hint`, `login_docs_url`.
 - **npx fields** — `fallback_npx_package` (spawn `npx -y <pkg>` only when no local binary
-  resolves; codex) vs `npx_only_package` (spawn via npx with a version we pin, skipping
-  auto-discovery entirely; claude-code, pi). The one npx-only exception, for providers
-  that opt in via `npx_only_honors_path_override` (claude-code), is a valid
+  resolves) vs `npx_only_package` (spawn via npx with a version we pin, skipping
+  auto-discovery entirely; claude-code, codex, pi). The npx-only exception, for providers
+  that opt in via `npx_only_honors_path_override` (claude-code, codex), is a valid
   `providers.paths[id]` override (absolute + executable): it is exec'd directly in place
   of the pinned npx spawn (`resolve_npx_only_override`, intent-hq/monorepo#4352) and the
   same override drives discovery's `installed`, the one-shot / test-prompt launches, and
@@ -82,6 +82,14 @@ needs. Fields that matter most:
   semantics. Resolution:
   `resolve_npx_only` in `crates/intent-services/src/agent_manager.rs` and the
   `npx_fallback_*` fields on `SpawnOptions` (`crates/intent-acp/src/spawn.rs`).
+- **Codex runtime** — managed sessions, model probes, and one-shot requests resolve
+  the host `codex` executable on each launch and pass its absolute path as `CODEX_PATH`.
+  When absent, the pinned adapter uses its bundled runtime. Inherited `CODEX_PATH` and
+  `CODEX_CONFIG` cannot override this choice; explicit adapter path overrides retain
+  their own environment. The model cache includes the host executable's resolved path,
+  size, and modification time. Custom launchers that update a runtime behind an
+  unchanged script may need a forced model refresh. Existing sessions keep their
+  running process until restarted; updating the host CLI does not grant model access.
 
 **Binary discovery** — `find_provider_binary` (`crates/intent-providers/src/discover.rs`)
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute

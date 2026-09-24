@@ -10477,10 +10477,10 @@ fn resolve_spawn(
     // never starts the managed server.
     let unsloth_endpoint = None;
 
-    // npx-only providers (claude-code, pi) are spawned via
+    // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
     // skipped entirely. For providers that opt in
-    // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
+    // (`npx_only_honors_path_override`; claude-code, codex) a valid `providers.paths`
     // override (absolute, executable) is the one exception: it is exec'd
     // directly in place of the pinned npx spawn (monorepo#4352); an invalid
     // override — or any override for pi — is ignored.
@@ -17664,11 +17664,11 @@ mod rebuild_spawn_opts_tests {
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         let mut opts = SpawnOptions::new(provider);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
+        opts.npx_fallback_package = provider.npx_only_package;
 
         let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
         assert_eq!(rebuilt.npx_fallback_binary, Some(npx_path.as_path()));
-        assert_eq!(rebuilt.npx_fallback_package, provider.fallback_npx_package);
+        assert_eq!(rebuilt.npx_fallback_package, provider.npx_only_package);
 
         // Through build_command/build_args: the rebuilt opts must spawn npx
         // with `--workspaces=false -y <package>`, not the bare `codex-acp`
@@ -17681,8 +17681,8 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(
             args[2],
             provider
-                .fallback_npx_package
-                .expect("codex has npx fallback")
+                .npx_only_package
+                .expect("codex has managed npx adapter")
         );
     }
 

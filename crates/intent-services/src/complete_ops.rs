@@ -265,14 +265,12 @@ pub(crate) fn one_shot_launch(
         OneShotCommand::npx(npx?, pkg).args(args)
     } else {
         let pkg = provider.fallback_npx_package?;
-        // The daemon-managed npx fallback: keep a stray env override from
-        // redirecting the adapter (mirrors the codex probe launch, #555).
-        OneShotCommand::npx(npx?, pkg)
-            .args(args)
-            .env_remove("CODEX_PATH")
-            .env_remove("CODEX_CONFIG")
+        OneShotCommand::npx(npx?, pkg).args(args)
     };
     if provider.id == "codex" {
+        if via_npx {
+            cmd = cmd.codex_runtime(intent_providers::codex::host_codex_path().as_deref());
+        }
         // Share persistent-session mode policy without importing unrelated
         // provider env defaults. Explicit inherited modes remain untouched.
         if let Some(mode) = intent_providers::build_provider_env_for_spawn(
@@ -1112,12 +1110,30 @@ rl.on('line', (line) => {
             let expected = std::env::var_os("INITIAL_AGENT_MODE")
                 .is_none()
                 .then(|| ("INITIAL_AGENT_MODE".to_string(), "agent-full-access".into()));
-            assert_eq!(cmd.env_vars(), expected.as_slice());
+            let mode: Vec<_> = cmd
+                .env_vars()
+                .iter()
+                .filter(|(key, _)| key == "INITIAL_AGENT_MODE")
+                .cloned()
+                .collect();
+            assert_eq!(mode, expected.as_slice());
+            let host = intent_providers::codex::host_codex_path();
+            let runtime = cmd.env_vars().iter().find(|(key, _)| key == "CODEX_PATH");
+            assert_eq!(
+                runtime.map(|(_, value)| value.as_os_str()),
+                host.as_deref()
+                    .filter(|_| via_npx)
+                    .map(std::path::Path::as_os_str)
+            );
             let removed: Vec<_> = cmd.removed_env_vars().iter().map(String::as_str).collect();
             assert_eq!(
                 removed,
                 if via_npx {
-                    vec!["CODEX_PATH", "CODEX_CONFIG"]
+                    if host.is_some() {
+                        vec!["CODEX_CONFIG"]
+                    } else {
+                        vec!["CODEX_CONFIG", "CODEX_PATH"]
+                    }
                 } else {
                     vec![]
                 }

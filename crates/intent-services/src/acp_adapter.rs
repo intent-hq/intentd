@@ -23,7 +23,7 @@
 //! panic and early-return paths a call-site guard would have to re-derive.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -272,6 +272,19 @@ impl AcpAdapterCommand {
     /// Remove an environment variable from the adapter child's inherited env.
     pub(crate) fn env_remove(mut self, key: impl Into<String>) -> Self {
         self.envs_removed.push(key.into());
+        self
+    }
+
+    pub(crate) fn codex_runtime(mut self, host: Option<&Path>) -> Self {
+        let mut command = std::process::Command::new(&self.program);
+        intent_providers::codex::configure_runtime(&mut command, host);
+        for (key, value) in command.get_envs() {
+            let key = key.to_string_lossy().into_owned();
+            self = match value {
+                Some(value) => self.env(key, value),
+                None => self.env_remove(key),
+            };
+        }
         self
     }
 

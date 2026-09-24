@@ -24,6 +24,7 @@ fn disable_node_compile_cache() {
 
 pub mod antigravity;
 pub mod args;
+pub mod codex;
 pub mod config;
 pub mod discover;
 pub mod models;

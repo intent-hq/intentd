@@ -1929,7 +1929,7 @@ async fn acp_probe_child_receives_env_overrides() {
 fn codex_probe_launch_npx_fallback_strips_codex_env() {
     // The pinned npx fallback is daemon-managed: CODEX_PATH / CODEX_CONFIG
     // must be removed from its child env (#555).
-    let cmd = super::codex_probe_launch(None, Some(std::path::PathBuf::from("/usr/local/bin/npx")))
+    let cmd = super::codex_probe_launch(Some(std::path::PathBuf::from("/usr/local/bin/npx")), None)
         .expect("npx fallback must produce a probe command");
     let removed = cmd.removed_env_vars();
     assert!(removed.iter().any(|k| k == "CODEX_PATH"));
@@ -1937,16 +1937,17 @@ fn codex_probe_launch_npx_fallback_strips_codex_env() {
 }
 
 #[test]
-fn codex_probe_launch_resolved_binary_keeps_codex_env() {
-    // A resolved codex-acp binary (providers.paths override / PATH scan) is
-    // the user's escape hatch — its env must be left untouched.
+fn codex_probe_launch_selects_host_runtime() {
     let cmd = super::codex_probe_launch(
-        Some(std::path::PathBuf::from("/custom/codex-acp")),
         Some(std::path::PathBuf::from("/usr/local/bin/npx")),
+        Some(std::path::Path::new("/host/codex")),
     )
-    .expect("resolved binary must produce a probe command");
-    assert!(cmd.removed_env_vars().is_empty());
-    assert!(cmd.env_vars().is_empty());
+    .expect("managed adapter must produce a probe command");
+    assert_eq!(cmd.removed_env_vars(), &["CODEX_CONFIG"]);
+    assert_eq!(
+        cmd.env_vars(),
+        &[("CODEX_PATH".into(), "/host/codex".into())]
+    );
 }
 
 #[test]

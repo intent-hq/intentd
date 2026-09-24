@@ -143,7 +143,7 @@ fn registry_field_parity() {
 
     let codex = find_provider("codex").unwrap();
     assert_eq!(codex.auth_check_args, Some(&["login", "status"][..]));
-    assert_eq!(codex.npx_only_package, None);
+    assert_eq!(codex.npx_only_package, Some(config::CODEX_ACP_NPX_PACKAGE));
 
     let cortex = find_provider("cortex").unwrap();
     assert_eq!(cortex.command, "cortex-acp");

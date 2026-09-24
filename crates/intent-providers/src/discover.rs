@@ -1449,7 +1449,7 @@ mod find_provider_binary_tests {
         let providers = discover_providers();
         for p in providers
             .iter()
-            .filter(|p| p.id != "claude-code" && p.id != "pi")
+            .filter(|p| p.id != "claude-code" && p.id != "pi" && p.id != "codex")
         {
             assert_eq!(p.npx_only_package, None, "{} must not be npx-only", p.id);
         }
@@ -1650,17 +1650,20 @@ mod find_provider_binary_tests {
         fs::create_dir_all(&v20_bin).unwrap();
         fs::create_dir_all(&v24_bin).unwrap();
         make_executable(&v20_bin.join("node"));
-        let codex = v24_bin.join("codex-acp");
-        make_executable(&codex);
+        let binary = v24_bin.join("opencode");
+        make_executable(&binary);
         let dirs = vec![v20_bin, v24_bin];
 
         let providers = discover_providers_with_overrides_and_resolver(&|_| None, &|_, command| {
             find_in_dirs(&dirs, command)
         });
-        let availability = providers.iter().find(|p| p.id == "codex").unwrap();
+        let availability = providers.iter().find(|p| p.id == "opencode").unwrap();
 
         assert!(availability.installed);
-        assert_eq!(availability.resolved_path.as_deref(), Some(codex.as_path()));
+        assert_eq!(
+            availability.resolved_path.as_deref(),
+            Some(binary.as_path())
+        );
     }
 
     /// intent-hq/intent#5725: `/usr/local/bin/node` is a symlink into the nvm
