@@ -8,12 +8,6 @@ pub fn host_codex_path() -> Option<PathBuf> {
     crate::find_provider_binary("codex", "codex", None)
 }
 
-/// Only an explicit override can replace the shipped adapter.
-#[must_use]
-pub fn adapter_override(explicit: Option<&str>) -> Option<PathBuf> {
-    explicit.and_then(|path| crate::discover::resolve_explicit_path("codex", path))
-}
-
 /// Content identity of the shipped adapter, including local patches.
 pub const ADAPTER_VERSION: &str = include_str!("../vendor/codex-acp/dist/version");
 

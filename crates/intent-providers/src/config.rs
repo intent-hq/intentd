@@ -42,6 +42,19 @@ pub const NPX_MIN_NPM_VERSION: &str = "7.0.0";
 /// [`NPX_MIN_NPM_VERSION`].
 pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
 
+/// Daemon-owned Codex subagent denial shared by persistent agents, model
+/// probes, and one-shot launches. V2 feature enabling takes precedence over
+/// `agents.enabled` in this runtime, so both settings must be false. Set this
+/// after all environment merges and remove `CODEX_PATH` so the adapter uses
+/// the device Codex executable. Do not merge user `CODEX_CONFIG`.
+pub const CODEX_SUBAGENT_POLICY_CONFIG: &str =
+    r#"{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}"#;
+
+/// Actionable prerequisite failure shared by all Codex launch entrypoints.
+pub const CODEX_ACP_PREREQUISITE_ERROR: &str =
+    "Codex requires Node.js 22+ and the Codex CLI to run the vendored codex-acp adapter. \
+     Install Node.js and Codex on the daemon host and try again.";
+
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
 /// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
 /// bumping the version is a deliberate code change. Also feeds the pi
@@ -419,11 +432,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
-        // Declared Native (the `empty()` default) for the Rust `codex-acp`
-        // override: no V8 heap-cap env on that path. The bundled adapter
-        // (vendored codex-acp, pure Node) is detected at spawn
-        // time and DOES get the NODE_OPTIONS heap cap
-        // (`build_provider_env_for_spawn`, intent-hq/monorepo#1661).
+        // The selected adapter runs on Node, including when a native or JS
+        // codex-acp is installed. Custom paths cannot bypass the subagent policy.
+        runtime: ProviderRuntime::Node,
         can_be_disabled: true,
         // The vendored codex-acp adapter ignores
         // `_meta.developerInstructions` (verified empirically, #479; still
@@ -446,9 +457,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // current/default reasoning effort when the model changes. A
         // `{base}/{effort}` suffix is stripped daemon-side before sending
         // (`config_option_model_target`); the effort itself rides the
-        // generic `thought_level` option (`reasoning_effort`). The `-c`
-        // args (`apply_codex_config_args`) are kept for the native Rust
-        // codex-acp binary path, which does consume them.
+        // generic `thought_level` option (`reasoning_effort`).
         supports_config_option_model: true,
         config_option_model_strips_effort: true,
         auth_check_args: Some(&["login", "status"]),

@@ -6,7 +6,7 @@ const model = process.argv[3];
 const send = message => process.stdout.write(JSON.stringify(message) + '\n');
 for await (const line of createInterface({input: process.stdin})) {
   const message = JSON.parse(line);
-  if (process.env.MOCK_CODEX_REPORT) appendFileSync(process.env.MOCK_CODEX_REPORT, JSON.stringify({model, method: message.method}) + '\n');
+  if (process.env.MOCK_CODEX_REPORT) appendFileSync(process.env.MOCK_CODEX_REPORT, JSON.stringify({model, method: message.method, params: message.params}) + '\n');
   if (message.id === undefined) continue;
   let result;
   switch (message.method) {

@@ -247,12 +247,27 @@ fn availability_for(
     resolve_auto: &dyn Fn(&str, &str) -> Option<PathBuf>,
     override_path: &dyn Fn(&str) -> Option<String>,
 ) -> ProviderAvailability {
-    let resolved_path = if gated_off.is_some() {
+    let resolve_npx = find_npx;
+    availability_for_with_npx(
+        provider,
+        gated_off,
+        resolve_auto,
+        override_path,
+        &resolve_npx,
+    )
+}
+
+fn availability_for_with_npx(
+    provider: &ProviderConfig,
+    gated_off: Option<String>,
+    resolve_auto: &dyn Fn(&str, &str) -> Option<PathBuf>,
+    override_path: &dyn Fn(&str) -> Option<String>,
+    resolve_npx: &dyn Fn() -> Option<PathBuf>,
+) -> ProviderAvailability {
+    let resolved_path = if gated_off.is_some() || provider.id == "codex" {
         None
-    } else if provider.id == "codex" {
-        crate::codex::adapter_override(override_path("codex").as_deref())
     } else if provider.npx_only_package.is_some() {
-        find_npx()
+        resolve_npx()
     } else {
         resolve_auto(provider.id, provider.command)
     };
@@ -262,9 +277,10 @@ fn availability_for(
     // key). npx-only providers only honor it when they opt in
     // (`npx_only_honors_path_override`; claude-code) — `resolve_spawn` then
     // exec's a valid override in place of the pinned npx spawn
-    // (monorepo#4352); pi keeps npx-only semantics, so an override never
+    // (monorepo#4352); pi and Codex keep npx-only semantics, so an override never
     // flips its `installed`.
     let primary_override = if gated_off.is_some()
+        || provider.id == "codex"
         || (provider.npx_only_package.is_some() && !provider.npx_only_honors_path_override)
     {
         None
@@ -355,6 +371,7 @@ pub fn not_installed_detail(
                 }
             }
         }
+        None if command == "codex-acp" => crate::config::CODEX_ACP_PREREQUISITE_ERROR.to_string(),
         None => format!("{command} not on PATH"),
     }
 }
@@ -806,6 +823,13 @@ pub fn find_npx() -> Option<PathBuf> {
         &intent_core::path_utils::inherited_path_dirs(),
         &intent_core::path_utils::enriched_tool_dirs(),
     )
+}
+
+/// Resolve Node for the vendored adapter only when the device Codex CLI exists.
+#[must_use]
+pub fn find_codex_node() -> Option<PathBuf> {
+    crate::codex::host_codex_path()?;
+    find_node()
 }
 
 /// Resolve the `node` the daemon detects — the same candidate the
@@ -1455,7 +1479,7 @@ mod find_provider_binary_tests {
         let providers = discover_providers();
         for p in providers
             .iter()
-            .filter(|p| p.id != "claude-code" && p.id != "pi")
+            .filter(|p| !matches!(p.id, "claude-code" | "pi" | "codex"))
         {
             assert_eq!(p.npx_only_package, None, "{} must not be npx-only", p.id);
         }
@@ -1656,17 +1680,20 @@ mod find_provider_binary_tests {
         fs::create_dir_all(&v20_bin).unwrap();
         fs::create_dir_all(&v24_bin).unwrap();
         make_executable(&v20_bin.join("node"));
-        let codex = v24_bin.join("codex");
-        make_executable(&codex);
+        let opencode = v24_bin.join("opencode");
+        make_executable(&opencode);
         let dirs = vec![v20_bin, v24_bin];
 
         let providers = discover_providers_with_overrides_and_resolver(&|_| None, &|_, command| {
             find_in_dirs(&dirs, command)
         });
-        let availability = providers.iter().find(|p| p.id == "codex").unwrap();
+        let availability = providers.iter().find(|p| p.id == "opencode").unwrap();
 
         assert!(availability.installed);
-        assert!(availability.resolved_path.is_none());
+        assert_eq!(
+            availability.resolved_path.as_deref(),
+            Some(opencode.as_path())
+        );
     }
 
     /// intent-hq/intent#5725: `/usr/local/bin/node` is a symlink into the nvm
@@ -1807,6 +1834,16 @@ mod find_provider_binary_tests {
             not_installed_detail("codex", false, None),
             "codex not on PATH"
         );
+    }
+
+    #[test]
+    fn codex_not_installed_detail_names_runtime_prerequisites() {
+        let detail = not_installed_detail("codex-acp", false, None);
+        assert!(
+            detail.contains("Codex requires Node.js 22+ and the Codex CLI"),
+            "{detail}"
+        );
+        assert!(detail.contains("Install Node.js and Codex"), "{detail}");
     }
 
     #[test]
@@ -2045,6 +2082,41 @@ mod override_aware_discovery_tests {
             availability.resolved_path.is_some(),
             "a pi override must not flip installed"
         );
+    }
+
+    #[test]
+    fn codex_discovery_requires_host_and_node_and_ignores_adapters() {
+        let dir = unique_temp_dir("codex-discovery-policy");
+        let adapter = dir.path().join("codex-acp");
+        make_executable(&adapter);
+        let codex = crate::config::find_provider("codex").unwrap();
+        for has_host in [false, true] {
+            for has_node in [false, true] {
+                for explicit_path in [None, Some(adapter.to_str().unwrap())] {
+                    let resolve_auto = |_: &str, command: &str| match command {
+                        "codex" if has_host => Some(dir.path().join("codex")),
+                        "node" if has_node => Some(dir.path().join("node")),
+                        "codex-acp" => Some(adapter.clone()),
+                        _ => None,
+                    };
+                    let availability = availability_for_with_npx(
+                        codex,
+                        None,
+                        &resolve_auto,
+                        &|_| explicit_path.map(str::to_string),
+                        &|| panic!("Codex must not resolve npx"),
+                    );
+                    assert_eq!(
+                        availability.installed,
+                        has_host && has_node,
+                        "host={has_host}, node={has_node}, override={explicit_path:?}"
+                    );
+                    assert!(availability.resolved_path.is_none());
+                    assert!(availability.npx_only_package.is_none());
+                    assert!(!availability.has_npx_fallback);
+                }
+            }
+        }
     }
 
     /// monorepo#4352: discovery honors the claude-code override for the

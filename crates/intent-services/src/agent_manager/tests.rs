@@ -21,8 +21,6 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
-#[cfg(unix)]
-use super::guard_npx_version;
 use super::{
     budget_admits, charged_bytes, compute_process_cap, derive_agent_type, derive_is_orchestrator,
     is_cancel_transport_closed, pop_and_wake_waiter, recommended_memory_budget_bytes,
@@ -33,6 +31,8 @@ use super::{
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
+#[cfg(unix)]
+use crate::npx_cli::guard_npx_version;
 use crate::test_support::test_tempdir;
 use crate::Services;
 

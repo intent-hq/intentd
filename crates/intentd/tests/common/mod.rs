@@ -8,6 +8,9 @@
 // uses a subset of it, so unused items are expected.
 #![allow(dead_code)]
 
+#[cfg(unix)]
+pub mod codex_runtime;
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Child;

@@ -180,7 +180,7 @@ pub const MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 60;
 pub const MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 5000;
 
 /// Default for `prMonitor.quotaSharePercent` — the share of the forge's
-/// REMAINING core quota (as reported by its quota-free `rate_limit` probe)
+/// REMAINING PR-read quota (from shared authoritative quota probes)
 /// the PR-monitor loop may plan to spend before the window resets. The
 /// hourly budget plans the steady state; this stretches the per-PR
 /// interval ahead of exhaustion once the quota is running low (agents'

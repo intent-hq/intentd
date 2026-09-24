@@ -64,7 +64,7 @@ function log(msg) {
 }
 
 // Session-lifecycle log: one JSON line per session/new | session/load —
-// { method, sessionId, pid, meta, nodeOptions, cwd, processCwd } — when
+// { method, sessionId, pid, meta, nodeOptions, cwd, processCwd, argv } — when
 // MOCK_AGENT_SESSION_LOG points at a file. Lets e2e tests assert exactly
 // which session ids the daemon offered to which child process (e.g. that a
 // cross-provider switch never issues session/load with the old provider's id
@@ -76,7 +76,10 @@ function log(msg) {
 // intent-hq/intent#4330). `cwd` is the request's `cwd` param (the ACP
 // session directory, null when absent) and `processCwd` this child's actual
 // working directory, so tests can prove the two are decoupled for npx
-// launches (intent-hq/intent#5738).
+// launches (intent-hq/intent#5738). `argv` records only the arguments passed
+// to this fixture, excluding the Node executable and script path, so tests
+// can verify provider selection. MOCK_AGENT_LOG_CODEX_POLICY opts into only
+// the daemon-owned policy JSON and CODEX_PATH presence, never other env values.
 function logSessionCall(method, sessionId, meta, cwd) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
@@ -91,6 +94,13 @@ function logSessionCall(method, sessionId, meta, cwd) {
         nodeOptions: process.env.NODE_OPTIONS ?? null,
         cwd: cwd ?? null,
         processCwd: process.cwd(),
+        argv: process.argv.slice(2),
+        ...(process.env.MOCK_AGENT_LOG_CODEX_POLICY === '1'
+          ? { codexPolicy: {
+              config: process.env.CODEX_CONFIG ? JSON.parse(process.env.CODEX_CONFIG) : null,
+              pathPresent: Object.hasOwn(process.env, 'CODEX_PATH'),
+            } }
+          : {}),
       }) + '\n'
     );
   } catch (err) {

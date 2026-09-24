@@ -4,9 +4,8 @@
 //! initial create and the resume-impossible recreate path — so delegated
 //! Codex threads stop titling themselves from the prepended system prompt.
 //!
-//! The `codex` provider is resolved hermetically via a `providers.paths`
-//! override in `config.toml` pointing at a shell wrapper that execs the
-//! deterministic mock fixture (the cross-provider-history pattern), and the
+//! A process-local node/npx pair resolves the selected Codex package to the
+//! deterministic mock fixture without npm or model access, and the
 //! fixture's `MOCK_AGENT_SESSION_LOG` seam records each `session/new` /
 //! `session/load` WITH the request's `_meta` verbatim. Sequence proven on
 //! the wire: turn 1 `session/new` carries exactly
@@ -20,8 +19,7 @@
 
 mod common;
 
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -269,40 +267,6 @@ fn gate(test: &str) -> Option<String> {
     Some(script)
 }
 
-/// Write an executable shell wrapper that execs the mock fixture under `node`,
-/// discarding whatever base args the daemon passes for the impersonated
-/// codex provider — the fixture speaks ACP on stdio and ignores argv anyway.
-fn write_provider_wrapper(data_dir: &Path, script: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
-    let wrapper = data_dir.join("fake-codex");
-    std::fs::write(
-        &wrapper,
-        format!("#!/bin/sh\nexec \"{}\" \"{}\"\n", node.display(), script),
-    )
-    .expect("write wrapper");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod wrapper");
-    wrapper
-}
-
-/// Seed `config.toml` with a `providers.paths` override pinning `codex` to the
-/// wrapper — the highest-precedence tier of provider binary resolution, so a
-/// real codex install (PATH or npx fallback) can never be picked up.
-fn seed_codex_path_override(data_dir: &Path, wrapper: &Path) {
-    let path = data_dir.join("config.toml");
-    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    let _ = write!(
-        text,
-        "\n[providers.paths]\ncodex = \"{}\"\n",
-        wrapper.display()
-    );
-    std::fs::write(&path, text).expect("write config.toml");
-}
-
 /// Parse the mock fixture's session-lifecycle log: one
 /// `{ method, sessionId, pid, meta }` JSON line per `session/new` /
 /// `session/load` the child received (`MOCK_AGENT_SESSION_LOG` seam), with
@@ -368,20 +332,23 @@ async fn codex_session_new_carries_session_title_meta_over_wss() {
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let wrapper = write_provider_wrapper(&data_dir, &script);
-    seed_codex_path_override(&data_dir, &wrapper);
+    let toolchain = common::codex_runtime::install(&data_dir, &script);
     let pid_file = data_dir.join("pids.txt");
     let pid_file_s = pid_file.to_string_lossy().into_owned();
     let session_log = data_dir.join("sessions.txt");
     let session_log_s = session_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "CODEX_TITLE_E2E_REPLY" }).to_string();
-    let env: [(&str, &str); 5] = [
+    let mut env: Vec<(&str, &str)> = toolchain
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    env.extend([
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PID_FILE", &pid_file_s),
         ("MOCK_AGENT_SESSION_LOG", &session_log_s),
-    ];
+    ]);
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,

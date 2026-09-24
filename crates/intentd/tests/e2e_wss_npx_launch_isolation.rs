@@ -456,7 +456,7 @@ async fn vendored_codex_adapter_refreshes_models_after_host_cli_upgrade() {
         std::fs::write(
             &codex,
             format!(
-                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 17\n[ -z \"${{CODEX_PATH+x}}\" ] || exit 18\n[ -z \"${{CODEX_CONFIG+x}}\" ] || exit 19\nexec '{}' '{}' app-server '{}'\n",
+                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 17\n[ -z \"${{CODEX_PATH+x}}\" ] || exit 18\nexec '{}' '{}' app-server '{}'\n",
                 node.display(),
                 mock.display(),
                 model
@@ -518,6 +518,16 @@ async fn vendored_codex_adapter_refreshes_models_after_host_cli_upgrade() {
         assert!(calls
             .iter()
             .any(|call| call["method"] == "thread/start" && call["model"] == model));
+        for call in calls.iter().filter(|call| call["method"] == "thread/start") {
+            assert_eq!(
+                call["params"]["config"]["agents"]["enabled"], false,
+                "{call}"
+            );
+            assert_eq!(
+                call["params"]["config"]["features"]["multi_agent_v2"], false,
+                "{call}"
+            );
+        }
     }
 }
 

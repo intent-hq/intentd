@@ -237,8 +237,7 @@ fn claude_code_version() -> String {
     intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE.to_string()
 }
 
-/// codex source: ACP probe via a resolved `codex-acp` binary, else the pinned
-/// npx fallback.
+/// codex source: ACP probe via the pinned npx adapter.
 fn codex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     provider_models_fetch("codex")
 }
@@ -496,11 +495,8 @@ impl ModelCatalogReader<'_> {
     /// or trigger a fetch — an unregistered provider, cold cache, stale-pin
     /// entry, or a catalog with no marked row all return `None` (the provider
     /// CLI default applies). The registry version-key function runs only when
-    /// a cached entry with a marked row exists — for codex it resolves the
-    /// `codex-acp` binary (an enhanced-PATH scan whose first call can block on
-    /// the login-shell PATH capture), a cost the cold-cache fall-through must
-    /// not pay; it also runs outside the cache lock so a slow first capture
-    /// never stalls other cache readers.
+    /// a cached entry with a marked row exists, and outside the cache lock so
+    /// executable-based source resolution never stalls other cache readers.
     pub(crate) fn cached_default_model(&self, provider_id: &str) -> Option<String> {
         let source = source_for(provider_id)?;
         let (entry_version_key, default_id) = {

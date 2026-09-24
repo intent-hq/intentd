@@ -1926,41 +1926,37 @@ async fn acp_probe_child_receives_env_overrides() {
 }
 
 #[test]
-fn codex_probe_launch_bundle_strips_codex_env() {
-    // The pinned npx fallback is daemon-managed: CODEX_PATH / CODEX_CONFIG
-    // must be removed from its child env (#555).
-    let cmd =
-        super::codex_probe_launch(None, Some(std::path::PathBuf::from("/usr/local/bin/node")))
-            .expect("npx fallback must produce a probe command");
+fn codex_probe_launch_enforces_both_subagent_settings() {
+    let cmd = super::codex_probe_launch(Some(std::path::PathBuf::from("/usr/local/bin/node")))
+        .expect("node must produce a probe command");
     let removed = cmd.removed_env_vars();
     assert!(removed.iter().any(|k| k == "CODEX_PATH"));
-    assert!(removed.iter().any(|k| k == "CODEX_CONFIG"));
-}
-
-#[test]
-fn codex_probe_launch_honors_explicit_adapter_override() {
-    let cmd = super::codex_probe_launch(
-        Some(std::path::PathBuf::from("/custom/codex-acp")),
-        Some(std::path::PathBuf::from("/usr/local/bin/node")),
-    )
-    .expect("resolved binary must produce a probe command");
-    assert!(cmd.removed_env_vars().is_empty());
-    assert_eq!(cmd.program(), std::path::Path::new("/custom/codex-acp"));
-    assert!(cmd.env_vars().is_empty());
-    let fallback =
-        super::codex_probe_launch(None, Some(std::path::PathBuf::from("/usr/local/bin/node")))
-            .unwrap();
+    assert!(!removed.iter().any(|k| k == "CODEX_CONFIG"));
+    let config = cmd
+        .env_vars()
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CODEX_CONFIG");
+    let value = config.map(|(_, value)| {
+        serde_json::from_str::<serde_json::Value>(value.to_str().unwrap()).unwrap()
+    });
     assert_eq!(
-        fallback.program(),
-        std::path::Path::new("/usr/local/bin/node")
+        value,
+        Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
     );
-    assert_eq!(fallback.env_vars(), cmd.env_vars());
-    assert_eq!(fallback.removed_env_vars(), &["CODEX_PATH", "CODEX_CONFIG"]);
 }
 
 #[test]
-fn codex_probe_launch_without_binary_or_npx_is_none() {
-    assert!(super::codex_probe_launch(None, None).is_none());
+fn codex_probe_launch_uses_selected_node() {
+    let node = std::path::PathBuf::from("/usr/local/bin/node");
+    let cmd =
+        super::codex_probe_launch(Some(node.clone())).expect("node must produce a probe command");
+    assert_eq!(cmd.program(), node.as_path());
+}
+
+#[test]
+fn codex_probe_launch_without_node_is_none() {
+    assert!(super::codex_probe_launch(None).is_none());
 }
 
 #[cfg(unix)]

@@ -110,6 +110,7 @@ mod model_catalog;
 mod nested_repos;
 mod note_merge;
 pub mod note_ops;
+mod npx_cli;
 mod one_shot_acp;
 pub mod pagination;
 pub mod pi_cli;
@@ -4847,8 +4848,8 @@ impl Services {
 
     /// A sweep forge call failed with [`Error::RateLimited`]: pause all
     /// forge-touching sweep work globally until the quota window resets.
-    /// The pause honors the forge-reported reset timestamp (GitHub's free
-    /// `rate_limit` probe) plus a margin, clamped, else a fixed fallback —
+    /// The pause honors the forge-reported reset timestamp (GitHub's enforced
+    /// response headers) plus a margin, clamped, else a fixed fallback —
     /// see [`rate_limit::pause_duration`]. Exactly one WARN is logged per
     /// pause window (the opening trigger); repeat triggers while paused
     /// extend the deadline silently, coalescing what used to be one WARN
@@ -4875,18 +4876,22 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
         detail: &str,
     ) {
-        let reset_unix = sc
-            .rate_limit_status()
-            .await
-            .ok()
-            .and_then(|status| status.reset_at);
+        let status = self.sweep_rate_limit.probe_status(sc.as_ref()).await;
+        // A rejection followed by already-healthy counters is contradictory
+        // evidence, not recovery (secondary limits and unmeasured resources
+        // also look this way). Keep a bounded fallback pause; those same
+        // counters cannot lift it early. This also rejects a healthy cadence
+        // probe cached just before the failing request.
+        let allow_early_lift =
+            !status.is_some_and(|s| rate_limit::quota_recovered(s.remaining, s.limit));
+        let reset_unix = status.filter(|_| allow_early_lift).and_then(|s| s.reset_at);
         let _reconcile = self.sweep_rate_limit.reconcile().await;
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let pause = rate_limit::pause_duration(reset_unix, now_unix);
         let before = self.sweep_rate_limit_paused_until();
-        let opened = self.sweep_rate_limit.pause_for(pause);
+        let opened = self.sweep_rate_limit.pause_for(pause, allow_early_lift);
         if opened {
             tracing::warn!(
                 pause_secs = pause.as_secs(),
@@ -4916,20 +4921,20 @@ impl Services {
         }
     }
 
-    /// While the gate is paused, re-probe the forge's quota-free
-    /// `rate_limit` endpoint and lift the pause early once the quota has
+    /// While the gate permits early recovery, consult the forge's shared
+    /// quota probe and lift the pause early once both PR-read resources have
     /// recovered ([`rate_limit::quota_recovered`]: a reported `remaining`
     /// at or above `max(500, 10% of limit)`), instead of sitting out the
-    /// full `reset + margin` blackout — the reported reset is the window's
-    /// nominal turnover, and the quota is routinely back well before it.
-    /// Called once at the top of each forge-touching sweep tick, so a
-    /// paused tick costs at most one (free) probe. A probe failure, a host
-    /// without the signal, or a quota still below the floor keeps the
+    /// full `reset + margin` blackout. GitHub's metered probe is shared
+    /// across all sweep ticks with at least 60 seconds between probes;
+    /// contradictory health at pause time disables early recovery for that
+    /// window. A probe failure, a host without the signal, or a quota still
+    /// below the floor keeps the
     /// existing deadline — no behavior change from the fixed window.
     ///
     /// Returns the probe's status when this call lifted the pause (so the
     /// caller can plan its cadence on it without a second probe —
-    /// [`Services::pr_monitor_quota_status`]) and `None` otherwise. On a
+    /// [`Services::pr_monitor_quota_window`]) and `None` otherwise. On a
     /// lift one INFO is logged and the pause annotation every active PR
     /// monitor carries ([`Self::pause_sweeps_for_rate_limit`]) is cleared
     /// ([`Store::clear_active_pr_monitors_pause`]) — the guarded
@@ -4954,17 +4959,10 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Option<intent_sourcecontrol::RateLimitStatus> {
         let until = self.sweep_rate_limit_paused_until()?;
-        let status = match sc.rate_limit_status().await {
-            Ok(status) => status,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    until,
-                    "forge rate limit pause: quota probe failed; keeping the deadline"
-                );
-                return None;
-            }
-        };
+        if !self.sweep_rate_limit.allows_early_lift() {
+            return None;
+        }
+        let status = self.sweep_rate_limit.probe_status(sc.as_ref()).await?;
         if !rate_limit::quota_recovered(status.remaining, status.limit) {
             tracing::debug!(
                 remaining = status.remaining,
@@ -4975,7 +4973,9 @@ impl Services {
             return None;
         }
         let _reconcile = self.sweep_rate_limit.reconcile().await;
-        if self.sweep_rate_limit_paused_until().as_deref() != Some(until.as_str()) {
+        if !self.sweep_rate_limit.allows_early_lift()
+            || self.sweep_rate_limit_paused_until().as_deref() != Some(until.as_str())
+        {
             tracing::debug!(
                 until,
                 now = ?self.sweep_rate_limit_paused_until(),
@@ -5730,7 +5730,7 @@ impl Services {
                 None
             }
         };
-        // A paused tick spends its one free quota probe here: the pause
+        // A paused tick consults the shared quota probe here: the pause
         // lifts early once the quota has recovered (monorepo#2961).
         if let Some(sc) = sc.as_ref() {
             self.maybe_lift_rate_limit_pause(sc).await;

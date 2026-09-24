@@ -11,8 +11,8 @@
 //! Sources:
 //! - `claude-code` — ACP probe via the pinned npx adapter
 //!   ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
-//! - `codex` — ACP probe via a resolved `codex-acp` binary, falling back to
-//!   the pinned npx package. Base models with reasoning-effort support carry
+//! - `codex` — ACP probe via the pinned npx package. Base models with
+//!   reasoning-effort support carry
 //!   their levels as `effortLevels` (parity with the FE). The FE
 //!   additionally tries a `codex app-server` transport first, but that path
 //!   exists to reuse its Electron-managed codex runtime; daemon-side the
@@ -216,14 +216,17 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
         );
     };
     let cmd = AcpProbeCommand::npx(npx, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
+    if let Err(err) = cmd.check_npx_version().await {
+        return ProviderModelsFetch::unavailable("claude-code", err);
+    }
     finish(
         "claude-code",
         run_acp_probe(cmd, |v| parse::parse_acp_models(v, "claude-code")).await,
     )
 }
 
-/// codex: ACP probe via a resolved `codex-acp` binary, else the vendored
-/// adapter running on Node. Effort-capable models carry `effortLevels` on one row.
+/// codex: ACP probe via the vendored adapter and device Codex CLI.
+/// Effort-capable base models carry `effortLevels` on one row.
 ///
 /// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
 /// dir, removed after the probe) so the user's `~/.codex/config.toml` — and
@@ -233,10 +236,10 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
 /// only the user's configured `model` / `model_reasoning_effort` so that
 /// model appears in the reported catalog.
 pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
-    let Some(cmd) = codex_probe_launch(None, intent_providers::find_node()) else {
+    let Some(cmd) = codex_probe_launch(intent_providers::find_codex_node()) else {
         return ProviderModelsFetch::unavailable(
             "codex",
-            "codex-acp binary not found and Node.js unavailable for the bundled adapter",
+            intent_providers::CODEX_ACP_PREREQUISITE_ERROR,
         );
     };
     let (cmd, codex_home) = match with_isolated_codex_home(cmd) {
@@ -253,16 +256,11 @@ pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
     finish("codex", outcome)
 }
 
-/// Preserve installed adapter precedence; the fallback is embedded in intentd.
-fn codex_probe_launch(
-    resolved_bin: Option<PathBuf>,
-    node: Option<PathBuf>,
-) -> Option<AcpProbeCommand> {
-    if let Some(bin) = resolved_bin {
-        Some(AcpProbeCommand::binary(bin, Vec::new()))
-    } else {
-        node.map(AcpProbeCommand::bundled_codex)
-    }
+/// The same vendored launch and policy used by one-shot completions. No native
+/// or configured adapter path is accepted by a Codex model probe.
+fn codex_probe_launch(node: Option<PathBuf>) -> Option<AcpProbeCommand> {
+    let provider = intent_providers::find_provider("codex")?;
+    crate::complete_ops::one_shot_launch(provider, None, node, None)
 }
 
 /// Attach a freshly created isolated `CODEX_HOME` to an ephemeral codex

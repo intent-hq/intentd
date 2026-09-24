@@ -842,7 +842,12 @@ async fn spawn_provider_npx_launch_is_isolated_from_the_launch_roots_ancestors()
     let tmp = test_temp_dir("intent-acp-npx-ancestor-");
     let workspace = tmp.path().join("plain workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let launch_root = seed_matching_workspace_ancestor(&tmp.path().join("home"));
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let linked_home = tmp.path().join("linked-home");
+    // Exercise the macOS /var -> /private/var path mismatch on Linux too.
+    std::os::unix::fs::symlink(&home, &linked_home).unwrap();
+    let launch_root = seed_matching_workspace_ancestor(&linked_home);
     let report = tmp.path().join("npx-report");
     let npx = write_fake_npx(tmp.path(), &report);
 
@@ -858,7 +863,7 @@ async fn spawn_provider_npx_launch_is_isolated_from_the_launch_roots_ancestors()
     let (npx_cwd, entries) = read_npx_report(&report).await;
     let status = agent.child_mut().wait().await.expect("wait fake npx");
     assert!(
-        npx_cwd.starts_with(&launch_root),
+        npx_cwd.starts_with(launch_root.canonicalize().unwrap()),
         "npx cwd {} is not under the launch root {}",
         npx_cwd.display(),
         launch_root.display()
@@ -990,7 +995,7 @@ async fn spawn_provider_real_npx_ignores_matching_ancestor_workspaces_and_siblin
                 .unwrap_or_else(|| panic!("{label} launch: unexpected report {started:?}")),
         );
         assert!(
-            cwd.starts_with(&launch_root),
+            cwd.starts_with(launch_root.canonicalize().unwrap()),
             "{label} launch: adapter cwd {} is not under the launch root {}",
             cwd.display(),
             launch_root.display()
@@ -1111,7 +1116,7 @@ async fn spawn_provider_real_npx_ignores_inherited_npm_workspace_selectors() {
             .unwrap_or_else(|| panic!("unexpected report {started:?}")),
     );
     assert!(
-        cwd.starts_with(&launch_root),
+        cwd.starts_with(launch_root.canonicalize().unwrap()),
         "adapter cwd {} is not under the launch root {}",
         cwd.display(),
         launch_root.display()

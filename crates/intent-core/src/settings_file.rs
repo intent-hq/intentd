@@ -1112,7 +1112,7 @@ pub struct PrMonitorSettings {
     /// exposed in the Settings UI).
     pub hourly_request_budget: u64,
     /// `prMonitor.quotaSharePercent` — the share of the forge's REMAINING
-    /// quota (read once per tick from its quota-free `rate_limit` probe)
+    /// quota (from a shared probe; GitHub probes at most once per minute)
     /// the loop may plan to spend before the window resets. Stretches the
     /// per-PR interval ahead of exhaustion; a host without the signal
     /// falls back to the hourly-budget model alone (config-file key; not
@@ -2013,8 +2013,8 @@ pollSeconds = 30
 # exceeds it; requests are not counted or blocked against it (minimum 60,
 # maximum 5000).
 hourlyRequestBudget = 1500
-# PR monitor quota share percent -- the share of the forge's REMAINING core
-# quota (read once per tick from its quota-free rate_limit probe) the loop
+# PR monitor quota share percent -- the share of the forge's REMAINING PR-read
+# quota (from a shared probe; GitHub probes at most once per minute) the loop
 # may plan to spend before the window resets; the per-PR interval stretches
 # ahead of exhaustion so the monitor slows down before the rate-limit pause
 # has to stop it. A host without the signal uses the hourly budget alone
