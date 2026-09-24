@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.105] - 2026-09-24
+
+### 🚀 Features
+
+- GitLab forge connection (device grant + PAT) behind sourceControl.* auth RPCs ([#2024](https://github.com/intent-hq/intentd/pull/2024))
+- *(store)* Key principals and invite pins by a provider-neutral identity triple ([#2036](https://github.com/intent-hq/intentd/pull/2036))
+- *(sourcecontrol)* Add GitLab snippet identity proofs ([#2037](https://github.com/intent-hq/intentd/pull/2037))
+
+### 🐛 Bug Fixes
+
+- Update Codex ACP and automate reviewed pin bumps ([#2105](https://github.com/intent-hq/intentd/pull/2105))
+- Preserve agent selections across workspace transfers ([#2099](https://github.com/intent-hq/intentd/pull/2099))
+- Reflect workspace branch renames in the UI ([#2053](https://github.com/intent-hq/intentd/pull/2053))
+- Reserve discussion requests for stalled assigned work ([#2107](https://github.com/intent-hq/intentd/pull/2107))
+
+
 ## [0.9.104] - 2026-09-23
 
 ### ⚙️ Miscellaneous Tasks
