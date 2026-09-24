@@ -156,6 +156,9 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
             crate::complete_ops::missing_one_shot_adapter_message(provider_id),
         ));
     };
+    if let Err(err) = cmd.check_npx_version().await {
+        return Ok(failure("not-installed", err.to_string()));
+    }
     // Provider env parity with real ACP spawns: `one_shot_launch` builds
     // argv and the Codex mode, but some providers need more spawn env —
     // cortex's `ELECTRON_RUN_AS_NODE`, opencode's `OPENCODE_CONFIG_CONTENT`,

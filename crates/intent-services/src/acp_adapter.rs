@@ -197,6 +197,15 @@ pub(crate) struct AcpAdapterCommand {
 }
 
 impl AcpAdapterCommand {
+    /// Check the selected npx runtime before launch. Direct adapters never
+    /// depend on npx, even when a stale installation is present on PATH.
+    pub(crate) async fn check_npx_version(&self) -> intent_core::Result<()> {
+        if self.via_npx {
+            crate::npx_cli::check_npx_version(&self.program).await?;
+        }
+        Ok(())
+    }
+
     /// Run a pinned npm package via `npx --workspaces=false -y <package>`
     /// (the same npm-isolation argv as `intent_acp::spawn::build_args`;
     /// the switch precedes the package because npx forwards everything after

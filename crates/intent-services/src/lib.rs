@@ -110,6 +110,7 @@ mod model_catalog;
 mod nested_repos;
 mod note_merge;
 pub mod note_ops;
+mod npx_cli;
 mod one_shot_acp;
 pub mod pagination;
 pub mod pi_cli;

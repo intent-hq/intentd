@@ -555,6 +555,9 @@ impl Services {
         let Some(cmd) = one_shot_launch(provider, resolved_bin, npx, model) else {
             return Ok(unavailable(missing_one_shot_adapter_message(provider_id)));
         };
+        if let Err(err) = cmd.check_npx_version().await {
+            return Ok(unavailable(err.to_string()));
+        }
         let cmd = match cwd {
             Some(dir) => cmd.cwd(dir),
             None => cmd,

@@ -239,6 +239,9 @@ pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
             intent_providers::CODEX_ACP_PREREQUISITE_ERROR,
         );
     };
+    if let Err(err) = cmd.check_npx_version().await {
+        return ProviderModelsFetch::unavailable("codex", err);
+    }
     let (cmd, codex_home) = match with_isolated_codex_home(cmd) {
         Ok(pair) => pair,
         Err(e) => {
