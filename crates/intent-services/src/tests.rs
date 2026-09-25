@@ -46852,6 +46852,57 @@ mod harness_versioning {
         assert_eq!(raw, None, "projection never writes the snapshot back");
     }
 
+    /// Snapshots captured before peerAgents existed keep that capability
+    /// unavailable on respawn, matching the unchanged read-only projection.
+    #[tokio::test]
+    async fn older_snapshot_without_peer_agents_keeps_feature_off() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let pinned = serde_json::json!({
+            "backgroundHooks": true,
+            "hostExec": false,
+            "scripts": true,
+            "terminalAccess": true,
+            "browserAutomation": true,
+            "richChatBlocks": true,
+            "structuredQuestions": true,
+            "attentionRequests": true,
+            "stateSnapshot": true,
+            "prMonitor": true,
+            "taskGraph": true
+        });
+        sqlx::query("UPDATE agent_session SET harness_features = ? WHERE id = ?")
+            .bind(pinned.to_string())
+            .bind(&id.0)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("persist older snapshot");
+
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let features = svc.session_agent_features(&session);
+        assert!(svc.effective_settings().agent_features.peer_agents);
+        assert!(
+            !features.peer_agents,
+            "respawn must not enable peerAgents absent from the captured snapshot"
+        );
+        assert!(!features.host_exec, "other captured values still win");
+
+        let lite = svc.project_lite_with_flags(session);
+        assert_eq!(
+            lite.harness_features.as_ref(),
+            Some(&pinned),
+            "agent.get keeps peerAgents absent for the read-only feature display"
+        );
+        let full = svc
+            .agent_get_session_op(id.clone())
+            .await
+            .expect("getSession");
+        assert_eq!(full.harness_features.as_ref(), Some(&pinned));
+        let stored = svc.store().get_agent_session(&id).await.expect("reread");
+        assert_eq!(stored.harness_features, Some(pinned));
+    }
+
     /// The runtime surface follows the persisted snapshot, not live settings:
     /// `session_agent_features` (the respawn read used for the MCP bridge and
     /// prompt assembly) decodes `harness_features` when present — so a
