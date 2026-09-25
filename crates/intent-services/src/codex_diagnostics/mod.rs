@@ -172,12 +172,13 @@ impl CodexLaunch {
     /// async callers should perform this synchronous step off their executor.
     #[must_use]
     pub fn discover(_settings: &SettingsFile) -> Self {
-        let selection = intent_providers::find_codex_npx()
-            .map(|npx| ProviderLaunch::Managed {
+        let selection = intent_providers::find_codex_npx().map_or(
+            ProviderLaunch::Bare { command: "npx" },
+            |npx| ProviderLaunch::Managed {
                 npx,
                 package: CODEX_ACP_NPX_PACKAGE,
-            })
-            .unwrap_or(ProviderLaunch::Bare { command: "npx" });
+            },
+        );
         let command = build_command(&spawn_options(&selection));
         Self {
             selection,
