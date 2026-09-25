@@ -55,10 +55,12 @@ only on `intent-services`, never on `intent-store`.
 | SQLite schema + migrations   | `crates/intent-store/`                                       |
 | ACP streaming / permissions  | `crates/intent-acp/`                                         |
 | user-only agent field (hidden from agents) | `AGENT_HIDDEN_FIELDS` in `crates/intent-core/src/model.rs`; the egress registry + contract test in `crates/intent-acp/src/tests_hidden_field_egress.rs` — a new agent-facing egress that serves session/event data must be registered there |
+| queue-entry visibility (who sees which queued message where) | `QueueSurface` + the contract table in `crates/intent-core/src/queue_visibility_contract.rs`, driven by the services harness (`crates/intent-services/src/agent_ops/queue_visibility_contract_tests.rs`) and the transport harness (`crates/intent-transport/src/events/tests.rs`); `queue_entry_egress_lint` fails until a new handler that serializes `queue_snapshot()` / publishes an `agent:queue:*` event is registered against a variant |
 | browser tab contract / `ws.browser.docs` text | `crates/intent-acp/src/mcp_server/bindings/browser_docs/*.md` — change together with the cloudlands-fe executor (`src/features/browser/main/browser-action-executor.ts`, `embedded-browser-cdp-service.ts`, the browser-tab-registry saga) and `../../docs/protocol/methods/files-terminal-browser.md`; monorepo `make docs-check` cross-checks the shared `errorCode` / `displayed` tokens |
 | binary CLI + composition     | `crates/intentd/src/`                                        |
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
+| writing a source lint (`*_lint.rs`) | `crates/intentd-test-support/src/source_lint.rs` (lexer, markers, cfg(test) blanking, statement splitter, file walker); "Gates → source lints" below |
 | RPC performance / cost rules | "Performance — the RPC cost contract" below; durable principles in `../../docs/ARCHITECTURE.md` |
 
 ## Performance — the RPC cost contract
@@ -198,7 +200,9 @@ that contract:
 ## Gates — keep them green
 
 Before opening a submodule PR (and before bumping the monorepo gitlink), the gates must
-pass. Run them from the monorepo root via the top-level `Makefile`:
+pass. Run them from the monorepo root via the top-level `Makefile` (the same targets also
+work from `packages/intentd`, whose `Makefile` forwards them to the monorepo root; in a
+standalone clone they exit 2 and name the monorepo command):
 
 ```bash
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
@@ -224,24 +228,27 @@ The CI `check` job also runs the **source lints**: every `crates/<crate>/tests/*
 integration test is a source-scanning lint, selected by convention — run them all with
 `make lint-sources` from the monorepo root or `cargo test --workspace --test '*_lint'` in
 `packages/intentd`. Each lint fails naming `file:line`; its rationale, heuristic, and
-limits live in its module doc. `source_lint_discovery_lint` fails when a `*_lint.rs` file
-exists that the glob does not select (nested dir, `autotests = false`, renamed `[[test]]`)
-or when ci.yml's `check` job has no non-comment `run:` line invoking the glob, so a new
-lint needs no CI, Makefile, or docs wiring — add the file and a row below. Every opt-out
-marker requires a reason; baselines only ratchet down (the lint fails until a fixed
-file's entry is removed or lowered).
+limits live in its module doc. A new lint imports `intentd_test_support::source_lint`
+rather than copying scaffolding and needs no CI, Makefile, or docs wiring — add the file
+and a row below; `source_lint_discovery_lint` enforces all of this (a `*_lint.rs` the glob
+does not select, a ci.yml `check` job with no non-comment `run:` line invoking the glob,
+or copied scaffolding). Every opt-out marker requires a reason; baselines only ratchet
+down (the lint fails until a fixed file's entry is removed or lowered).
 
 | Lint | Fails on | Opt-out / baseline |
 | --- | --- | --- |
 | `repo_slug_fold_lint` | a case-fold call on an `owner` / `repo` / `repository` / `slug` identifier outside `intent_core::RepoRef` (intent-hq/intentd#1809 → #1815); route slug identity through `RepoRef` regardless | `// repo-slug-fold: allow — <reason>` on the line above |
 | `event_type_lint` | a `note:` / `task:` / `workspace:` / `agent:` string literal outside test code not in `intent_core::events::ALL_EVENT_TYPES`; add the type there, regenerate the golden `crates/intent-core/tests/goldens/event_types.json` with `INTENTD_UPDATE_GOLDENS=1`, and emit via the constant | `// event-type-lint: allow — <reason>` on the line above |
+| `running_turn_rule_lint` | an or-pattern outside test code and `crates/intent-core/src/model.rs` spelling exactly `AgentStatus::Pending \| Active \| Processing` (any order, `Self::` / qualified paths, `matches!` or match arm), or a string literal in non-test `crates/intent-store/src/**` containing both `'active'` and `'Processing'` (a hand-written SQL status list) — a fifth copy of the running-turn rule #2058 consolidated onto `AgentStatus::is_running_turn`; call the method, or generate the SQL list from `AgentStatus::ALL` filtered by it as `delegated_counts_sql` does | `// running-turn: allow — <reason>` on the line above the pattern / literal or its statement |
 | `fixed_sleep_lint` | `thread::sleep(` / `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**` (intent-hq/intentd#1924); wait on an observable event instead | `// timing-guard: <reason>` on the line or the line above; `crates/intent-core/tests/fixed_sleep_baseline.txt` (`<path> <count>`) |
 | `raw_child_lint` | a test file naming `std::process::Child` as a type instead of holding an `intentd_test_support::GuardedChild` (borrows and `use` paths are not hits) | `// raw-child: allow — <reason>` on the line above; the lint's `BASELINE` |
 | `tmp_hygiene_lint` | a raw `PathBuf::from("/tmp")` / `Path::new("/tmp")` / `temp_dir().join(..)` in test code instead of `test_tempdir` | trailing `// tmp-hygiene: allow — <reason>` |
 | `repo_cache_path_lint` | a literal `".repo-cache"` in test code instead of `intent_git::repo_cache::cache_root_for` / `cache_path_for` | trailing `// repo-cache-path: allow — <reason>` |
 | `serve_spawn_lint` | a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"`, or a file calling `enable_ws_api(` without `serve_command` in code | `// serve-spawn: allow — <reason>` on the statement line, or anywhere in the file for the second rule |
 | `agent_hidden_field_egress_lint` | a `mcp_server/bindings/` file that reads session/event rows (`AgentLite` / `Event`, `agent_get(` / `agent_list(` / `event_query(` …) without a `SCRUBBED_BINDINGS` row (scrubs with `strip_agent_hidden_fields` + `EGRESS_REGISTRY` entries), or an `intent-services` fn copying `.data` wholesale into `json!` without a `WAKE_METADATA_BUILDERS` row; allowlist rows and registry entries are cross-checked for staleness | `HAND_PICKED_BINDINGS` / `SAFE_DATA_COPIES` rows in the lint (reason required) |
-| `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, or a ci.yml `check` job with no non-comment `run:` line invoking the glob | none |
+| `queue_entry_egress_lint` | a non-test `queue_snapshot(` / `queue_snapshot_preview(` call whose enclosing fn, or an `event_type: <const>` publish of any const whose string value in `crates/intent-core/src/events.rs` starts with `agent:queue:` (the watched set is derived from that file, so a new `agent:queue:*` constant is watched without editing the lint) whose const, is named by no `REGISTERED_EGRESS` row (the row maps it to a `QueueSurface` variant in `crates/intent-core/src/queue_visibility_contract.rs`, so the contract harnesses drive it); outside `events.rs`, any other reference to a watched const (helper argument, local binding, `json!` value, comparison; `use` items excepted) or an `"agent:queue:*"` string literal whose enclosing fn is named by no `Key::Fn` row; a variant no row claims, or a row naming a variant / fn / const that no longer exists, also fails (multiplayer queue visibility, intentd#2068) | `// queue-egress: allow — <reason>` on the line above the call / reference or its statement, only when no entry leaves the daemon (a consumer matching on the type) |
+| `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, a ci.yml `check` job with no non-comment `run:` line invoking the glob, or a `*_lint.rs` file defining its own `fn lex(` / `markers_by_line(` / `blank_cfg_test_items(` / `cfg_test_item_ranges(` / `split_statements(` instead of importing `intentd_test_support::source_lint` (the #2073 fixes had to be re-applied per private copy) | `// source-lint-scaffolding: allow — <reason>` on the line above the definition; none for the first two rules |
+| `workflow_grep_quiet_lint` | a `\| grep -q` / `-Eq` / `--quiet` / `--silent` pipeline in `.github/workflows/*.yml` — under `bash -eo pipefail` a large matched input makes the producer die of SIGPIPE and the step report "no match" (cloudlands-fe#2709); use a here-string for variable input, `\| grep -E pat >/dev/null` for a real producer, or `grep -q pat file` | none |
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.

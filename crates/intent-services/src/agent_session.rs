@@ -9,7 +9,7 @@
 //! `agent:stream:end` is emitted per turn — `complete` and `error` both map to it
 //! (PROTOCOL §7).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,14 +29,15 @@ use intent_core::{
     MessageOrigin, Result, UsageCost, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::NewEvent;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent_ops::{
     last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
 };
-use crate::{token_usage, usage_stats, Services};
+use crate::image_dimensions::{self, ProbeContext};
+use crate::{file_ops, token_usage, usage_stats, Services};
 
 /// Derive the cross-layer, content-free stream correlation value used only in
 /// diagnostics. The input is an existing wire `turnId` (or the assistant
@@ -159,12 +160,26 @@ pub(crate) const PROMPT_SUSPEND_INTERRUPT_PREFIX: &str =
 /// against this prefix so the contract cannot drift.
 pub(crate) const PROMPT_AUTH_REQUIRED_PREFIX: &str = "session/prompt: provider \"";
 
+/// The auth-specific marker of [`crate::provider_auth::not_authenticated_message`].
+/// The turn-start disabled-provider rejection
+/// ([`crate::agent_ops::ensure_provider_enabled`] labelled `session/prompt`,
+/// intent-hq/intent#5737) shares [`PROMPT_AUTH_REQUIRED_PREFIX`] but reads
+/// `… is not enabled …` and has NOT emitted the terminal pair, so the
+/// classifier requires this marker too.
+pub(crate) const PROMPT_AUTH_REQUIRED_MARKER: &str = ") is not authenticated";
+
 /// Whether a turn error is the auth-required `session/prompt` mapping from
-/// [`Services::run_prompt_turn`] (see [`PROMPT_AUTH_REQUIRED_PREFIX`]).
-/// Prefix-anchored on the `InvalidParams` payload — mid-string mentions and
-/// other `InvalidParams` shapes never classify.
+/// [`Services::run_prompt_turn`] (see [`PROMPT_AUTH_REQUIRED_PREFIX`] and
+/// [`PROMPT_AUTH_REQUIRED_MARKER`]). Prefix-anchored on the `InvalidParams`
+/// payload — mid-string mentions, the disabled-provider rejection, and other
+/// `InvalidParams` shapes never classify.
 pub(crate) fn prompt_auth_required_turn_error(err: &Error) -> bool {
-    matches!(err, Error::InvalidParams(msg) if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX))
+    matches!(
+        err,
+        Error::InvalidParams(msg)
+            if msg.starts_with(PROMPT_AUTH_REQUIRED_PREFIX)
+                && msg.contains(PROMPT_AUTH_REQUIRED_MARKER)
+    )
 }
 
 /// Prefix of the auth-required `session/load` mapping
@@ -361,7 +376,26 @@ struct Transcript {
     /// whose arguments happen to be `{ code, summary }` keeps its own name
     /// and must never claim a `workspace_api` batch (intent-hq/intent#4491).
     identified_tool_calls: HashSet<String>,
+    /// Resolution context for the Markdown image dimension probe (§7.1 text
+    /// block `media` sidecar); `None` disables probing (unit drivers).
+    probe: Option<ProbeContext>,
+    /// Per-turn probe cache: Markdown `src` → header-only dimensions (`None`
+    /// = unresolvable), so a source repeated across blocks is probed once.
+    probe_cache: HashMap<String, Option<(u32, u32)>>,
+    /// `media` entries resolved for the PENDING text buffer so far (the union
+    /// [`flush_text`](Self::flush_text) stamps onto the block).
+    pending_media: BTreeMap<String, (u32, u32)>,
+    /// Byte offset into [`text`](Self::text) up to which completed image
+    /// references were already consumed (see `scan_image_refs`).
+    media_scan_pos: usize,
+    /// Image references examined for the pending buffer (cap, see
+    /// [`MAX_IMAGE_REFS_PER_BLOCK`]).
+    media_refs_seen: usize,
 }
+
+/// Cap on Markdown image references examined per text block — bounds both
+/// the header probes and the `media` sidecar size of one block.
+const MAX_IMAGE_REFS_PER_BLOCK: usize = 32;
 
 /// The block indices one [`Transcript::record_tool`] call materialized. The
 /// `agent:tool:call` event carries the ids derived from them (§7.1
@@ -392,7 +426,69 @@ impl Transcript {
             usage_cost: None,
             open_tool_calls: HashSet::new(),
             identified_tool_calls: HashSet::new(),
+            probe: None,
+            probe_cache: HashMap::new(),
+            pending_media: BTreeMap::new(),
+            media_scan_pos: 0,
+            media_refs_seen: 0,
         }
+    }
+
+    /// Enable the Markdown image dimension probe for this turn's text blocks.
+    #[must_use]
+    fn with_probe_context(mut self, probe: ProbeContext) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// Detect the image references the last chunk COMPLETED in the pending
+    /// assistant-text buffer, probe each (once per turn per `src`, cached),
+    /// and return the `media` entries newly resolved for the block — the
+    /// live delta's `media` field (§7.1) — or `None` when nothing new
+    /// resolved. The entries also join [`pending_media`](Self::pending_media),
+    /// the union [`flush_text`](Self::flush_text) persists, so live and
+    /// persisted `media` agree by construction. Reasoning (`thinking`)
+    /// buffers and probe-less transcripts never resolve anything.
+    fn probe_new_images(&mut self) -> Option<Map<String, Value>> {
+        let probe = self.probe.as_ref()?;
+        if self.pending_thought || self.media_refs_seen >= MAX_IMAGE_REFS_PER_BLOCK {
+            return None;
+        }
+        let refs = image_dimensions::scan_image_refs(&self.text, &mut self.media_scan_pos);
+        let mut new_entries = Map::new();
+        for src in refs {
+            if self.media_refs_seen >= MAX_IMAGE_REFS_PER_BLOCK {
+                break;
+            }
+            self.media_refs_seen += 1;
+            if self.pending_media.contains_key(&src) {
+                continue;
+            }
+            let dims = *self
+                .probe_cache
+                .entry(src.clone())
+                .or_insert_with(|| probe.probe(&src));
+            let Some((width, height)) = dims else {
+                continue;
+            };
+            self.pending_media.insert(src.clone(), (width, height));
+            new_entries.insert(src, json!({ "width": width, "height": height }));
+        }
+        (!new_entries.is_empty()).then_some(new_entries)
+    }
+
+    /// The `media` sidecar of the pending text buffer as a JSON object, or
+    /// `None` when nothing resolved (the key is then omitted).
+    fn pending_media_json(&self) -> Option<Value> {
+        if self.pending_media.is_empty() {
+            return None;
+        }
+        Some(Value::Object(
+            self.pending_media
+                .iter()
+                .map(|(src, (w, h))| (src.clone(), json!({ "width": w, "height": h })))
+                .collect(),
+        ))
     }
 
     /// Number of recorded tool calls still awaiting a terminal
@@ -467,16 +563,26 @@ impl Transcript {
         }
     }
 
+    /// Close the pending chunk buffer into a `text`/`thinking` block. A text
+    /// block carries the `media` sidecar — the union of every entry
+    /// [`probe_new_images`](Self::probe_new_images) resolved for it (§7.1),
+    /// omitted when nothing resolved — and the per-block scan state resets.
     fn flush_text(&mut self) {
         if !self.text.is_empty() {
             let index = self.blocks.len();
             let id = self.block_id(index);
             let block_type = self.pending_block_type();
-            self.blocks.push(
-                json!({ "type": block_type, "id": id, "text": std::mem::take(&mut self.text) }),
-            );
+            let mut block =
+                json!({ "type": block_type, "id": id, "text": std::mem::take(&mut self.text) });
+            if let Some(media) = self.pending_media_json() {
+                block["media"] = media;
+            }
+            self.blocks.push(block);
         }
         self.pending_thought = false;
+        self.pending_media.clear();
+        self.media_scan_pos = 0;
+        self.media_refs_seen = 0;
     }
 
     /// Record a tool call into the transcript (CS-0 D6). On first sight of a
@@ -737,11 +843,15 @@ impl Transcript {
         let mut blocks = self.blocks.clone();
         if !self.text.is_empty() {
             let index = blocks.len();
-            blocks.push(json!({
+            let mut block = json!({
                 "type": self.pending_block_type(),
                 "id": self.block_id(index),
                 "text": self.text.clone(),
-            }));
+            });
+            if let Some(media) = self.pending_media_json() {
+                block["media"] = media;
+            }
+            blocks.push(block);
         }
         blocks
     }
@@ -1538,15 +1648,15 @@ fn model_select(options: &[SessionConfigOption]) -> Option<&session::SessionConf
         .or_else(|| select_by(&|o| matches!(o.category, Some(SessionConfigOptionCategory::Model))))
 }
 
-/// Discover the provider's reasoning-effort selector in a `session/new` /
-/// `session/load` response's `configOptions` (PROTOCOL §5.5): the first
+/// Discover the provider's reasoning-effort selector in a session-open or
+/// model-change response's `configOptions` (PROTOCOL §5.5): the first
 /// SELECT whose `category` is `thought_level`. Adapters pick their own ids
 /// (`effort` for claude-agent-acp, `reasoning_effort` for codex-acp), so the
 /// category is the only portable key; the discovered id is what the
 /// subsequent `session/set_config_option` must carry. `None` when the
 /// provider advertises no such option (every non-supporting provider, which
 /// then silently ignores the session's `reasoningEffort`).
-fn discover_thought_level(
+pub(crate) fn discover_thought_level(
     config_options: Option<&[SessionConfigOption]>,
 ) -> Option<ThoughtLevelOption> {
     let (option, select) = config_options?.iter().find_map(|o| match &o.kind {
@@ -1680,6 +1790,22 @@ fn build_session_meta(
 }
 
 impl Services {
+    /// The turn's Markdown image dimension probe context (§7.1 text block
+    /// `media`): the workspace root (or the agent's sandbox path, `CoW`
+    /// containment) plus the assets root, resolved ONCE per turn so the
+    /// per-chunk probe does no store reads.
+    async fn image_probe_context(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> ProbeContext {
+        ProbeContext {
+            workspace_id: workspace_id.0.clone(),
+            workspace_root: file_ops::resolve_root(&self.store, workspace_id, Some(agent_id)).await,
+            assets_root: self.assets_root.clone(),
+        }
+    }
+
     /// Begin a live-turn slot for `agent_id` (CS-0 D5): seed it with the freshly
     /// minted assistant `message_id` and no blocks yet, returning a
     /// [`LiveTurnGuard`] that clears the slot on drop (abort-safe). The slot is
@@ -2907,7 +3033,8 @@ impl Services {
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
         trace_stream_correlation_mapping(&message_id, turn_id);
-        let mut transcript = Transcript::new(message_id.clone());
+        let mut transcript = Transcript::new(message_id.clone())
+            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
         // Turn wall-clock start, for the global usage-stats longest-run MAX.
         let turn_started = std::time::Instant::now();
         // Publish the in-flight turn so a `chat.subscribe` arriving mid-turn can
@@ -4301,7 +4428,8 @@ impl Services {
     ) -> HarnessWakeOutcome {
         let turn_started = Instant::now();
         let message_id = Uuid::now_v7().to_string();
-        let mut transcript = Transcript::new(message_id.clone());
+        let mut transcript = Transcript::new(message_id.clone())
+            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
         // a `chat.subscribe` arriving mid-wake reconstructs the partial
         // message, and an abort (preempting prompt / stop) clears the slot.
@@ -5073,35 +5201,38 @@ impl Services {
                 // thought↔text switch or a non-text block starts a new one.
                 // Thought chunks flush as `thinking` blocks (Zed's model) and
                 // ride the same `chat:stream:delta` shape.
-                let (block_index, block_type) = if let Some(t) = &text {
+                // A text chunk that COMPLETES a Markdown image reference
+                // also carries the reference's header-probed dimensions as
+                // `media` (§7.1 sidecar) — only the entries this chunk
+                // resolved; the persisted block carries the union.
+                let (block_index, block_type, media) = if let Some(t) = &text {
                     let index = transcript.push_chunk(t, thought);
                     let block_type = if thought { "thinking" } else { "text" };
-                    (index, block_type.to_string())
+                    (index, block_type.to_string(), transcript.probe_new_images())
                 } else {
                     let block_type = content
                         .get("type")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown")
                         .to_string();
-                    (transcript.push_block(content.clone()), block_type)
+                    (transcript.push_block(content.clone()), block_type, None)
                 };
                 // Internal chat-channel delta (§7.1): the full content-bearing
                 // payload the per-agent `chat.subscribe` forwarder accumulates
                 // into block deltas (D4 block identity kept).
-                self.publish_agent_event(
-                    workspace_id,
-                    agent_id,
-                    CHAT_STREAM_DELTA,
-                    json!({
-                        "agentId": agent_id.0,
-                        "content": content,
-                        "messageId": message_id,
-                        "blockIndex": block_index,
-                        "blockId": transcript.block_id(block_index),
-                        "blockType": block_type,
-                    }),
-                )
-                .await;
+                let mut delta = json!({
+                    "agentId": agent_id.0,
+                    "content": content,
+                    "messageId": message_id,
+                    "blockIndex": block_index,
+                    "blockId": transcript.block_id(block_index),
+                    "blockType": block_type,
+                });
+                if let Some(media) = media {
+                    delta["media"] = Value::Object(media);
+                }
+                self.publish_agent_event(workspace_id, agent_id, CHAT_STREAM_DELTA, delta)
+                    .await;
                 // External activity signal (§7): leading-edge throttled per
                 // agent — the first chunk of a turn emits immediately
                 // (preserves the FE's pre-first-token status-hint clearing

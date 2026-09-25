@@ -195,7 +195,9 @@ async fn import_workspace(
 async fn upsert_workspace(store: &Store, ws: &Workspace) -> anyhow::Result<bool> {
     match store.get_workspace(&ws.id).await {
         Ok(_) => {
-            store.update_workspace(ws).await?;
+            store
+                .update_workspace_with_branch(ws, Some(&ws.branch))
+                .await?;
             Ok(true)
         }
         Err(Error::NotFound(_)) => {

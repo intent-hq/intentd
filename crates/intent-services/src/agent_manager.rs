@@ -35,21 +35,23 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use intent_acp::handshake::try_bypass_permissions_mode;
-use intent_acp::session::{ContentBlock, McpServer, SessionModeState, StopReason};
+use intent_acp::session::{
+    ContentBlock, McpServer, SessionConfigOption, SessionModeState, StopReason,
+};
 use intent_acp::{
     apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
     normalize_mcp_servers, normalize_spaced_bridge_command, serve_workspace_mcp_tcp,
     spawn_provider, to_acp_session_mcp_servers, to_auggie_mcp_config, to_opencode_mcp_config,
     ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
     IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer, NormalizedMcpServers,
-    PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData, SinkEvent,
-    SpawnOptions, WorkspaceMcpServer,
+    NpxLaunchDir, PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
+    SinkEvent, SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
     now_iso, parse_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus,
     BoxFuture, Error, EventActor, Result, UsageCost, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    WorkspaceSetupState, WorkspaceStatus,
 };
 use intent_providers::{build_provider_env_with_unsloth, InjectionMechanism, ProviderConfig};
 use intent_store::{NewEvent, NewTrackedChange};
@@ -64,7 +66,8 @@ use crate::agent_ops::{
     MAX_MESSAGE_ID_LEN,
 };
 use crate::agent_session::{
-    agent_actor, InterruptFlushOutcome, InterruptReason, InterruptedBy, ThoughtLevelOption,
+    agent_actor, discover_thought_level, AcpSessionOpened, InterruptFlushOutcome, InterruptReason,
+    InterruptedBy, ThoughtLevelOption,
 };
 use crate::events::EventBus;
 use crate::microvm::{
@@ -2346,6 +2349,14 @@ fn guest_mcp_servers(bridge_connect_addr: String) -> NormalizedMcpServers {
 /// [`kill_child_tree`], with `kill_on_drop` as a direct-child safety net), and
 /// the per-agent MCP bridge + generated config that back the agent→BE tool loop.
 ///
+/// Ownership invariant: a handle never drops while still owning its child.
+/// Every teardown path moves the child out first ([`DetachedChild::take`])
+/// and awaits its owned cleanup; a handle dropped any other way — the fresh
+/// local handle `create_agent` holds across the stale reap when that await
+/// is cancelled, or a map dropped wholesale — hands the child to the same
+/// owned cleanup from [`Drop`], so the tree is still swept before its npx
+/// launch dir goes away.
+///
 /// `spawned_model` and `spawned_provider` track the model/provider the child was
 /// spawned with, enabling `ensure_started` to detect model changes (via `agent.setModel`)
 /// and respawn the child with the new model before the next turn.
@@ -2372,6 +2383,12 @@ struct AgentHandle {
     /// Bundled pi-extension MCP delivery files (extension + wrapper script),
     /// removed when the handle drops (pi only).
     _pi_extension: Option<PiExtensionDelivery>,
+    /// The neutral directory an npx launch started in (intent-hq/intent#5738;
+    /// `None` for other launch tiers). It is the live tree's cwd, so it
+    /// always leaves the handle together with the child
+    /// ([`DetachedChild::take`], explicitly or from [`Drop`]) and only the
+    /// detached child's owned cleanup may release it.
+    npx_launch_dir: Option<NpxLaunchDir>,
     antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
@@ -2405,6 +2422,10 @@ impl Drop for AgentHandle {
         if let Some(listener) = &self.wake_listener {
             listener.abort();
         }
+        // Cancellation-safe fallback for a handle that still owns its child:
+        // the detached child's own `Drop` starts the owned tree kill (no-op
+        // once a teardown path has already taken the child).
+        drop(DetachedChild::take(self));
     }
 }
 
@@ -2570,6 +2591,12 @@ pub struct AgentManager {
     /// `<supervisor>` XML so the fresh session has context, then clears the flag
     /// (parity: TS `sessionWasRecreated`).
     recreated: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents already told that their workspace's setup script `failed`
+    /// (§6.5): the failure notice is prepended to exactly one turn per agent,
+    /// the first that starts after the failure. In-memory like the setup
+    /// state map it mirrors — a restart forgets both, and the state reads
+    /// `unknown` (no notice) anyway.
+    setup_failure_notified: Arc<Mutex<HashSet<AgentId>>>,
     /// Agents whose NEXT turn must carry the assembled system prompt prepended
     /// as a `<system>` block — the `FirstTurnPrepend` fallback (§18.1) for
     /// providers with no (usable) native injection mechanism (codex, cortex,
@@ -2745,6 +2772,7 @@ impl AgentManager {
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             recreated: Arc::new(Mutex::new(HashSet::new())),
+            setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             stop_redelivery: Arc::new(Mutex::new(HashMap::new())),
@@ -3376,6 +3404,16 @@ impl AgentManager {
             mcp_config_path.as_deref(),
             env_mcp_config.as_deref(),
         );
+        // An npx launch starts in a fresh empty dir under the daemon-owned
+        // agent-configs root, so the workspace's own package configuration
+        // never reaches npm (intent-hq/intent#5738). Unlike the config files
+        // above, the startup sweep skips these dirs
+        // (`intent_core::NPX_LAUNCH_DIR_PREFIX`): one retained by an
+        // interrupted teardown (`RetainUnlessSwept`) may still be a live
+        // tree's cwd. The workspace stays the ACP session cwd.
+        if spawn_opts.npx_launch_root.is_none() {
+            spawn_opts.npx_launch_root = Some(config_dir.as_path());
+        }
         // `agents.acpNodeMaxOldSpaceMb` is read live per spawn (not pinned at
         // boot), so a settings change applies to the next spawned/respawned
         // provider process without a daemon restart (intent-hq/intent#4330).
@@ -3439,7 +3477,7 @@ impl AgentManager {
         // exec the provider over vsock; everything else spawns a host child.
         // Both paths converge on the same `Connection` type — the vsock
         // stream IS the provider's stdio, framed identically.
-        let (child, child_pid, connection, vm) = if let Some(ws) = &microvm_ws {
+        let (child, child_pid, connection, vm, npx_launch_dir) = if let Some(ws) = &microvm_ws {
             let (mut vm, connection) = self
                 .spawn_in_microvm(
                     &agent_id,
@@ -3453,17 +3491,23 @@ impl AgentManager {
                 .await?;
             let child = vm.take_child();
             let child_pid = child.as_ref().and_then(tokio::process::Child::id);
-            (child, child_pid, Arc::new(connection), Some(vm))
+            (child, child_pid, Arc::new(connection), Some(vm), None)
         } else {
             let spawned = spawn_provider(&spawn_opts, hooks)
                 .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
-            let (child, connection) = spawned.into_parts();
+            let (child, connection, npx_launch_dir) = spawned.into_parts();
             // Pin the spawned child's pid for the exit watcher armed
             // below: the watcher stands down when the handle's child no
             // longer matches it (a respawn installed a newer child with
             // its own watcher).
             let child_pid = child.id();
-            (Some(child), child_pid, Arc::new(connection), None)
+            (
+                Some(child),
+                child_pid,
+                Arc::new(connection),
+                None,
+                npx_launch_dir,
+            )
         };
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> =
@@ -3515,6 +3559,7 @@ impl AgentManager {
             _mcp_config: mcp_config,
             _rules_config: rules_config,
             _pi_extension: pi_extension,
+            npx_launch_dir,
             antigravity_profile,
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
@@ -3525,17 +3570,19 @@ impl AgentManager {
         };
         // Concurrency safety: fully reap any stale handle + child for this agent
         // BEFORE installing the new one, reusing the process-group teardown.
-        // A bare `insert` would only drop the old handle (aborting its serve
-        // loop, with `kill_on_drop` reaping just the direct child) — orphaning
-        // grandchildren and risking a lingering streamer from a lost/old session
-        // that could keep appending to the agentId-keyed transcript. The
-        // per-agent single-flight slot serializes turns; this closes the
-        // respawn-time window. (Drop the lock before awaiting the kill.)
+        // A bare `insert` would only drop the old handle, which starts the
+        // tree kill but does not wait for it — risking a lingering streamer
+        // from a lost/old session that could keep appending to the
+        // agentId-keyed transcript. The per-agent single-flight slot
+        // serializes turns; this closes the respawn-time window. (Drop the
+        // lock before awaiting the kill.) If this await is cancelled, the
+        // fresh `handle` above drops with its child still inside: its `Drop`
+        // hands that child to the owned cleanup too, so neither tree is
+        // orphaned and neither launch dir is removed early.
         let stale = self.handles.lock().unwrap().remove(&agent_id);
         if let Some(mut stale) = stale {
-            let stale_pid = stale.child_pid;
-            if let Some(child) = stale.child.take() {
-                kill_child_tree(child, stale_pid).await;
+            if let Some(child) = DetachedChild::take(&mut stale) {
+                child.kill_tree().await;
             }
         }
         // Teardown fence (ghost-agent race): a `workspace.delete` batch stop
@@ -3561,9 +3608,8 @@ impl AgentManager {
         };
         if let Some(mut handle) = fenced {
             self.registry.deregister(&agent_id);
-            let spawn_pid = handle.child_pid;
-            if let Some(child) = handle.child.take() {
-                kill_child_tree(child, spawn_pid).await;
+            if let Some(child) = DetachedChild::take(&mut handle) {
+                child.kill_tree().await;
             }
             return Err(Error::NotFound(format!(
                 "agent session {agent_id} is being deleted"
@@ -4184,7 +4230,7 @@ impl AgentManager {
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.
-        let stored_id = session_record.acp_session_id;
+        let stored_id = session_record.acp_session_id.clone();
 
         // Forced recreate (`agent.editAndRegenerate`): the transcript was
         // truncated, so resuming the provider session would retain the
@@ -4234,19 +4280,20 @@ impl AgentManager {
                     opened.modes.as_ref(),
                 )
                 .await;
-                self.maybe_apply_session_model(
-                    conn.as_ref(),
-                    agent_id,
-                    provider,
-                    &opened.session_id,
-                    stored_model.as_deref(),
-                )
-                .await?;
+                let model_response = self
+                    .maybe_apply_session_model(
+                        conn.as_ref(),
+                        agent_id,
+                        provider,
+                        &opened.session_id,
+                        stored_model.as_deref(),
+                    )
+                    .await?;
                 self.install_and_apply_thought_level(
                     conn.as_ref(),
-                    agent_id,
-                    &opened.session_id,
-                    opened.thought_level.clone(),
+                    &session_record,
+                    &opened,
+                    model_response,
                     stored_effort.as_deref(),
                 )
                 .await;
@@ -4275,14 +4322,15 @@ impl AgentManager {
                 .services
                 .prepare_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
                 .await?;
-            self.maybe_apply_session_model(
-                conn.as_ref(),
-                agent_id,
-                provider,
-                &prepared.response.session_id.0,
-                stored_model.as_deref(),
-            )
-            .await?;
+            let model_response = self
+                .maybe_apply_session_model(
+                    conn.as_ref(),
+                    agent_id,
+                    provider,
+                    &prepared.response.session_id.0,
+                    stored_model.as_deref(),
+                )
+                .await?;
             let opened = self
                 .services
                 .commit_antigravity_acp_session(prepared, stored_id.as_deref())
@@ -4294,9 +4342,9 @@ impl AgentManager {
             self.arm_first_turn_prepend(agent_id, provider);
             self.install_and_apply_thought_level(
                 conn.as_ref(),
-                agent_id,
-                &opened.session_id,
-                opened.thought_level.clone(),
+                &session_record,
+                &opened,
+                model_response,
                 stored_effort.as_deref(),
             )
             .await;
@@ -4331,19 +4379,20 @@ impl AgentManager {
                 opened.modes.as_ref(),
             )
             .await;
-            self.maybe_apply_session_model(
-                conn.as_ref(),
-                agent_id,
-                provider,
-                &opened.session_id,
-                stored_model.as_deref(),
-            )
-            .await?;
+            let model_response = self
+                .maybe_apply_session_model(
+                    conn.as_ref(),
+                    agent_id,
+                    provider,
+                    &opened.session_id,
+                    stored_model.as_deref(),
+                )
+                .await?;
             self.install_and_apply_thought_level(
                 conn.as_ref(),
-                agent_id,
-                &opened.session_id,
-                opened.thought_level.clone(),
+                &session_record,
+                &opened,
+                model_response,
                 stored_effort.as_deref(),
             )
             .await;
@@ -4364,48 +4413,60 @@ impl AgentManager {
             opened.modes.as_ref(),
         )
         .await;
-        self.maybe_apply_session_model(
-            conn.as_ref(),
-            agent_id,
-            provider,
-            &opened.session_id,
-            stored_model.as_deref(),
-        )
-        .await?;
+        let model_response = self
+            .maybe_apply_session_model(
+                conn.as_ref(),
+                agent_id,
+                provider,
+                &opened.session_id,
+                stored_model.as_deref(),
+            )
+            .await?;
         self.install_and_apply_thought_level(
             conn.as_ref(),
-            agent_id,
-            &opened.session_id,
-            opened.thought_level.clone(),
+            &session_record,
+            &opened,
+            model_response,
             stored_effort.as_deref(),
         )
         .await;
         Ok(opened.session_id)
     }
 
-    /// Record the `thought_level` selector a freshly opened/resumed session
-    /// advertised on the live handle and apply the session's stored
-    /// `reasoningEffort` through it (PROTOCOL §5.5). Generic by construction:
-    /// the config id comes from the adapter's own `configOptions`
-    /// (claude-agent-acp `effort`, codex-acp `reasoning_effort`), so no
-    /// provider capability flag is needed and a provider that advertises no
-    /// such option silently ignores the field. The selector's surfaced levels
-    /// are persisted inside the open/recreate/resume fns themselves — where
-    /// the CAS outcome is known, so a lost CAS never clears them (see
-    /// [`Services::persist_session_effort_levels`]). Best-effort — a
-    /// rejected call is logged and never fails session startup.
+    /// Install the selector for the effective model before applying saved
+    /// effort. A successful model change can replace the opening selector
+    /// (Pi may open with only `off`, then offer reasoning levels). Missing
+    /// or malformed config options preserve the opening selector for older
+    /// adapters. An explicit list without `thought_level` clears it.
+    /// Opening levels are persisted by open/resume/recreate with their CAS
+    /// guard; refreshed levels come from a subsequent response for the
+    /// canonical session, never from a losing session/new candidate.
     async fn install_and_apply_thought_level(
         &self,
         conn: &Connection,
-        agent_id: &AgentId,
-        acp_session_id: &str,
-        thought_level: Option<ThoughtLevelOption>,
+        session_record: &AgentSession,
+        opened: &AcpSessionOpened,
+        model_response: Option<Value>,
         stored_effort: Option<&str>,
     ) {
-        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+        let mut thought_level = opened.thought_level.clone();
+        if let Some(options) = model_response
+            .and_then(|mut response| response.get_mut("configOptions").map(Value::take))
+            .and_then(|options| serde_json::from_value::<Vec<SessionConfigOption>>(options).ok())
+        {
+            thought_level = discover_thought_level(Some(&options));
+            self.services
+                .persist_session_effort_levels(
+                    &session_record.workspace_id,
+                    &session_record.id,
+                    thought_level.as_ref(),
+                )
+                .await;
+        }
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
             handle.thought_level = thought_level;
         }
-        self.apply_thought_level(conn, agent_id, acp_session_id, stored_effort)
+        self.apply_thought_level(conn, &session_record.id, &opened.session_id, stored_effort)
             .await;
     }
 
@@ -4498,7 +4559,7 @@ impl AgentManager {
     /// `session/set_config_option { configId: "model" }` for providers that
     /// expose the model as a session config option
     /// (`supports_config_option_model`; claude-code, pi, and codex today —
-    /// codex's npx-fallback adapter ignores `-c model=…` argv overrides and
+    /// codex's pinned npx adapter ignores `-c model=…` argv overrides and
     /// its `session/set_model` handler rejects our id formats, but it
     /// advertises a bare-id `configOptions[id="model"]` select). Compound ids
     /// are honored only when their provider prefix matches the running
@@ -4508,6 +4569,8 @@ impl AgentManager {
     /// the child so a retry cannot reuse its default model. Antigravity
     /// requires default permission mode and exact model confirmation,
     /// including after cold load. Other providers retain best-effort behavior.
+    /// Retain the config-option response so thinking choices can follow the
+    /// selected model before applying the stored reasoning effort.
     async fn maybe_apply_session_model(
         &self,
         conn: &Connection,
@@ -4515,7 +4578,7 @@ impl AgentManager {
         provider: &ProviderConfig,
         acp_session_id: &str,
         stored_model: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<Value>> {
         if provider.id == "antigravity" {
             intent_acp::handshake::set_session_mode(conn, acp_session_id, "default")
                 .await
@@ -4530,7 +4593,7 @@ impl AgentManager {
             let raw = stored_model.unwrap_or_default();
             let bare = raw.strip_prefix("antigravity:").unwrap_or(raw);
             if bare.is_empty() || bare.eq_ignore_ascii_case("default") {
-                return Ok(());
+                return Ok(None);
             }
             let model = Self::provider_local_model_target(provider, stored_model).ok_or_else(|| {
                 Error::InvalidInput("Invalid Antigravity model ID. Refresh models and select an available Antigravity model.".into())
@@ -4553,7 +4616,7 @@ impl AgentManager {
                     "Antigravity did not confirm model {model}; no prompt was sent. Refresh models and retry."
                 )));
             }
-            return Ok(());
+            return Ok(Some(result));
         }
         if let Some(model_id) = Self::set_model_target(provider, stored_model) {
             match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
@@ -4577,7 +4640,7 @@ impl AgentManager {
             }
         }
         if let Some(model_id) = Self::config_option_model_target(provider, stored_model) {
-            match intent_acp::session::set_session_config_option(
+            match intent_acp::session::set_session_config_option_response(
                 conn,
                 acp_session_id,
                 "model",
@@ -4585,13 +4648,14 @@ impl AgentManager {
             )
             .await
             {
-                Ok(()) => {
+                Ok(response) => {
                     tracing::debug!(
                         provider = provider.id,
                         session_id = acp_session_id,
                         model = %model_id,
                         "session/set_config_option accepted"
                     );
+                    return Ok(Some(response));
                 }
                 Err(e) => {
                     // Codex is the only production provider with this
@@ -4623,7 +4687,7 @@ impl AgentManager {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Resolve the model id `maybe_apply_session_model` should send via
@@ -4667,7 +4731,7 @@ impl AgentManager {
     /// Legacy Codex slash ids retain their existing parsing. Bracket ids
     /// split only for recognized catalog effort levels; arbitrary/malformed
     /// brackets must reach the adapter unchanged and be rejected there.
-    fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
+    pub(crate) fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
         if let Some((base, effort)) = model.split_once('/') {
             return (base, Some(effort));
         }
@@ -4687,7 +4751,7 @@ impl AgentManager {
     /// The explicit field is canonical. Embedded legacy Codex effort is a
     /// fallback only when that field is absent/empty, both at startup and
     /// when reusing a child; otherwise reuse would reset suffix-only effort.
-    fn session_model_effort(
+    pub(crate) fn session_model_effort(
         provider: &ProviderConfig,
         model: Option<&str>,
         explicit: Option<&str>,
@@ -4806,6 +4870,39 @@ impl AgentManager {
         }
         Some(crate::harness::latest().first_turn_prepend_block(prompt))
     }
+
+    /// The workspace setup-stage notice for a turn starting now (§6.5),
+    /// prompt-only: while the setup script is `pending` / `running` every
+    /// turn carries the in-progress notice (the worktree is provisional until
+    /// then); the first turn after the script `failed` carries the failure
+    /// notice once per agent; `completed` / `skipped` / `unknown` carry
+    /// nothing. Reads the in-memory setup state map — no store round trip.
+    fn build_setup_notice(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> Option<String> {
+        let status = self.services.workspace_setup_status(workspace_id);
+        match status.state {
+            WorkspaceSetupState::Pending | WorkspaceSetupState::Running => {
+                Some(crate::harness::latest().setup_in_progress_notice(crate::SETUP_TERMINAL_NAME))
+            }
+            WorkspaceSetupState::Failed => {
+                if !self
+                    .setup_failure_notified
+                    .lock()
+                    .unwrap()
+                    .insert(agent_id.clone())
+                {
+                    return None;
+                }
+                Some(
+                    crate::harness::latest()
+                        .setup_failed_notice(status.exit_code, crate::SETUP_TERMINAL_NAME),
+                )
+            }
+            WorkspaceSetupState::Completed
+            | WorkspaceSetupState::Skipped
+            | WorkspaceSetupState::Unknown => None,
+        }
+    }
+
     /// Compute the fire-once agent/workspace naming instruction for the
     /// outbound prompt, or `None` when both independently gated instructions
     /// should be omitted. Ported from the reference
@@ -4962,6 +5059,12 @@ impl AgentManager {
         // the snapshot is trivial (all counts zero, no pending attention),
         // leaving the prompt byte-identical to pre-feature output.
         let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
+        // Workspace setup-stage notice (§6.5): sits between the snapshot line
+        // and the Context block, ahead of the user content, so an agent whose
+        // turn starts while the setup script is still running (the create-time
+        // initial send, or any later message) is told the worktree is
+        // provisional — and told once when the script failed. Never persisted.
+        let setup_notice = self.build_setup_notice(agent_id, workspace_id);
         // FirstTurnPrepend fallback (§18.1): for providers with no (usable)
         // native system-prompt mechanism (codex, cortex, pi, grok, mock), the
         // assembled system prompt is delivered as the OUTERMOST `<system>`
@@ -4974,6 +5077,7 @@ impl AgentManager {
             crate::harness::latest().compose_turn_prompt(&crate::harness::TurnEnvelopeParams {
                 first_turn_prepend: prepend.as_deref(),
                 snapshot_line: snapshot_line.as_deref(),
+                setup_notice: setup_notice.as_deref(),
                 stdin_context,
                 naming_nudge: naming.as_deref(),
                 role_reminder: reminder.as_deref(),
@@ -5157,8 +5261,8 @@ impl AgentManager {
     /// `agent.stop` / hard-cancel cancel semantics.
     pub async fn stop(&self, agent_id: &AgentId) -> bool {
         let (removed, child) = self.detach(agent_id).await;
-        if let Some((child, spawn_pid)) = child {
-            kill_child_tree(child, spawn_pid).await;
+        if let Some(child) = child {
+            child.kill_tree().await;
         }
         removed
     }
@@ -5217,7 +5321,7 @@ impl AgentManager {
             tracing::warn!(error = %e, "stop-redelivery persistence sync failed for batch stop");
         }
         if !children.is_empty() {
-            kill_child_trees(children).await;
+            DetachedChild::kill_trees(children).await;
         }
         fence
     }
@@ -5228,7 +5332,7 @@ impl AgentManager {
     /// `stop()` kills the single tree inline (SIGTERM→grace→SIGKILL);
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
-    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<(Child, Option<u32>)>) {
+    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<DetachedChild>) {
         self.detach_with_redelivery(agent_id, None, true).await
     }
 
@@ -5253,7 +5357,7 @@ impl AgentManager {
         agent_id: &AgentId,
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
         sync_store: bool,
-    ) -> (bool, Option<(Child, Option<u32>)>) {
+    ) -> (bool, Option<DetachedChild>) {
         // Pin the live-turn slot BEFORE aborting the worker (the abort drops
         // LiveTurnGuard; the pin keeps the slot published until the flush
         // below persists the row — monorepo#2056), then flush the partial
@@ -5321,10 +5425,7 @@ impl AgentManager {
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
-        let child = handle.and_then(|mut h| {
-            let spawn_pid = h.child_pid;
-            h.child.take().map(|c| (c, spawn_pid))
-        });
+        let child = handle.and_then(|mut h| DetachedChild::take(&mut h));
         self.registry.deregister(agent_id);
         (removed, child)
     }
@@ -5953,8 +6054,8 @@ impl AgentManager {
         let (removed, child) = self
             .detach_with_redelivery(agent_id, redelivery, true)
             .await;
-        if let Some((child, spawn_pid)) = child {
-            kill_child_tree(child, spawn_pid).await;
+        if let Some(child) = child {
+            child.kill_tree().await;
         }
         removed
     }
@@ -7559,19 +7660,33 @@ impl AgentManager {
         // status events, and the spawn below must key on the workspace the
         // target lives in (see the module-header invariant).
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        // Ownership (multiplayer, intentd#2068): resolved before the pop,
+        // checked inside the pop's critical section against the entry found
+        // there — a guest force-sends only what its `agent.getQueue` shows it.
+        let gate = self.services.queue_entry_gate(&agent_id, false).await?;
+        self.services.park_queue_mutation_gate(gate.as_ref()).await;
         // Quarantine gate (monorepo#840): a provably-poisoned session must
         // not be redriven by delivery — every replay deterministically
         // fails. The entry STAYS in the queue (no side effects); the absent
         // case is still `-32602` so the contract holds.
         if self.services.session_poisoned(&session) {
+            let not_found =
+                || Error::InvalidParams(format!("queued message not found: {message_id}"));
+            if let Some(gate) = gate.as_ref() {
+                // A gated caller sees only the live entry: one mid-drain
+                // (overlay only) reads as absent, and a foreign one is refused.
+                let live = self
+                    .services
+                    .find_queued_message(&agent_id, &message_id)
+                    .ok_or_else(not_found)?;
+                gate.check(&live)?;
+            }
             let entry = self
                 .services
                 .queue_snapshot(&agent_id)
                 .into_iter()
                 .find(|m| m["id"].as_str() == Some(message_id.as_str()))
-                .ok_or_else(|| {
-                    Error::InvalidParams(format!("queued message not found: {message_id}"))
-                })?;
+                .ok_or_else(not_found)?;
             tracing::warn!(
                 agent = %agent_id,
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
@@ -7589,7 +7704,7 @@ impl AgentManager {
         // snapshots (§6.5 drain ordering) until `draining` is dropped.
         let (mut entry, draining) = self
             .services
-            .take_queued_message_draining(&agent_id, &message_id)
+            .take_queued_message_draining_gated(&agent_id, &message_id, gate.as_ref())?
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
@@ -8685,6 +8800,23 @@ impl AgentManager {
     /// never persists a notice or commits an identity the agent never ran
     /// under; retry attempts within one turn (`retry_spawn`) cannot duplicate
     /// the notice — the identity commit lands with the first success.
+    ///
+    /// A turn-start re-home off a disabled provider (intent-hq/intent#5737)
+    /// suppresses the row: the `provider_rehomed` notice
+    /// [`AgentManager::rehome_if_provider_disabled`] persisted already
+    /// explains this exact provider hop, so a second `model_changed` row
+    /// would be a duplicate. The suppression is derived from the transcript
+    /// (see [`AgentManager::model_change_is_announced_rehome`]) rather than
+    /// carried in memory, because the re-home lands in the store on the
+    /// FIRST spawn attempt while the identity commit waits for the first
+    /// SUCCESS: a handshake failure followed by a `retry_spawn` attempt, a
+    /// later turn after an exhausted retry budget, or a daemon restart in
+    /// between all reach this method with the session already on the target
+    /// provider and `last_turn_provider` still naming the disabled one. The
+    /// identity commit still runs so the next turn compares against the
+    /// re-homed identity; `last_turn_provider` is never committed early
+    /// because the cross-provider resume guard in `agent_session` relies on
+    /// it naming the owner of the stored `acp_session_id`.
     async fn maybe_persist_model_change_notice(
         &self,
         agent_id: &AgentId,
@@ -8712,7 +8844,15 @@ impl AgentManager {
                 prev_provider != to_provider || from_model.as_deref() != to_model
             }
         };
-        if changed {
+        let announced = changed
+            && self
+                .model_change_is_announced_rehome(
+                    agent_id,
+                    from_provider.as_deref().unwrap_or(""),
+                    to_provider,
+                )
+                .await;
+        if changed && !announced {
             let label = |provider: &str, model: Option<&str>| match model {
                 Some(m) => format!("{provider}:{m}"),
                 None => format!("{provider} (default model)"),
@@ -8770,6 +8910,52 @@ impl AgentManager {
         }
     }
 
+    /// Whether a pending `model_changed` row for the provider hop
+    /// `from_provider` → `to_provider` is the deferred last-turn commit of a
+    /// re-home the transcript already announces (intent-hq/intent#5737): the
+    /// agent's newest identity-change system row
+    /// ([`intent_store::Store::latest_agent_identity_notice`]) is a
+    /// `provider_rehomed` notice for that same hop, both sides canonicalized
+    /// through the provider registry. Requiring the NEWEST identity row (not
+    /// merely any re-home row) keeps a stale notice from muting a later,
+    /// explicit switch that happens to retrace the hop: an explicit switch
+    /// back off the target lands its own `model_changed` row in between. A
+    /// read failure reads as "not announced" so the generic row still lands
+    /// — a duplicate beats a silent switch. Same-provider changes are never
+    /// a re-home.
+    async fn model_change_is_announced_rehome(
+        &self,
+        agent_id: &AgentId,
+        from_provider: &str,
+        to_provider: &str,
+    ) -> bool {
+        let canonical = |id: &str| intent_providers::provider_config(id).id;
+        if canonical(from_provider) == canonical(to_provider) {
+            return false;
+        }
+        let latest = match self
+            .services
+            .store
+            .latest_agent_identity_notice(agent_id)
+            .await
+        {
+            Ok(latest) => latest,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read latest identity notice; keeping the model-change notice");
+                return false;
+            }
+        };
+        let Some(latest) = latest else {
+            return false;
+        };
+        if latest["type"].as_str() != Some("provider_rehomed") {
+            return false;
+        }
+        let hop = |key: &str| latest[key].as_str().map(canonical);
+        hop("fromProvider") == Some(canonical(from_provider))
+            && hop("toProvider") == Some(canonical(to_provider))
+    }
+
     /// Persist the informational `auto_unarchived` transcript row when this
     /// turn's start actually auto-unarchived the workspace (the #1216 flip
     /// persisted — [`AgentManager::try_begin_outcome`] calls this only on a
@@ -8808,6 +8994,209 @@ impl AgentManager {
             }
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to persist auto-unarchive notice");
+            }
+        }
+    }
+
+    /// Turn-start disabled-provider gate (intent-hq/intent#5737). When the
+    /// session's effective provider — what `resolve_spawn` would run:
+    /// `session.provider` (legacy aliases normalized through
+    /// `provider_config`) else the settings-derived default — is disabled in
+    /// `providers.enabled`, the daemon is the source of truth and never spawns
+    /// it:
+    ///
+    /// 1. With a usable default provider
+    ///    ([`crate::agent_ops::resolve_disabled_provider_rehome`]: the
+    ///    settings-derived default passing enabled → authenticated →
+    ///    runnable), the session is re-homed: `provider` ← default, `model` ←
+    ///    the settings default for it (else `None`), `reasoning_effort` ←
+    ///    `None`, through the narrow
+    ///    [`intent_store::Store::rehome_agent_session_provider`] writer. The
+    ///    caller's `resolve_spawn` then yields the new identity, so a live
+    ///    child takes the existing `agent.setModel` respawn branch (kill,
+    ///    fresh `session/new`) and the last-turn identity commit runs on
+    ///    success exactly as after a `setModel` — but the generic
+    ///    `model_changed` row is suppressed, because the `provider_rehomed`
+    ///    system row this persists in the transcript (see
+    ///    [`AgentManager::persist_provider_rehome_notice`]) already names the
+    ///    same identity change; the suppression is read back from that row
+    ///    ([`AgentManager::model_change_is_announced_rehome`]) so it survives
+    ///    a failed first spawn attempt, whose retry (or a later turn, or a
+    ///    restart) finds the session already on the target provider with
+    ///    the identity commit still pending. This also emits the same `agent:updated`
+    ///    invalidation `agent.setModel` publishes. One-way: re-enabling the
+    ///    old provider never moves the session back.
+    /// 2. Otherwise the turn fails before any spawn with the distinct "not
+    ///    enabled" `-32602` from
+    ///    [`crate::agent_ops::ensure_provider_enabled`] (method label
+    ///    `session/prompt`).
+    ///
+    /// Every turn origin (user send, hook wake, queued message, delegated
+    /// child) funnels through `ensure_started`, so all are covered. Returns
+    /// the (possibly re-homed) session the spawn resolution must use and
+    /// whether a re-home happened — the caller uses that flag to force the
+    /// live child's teardown (the disabled provider's child must never be
+    /// reused, even when the target shares its `command` and resolved model,
+    /// e.g. `opencode` → `unsloth`).
+    async fn rehome_if_provider_disabled(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: AgentSession,
+        settings: &intent_core::settings_file::SettingsFile,
+    ) -> Result<(AgentSession, bool)> {
+        const METHOD: &str = "session/prompt";
+        // Nothing resolves → `resolve_spawn` raises its own loud error.
+        let Some(raw) = session_provider_id(
+            &session,
+            crate::agent_session::derived_default_provider(settings).as_deref(),
+        ) else {
+            return Ok((session, false));
+        };
+        let current = intent_providers::provider_config(&raw).id;
+        if !crate::agent_ops::provider_is_disabled(current, settings.providers.enabled.as_ref()) {
+            return Ok((session, false));
+        }
+        let Some(target) =
+            crate::agent_ops::resolve_disabled_provider_rehome(&self.services, settings, METHOD)
+        else {
+            tracing::warn!(
+                agent_id = %agent_id,
+                provider_id = current,
+                "session provider is disabled and no usable default provider exists; refusing to spawn"
+            );
+            return crate::agent_ops::ensure_provider_enabled(
+                METHOD,
+                current,
+                settings.providers.enabled.as_ref(),
+            )
+            .map(|()| (session, false));
+        };
+        tracing::info!(
+            agent_id = %agent_id,
+            from_provider = current,
+            to_provider = %target.provider,
+            to_model = ?target.model,
+            "session provider is disabled; re-homing onto the default provider"
+        );
+        // Compare-and-set on the provider the snapshot above was read with:
+        // a concurrent `agent.setModel` that moved the session between that
+        // read and this write wins — nothing is overwritten, no notice or
+        // invalidation is emitted, and the turn proceeds on the fresh row
+        // (the next turn re-runs this gate against whatever it carries).
+        let landed = self
+            .services
+            .store
+            .rehome_agent_session_provider(
+                workspace_id,
+                agent_id,
+                session.provider.as_deref(),
+                &target.provider,
+                target.model.as_deref(),
+                &now_iso(),
+            )
+            .await?;
+        if !landed {
+            tracing::info!(
+                agent_id = %agent_id,
+                "session provider changed concurrently; skipping the re-home"
+            );
+            let fresh = self.services.store.get_agent_session(agent_id).await?;
+            return Ok((fresh, false));
+        }
+        // Same follow-through as `agent.setModel`: the persisted display
+        // resolution (D14) names the old model — clear it (best-effort), then
+        // invalidate clients so they re-read the projection.
+        if let Err(e) = self
+            .services
+            .store
+            .clear_agent_session_resolved_model(workspace_id, agent_id)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "clear resolved display model failed");
+        }
+        self.services.invalidate_agent_list_cache(workspace_id);
+        self.services
+            .publish_agent_mutation_event(
+                workspace_id,
+                agent_id,
+                intent_core::events::AGENT_UPDATED,
+                json!({
+                    "agentId": agent_id.0,
+                    "modelId": target.model,
+                    "providerId": target.provider,
+                }),
+            )
+            .await;
+        self.persist_provider_rehome_notice(agent_id, workspace_id, &session, current, &target)
+            .await;
+        let mut session = session;
+        session.provider = Some(target.provider);
+        session.model = target.model;
+        session.reasoning_effort = None;
+        Ok((session, true))
+    }
+
+    /// Persist the informational `provider_rehomed` transcript row for a
+    /// turn-start re-home off a disabled provider (intent-hq/intent#5737).
+    /// The row is `role: "system"` — excluded from supervisor-XML history
+    /// replay like the model-change and auto-unarchive notices — with
+    /// metadata `{ type: "provider_rehomed", reason: "provider_disabled",
+    /// from, to, fromProvider, toProvider }` (`from`/`to` are the bare model
+    /// ids, `null` = provider default). Emits `agent:message` so clients
+    /// update live. Entirely best-effort: an append/publish failure is logged
+    /// and the turn proceeds on the new provider.
+    async fn persist_provider_rehome_notice(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: &AgentSession,
+        from_provider: &str,
+        target: &crate::agent_ops::DisabledProviderRehome,
+    ) {
+        let from_display = intent_providers::provider_config(from_provider).display_name;
+        let to_display = intent_providers::provider_config(&target.provider).display_name;
+        let from_model = session
+            .model
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .map(|m| m.split_once(':').map_or(m, |(_, bare)| bare));
+        let model_label = from_model.unwrap_or("The default model");
+        let content = json!([{
+            "type": "text",
+            "text": format!(
+                "{model_label} ({from_display}) is no longer available — {from_display} was \
+                 disabled in Settings > Agents; this agent now runs on {to_display}."
+            ),
+        }]);
+        let metadata = json!({
+            "type": "provider_rehomed",
+            "reason": "provider_disabled",
+            "from": from_model,
+            "to": target.model,
+            "fromProvider": from_provider,
+            "toProvider": target.provider,
+        });
+        match self
+            .services
+            .store
+            .append_agent_message_with_metadata(
+                agent_id,
+                "system",
+                &content,
+                Some(&metadata),
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(message) => {
+                self.services.invalidate_agent_list_cache(workspace_id);
+                self.services
+                    .publish_agent_message_events(workspace_id, agent_id, &message, None)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to persist provider re-home notice");
             }
         }
     }
@@ -8938,6 +9327,15 @@ impl AgentManager {
             }
         }
         let settings = self.services.effective_settings();
+        // Disabled-provider gate (intent-hq/intent#5737): a session pinned to
+        // a provider the user switched off in Settings > Agents never spawns
+        // it — re-home onto the usable default (persisted before
+        // `resolve_spawn`, so the respawn branch below sees the new identity)
+        // or fail the turn with the same "not enabled" rejection the create
+        // front doors raise.
+        let (session, rehomed) = self
+            .rehome_if_provider_disabled(agent_id, workspace_id, session, &settings)
+            .await?;
         let mut resolved = resolve_spawn(
             &session,
             workspace.as_ref(),
@@ -8972,7 +9370,11 @@ impl AgentManager {
             // the live-child reuse branch below would return the stale session
             // with the armed flag sitting unconsumed.
             let forced = self.force_recreate.lock().unwrap().contains(agent_id);
-            if needs_respawn || forced {
+            // A re-home off a disabled provider always tears the live child
+            // down: the identity comparison above keys on the provider
+            // `command`, which `opencode` and `unsloth` share, so it alone
+            // could reuse the disabled provider's child.
+            if needs_respawn || forced || rehomed {
                 // Tear down the existing child (preserving the acpSessionId so
                 // start_session can try session/load for providers that support it).
                 // This is narrower than stop() — only kills the child/handle, no
@@ -9042,6 +9444,18 @@ impl AgentManager {
             .await
             .map_err(|e| Error::Internal(format!("auggie version probe task failed: {e}")))??;
             resolved.provider_binary = Some(selected);
+        }
+        // npx version gate (intent-hq/intent#5725): before a fresh child spawns
+        // through npx (npx-only providers and optional npx fallbacks), reject
+        // an npm-6 npx with an actionable error instead of three doomed
+        // `npx -y` attempts. Only for a fresh spawn — a reused live child
+        // never re-runs npx, so a later stale or hanging probe must not fail
+        // or stall its next turn — and off the runtime like the auggie probe
+        // (blocking subprocess, ≤3s on a cache miss).
+        if let Some(npx) = resolved.npx_fallback_binary.clone() {
+            if !self.contains(agent_id) {
+                crate::npx_cli::check_npx_version(&npx).await?;
+            }
         }
         // unsloth spawn gate (spec "Proposed design" §4): before the child
         // spawns, make sure the daemon-managed Unsloth server is running and
@@ -9214,7 +9628,9 @@ impl AgentManager {
         // not persist a notice or commit `last_turn_*` to an identity the
         // agent never ran under. Store-based (not handle-based) so detection
         // also covers idle-agent respawns. Best-effort — a notice failure
-        // never blocks the turn.
+        // never blocks the turn. A re-home commits the identity but skips the
+        // row (the `provider_rehomed` notice already landed) — detected from
+        // the transcript, so it holds on a retry after a failed first spawn.
         self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
             .await;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
@@ -9341,7 +9757,7 @@ impl AgentManager {
                 children.push(child);
             }
         }
-        kill_child_trees(children).await;
+        DetachedChild::kill_trees(children).await;
         // The daemon-managed Unsloth server is not an agent child — tear it
         // down explicitly so a clean shutdown never orphans it.
         self.unsloth.shutdown().await;
@@ -9507,9 +9923,8 @@ impl AgentManager {
     async fn kill_child_only(&self, agent_id: &AgentId) {
         let handle = self.handles.lock().unwrap().remove(agent_id);
         if let Some(mut handle) = handle {
-            let spawn_pid = handle.child_pid;
-            if let Some(child) = handle.child.take() {
-                kill_child_tree(child, spawn_pid).await;
+            if let Some(child) = DetachedChild::take(&mut handle) {
+                child.kill_tree().await;
             }
         }
         self.registry.deregister(agent_id);
@@ -9528,9 +9943,8 @@ impl AgentManager {
                     .upgrade()
                     .and_then(|h| h.lock().unwrap().remove(&id));
                 if let Some(mut handle) = removed {
-                    let spawn_pid = handle.child_pid;
-                    if let Some(child) = handle.child.take() {
-                        kill_child_tree(child, spawn_pid).await;
+                    if let Some(child) = DetachedChild::take(&mut handle) {
+                        child.kill_tree().await;
                     }
                 }
             })
@@ -9626,7 +10040,9 @@ impl AgentManager {
                                 registry.deregister(&agent_id);
                                 Some((
                                     status,
-                                    dead.map(|mut h| (h.child.take(), Arc::clone(&h.connection))),
+                                    dead.map(|mut h| {
+                                        (DetachedChild::take(&mut h), Arc::clone(&h.connection))
+                                    }),
                                 ))
                             }
                         }
@@ -9642,9 +10058,11 @@ impl AgentManager {
                     // write end open is killed first — EOF is then
                     // deterministic and the capture includes its last output,
                     // instead of the await burning its full bound and the
-                    // WARN underclaiming (monorepo#3570).
+                    // WARN underclaiming (monorepo#3570). The npx launch dir
+                    // is those descendants' cwd, so it is released only once
+                    // the sweep is done (intent-hq/intent#5738).
                     if let Some(dead_child) = dead_child {
-                        kill_child_tree(dead_child, child_pid).await;
+                        dead_child.kill_tree().await;
                     }
                     // Honest capture hint (monorepo#3570): bounded-await the
                     // stderr drain's settle (EOF + flush — the whole group is
@@ -9698,6 +10116,144 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 /// before returning (`SIGKILLed` children reap almost instantly).
 #[cfg(unix)]
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
+
+/// A provider child handed out of its [`AgentHandle`] for a bounded
+/// process-tree kill, together with its spawn-time pid (the process-group
+/// id, still valid once the leader has been `try_wait`ed) and the npx launch
+/// dir it runs in (intent-hq/intent#5738): that dir is the live tree's cwd,
+/// so it must outlive [`kill_child_tree`] / [`kill_child_trees`] rather than
+/// drop with the handle before the tree has been signalled.
+///
+/// Cleanup ownership is persistent, not the awaiting caller's: [`Self::kill_tree`]
+/// and [`Self::kill_trees`] move the child, its pgid and the launch dir into
+/// ONE owned task on the current runtime and await that task. Cancelling the
+/// caller — `stop()` aborting a worker inside `kill_child_only` after the
+/// handle left the map, an RPC deadline dropping a `stop` / `stop_many`
+/// future — leaves the task, and the descendant snapshot it already took,
+/// running to completion (a second kill could not rediscover escaped
+/// descendants once the leader is dead). [`Drop`] starts the same task for a
+/// detached child that was never killed explicitly. When no runtime can run
+/// the task, or it shuts down before the task finishes, the launch dir is
+/// retained on disk rather than removed from under a possibly live tree, and
+/// the child falls back to `kill_on_drop` — the same boundary as the
+/// ephemeral adapter's `AdapterChild`.
+struct DetachedChild {
+    /// `None` once moved into the owned cleanup task.
+    child: Option<Child>,
+    spawn_pid: Option<u32>,
+    /// `None` once moved into the owned cleanup task.
+    npx_launch_dir: Option<NpxLaunchDir>,
+}
+
+impl DetachedChild {
+    /// Move the child (and its launch dir) out of `handle`; `None` when the
+    /// handle owns no child.
+    fn take(handle: &mut AgentHandle) -> Option<Self> {
+        let child = handle.child.take()?;
+        Some(Self {
+            child: Some(child),
+            spawn_pid: handle.child_pid,
+            npx_launch_dir: handle.npx_launch_dir.take(),
+        })
+    }
+
+    /// [`kill_child_tree`] on an owned task, releasing the launch dir only
+    /// afterwards; awaits the task, but the task outlives a cancelled await.
+    async fn kill_tree(mut self) {
+        if let Some(cleanup) = self.start_cleanup() {
+            let _ = cleanup.await;
+        }
+    }
+
+    /// Move the child and the launch dir into the owned cleanup task. `None`
+    /// when there is nothing left to clean up or no runtime to run it on
+    /// (then the dir is retained and the child left to `kill_on_drop`).
+    fn start_cleanup(&mut self) -> Option<JoinHandle<()>> {
+        let child = self.child.take()?;
+        let spawn_pid = self.spawn_pid;
+        let launch_dir = RetainUnlessSwept(self.npx_launch_dir.take());
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            drop(launch_dir);
+            drop(child);
+            return None;
+        };
+        Some(spawn_owned_cleanup(&runtime, async move {
+            kill_child_tree(child, spawn_pid).await;
+            launch_dir.remove();
+        }))
+    }
+
+    /// [`kill_child_trees`] over the batch on ONE owned task, releasing every
+    /// launch dir only after the shared sweep completes; a cancelled await
+    /// leaves the batch sweep running.
+    async fn kill_trees(children: Vec<Self>) {
+        let mut trees = Vec::with_capacity(children.len());
+        let mut launch_dirs = Vec::with_capacity(children.len());
+        for mut detached in children {
+            if let Some(child) = detached.child.take() {
+                trees.push((child, detached.spawn_pid));
+            }
+            launch_dirs.push(RetainUnlessSwept(detached.npx_launch_dir.take()));
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let _ = spawn_owned_cleanup(&runtime, async move {
+            kill_child_trees(trees).await;
+            for dir in launch_dirs {
+                dir.remove();
+            }
+        })
+        .await;
+    }
+}
+
+impl Drop for DetachedChild {
+    fn drop(&mut self) {
+        drop(self.start_cleanup());
+    }
+}
+
+/// Spawn `cleanup` on `runtime` as a task no caller owns: it runs with
+/// [`intent_core::Caller::Daemon`] bound (like [`intent_core::spawn_daemon`])
+/// and is neither aborted nor dropped when the future awaiting its
+/// [`JoinHandle`] is cancelled.
+fn spawn_owned_cleanup<F>(runtime: &tokio::runtime::Handle, cleanup: F) -> JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    runtime.spawn(intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        cleanup,
+    ))
+}
+
+/// A launch dir travelling through the owned cleanup: [`Self::remove`]
+/// deletes it once the tree has been swept; dropping the wrapper any other
+/// way (the cleanup future dropped unpolled on a shutting-down runtime, or
+/// never scheduled at all) retains the directory instead of deleting it. A
+/// retained dir survives the next daemon start too: the agent-configs
+/// startup sweep skips `intent_core::NPX_LAUNCH_DIR_PREFIX` entries, since a
+/// restart cannot tell a still-live orphan tree from a dead one.
+struct RetainUnlessSwept(Option<NpxLaunchDir>);
+
+impl RetainUnlessSwept {
+    fn remove(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl Drop for RetainUnlessSwept {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            tracing::debug!(
+                path = %dir.path().display(),
+                "retaining npx launch dir: process-tree cleanup could not finish"
+            );
+            std::mem::forget(dir);
+        }
+    }
+}
 
 #[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Terminate a spawned provider's WHOLE process tree (§5.6). The child is its
@@ -10215,6 +10771,20 @@ struct ResolvedSpawn {
     unsloth_endpoint: Option<intent_providers::UnslothEndpoint>,
 }
 
+/// Exercise the real first-turn resolver without starting a provider process.
+#[cfg(test)]
+pub(crate) fn imported_spawn_selection_for_test(
+    session: &AgentSession,
+    settings: &intent_core::settings_file::SettingsFile,
+) -> (String, Option<String>, Option<String>) {
+    let resolved = resolve_spawn(session, None, settings, None).expect("imported spawn resolves");
+    (
+        resolved.provider.id.to_string(),
+        resolved.model,
+        resolved.reasoning_effort,
+    )
+}
+
 /// Resolve the provider config, model, cwd, and extra env for spawning an
 /// The default agent type for an agent with no specialist-declared `agentType`
 /// (the foreground/interactive type, which has no internal tool denylist).
@@ -10447,7 +11017,9 @@ fn resolve_spawn(
         };
         return Ok(ResolvedSpawn {
             provider,
-            model: None,
+            // Config-option E2E providers must track the selected model so
+            // live switches exercise the same respawn path as real providers.
+            model: if config_option_model { model } else { None },
             reasoning_effort: None,
             cwd,
             provider_binary: None,
@@ -10475,13 +11047,13 @@ fn resolve_spawn(
     // never starts the managed server.
     let unsloth_endpoint = None;
 
-    // npx-only providers (claude-code, pi) are spawned via
+    // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
     // skipped entirely. For providers that opt in
     // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
     // override (absolute, executable) is the one exception: it is exec'd
     // directly in place of the pinned npx spawn (monorepo#4352); an invalid
-    // override — or any override for pi — is ignored.
+    // override — or any override for codex/pi — is ignored.
     if provider.npx_only_package.is_some() {
         let explicit_path = read_provider_path_setting(settings, &provider_id);
         if let Some(binary) =
@@ -10504,7 +11076,12 @@ fn resolve_spawn(
                 unsloth_endpoint,
             });
         }
-        let (npx_binary, npx_package) = resolve_npx_only(&provider, intent_providers::find_npx())?;
+        let npx = if provider.id == "codex" {
+            intent_providers::find_codex_npx()
+        } else {
+            intent_providers::find_npx()
+        };
+        let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
         return Ok(ResolvedSpawn {
             provider,
             model,
@@ -10570,7 +11147,9 @@ fn resolve_spawn(
 
 /// Resolve the npx spawn inputs for an npx-only provider. `npx_path` is the
 /// caller-supplied `find_npx()` result (parameterized as a test seam). Missing
-/// npx is a hard, user-facing error — there is no local-binary fallback.
+/// npx is a hard, user-facing error — there is no local-binary fallback. A
+/// stale npm-6 npx is rejected later, by [`crate::npx_cli::check_npx_version`] in
+/// `ensure_started`, only when a fresh child is about to spawn.
 fn resolve_npx_only(
     provider: &ProviderConfig,
     npx_path: Option<PathBuf>,
@@ -10585,6 +11164,9 @@ fn resolve_npx_only(
         // InvalidInput (not Internal): this is an environment misconfiguration,
         // and its Display survives the JSON-RPC envelope (`domain_to_rpc` masks
         // Internal messages behind a literal "Internal error").
+        if provider.id == "codex" {
+            return Error::InvalidInput(intent_providers::CODEX_ACP_PREREQUISITE_ERROR.to_string());
+        }
         Error::InvalidInput(format!(
             "npx not found — {} is required to run {}. Install Node.js (which provides npx) and try again.",
             intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT,
@@ -10604,7 +11186,7 @@ fn resolve_npx_only(
 /// generated rules/MCP config paths while preserving every other field of the
 /// incoming opts. Notably the npx fallback pair must survive: dropping it
 /// makes `build_command` fall back to the bare provider command and fail with
-/// ENOENT when no local provider binary exists (codex fallback / claude-code
+/// ENOENT when no local provider binary exists (codex / claude-code
 /// npx-only spawns).
 fn rebuild_spawn_opts<'a>(
     opts: &SpawnOptions<'a>,
@@ -10627,6 +11209,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.env_mcp_config = env_mcp_config;
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
     spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
+    spawn_opts.npx_launch_root = opts.npx_launch_root;
     spawn_opts
 }
 
@@ -12245,6 +12828,14 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
 /// child, publish an `agent:stream:status` retry hint, and spawn a fresh
 /// process. Returns the `acpSessionId` on success, or the final error after
 /// exhausting all attempts.
+///
+/// A retried attempt's WARN names the stderr capture dir when THAT attempt's
+/// child wrote stderr before dying (via [`stderr_capture_hint`], which sweeps
+/// the child's process group and bounded-awaits the flush first), so the
+/// first failure stays diagnosable even when a later attempt succeeds and
+/// nothing terminal is ever surfaced. The final / non-retryable attempt keeps
+/// the plain WARN: its handle is left installed for the caller's terminal
+/// "failed after all retries" hint.
 async fn retry_spawn(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -12258,24 +12849,44 @@ async fn retry_spawn(
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
                 let error_msg = e.to_string();
-                tracing::warn!(
-                    agent = %agent_id,
-                    attempt = attempt,
-                    max = MAX_SPAWN_ATTEMPTS,
-                    retryable = retryable,
-                    error = %e,
-                    "agent spawn attempt failed"
-                );
+                let will_retry = retryable && attempt < MAX_SPAWN_ATTEMPTS;
+                let captured = if will_retry {
+                    stderr_capture_hint(mgr, agent_id, &e).await
+                } else {
+                    None
+                };
+                if let Some(log) = captured {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        attempt = attempt,
+                        max = MAX_SPAWN_ATTEMPTS,
+                        retryable = retryable,
+                        error = %e,
+                        "agent spawn attempt failed (agent stderr captured at {})",
+                        log.display()
+                    );
+                } else {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        attempt = attempt,
+                        max = MAX_SPAWN_ATTEMPTS,
+                        retryable = retryable,
+                        error = %e,
+                        "agent spawn attempt failed"
+                    );
+                }
 
                 last_error = Some(e);
 
                 // If non-retryable or last attempt, fail immediately
-                if !retryable || attempt == MAX_SPAWN_ATTEMPTS {
+                if !will_retry {
                     break;
                 }
 
                 // Tear down the failed child so the next attempt spawns fresh
-                // (narrower than full stop() — only kills child/handle, no worker/busy-flag touch)
+                // (narrower than full stop() — only kills child/handle, no
+                // worker/busy-flag touch). A no-op when the hint above
+                // already swept it.
                 mgr.kill_child_only(agent_id).await;
 
                 // Publish retry status hint with the actual failure kind
@@ -13100,9 +13711,10 @@ fn is_benign_turn_error(err: &Error) -> bool {
     prompt_cancellation_error(err)
 }
 
-/// STAB-53: when a terminal failure means the child died mid-turn ("agent
-/// stdout closed") and stderr capture is enabled, return the capture directory
-/// for `agent_id` so the WARN line can point at the child's last words.
+/// STAB-53: when a failure means the child died ("agent stdout closed" — a
+/// terminal mid-turn failure, or a startup attempt [`retry_spawn`] is about
+/// to retry) and stderr capture is enabled, return the capture directory for
+/// `agent_id` so the WARN line can point at the child's last words.
 /// Matches on the structured `Error::Internal` payload — the transport's
 /// child-death error is always wrapped there (handshake/prompt failures) —
 /// avoiding a Display allocation per check.
@@ -13182,6 +13794,176 @@ mod stderr_capture_hint_tests {
             stderr_capture_dir_populated(&empty),
             "dir with a capture file"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod first_attempt_stderr_hint_tests {
+    //! First-failed-startup diagnostics: `retry_spawn`'s per-attempt WARN
+    //! names the stderr capture dir when THIS attempt's child wrote stderr
+    //! before dying, so a later successful retry cannot hide where the first
+    //! failure's last words went — and the claim stays honest: a silent
+    //! child over a stale capture dir names nothing.
+
+    use super::dead_child_respawn_tests::{install_handle_with_connection, mock_agent_script};
+    use super::role_reminder_tests::{manager_with, session};
+    use super::tests::{AgentManagerLogCapture, EnvGuard};
+    use super::*;
+
+    const STDOUT_CLOSED: &str = "handshake failed: JSON-RPC error 0: agent stdout closed";
+
+    fn read_capture_dir(dir: &Path) -> String {
+        let mut out = String::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                out.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+        out
+    }
+
+    /// Mock exits (logging to stderr) on attempt 1 and serves attempt 2: the
+    /// attempt-1 WARN names the capture dir holding its last words, the
+    /// retry still succeeds, and no later WARN obscures the first one.
+    #[tokio::test]
+    async fn first_failed_attempt_warn_names_capture_dir_then_retry_succeeds() {
+        let script = mock_agent_script();
+        let tmp = crate::tests::test_tempdir("intentd-first-attempt-hint-");
+        let attempt_file = tmp.path().join("attempts.txt");
+        let attempt_file = attempt_file.to_string_lossy().into_owned();
+        let _env = EnvGuard::apply(&[
+            ("MOCK_AGENT_SCRIPT_PATH", Some(script.as_str())),
+            (
+                "MOCK_AGENT_BEHAVIOR",
+                Some(r#"{"exitImmediatelyAttempts":1}"#),
+            ),
+            ("MOCK_AGENT_ATTEMPT_FILE", Some(attempt_file.as_str())),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", Some("0,0")),
+        ]);
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let log_root = tmp.path().join("agent-logs");
+        let mgr = mgr.with_agent_log_root(log_root.clone());
+        let ws = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-first-attempt-hint");
+        let mut s = session(&agent_id, &ws, None);
+        s.provider = Some("mock".to_string());
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+
+        let capture = AgentManagerLogCapture::default();
+        let guard = capture.set_as_default();
+        let result = retry_spawn(&mgr, &agent_id, &ws).await;
+        drop(guard);
+        assert!(
+            result.is_ok(),
+            "attempt 2 succeeds after the attempt-1 exit: {result:?}"
+        );
+
+        let capture_dir = log_root.join(&agent_id.0);
+        let captured = read_capture_dir(&capture_dir);
+        assert!(
+            captured.contains("exiting immediately (attempt 1/1)"),
+            "capture dir {} holds the attempt-1 child's last words; got: {captured:?}",
+            capture_dir.display()
+        );
+
+        let lines = capture.lines();
+        let attempt_warns: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("agent spawn attempt failed"))
+            .collect();
+        assert_eq!(
+            attempt_warns.len(),
+            1,
+            "exactly one failed attempt was logged: {lines:?}"
+        );
+        let first = attempt_warns[0];
+        assert!(first.contains("attempt=1"), "WARN is attempt one: {first}");
+        let expected = format!("agent stderr captured at {}", capture_dir.display());
+        assert!(
+            first.contains(&expected),
+            "attempt-1 WARN names the capture dir {expected:?}: {first}"
+        );
+        assert!(
+            mgr.handle_is_live(&agent_id),
+            "the successful retry leaves a live handle installed"
+        );
+        mgr.kill_child_only(&agent_id).await;
+    }
+
+    /// A child that died without writing stderr, over a capture dir a
+    /// previous run populated, must not be claimed as "stderr captured at"
+    /// — the per-connection `stderr_captured` flag gates the hint. The same
+    /// connection shape with fresh output names the dir.
+    #[tokio::test]
+    async fn silent_child_over_stale_capture_claims_nothing() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let tmp = crate::tests::test_tempdir("intentd-stale-capture-hint-");
+        let log_root = tmp.path().join("agent-logs");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = mgr.with_agent_log_root(log_root.clone());
+        let agent_id = AgentId::from("agent-stale-capture");
+        let dir = log_root.join(&agent_id.0);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2020-01-01.log"), "old run\n").unwrap();
+        let err = Error::Internal(STDOUT_CLOSED.to_string());
+
+        let connect = |dir: PathBuf| {
+            let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
+            let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
+            let (stderr_w, stderr_r) = tokio::io::duplex(4096);
+            let hooks = ConnectionHooks {
+                stderr_log_dir: Some(dir),
+                ..ConnectionHooks::default()
+            };
+            let conn = Arc::new(Connection::new(
+                c2a_client,
+                a2c_client,
+                Some(Box::new(stderr_r)),
+                hooks,
+            ));
+            (conn, stderr_w, (c2a_agent, a2c_agent))
+        };
+
+        // Silent child: EOF with no output → no claim despite the stale file.
+        let (conn, stderr_w, _ends) = connect(dir.clone());
+        install_handle_with_connection(&mgr, &agent_id, None, conn);
+        drop(stderr_w);
+        assert!(
+            stderr_capture_hint(&mgr, &agent_id, &err).await.is_none(),
+            "silent child over a stale capture dir must not claim capture"
+        );
+        assert!(
+            !mgr.handles.lock().unwrap().contains_key(&agent_id),
+            "the hint tore the failed child's handle down"
+        );
+
+        // Child that wrote stderr before dying → the dir is named.
+        let (conn, mut stderr_w, _ends) = connect(dir.clone());
+        install_handle_with_connection(&mgr, &agent_id, None, conn);
+        stderr_w.write_all(b"fresh crash output\n").await.unwrap();
+        stderr_w.flush().await.unwrap();
+        drop(stderr_w);
+        assert_eq!(
+            stderr_capture_hint(&mgr, &agent_id, &err).await,
+            Some(dir.clone()),
+            "child that wrote stderr names its capture dir"
+        );
+
+        // Not a child-death error → no claim even with a fresh capture.
+        let (conn, mut stderr_w, _ends) = connect(dir.clone());
+        install_handle_with_connection(&mgr, &agent_id, None, conn);
+        stderr_w.write_all(b"unrelated\n").await.unwrap();
+        stderr_w.flush().await.unwrap();
+        drop(stderr_w);
+        let timeout = Error::Internal("session/new failed: timed out".to_string());
+        assert!(
+            stderr_capture_hint(&mgr, &agent_id, &timeout)
+                .await
+                .is_none(),
+            "a non-child-death error never carries the hint"
+        );
+        mgr.kill_child_only(&agent_id).await;
     }
 }
 
@@ -13390,6 +14172,636 @@ async fn handle_terminal_turn_failure(
         persist,
     )
     .await;
+}
+
+#[cfg(all(test, unix))]
+mod npx_launch_dir_lifetime_tests {
+    //! The npx launch dir is a live child's cwd (intent-hq/intent#5738), so
+    //! its RAII guard must outlive the bounded process-tree kill on every
+    //! teardown path that hands the child out of its `AgentHandle`: `stop`,
+    //! `stop_many`, `shutdown`, and the idle-exit watcher's descendant sweep.
+    //! Each child reports, from inside its SIGTERM trap, whether its cwd still
+    //! existed when the kill reached it; the dir must be gone afterwards.
+
+    use super::dead_child_respawn_tests::{
+        fake_handle_with_launch_dir, install_fake_handle_with_launch_dir,
+    };
+    use super::role_reminder_tests::manager_with;
+    use super::*;
+
+    /// A child whose cwd is `dir`: on SIGTERM it writes `cwd-present` or
+    /// `cwd-gone` to `marker` (a path outside `dir`) and exits, so the kill's
+    /// `child.wait()` returns only after the verdict is on disk.
+    fn trap_reporting_child(dir: &Path, marker: &Path) -> Child {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "trap 'if [ -e ./package.json ]; then echo cwd-present > \"$0\"; \
+                 else echo cwd-gone > \"$0\"; fi; exit 0' TERM; \
+                 while :; do sleep 0.05; done",
+            )
+            .arg(marker)
+            .current_dir(dir)
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn trap-reporting child")
+    }
+
+    fn verdict(marker: &Path) -> String {
+        std::fs::read_to_string(marker)
+            .unwrap_or_else(|e| panic!("child never reported at {}: {e}", marker.display()))
+            .trim()
+            .to_string()
+    }
+
+    struct Installed {
+        agent_id: AgentId,
+        launch_path: PathBuf,
+        marker: PathBuf,
+        _ends: (tokio::io::DuplexStream, tokio::io::DuplexStream),
+    }
+
+    fn install(mgr: &AgentManager, root: &Path, tag: &str) -> Installed {
+        let launch_dir = NpxLaunchDir::create(Some(root)).expect("create launch dir");
+        let launch_path = launch_dir.path().to_path_buf();
+        let marker = root.join(format!("{tag}.verdict"));
+        let child = trap_reporting_child(&launch_path, &marker);
+        let agent_id = AgentId::from(format!("agent-npx-lifetime-{tag}"));
+        let ends =
+            install_fake_handle_with_launch_dir(mgr, &agent_id, Some(child), Some(launch_dir));
+        Installed {
+            agent_id,
+            launch_path,
+            marker,
+            _ends: ends,
+        }
+    }
+
+    fn assert_torn_down(installed: &Installed, path: &str) {
+        assert_eq!(
+            verdict(&installed.marker),
+            "cwd-present",
+            "{path}: launch dir was removed before the child was signalled"
+        );
+        assert!(
+            !installed.launch_path.exists(),
+            "{path}: launch dir must be removed once the tree kill completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_keeps_launch_dir_until_tree_kill_completes() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-lifetime-stop-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let a = install(&mgr, tmp.path(), "stop");
+        assert!(a.launch_path.join("package.json").is_file());
+
+        assert!(mgr.stop(&a.agent_id).await, "handle existed");
+        assert_torn_down(&a, "stop");
+    }
+
+    #[tokio::test]
+    async fn stop_many_keeps_launch_dirs_until_sweep_completes() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-lifetime-many-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let a = install(&mgr, tmp.path(), "many-a");
+        let b = install(&mgr, tmp.path(), "many-b");
+
+        let fence = mgr
+            .stop_many(&[a.agent_id.clone(), b.agent_id.clone()])
+            .await;
+        drop(fence);
+        assert_torn_down(&a, "stop_many");
+        assert_torn_down(&b, "stop_many");
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_launch_dirs_until_sweep_completes() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-lifetime-shutdown-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let a = install(&mgr, tmp.path(), "shutdown");
+
+        mgr.shutdown().await;
+        assert_torn_down(&a, "shutdown");
+    }
+
+    /// Idle-exit path: the leader exits on its own leaving a same-group
+    /// descendant behind. The watcher reaps the handle and sweeps the group;
+    /// the descendant re-checks its cwd every 10ms until it is killed, so the
+    /// last verdict on disk is what it saw just before the sweep reached it.
+    /// With the guard dropped before the sweep (the regression), the dir is
+    /// gone for the whole `ps` snapshot + signal window and the descendant
+    /// records `cwd-gone`; with the guard held across the sweep it can never
+    /// observe a missing cwd.
+    ///
+    /// The descendant is `SIGKILLed` mid-loop, so each verdict is published by
+    /// `mv` (an atomic rename) rather than `>` on the marker itself: a kill
+    /// landing between the redirect's truncate and its write would otherwise
+    /// leave an empty marker (reproduced 3/40 under parallel load). The
+    /// watcher is armed only once the first verdict is on disk, so the sweep
+    /// provably reaches a running descendant.
+    #[tokio::test]
+    async fn idle_exit_sweep_keeps_launch_dir_until_descendants_are_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-lifetime-idle-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let launch_dir = NpxLaunchDir::create(Some(tmp.path())).expect("create launch dir");
+        let launch_path = launch_dir.path().to_path_buf();
+        let marker = tmp.path().join("idle.verdict");
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "(trap '' TERM; while :; do if [ -e ./package.json ]; \
+                 then echo cwd-present > \"$0.tmp\"; else echo cwd-gone > \"$0.tmp\"; fi; \
+                 mv -f \"$0.tmp\" \"$0\"; sleep 0.01; done) & exit 0",
+            )
+            .arg(&marker)
+            .current_dir(&launch_path)
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn exiting leader with lingering descendant");
+        let child_pid = child.id();
+        let agent_id = AgentId::from("agent-npx-lifetime-idle");
+        let _ends =
+            install_fake_handle_with_launch_dir(&mgr, &agent_id, Some(child), Some(launch_dir));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant never published its first verdict"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            verdict(&marker),
+            "cwd-present",
+            "descendant started in its cwd"
+        );
+
+        let fired = mgr
+            .arm_child_exit_watcher(agent_id.clone(), child_pid)
+            .await
+            .expect("watcher task joins");
+        assert!(fired, "watcher reaps the idle-exited leader");
+        assert!(
+            !mgr.handles.lock().unwrap().contains_key(&agent_id),
+            "handle removed by the watcher"
+        );
+        assert_eq!(
+            verdict(&marker),
+            "cwd-present",
+            "idle-exit: launch dir was removed before the descendant sweep"
+        );
+        assert!(
+            !launch_path.exists(),
+            "idle-exit: launch dir must be removed once the sweep completes"
+        );
+    }
+
+    // ---- cancellation regressions (intent-hq/intent#5738) -----------------
+    //
+    // The kill is a multi-await operation (descendant snapshot → SIGTERM →
+    // grace → SIGKILL → escape sweep) and every teardown entry point can be
+    // cancelled mid-way: `stop()` aborts the worker running `kill_child_only`,
+    // an RPC deadline drops a `stop`/`stop_many` future, a `stop_many` sweep
+    // is itself abandoned. Cleanup ownership must not travel with the
+    // cancelled future: the launch dir has to survive until the bounded kill
+    // — the one that already took the descendant snapshot — has finished.
+
+    /// SIGKILLs a pid on drop so a failed test never leaves the fixture's
+    /// SIGTERM-ignoring grandchild behind.
+    struct KillGrandchildOnDrop(i32);
+
+    impl Drop for KillGrandchildOnDrop {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.0),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    /// A leader whose cwd is `dir`: it starts a same-group grandchild that
+    /// ignores SIGTERM (`SIG_IGN` survives `exec`) and writes its pid to
+    /// `pidfile`; on SIGTERM the leader itself creates `term_marker` and KEEPS
+    /// running. The tree therefore only dies on the group's SIGKILL
+    /// escalation after [`PROCESS_GROUP_TERM_GRACE`], and `term_marker`
+    /// proves the kill has passed its descendant snapshot and signalled the
+    /// group — the window in which the killing caller is cancelled.
+    fn term_ignoring_tree(dir: &Path, pidfile: &Path, term_marker: &Path) -> Child {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "trap ': > \"$1\"' TERM; sh -c 'trap \"\" TERM; exec sleep 300' & \
+                 echo $! > \"$0\"; while :; do sleep 0.05; done",
+            )
+            .arg(pidfile)
+            .arg(term_marker)
+            .current_dir(dir)
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn SIGTERM-ignoring tree")
+    }
+
+    async fn wait_for_file(path: &Path, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: {} never appeared",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn read_grandchild_pid(pidfile: &Path) -> i32 {
+        wait_for_file(pidfile, "grandchild pidfile").await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(pidfile)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild pid never written"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A spawned [`term_ignoring_tree`] plus the launch dir it runs in.
+    struct Tree {
+        launch_dir: Option<NpxLaunchDir>,
+        launch_path: PathBuf,
+        child: Option<Child>,
+        grandchild: i32,
+        term_marker: PathBuf,
+        _sweep: KillGrandchildOnDrop,
+    }
+
+    async fn spawn_tree(root: &Path, tag: &str) -> Tree {
+        let launch_dir = NpxLaunchDir::create(Some(root)).expect("create launch dir");
+        let launch_path = launch_dir.path().to_path_buf();
+        let pidfile = root.join(format!("{tag}.grandchild.pid"));
+        let term_marker = root.join(format!("{tag}.term"));
+        let child = term_ignoring_tree(&launch_path, &pidfile, &term_marker);
+        let grandchild = read_grandchild_pid(&pidfile).await;
+        assert_eq!(
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(grandchild)))
+                .expect("grandchild pgid")
+                .as_raw(),
+            child.id().expect("leader pid").cast_signed(),
+            "grandchild must share the leader's process group"
+        );
+        Tree {
+            launch_dir: Some(launch_dir),
+            launch_path,
+            child: Some(child),
+            grandchild,
+            term_marker,
+            _sweep: KillGrandchildOnDrop(grandchild),
+        }
+    }
+
+    /// Install `tree` as `agent_id`'s handle (child + launch dir guard).
+    fn install_tree(
+        mgr: &AgentManager,
+        tree: &mut Tree,
+        agent_id: &AgentId,
+    ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        install_fake_handle_with_launch_dir(
+            mgr,
+            agent_id,
+            tree.child.take(),
+            tree.launch_dir.take(),
+        )
+    }
+
+    /// The launch dir must exist for as long as the discoverable tree is
+    /// live, and be gone once the bounded kill has swept it.
+    async fn assert_dir_outlives_tree(tree: &Tree, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while pid_alive(tree.grandchild) {
+            assert!(
+                tree.launch_path.is_dir(),
+                "{what}: launch dir {} removed while grandchild {} is still alive",
+                tree.launch_path.display(),
+                tree.grandchild
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: grandchild {} still alive after the bounded kill window",
+                tree.grandchild
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while tree.launch_path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: launch dir {} still present after the tree died",
+                tree.launch_path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Abort `task` and confirm it neither panicked nor is still running.
+    async fn abort_and_settle(task: JoinHandle<()>, what: &str) {
+        task.abort();
+        let outcome = task.await;
+        assert!(
+            outcome
+                .as_ref()
+                .map_or_else(tokio::task::JoinError::is_cancelled, |()| true),
+            "{what}: task neither finished nor cancelled: {outcome:?}"
+        );
+    }
+
+    /// `stop()` cancelled after the kill has signalled the group (an RPC
+    /// deadline, a dropped future).
+    #[tokio::test]
+    async fn cancelled_stop_keeps_launch_dir_until_tree_is_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-stop-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let mut tree = spawn_tree(tmp.path(), "stop").await;
+        let agent_id = AgentId::from("agent-npx-cancel-stop");
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+
+        let stopping = {
+            let mgr = Arc::clone(&mgr);
+            let agent_id = agent_id.clone();
+            intent_core::spawn_daemon(async move {
+                mgr.stop(&agent_id).await;
+            })
+        };
+        wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+        assert!(tree.launch_path.is_dir());
+        abort_and_settle(stopping, "stop").await;
+
+        assert_dir_outlives_tree(&tree, "stop cancelled mid-kill").await;
+    }
+
+    /// `stop_many()` cancelled after the shared SIGTERM phase: every launch
+    /// dir of the batch must survive the batch's bounded sweep.
+    #[tokio::test]
+    async fn cancelled_stop_many_keeps_launch_dirs_until_sweep_completes() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-many-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let mut a = spawn_tree(tmp.path(), "many-a").await;
+        let mut b = spawn_tree(tmp.path(), "many-b").await;
+        let id_a = AgentId::from("agent-npx-cancel-many-a");
+        let id_b = AgentId::from("agent-npx-cancel-many-b");
+        let _ends_a = install_tree(&mgr, &mut a, &id_a);
+        let _ends_b = install_tree(&mgr, &mut b, &id_b);
+
+        let sweeping = {
+            let mgr = Arc::clone(&mgr);
+            let ids = [id_a.clone(), id_b.clone()];
+            intent_core::spawn_daemon(async move {
+                let _fence = mgr.stop_many(&ids).await;
+            })
+        };
+        wait_for_file(&a.term_marker, "leader a SIGTERM").await;
+        wait_for_file(&b.term_marker, "leader b SIGTERM").await;
+        abort_and_settle(sweeping, "stop_many").await;
+
+        assert_dir_outlives_tree(&a, "stop_many cancelled mid-sweep (a)").await;
+        assert_dir_outlives_tree(&b, "stop_many cancelled mid-sweep (b)").await;
+    }
+
+    /// The worker-owned path: `kill_child_only` (retry / respawn / terminal
+    /// failure) removes the handle from the map BEFORE the kill, so once
+    /// `stop()` aborts the worker mid-kill there is no handle left for an
+    /// external stop to recover — the kill it interrupted must finish on its
+    /// own.
+    #[tokio::test]
+    async fn cancelled_kill_child_only_keeps_launch_dir_until_tree_is_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-worker-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = Arc::new(mgr);
+        let mut tree = spawn_tree(tmp.path(), "worker").await;
+        let agent_id = AgentId::from("agent-npx-cancel-worker");
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+
+        let worker = {
+            let mgr = Arc::clone(&mgr);
+            let agent_id = agent_id.clone();
+            intent_core::spawn_daemon(async move {
+                mgr.kill_child_only(&agent_id).await;
+            })
+        };
+        wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+        assert!(
+            !mgr.handles.lock().unwrap().contains_key(&agent_id),
+            "handle is out of the map before the kill runs"
+        );
+        abort_and_settle(worker, "kill_child_only").await;
+        assert!(
+            !mgr.stop(&agent_id).await,
+            "an external stop after the abort finds no handle to recover"
+        );
+
+        assert_dir_outlives_tree(&tree, "kill_child_only cancelled mid-kill").await;
+    }
+
+    /// The registry kill callback (`make_kill`) cancelled mid-kill.
+    #[tokio::test]
+    async fn cancelled_registry_kill_keeps_launch_dir_until_tree_is_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-registry-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mut tree = spawn_tree(tmp.path(), "registry").await;
+        let agent_id = AgentId::from("agent-npx-cancel-registry");
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+
+        let kill = mgr.make_kill(agent_id.clone());
+        let killing = intent_core::spawn_daemon(kill());
+        wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+        abort_and_settle(killing, "registry kill").await;
+
+        assert_dir_outlives_tree(&tree, "registry kill cancelled mid-kill").await;
+    }
+
+    /// A detached child dropped before its kill was ever awaited (the caller
+    /// cancelled between `detach` and `kill_tree`) still owns its cleanup:
+    /// the tree is swept, and only then the dir removed.
+    #[tokio::test]
+    async fn dropped_detached_child_still_sweeps_tree_before_removing_launch_dir() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-drop-detached-");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mut tree = spawn_tree(tmp.path(), "dropped").await;
+        let agent_id = AgentId::from("agent-npx-drop-detached");
+        let _ends = install_tree(&mgr, &mut tree, &agent_id);
+
+        let (removed, detached) = mgr.detach(&agent_id).await;
+        assert!(removed);
+        drop(detached.expect("handle owned a child"));
+
+        assert_dir_outlives_tree(&tree, "detached child dropped unkilled").await;
+    }
+
+    /// `create_agent`'s respawn window: the freshly spawned child already
+    /// sits in a local [`AgentHandle`] while the stale handle's owned kill is
+    /// awaited, before the fresh handle reaches the map. Cancelling that
+    /// await drops the fresh handle with its child still inside — the drop
+    /// must hand the child to the owned cleanup rather than `kill_on_drop`
+    /// just the leader and remove the launch dir from under its descendants.
+    #[tokio::test]
+    async fn cancelled_stale_reap_keeps_fresh_handles_launch_dir_until_its_tree_is_swept() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-cancel-respawn-");
+        let mut stale = spawn_tree(tmp.path(), "respawn-stale").await;
+        let mut fresh = spawn_tree(tmp.path(), "respawn-fresh").await;
+        let (fresh_handle, fresh_ends) =
+            fake_handle_with_launch_dir(fresh.child.take(), fresh.launch_dir.take());
+        let stale_detached = detach_tree(&mut stale);
+
+        let respawning = intent_core::spawn_daemon(async move {
+            let _fresh_handle = fresh_handle;
+            let _fresh_ends = fresh_ends;
+            stale_detached.kill_tree().await;
+            unreachable!("the stale reap is cancelled before it completes");
+        });
+        wait_for_file(&stale.term_marker, "stale leader SIGTERM").await;
+        assert!(
+            fresh.launch_path.is_dir(),
+            "precondition: fresh dir present"
+        );
+        assert!(
+            pid_alive(fresh.grandchild),
+            "precondition: fresh descendant alive"
+        );
+        abort_and_settle(respawning, "create_agent stale reap").await;
+
+        assert_dir_outlives_tree(&stale, "stale tree, reap cancelled mid-kill").await;
+        assert_dir_outlives_tree(&fresh, "fresh handle dropped during the stale reap").await;
+    }
+
+    /// Detach `tree` the way every teardown path does: out of an
+    /// [`AgentHandle`] via [`DetachedChild::take`].
+    fn detach_tree(tree: &mut Tree) -> DetachedChild {
+        let (mut handle, _ends) =
+            fake_handle_with_launch_dir(tree.child.take(), tree.launch_dir.take());
+        DetachedChild::take(&mut handle).expect("handle owned a child")
+    }
+
+    /// Interrupted cleanup: the runtime shuts down while the owned kill is
+    /// still inside its grace window. The kill cannot finish, so the launch
+    /// dir is retained (a small orphan directory) rather than removed from
+    /// under a tree that may still be running — the same boundary as the
+    /// ephemeral adapter's.
+    #[test]
+    fn launch_dir_is_retained_when_the_runtime_shuts_down_mid_kill() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-rt-shutdown-");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tree, _killing) = rt.block_on(async {
+            let mut tree = spawn_tree(tmp.path(), "rt-shutdown").await;
+            let detached = detach_tree(&mut tree);
+            let killing = intent_core::spawn_daemon(detached.kill_tree());
+            wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+            (tree, killing)
+        });
+        assert!(pid_alive(tree.grandchild));
+
+        drop(rt);
+        assert!(
+            tree.launch_path.is_dir(),
+            "launch dir {} removed on runtime shutdown although its kill never finished",
+            tree.launch_path.display()
+        );
+    }
+
+    /// A launch dir retained on runtime shutdown lives under the agent-configs
+    /// root, which the next daemon start sweeps before spawning anything. The
+    /// sweep must skip it — its descendants may still run in it — while still
+    /// reclaiming the per-agent config files beside it.
+    #[test]
+    fn startup_sweep_keeps_launch_dir_retained_on_runtime_shutdown() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-startup-sweep-");
+        let root = intent_core::agent_configs_root(tmp.path());
+        intent_core::create_agent_configs_dir(&root).expect("create agent-configs root");
+        let stale_config = root.join("intentd-mcp-stale.json");
+        std::fs::write(&stale_config, b"{}").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tree, _killing) = rt.block_on(async {
+            let mut tree = spawn_tree(&root, "startup-sweep").await;
+            let detached = detach_tree(&mut tree);
+            let killing = intent_core::spawn_daemon(detached.kill_tree());
+            wait_for_file(&tree.term_marker, "leader SIGTERM").await;
+            (tree, killing)
+        });
+        drop(rt);
+        assert!(tree.launch_path.is_dir(), "precondition: dir retained");
+        assert!(pid_alive(tree.grandchild), "precondition: descendant alive");
+
+        intent_core::sweep_agent_configs(&root).expect("startup sweep");
+        assert!(
+            tree.launch_path.is_dir(),
+            "startup sweep removed retained launch dir {} while grandchild {} is still alive",
+            tree.launch_path.display(),
+            tree.grandchild
+        );
+        assert!(
+            tree.launch_path.join("package.json").is_file(),
+            "retained launch dir must keep its sentinel manifest"
+        );
+        assert!(
+            !stale_config.exists(),
+            "startup sweep must still reclaim leaked config files"
+        );
+    }
+
+    /// No runtime at all: a detached child dropped outside any runtime cannot
+    /// start its owned kill, so the dir is retained and the child left to
+    /// `kill_on_drop`.
+    #[test]
+    fn launch_dir_is_retained_when_no_runtime_can_run_the_kill() {
+        let tmp = crate::tests::test_tempdir("intentd-npx-no-rt-");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tree, detached) = rt.block_on(async {
+            let mut tree = spawn_tree(tmp.path(), "no-rt").await;
+            let detached = detach_tree(&mut tree);
+            (tree, detached)
+        });
+        drop(rt);
+
+        drop(detached);
+        assert!(
+            tree.launch_path.is_dir(),
+            "launch dir {} removed with no runtime to run the kill",
+            tree.launch_path.display()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -14892,7 +16304,7 @@ mod role_reminder_tests {
             None
         );
 
-        // Codex opted into the config-option path (its npx-fallback adapter
+        // Codex opted into the config-option path (its pinned npx adapter
         // ignores `-c model=…` argv overrides, and its `session/set_model`
         // handler rejects both bare and `{base}/{effort}` ids). The
         // adapter's model select values are bare base ids, so a
@@ -15040,6 +16452,31 @@ mod dead_child_respawn_tests {
         agent_id: &AgentId,
         child: Option<Child>,
     ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        install_fake_handle_with_launch_dir(mgr, agent_id, child, None)
+    }
+
+    /// [`install_fake_handle`] whose handle also owns an npx launch dir guard
+    /// (the child's cwd), for the teardown lifetime tests.
+    pub(super) fn install_fake_handle_with_launch_dir(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        child: Option<Child>,
+        npx_launch_dir: Option<NpxLaunchDir>,
+    ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (handle, ends) = fake_handle_with_launch_dir(child, npx_launch_dir);
+        mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
+        ends
+    }
+
+    /// Build (without installing) a fake duplex-backed handle owning `child`
+    /// and an npx launch dir guard; returns the handle and the far ends.
+    pub(super) fn fake_handle_with_launch_dir(
+        child: Option<Child>,
+        npx_launch_dir: Option<NpxLaunchDir>,
+    ) -> (
+        AgentHandle,
+        (tokio::io::DuplexStream, tokio::io::DuplexStream),
+    ) {
         let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
         let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
         let connection = Arc::new(Connection::new(
@@ -15048,9 +16485,31 @@ mod dead_child_respawn_tests {
             None,
             ConnectionHooks::default(),
         ));
+        let handle = fake_handle(child, connection, npx_launch_dir);
+        (handle, (c2a_agent, a2c_agent))
+    }
+
+    /// Install a handle around a caller-built `connection` (e.g. one with a
+    /// stderr pipe + capture dir) so tests can drive the stderr-capture hint
+    /// against a connection whose capture state they control.
+    pub(super) fn install_handle_with_connection(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        child: Option<Child>,
+        connection: Arc<Connection>,
+    ) {
+        let handle = fake_handle(child, connection, None);
+        mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
+    }
+
+    fn fake_handle(
+        child: Option<Child>,
+        connection: Arc<Connection>,
+        npx_launch_dir: Option<NpxLaunchDir>,
+    ) -> AgentHandle {
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let child_pid = child.as_ref().and_then(tokio::process::Child::id);
-        let handle = AgentHandle {
+        AgentHandle {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
@@ -15061,6 +16520,7 @@ mod dead_child_respawn_tests {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            npx_launch_dir,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -15068,9 +16528,7 @@ mod dead_child_respawn_tests {
             thought_level: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
-        };
-        mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
-        (c2a_agent, a2c_agent)
+        }
     }
 
     /// Live child + unchanged model → the cached session comes back with no
@@ -15205,6 +16663,605 @@ mod dead_child_respawn_tests {
         assert!(
             mgr.handles.lock().unwrap().contains_key(&agent_id),
             "only the mapping drops out; the handle awaits the exit watcher"
+        );
+        mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod disabled_provider_rehome_tests {
+    //! Regression tests for intent-hq/intent#5737: a turn for a session whose
+    //! provider was disabled in Settings > Agents (`providers.enabled[id] ==
+    //! false`) never spawns that provider. `ensure_started` re-homes the
+    //! session onto the usable settings-derived default (persisting the row,
+    //! an `agent:updated` invalidation and a `provider_rehomed` transcript
+    //! notice) or, with no usable default, fails the turn with the distinct
+    //! "not enabled" `-32602` before any spawn.
+    //!
+    //! `codex` plays the disabled provider (disableable, never spawned here);
+    //! `mock` plays the runnable default — its availability is gated purely
+    //! on `MOCK_AGENT_SCRIPT_PATH`, which [`mock_env`] pins.
+
+    use super::dead_child_respawn_tests::{install_fake_handle, mock_agent_script, mock_env};
+    use super::role_reminder_tests::{session, workspace};
+    use super::*;
+    use crate::events::{EventBus, SubscriptionFilter};
+    use intent_store::Store;
+
+    const WS: &str = "ws-1";
+
+    /// Manager over a temp store with a settings registry wired and NO
+    /// seeded session — each test seeds its own row.
+    async fn registry_manager() -> (AgentManager, EventBus, tempfile::TempDir, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-rehome-");
+        let path = db_dir.path().join("store.db");
+        let store = Store::open(&path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        store
+            .insert_workspace(&workspace(&WorkspaceId::from(WS)))
+            .await
+            .unwrap();
+        let sink = Arc::new(BusEventSink::new(bus.clone()));
+        (
+            AgentManager::new(services, sink, 4),
+            bus,
+            db_dir,
+            config_dir,
+        )
+    }
+
+    fn set(mgr: &AgentManager, path: &str, value: Value) {
+        mgr.services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[(path.to_string(), value)])
+            .expect("apply setting");
+    }
+
+    async fn seed_session(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        provider: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) {
+        let mut s = session(agent_id, &WorkspaceId::from(WS), None);
+        s.provider = Some(provider.to_string());
+        s.model = model.map(str::to_string);
+        s.reasoning_effort = effort.map(str::to_string);
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+    }
+
+    async fn drain(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
+        let mut events = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(300), sub.recv()).await
+        {
+            events.extend(batch);
+        }
+        events
+    }
+
+    /// (a) Disabled provider + available default: the row is re-homed
+    /// (provider ← default, model ← the provider's settings default, effort
+    /// cleared), the notice row + `agent:updated` / `agent:message` land,
+    /// and the spawn runs the default provider — never the disabled one.
+    #[tokio::test]
+    async fn rehomes_onto_available_default_and_spawns_it() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        set(
+            &mgr,
+            "model.providerDefaults",
+            json!({ "mock": "mock-default" }),
+        );
+        let agent_id = AgentId::from("agent-5737-rehome");
+        seed_session(&mgr, &agent_id, "codex", Some("gpt-5"), Some("high")).await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        mgr.ensure_started(&agent_id, &WorkspaceId::from(WS))
+            .await
+            .expect("re-homed turn spawns the default provider");
+
+        let row = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.provider.as_deref(),
+            Some("mock"),
+            "re-homed onto the default"
+        );
+        assert_eq!(
+            row.model.as_deref(),
+            Some("mock-default"),
+            "settings default for mock"
+        );
+        assert_eq!(row.reasoning_effort, None, "effort never carries over");
+        {
+            // (`resolve_spawn` always spawns the mock with no model, so the
+            // pin is asserted on the row above, not on the handle.)
+            let handles = mgr.handles.lock().unwrap();
+            let handle = handles.get(&agent_id).expect("child spawned");
+            assert_eq!(handle.spawned_provider, "node", "the mock child, not codex");
+        }
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        let notice = messages
+            .iter()
+            .find(|m| {
+                m.metadata.as_ref().and_then(|md| md["type"].as_str()) == Some("provider_rehomed")
+            })
+            .expect("provider_rehomed notice persisted");
+        assert_eq!(notice.role, "system");
+        assert_eq!(
+            notice.content[0]["text"],
+            json!(
+                "gpt-5 (OpenAI Codex) is no longer available — OpenAI Codex was disabled in \
+                 Settings > Agents; this agent now runs on Mock (E2E)."
+            )
+        );
+        assert_eq!(
+            notice.metadata,
+            Some(json!({
+                "type": "provider_rehomed",
+                "reason": "provider_disabled",
+                "from": "gpt-5",
+                "to": "mock-default",
+                "fromProvider": "codex",
+                "toProvider": "mock",
+            }))
+        );
+
+        let events = drain(&mut sub).await;
+        let updated = events
+            .iter()
+            .find(|e| e.event_type == intent_core::events::AGENT_UPDATED)
+            .expect("re-home published agent:updated");
+        assert_eq!(updated.data["agentId"], json!(agent_id.0));
+        assert_eq!(updated.data["modelId"], json!("mock-default"));
+        assert_eq!(updated.data["providerId"], json!("mock"));
+        let msg_event = events
+            .iter()
+            .find(|e| e.event_type == "agent:message" && e.data["role"] == json!("system"))
+            .expect("notice emitted agent:message");
+        assert_eq!(msg_event.data["messageId"], json!(notice.id));
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (a′) A session with a COMMITTED prior turn on the disabled provider
+    /// (`last_turn_*` set, as after any real turn) gets exactly ONE system
+    /// notice for the re-home — the `provider_rehomed` row — never the
+    /// generic `model_changed` row the identity comparison would otherwise
+    /// also produce. The identity commit still lands, so the next turn and
+    /// a turn after re-enabling the old provider add no further notices.
+    #[tokio::test]
+    async fn rehome_after_committed_turn_persists_exactly_one_notice() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        let ws = WorkspaceId::from(WS);
+        let agent_id = AgentId::from("agent-5737-prior-turn");
+        seed_session(&mgr, &agent_id, "codex", Some("gpt-5"), None).await;
+        mgr.services
+            .store
+            .set_agent_session_last_turn_model(&ws, &agent_id, Some("gpt-5"), "codex")
+            .await
+            .unwrap();
+
+        let system_rows = |messages: &[intent_core::AgentMessage]| -> Vec<String> {
+            messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| {
+                    m.metadata
+                        .as_ref()
+                        .and_then(|md| md["type"].as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        };
+
+        mgr.ensure_started(&agent_id, &ws)
+            .await
+            .expect("re-homed turn spawns the default provider");
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            system_rows(&messages),
+            vec!["provider_rehomed".to_string()],
+            "one notice for the re-home, no model_changed duplicate: {messages:?}"
+        );
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session_last_turn_model(&ws, &agent_id)
+                .await
+                .unwrap(),
+            (None, Some("mock".to_string())),
+            "identity commit still lands on the re-homed pair"
+        );
+
+        // Subsequent turn on the (now enabled) re-homed provider: no notice.
+        mgr.ensure_started(&agent_id, &ws)
+            .await
+            .expect("second turn reuses the re-homed session");
+        // Re-enabling the old provider is one-way: no move back, no notice.
+        set(&mgr, "providers.enabled", json!({ "codex": true }));
+        mgr.ensure_started(&agent_id, &ws)
+            .await
+            .expect("turn after re-enable stays on the re-homed provider");
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            system_rows(&messages),
+            vec!["provider_rehomed".to_string()],
+            "later turns add no notices: {messages:?}"
+        );
+        let row = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert_eq!(row.provider.as_deref(), Some("mock"));
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (a‴) The single-notice guarantee survives a FAILED first spawn on the
+    /// re-homed provider. The re-home (row + `provider_rehomed` notice) lands
+    /// on the first `ensure_started`, whose child then dies before the
+    /// handshake; the next attempt — `retry_spawn` within the turn, a later
+    /// turn, or a restart — finds the session already on the enabled target
+    /// (no re-home this time) with `last_turn_provider` still naming the
+    /// disabled provider, and must still not append a `model_changed` row.
+    /// The mock exits immediately on its first launch (attempt counter in
+    /// `MOCK_AGENT_ATTEMPT_FILE`) and serves the second; the turn is driven
+    /// through `retry_spawn` exactly as the message worker does.
+    #[tokio::test]
+    async fn rehome_with_failed_first_spawn_still_persists_exactly_one_notice() {
+        let script = mock_agent_script();
+        let attempts = crate::tests::test_tempdir("intentd-rehome-attempts-");
+        let attempt_file = attempts
+            .path()
+            .join("attempts.txt")
+            .to_string_lossy()
+            .into_owned();
+        let behavior = json!({ "exitImmediatelyAttempts": 1 }).to_string();
+        let _env = super::tests::EnvGuard::apply(&[
+            ("MOCK_AGENT_SCRIPT_PATH", Some(&script)),
+            ("MOCK_AGENT_BEHAVIOR", Some(&behavior)),
+            ("MOCK_AGENT_ATTEMPT_FILE", Some(&attempt_file)),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", Some("10,20")),
+        ]);
+        let (mgr, _bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        let ws = WorkspaceId::from(WS);
+        let agent_id = AgentId::from("agent-5737-failed-first-spawn");
+        seed_session(&mgr, &agent_id, "codex", Some("gpt-5"), None).await;
+        mgr.services
+            .store
+            .set_agent_session_last_turn_model(&ws, &agent_id, Some("gpt-5"), "codex")
+            .await
+            .unwrap();
+
+        let system_rows = |messages: &[intent_core::AgentMessage]| -> Vec<String> {
+            messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| {
+                    m.metadata
+                        .as_ref()
+                        .and_then(|md| md["type"].as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        };
+
+        retry_spawn(&mgr, &agent_id, &ws)
+            .await
+            .expect("the retried spawn succeeds on the re-homed provider");
+        assert_eq!(
+            std::fs::read_to_string(&attempt_file).unwrap().trim(),
+            "3",
+            "the mock was launched twice: one failed attempt, one served"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            system_rows(&messages),
+            vec!["provider_rehomed".to_string()],
+            "one notice across the failed and the successful attempt: {messages:?}"
+        );
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session_last_turn_model(&ws, &agent_id)
+                .await
+                .unwrap(),
+            (None, Some("mock".to_string())),
+            "the successful attempt commits the re-homed identity"
+        );
+
+        // A third turn under the committed identity stays silent.
+        mgr.ensure_started(&agent_id, &ws)
+            .await
+            .expect("later turn reuses the re-homed session");
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            system_rows(&messages),
+            vec!["provider_rehomed".to_string()],
+            "later turns add no notices: {messages:?}"
+        );
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (a″) A LIVE child on the disabled provider is always torn down by the
+    /// re-home, even when the respawn comparison alone would reuse it: the
+    /// fake handle below was "spawned" with the same `command` (`node`) and
+    /// resolved model (`None`) the mock target resolves to — the
+    /// `opencode` → `unsloth` shape — so without the forced teardown the
+    /// live-child reuse branch would hand back the cached session.
+    #[tokio::test]
+    async fn rehome_tears_down_live_child_sharing_the_target_command() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        let agent_id = AgentId::from("agent-5737-live-child");
+        let mut s = session(&agent_id, &WorkspaceId::from(WS), None);
+        s.provider = Some("codex".to_string());
+        s.acp_session_id = Some("acp-cached".to_string());
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        let acp = mgr
+            .ensure_started(&agent_id, &WorkspaceId::from(WS))
+            .await
+            .expect("re-homed turn respawns onto the default provider");
+        assert_ne!(
+            acp, "acp-cached",
+            "the disabled provider's session is never reused"
+        );
+        {
+            let handles = mgr.handles.lock().unwrap();
+            assert!(
+                handles.get(&agent_id).unwrap().child.is_some(),
+                "re-home replaced the fake handle with a real child"
+            );
+        }
+        let row = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert_eq!(row.provider.as_deref(), Some("mock"));
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (a‴) A concurrent `agent.setModel` that moves the session off the
+    /// disabled provider between `ensure_started`'s snapshot read and the
+    /// re-home write wins: the compare-and-set does not land, no notice or
+    /// `agent:updated` is emitted, and the turn runs on the fresh row.
+    #[tokio::test]
+    async fn concurrent_set_model_is_not_overwritten_by_rehome() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        let ws = WorkspaceId::from(WS);
+        let agent_id = AgentId::from("agent-5737-race");
+        seed_session(&mgr, &agent_id, "codex", Some("gpt-5"), None).await;
+        let settings = mgr.services.effective_settings();
+        // The stale snapshot `ensure_started` would have read...
+        let stale = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        // ...and the user's newer pick landing before the re-home write.
+        mgr.services
+            .store
+            .set_agent_session_model(&ws, &agent_id, "m-user", Some("mock"), &now_iso())
+            .await
+            .unwrap();
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let (fresh, rehomed) = mgr
+            .rehome_if_provider_disabled(&agent_id, &ws, stale, &settings)
+            .await
+            .expect("a lost race is not an error");
+        assert!(!rehomed, "the concurrent setModel wins");
+        assert_eq!(fresh.provider.as_deref(), Some("mock"));
+        assert_eq!(
+            fresh.model.as_deref(),
+            Some("m-user"),
+            "user's pick survives"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert!(messages.is_empty(), "no re-home notice on a lost race");
+        let events = drain(&mut sub).await;
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event_type != intent_core::events::AGENT_UPDATED),
+            "no agent:updated on a lost race"
+        );
+    }
+
+    /// (b) Disabled provider + no usable default (none configured): the turn
+    /// is rejected with the not-enabled `-32602` labelled `session/prompt`,
+    /// nothing spawns, and the row is untouched.
+    #[tokio::test]
+    async fn rejects_when_no_default_provider_is_configured() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        let agent_id = AgentId::from("agent-5737-no-default");
+        seed_session(&mgr, &agent_id, "codex", Some("gpt-5"), None).await;
+
+        let err = mgr
+            .ensure_started(&agent_id, &WorkspaceId::from(WS))
+            .await
+            .expect_err("disabled provider without a default must not spawn");
+        assert!(
+            matches!(&err, Error::InvalidParams(m)
+                if m.starts_with("session/prompt:") && m.contains("\"codex\"") && m.contains("not enabled") && m.contains("Settings > Agents")),
+            "distinct not-enabled rejection: {err:?}"
+        );
+        assert!(!mgr.contains(&agent_id), "no child spawned");
+        let row = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert_eq!(row.provider.as_deref(), Some("codex"));
+        assert_eq!(row.model.as_deref(), Some("gpt-5"));
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert!(messages.is_empty(), "no notice on a rejected turn");
+    }
+
+    /// (b′) The default itself is disabled (or otherwise fails the
+    /// availability funnel): same rejection, no spawn — a session with NO
+    /// provider column resolving to that disabled default is covered too.
+    #[tokio::test]
+    async fn rejects_when_default_provider_is_also_disabled() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _bus, _db, _cfg) = registry_manager().await;
+        set(
+            &mgr,
+            "providers.enabled",
+            json!({ "codex": false, "mock": false }),
+        );
+        set(&mgr, "model.defaultProvider", json!("mock"));
+        let pinned = AgentId::from("agent-5737-default-disabled");
+        seed_session(&mgr, &pinned, "codex", None, None).await;
+        let err = mgr
+            .ensure_started(&pinned, &WorkspaceId::from(WS))
+            .await
+            .expect_err("disabled default is not a re-home target");
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if m.contains("\"codex\"") && m.contains("not enabled")),
+            "rejection names the session's own provider: {err:?}"
+        );
+        assert!(!mgr.contains(&pinned));
+
+        let unpinned = AgentId::from("agent-5737-unpinned");
+        let s = session(&unpinned, &WorkspaceId::from(WS), None);
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+        let err = mgr
+            .ensure_started(&unpinned, &WorkspaceId::from(WS))
+            .await
+            .expect_err("NULL provider resolving to a disabled default must not spawn");
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if m.contains("\"mock\"") && m.contains("not enabled")),
+            "rejection names the effective (default) provider: {err:?}"
+        );
+        assert!(!mgr.contains(&unpinned));
+    }
+
+    /// (c) Enabled provider: unchanged — a disabled entry for ANOTHER
+    /// provider leaves the session on its own provider, with no notice and
+    /// no `agent:updated`.
+    #[tokio::test]
+    async fn enabled_provider_is_left_alone() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, bus, _db, _cfg) = registry_manager().await;
+        set(&mgr, "providers.enabled", json!({ "codex": false }));
+        set(&mgr, "model.defaultProvider", json!("codex"));
+        let agent_id = AgentId::from("agent-5737-enabled");
+        seed_session(&mgr, &agent_id, "mock", Some("m-1"), Some("low")).await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        mgr.ensure_started(&agent_id, &WorkspaceId::from(WS))
+            .await
+            .expect("enabled provider spawns as before");
+
+        let row = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert_eq!(row.provider.as_deref(), Some("mock"));
+        assert_eq!(row.model.as_deref(), Some("m-1"));
+        assert_eq!(row.reasoning_effort.as_deref(), Some("low"));
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap();
+        assert!(
+            messages.iter().all(|m| {
+                m.metadata.as_ref().and_then(|md| md["type"].as_str()) != Some("provider_rehomed")
+            }),
+            "no re-home notice: {messages:?}"
+        );
+        let events = drain(&mut sub).await;
+        assert!(
+            events
+                .iter()
+                .all(|e| e.event_type != intent_core::events::AGENT_UPDATED),
+            "no agent:updated invalidation"
         );
         mgr.stop(&agent_id).await;
     }
@@ -16332,6 +18389,108 @@ mod thought_level_tests {
         }
     }
 
+    #[tokio::test]
+    async fn absent_or_malformed_model_options_preserve_the_opening_selector() {
+        for response in [
+            None,
+            Some(json!({})),
+            Some(json!({"configOptions": null})),
+            Some(json!({"configOptions": [{"id": "model", "currentValue": "selected"}]})),
+        ] {
+            let (mgr, agent_id, conn, calls, _db, _task) = setup(None).await;
+            let record = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            let opened = AcpSessionOpened {
+                session_id: "sid-1".into(),
+                modes: None,
+                thought_level: Some(option("medium")),
+            };
+            mgr.services
+                .persist_session_effort_levels(
+                    &record.workspace_id,
+                    &agent_id,
+                    opened.thought_level.as_ref(),
+                )
+                .await;
+            mgr.install_and_apply_thought_level(
+                conn.as_ref(),
+                &record,
+                &opened,
+                response,
+                Some("high"),
+            )
+            .await;
+            assert_eq!(calls.lock().unwrap()[0]["value"], "high");
+            let stored = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            assert_eq!(stored.effort_levels, Some(option("medium").values));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_model_options_without_thought_level_clear_stale_choices() {
+        for options in [
+            json!([]),
+            json!([{
+                "id": "model", "name": "Model", "type": "select", "category": "model",
+                "currentValue": "plain", "options": [{"value": "plain", "name": "Plain"}],
+            }]),
+        ] {
+            let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+            let record = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            let opened = AcpSessionOpened {
+                session_id: "sid-1".into(),
+                modes: None,
+                thought_level: Some(option("medium")),
+            };
+            mgr.services
+                .persist_session_effort_levels(
+                    &record.workspace_id,
+                    &agent_id,
+                    opened.thought_level.as_ref(),
+                )
+                .await;
+            mgr.install_and_apply_thought_level(
+                conn.as_ref(),
+                &record,
+                &opened,
+                Some(json!({"configOptions": options})),
+                Some("high"),
+            )
+            .await;
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "unsupported effort must not be sent"
+            );
+            assert!(mgr.handles.lock().unwrap()[&agent_id]
+                .thought_level
+                .is_none());
+            let stored = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            assert!(
+                stored.effort_levels.is_none(),
+                "stale UI choices must be cleared"
+            );
+        }
+    }
+
     /// The stored effort is sent under the adapter's own config id, and the
     /// handle's tracked current value follows so a repeat is a no-op.
     #[tokio::test]
@@ -16455,10 +18614,22 @@ mod thought_level_tests {
 mod rebuild_spawn_opts_tests {
     //! Regression tests for the `create_agent` [`SpawnOptions`] reconstruction:
     //! it must preserve the npx fallback pair, otherwise providers without a
-    //! local binary (codex fallback / claude-code npx-only) spawn the bare
+    //! local binary (codex / claude-code npx-only) spawn the bare
     //! provider command and fail with ENOENT.
 
     use super::*;
+
+    #[test]
+    fn codex_npx_prerequisite_error_is_actionable() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let error = resolve_npx_only(provider, None).unwrap_err();
+        let Error::InvalidInput(message) = error else {
+            panic!("missing Codex prerequisites must be user-visible: {error}");
+        };
+        for expected in ["Node.js", "npx", "Install"] {
+            assert!(message.contains(expected), "{message}");
+        }
+    }
 
     #[test]
     fn rebuild_preserves_npx_fallback_and_targets_npx() {
@@ -16466,23 +18637,23 @@ mod rebuild_spawn_opts_tests {
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         let mut opts = SpawnOptions::new(provider);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
+        opts.npx_fallback_package = provider.npx_only_package;
 
         let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
         assert_eq!(rebuilt.npx_fallback_binary, Some(npx_path.as_path()));
-        assert_eq!(rebuilt.npx_fallback_package, provider.fallback_npx_package);
+        assert_eq!(rebuilt.npx_fallback_package, provider.npx_only_package);
 
         // Through build_command/build_args: the rebuilt opts must spawn npx
-        // with `-y <package>`, not the bare `codex-acp` command.
+        // with `--workspaces=false -y <package>`, not the bare `codex-acp`
+        // command.
         let cmd = intent_acp::spawn::build_command(&rebuilt);
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = intent_acp::spawn::build_args(&rebuilt);
-        assert_eq!(args[0], "-y");
+        assert_eq!(args[0], intent_acp::spawn::NPX_NO_WORKSPACES_ARG);
+        assert_eq!(args[1], "-y");
         assert_eq!(
-            args[1],
-            provider
-                .fallback_npx_package
-                .expect("codex has npx fallback")
+            args[2],
+            provider.npx_only_package.expect("codex is npx-only")
         );
     }
 
@@ -16750,7 +18921,7 @@ mod provider_path_override_tests {
     }
 
     #[test]
-    fn codex_spawn_normalizes_legacy_model_and_explicit_effort_before_cli_args() {
+    fn codex_spawn_normalizes_legacy_model_and_effort_for_session_config() {
         let dir = tempfile::tempdir().unwrap();
         let stub = exec_stub(dir.path(), "codex-acp");
         let settings = settings_with_paths(&[("codex", &stub)]);
@@ -16767,15 +18938,22 @@ mod provider_path_override_tests {
                 let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
                 assert_eq!(resolved.model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(resolved.reasoning_effort.as_deref(), Some(expected));
+                assert!(
+                    resolved.provider_binary.is_none(),
+                    "custom adapter cannot bypass npx"
+                );
+                assert_eq!(
+                    resolved.npx_fallback_package,
+                    Some(intent_providers::config::CODEX_ACP_NPX_PACKAGE)
+                );
                 let mut opts = SpawnOptions::new(&resolved.provider);
                 opts.model = resolved.model.as_deref();
                 opts.reasoning_effort = resolved.reasoning_effort.as_deref();
                 let args = intent_acp::spawn::build_args(&opts);
                 assert!(
-                    args.contains(&format!("model_reasoning_effort=\"{expected}\"")),
-                    "{args:?}"
+                    !args.iter().any(|arg| arg == "-c" || arg == "--config"),
+                    "model/effort use ACP config options: {args:?}"
                 );
-                assert!(args.contains(&"model=\"gpt-5.5\"".to_string()), "{args:?}");
             }
         }
     }
@@ -17324,6 +19502,19 @@ mod turn_failure_tests {
             "agent.create: {}",
             crate::provider_auth::not_authenticated_message("claude-code")
         ));
+        assert!(!turn_failure_events_already_emitted(&err));
+        // The turn-start disabled-provider rejection (intent-hq/intent#5737)
+        // shares the `session/prompt: provider "` prefix but is raised before
+        // any spawn — the worker must still emit the pair.
+        let err = crate::agent_ops::ensure_provider_enabled(
+            "session/prompt",
+            "codex",
+            Some(&std::collections::BTreeMap::from([(
+                "codex".to_string(),
+                false,
+            )])),
+        )
+        .expect_err("codex disabled");
         assert!(!turn_failure_events_already_emitted(&err));
     }
 

@@ -155,7 +155,14 @@ async fn uds_slice_end_to_end() {
             // Keep the (y) github.* section hermetic: `github.connect` must
             // deterministically fail fast (port 0 is never a valid
             // destination), never touch the real github.com.
-            .with_github_login_base_uri("http://127.0.0.1:0"),
+            .with_github_login_base_uri("http://127.0.0.1:0")
+            // Same for the boot-time primary-identity refresh: the in-process
+            // daemon still resolves the HOST's `gh auth token`, and a live
+            // `GET /user` would hydrate the developer's login onto the primary
+            // principal — racing the (j) `authorType == "agent"` assertion on a
+            // gh-authenticated machine (intent-hq/intent#5650). An unroutable
+            // API base fails the read fast and keeps the identity anonymous.
+            .with_github_api_base_uri("http://127.0.0.1:0"),
     );
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();

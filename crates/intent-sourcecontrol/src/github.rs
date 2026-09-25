@@ -35,9 +35,65 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// rationale as [`CONNECT_TIMEOUT`] (intent-hq/monorepo#1988).
 pub(crate) const READ_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Only headers on an enforced request describe its actual quota. In
+/// particular, `/rate_limit` can report a healthy overview while these
+/// counters reject requests (intent#5837). Missing/malformed headers never
+/// establish recovery, nor does an unrelated resource's allowance.
+fn enforced_quota(headers: &http::HeaderMap, resource: &str) -> RateLimitStatus {
+    if headers
+        .get("x-ratelimit-resource")
+        .and_then(|v| v.to_str().ok())
+        != Some(resource)
+    {
+        return RateLimitStatus::default();
+    }
+    let number = |name| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+    };
+    let status = RateLimitStatus {
+        reset_at: number("x-ratelimit-reset"),
+        remaining: number("x-ratelimit-remaining"),
+        limit: number("x-ratelimit-limit"),
+    };
+    match (status.remaining, status.limit) {
+        (Some(remaining), Some(limit)) if limit > 0 && remaining <= limit => status,
+        _ => RateLimitStatus::default(),
+    }
+}
+
+/// PR reads spend both REST and GraphQL quota. Preserve an exhausted
+/// resource's reset (the later one when both are exhausted); otherwise use
+/// conservative headroom across BOTH resources. One unreadable resource
+/// cannot be declared recovered just because the other has quota left.
+fn pr_read_quota(core: RateLimitStatus, graphql: RateLimitStatus) -> RateLimitStatus {
+    if let Some(exhausted) = [core, graphql]
+        .into_iter()
+        .filter(|status| status.remaining == Some(0))
+        .max_by_key(|status| status.reset_at)
+    {
+        return exhausted;
+    }
+    match (core.remaining, graphql.remaining, core.limit, graphql.limit) {
+        (Some(rest), Some(gql), Some(rest_limit), Some(gql_limit)) => RateLimitStatus {
+            remaining: Some(rest.min(gql)),
+            limit: Some(rest_limit.max(gql_limit)),
+            reset_at: match rest.cmp(&gql) {
+                std::cmp::Ordering::Less => core.reset_at,
+                std::cmp::Ordering::Greater => graphql.reset_at,
+                // Equal headroom remains constrained until both refill.
+                std::cmp::Ordering::Equal => core.reset_at.max(graphql.reset_at),
+            },
+        },
+        _ => RateLimitStatus::default(),
+    }
+}
+
 /// GitHub implementation of [`SourceControl`].
 pub struct GitHubSourceControl {
     client: octocrab::Octocrab,
+    quota_client: octocrab::Octocrab,
 }
 
 impl GitHubSourceControl {
@@ -48,18 +104,58 @@ impl GitHubSourceControl {
     ///
     /// Returns an error if the octocrab client cannot be built (e.g. an invalid `api_base_url`).
     pub fn new(token: &str, api_base_url: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            client: Self::build_client(Some(token), api_base_url, false)?,
+            quota_client: Self::build_client(Some(token), api_base_url, true)?,
+        })
+    }
+
+    /// Build a client with **no** credential (same base URI and timeouts as
+    /// [`Self::new`]): the host's fallback for reading a guest's public or
+    /// secret proof gist when it holds no GitHub token of its own. Every
+    /// authenticated read on it fails with `Auth`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the octocrab client cannot be built (e.g. an
+    /// invalid `api_base_url`).
+    pub fn anonymous(api_base_url: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            client: Self::build_client(None, api_base_url, false)?,
+            quota_client: Self::build_client(None, api_base_url, true)?,
+        })
+    }
+
+    fn build_client(
+        token: Option<&str>,
+        api_base_url: Option<&str>,
+        quota_probe: bool,
+    ) -> Result<octocrab::Octocrab> {
         let mut builder = octocrab::Octocrab::builder()
-            .personal_token(token.to_string())
             .set_connect_timeout(Some(CONNECT_TIMEOUT))
             .set_read_timeout(Some(READ_WRITE_TIMEOUT))
             .set_write_timeout(Some(READ_WRITE_TIMEOUT));
+        if let Some(token) = token {
+            builder = builder.personal_token(token.to_string());
+        }
+        if quota_probe {
+            // The gate owns probe retries. Octocrab's default immediately
+            // retries 429/5xx three times, multiplying the metered probe cost.
+            builder =
+                builder.add_retry_config(octocrab::service::middleware::retry::RetryConfig::None);
+        }
         if let Some(base) = api_base_url {
             builder = builder
                 .base_uri(base)
                 .map_err(|e| Error::Config(format!("invalid github apiBaseUrl {base:?}: {e}")))?;
         }
-        let client = builder.build()?;
-        Ok(Self { client })
+        Ok(builder.build()?)
+    }
+
+    /// The underlying octocrab client (token + base URI + timeouts), for
+    /// crate-internal callers outside the [`SourceControl`] surface.
+    pub(crate) fn client(&self) -> &octocrab::Octocrab {
+        &self.client
     }
 
     fn repo_path(repo: &RepoRef, suffix: &str) -> String {
@@ -1417,18 +1513,46 @@ impl SourceControl for GitHubSourceControl {
     }
 
     async fn rate_limit_status(&self) -> Result<RateLimitStatus> {
-        // `GET /rate_limit` is quota-free, so it stays usable while the core
-        // quota is exhausted (monorepo#2961).
-        let v: Value = self.client.get("/rate_limit", None::<&()>).await?;
-        let core = |field: &str| {
-            v.pointer(&format!("/resources/core/{field}"))
-                .and_then(Value::as_u64)
+        // GitHub explicitly makes request headers authoritative over its
+        // quota overview: https://docs.github.com/en/rest/rate-limit/rate-limit.
+        // These small reads cost at most one point per resource; never query
+        // PR details merely to decide whether to resume them. Bypass HTTP
+        // caches; the shared gate bounds how often these reads can run.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache"),
+        );
+        let rest = self
+            .quota_client
+            ._get_with_headers("/user", Some(headers))
+            .await?;
+        let core = enforced_quota(rest.headers(), "core");
+        let core = if rest.status().is_success() || core.remaining == Some(0) {
+            core
+        } else {
+            RateLimitStatus::default()
         };
-        Ok(RateLimitStatus {
-            reset_at: core("reset"),
-            remaining: core("remaining"),
-            limit: core("limit"),
-        })
+        let _body = self.quota_client.body_to_string(rest).await?;
+        let graphql = self
+            .quota_client
+            ._post(
+                "/graphql",
+                Some(&json!({"query": "query { rateLimit { remaining } }"})),
+            )
+            .await?;
+        let quota = enforced_quota(graphql.headers(), "graphql");
+        let quota = if graphql.status().is_success() || quota.remaining == Some(0) {
+            quota
+        } else {
+            RateLimitStatus::default()
+        };
+        let _body = self.quota_client.body_to_string(graphql).await?;
+        Ok(pr_read_quota(core, quota))
+    }
+
+    fn rate_limit_probe_interval(&self) -> Duration {
+        Duration::from_secs(60)
     }
 
     async fn get_user(&self) -> Result<UserIdentity> {
@@ -1446,6 +1570,18 @@ impl SourceControl for GitHubSourceControl {
             .get(format!("/users/{login}"), None::<&()>)
             .await?;
         map_user_identity(v)
+    }
+
+    async fn get_proof_gist(&self, gist_id: &str) -> Result<crate::identity_proof::ProofGistView> {
+        let gist_id = gist_id.trim();
+        if gist_id.is_empty() || !gist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::NotFound(format!("gist {gist_id:?}")));
+        }
+        let v: Value = self
+            .client
+            .get(format!("/gists/{gist_id}"), None::<&()>)
+            .await?;
+        crate::identity_proof::proof_gist_view(&v)
     }
 
     async fn search_users(&self, query: &str, limit: u8) -> Result<Vec<UserIdentity>> {

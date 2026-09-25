@@ -164,7 +164,7 @@ API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
 
   ws.workspace.info() → { id, path }  // Current workspace ID + absolute path.
-  ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary.
+  ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags, setupStatus }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary. `setupStatus` is `{ state, exitCode?, terminalId?, startedAt?, finishedAt? }` — the workspace setup script's stage: `pending` (worktree ready, script not yet resolved), `running` (script executing in terminal `terminalId` — the worktree is provisional until it finishes), `completed` (`exitCode` 0), `failed` (non-zero `exitCode`, or none when the spawn failed), `skipped` (no setup script), `unknown` (no record in this daemon lifetime, e.g. a workspace created before restart). Optional fields are omitted, never null.
   ws.workspace.setTitle(title) → { ok, title, branch, skipped? }  // Set a short 1-5 word workspace title. May rename the branch if it is still auto-generated; returns `skipped` if the workspace already has a custom title.
   ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the user-facing workspace status message shown on the workspace card: one plain sentence, ideally under 15 words, naming what is being worked on and where it stands (no counts, check lists, or implementation details); does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
   ws.workspace.setStatusImage({ data, mimeType, originalName? } | null) → { ok, statusImageAssetId, url? }  // Set or clear the workspace status screenshot shown on the workspace card. `data` is base64 image bytes (a `data:` URL prefix is accepted), `mimeType` must be image/*. Pass null to clear. Unavailable in the chief-of-staff workspace.
@@ -231,10 +231,10 @@ API:
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib 128-65536); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
     Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
-  ws.agent.send(agentId, message, priority?) → { ok, agentId, delivery?, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy; the third argument also takes an options object `{ priority?, replacePending? }`.
+  ws.agent.send(agentId, message, priority?) → { ok, agentId, delivery?, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy; the third argument also takes an options object `{ priority?, replacePending? }`. You cannot message YOURSELF: a send targeting your own agent id is rejected with an invalid-params error before anything is queued or interrupted — use `ws.agent.reportToParent` or a note instead.
     `ok: true` does not always mean delivered NOW — read the `delivery` outcome: `"delivered"` (driving a turn now) or `"queued"` (parked in the target's queue, drained when its turn ends; raw flag `queued: true`).
     Only ONE pending message per sender per target: while an earlier message of yours is still in the target's queue, a second send is refused with `ok: false` + `refused: true` + your `pendingMessageId` + the target's current `queue` + an `instruction`. Remediation: keep the pending entry as-is, or re-send ONE message combining everything with `replacePending: true` — one call that sends the new message and then retracts your pending entry, so a failed send never loses it (the result reports `replaced`/`replacedMessageId`, or `replaceOutcome: "drained"`/`"none"`/`"error"` when the entry delivered first, was absent, or the retraction failed). Manual `ws.agent.removeQueuedMessage` + re-send still works but is NOT atomic. Either way a re-sent message lands at the END of the queue.
-  ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, delivery?, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out. Same `delivery` outcomes, single-pending-message rule, `refused: true` refusal shape, and `{ priority?, replacePending? }` options-object third argument as `send()` — a refusal additionally echoes `taskNoteId`, and a mid-call assignee change skips the retraction with `replaceOutcome: "reassigned"`.
+  ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, delivery?, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out. Same `delivery` outcomes, single-pending-message rule, `refused: true` refusal shape, and `{ priority?, replacePending? }` options-object third argument as `send()` — a refusal additionally echoes `taskNoteId`, and a mid-call assignee change skips the retraction with `replaceOutcome: "reassigned"`. Same self-send rule: a task whose assignee is YOU is rejected with an invalid-params error.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: true`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that does NOT consume the watch: it stays armed, silent through further monitoring idles in the SAME waiting period, and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. Cancel with `ws.agent.unwatch` if you no longer want the wake. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
@@ -252,8 +252,8 @@ API:
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history. Served under the slim projection: oversized tool/image block bodies arrive truncated (`inputTruncated`/`outputTruncated`) with stable block ids — hydrate one in full with `ws.agent.getMessageBlock`. A mid-turn read includes the in-flight turn's partial assistant message (tool calls/blocks streamed so far) as a trailing `inProgress: true` row, so a busy agent's latest activity is visible without waiting for the turn to end.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — the on-demand hydration counterpart to the slim `readConversation` truncation markers.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
-  ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
-  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
+  ws.agent.reportToParent(report) → { ok, ... }  // Report completed or progressing work to your parent. Use `ws.agent.reportBlocker` for infrastructure/environment problems you cannot resolve, or `ws.agent.requestDiscussion` only when an issue in assigned work leaves you unsure how to proceed without a decision. Only works for delegated agents; user-created agents will get an error.
+  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise attention only when concrete assigned work encounters an issue that leaves you unsure how to proceed without a user or coordinator decision; use ordinary conversation for back-and-forth, routine clarification, and plan approval. Check available context and use your judgment for routine choices first. Applies to direct user assignments and delegated work; a formal task note is not required. `reason` must name the issue and the specific decision needed. Call it BEFORE ending your turn, then end the turn normally. If you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
   ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session — TERMINAL for you: the call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
 
@@ -276,13 +276,14 @@ API:
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
   ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
   ws.script.remove(scriptId) → { ok, scriptId }  // Stops and removes a saved script definition.
-  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script.
+  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously (a call that lands inside a `restarting` gap keeps `restarting`; one on an already `starting` / `running` script is a no-op) and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
   ws.script.stop(scriptId) → { ok, scriptId }  // Stops a running script.
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
-  ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings.
+  ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings. `status` is `idle` | `starting` | `running` | `restarting` | `exited`. For a command-mode script the settled condition is exactly `status === "exited"`; `starting` / `running` / `restarting` are live (a poll mid-launch or mid-restart must keep waiting), and `idle` after a start means `ws.script.stop` ran: it aborted the launch, or it reset a command that had already `exited` (that reset publishes no `script:state` event, so a poll can find `idle` where the previous one would have found `exited`) — treat `idle` as terminal and read the output rather than assuming nothing ran. A service-mode script may publish `exited` briefly before `restarting`; `exited` alone does not establish final service completion. Every `exited` carries an `exitCode`: the real code when the host observed the process exit (0 success, non-zero failure; `error` absent), or the sentinel `-1` with `error` set whenever no code could be observed — a startup failure, but also a process that did run and whose exit status was lost (`error: "exit status unobservable"`: reaped out of band, session torn down under the supervisor) or a command that was running when the daemon stopped (`error: "lost: the daemon stopped while the script was running"`). A startup failure (PTY allocation, a cwd escaping the workspace root, a spawn error) never ran a process, so it settles as `exited` with `exitCode: -1`, `error` = the original failure text (kept verbatim — no success code is invented) and `stoppedAt`. Never gate completion on `exitCode` alone and never read `-1` as a real code: check `status`, then `error` — `error` names which of these it was.
+    Canonical completion hook for command-mode scripts — settles on success, non-zero exit, startup failure (or a lost exit status) AND a `ws.script.stop` (aborted launch, or a finished run reset before the poll), and keeps waiting through `starting` / `running` / `restarting`: `const id = "<id>"; ws.hook.schedule({ name: ("script " + id + " done").slice(0, 50), delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const id = ' + JSON.stringify(id) + '; const s = await ws.script.status(id); if (s.status !== "exited" && s.status !== "idle") return { dispatch: false }; const out = await ws.script.output(id, 200); const outcome = s.status === "idle" ? "is idle: ws.script.stop ran (launch aborted, or a finished run reset before this poll)" : s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script " + id + " " + outcome + "\\n" + out };' })` — schedule it only after `ws.script.start` has returned (the hook's immediate validation run would otherwise see the pre-start `idle` and dispatch at once). `<id>` is written exactly once, as an ordinary JavaScript string literal; it reaches the hook body through `JSON.stringify`, so a caller-chosen `scriptId` containing quotes, backslashes or newlines needs no hand-escaping inside the body. The `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
-    `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with a self-checking background hook that polls `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
+    `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with the completion hook documented under `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
   ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root, and an omitted `cwd` defaults to the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
@@ -321,9 +322,10 @@ API:
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
   ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
-  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
+  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements, pausedUntil?, adoptedFrom? }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
     `threads.unresolved?` is omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown.
     `mergeQueueEjection?` is `{ at, reason? }` — the latest merge-queue removal event (e.g. reason `failed_checks`); absent when the PR was never ejected or the host did not report it.
+    A GitHub rate limit never loses the registration: when the forge quota is exhausted the monitor is persisted anyway, its baseline fetch is deferred to the end of the daemon's global forge rate-limit pause, and the call returns `ok: true` with `requirements: null` plus `pausedUntil` (RFC 3339, the pause deadline; also on `monitor.pausedUntil` and named by `monitor.lastError`) — do NOT retry or hand-roll a retry hook: the first post-pause poll adopts the PR's state as the baseline (nothing pending) and the monitor wakes you from there; call `ws.pr.snapshot` once the pause lifts if you need the checklist before then. `pausedUntil` is omitted (never null) while the gate is open at result time — including the rare deferred result whose pause lifted meanwhile (then no `lastError` either, and the row is due on the very next sweep) — and `requirements` is `null` only on a deferred fetch.
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
     ONE monitor per PR per workspace: when ANOTHER live agent in this workspace already holds an active monitor on the PR, the call is REFUSED (not an error) and returns `{ ok: false, refused: true, reason: "already-monitored", ownerAgentId, ownerAgentName?, monitorId, repo, prNumber, instruction }` instead of `{ ok, monitor, requirements }` — the owner's agent id, its session name when it has one, and its `monitorId`. That owner receives the PR's wakes — do not re-register; instead `ws.agent.send(ownerAgentId, …)` to ask the owner either to relay the specific PR events you care about when its monitor wakes, or to relinquish the monitor with `ws.pr.unmonitor` so you can call `ws.pr.monitor` yourself; use `ws.pr.snapshot` for a one-shot read of the current state. The PR becomes registrable again once the owner's monitor is cancelled or completes. Your OWN re-register is never refused. A monitor whose owner can no longer receive wakes (its session failed, was deleted or retired, or is gone) is ORPHANED, not held: your `ws.pr.monitor` on that PR ADOPTS it instead of being refused — the same monitor row is re-armed under you (baseline refreshed, pending changes cleared; no second row), the ordinary success payload carries `adoptedFrom` (the previous owner's agent id), and you receive the PR's wakes from then on. Adoption counts against your own monitor cap like a fresh registration. PARENT TAKEOVER: a monitor held by your own DIRECT sub-agent (its `parentAgentId` is you — no grandchildren, no peers, never the reverse) is likewise ADOPTED, not refused, once that child has SETTLED — its linked task note is `complete` / `cancelled`, or it is idle with nothing pending except its PR monitors (no busy turn, queued message, unresolved blocker/discussion or question, watch, event subscription, or active hook); the same success payload with `adoptedFrom` results, and the child is told once via a queued `pr_monitor_wake` with `reason: "transferred"` and `adoptedBy` (your agent id) so it does not re-register. A child that is still working keeps its monitor: you get the ordinary refusal, whose `instruction` says when it becomes adoptable — retry when the child's task moves to `complete` / `cancelled`, or when a `ws.agent.watch` on the child delivers its monitoring-idle advisory (`childExternallyWaiting` naming only `waitingOnPrMonitors`) or `ws.agent.status` shows it idle with nothing else pending. Do NOT wait for the child's genuine completion: while it holds the monitor that completion is exactly what the watch defers, so it may never come. Retry rather than asking it to relinquish.
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop monitoring a PR you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
@@ -399,7 +401,7 @@ API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
 
   ws.workspace.info() → { id, path }  // Current workspace ID + absolute path.
-  ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary.
+  ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags, setupStatus }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary. `setupStatus` is `{ state, exitCode?, terminalId?, startedAt?, finishedAt? }` — the workspace setup script's stage: `pending` (worktree ready, script not yet resolved), `running` (script executing in terminal `terminalId` — the worktree is provisional until it finishes), `completed` (`exitCode` 0), `failed` (non-zero `exitCode`, or none when the spawn failed), `skipped` (no setup script), `unknown` (no record in this daemon lifetime, e.g. a workspace created before restart). Optional fields are omitted, never null.
   ws.workspace.setTitle(title) → { ok, title, branch, skipped? }  // Set a short 1-5 word workspace title. May rename the branch if it is still auto-generated; returns `skipped` if the workspace already has a custom title.
   ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the user-facing workspace status message shown on the workspace card: one plain sentence, ideally under 15 words, naming what is being worked on and where it stands (no counts, check lists, or implementation details); does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
   ws.workspace.setStatusImage({ data, mimeType, originalName? } | null) → { ok, statusImageAssetId, url? }  // Set or clear the workspace status screenshot shown on the workspace card. `data` is base64 image bytes (a `data:` URL prefix is accepted), `mimeType` must be image/*. Pass null to clear. Unavailable in the chief-of-staff workspace.
@@ -492,10 +494,10 @@ API:
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib 128-65536); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
     Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason, a top-level `summary` (started/held/skipped/errors counts) plus a prominent `warning` when ZERO tasks started (a zero-started call owes no completion wake; in `after_all` mode with no open delegation group an immediate advisory wake is delivered instead of silence), and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
-  ws.agent.send(agentId, message, priority?) → { ok, agentId, delivery?, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy; the third argument also takes an options object `{ priority?, replacePending? }`.
+  ws.agent.send(agentId, message, priority?) → { ok, agentId, delivery?, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy; the third argument also takes an options object `{ priority?, replacePending? }`. You cannot message YOURSELF: a send targeting your own agent id is rejected with an invalid-params error before anything is queued or interrupted — use `ws.agent.reportToParent` or a note instead.
     `ok: true` does not always mean delivered NOW — read the `delivery` outcome: `"delivered"` (driving a turn now) or `"queued"` (parked in the target's queue, drained when its turn ends; raw flag `queued: true`).
     Only ONE pending message per sender per target: while an earlier message of yours is still in the target's queue, a second send is refused with `ok: false` + `refused: true` + your `pendingMessageId` + the target's current `queue` + an `instruction`. Remediation: keep the pending entry as-is, or re-send ONE message combining everything with `replacePending: true` — one call that sends the new message and then retracts your pending entry, so a failed send never loses it (the result reports `replaced`/`replacedMessageId`, or `replaceOutcome: "drained"`/`"none"`/`"error"` when the entry delivered first, was absent, or the retraction failed). Manual `ws.agent.removeQueuedMessage` + re-send still works but is NOT atomic. Either way a re-sent message lands at the END of the queue.
-  ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, delivery?, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out. Same `delivery` outcomes, single-pending-message rule, `refused: true` refusal shape, and `{ priority?, replacePending? }` options-object third argument as `send()` — a refusal additionally echoes `taskNoteId`, and a mid-call assignee change skips the retraction with `replaceOutcome: "reassigned"`.
+  ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, delivery?, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out. Same `delivery` outcomes, single-pending-message rule, `refused: true` refusal shape, and `{ priority?, replacePending? }` options-object third argument as `send()` — a refusal additionally echoes `taskNoteId`, and a mid-call assignee change skips the retraction with `replaceOutcome: "reassigned"`. Same self-send rule: a task whose assignee is YOU is rejected with an invalid-params error.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A target that goes idle while still owning active background hooks or PR monitors is NOT complete — instead of deferring silently, you get ONE advisory wake per continuous waiting period (metadata `childExternallyWaiting: true` + `watchStillArmed: true`, with `waitingOnHooks` / `waitingOnPrMonitors` naming them) that does NOT consume the watch: it stays armed, silent through further monitoring idles in the SAME waiting period, and fires at the real completion/failure/deletion; if the target runs a real turn and goes monitoring-idle again, that NEW waiting period delivers a fresh advisory. Cancel with `ws.agent.unwatch` if you no longer want the wake. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
@@ -511,8 +513,8 @@ API:
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history. Slim projection: oversized tool/image block bodies arrive truncated with stable block ids. Mid-turn reads append the in-flight turn's partial message as a trailing `inProgress: true` row.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — hydrates the truncated slim blocks from `readConversation`.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
-  ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
-  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
+  ws.agent.reportToParent(report) → { ok, ... }  // Report completed or progressing work to your parent. Use `ws.agent.reportBlocker` for infrastructure/environment problems you cannot resolve, or `ws.agent.requestDiscussion` only when an issue in assigned work leaves you unsure how to proceed without a decision. Only works for delegated agents; user-created agents will get an error.
+  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise attention only when concrete assigned work encounters an issue that leaves you unsure how to proceed without a user or coordinator decision; use ordinary conversation for back-and-forth, routine clarification, and plan approval. Check available context and use your judgment for routine choices first. Applies to direct user assignments and delegated work; a formal task note is not required. `reason` must name the issue and the specific decision needed. Call it BEFORE ending your turn, then end the turn normally. If you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
   ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session — TERMINAL for you: the call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
 
@@ -535,13 +537,14 @@ API:
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
   ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId? }) → { id }  // Create or update a saved script. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
   ws.script.remove(scriptId) → { ok, scriptId }  // Stops and removes a saved script definition.
-  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script.
+  ws.script.start(scriptId) → { ok, scriptId }  // Starts an existing script and returns at once: `ok: true` means the launch was accepted, not that the process is up. The status flips to `starting` synchronously (a call that lands inside a `restarting` gap keeps `restarting`; one on an already `starting` / `running` script is a no-op) and the spawn's outcome — `running`, or `exited` + `error` on a startup failure — lands on `ws.script.status` and the `script:state` event afterwards; watch it with the completion recipe under `ws.script.status`.
   ws.script.stop(scriptId) → { ok, scriptId }  // Stops a running script.
   ws.script.restart(scriptId) → { ok, scriptId }  // Stops then restarts a script.
   ws.script.output(scriptId, maxLines?) → string  // Returns recent output buffer text.
-  ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings.
+  ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings. `status` is `idle` | `starting` | `running` | `restarting` | `exited`. For a command-mode script the settled condition is exactly `status === "exited"`; `starting` / `running` / `restarting` are live (a poll mid-launch or mid-restart must keep waiting), and `idle` after a start means `ws.script.stop` ran: it aborted the launch, or it reset a command that had already `exited` (that reset publishes no `script:state` event, so a poll can find `idle` where the previous one would have found `exited`) — treat `idle` as terminal and read the output rather than assuming nothing ran. A service-mode script may publish `exited` briefly before `restarting`; `exited` alone does not establish final service completion. Every `exited` carries an `exitCode`: the real code when the host observed the process exit (0 success, non-zero failure; `error` absent), or the sentinel `-1` with `error` set whenever no code could be observed — a startup failure, but also a process that did run and whose exit status was lost (`error: "exit status unobservable"`: reaped out of band, session torn down under the supervisor) or a command that was running when the daemon stopped (`error: "lost: the daemon stopped while the script was running"`). A startup failure (PTY allocation, a cwd escaping the workspace root, a spawn error) never ran a process, so it settles as `exited` with `exitCode: -1`, `error` = the original failure text (kept verbatim — no success code is invented) and `stoppedAt`. Never gate completion on `exitCode` alone and never read `-1` as a real code: check `status`, then `error` — `error` names which of these it was.
+    Canonical completion hook for command-mode scripts — settles on success, non-zero exit, startup failure (or a lost exit status) AND a `ws.script.stop` (aborted launch, or a finished run reset before the poll), and keeps waiting through `starting` / `running` / `restarting`: `const id = "<id>"; ws.hook.schedule({ name: ("script " + id + " done").slice(0, 50), delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const id = ' + JSON.stringify(id) + '; const s = await ws.script.status(id); if (s.status !== "exited" && s.status !== "idle") return { dispatch: false }; const out = await ws.script.output(id, 200); const outcome = s.status === "idle" ? "is idle: ws.script.stop ran (launch aborted, or a finished run reset before this poll)" : s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script " + id + " " + outcome + "\\n" + out };' })` — schedule it only after `ws.script.start` has returned (the hook's immediate validation run would otherwise see the pre-start `idle` and dispatch at once). `<id>` is written exactly once, as an ordinary JavaScript string literal; it reaches the hook body through `JSON.stringify`, so a caller-chosen `scriptId` containing quotes, backslashes or newlines needs no hand-escaping inside the body. The `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
-    `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with a self-checking background hook that polls `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
+    `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, `ws.script.start(scriptId)` the script and wait with the completion hook documented under `ws.script.status(scriptId)`, then read `ws.script.output(scriptId)`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
   ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
@@ -578,9 +581,10 @@ API:
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
   ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
-  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
+  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements, pausedUntil?, adoptedFrom? }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
     `threads.unresolved?` is omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown.
     `mergeQueueEjection?` is `{ at, reason? }` — the latest merge-queue removal event (e.g. reason `failed_checks`); absent when the PR was never ejected or the host did not report it.
+    A GitHub rate limit never loses the registration: when the forge quota is exhausted the monitor is persisted anyway, its baseline fetch is deferred to the end of the daemon's global forge rate-limit pause, and the call returns `ok: true` with `requirements: null` plus `pausedUntil` (RFC 3339, the pause deadline; also on `monitor.pausedUntil` and named by `monitor.lastError`) — do NOT retry or hand-roll a retry hook: the first post-pause poll adopts the PR's state as the baseline (nothing pending) and the monitor wakes you from there; call `ws.pr.snapshot` once the pause lifts if you need the checklist before then. `pausedUntil` is omitted (never null) while the gate is open at result time — including the rare deferred result whose pause lifted meanwhile (then no `lastError` either, and the row is due on the very next sweep) — and `requirements` is `null` only on a deferred fetch.
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
     ONE monitor per PR per workspace: when ANOTHER live agent in this workspace already holds an active monitor on the PR, the call is REFUSED (not an error) and returns `{ ok: false, refused: true, reason: "already-monitored", ownerAgentId, ownerAgentName?, monitorId, repo, prNumber, instruction }` instead of `{ ok, monitor, requirements }` — the owner's agent id, its session name when it has one, and its `monitorId`. That owner receives the PR's wakes — do not re-register; instead `ws.agent.send(ownerAgentId, …)` to ask the owner either to relay the specific PR events you care about when its monitor wakes, or to relinquish the monitor with `ws.pr.unmonitor` so you can call `ws.pr.monitor` yourself; use `ws.pr.snapshot` for a one-shot read of the current state. The PR becomes registrable again once the owner's monitor is cancelled or completes. Your OWN re-register is never refused. A monitor whose owner can no longer receive wakes (its session failed, was deleted or retired, or is gone) is ORPHANED, not held: your `ws.pr.monitor` on that PR ADOPTS it instead of being refused — the same monitor row is re-armed under you (baseline refreshed, pending changes cleared; no second row), the ordinary success payload carries `adoptedFrom` (the previous owner's agent id), and you receive the PR's wakes from then on. Adoption counts against your own monitor cap like a fresh registration. PARENT TAKEOVER: a monitor held by your own DIRECT sub-agent (its `parentAgentId` is you — no grandchildren, no peers, never the reverse) is likewise ADOPTED, not refused, once that child has SETTLED — its linked task note is `complete` / `cancelled`, or it is idle with nothing pending except its PR monitors (no busy turn, queued message, unresolved blocker/discussion or question, watch, event subscription, or active hook); the same success payload with `adoptedFrom` results, and the child is told once via a queued `pr_monitor_wake` with `reason: "transferred"` and `adoptedBy` (your agent id) so it does not re-register. A child that is still working keeps its monitor: you get the ordinary refusal, whose `instruction` says when it becomes adoptable — retry when the child's task moves to `complete` / `cancelled`, or when a `ws.agent.watch` on the child delivers its monitoring-idle advisory (`childExternallyWaiting` naming only `waitingOnPrMonitors`) or `ws.agent.status` shows it idle with nothing else pending. Do NOT wait for the child's genuine completion: while it holds the monitor that completion is exactly what the watch defers, so it may never come. Retry rather than asking it to relinquish.
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop monitoring a PR you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
@@ -692,7 +696,7 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
 /// attention-request methods, scrubbed from the assembled description when
 /// `agentFeatures.attentionRequests` is off (a unit test guards that this
 /// clause still matches both description variants verbatim).
-const REPORT_TO_PARENT_ATTENTION_XREF: &str = " — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead";
+const REPORT_TO_PARENT_ATTENTION_XREF: &str = " Use `ws.agent.reportBlocker` for infrastructure/environment problems you cannot resolve, or `ws.agent.requestDiscussion` only when an issue in assigned work leaves you unsure how to proceed without a decision.";
 
 /// Sandbox doc clauses scrubbed from the assembled description when the
 /// workspace is NOT CoW-capable (no `CoW` filesystem support and not a microVM
@@ -736,6 +740,24 @@ const PR_MONITOR_HOOK_XREF: &str = " For PR monitoring prefer `ws.pr.monitor` �
 const PR_MONITOR_SNAPSHOT_XREF_LINE: &str = "    This is the SAME enriched object `ws.pr.monitor` returns and monitor wakes / `ws.pr.monitors` rows carry — one canonical shape across all three surfaces — except that a snapshot registers nothing and triggers no monitoring. For PR monitoring prefer `ws.pr.monitor` — it runs the polling, debouncing and merge detection in the daemon, so you do not have to author a hook that diffs snapshots and expires while the PR sits blocked. Use `ws.pr.snapshot` when you just want the current state once.\n";
 const PR_MONITOR_ONLY_METHODS: &str = "These are the only `ws.pr.*` methods.";
 const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
+
+/// The `ws.script.status` continuation line carrying the canonical
+/// completion-hook recipe (intent-hq/intent#5577): a `ws.hook.schedule` call
+/// outside the `ws.hook.*` doc lines, scrubbed whole when
+/// `agentFeatures.backgroundHooks` is off so the surviving script docs never
+/// advertise a pruned method (a unit test guards the needle verbatim in both
+/// variants).
+const SCRIPT_COMPLETION_HOOK_LINE: &str = r#"    Canonical completion hook for command-mode scripts — settles on success, non-zero exit, startup failure (or a lost exit status) AND a `ws.script.stop` (aborted launch, or a finished run reset before the poll), and keeps waiting through `starting` / `running` / `restarting`: `const id = "<id>"; ws.hook.schedule({ name: ("script " + id + " done").slice(0, 50), delayMs: 30000, ttlMs: <expected runtime + margin>, code: 'const id = ' + JSON.stringify(id) + '; const s = await ws.script.status(id); if (s.status !== "exited" && s.status !== "idle") return { dispatch: false }; const out = await ws.script.output(id, 200); const outcome = s.status === "idle" ? "is idle: ws.script.stop ran (launch aborted, or a finished run reset before this poll)" : s.error ? "failed: " + s.error : s.exitCode === 0 ? "succeeded" : "exited with code " + s.exitCode; return { dispatch: true, message: "script " + id + " " + outcome + "\\n" + out };' })` — schedule it only after `ws.script.start` has returned (the hook's immediate validation run would otherwise see the pre-start `idle` and dispatch at once). `<id>` is written exactly once, as an ordinary JavaScript string literal; it reaches the hook body through `JSON.stringify`, so a caller-chosen `scriptId` containing quotes, backslashes or newlines needs no hand-escaping inside the body. The `\\n` is doubled on purpose: the hook body is itself a JavaScript string, so a single `\n` would put a raw newline inside the message literal and the hook would not compile.
+"#;
+/// The `ws.script.start` / `ws.script.run` clauses pointing at that recipe;
+/// scrubbed (or rewritten to plain status polling) alongside it so the
+/// surviving script docs never reference a recipe that is no longer there.
+const SCRIPT_START_RECIPE_XREF: &str =
+    "; watch it with the completion recipe under `ws.script.status`";
+const SCRIPT_RUN_RECIPE_XREF: &str =
+    "wait with the completion hook documented under `ws.script.status(scriptId)`";
+const SCRIPT_RUN_RECIPE_XREF_OFF: &str =
+    "poll `ws.script.status(scriptId)` until `status === \"exited\"` (or `\"idle\"`: a `ws.script.stop` aborted the launch or reset a finished run — read the output either way)";
 
 /// Task-graph teaching scrubbed from the assembled description when
 /// `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). Docs only —
@@ -862,6 +884,15 @@ pub fn workspace_api_description(
         out =
             out.replacen(HOOK_HOST_EXEC_INDEX_XREF, "", 1)
                 .replacen(HOOK_HOST_EXEC_DOC_XREF, "", 1);
+    }
+    // Cross-reference scrub for `backgroundHooks`: the `ws.script.status`
+    // completion recipe is a `ws.hook.schedule` call on its own continuation
+    // line, which method-line pruning cannot reach.
+    if !features.background_hooks {
+        out = out
+            .replacen(SCRIPT_COMPLETION_HOOK_LINE, "", 1)
+            .replacen(SCRIPT_START_RECIPE_XREF, "", 1)
+            .replacen(SCRIPT_RUN_RECIPE_XREF, SCRIPT_RUN_RECIPE_XREF_OFF, 1);
     }
     // Cross-reference scrub for `prMonitor`: the three monitor doc lines are
     // pruned above, but the surviving `ws.pr.*` index entry, hook steer and
@@ -1348,9 +1379,11 @@ mod tests {
         HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT,
         PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF,
         PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
-        TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS,
-        TASK_GRAPH_SETCONTENT_XREF, TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION,
-        WORKSPACE_API_DESCRIPTION_CHIEF, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+        SCRIPT_COMPLETION_HOOK_LINE, SCRIPT_RUN_RECIPE_XREF, SCRIPT_RUN_RECIPE_XREF_OFF,
+        SCRIPT_START_RECIPE_XREF, TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR,
+        TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF, TASK_GRAPH_UNBLOCKED_WAKE_XREF,
+        WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
+        WORKSPACE_API_SYSTEM_PROMPT_HEADING,
     };
     use std::collections::HashSet;
 
@@ -1789,6 +1822,64 @@ mod tests {
                 create_line.contains("`topLevel: true`"),
                 "chief={is_chief}: condensed create line must mention topLevel: {create_line}"
             );
+        }
+    }
+
+    #[test]
+    fn discussion_guidance_survives_full_condensed_and_namespace_help() {
+        for is_chief in [false, true] {
+            for attention_requests in [true, false] {
+                let features = AgentFeaturesSettings {
+                    attention_requests,
+                    ..AgentFeaturesSettings::default()
+                };
+                for (description, includes_details) in [
+                    (
+                        workspace_api_description(is_chief, &features, false).into_owned(),
+                        true,
+                    ),
+                    (
+                        condensed_workspace_api_description(is_chief, &features, false, &[], None),
+                        false,
+                    ),
+                    (
+                        help_namespace(is_chief, &features, false, "agent").unwrap(),
+                        true,
+                    ),
+                    (
+                        help_namespace(is_chief, &features, true, "agent").unwrap(),
+                        true,
+                    ),
+                ] {
+                    let discussion = description
+                        .lines()
+                        .find(|line| line.trim_start().starts_with("ws.agent.requestDiscussion("));
+                    assert_eq!(discussion.is_some(), attention_requests);
+                    if let Some(line) = discussion {
+                        for guidance in [
+                            "only when concrete assigned work encounters an issue",
+                            "unsure how to proceed without a user or coordinator decision",
+                            "ordinary conversation",
+                            "back-and-forth, routine clarification, and plan approval",
+                        ] {
+                            assert!(line.contains(guidance), "missing {guidance}: {line}");
+                        }
+                    }
+                    let report = description
+                        .lines()
+                        .find(|line| line.trim_start().starts_with("ws.agent.reportToParent("))
+                        .unwrap();
+                    assert!(!report.contains("if you are blocked or need input"));
+                    assert_eq!(
+                        report.contains("only when an issue in assigned work"),
+                        attention_requests && includes_details
+                    );
+                    if !attention_requests {
+                        assert!(!description.contains("ws.agent.requestDiscussion"));
+                        assert!(!description.contains("ws.agent.reportBlocker"));
+                    }
+                }
+            }
         }
     }
 
@@ -2357,6 +2448,15 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("disabled in settings"), "{err}");
+        for guidance in [
+            "ordinary conversation with your parent",
+            "routine clarification and plan approval",
+            "an issue in concrete assigned work",
+            "unsure how to proceed without a user/coordinator decision",
+            "Check available context and use your judgment for routine choices first",
+        ] {
+            assert!(err.contains(guidance), "missing {guidance}: {err}");
+        }
         // Genuine settings-off on a top-level bridge keeps the toggle error.
         let err = help_namespace(false, &forced_off, false, "app.question").unwrap_err();
         assert!(err.contains("agentFeatures.structuredQuestions"), "{err}");
@@ -2784,6 +2884,192 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Guard: the `ws.script.status` completion recipe (the one
+    // `ws.hook.schedule` mention outside the hook docs, intent-hq/intent#5577)
+    // matches both variants verbatim, so the `backgroundHooks` scrub cannot
+    // silently become a no-op; with hooks off the recipe is gone while the
+    // command-mode settled-condition contract AND the service-mode caveat
+    // on the same method line survive (a hooks-off reader must never be told
+    // that any `exited` is final).
+    #[test]
+    fn script_completion_recipe_matches_both_variants_and_follows_hook_gate() {
+        const SETTLED: &str =
+            "For a command-mode script the settled condition is exactly `status === \"exited\"`";
+        const SERVICE_CAVEAT: &str = "A service-mode script may publish `exited` briefly before `restarting`; `exited` alone does not establish final service completion";
+        const IDLE_ABORTED: &str =
+            "`idle` after a start means `ws.script.stop` ran: it aborted the launch, or it reset a command that had already `exited`";
+        // Retired: a poll-count rule cannot establish service finality (two
+        // polls can sample `exited` from different runs), so no variant may
+        // prescribe one.
+        let prescribes_service_algorithm =
+            |doc: &str| doc.contains("consecutive poll") || doc.contains("two consecutive polls");
+        // The recipe binds `<id>` once as an outer JS literal and reaches the
+        // hook body through `JSON.stringify`, so a caller-chosen `scriptId`
+        // never has to be hand-escaped inside the nested string, and it
+        // treats the `idle` an aborted launch leaves as terminal.
+        assert!(SCRIPT_COMPLETION_HOOK_LINE.contains("`const id = \"<id>\"; ws.hook.schedule("));
+        assert!(SCRIPT_COMPLETION_HOOK_LINE.contains("JSON.stringify(id)"));
+        assert!(SCRIPT_COMPLETION_HOOK_LINE
+            .contains("if (s.status !== \"exited\" && s.status !== \"idle\") return { dispatch: false }; const out = await ws.script.output(id, 200);"));
+        assert!(SCRIPT_COMPLETION_HOOK_LINE
+            .contains("s.status === \"idle\" ? \"is idle: ws.script.stop ran"));
+        let snippet_end = SCRIPT_COMPLETION_HOOK_LINE
+            .find(")` — schedule it only after")
+            .expect("recipe snippet closes before the ordering rule");
+        assert!(
+            SCRIPT_COMPLETION_HOOK_LINE[..snippet_end]
+                .matches("<id>")
+                .count()
+                == 1
+        );
+        assert!(SCRIPT_RUN_RECIPE_XREF_OFF.contains("`\"idle\"`"));
+        for base in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert!(base.contains(SCRIPT_COMPLETION_HOOK_LINE));
+            assert!(base.contains(SCRIPT_START_RECIPE_XREF));
+            assert!(base.contains(SCRIPT_RUN_RECIPE_XREF));
+            assert!(base.contains(SETTLED));
+            assert!(base.contains(SERVICE_CAVEAT));
+            assert!(base.contains(IDLE_ABORTED));
+            assert!(!prescribes_service_algorithm(base));
+            assert!(base.contains(
+                "settles as `exited` with `exitCode: -1`, `error` = the original failure text"
+            ));
+            assert!(base.contains("`error: \"exit status unobservable\"`"));
+            assert!(
+                base.contains("`error: \"lost: the daemon stopped while the script was running\"`")
+            );
+        }
+        let features = AgentFeaturesSettings {
+            background_hooks: false,
+            ..AgentFeaturesSettings::default()
+        };
+        for is_chief in [false, true] {
+            let pruned = workspace_api_description(is_chief, &features, false);
+            assert!(
+                !pruned.contains("Canonical completion hook"),
+                "chief={is_chief}: the hook recipe survived disabling backgroundHooks"
+            );
+            assert!(
+                !pruned.contains("completion recipe") && !pruned.contains("completion hook"),
+                "chief={is_chief}: a dangling recipe cross-reference survived disabling backgroundHooks"
+            );
+            assert!(
+                pruned.contains(SCRIPT_RUN_RECIPE_XREF_OFF),
+                "chief={is_chief}: the ws.script.run clause was not rewritten to plain polling"
+            );
+            assert!(
+                pruned.contains(SETTLED),
+                "chief={is_chief}: the command-mode settled-condition contract was wrongly pruned"
+            );
+            assert!(
+                pruned.contains(SERVICE_CAVEAT),
+                "chief={is_chief}: the service-mode caveat did not survive disabling backgroundHooks"
+            );
+            assert!(
+                pruned.contains(IDLE_ABORTED),
+                "chief={is_chief}: the aborted-launch `idle` contract did not survive disabling backgroundHooks"
+            );
+            assert!(
+                !prescribes_service_algorithm(&pruned),
+                "chief={is_chief}: a retired consecutive-poll service rule resurfaced"
+            );
+        }
+    }
+
+    // Regression (intent-hq/intentd#2054 review): the recipe's hook body is a
+    // JavaScript string nested inside the documented `ws.hook.schedule` call,
+    // so its message newline must survive BOTH parsing layers, and `scriptId`
+    // is caller-supplied without character validation, so the id must reach
+    // the body intact even when it contains quotes, backslashes or newlines.
+    // Evaluate the snippet exactly as an agent would paste it (with a hostile
+    // id), then compile and run the captured `code` against every documented
+    // terminal / live status, including the `idle` an aborted launch leaves.
+    // Self-skips when `node` is not on PATH (same convention as the intentd
+    // e2e suites).
+    #[test]
+    fn script_completion_recipe_compiles_and_settles_under_node() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        // Source form of the id `a"b\c<newline>d` — exactly what an agent
+        // types between the quotes of an ordinary JS string literal.
+        const HOSTILE_ID_SRC: &str = r#"a\"b\\c\nd"#;
+
+        let start = SCRIPT_COMPLETION_HOOK_LINE
+            .find("`const id = \"<id>\"; ws.hook.schedule(")
+            .expect("recipe opens by binding the id, then a ws.hook.schedule call");
+        let rest = &SCRIPT_COMPLETION_HOOK_LINE[start + 1..];
+        let end = rest
+            .find(")`")
+            .expect("recipe call closes before the backtick");
+        let snippet = rest[..=end]
+            .replace("<expected runtime + margin>", "60000")
+            .replace("<id>", HOSTILE_ID_SRC);
+        assert!(
+            !snippet.contains("<id>") && snippet.matches(HOSTILE_ID_SRC).count() == 1,
+            "the id must be written exactly once: {snippet}"
+        );
+
+        let script = format!(
+            r#"
+const ID = "{HOSTILE_ID_SRC}";
+const ws = {{ hook: {{ schedule: (o) => o }} }};
+const opts = eval({snippet:?});
+if (typeof opts.code !== "string") throw new Error("code is not a string");
+const expect = (cond, msg) => {{ if (!cond) throw new Error(msg); }};
+expect(opts.name === ("script " + ID + " done").slice(0, 50) && opts.name.length <= 50, "name: " + JSON.stringify(opts.name));
+const run = async (s, out) => {{
+  const ws = {{ script: {{ status: async (id) => {{ expect(id === ID, "status id: " + JSON.stringify(id)); return s; }}, output: async (id) => {{ expect(id === ID, "output id: " + JSON.stringify(id)); return out; }} }} }};
+  return await new Function("ws", "hookState", "return (async () => {{" + opts.code + "}})()")(ws, null);
+}};
+(async () => {{
+  for (const status of ["starting", "running", "restarting"]) {{
+    const r = await run({{ status }}, "");
+    expect(r.dispatch === false, "live status " + status + " must not dispatch");
+  }}
+  let r = await run({{ status: "exited", exitCode: 0 }}, "l1\nl2");
+  expect(r.dispatch === true && r.message === "script " + ID + " succeeded\nl1\nl2", "success: " + JSON.stringify(r));
+  r = await run({{ status: "exited", exitCode: 7 }}, "boom");
+  expect(r.message === "script " + ID + " exited with code 7\nboom", "non-zero: " + JSON.stringify(r));
+  r = await run({{ status: "exited", exitCode: -1, error: "spawn failed" }}, "");
+  expect(r.message === "script " + ID + " failed: spawn failed\n", "startup failure: " + JSON.stringify(r));
+  r = await run({{ status: "exited", exitCode: -1, error: "exit status unobservable" }}, "ran");
+  expect(r.message === "script " + ID + " failed: exit status unobservable\nran", "lost exit status: " + JSON.stringify(r));
+  r = await run({{ status: "idle" }}, "partial");
+  expect(r.dispatch === true && r.message === "script " + ID + " is idle: ws.script.stop ran (launch aborted, or a finished run reset before this poll)\npartial", "stopped: " + JSON.stringify(r));
+  r = await run({{ status: "idle", exitCode: 0 }}, "done");
+  expect(r.dispatch === true && r.message.endsWith("\ndone"), "reset after exit keeps the output: " + JSON.stringify(r));
+}})().then(() => process.stdout.write("ok"), (e) => {{ process.stderr.write(String(e && e.stack || e)); process.exit(1); }});
+"#
+        );
+
+        let Ok(mut child) = Command::new("node")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!(
+                "skipping script_completion_recipe_compiles_and_settles_under_node: node not on PATH"
+            );
+            return;
+        };
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(script.as_bytes())
+            .expect("write recipe harness to node");
+        let output = child.wait_with_output().expect("node exits");
+        assert!(
+            output.status.success(),
+            "recipe harness failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
     }
 
     // Guard: every `prMonitor` cross-reference the scrub rewrites still

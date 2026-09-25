@@ -163,6 +163,12 @@ pub(crate) static V2_6: InstructionSet = InstructionSet {
     ..V2_2
 };
 
+/// Harness v2.8 reserves discussion requests for stalled assigned work.
+pub(crate) static V2_8: InstructionSet = InstructionSet {
+    common: instr!("v2.8", "common"),
+    ..V2_6
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -469,11 +475,74 @@ mod tests {
         defaults()
     }
 
-    /// The latest common body includes v2.6 plain-language guidance.
-    const COMMON_LATEST: &str = V2_6.common;
+    /// The latest common body includes v2.8 discussion-request guidance.
+    const COMMON_LATEST: &str = V2_8.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;
+
+    #[test]
+    fn discussion_guidance_reaches_interactive_roles_and_respects_attention_gate() {
+        let set = crate::harness::latest_entry().doctrine.instructions;
+        for attention_requests in [true, false] {
+            let features = AgentFeaturesSettings {
+                attention_requests,
+                ..defaults()
+            };
+            for role in [
+                "interactive",
+                "workspace-agent",
+                "task-focused",
+                "task-loop",
+                "chat",
+            ] {
+                let prompt = get_instruction_with_common_for(set, role, &features);
+                for guidance in [
+                    "ordinary conversation or the normal question flow",
+                    "back-and-forth, routine clarification, and plan approval",
+                    "Check the available context and use your judgment for routine choices",
+                    "concrete assigned work",
+                    "an issue encountered during that work",
+                    "unsure how to proceed",
+                    "a user or coordinator decision before continuing",
+                    "direct user assignments and delegated work",
+                    "a formal task note is not required",
+                    "State the issue and the specific decision needed",
+                    "After the call, end your turn normally",
+                    "ws.agent.requestDiscussion(reason)",
+                    "ws.agent.reportBlocker(reason)",
+                ] {
+                    assert_eq!(
+                        prompt.contains(guidance),
+                        attention_requests,
+                        "role={role}, attention={attention_requests}: {guidance}"
+                    );
+                }
+                assert!(!prompt.contains("you need user/coordinator input to continue"));
+                assert!(prompt.contains("## Plain language for the user"));
+                assert!(prompt.contains("## Waiting on External Conditions"));
+            }
+        }
+    }
+
+    #[test]
+    fn discussion_guidance_preserves_previous_doctrine_and_unrelated_sections() {
+        let previous = crate::harness::resolve_entry("2.7");
+        let current = crate::harness::latest_entry();
+        assert_eq!(current.version, "2.8");
+        assert_eq!(
+            previous.doctrine.instructions.common,
+            instr!("v2.6", "common")
+        );
+        assert!(previous.doctrine.instructions.common.contains(
+            "ws.agent.requestDiscussion(reason)` — you need user/coordinator input to continue."
+        ));
+        assert_eq!(
+            remove_section(previous.doctrine.instructions.common, "Raising Attention"),
+            remove_section(current.doctrine.instructions.common, "Raising Attention")
+        );
+        assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
+    }
 
     #[test]
     fn common_only_is_not_self_wrapped() {

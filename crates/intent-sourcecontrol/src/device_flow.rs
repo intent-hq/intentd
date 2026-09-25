@@ -27,7 +27,6 @@ use serde_json::{json, Value};
 use tokio::time::timeout;
 
 use crate::error::{Error, Result};
-use crate::model::UserIdentity;
 use crate::token::SECRET_ACCOUNT;
 use crate::SourceControl;
 
@@ -46,8 +45,11 @@ const SLOW_DOWN_BUMP_SECS: u64 = 5;
 const SECRET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default scopes requested by the device flow (§spec: PR/issue/review work,
-/// org-repo listing, and workflow-file pushes).
-pub const DEFAULT_SCOPES: &[&str] = &["repo", "read:org", "workflow"];
+/// org-repo listing, workflow-file pushes, and the secret proof gist of the
+/// gist identity-proof join flow — [`crate::identity_proof`]). Tokens granted
+/// before `gist` was added keep working; they only need a re-authorization
+/// when the user first joins a workspace as a guest.
+pub const DEFAULT_SCOPES: &[&str] = &["repo", "read:org", "workflow", "gist"];
 
 /// User-facing half of the device-flow start response. Deliberately excludes
 /// the secret `device_code` (which stays inside [`DeviceFlow`]) so this shape
@@ -271,149 +273,6 @@ impl DeviceFlow {
             }
             PollResponse::Expired => Ok(PollStatus::Expired),
             PollResponse::Denied => Ok(PollStatus::Denied),
-        }
-    }
-}
-
-/// Terminal-visible poll states of an [`IdentityFlow`] (multiplayer w4).
-/// Unlike [`PollStatus`], the authorized arm carries the proven identity —
-/// the access token itself was used once for `GET /user` and dropped.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IdentityPollStatus {
-    /// The user authorized and `GET /user` resolved their identity.
-    Authorized(UserIdentity),
-    /// Poll again after [`IdentityFlow::interval_secs`].
-    Pending,
-    /// The device/user codes expired; restart the flow.
-    Expired,
-    /// The user denied the authorization request.
-    Denied,
-}
-
-/// Identity-only device flow (multiplayer w4): the same GitHub device grant
-/// as [`DeviceFlow`], requested with **no scopes**, whose access token is
-/// spent on exactly one `GET /user` and never persisted — it proves *who*
-/// the invitee is without granting the daemon any access as them.
-pub struct IdentityFlow {
-    crab: octocrab::Octocrab,
-    api_base_uri: Option<String>,
-    client_id: SecretString,
-    device_code: SecretString,
-    interval: u64,
-    /// Set the moment a grant is received: the device code is spent, so no
-    /// further poll can (or may) re-exchange it — see [`Self::is_spent`].
-    spent: bool,
-}
-
-/// Start an identity-only device flow for `client_id` against github.com.
-///
-/// # Errors
-///
-/// Returns [`Error::Config`] if `client_id` is empty; propagates HTTP/deserialization failures from the code request.
-pub async fn start_identity(client_id: &str) -> Result<(DeviceAuthorization, IdentityFlow)> {
-    start_identity_at(DEFAULT_LOGIN_BASE_URI, None, client_id).await
-}
-
-/// [`start_identity`] against an explicit login `base_uri` and API base
-/// (`None` = api.github.com) — the test seam for a local mock of
-/// `/login/device/code`, `/login/oauth/access_token` and `/user`.
-///
-/// # Errors
-///
-/// Returns [`Error::Config`] if `client_id` is empty; propagates HTTP/deserialization failures from the code request.
-pub async fn start_identity_at(
-    base_uri: &str,
-    api_base_uri: Option<&str>,
-    client_id: &str,
-) -> Result<(DeviceAuthorization, IdentityFlow)> {
-    if client_id.trim().is_empty() {
-        return Err(Error::Config(
-            "github device flow requires a non-empty oauth client id \
-             (sourceControl.github.oauthClientId)"
-                .to_string(),
-        ));
-    }
-    let crab = login_client(base_uri)?;
-    let client_id = SecretString::from(client_id.to_string());
-    let codes = crab
-        .authenticate_as_device(&client_id, &[] as &[&str])
-        .await?;
-    let auth = DeviceAuthorization {
-        user_code: codes.user_code.clone(),
-        verification_uri: codes.verification_uri.clone(),
-        expires_in: codes.expires_in,
-        interval: codes.interval,
-    };
-    let flow = IdentityFlow {
-        crab,
-        api_base_uri: api_base_uri.map(str::to_string),
-        client_id,
-        device_code: SecretString::from(codes.device_code),
-        interval: codes.interval,
-        spent: false,
-    };
-    Ok((auth, flow))
-}
-
-impl IdentityFlow {
-    /// Minimum seconds callers must wait before the next [`Self::poll_once`]
-    /// (grows when GitHub answers `slow_down`).
-    pub fn interval_secs(&self) -> u64 {
-        self.interval
-    }
-
-    /// True once a grant was received: every post-grant outcome is
-    /// terminal. A failed identity lookup after the grant is reported as an
-    /// error, but the grant is not polled again — the device code has been
-    /// discarded and a further [`Self::poll_once`] fails without any request.
-    pub fn is_spent(&self) -> bool {
-        self.spent
-    }
-
-    /// Poll the token endpoint once. On authorization the token is used for
-    /// a single `GET /user` and dropped; only the resolved identity returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the token request or the identity lookup fails, or the response cannot be classified. Grant expiration and denial are not errors — they are reported as [`IdentityPollStatus::Expired`] and [`IdentityPollStatus::Denied`]. Once [`Self::is_spent`], every call fails immediately.
-    pub async fn poll_once(&mut self) -> Result<IdentityPollStatus> {
-        if self.spent {
-            return Err(Error::Api(
-                "identity device grant already consumed; start a new flow".to_string(),
-            ));
-        }
-        let body: Value = self
-            .crab
-            .post(
-                "/login/oauth/access_token",
-                Some(&json!({
-                    "client_id": self.client_id.expose_secret(),
-                    "device_code": self.device_code.expose_secret(),
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                })),
-            )
-            .await?;
-        match parse_poll_response(&body)? {
-            PollResponse::Authorized { access_token } => {
-                // The grant is single-use: retire the device code before the
-                // lookup so an identity failure cannot lead to a re-poll.
-                self.spent = true;
-                self.device_code = SecretString::from(String::new());
-                let client = crate::github::GitHubSourceControl::new(
-                    access_token.expose_secret(),
-                    self.api_base_uri.as_deref(),
-                )?;
-                drop(access_token);
-                let identity = client.get_user().await?;
-                Ok(IdentityPollStatus::Authorized(identity))
-            }
-            PollResponse::Pending => Ok(IdentityPollStatus::Pending),
-            PollResponse::SlowDown { interval } => {
-                self.interval = next_interval(self.interval, interval);
-                Ok(IdentityPollStatus::Pending)
-            }
-            PollResponse::Expired => Ok(IdentityPollStatus::Expired),
-            PollResponse::Denied => Ok(IdentityPollStatus::Denied),
         }
     }
 }
@@ -715,7 +574,8 @@ mod tests {
 
     #[test]
     fn default_scopes_and_client_id_match_the_registered_oauth_app() {
-        assert_eq!(DEFAULT_SCOPES, &["repo", "read:org", "workflow"]);
+        assert_eq!(DEFAULT_SCOPES, &["repo", "read:org", "workflow", "gist"]);
+        assert!(DEFAULT_SCOPES.contains(&crate::identity_proof::REQUIRED_SCOPE));
         assert_eq!(DEFAULT_OAUTH_CLIENT_ID, "Ov23li8bvmPsd4B4pW38");
     }
 }

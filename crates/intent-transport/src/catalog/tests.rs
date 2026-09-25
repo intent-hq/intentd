@@ -155,18 +155,44 @@ fn extract_fastpath_methods() -> HashSet<String> {
 ///
 /// Agent memory attribution (§5.5): +1 router method (`agent.memoryUsage`).
 ///
-/// Execution environments (protocol 10.5): +4 router methods
+/// Returning guest (multiplayer w4): +2 fast-path methods on the `/invite`
+/// endpoint (`invite.inspect`, `invite.accept`).
+///
+/// Gist identity proof (guest half): +2 router methods
+/// (`github.identityProof.create`, `github.identityProof.delete`).
+///
+/// Gist identity proof (host half): +2 fast-path methods on the `/invite`
+/// endpoint (`invite.challenge`, `invite.prove`).
+///
+/// Gist identity proof replaces the host-side device flow: −1 fast-path
+/// method (`invite.redeem`); the guest joins through `invite.challenge` /
+/// `invite.prove` (or `invite.accept` with a credential) instead.
+///
+/// Direct member add: +2 router methods (`principal.list`, the owner-only
+/// roster of credentialed guests; `workspace.members.add`, the owner-only
+/// direct attach of one of them).
+///
+/// Provider-generic auth (protocol 10.5, §5.27): +5 router methods
+/// (`sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
+/// `getUser`); the `github.*` auth quintet stays as byte-identical aliases.
+///
+/// Provider-generic identity proof (protocol 10.8): +2 router methods
+/// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
+/// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
+/// stays as byte-identical aliases.
+///
+/// Execution environments (protocol 10.9): +4 router methods
 /// (`sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
-/// `sandbox.image.check`) on top of the 10.4 catalog (380).
-const EXPECTED_TOTAL_METHODS: usize = 384;
+/// `sandbox.image.check`) on top of the 10.8 catalog (394).
+const EXPECTED_TOTAL_METHODS: usize = 398;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 329;
+const EXPECTED_ROUTER_METHODS: usize = 340;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 53;
+const EXPECTED_FASTPATH_METHODS: usize = 56;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -429,7 +455,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
     ),
     (
         "agent.retry",
-        "re-delivers the requeued entry with the stamp captured at enqueue / wake delivery — the retrier is never the author (`guest_wake_stamp_survives_terminal_failure_requeue_over_wss`)",
+        "re-delivers the requeued entry with the stamp captured at enqueue / wake delivery — the retrier is never the author (`wake_stamp_survives_terminal_failure_requeue_over_wss`)",
     ),
     (
         "agent.sendMessage",
@@ -608,6 +634,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.identityProof.create",
+    "github.identityProof.delete",
     "github.issues.get",
     "github.issues.list",
     "github.issues.search",
@@ -652,7 +680,10 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.providerTestPrompt",
     "host.status",
     "host.toolAvailability",
-    "invite.redeem",
+    "invite.accept",
+    "invite.challenge",
+    "invite.inspect",
+    "invite.prove",
     "linear.authStatus",
     "linear.createIssue",
     "linear.getIssue",
@@ -712,6 +743,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "primitive.addCli",
     "primitive.addPatch",
     "primitive.addReference",
+    "principal.list",
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
@@ -766,6 +798,13 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "settings.reset",
     "settings.update",
     "skill.list",
+    "sourceControl.authStatus",
+    "sourceControl.cancelAuth",
+    "sourceControl.connect",
+    "sourceControl.getUser",
+    "sourceControl.identityProof.create",
+    "sourceControl.identityProof.delete",
+    "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
     "specialist.edit",
@@ -837,6 +876,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.list",
     "workspace.localChanges",
     "workspace.markSeen",
+    "workspace.members.add",
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
@@ -1102,8 +1142,10 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// and `system.status`),
 /// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
-/// `git.agentCommit` (agent-only), agent deletion / proposals / one-shot
-/// completions, `agent.replaceMessages` (persists client-supplied user rows
+/// `git.agentCommit` (agent-only), agent creation / delegation (decided
+/// 2026-09-19: guests steer existing agents only — `agent.create`,
+/// `agent.delegate`, `agent.wakeOrCreate`), agent deletion / proposals /
+/// one-shot completions, `agent.replaceMessages` (persists client-supplied user rows
 /// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
 /// PR-monitor cancel/flush, daemon-wide metrics, and the `accept-changes.*` /
 /// `file-tracking.*` publishing flow (stages, commits, pushes and merges as
@@ -1116,6 +1158,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.prepare",
     "agent.cancelDelete",
     "agent.completeOnce",
+    "agent.create",
+    "agent.delegate",
     "agent.delete",
     "agent.diagnostics",
     "agent.enhancePrompt",
@@ -1123,6 +1167,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.replaceMessages",
     "agent.reportToParent",
     "agent.resolveProposal",
+    "agent.wakeOrCreate",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -1150,6 +1195,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",
+    "github.identityProof.create",
+    "github.identityProof.delete",
     "github.issues.get",
     "github.issues.list",
     "github.issues.search",
@@ -1191,7 +1238,10 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
-    "invite.redeem",
+    "invite.accept",
+    "invite.challenge",
+    "invite.inspect",
+    "invite.prove",
     "linear.authStatus",
     "linear.createIssue",
     "linear.getIssue",
@@ -1220,6 +1270,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "pairing.getInfo",
     "prMonitor.cancel",
     "prMonitor.flush",
+    "principal.list",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1263,6 +1314,13 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "settings.list",
     "settings.reset",
     "settings.update",
+    "sourceControl.authStatus",
+    "sourceControl.cancelAuth",
+    "sourceControl.connect",
+    "sourceControl.getUser",
+    "sourceControl.identityProof.create",
+    "sourceControl.identityProof.delete",
+    "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
     "specialist.edit",
@@ -1305,6 +1363,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "workspace.invite.create",
     "workspace.invite.list",
     "workspace.invite.revoke",
+    "workspace.members.add",
     "workspace.members.remove",
     "workspace.restore",
     "workspace.saveSetupScript",
@@ -1453,7 +1512,8 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "presence.snapshot",
         "presence.update",
         "note.presence.subscribe",
-        "agent.create",
+        "agent.rename",
+        "agent.update",
         "agent.stop",
         "agent.sendMessage",
         "agent.setModel",
@@ -1481,7 +1541,11 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "voice.transcribe",
         "workspace.create",
         "git.clone",
+        "agent.create",
+        "agent.delegate",
+        "agent.wakeOrCreate",
         "agent.delete",
+        "agent.cancelDelete",
         "agent.replaceMessages",
         "terminal.list",
         "script.list",
@@ -1532,7 +1596,9 @@ fn reverse_methods_are_never_on_the_collaborator_allowlist() {
 ///
 /// The remaining refused methods — the connection-task fast paths (`host.*`,
 /// `browser.*`, `forward.*`, `system.*`, `pairing.*`, `server.*`,
-/// `providers.setup.*`, `invite.redeem`) and the subscription channels — have
+/// `providers.setup.*`, `invite.inspect` / `invite.accept` /
+/// `invite.challenge` / `invite.prove`)
+/// and the subscription channels — have
 /// no `WorkspaceApi` method to gate; they are protected only by the
 /// transport allowlist in `conn::process_frame` (`-32003`) and stay out of
 /// this table by construction. That partition is asserted, not assumed.
@@ -1695,6 +1761,11 @@ mod unbound_owner_only_methods {
                 "agent.completeOnce",
                 json!({ "prompt": "p", "timeoutMs": 1 }),
             ),
+            ("agent.create", json!({ "workspaceId": ws })),
+            (
+                "agent.delegate",
+                json!({ "workspaceId": ws, "taskNoteId": "t1" }),
+            ),
             ("agent.delete", json!({ "agentId": "a1" })),
             ("agent.diagnostics", json!({ "workspaceId": ws })),
             (
@@ -1713,6 +1784,10 @@ mod unbound_owner_only_methods {
             (
                 "agent.resolveProposal",
                 json!({ "workspaceId": ws, "agentId": "a1", "proposalId": "p1", "outcome": "reject" }),
+            ),
+            (
+                "agent.wakeOrCreate",
+                json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
             ),
             ("client.list", json!({})),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
@@ -1743,6 +1818,11 @@ mod unbound_owner_only_methods {
             ("github.connect", json!({})),
             ("github.getReviewThreads", gh_n.clone()),
             ("github.getUser", json!({})),
+            (
+                "github.identityProof.create",
+                json!({ "nonce": "n", "hostLabel": "h" }),
+            ),
+            ("github.identityProof.delete", json!({ "gistId": "g" })),
             ("github.issues.get", gh_n.clone()),
             ("github.issues.list", gh.clone()),
             ("github.issues.search", gh.clone()),
@@ -1819,6 +1899,7 @@ mod unbound_owner_only_methods {
                 "prMonitor.flush",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),
             ),
+            ("principal.list", json!({})),
             ("repo.list", json!({})),
             ("repo.remove", json!({ "path": dir })),
             (
@@ -1880,6 +1961,19 @@ mod unbound_owner_only_methods {
             ("settings.list", json!({})),
             ("settings.reset", json!({ "path": "model.defaultProvider" })),
             ("settings.update", json!({ "changes": {} })),
+            ("sourceControl.authStatus", json!({ "provider": "github" })),
+            ("sourceControl.cancelAuth", json!({ "provider": "github" })),
+            ("sourceControl.connect", json!({ "provider": "github" })),
+            ("sourceControl.getUser", json!({ "provider": "github" })),
+            (
+                "sourceControl.identityProof.create",
+                json!({ "provider": "github", "nonce": "n", "hostLabel": "h" }),
+            ),
+            (
+                "sourceControl.identityProof.delete",
+                json!({ "provider": "github", "proofId": "g" }),
+            ),
+            ("sourceControl.revoke", json!({ "provider": "github" })),
             ("specialist.create", json!({ "id": "s", "spec": {} })),
             ("specialist.delete", json!({ "id": "s", "scope": "global" })),
             (
@@ -1943,6 +2037,10 @@ mod unbound_owner_only_methods {
             (
                 "workspace.invite.revoke",
                 json!({ "workspaceId": ws, "inviteId": "inv" }),
+            ),
+            (
+                "workspace.members.add",
+                json!({ "workspaceId": ws, "principalId": "p" }),
             ),
             (
                 "workspace.members.remove",

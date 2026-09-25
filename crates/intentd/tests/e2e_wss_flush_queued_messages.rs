@@ -21,6 +21,21 @@
 //! system-only batch and drain one-at-a-time — same observable shape as
 //! case 2 (one turn per message, no combined header, queue 2 → 1 → 0).
 //!
+//! Case 4 (two members, default `"all"`): the owner and a collaborator each
+//! queue one message behind the busy turn. Per-user queue visibility holds
+//! on every egress — `agent.getQueue` and the `agent:queue:updated` push
+//! show the collaborator only its own entry (owner sees both, `position`
+//! not renumbered), the owner's edit of the guest's entry and the guest's
+//! edit/remove of the owner's entry are refused (`-32602`) — and the flush
+//! still drains BOTH entries in one combined turn.
+//!
+//! Case 5 (`agent.diagnostics`, two members + one agent-sent entry): the
+//! `queues[]` view is projected per caller exactly like `agent.getQueue`.
+//! Over the wire only the administrator reaches it — the guest's call is
+//! refused by the collaborator allowlist (`-32003`) — and the owner's
+//! diagnostics list all three entries with `queueLength` and
+//! `summary.queuedAgents` following the projected entries.
+//!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
 #![cfg(unix)]
@@ -45,10 +60,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+const GUEST_TOKEN: &str = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
 
 const KICKOFF_MSG: &str = "kick-off slow turn";
 const QUEUED_ONE: &str = "queued flush one";
 const QUEUED_TWO: &str = "queued flush two";
+const OWNER_QUEUED: &str = "queued by owner";
+const GUEST_QUEUED: &str = "queued by guest";
+const GUEST_PREAMBLE: &str = "Message from @guest";
+const AGENT_QUEUED: &str = "queued by a sibling agent";
+const RELAY_MARKER: &str = "relay to the busy target";
 const FLUSH_HEADER: &str = "2 queued messages while you were working";
 const WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
 
@@ -176,11 +197,23 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 }
 
 async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> common::TlsWs {
-    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    connect_ws_as(port, cfg, TOKEN).await
+}
+
+async fn connect_ws_as(port: u16, cfg: Arc<ClientConfig>, token: &str) -> common::TlsWs {
+    let url = format!("wss://localhost:{port}/ws?token={token}");
     common::wss_connect_with_retry(port, cfg, &url).await
 }
 
-async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+/// One JSON-RPC round-trip returning the full response envelope (pushes and
+/// pings interleaved on the same socket are skipped) — for refusal
+/// assertions on `error`.
+async fn wss_rpc_envelope<S>(
+    ws: &mut WebSocketStream<S>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -196,8 +229,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
-                    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                    return v["result"].clone();
+                    return v;
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -207,6 +239,15 @@ where
             other => panic!("expected text frame, got {other:?}"),
         }
     }
+}
+
+async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let v = wss_rpc_envelope(ws, id, method, params).await;
+    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
+    v["result"].clone()
 }
 
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
@@ -262,6 +303,54 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
         .await
         .expect("insert ws");
     ws.0
+}
+
+/// Seed a workspace plus a non-primary `guest` principal — credential bound
+/// to `GUEST_TOKEN`, collaborator member of the workspace — BEFORE boot.
+/// Returns `(workspace id, guest principal)`.
+async fn seed_workspace_with_guest(data_dir: &Path) -> (String, intent_core::Principal) {
+    use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId, WorkspaceRole};
+    use intent_store::Store;
+    let store = Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace_seed(&ws))
+        .await
+        .expect("insert ws");
+    let guest = Principal {
+        id: PrincipalId::new(),
+        identity: None,
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store
+        .upsert_principal(&guest)
+        .await
+        .expect("guest principal");
+    let token_hash =
+        Sha256::digest(GUEST_TOKEN.as_bytes())
+            .iter()
+            .fold(String::new(), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+    store
+        .insert_principal_credential(&guest.id, &token_hash)
+        .await
+        .expect("guest credential");
+    store
+        .add_workspace_member(&ws, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    (ws.0, guest)
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
@@ -355,15 +444,44 @@ struct FlushSetup {
     queued_ids: [String; 2],
 }
 
-async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> FlushSetup {
+/// A booted daemon with the slow-first-turn mock: the first turn parks
+/// `first_turn_delay_ms` (a deterministic window to queue messages while the
+/// worker is busy); queue-drained turns run at full mock speed.
+struct Booted {
+    daemon: Daemon,
+    port: u16,
+    cfg: Arc<ClientConfig>,
+    prompt_log: PathBuf,
+}
+
+/// `kickoff_release`: when set, the mock ALSO holds the kick-off turn
+/// (`KICKOFF_MSG`) open until this file exists — a barrier the test releases
+/// once its busy-window work is provably done, instead of a timer that host
+/// scheduling can outrun. `extra_rules` are appended to the mock's
+/// prompt-matched `rules` after the kick-off barrier.
+async fn boot_daemon(
+    data_dir: &Path,
+    script: &str,
+    first_turn_delay_ms: u64,
+    kickoff_release: Option<&Path>,
+    extra_rules: &[Value],
+) -> Booted {
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
-    // First turn parks 2s: a deterministic window to queue both messages
-    // while the worker is busy. Queue-drained turns run at full mock speed.
-    let behavior = json!({ "response": "flush reply", "firstTurnDelayMs": 2000 }).to_string();
+    let mut behavior =
+        json!({ "response": "flush reply", "firstTurnDelayMs": first_turn_delay_ms });
+    let mut rules: Vec<Value> = Vec::new();
+    if let Some(release) = kickoff_release {
+        rules.push(json!({ "ifPromptContains": KICKOFF_MSG, "releaseFile": release }));
+    }
+    rules.extend(extra_rules.iter().cloned());
+    if !rules.is_empty() {
+        behavior["rules"] = Value::Array(rules);
+    }
+    let behavior = behavior.to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        // The 2s busy window sits below the 5s dequeue-wait annotation
+        // The busy window sits below the 5s dequeue-wait annotation
         // threshold (monorepo#2353); drop it so the wait-note assertions
         // exercise the annotation without slowing the suite.
         ("INTENTD_DEQUEUE_WAIT_MIN_MS", "0"),
@@ -371,7 +489,6 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
     ];
-    let ws_id = seed_workspace_only(data_dir).await;
     let child = spawn_serve(data_dir, &env);
     let daemon = Daemon {
         child,
@@ -386,7 +503,22 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let cfg = client_config(&fingerprint);
+    Booted {
+        daemon,
+        port,
+        cfg: client_config(&fingerprint),
+        prompt_log,
+    }
+}
+
+async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> FlushSetup {
+    let ws_id = seed_workspace_only(data_dir).await;
+    let Booted {
+        daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, script, 2000, None, &[]).await;
 
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_resp = wss_rpc(
@@ -539,9 +671,12 @@ fn user_row_texts(conv: &Value) -> Vec<String> {
 /// kick-off send's echo carries its own turn's id, so it appears first),
 /// plus each user-row echo's drain identity link `queuedMessageId`
 /// (intentd#1783; `None` for the direct-send kick-off echo).
+/// `processing_frames` keeps each `agent:queue:processing` `data` payload
+/// whole, for the per-subscriber `content` projection.
 struct DrainObservation {
     queue_lengths: Vec<usize>,
     processing_turn_ids: Vec<String>,
+    processing_frames: Vec<Value>,
     user_row_turn_ids: Vec<String>,
     user_row_queued_message_ids: Vec<Option<String>>,
 }
@@ -553,6 +688,7 @@ async fn observe_drain(
 ) -> DrainObservation {
     let mut queue_lengths = Vec::new();
     let mut processing_turn_ids = Vec::new();
+    let mut processing_frames = Vec::new();
     let mut user_row_turn_ids = Vec::new();
     let mut user_row_queued_message_ids = Vec::new();
     let mut stream_ends = 0usize;
@@ -574,6 +710,7 @@ async fn observe_drain(
                         .expect("queue:processing carries a turnId")
                         .to_string(),
                 );
+                processing_frames.push(event["data"].clone());
             }
             Some("agent:message") => {
                 if event["data"]["role"] == "user" {
@@ -603,6 +740,7 @@ async fn observe_drain(
     DrainObservation {
         queue_lengths,
         processing_turn_ids,
+        processing_frames,
         user_row_turn_ids,
         user_row_queued_message_ids,
     }
@@ -1020,4 +1158,812 @@ async fn flush_system_only_excludes_queue_message_entries_over_wss() {
         queue["queue"].as_array().expect("queue array").is_empty(),
         "queue empty after drain: {queue}"
     );
+}
+
+/// Queue entry ids of an `agent:queue:updated` payload, in drain order.
+fn queue_ids(queue: &Value) -> Vec<String> {
+    queue
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .map(|e| e["id"].as_str().expect("entry id").to_string())
+        .collect()
+}
+
+/// Enqueue-phase observation: consume subscription events until an
+/// `agent:queue:updated` snapshot for the agent satisfies `done`, returning
+/// EVERY `agent:queue:updated` payload seen for the agent (the matching one
+/// last). A terminal `agent:stream:end` for the agent before then means the
+/// busy window closed early — fail loudly rather than mis-attribute the
+/// drain-phase snapshots.
+async fn await_queue_snapshots(
+    sub: &mut common::TlsWs,
+    agent_id: &str,
+    done: impl Fn(&Value) -> bool,
+) -> Vec<Value> {
+    let mut seen = Vec::new();
+    for _ in 0..200 {
+        let frame = wss_event(sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:queue:updated") => {
+                let queue = event["data"]["queue"].clone();
+                let finished = done(&queue);
+                seen.push(queue);
+                if finished {
+                    return seen;
+                }
+            }
+            Some("agent:stream:end") => {
+                panic!("busy turn ended before the enqueue phase completed: {seen:?}")
+            }
+            _ => {}
+        }
+    }
+    panic!("never observed the awaited agent:queue:updated snapshot: {seen:?}")
+}
+
+/// FLUSH-4 (two members, default `agents.flushQueuedMessages = "all"`): the
+/// owner (administrator) and a collaborator (`guest`, seeded as a workspace
+/// member) each queue ONE message behind the busy turn. Per-user queue
+/// visibility holds on every egress, and the batched flush still drains
+/// both entries in ONE combined turn.
+///
+/// Contract locked down:
+/// 1. `agent.getQueue` — the owner sees both entries (its own first, the
+///    guest's second, `author.principalId` resolved on each); the guest
+///    sees ONLY its own entry, with `position` kept at 1 (not renumbered).
+/// 2. `agent:queue:updated` — the owner's subscription is pushed the full
+///    snapshots (1 → 2 entries); the guest's subscription is pushed the
+///    projected ones: the owner's entry never appears, and the last
+///    enqueue-phase snapshot is exactly `[guest entry]` at `position` 1.
+/// 3. Ownership refusals (`-32602`, no snapshot published): the owner's
+///    `agent.editQueuedMessage` of the guest's entry (`can only be edited by
+///    its author`), the guest's `agent.editQueuedMessage` and
+///    `agent.removeQueuedMessage` of the owner's entry (`queued message not
+///    found` — an invisible entry reads as absent). Both queues are
+///    unchanged afterwards. Administrator override: the guest queues a
+///    scratch entry, the owner's `agent.removeQueuedMessage` of it succeeds
+///    (`{ success: true }`) and BOTH views return to exactly their previous
+///    two-entry / one-entry state (the removal snapshots are consumed on
+///    both subscriptions).
+/// 4. Flush intact: the drain publishes ONE empty snapshot to each
+///    subscriber (2 → 0 for the owner, 1 → 0 projected for the guest),
+///    exactly ONE `agent:queue:processing` fires (same `turnId` on both
+///    subscriptions), the flushed user-row echoes link BOTH entry ids in
+///    queue order, the provider-received prompt is one combined message
+///    (batch header, owner body before the preambled guest body), and the
+///    transcript keeps two rows sharing one `batchId` — the guest's stamped
+///    `fromPrincipalId`. Both members read an empty queue afterwards.
+#[tokio::test]
+async fn two_members_see_disjoint_queues_and_flush_combines_both_over_wss() {
+    let Some(script) = gate("WSS two-member queue visibility + flush E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, guest) = seed_workspace_with_guest(&data_dir).await;
+    // Two connections' worth of enqueue reads, pushes and refusals must all
+    // land before the kick-off turn ends (an early end panics in
+    // `await_queue_snapshots`), so the busy window is a barrier the test
+    // releases before (4) rather than a timer host scheduling could outrun.
+    let kickoff_release = data_dir.join("release-kickoff");
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(&data_dir, &script, 0, Some(&kickoff_release), &[]).await;
+
+    // Both members subscribe to `agent:*` BEFORE the kick-off send.
+    let mut owner_sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut owner_sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "owner subscribed: {sub_resp}"
+    );
+    let mut guest_sub = connect_ws_as(port, cfg.clone(), GUEST_TOKEN).await;
+    let sub_resp = wss_rpc(
+        &mut guest_sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "guest subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut guest_rpc = connect_ws_as(port, cfg.clone(), GUEST_TOKEN).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-FLUSH-2M", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": KICKOFF_MSG }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    assert_eq!(
+        sent["queued"], false,
+        "kick-off streams, not queued: {sent}"
+    );
+
+    // Owner queues first, guest second.
+    let owner_q = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.queueMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": OWNER_QUEUED }),
+    )
+    .await;
+    assert_eq!(owner_q["success"], true, "owner queue: {owner_q}");
+    let owner_id = owner_q["queuedMessage"]["id"]
+        .as_str()
+        .expect("owner entry id")
+        .to_string();
+    let guest_q = wss_rpc(
+        &mut guest_rpc,
+        100,
+        "agent.queueMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": GUEST_QUEUED }),
+    )
+    .await;
+    assert_eq!(guest_q["success"], true, "guest queue: {guest_q}");
+    let guest_id = guest_q["queuedMessage"]["id"]
+        .as_str()
+        .expect("guest entry id")
+        .to_string();
+    assert_ne!(owner_id, guest_id, "distinct entry ids");
+
+    // (1) agent.getQueue: owner sees both; guest sees only its own.
+    let owner_view = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        queue_ids(&owner_view["queue"]),
+        vec![owner_id.clone(), guest_id.clone()],
+        "owner reads the full queue in order: {owner_view}"
+    );
+    let entries = owner_view["queue"].as_array().expect("queue array");
+    assert_eq!(entries[0]["position"], json!(0), "{owner_view}");
+    assert_eq!(entries[1]["position"], json!(1), "{owner_view}");
+    assert_eq!(entries[0]["content"], json!(OWNER_QUEUED), "{owner_view}");
+    let owner_principal_id = entries[0]["author"]["principalId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("owner entry resolves its author: {owner_view}"))
+        .to_string();
+    assert_ne!(
+        owner_principal_id, guest.id.0,
+        "owner entry is authored by the administrator: {owner_view}"
+    );
+    assert_eq!(
+        entries[1]["author"]["principalId"],
+        json!(guest.id.0),
+        "guest entry is authored by the guest: {owner_view}"
+    );
+    assert_eq!(
+        entries[1]["author"]["login"],
+        json!("guest"),
+        "{owner_view}"
+    );
+    let guest_content = entries[1]["content"].as_str().expect("guest content");
+    assert!(
+        guest_content.starts_with(GUEST_PREAMBLE) && guest_content.ends_with(GUEST_QUEUED),
+        "guest entry carries the sender preamble above its body: {guest_content}"
+    );
+
+    let guest_view = wss_rpc(
+        &mut guest_rpc,
+        101,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        queue_ids(&guest_view["queue"]),
+        vec![guest_id.clone()],
+        "guest reads only its own entry: {guest_view}"
+    );
+    let guest_entry = &guest_view["queue"][0];
+    assert_eq!(
+        guest_entry["position"],
+        json!(1),
+        "position is not renumbered for the projected view: {guest_view}"
+    );
+    assert_eq!(guest_entry["author"]["principalId"], json!(guest.id.0));
+
+    // (2) agent:queue:updated pushes: full snapshots to the owner, projected
+    // ones to the guest (the owner's entry never appears).
+    let owner_pushes = await_queue_snapshots(&mut owner_sub, &agent_id, |q| {
+        queue_ids(q) == [owner_id.clone(), guest_id.clone()]
+    })
+    .await;
+    assert!(
+        owner_pushes
+            .iter()
+            .any(|q| queue_ids(q) == [owner_id.clone()]),
+        "owner sees the 1-entry snapshot before the 2-entry one: {owner_pushes:?}"
+    );
+    let guest_pushes = await_queue_snapshots(&mut guest_sub, &agent_id, |q| {
+        queue_ids(q).contains(&guest_id)
+    })
+    .await;
+    assert!(
+        guest_pushes
+            .iter()
+            .all(|q| !queue_ids(q).contains(&owner_id)),
+        "the owner's entry is never pushed to the guest: {guest_pushes:?}"
+    );
+    let guest_last = guest_pushes.last().expect("guest saw a snapshot");
+    assert_eq!(
+        queue_ids(guest_last),
+        vec![guest_id.clone()],
+        "guest's projected snapshot is exactly its own entry: {guest_last}"
+    );
+    assert_eq!(
+        guest_last[0]["position"],
+        json!(1),
+        "projected push keeps position 1: {guest_last}"
+    );
+
+    // (3) Ownership refusals — none publishes a snapshot.
+    let owner_edit = wss_rpc_envelope(
+        &mut rpc,
+        14,
+        "agent.editQueuedMessage",
+        json!({ "agentId": agent_id, "messageId": guest_id, "content": "owner rewrite" }),
+    )
+    .await;
+    assert_eq!(owner_edit["jsonrpc"], "2.0", "{owner_edit}");
+    assert!(owner_edit.get("result").is_none(), "{owner_edit}");
+    assert_eq!(owner_edit["error"]["code"], -32602, "{owner_edit}");
+    assert!(
+        owner_edit["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("can only be edited by its author")),
+        "owner cannot edit the guest's entry: {owner_edit}"
+    );
+    let guest_edit = wss_rpc_envelope(
+        &mut guest_rpc,
+        102,
+        "agent.editQueuedMessage",
+        json!({ "agentId": agent_id, "messageId": owner_id, "content": "guest rewrite" }),
+    )
+    .await;
+    assert_eq!(guest_edit["error"]["code"], -32602, "{guest_edit}");
+    assert!(
+        guest_edit["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("queued message not found")),
+        "the owner's entry is invisible to the guest's edit: {guest_edit}"
+    );
+    let guest_remove = wss_rpc_envelope(
+        &mut guest_rpc,
+        103,
+        "agent.removeQueuedMessage",
+        json!({ "agentId": agent_id, "messageId": owner_id }),
+    )
+    .await;
+    assert!(guest_remove.get("result").is_none(), "{guest_remove}");
+    assert_eq!(guest_remove["error"]["code"], -32602, "{guest_remove}");
+    assert!(
+        guest_remove["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("queued message not found")),
+        "the owner's entry is invisible to the guest's remove: {guest_remove}"
+    );
+    let owner_after = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        owner_after["queue"], owner_view["queue"],
+        "refused edits/removes leave the queue untouched"
+    );
+    let guest_after = wss_rpc(
+        &mut guest_rpc,
+        104,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        guest_after["queue"], guest_view["queue"],
+        "refused edits/removes leave the guest's view untouched"
+    );
+
+    // (3b) Administrator override: the owner CAN remove a guest-authored
+    // entry. The guest queues a scratch entry, the owner removes it, and
+    // both views return to exactly their previous state — the removal's
+    // snapshots are consumed here so (4) still sees only the drain's.
+    let scratch_q = wss_rpc(
+        &mut guest_rpc,
+        105,
+        "agent.queueMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "guest scratch" }),
+    )
+    .await;
+    assert_eq!(
+        scratch_q["success"], true,
+        "guest scratch queue: {scratch_q}"
+    );
+    let scratch_id = scratch_q["queuedMessage"]["id"]
+        .as_str()
+        .expect("scratch entry id")
+        .to_string();
+    let owner_grown = await_queue_snapshots(&mut owner_sub, &agent_id, |q| {
+        queue_ids(q) == [owner_id.clone(), guest_id.clone(), scratch_id.clone()]
+    })
+    .await;
+    assert_eq!(
+        owner_grown.len(),
+        1,
+        "one enqueue snapshot: {owner_grown:?}"
+    );
+    let guest_grown = await_queue_snapshots(&mut guest_sub, &agent_id, |q| {
+        queue_ids(q) == [guest_id.clone(), scratch_id.clone()]
+    })
+    .await;
+    assert_eq!(
+        guest_grown.len(),
+        1,
+        "one projected enqueue snapshot: {guest_grown:?}"
+    );
+    assert_eq!(
+        guest_grown[0][1]["position"],
+        json!(2),
+        "scratch keeps its full-queue position in the projection: {guest_grown:?}"
+    );
+
+    let owner_remove = wss_rpc_envelope(
+        &mut rpc,
+        16,
+        "agent.removeQueuedMessage",
+        json!({ "agentId": agent_id, "messageId": scratch_id }),
+    )
+    .await;
+    assert!(owner_remove.get("error").is_none(), "{owner_remove}");
+    assert_eq!(
+        owner_remove["result"],
+        json!({ "success": true }),
+        "the administrator removes the guest's entry: {owner_remove}"
+    );
+    let owner_shrunk = await_queue_snapshots(&mut owner_sub, &agent_id, |q| {
+        queue_ids(q) == [owner_id.clone(), guest_id.clone()]
+    })
+    .await;
+    assert_eq!(
+        owner_shrunk.len(),
+        1,
+        "one removal snapshot: {owner_shrunk:?}"
+    );
+    let guest_shrunk = await_queue_snapshots(&mut guest_sub, &agent_id, |q| {
+        queue_ids(q) == [guest_id.clone()]
+    })
+    .await;
+    assert_eq!(
+        guest_shrunk.len(),
+        1,
+        "one projected removal snapshot: {guest_shrunk:?}"
+    );
+
+    let owner_restored = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        owner_restored["queue"], owner_view["queue"],
+        "only the scratch entry is gone; the owner's view is exactly as before"
+    );
+    let guest_restored = wss_rpc(
+        &mut guest_rpc,
+        106,
+        "agent.getQueue",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        guest_restored["queue"], guest_view["queue"],
+        "the guest's own surviving entry is untouched"
+    );
+
+    // (4) Flush intact — observed on both subscriptions: kick-off
+    // stream:end, then the ONE combined flush turn. Everything the busy
+    // window had to cover is done; let the kick-off turn end.
+    std::fs::write(&kickoff_release, b"go").expect("write kick-off release file");
+    let (owner_obs, guest_obs) = tokio::join!(
+        observe_drain(&mut owner_sub, &agent_id, 2),
+        observe_drain(&mut guest_sub, &agent_id, 2),
+    );
+    // The enqueue-phase snapshots were consumed above and the refusals
+    // published none, so the only snapshot left is the drain's — one shot,
+    // straight to empty, on both projections.
+    assert_eq!(
+        owner_obs.queue_lengths,
+        vec![0],
+        "owner: queue empties in one snapshot (2 → 0)"
+    );
+    assert_eq!(
+        guest_obs.queue_lengths,
+        vec![0],
+        "guest: projected queue empties in one snapshot (1 → 0)"
+    );
+    assert_eq!(
+        owner_obs.processing_turn_ids.len(),
+        1,
+        "exactly ONE agent:queue:processing for the combined turn: {:?}",
+        owner_obs.processing_turn_ids
+    );
+    assert_eq!(
+        guest_obs.processing_turn_ids, owner_obs.processing_turn_ids,
+        "the guest observes the same single combined turn"
+    );
+    let combined_turn_id = &owner_obs.processing_turn_ids[0];
+    // The drain-start frame is keyed on the batch head — the owner's entry.
+    // The owner's frame carries its content; the guest's is projected to
+    // ids only (the entry is hidden from the guest's queue), while the
+    // batch still flushes as one turn below.
+    let owner_processing = &owner_obs.processing_frames[0];
+    assert_eq!(
+        owner_processing["messageId"],
+        json!(owner_id),
+        "processing keys on the head entry: {owner_processing}"
+    );
+    assert!(
+        owner_processing["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with(OWNER_QUEUED)),
+        "the owner sees its own entry's content (plus the dequeue-wait note): {owner_processing}"
+    );
+    assert_eq!(
+        guest_obs.processing_frames[0],
+        json!({ "agentId": agent_id, "messageId": owner_id, "turnId": combined_turn_id }),
+        "the guest's processing frame for the owner's entry carries no content"
+    );
+    for obs in [&owner_obs, &guest_obs] {
+        let linked: Vec<&String> = obs.user_row_queued_message_ids.iter().flatten().collect();
+        assert_eq!(
+            linked,
+            vec![&owner_id, &guest_id],
+            "flushed echoes link both entries in queue order: {:?}",
+            obs.user_row_queued_message_ids
+        );
+        assert!(
+            obs.user_row_turn_ids
+                .ends_with(&[combined_turn_id.clone(), combined_turn_id.clone()]),
+            "both flushed echoes carry the combined turn's turnId: {:?}",
+            obs.user_row_turn_ids
+        );
+    }
+
+    let prompts = await_prompts(&prompt_log, 2).await;
+    assert_eq!(prompts.len(), 2, "kick-off + ONE flush turn: {prompts:?}");
+    let flush = &prompts[1];
+    assert!(
+        flush.starts_with(FLUSH_HEADER),
+        "flush prompt starts with the batch header: {flush}"
+    );
+    let i_owner = flush
+        .find(OWNER_QUEUED)
+        .unwrap_or_else(|| panic!("flush prompt carries {OWNER_QUEUED:?}: {flush}"));
+    let i_guest = flush
+        .find(GUEST_QUEUED)
+        .unwrap_or_else(|| panic!("flush prompt carries {GUEST_QUEUED:?}: {flush}"));
+    assert!(i_owner < i_guest, "entries appear in queue order: {flush}");
+    assert!(
+        flush.contains(GUEST_PREAMBLE),
+        "the guest's sender preamble survives into the combined prompt: {flush}"
+    );
+
+    let conv = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let owner_row = user_row(&conv, OWNER_QUEUED);
+    let guest_row = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .find(|m| {
+            m["contentBlocks"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with(GUEST_PREAMBLE) && t.contains(GUEST_QUEUED))
+        })
+        .unwrap_or_else(|| panic!("missing guest user row: {conv}"));
+    let batch_id = owner_row["metadata"]["queueInfo"]["batchId"]
+        .as_str()
+        .expect("flushed row carries queueInfo.batchId");
+    assert_eq!(
+        guest_row["metadata"]["queueInfo"]["batchId"].as_str(),
+        Some(batch_id),
+        "both members' rows share the batch's id"
+    );
+    assert_eq!(
+        owner_row["metadata"]["queueInfo"]["queuedMessageId"],
+        json!(owner_id)
+    );
+    assert_eq!(
+        guest_row["metadata"]["queueInfo"]["queuedMessageId"],
+        json!(guest_id)
+    );
+    assert_eq!(
+        guest_row["metadata"]["fromPrincipalId"],
+        json!(guest.id.0),
+        "guest row keeps its principal stamp: {guest_row}"
+    );
+    assert_eq!(
+        owner_row["metadata"]["fromPrincipalId"],
+        json!(owner_principal_id),
+        "owner row keeps its principal stamp: {owner_row}"
+    );
+
+    for (ws, id) in [(&mut rpc, 21), (&mut guest_rpc, 105)] {
+        let queue = wss_rpc(ws, id, "agent.getQueue", json!({ "agentId": agent_id })).await;
+        assert!(
+            queue["queue"].as_array().expect("queue array").is_empty(),
+            "queue empty after flush: {queue}"
+        );
+    }
+}
+
+/// Entry ids of one `agent.diagnostics` `queues[]` row, in drain order.
+fn diagnostics_entry_ids(queue_row: &Value) -> Vec<String> {
+    queue_ids(&queue_row["entries"])
+}
+
+/// FLUSH-5 (`agent.diagnostics`, two members): the owner (administrator)
+/// and a collaborator (`guest`) each queue ONE entry behind the target's
+/// busy turn, and a sibling agent queues a third via `ws.agent.send(…,
+/// 'queue')` — the agent-sent tier no wire caller can forge. `queues[]` is
+/// projected to the bound caller exactly like `agent.getQueue`
+/// (`intent_core::project_queue_for_caller`), and the wire reaches it only
+/// for the administrator:
+///
+/// 1. As the guest: `agent.diagnostics` is outside the collaborator
+///    allowlist (`COLLABORATOR_METHODS`), so the envelope is
+///    `{ jsonrpc: "2.0", id, error: { code: -32003, message: "Forbidden" } }`
+///    with no `result` — the transport refuses before the router runs. The
+///    guest-side projection (own + agent-sent entries, owner's hidden) is
+///    the services harness's cell, not a WSS-observable one.
+/// 2. As the owner: `{ jsonrpc: "2.0", id, result }` (no `error`),
+///    `result.ok` is true, `queues` holds ONE row for the target whose
+///    `entries` are all three in drain order (`[owner, guest, agent-sent]`)
+///    with each entry's attribution intact, `queueLength` 3 and
+///    `summary.queuedAgents` 1.
+#[tokio::test]
+async fn diagnostics_projects_queues_per_caller_over_wss() {
+    let Some(script) = gate("WSS agent.diagnostics queue projection E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, guest) = seed_workspace_with_guest(&data_dir).await;
+    // The target's kick-off turn is a barrier (released at the end) so all
+    // three enqueues and both diagnostics reads land inside the busy window.
+    let kickoff_release = data_dir.join("release-kickoff");
+    let relay_code = format!(
+        "const agents = await ws.agent.list(true); \
+         const target = agents.find(a => a.name === 'WSS-DIAG-TARGET'); \
+         return await ws.agent.send(target.id, '{AGENT_QUEUED}', 'queue');"
+    );
+    let relay_rule = json!({
+        "ifPromptContains": RELAY_MARKER,
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": relay_code, "summary": "sibling queues on the busy target" }
+        },
+        "response": "relay dispatched"
+    });
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log: _,
+    } = boot_daemon(&data_dir, &script, 0, Some(&kickoff_release), &[relay_rule]).await;
+
+    // The owner's subscription observes the target's queue growing so the
+    // diagnostics reads run only once all three entries are parked.
+    let mut owner_sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut owner_sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "owner subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut guest_rpc = connect_ws_as(port, cfg.clone(), GUEST_TOKEN).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-DIAG-TARGET", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let target_id = created["agent"]["id"]
+        .as_str()
+        .expect("target agent id")
+        .to_string();
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-DIAG-SENDER", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let sender_id = created["agent"]["id"]
+        .as_str()
+        .expect("sender agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": target_id, "content": KICKOFF_MSG }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    assert_eq!(
+        sent["queued"], false,
+        "kick-off streams, not queued: {sent}"
+    );
+
+    // (a) owner-stamped, (b) guest-stamped, (c) agent-sent — in that order.
+    let owner_q = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.queueMessage",
+        json!({ "workspaceId": ws_id, "agentId": target_id, "content": OWNER_QUEUED }),
+    )
+    .await;
+    assert_eq!(owner_q["success"], true, "owner queue: {owner_q}");
+    let owner_id = owner_q["queuedMessage"]["id"]
+        .as_str()
+        .expect("owner entry id")
+        .to_string();
+    let guest_q = wss_rpc(
+        &mut guest_rpc,
+        100,
+        "agent.queueMessage",
+        json!({ "workspaceId": ws_id, "agentId": target_id, "content": GUEST_QUEUED }),
+    )
+    .await;
+    assert_eq!(guest_q["success"], true, "guest queue: {guest_q}");
+    let guest_id = guest_q["queuedMessage"]["id"]
+        .as_str()
+        .expect("guest entry id")
+        .to_string();
+    let relayed = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": sender_id, "content": RELAY_MARKER }),
+    )
+    .await;
+    assert_eq!(relayed["success"], true, "sender kick-off ok: {relayed}");
+    let grown =
+        await_queue_snapshots(&mut owner_sub, &target_id, |q| queue_ids(q).len() == 3).await;
+    let full = grown.last().expect("three-entry snapshot");
+    let full_ids = queue_ids(full);
+    assert_eq!(
+        &full_ids[..2],
+        [owner_id.clone(), guest_id.clone()],
+        "{full}"
+    );
+    let agent_entry_id = full_ids[2].clone();
+    assert_eq!(
+        full[2]["messageMetadata"]["fromAgentId"],
+        json!(sender_id),
+        "third entry is the sibling's agent-sent one: {full}"
+    );
+    assert!(
+        full[2]["messageMetadata"].get("fromPrincipalId").is_none(),
+        "agent-sent entry carries no principal stamp: {full}"
+    );
+
+    let diagnostics_params = json!({ "workspaceId": ws_id, "agentId": target_id });
+
+    // (1) Guest: refused at the transport — `agent.diagnostics` is not a
+    // collaborator method, so no projected view ever reaches the wire.
+    let guest_env = wss_rpc_envelope(
+        &mut guest_rpc,
+        101,
+        "agent.diagnostics",
+        diagnostics_params.clone(),
+    )
+    .await;
+    assert_eq!(guest_env["jsonrpc"], "2.0", "{guest_env}");
+    assert_eq!(guest_env["id"], json!(101), "{guest_env}");
+    assert!(guest_env.get("result").is_none(), "{guest_env}");
+    assert_eq!(
+        guest_env["error"],
+        json!({ "code": -32003, "message": "Forbidden" }),
+        "collaborator allowlist refuses agent.diagnostics: {guest_env}"
+    );
+
+    // (2) Owner: all three, in drain order, attribution intact.
+    let owner_env = wss_rpc_envelope(&mut rpc, 15, "agent.diagnostics", diagnostics_params).await;
+    assert_eq!(owner_env["jsonrpc"], "2.0", "{owner_env}");
+    assert_eq!(owner_env["id"], json!(15), "{owner_env}");
+    assert!(owner_env.get("error").is_none(), "{owner_env}");
+    let result = &owner_env["result"];
+    assert_eq!(result["ok"], true, "{result}");
+    let queues = result["diagnostics"]["queues"]
+        .as_array()
+        .unwrap_or_else(|| panic!("queues array: {result}"));
+    assert_eq!(queues.len(), 1, "one queued agent in scope: {result}");
+    let owner_row = &queues[0];
+    assert_eq!(owner_row["agentId"], json!(target_id), "{result}");
+    assert_eq!(owner_row["agentName"], json!("WSS-DIAG-TARGET"), "{result}");
+    assert_eq!(
+        result["diagnostics"]["summary"]["queuedAgents"],
+        json!(1),
+        "{result}"
+    );
+    assert_eq!(
+        diagnostics_entry_ids(owner_row),
+        vec![owner_id, guest_id, agent_entry_id],
+        "owner sees the full queue: {owner_row}"
+    );
+    assert_eq!(owner_row["queueLength"], json!(3), "{owner_row}");
+    let entries = owner_row["entries"].as_array().expect("entries array");
+    assert!(
+        entries[0]["messageMetadata"]["fromPrincipalId"]
+            .as_str()
+            .is_some_and(|p| p != guest.id.0),
+        "owner entry is stamped with the administrator's principal: {owner_row}"
+    );
+    assert_eq!(
+        entries[1]["messageMetadata"]["fromPrincipalId"],
+        json!(guest.id.0),
+        "guest entry keeps its principal stamp: {owner_row}"
+    );
+    assert_eq!(
+        entries[2]["messageMetadata"]["fromAgentId"],
+        json!(sender_id),
+        "agent-sent entry keeps its agent stamp: {owner_row}"
+    );
+
+    std::fs::write(&kickoff_release, b"go").expect("write kick-off release file");
 }

@@ -11,11 +11,12 @@ use crate::ids::{
     AgentId, ClientId, HookId, NoteId, PrMonitorId, PrincipalId, WorkspaceGitRootId, WorkspaceId,
 };
 use crate::model::{
-    AgentDelegateInput, AgentListRowScope, AgentLite, AgentScopeCounts, AgentSession, BrowserTab,
-    BrowserTabInput, ClientHostInfo, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentResolveThreadResult, CommentRespondResult, ContextItem, Draft,
-    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts, GitPullResult, GitStatus,
+    AgentDelegateInput, AgentDelegatedCounts, AgentListRowScope, AgentLite, AgentScopeCounts,
+    AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo, CommentAddResult,
+    CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentResolveThreadResult,
+    CommentRespondResult, ContextItem, Draft, EventQueryParams, EventSubscribeResult,
+    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
+    GitMergeConflicts, GitPullResult, GitStatus, InvitePin, InviteProofClaim,
     LineAttributionComputeResult, LineAttributionData, MessageOrigin, Note, NoteAddInput,
     NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
@@ -25,7 +26,8 @@ use crate::model::{
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
     TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
-    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceSetupStatus, WorkspaceTask,
+    WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -77,6 +79,18 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::get_workspace not implemented".to_string(),
             ))
         })
+    }
+
+    /// The daemon-owned, in-memory setup-stage state for `id` (§6.5
+    /// lifecycle: `pending` → `running` → `completed` | `failed`, or
+    /// `skipped`), backing `ws.workspace.details().setupStatus` and the
+    /// turn-start setup notice. Synchronous (no I/O); a workspace with no
+    /// record in this daemon lifetime — including every workspace created
+    /// before boot — reads `state: "unknown"`, which is also the default so
+    /// non-services `WorkspaceApi` impls need not implement it.
+    fn workspace_setup_status(&self, id: &WorkspaceId) -> WorkspaceSetupStatus {
+        let _ = id;
+        WorkspaceSetupStatus::unknown()
     }
 
     /// `workspace.diskUsage`: on-demand cached physical footprint of the
@@ -1526,6 +1540,20 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_scope_counts not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Per-parent non-retired delegated session counts — the `delegatedCounts`
+    /// field attached to every `agent.list` response variant (PROTOCOL §5.5).
+    fn agent_delegated_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<AgentDelegatedCounts>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_delegated_counts not implemented".to_string(),
             ))
         })
     }
@@ -4325,8 +4353,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.connect`: start (or return the still-pending) GitHub OAuth
-    /// device flow → `{ ok, userCode, verificationUri, expiresIn, interval }`.
-    /// The daemon polls GitHub in the background and emits
+    /// device flow → `{ ok, flowId, userCode, verificationUri, expiresIn,
+    /// interval }`. `flowId` is the opaque handle `github.cancelAuth` scopes
+    /// to. The daemon polls GitHub in the background and emits
     /// `github:auth-changed` on terminal transitions; the token is persisted
     /// server-side and never crosses the wire.
     fn github_connect(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -4339,7 +4368,15 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.cancelAuth`: abort the in-flight device flow, if any →
     /// `{ ok, cancelled }` (`cancelled: false` when nothing was pending).
-    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+    /// With `flow_id` (the `flowId` a `github.connect` returned) only that
+    /// flow is cancelled: any other pending flow is left untouched and the
+    /// call answers `cancelled: false`. `None` cancels whichever flow is
+    /// pending.
+    fn github_cancel_auth(
+        &self,
+        flow_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = flow_id;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_cancel_auth not implemented".to_string(),
@@ -4445,6 +4482,188 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.identityProof.create`: publish a host-issued `nonce` in a
+    /// **secret gist** created with the stored GitHub token (guest half of
+    /// the gist identity-proof join flow) → `{ gistId, login }`. Refused
+    /// with `Error::IdentityProof` (`github-not-connected` when no token is
+    /// stored or GitHub rejects it, `github-scope-missing` when the token
+    /// lacks the `gist` scope, `github-unreachable` on transport failure).
+    /// Owner-client only. Never returns the token.
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (nonce, host_label);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_identity_proof_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.identityProof.delete`: delete a proof gist created by
+    /// `github.identityProof.create` → `{ ok: true }`. Idempotent (an
+    /// already-deleted gist is `ok`); same bounded `Error::IdentityProof`
+    /// codes as create, the `gist`-scope check included. The gist is read
+    /// back before the delete and must be a proof gist (exactly one file,
+    /// `intent-join-proof.txt`); any other gist of the account is refused
+    /// with `-32602` and nothing is deleted. Owner-client only.
+    fn github_identity_proof_delete(
+        &self,
+        gist_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = gist_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_identity_proof_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.identityProof.create` (protocol 10.8): the
+    /// provider-generic form of `github.identityProof.create`. `provider` is
+    /// `github` (a secret gist, as the alias) or `gitlab` (a **public**
+    /// personal snippet on `host` — the bound instance when omitted); the
+    /// proof is made with the stored token for that `(provider, host)` only.
+    /// → `{ proofId, provider, host, login, externalUserId, avatarUrl }`
+    /// (`externalUserId` / `avatarUrl` are `null` when the forge's create
+    /// does not report them — GitHub). Refused with `Error::IdentityProof`
+    /// (`<provider>-not-connected` / `-scope-missing` / `-unreachable`).
+    /// Owner-client only. Never returns the token.
+    fn source_control_identity_proof_create(
+        &self,
+        provider: String,
+        host: Option<String>,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, nonce, host_label);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_identity_proof_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.identityProof.delete` (protocol 10.8): delete the
+    /// proof `proofId` (a gist id / snippet id) created by
+    /// `sourceControl.identityProof.create` for the same `(provider, host)`
+    /// → `{ ok: true }`. Idempotent (an already-deleted proof is `ok`); the
+    /// proof is read back first and anything that is not an Intent proof is
+    /// refused with `-32602`, nothing deleted. Same bounded
+    /// `Error::IdentityProof` codes as create. Owner-client only.
+    fn source_control_identity_proof_delete(
+        &self,
+        provider: String,
+        host: Option<String>,
+        proof_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, proof_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_identity_proof_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ========================================================================
+    // sourceControl.* — provider-generic forge auth (PROTOCOL §5.27
+    // "Provider-generic auth — `sourceControl.*`", v10.5). `provider` is
+    // `"github"` | `"gitlab"` (anything else → `-32602`); `host` is
+    // gitlab-only (a non-empty host with `provider: "github"` → `-32602`).
+    // The `github.authStatus` / `connect` / `cancelAuth` / `revoke` /
+    // `getUser` quintet above is served as aliases of these with
+    // `provider: "github"` pinned and the additive fields projected away.
+    // ========================================================================
+
+    /// `sourceControl.authStatus { provider, host? }`: the `github.authStatus`
+    /// shape plus additive `provider`, `host`, `method`
+    /// (`"device" | "pat" | "env" | null`), `user?` (iff `isConfigured`) and
+    /// `deviceGrantSupported`.
+    fn source_control_auth_status(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_auth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.connect { provider, host?, method?, token? }`: start (or
+    /// return the still-pending) device grant for `(provider, host)` →
+    /// `{ ok, userCode, verificationUri, expiresIn, interval }`, or with
+    /// `method: "pat"` validate + persist the in-band `token` →
+    /// `{ ok: true, method: "pat" }`. 🔒 `token` is never logged or echoed.
+    /// A provider holds one credential for one bound host, so a connect that
+    /// binds `host` — device or PAT — supersedes a device flow still pending
+    /// for any host (its late completion is discarded: no write, no event).
+    fn source_control_connect(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, method, token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_connect not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.cancelAuth { provider, host? }`: abort the pending device
+    /// grant for `(provider, host)` → `{ ok: true, cancelled }`.
+    fn source_control_cancel_auth(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_cancel_auth not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.revoke { provider, host? }`: delete the stored
+    /// `sourceControl.<provider>.token`, abort any in-flight grant and emit
+    /// `sourceControl:auth-changed { status: "revoked" }` → `{ ok: true }`.
+    fn source_control_revoke(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_revoke not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.getUser { provider, host? }`: the authenticated identity
+    /// from the host's user probe → `{ user: SourceControlUser | null }`; a
+    /// rejected credential → `source-control-unauthorized`.
+    fn source_control_get_user(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_get_user not implemented".to_string(),
+            ))
+        })
+    }
+
     // ========================================================================
     // principal.* (multiplayer w1)
     // ========================================================================
@@ -4458,6 +4677,21 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::principal_me not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `principal.list` (direct member add): the host's credentialed guests
+    /// → `{ principals: [{ principalId, login?, displayName?, avatarUrl?,
+    /// githubUserId? }] }` — every non-primary principal holding at least
+    /// one active (non-revoked) credential, by `createdAt`; a guest that
+    /// revoked itself is omitted (it cannot connect). No params.
+    /// Owner-only: a per-principal (collaborator) wire caller is
+    /// `Forbidden`; the administrator, agents and the daemon pass.
+    fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::principal_list not implemented".to_string(),
             ))
         })
     }
@@ -4476,6 +4710,27 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_members_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.members.add` (direct member add): attach an existing
+    /// credentialed guest as a collaborator → `{ added: bool, memberCount }`;
+    /// `added: false` when the principal is already a member (idempotent,
+    /// nothing published). Owner-only. `InvalidParams` for an unknown
+    /// principal, the primary principal, or a principal without an active
+    /// credential; `guest-limit` when the workspace's guest cap is spent.
+    /// On an add the same `workspace:updated { members: true,
+    /// addedPrincipalId, memberCount }` an invite join publishes.
+    fn workspace_members_add(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_members_add not implemented".to_string(),
             ))
         })
     }
@@ -4662,27 +4917,30 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `workspace.invite.create` (multiplayer w4), service half: mint a
-    /// single-use invite for `workspace_id` → `{ invite, secret }`. The
-    /// plaintext `secret` is persisted next to its hash (migration `0128`)
-    /// so the owner can copy the link again later, but it never serialises
-    /// as a field: this result carries it exactly once, and afterwards it
-    /// reaches the wire only inside the rebuilt `url` of
-    /// `workspace_invite_list`. Owner-only.
+    /// `workspace.invite.create` (multiplayer w4), service half: mint an
+    /// invite for `workspace_id` → `{ invite, secret }`. Unpinned, the invite
+    /// is reusable until it expires or is revoked; pinned, it is single-use
+    /// (`invite.reusable` on the wire). The plaintext `secret` is persisted
+    /// next to its hash (migration `0128`) so the owner can copy the link
+    /// again later, but it never serialises as a field: this result carries
+    /// it exactly once, and afterwards it reaches the wire only inside the
+    /// rebuilt `url` of `workspace_invite_list`. Owner-only.
     /// Refused with `InviteErrorKind::GithubIdentityRequired` unless the
-    /// owner's GitHub identity is linked; `pin_login` (a GitHub login) is
-    /// resolved to its account id and stored as the pin
-    /// (`InviteErrorKind::PinUnknown` when it names no account). The first
-    /// invite of a workspace sets its `legacy_author_principal_id` to the
-    /// owner when unset. `expires_in_secs` defaults to 7 days. The transport
-    /// wraps the result into the `intent://invite?…` link.
+    /// owner carries a linked forge identity (github or gitlab); `pin` names
+    /// the login to pin to on `pin.provider` / `pin.host` (both default to
+    /// the owner's own identity forge), resolved to its account and stored
+    /// as the pin triple (`InviteErrorKind::PinUnknown` when it names no
+    /// account). The first invite of a workspace sets its
+    /// `legacy_author_principal_id` to the owner when unset.
+    /// `expires_in_secs` defaults to 7 days. The transport wraps the result
+    /// into the `intent://invite?…` link.
     fn workspace_invite_create(
         &self,
         workspace_id: WorkspaceId,
-        pin_login: Option<String>,
+        pin: Option<InvitePin>,
         expires_in_secs: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, pin_login, expires_in_secs);
+        let _ = (workspace_id, pin, expires_in_secs);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_invite_create not implemented".to_string(),
@@ -4695,8 +4953,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// serialised `WorkspaceInvite` (secrets never included as fields) plus
     /// the additive `url`, the invite's `intent://invite?…` link rebuilt from
     /// the stored secret; `url` is omitted when the row predates the stored
-    /// secret or no link can be built right now (listener down, no dialable
-    /// route). Owner-only.
+    /// secret or no link can be built right now (listener down, tunnel
+    /// down — invite links are tunnel-only). Owner-only.
     fn workspace_invite_list(
         &self,
         workspace_id: WorkspaceId,
@@ -4725,12 +4983,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `invite.redeem` phase 1 (multiplayer w4, unauthenticated `/invite`
-    /// endpoint): validate `(invite_id, secret)` and start an identity-only
-    /// GitHub device flow → `{ flowId, userCode, verificationUri, expiresIn,
-    /// interval, workspaceId, workspaceTitle }`. The access token the flow
-    /// yields is used once for `GET /user` and never persisted.
-    fn invite_redeem_start(
+    /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
+    /// endpoint): validate `(invite_id, secret)` — the
+    /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
+    /// revoked / (pinned and) redeemed link — and answer
+    /// `{ workspaceId, workspaceTitle, pinIdentity }` without contacting a
+    /// forge or issuing a nonce. `pinIdentity` is the required
+    /// `{ provider, host, externalUserId }` triple (including legacy GitHub
+    /// pins), or explicit `null` for an unpinned link; older daemons omit it.
+    /// Errors disclose no pin. The `/invite` transport
+    /// extends the result with the host's `hostname` / `prettyHostname`
+    /// (same sources as `system.status`), so a client can show the consent
+    /// prompt before it decides between `invite.accept` and
+    /// `invite.challenge` / `invite.prove`.
+    fn invite_inspect(
         &self,
         invite_id: String,
         secret: String,
@@ -4738,22 +5004,95 @@ pub trait WorkspaceApi: Send + Sync {
         let _ = (invite_id, secret);
         Box::pin(async {
             Err(Error::Internal(
-                "WorkspaceApi::invite_redeem_start not implemented".to_string(),
+                "WorkspaceApi::invite_inspect not implemented".to_string(),
             ))
         })
     }
 
-    /// `invite.redeem` phase 2 (multiplayer w4): wait for the flow started by
-    /// [`Self::invite_redeem_start`] to settle → `{ status: "authorized",
-    /// token, principalId, login, workspaceId }` exactly once (the flow is
-    /// forgotten after the result is collected), or the terminal
-    /// [`crate::InviteErrorKind`] error (denied / expired / pin mismatch /
-    /// invite closed meanwhile).
-    fn invite_redeem_wait(&self, flow_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = flow_id;
+    /// `invite.accept` (multiplayer w4, unauthenticated `/invite` endpoint):
+    /// the returning guest's join. `credential` is a per-principal bearer
+    /// credential this host minted earlier (another workspace's join);
+    /// its hash resolves the principal like the `/ws` bearer gate does —
+    /// unknown or revoked is [`crate::InviteErrorKind::CredentialInvalid`]
+    /// (`credential-invalid`); one bound to the primary principal (the host
+    /// owner's own account) is [`crate::InviteErrorKind::OwnerSelfJoin`]
+    /// (`owner-self-join`). The invite is then validated like
+    /// [`Self::invite_inspect`], a pin is checked against the
+    /// principal's stored `github_user_id` (`invite-pin-mismatch`), and the
+    /// join commits with the stored identity (no GitHub call, no profile
+    /// refresh) → the [`Self::invite_prove`] shape
+    /// `{ status: "authorized", token, principalId, login, workspaceId }`
+    /// with a fresh credential.
+    fn invite_accept(
+        &self,
+        invite_id: String,
+        secret: String,
+        credential: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret, credential);
         Box::pin(async {
             Err(Error::Internal(
-                "WorkspaceApi::invite_redeem_wait not implemented".to_string(),
+                "WorkspaceApi::invite_accept not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.challenge` (gist identity-proof join, unauthenticated
+    /// `/invite` endpoint): validate `(invite_id, secret)` exactly like
+    /// [`Self::invite_inspect`] and issue a single-use nonce bound to the
+    /// invite → `{ workspaceId, workspaceTitle, pinIdentity, nonce, nonceExpiresAt }`.
+    /// `pinIdentity` has the same triple-or-null semantics as `inspect`.
+    /// The nonce is 32 random bytes (base64url, unpadded), lives 10 minutes
+    /// and is consumed by the first [`Self::invite_prove`] that names it.
+    /// No forge is contacted. The `/invite` transport extends the result
+    /// with the host's `hostname` / `prettyHostname`.
+    fn invite_challenge(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_challenge not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `invite.prove` (forge identity-proof join, unauthenticated `/invite`
+    /// endpoint): the guest published `nonce` in a proof under its own
+    /// account — a gist on GitHub, a personal snippet on GitLab — and names
+    /// it in `claim` (`proof_id`, `login`, the forge `provider` / `host`;
+    /// protocol 10.8). The host reads the proof back through the provider
+    /// seam and requires the owner login to equal `login`
+    /// (case-insensitively), the proof file to start with the nonce and the
+    /// proof to have been created no earlier than the nonce was issued; then
+    /// resolves the account and commits the join → `{ status: "authorized",
+    /// token, principalId, login, workspaceId }`; the joined principal
+    /// carries the forge's identity triple. Refusals:
+    /// [`crate::InviteErrorKind::ProofInvalid`]
+    /// (any mismatch, an unknown proof, or a nonce not issued for this invite
+    /// / already consumed), [`crate::InviteErrorKind::ProofExpired`],
+    /// [`crate::InviteErrorKind::GithubUnreachable`],
+    /// [`Error::IdentityUnverifiable`] (a GitLab instance that will not
+    /// serve the proof to this host); [`crate::InviteErrorKind::OwnerSelfJoin`]
+    /// (`owner-self-join`) when the proven account is the primary
+    /// principal's own — the host owner cannot join its own host as a guest
+    /// and no credential is minted; a closed invite, a pin mismatch and a
+    /// full workspace answer their existing kinds. The nonce is consumed by
+    /// the first attempt that reaches the verification, except when the
+    /// forge was unreachable (the guest may retry).
+    fn invite_prove(
+        &self,
+        invite_id: String,
+        secret: String,
+        nonce: String,
+        claim: InviteProofClaim,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (invite_id, secret, nonce, claim);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::invite_prove not implemented".to_string(),
             ))
         })
     }
@@ -7203,9 +7542,13 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.pr.monitor`: register (idempotently) a centralized monitor on
     /// `pr_number` for `agent_id`, returning the monitor row plus the freshly
-    /// fetched merge-requirements checklist. `repo` is an optional
-    /// `"owner/name"` override; `None` resolves the workspace repo. MCP-only
-    /// — monitors are agent-owned, so there is no wire registration method.
+    /// fetched merge-requirements checklist — `requirements: null` plus a
+    /// `pausedUntil` deadline when the forge quota is exhausted and the
+    /// baseline fetch is deferred to the end of the daemon's global
+    /// rate-limit pause (the monitor is still registered). `repo` is an
+    /// optional `"owner/name"` override; `None` resolves the workspace repo.
+    /// MCP-only — monitors are agent-owned, so there is no wire registration
+    /// method.
     fn pr_monitor_start(
         &self,
         workspace_id: WorkspaceId,

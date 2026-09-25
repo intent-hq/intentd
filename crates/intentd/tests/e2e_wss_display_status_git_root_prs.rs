@@ -202,6 +202,7 @@ fn pr_info(number: u64, status: PullRequestStatus) -> PullRequestInfo {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     }
 }
 

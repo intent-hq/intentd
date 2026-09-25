@@ -35,6 +35,23 @@ fn registry_first_provider_and_lookups() {
 /// (behavior unchanged), and the warn gate fires only for genuinely unknown
 /// ids — not for empty ids or legacy default aliases.
 #[test]
+fn legacy_alias_lookup_retains_unknown_provider_distinction() {
+    for id in all_provider_ids() {
+        assert_eq!(find_provider_or_legacy_alias(id).unwrap().id, id);
+    }
+    for alias in ["default", "acp", "augment"] {
+        assert_eq!(
+            find_provider_or_legacy_alias(alias).unwrap().id,
+            provider_config(alias).id
+        );
+        assert_eq!(find_provider_or_legacy_alias(alias).unwrap().id, "auggie");
+    }
+    for unknown in ["", "nope", "pi-typo"] {
+        assert!(find_provider_or_legacy_alias(unknown).is_none());
+    }
+}
+
+#[test]
 fn unknown_provider_fallback_warn_gate() {
     // Fallback behavior is preserved for every suppressed alias and for
     // genuinely unknown ids.
@@ -126,7 +143,12 @@ fn registry_field_parity() {
 
     let codex = find_provider("codex").unwrap();
     assert_eq!(codex.auth_check_args, Some(&["login", "status"][..]));
-    assert_eq!(codex.npx_only_package, None);
+    assert_eq!(
+        codex.npx_only_package,
+        Some(crate::config::CODEX_ACP_NPX_PACKAGE)
+    );
+    assert_eq!(codex.fallback_npx_package, None);
+    assert!(!codex.npx_only_honors_path_override);
 
     let cortex = find_provider("cortex").unwrap();
     assert_eq!(cortex.command, "cortex-acp");
@@ -260,7 +282,7 @@ fn session_mcp_servers_partition() {
 /// These providers apply the stored model post-session via
 /// `session/set_config_option { configId: "model" }` (their pinned adapters
 /// expose the model as a `configOptions[id="model"]` select; claude-code and
-/// pi have no CLI model flag, and codex's npx-fallback adapter ignores the
+/// pi have no CLI model flag, and codex's pinned npx adapter ignores the
 /// `-c model=…` argv overrides). Asserted over the full registry so a newly
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
@@ -310,7 +332,7 @@ fn pi_resolves_in_registry_with_pinned_npx_package() {
     assert_eq!(provider_config("pi").id, "pi");
     let pi = find_provider("pi").expect("pi is registered");
     assert_eq!(pi.command, "pi-acp");
-    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.33");
+    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.34");
     assert_eq!(pi.npx_only_package, Some(PI_ACP_NPX_PACKAGE));
 }
 
@@ -577,7 +599,7 @@ fn provider_runtimes() {
     assert_eq!(runtime("unsloth"), ProviderRuntime::Node);
     assert_eq!(runtime("mock"), ProviderRuntime::Node);
     assert_eq!(runtime("cortex"), ProviderRuntime::Electron);
-    assert_eq!(runtime("codex"), ProviderRuntime::Native);
+    assert_eq!(runtime("codex"), ProviderRuntime::Node);
     assert_eq!(runtime("droid"), ProviderRuntime::Native);
     assert_eq!(runtime("grok"), ProviderRuntime::Native);
 }
@@ -708,6 +730,61 @@ impl Drop for EnvGuard {
     }
 }
 
+#[test]
+fn codex_initial_mode_defaults_to_full_access_without_replacing_explicit_values() {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let _mode_guard = EnvGuard::new("INITIAL_AGENT_MODE");
+    let env_for = |id: &str, via_npx: bool| {
+        args::build_provider_env_for_spawn(
+            find_provider(id).unwrap(),
+            None,
+            None,
+            None,
+            None,
+            via_npx,
+            None,
+        )
+    };
+
+    std::env::remove_var("INITIAL_AGENT_MODE");
+    for via_npx in [false, true] {
+        assert_eq!(
+            env_for("codex", via_npx)
+                .get("INITIAL_AGENT_MODE")
+                .map(String::as_str),
+            Some("agent-full-access")
+        );
+        for id in all_provider_ids().into_iter().filter(|id| *id != "codex") {
+            assert!(
+                !env_for(id, via_npx).contains_key("INITIAL_AGENT_MODE"),
+                "{id} must not receive a Codex mode default"
+            );
+        }
+    }
+
+    let explicit_values = [
+        std::ffi::OsString::from("agent"),
+        std::ffi::OsString::from("read-only"),
+        std::ffi::OsString::from("agent-full-access"),
+        std::ffi::OsString::from(""),
+        std::ffi::OsString::from("invalid-mode"),
+        #[cfg(unix)]
+        std::ffi::OsString::from_vec(vec![0xff]),
+    ];
+    for value in explicit_values {
+        std::env::set_var("INITIAL_AGENT_MODE", &value);
+        for via_npx in [false, true] {
+            assert!(
+                !env_for("codex", via_npx).contains_key("INITIAL_AGENT_MODE"),
+                "explicit mode {value:?} must be inherited unchanged"
+            );
+        }
+    }
+}
+
 /// STAB-50: `NODE_OPTIONS` heap-cap injection for V8-runtime (Node/Electron)
 /// providers. All scenarios run inside one test fn because they mutate
 /// process-global env vars — parallel test threads must not race on
@@ -756,6 +833,7 @@ fn v8_runtime_node_options_heap_cap() {
     for id in [
         "auggie",
         "claude-code",
+        "codex",
         "opencode",
         "unsloth",
         "cortex",
@@ -768,7 +846,7 @@ fn v8_runtime_node_options_heap_cap() {
         );
     }
     // Native runtimes get no NODE_OPTIONS.
-    for id in ["codex", "droid", "grok"] {
+    for id in ["droid", "grok"] {
         assert!(
             !env_for(id).contains_key("NODE_OPTIONS"),
             "native provider {id} must not get NODE_OPTIONS"
@@ -776,22 +854,22 @@ fn v8_runtime_node_options_heap_cap() {
     }
 
     // Spawn-time npx signal: an npx spawn always runs a Node child, so even
-    // a declared-Native provider (codex's npx fallback) gets the cap; the
+    // a declared-Native provider (modeled with droid here) gets the cap; the
     // same provider without the signal (resolved native binary) stays
     // untouched (intent-hq/monorepo#1661).
-    let codex = find_provider("codex").unwrap();
-    let codex_via_npx =
-        args::build_provider_env_for_spawn(codex, None, None, None, None, true, None);
+    let native = find_provider("droid").unwrap();
+    let native_via_npx =
+        args::build_provider_env_for_spawn(native, None, None, None, None, true, None);
     assert_eq!(
-        codex_via_npx.get("NODE_OPTIONS").map(String::as_str),
+        native_via_npx.get("NODE_OPTIONS").map(String::as_str),
         Some("--max-old-space-size=8192"),
-        "codex npx-fallback spawn must get the heap cap"
+        "npx spawn must get the heap cap even for a declared native provider"
     );
-    let codex_native =
-        args::build_provider_env_for_spawn(codex, None, None, None, None, false, None);
+    let native_direct =
+        args::build_provider_env_for_spawn(native, None, None, None, None, false, None);
     assert!(
-        !codex_native.contains_key("NODE_OPTIONS"),
-        "codex resolved-binary spawn must not get NODE_OPTIONS"
+        !native_direct.contains_key("NODE_OPTIONS"),
+        "native resolved-binary spawn must not get NODE_OPTIONS"
     );
 
     // `agents.acpNodeMaxOldSpaceMb` setting (no env override): the supplied
@@ -812,6 +890,7 @@ fn v8_runtime_node_options_heap_cap() {
     for id in [
         "auggie",
         "claude-code",
+        "codex",
         "opencode",
         "unsloth",
         "cortex",
@@ -830,9 +909,9 @@ fn v8_runtime_node_options_heap_cap() {
             .get("NODE_OPTIONS")
             .map(String::as_str),
         Some("--max-old-space-size=4096"),
-        "codex npx-fallback spawn should honor the configured setting"
+        "codex npx spawn should honor the configured setting"
     );
-    for id in ["codex", "droid", "grok"] {
+    for id in ["droid", "grok"] {
         assert!(
             !env_for_spawn(id, false, Some(4096)).contains_key("NODE_OPTIONS"),
             "native provider {id} must not get NODE_OPTIONS even with a setting"
@@ -854,6 +933,7 @@ fn v8_runtime_node_options_heap_cap() {
     for id in [
         "auggie",
         "claude-code",
+        "codex",
         "opencode",
         "unsloth",
         "cortex",
@@ -878,6 +958,7 @@ fn v8_runtime_node_options_heap_cap() {
     for id in [
         "auggie",
         "claude-code",
+        "codex",
         "opencode",
         "unsloth",
         "cortex",
@@ -895,6 +976,7 @@ fn v8_runtime_node_options_heap_cap() {
     for id in [
         "auggie",
         "claude-code",
+        "codex",
         "opencode",
         "unsloth",
         "cortex",
@@ -968,85 +1050,6 @@ fn fuzzy_and_override_resolution() {
         Some("sonnet4.5")
     );
     assert_eq!(resolve_preferred_model(&["x"], &["y"]), None);
-}
-
-#[test]
-fn codex_reasoning_effort_parsing() {
-    assert_eq!(
-        parse_codex_reasoning_effort("gpt-5.3-codex/high"),
-        ("gpt-5.3-codex".to_string(), Some("high".to_string()))
-    );
-    assert_eq!(
-        parse_codex_reasoning_effort("gpt-5.3-codex"),
-        ("gpt-5.3-codex".to_string(), None)
-    );
-}
-
-#[test]
-fn codex_upsert_config_args_quotes_and_replaces() {
-    // Fresh insert appends `-c key="value"`.
-    let args = upsert_codex_config_args(&[], "model", "gpt-5.3-codex");
-    assert_eq!(args, vec!["-c", "model=\"gpt-5.3-codex\""]);
-
-    // Existing value for the same key is replaced (old `-c model=…` dropped).
-    let prior = vec![
-        "exec".to_string(),
-        "-c".to_string(),
-        "model=\"old\"".to_string(),
-        "-c".to_string(),
-        "sandbox=\"danger\"".to_string(),
-    ];
-    let next = upsert_codex_config_args(&prior, "model", "new");
-    assert_eq!(
-        next,
-        vec!["exec", "-c", "sandbox=\"danger\"", "-c", "model=\"new\""]
-    );
-
-    // Embedded quotes are escaped.
-    let escaped = upsert_codex_config_args(&[], "model", "a\"b");
-    assert_eq!(escaped, vec!["-c", "model=\"a\\\"b\""]);
-}
-
-#[test]
-fn codex_apply_config_args_effort_resolution() {
-    // Effort embedded in the model id wins over the env fallback.
-    let from_model = apply_codex_config_args(
-        vec!["exec".to_string()],
-        Some("gpt-5.3-codex/high"),
-        Some("low"),
-    );
-    assert_eq!(
-        from_model,
-        vec![
-            "exec",
-            "-c",
-            "model=\"gpt-5.3-codex\"",
-            "-c",
-            "model_reasoning_effort=\"high\""
-        ]
-    );
-
-    // Bare model id falls back to env effort.
-    let from_env = apply_codex_config_args(vec![], Some("gpt-5.3-codex"), Some("medium"));
-    assert_eq!(
-        from_env,
-        vec![
-            "-c",
-            "model=\"gpt-5.3-codex\"",
-            "-c",
-            "model_reasoning_effort=\"medium\""
-        ]
-    );
-
-    // The `default` sentinel and `None` are no-ops.
-    assert_eq!(
-        apply_codex_config_args(vec!["exec".to_string()], Some("default"), None),
-        vec!["exec"]
-    );
-    assert_eq!(
-        apply_codex_config_args(vec!["exec".to_string()], None, Some("high")),
-        vec!["exec"]
-    );
 }
 
 #[test]

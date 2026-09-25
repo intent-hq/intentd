@@ -72,6 +72,27 @@ pub(crate) const DEPRECATED_ACTIVE_PROVIDER_PATH: &str = "providers.active";
 /// Settings path of the user-editable transcription vocabulary (§5.12).
 pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
 
+/// The secret-store siblings a forge token written / reset through the
+/// generic `settings.*` path must take with it, so the stored credential is
+/// classified by what the user just did rather than by what a device flow
+/// left behind: a `sourceControl.gitlab.token` written this way is a PAT (no
+/// refresh token / expiry — the auth-status probe must never refresh or
+/// disconnect over it with a stale grant), and a `sourceControl.github.token`
+/// written this way is `method: "pat"` (no device-flow marker). Other secrets
+/// have no siblings.
+pub(crate) fn forge_token_secret_siblings(path: &str) -> &'static [&'static str] {
+    if path == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT {
+        &[
+            intent_sourcecontrol::gitlab_token::REFRESH_SECRET_ACCOUNT,
+            intent_sourcecontrol::gitlab_token::EXPIRES_AT_SECRET_ACCOUNT,
+        ]
+    } else if path == crate::github_auth_ops::SECRET_ACCOUNT {
+        &[crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT]
+    } else {
+        &[]
+    }
+}
+
 /// Abstraction over secret persistence (the sensitive-setting analog of the
 /// transport's `TokenStore`). Production uses the file-backed
 /// [`intent_core::FileSecretStore`]; tests inject [`InMemorySecretStore`] so
@@ -163,6 +184,13 @@ const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
 /// Rate-limit window per account for the `secret-store load timed out` warning
 /// so a wedged backing store doesn't drown the daemon log.
 const DEFAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// Cap on how long a compensating write waits for a timed-out `store` /
+/// `delete` on the same account to finish ([`AsyncSecretStore::settle_detached`]).
+/// Three write budgets: long enough for a slow disk or a keychain prompt that
+/// is answered promptly, short enough that a wedged backing store cannot hold
+/// the settings gates (and every `settings.*` caller) indefinitely. Past the
+/// cap the credential state is unknown and the caller must not blind-restore.
+const DEFAULT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Async, single-flight, TTL-cached wrapper around a synchronous [`SecretStore`]
 /// so blocking secret-store calls (file I/O) never wedge
@@ -178,6 +206,7 @@ pub(crate) struct AsyncSecretStore {
     write_timeout: Duration,
     cache_ttl: Duration,
     warn_interval: Duration,
+    settle_timeout: Duration,
 }
 
 /// Per-account async state: cached values (with expiry) and in-flight load
@@ -189,6 +218,11 @@ struct AsyncState {
     /// Monotonic counter dispensing a unique `load_id` per in-flight load, so a
     /// delayed `spawn_blocking` result can tell whether it still owns the slot.
     next_load_id: u64,
+    /// Writes / deletes whose caller timed out. A `spawn_blocking` task cannot
+    /// be cancelled, so the mutation may still land; the handles are kept so
+    /// [`AsyncSecretStore::settle_detached`] can wait for them before a
+    /// compensating write touches the same account.
+    detached: Vec<(String, tokio::task::JoinHandle<Result<()>>)>,
 }
 
 /// One per-account cache slot: either an in-flight load that later resolvers
@@ -241,12 +275,22 @@ impl AsyncSecretStore {
                 entries: HashMap::new(),
                 last_warn: HashMap::new(),
                 next_load_id: 0,
+                detached: Vec::new(),
             })),
             load_timeout,
             write_timeout,
             cache_ttl,
             warn_interval,
+            settle_timeout: DEFAULT_SETTLE_TIMEOUT,
         }
+    }
+
+    /// Override the [`settle_detached`](Self::settle_detached) cap so a test can
+    /// drive the past-the-cap path without waiting out the production budget.
+    #[cfg(test)]
+    fn with_settle_timeout(mut self, settle_timeout: Duration) -> Self {
+        self.settle_timeout = settle_timeout;
+        self
     }
 
     /// Read the secret for `account`. `Ok(None)` when confirmed absent;
@@ -297,6 +341,22 @@ impl AsyncSecretStore {
         }
     }
 
+    /// Read `account` from the backing store, bypassing a cached slot. The
+    /// TTL cache only sees writes that go through this wrapper; the GitLab
+    /// device flow writes its `FileSecretStore` handle directly, so a write
+    /// path that decides whether to persist or delete on cached presence can
+    /// act on a stale answer. A load already in flight is joined as usual —
+    /// it is a live read of the backing store.
+    pub(crate) async fn load_fresh(&self, account: &str) -> Result<Option<String>> {
+        {
+            let mut state = self.state.lock().unwrap();
+            if matches!(state.entries.get(account), Some(Entry::Cached { .. })) {
+                state.entries.remove(account);
+            }
+        }
+        self.load(account).await
+    }
+
     /// Persist `value` for `account`. Runs the blocking write off the async
     /// runtime with a bounded timeout, then refreshes the cache slot so
     /// subsequent `load` calls observe the new value without re-hitting the
@@ -305,8 +365,9 @@ impl AsyncSecretStore {
         let inner = self.inner.clone();
         let account_owned = account.to_string();
         let value_owned = value.to_string();
-        let handle = tokio::task::spawn_blocking(move || inner.store(&account_owned, &value_owned));
-        match timeout(self.write_timeout, handle).await {
+        let mut handle =
+            tokio::task::spawn_blocking(move || inner.store(&account_owned, &value_owned));
+        match timeout(self.write_timeout, &mut handle).await {
             Ok(Ok(Ok(()))) => {
                 self.set_cached(account, Some(value.to_string()));
                 Ok(())
@@ -317,6 +378,7 @@ impl AsyncSecretStore {
             ))),
             Err(_) => {
                 self.warn_timeout(account, "secret-store write timed out");
+                self.detach(account, handle);
                 Err(Error::Internal(format!(
                     "secret-store write timed out for {account}"
                 )))
@@ -330,8 +392,8 @@ impl AsyncSecretStore {
     pub(crate) async fn delete(&self, account: &str) -> Result<()> {
         let inner = self.inner.clone();
         let account_owned = account.to_string();
-        let handle = tokio::task::spawn_blocking(move || inner.delete(&account_owned));
-        match timeout(self.write_timeout, handle).await {
+        let mut handle = tokio::task::spawn_blocking(move || inner.delete(&account_owned));
+        match timeout(self.write_timeout, &mut handle).await {
             Ok(Ok(Ok(()))) => {
                 self.set_cached(account, None);
                 Ok(())
@@ -342,11 +404,87 @@ impl AsyncSecretStore {
             ))),
             Err(_) => {
                 self.warn_timeout(account, "secret-store delete timed out");
+                self.detach(account, handle);
                 Err(Error::Internal(format!(
                     "secret-store delete timed out for {account}"
                 )))
             }
         }
+    }
+
+    /// Keep the handle of a timed-out write / delete so a later
+    /// [`settle_detached`](Self::settle_detached) can wait for it. Finished
+    /// handles are pruned on every insert, so the list stays bounded by the
+    /// number of mutations still running.
+    fn detach(&self, account: &str, handle: tokio::task::JoinHandle<Result<()>>) {
+        let mut state = self.state.lock().unwrap();
+        state.detached.retain(|(_, h)| !h.is_finished());
+        state.detached.push((account.to_string(), handle));
+    }
+
+    /// Wait until every timed-out write / delete on `account` has finished, so
+    /// a compensating write issued afterwards cannot be undone by a mutation
+    /// that was still running. `Ok(false)` when no such mutation existed,
+    /// `Ok(true)` once all of them landed (the cache slot is dropped because
+    /// the late completion bypassed the cache refresh). The wait is bounded by
+    /// [`DEFAULT_SETTLE_TIMEOUT`]: a `spawn_blocking` task cannot be cancelled,
+    /// so past the cap the mutation may still land later and the account's
+    /// state is unknown — `Err(Error::Internal)` tells the caller to surface
+    /// that instead of blind-restoring, and the unfinished handles go back on
+    /// the list so a later settle still waits for them.
+    pub(crate) async fn settle_detached(&self, account: &str) -> Result<bool> {
+        let handles: Vec<_> = {
+            let mut state = self.state.lock().unwrap();
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut state.detached)
+                .into_iter()
+                .partition(|(a, _)| a == account);
+            state.detached = rest;
+            mine.into_iter().map(|(_, h)| h).collect()
+        };
+        if handles.is_empty() {
+            return Ok(false);
+        }
+        let deadline = Instant::now() + self.settle_timeout;
+        let mut handles = handles.into_iter();
+        while let Some(mut handle) = handles.next() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match timeout(remaining, &mut handle).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => tracing::warn!(
+                    account = %account,
+                    error = %e,
+                    "timed-out secret-store mutation finished with an error"
+                ),
+                Ok(Err(join_err)) => tracing::warn!(
+                    account = %account,
+                    error = %join_err,
+                    "timed-out secret-store mutation panicked"
+                ),
+                Err(_) => {
+                    let unfinished: Vec<_> = std::iter::once(handle)
+                        .chain(handles)
+                        .map(|h| (account.to_string(), h))
+                        .collect();
+                    let pending = unfinished.len();
+                    self.state.lock().unwrap().detached.extend(unfinished);
+                    tracing::warn!(
+                        account = %account,
+                        pending,
+                        cap_secs = self.settle_timeout.as_secs_f64(),
+                        "secret-store mutation still running past the settle cap; credential state unknown"
+                    );
+                    return Err(Error::Internal(format!(
+                        "secret-store mutation on {account} still running after {:.0?}; the stored credential state is unknown — reconcile it (re-authenticate) before retrying",
+                        self.settle_timeout
+                    )));
+                }
+            }
+        }
+        let mut state = self.state.lock().unwrap();
+        if matches!(state.entries.get(account), Some(Entry::Cached { .. })) {
+            state.entries.remove(account);
+        }
+        Ok(true)
     }
 
     /// Kick off the blocking load for `account`, publishing the result via `tx`
@@ -487,6 +625,26 @@ impl AsyncSecretStore {
         if should {
             tracing::warn!(account = %account, "{msg}");
         }
+    }
+
+    /// Whether a call on `account` has hit its timeout (the rate-limited
+    /// warning was recorded) — lets tests sequence a release deterministically.
+    #[cfg(test)]
+    fn timed_out(&self, account: &str) -> bool {
+        self.state.lock().unwrap().last_warn.contains_key(account)
+    }
+
+    /// Timed-out mutations on `account` not yet claimed by
+    /// [`settle_detached`](Self::settle_detached).
+    #[cfg(test)]
+    fn detached_len(&self, account: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .detached
+            .iter()
+            .filter(|(a, _)| a == account)
+            .count()
     }
 }
 
@@ -635,6 +793,8 @@ impl SettingDefinition {
             }
             SettingType::Enum(values) => match value.as_str() {
                 Some(s) if values.contains(&s) => {}
+                // A nullable enum (no default) accepts `null` as "unset".
+                None if value.is_null() && self.default_value.is_none() => {}
                 _ => {
                     return invalid(format!(
                         "{}: must be one of [{}]",
@@ -958,6 +1118,28 @@ fn enumerated(
         category,
         ty: SettingType::Enum(values),
         default_value: Some(json!(default)),
+        sensitive: false,
+        read_only: false,
+        token_impact: None,
+    }
+}
+
+/// An [`enumerated`] setting without a default: unset (`null`) is a legal,
+/// distinct state, and a `null` write clears it.
+fn nullable_enumerated(
+    path: &'static str,
+    label: &'static str,
+    description: &'static str,
+    category: &'static str,
+    values: &'static [&'static str],
+) -> SettingDefinition {
+    SettingDefinition {
+        path,
+        label,
+        description,
+        category,
+        ty: SettingType::Enum(values),
+        default_value: None,
         sensitive: false,
         read_only: false,
         token_impact: None,
@@ -1429,6 +1611,44 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "sourceControl",
             true,
         ),
+        string(
+            "sourceControl.gitlab.host",
+            "GitLab host",
+            "The bound GitLab instance as a bare host[:port] (no scheme); written by a \
+             successful sourceControl.connect for gitlab",
+            "sourceControl",
+            Some(intent_core::settings_file::DEFAULT_GITLAB_HOST),
+        ),
+        secret(
+            "sourceControl.gitlab.token",
+            "GitLab token",
+            "Access token used by the GitLab client (device grant or personal access token)",
+            "sourceControl",
+        ),
+        string(
+            "sourceControl.gitlab.oauthClientId",
+            "GitLab OAuth client ID",
+            "Public OAuth application id for the device authorization grant against the \
+             host; empty means the built-in gitlab.com id (gitlab.com only)",
+            "sourceControl",
+            None,
+        ),
+        string(
+            "sourceControl.gitlab.apiBaseUrl",
+            "GitLab API base URL",
+            "Optional origin override for API calls to the bound host (test seam); never \
+             changes the reported host",
+            "sourceControl",
+            None,
+        ),
+        nullable_enumerated(
+            "identity.provider",
+            "Identity provider",
+            "The linked forge the primary user's identity is keyed by; unset means the only \
+             connected forge (github when both are). Changing it re-keys the primary identity",
+            "sourceControl",
+            &["github", "gitlab"],
+        ),
         // --- Group A: Linear integration --------------------------------------
         secret(
             "linear.token",
@@ -1894,11 +2114,20 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "prMonitor.quotaSharePercent",
             "PR monitor quota share percent",
-            "Share of the forge's REMAINING core quota (read once per tick from its quota-free rate_limit probe) the centralized loop may plan to spend before the window resets — the per-PR interval stretches above the hourly-budget cadence once PRs × 3 × secondsToReset would exceed that share of the remaining quota, so the monitor slows down before the shared rate-limit pause has to stop it; never below pollSeconds. A host without the signal uses the hourly budget alone (minimum 1, maximum 100)",
+            "Share of the forge's REMAINING PR-read quota (from shared authoritative probes) the centralized loop may plan to spend before the window resets — the per-PR interval stretches above the hourly-budget cadence once PRs × 3 × secondsToReset would exceed that share of the remaining quota, so the monitor slows down before the shared rate-limit pause has to stop it; never below pollSeconds. A host without the signal uses the hourly budget alone (minimum 1, maximum 100)",
             "prMonitor",
             Some(1.0),
             Some(100.0),
             50.0,
+        ),
+        number(
+            "prCache.maxAgeSeconds",
+            "PR cache max age seconds",
+            "How old (in seconds) a cached PR read may be and still be served to an on-demand reader (github.pulls.get, ws.pr.snapshot) without a forge call; PR-monitor polls refresh the shared cache (minimum 10, maximum 600)",
+            "prCache",
+            Some(10.0),
+            Some(600.0),
+            60.0,
         ),
         boolean(
             "updates.checkOnIdle",
@@ -2574,7 +2803,19 @@ impl<'a> SettingsService<'a> {
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
+                    // Decided against the backing store, not the TTL cache:
+                    // a device grant may have replaced the token behind the
+                    // cache. A forge token whose device-grant siblings are
+                    // still stored is a change even when the token repeats —
+                    // the write reclassifies the credential as a PAT.
+                    let mut unchanged = self.secrets.load_fresh(def.path).await?.as_deref()
+                        == Some(desired.as_str());
+                    for sibling in forge_token_secret_siblings(def.path) {
+                        if unchanged && self.secrets.load_fresh(sibling).await?.is_some() {
+                            unchanged = false;
+                        }
+                    }
+                    unchanged
                 }
             } else if let Some(reg) = self.registry_for(def.path) {
                 match reg.origin(def.path) {
@@ -2636,8 +2877,7 @@ impl<'a> SettingsService<'a> {
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    self.secrets
-                        .store(def.path, &secret_value)
+                    self.store_secret_and_clear_siblings(def.path, &secret_value)
                         .await
                         .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
                 }
@@ -2685,6 +2925,77 @@ impl<'a> SettingsService<'a> {
         Ok(applied)
     }
 
+    /// Persist `value` for the secret at `path`, then clear its
+    /// [`forge_token_secret_siblings`]. A sibling delete can fail after the
+    /// token already landed; the prior token and siblings are captured first
+    /// and restored (best effort, failures logged) so the caller's error never
+    /// leaves the new token persisted next to half-cleared grant metadata.
+    /// A timed-out write or delete is still running on the blocking pool, so
+    /// the restore waits for every such mutation on these accounts to settle
+    /// first — otherwise a late completion would undo the restore. If one is
+    /// still running past the settle cap the restore is skipped altogether and
+    /// the unknown-state error surfaces: a blind restore could race the late
+    /// completion, and the caller must reconcile the credential instead.
+    async fn store_secret_and_clear_siblings(&self, path: &str, value: &str) -> Result<()> {
+        let siblings = forge_token_secret_siblings(path);
+        if siblings.is_empty() {
+            return self.secrets.store(path, value).await;
+        }
+        let mut prior = Vec::with_capacity(siblings.len() + 1);
+        for account in std::iter::once(path).chain(siblings.iter().copied()) {
+            prior.push((account, self.secrets.load_fresh(account).await?));
+        }
+        let failure = match self.secrets.store(path, value).await {
+            Ok(()) => match self.clear_forge_token_secret_siblings(path).await {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            },
+            // A synchronous store error mutated nothing; a timed-out write may
+            // still land, so wait for it and then put the prior value back.
+            Err(e) => {
+                if !self.secrets.settle_detached(path).await? {
+                    return Err(e);
+                }
+                e
+            }
+        };
+        for (account, _) in &prior {
+            if let Err(settle_err) = self.secrets.settle_detached(account).await {
+                tracing::warn!(
+                    account = %account,
+                    error = %failure,
+                    "settings.update secret rollback skipped after forge token write error: a timed-out mutation is still running"
+                );
+                return Err(settle_err);
+            }
+        }
+        for (account, prior_value) in prior {
+            let restored = match prior_value {
+                Some(v) => self.secrets.store(account, &v).await,
+                None => self.secrets.delete(account).await,
+            };
+            if let Err(restore_err) = restored {
+                tracing::error!(
+                    account = %account,
+                    error = %restore_err,
+                    "settings.update secret rollback failed after forge token write error"
+                );
+            }
+        }
+        Err(failure)
+    }
+
+    /// Delete the [`forge_token_secret_siblings`] of `path` after its secret
+    /// was stored or deleted through `settings.*` (a no-op for every other
+    /// secret). Runs on the same [`AsyncSecretStore`] the token write went to,
+    /// so the classifier that reads next sees token and siblings move together.
+    async fn clear_forge_token_secret_siblings(&self, path: &str) -> Result<()> {
+        for sibling in forge_token_secret_siblings(path) {
+            self.secrets.delete(sibling).await?;
+        }
+        Ok(())
+    }
+
     /// `settings.reset` → restore the default (remove the key from
     /// `config.toml` for TOML-backed keys / delete the persisted or secret
     /// value otherwise) and return the **redacted** `{ path, value, origin? }`;
@@ -2698,12 +3009,24 @@ impl<'a> SettingsService<'a> {
         let def = find_definition(path)
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
         let changed = if def.sensitive {
-            if self.secrets.load(def.path).await?.is_none() {
-                false
-            } else {
-                self.secrets.delete(def.path).await?;
-                true
+            // Siblings are cleared even when the token itself is absent: a
+            // device grant's refresh token / expiry can outlive its access
+            // token, and a reset must not leave that metadata orphaned.
+            // Presence is read from the backing store, not the TTL cache: the
+            // GitLab device flow stores behind the cache, and a cached
+            // "absent" would skip the delete while the siblings still go.
+            let mut changed = false;
+            for sibling in forge_token_secret_siblings(def.path) {
+                if self.secrets.load_fresh(sibling).await?.is_some() {
+                    changed = true;
+                }
             }
+            if self.secrets.load_fresh(def.path).await?.is_some() {
+                self.secrets.delete(def.path).await?;
+                changed = true;
+            }
+            self.clear_forge_token_secret_siblings(def.path).await?;
+            changed
         } else if let Some(reg) = self.registry_for(def.path) {
             if matches!(reg.origin(def.path), Some(SettingOrigin::Default)) {
                 false
@@ -3147,6 +3470,649 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// Regression (intentd#2036 review): a `sourceControl.gitlab.token`
+    /// written through `settings.update` is a PAT. The device-grant siblings
+    /// a previous `sourceControl.connect` stored (`refreshToken`,
+    /// `tokenExpiresAt`) must go with it, so the credential classifies as
+    /// [`StoredCredential::Pat`] and the auth-status probe never refreshes
+    /// or disconnects over the user's PAT with the stale grant; `settings.reset`
+    /// clears the siblings with the token.
+    #[tokio::test]
+    async fn gitlab_token_written_via_settings_clears_the_device_grant_siblings() {
+        use intent_core::FileSecretStore;
+        use intent_sourcecontrol::gitlab_auth::stored_credential;
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+        use intent_sourcecontrol::StoredCredential;
+
+        let dir = crate::test_support::test_tempdir("settings-gitlab-token-siblings");
+        let store = Store::open(&dir.path().join("state.db"))
+            .await
+            .expect("open store");
+        let file_store = FileSecretStore::with_path(dir.path().join("secrets.json"));
+        let secrets = AsyncSecretStore::new(Arc::new(file_store.clone()));
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        // What a completed device grant leaves behind (near / past expiry).
+        file_store.store(SECRET_ACCOUNT, "glo_device").unwrap();
+        file_store
+            .store(REFRESH_SECRET_ACCOUNT, "glr_device")
+            .unwrap();
+        file_store.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+        assert!(matches!(
+            stored_credential(file_store.clone()).await.unwrap(),
+            StoredCredential::Device {
+                expires_at: Some(1)
+            }
+        ));
+
+        svc.update(&json!([{ "path": SECRET_ACCOUNT, "value": "glpat-pasted" }]))
+            .await
+            .expect("store the pat");
+        assert_eq!(
+            file_store.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glpat-pasted")
+        );
+        assert_eq!(file_store.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(file_store.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(
+            stored_credential(file_store.clone()).await.unwrap(),
+            StoredCredential::Pat,
+            "a token written through settings is a PAT: never refreshed"
+        );
+
+        // Reset takes any siblings with the token too.
+        file_store
+            .store(REFRESH_SECRET_ACCOUNT, "glr_stale")
+            .unwrap();
+        file_store.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+        let (_, changed) = svc.reset_with_change(SECRET_ACCOUNT).await.expect("reset");
+        assert!(changed);
+        assert_eq!(file_store.load(SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(file_store.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(file_store.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(
+            stored_credential(file_store).await.unwrap(),
+            StoredCredential::None
+        );
+    }
+
+    /// Regression (intentd#2042 review): `settings.reset` of
+    /// `sourceControl.gitlab.token` clears the device-grant siblings even
+    /// when the access token itself is already gone, so no orphan
+    /// `refreshToken` / `tokenExpiresAt` survives; the reset counts as a
+    /// change when only siblings existed, and as a no-op when nothing did.
+    #[tokio::test]
+    async fn gitlab_token_reset_clears_orphan_device_grant_siblings() {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+
+        let dir = crate::test_support::test_tempdir("settings-gitlab-reset-orphans");
+        let store = Store::open(&dir.path().join("state.db"))
+            .await
+            .expect("open store");
+        let raw_secrets = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(raw_secrets.clone());
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        raw_secrets
+            .store(REFRESH_SECRET_ACCOUNT, "glr_orphan")
+            .unwrap();
+        raw_secrets.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+        assert_eq!(raw_secrets.load(SECRET_ACCOUNT).unwrap(), None);
+
+        let (_, changed) = svc.reset_with_change(SECRET_ACCOUNT).await.expect("reset");
+        assert!(changed, "clearing orphan siblings is a change");
+        assert_eq!(
+            raw_secrets.load(REFRESH_SECRET_ACCOUNT).unwrap(),
+            None,
+            "reset left orphan refresh metadata"
+        );
+        assert_eq!(
+            raw_secrets.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(),
+            None,
+            "reset left orphan expiry metadata"
+        );
+
+        let (_, changed) = svc.reset_with_change(SECRET_ACCOUNT).await.expect("reset");
+        assert!(!changed, "nothing left to clear");
+    }
+
+    /// Regression (intentd#2042 review): an explicit `settings.update` that
+    /// repeats the stored forge token is still a PAT write — the device-grant
+    /// siblings must go even though the token itself is unchanged, so retrying
+    /// the same paste never leaves the credential classified as a device
+    /// grant. A repeated write of a secret without siblings stays a no-op.
+    #[tokio::test]
+    async fn forge_token_rewritten_with_the_same_value_still_clears_the_siblings() {
+        use crate::github_auth_ops::SECRET_ACCOUNT as GITHUB_ACCOUNT;
+        use crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT;
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+
+        let dir = crate::test_support::test_tempdir("settings-forge-token-same-value");
+        let store = Store::open(&dir.path().join("state.db"))
+            .await
+            .expect("open store");
+        let raw_secrets = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(raw_secrets.clone());
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        raw_secrets.store(SECRET_ACCOUNT, "glo_same").unwrap();
+        raw_secrets
+            .store(REFRESH_SECRET_ACCOUNT, "glr_device")
+            .unwrap();
+        raw_secrets.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+        let applied = svc
+            .update(&json!([{ "path": SECRET_ACCOUNT, "value": "glo_same" }]))
+            .await
+            .expect("rewrite the same token");
+        assert_eq!(
+            applied,
+            vec![json!({ "path": SECRET_ACCOUNT, "value": REDACTED_PLACEHOLDER })],
+            "a same-value write with siblings present is a change"
+        );
+        assert_eq!(
+            raw_secrets.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glo_same")
+        );
+        assert_eq!(raw_secrets.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(raw_secrets.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+
+        raw_secrets.store(GITHUB_ACCOUNT, "gho_same").unwrap();
+        raw_secrets
+            .store(GITHUB_TOKEN_METHOD_ACCOUNT, "device")
+            .unwrap();
+        svc.update(&json!([{ "path": GITHUB_ACCOUNT, "value": "gho_same" }]))
+            .await
+            .expect("rewrite the same token");
+        assert_eq!(
+            raw_secrets.load(GITHUB_ACCOUNT).unwrap().as_deref(),
+            Some("gho_same")
+        );
+        assert_eq!(raw_secrets.load(GITHUB_TOKEN_METHOD_ACCOUNT).unwrap(), None);
+
+        // With the siblings gone (or for a secret that has none) the same
+        // value is still filtered as unchanged.
+        let applied = svc
+            .update(&json!([{ "path": SECRET_ACCOUNT, "value": "glo_same" }]))
+            .await
+            .expect("rewrite again");
+        assert!(
+            applied.is_empty(),
+            "no siblings left: same value is a no-op"
+        );
+        raw_secrets.store("linear.token", "lin_same").unwrap();
+        let applied = svc
+            .update(&json!([{ "path": "linear.token", "value": "lin_same" }]))
+            .await
+            .expect("rewrite a sibling-less secret");
+        assert!(applied.is_empty(), "sibling-less same value is a no-op");
+    }
+
+    /// Regression (intentd#2042 review): the GitLab device flow writes the
+    /// token through its own `FileSecretStore` handle, behind the
+    /// [`AsyncSecretStore`] TTL cache. A `settings.reset` (or a same-value
+    /// `settings.update`) that decided on the cached "absent" would skip the
+    /// delete and leave the token reclassified as a PAT — write paths must
+    /// consult the backing store, not the cache.
+    #[tokio::test]
+    async fn gitlab_token_reset_deletes_a_token_written_behind_the_cache() {
+        use intent_core::FileSecretStore;
+        use intent_sourcecontrol::gitlab_auth::stored_credential;
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+        use intent_sourcecontrol::StoredCredential;
+
+        let dir = crate::test_support::test_tempdir("settings-gitlab-token-behind-cache");
+        let store = Store::open(&dir.path().join("state.db"))
+            .await
+            .expect("open store");
+        let file_store = FileSecretStore::with_path(dir.path().join("secrets.json"));
+        let secrets = AsyncSecretStore::new(Arc::new(file_store.clone()));
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        // `settings.list` caches the token (and only the token) as absent.
+        svc.list().await.expect("list");
+        assert_eq!(secrets.load(SECRET_ACCOUNT).await.unwrap(), None);
+
+        // A device grant completes through the sibling `FileSecretStore`
+        // handle — the cache never hears about it.
+        file_store.store(SECRET_ACCOUNT, "glo_device").unwrap();
+        file_store
+            .store(REFRESH_SECRET_ACCOUNT, "glr_device")
+            .unwrap();
+        file_store.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+        assert_eq!(
+            secrets.load(SECRET_ACCOUNT).await.unwrap(),
+            None,
+            "precondition: the cache still serves the stale absence"
+        );
+
+        let (_, changed) = svc.reset_with_change(SECRET_ACCOUNT).await.expect("reset");
+        assert!(changed, "the reset deleted a stored credential");
+        assert_eq!(file_store.load(SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(file_store.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(file_store.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(
+            stored_credential(file_store.clone()).await.unwrap(),
+            StoredCredential::None,
+            "reset must not leave the access token behind as a PAT"
+        );
+
+        // A stale cached *presence* must not skip a write either: the cache
+        // remembers the PAT written through settings, a device grant then
+        // replaces it behind the cache, and the user pastes the PAT again.
+        svc.update(&json!([{ "path": SECRET_ACCOUNT, "value": "glpat-pasted" }]))
+            .await
+            .expect("pat write");
+        file_store.store(SECRET_ACCOUNT, "glo_device").unwrap();
+        file_store
+            .store(REFRESH_SECRET_ACCOUNT, "glr_device")
+            .unwrap();
+        file_store.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+        assert_eq!(
+            secrets.load(SECRET_ACCOUNT).await.unwrap().as_deref(),
+            Some("glpat-pasted"),
+            "precondition: the cache still serves the stale PAT"
+        );
+        let applied = svc
+            .update(&json!([{ "path": SECRET_ACCOUNT, "value": "glpat-pasted" }]))
+            .await
+            .expect("pat write again");
+        assert_eq!(applied.len(), 1, "the write must reach the store");
+        assert_eq!(
+            file_store.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glpat-pasted")
+        );
+        assert_eq!(
+            stored_credential(file_store).await.unwrap(),
+            StoredCredential::Pat,
+            "the device grant behind the cache must be replaced by the PAT"
+        );
+    }
+
+    /// An [`InMemorySecretStore`] whose `delete` fails for one account —
+    /// models a backing-store error midway through the sibling clear.
+    #[derive(Debug)]
+    struct FailingDeleteSecretStore {
+        inner: InMemorySecretStore,
+        fail_delete_for: &'static str,
+    }
+    impl SecretStore for FailingDeleteSecretStore {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.inner.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            self.inner.store(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            if account == self.fail_delete_for {
+                return Err(Error::Internal(format!(
+                    "injected delete failure for {account}"
+                )));
+            }
+            self.inner.delete(account)
+        }
+    }
+
+    /// Regression (intentd#2042 review): when the sibling clear fails after
+    /// the new token landed, `settings.update` reports the error AND puts the
+    /// store back — the prior token and every sibling (including the one
+    /// already deleted) are restored, so a failed update never leaves the
+    /// new token persisted with half-cleared grant metadata.
+    #[tokio::test]
+    async fn forge_token_update_restores_the_prior_credential_when_sibling_clear_fails() {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+
+        let dir = crate::test_support::test_tempdir("settings-gitlab-token-sibling-fail");
+        let store = Store::open(&dir.path().join("state.db"))
+            .await
+            .expect("open store");
+        let raw_secrets = InMemorySecretStore::default();
+        let failing: Arc<dyn SecretStore> = Arc::new(FailingDeleteSecretStore {
+            inner: raw_secrets.clone(),
+            fail_delete_for: EXPIRES_AT_SECRET_ACCOUNT,
+        });
+        let secrets = AsyncSecretStore::new(failing);
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        raw_secrets.store(SECRET_ACCOUNT, "glo_device").unwrap();
+        raw_secrets
+            .store(REFRESH_SECRET_ACCOUNT, "glr_device")
+            .unwrap();
+        raw_secrets.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+
+        let err = svc
+            .update(&json!([{ "path": SECRET_ACCOUNT, "value": "glpat-pasted" }]))
+            .await
+            .expect_err("the failed sibling clear must surface");
+        assert!(matches!(err, Error::Internal(_)), "got {err:?}");
+        assert_eq!(
+            raw_secrets.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glo_device"),
+            "the new token must not stay persisted behind a failed update"
+        );
+        assert_eq!(
+            raw_secrets.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glr_device"),
+            "the already-deleted sibling must be restored"
+        );
+        assert_eq!(
+            raw_secrets
+                .load(EXPIRES_AT_SECRET_ACCOUNT)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            secrets.load(SECRET_ACCOUNT).await.unwrap().as_deref(),
+            Some("glo_device"),
+            "the cache must reflect the restored token"
+        );
+    }
+
+    /// An [`InMemorySecretStore`] whose `delete` of one account parks until the
+    /// test releases it — models a backing-store delete that outlives the
+    /// [`AsyncSecretStore`] write timeout and completes later.
+    struct ParkedDeleteSecretStore {
+        inner: InMemorySecretStore,
+        park_delete_for: &'static str,
+        parked: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        done: std::sync::mpsc::Sender<()>,
+    }
+    impl SecretStore for ParkedDeleteSecretStore {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.inner.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            self.inner.store(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            if account == self.park_delete_for {
+                self.parked.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                self.inner.delete(account)?;
+                self.done.send(()).unwrap();
+                return Ok(());
+            }
+            self.inner.delete(account)
+        }
+    }
+
+    /// Regression (intentd#2042 review, timeout half): a sibling delete that
+    /// times out keeps running on the blocking pool. The rollback must wait
+    /// for it to land before restoring the prior credential, or the late
+    /// completion deletes the metadata the rollback just put back. The test
+    /// releases the parked delete only after the timeout has fired and the
+    /// rollback has claimed the still-running delete (or, on a regression,
+    /// once the rollback restored the token without waiting).
+    #[tokio::test]
+    async fn forge_token_rollback_waits_for_a_timed_out_sibling_delete() {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+
+        let dir = crate::test_support::test_tempdir("settings-gitlab-token-sibling-late");
+        let store = Store::open(&dir.path().join("state.db"))
+            .await
+            .expect("open store");
+        let raw_secrets = InMemorySecretStore::default();
+        raw_secrets.store(SECRET_ACCOUNT, "glo_device").unwrap();
+        raw_secrets
+            .store(REFRESH_SECRET_ACCOUNT, "glr_device")
+            .unwrap();
+        raw_secrets.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let parked: Arc<dyn SecretStore> = Arc::new(ParkedDeleteSecretStore {
+            inner: raw_secrets.clone(),
+            park_delete_for: REFRESH_SECRET_ACCOUNT,
+            parked: parked_tx,
+            release: Mutex::new(release_rx),
+            done: done_tx,
+        });
+        let secrets = AsyncSecretStore::with_timings(
+            parked,
+            Duration::from_secs(2),
+            Duration::from_millis(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        let entries = json!([{ "path": SECRET_ACCOUNT, "value": "glpat-pasted" }]);
+        let update_finished = std::cell::Cell::new(false);
+        let update = async {
+            let result = svc.update(&entries).await;
+            update_finished.set(true);
+            result
+        };
+        let driver = async {
+            tokio::task::spawn_blocking(move || parked_rx.recv_timeout(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .expect("the sibling delete must park");
+            let rollback_claimed_delete = || {
+                secrets.timed_out(REFRESH_SECRET_ACCOUNT)
+                    && secrets.detached_len(REFRESH_SECRET_ACCOUNT) == 0
+            };
+            while !rollback_claimed_delete() && !update_finished.get() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                raw_secrets.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+                Some("glr_device"),
+                "the parked delete must not have landed yet"
+            );
+            release_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(update, driver);
+        let err = result.expect_err("the timed-out sibling clear must surface");
+        assert!(matches!(err, Error::Internal(_)), "got {err:?}");
+
+        tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("the parked delete must complete");
+        assert_eq!(
+            raw_secrets.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glo_device"),
+            "the new token must not stay persisted behind a failed update"
+        );
+        assert_eq!(
+            raw_secrets.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glr_device"),
+            "the late timed-out delete must not remove the restored refresh sibling"
+        );
+        assert_eq!(
+            raw_secrets
+                .load(EXPIRES_AT_SECRET_ACCOUNT)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            secrets
+                .load(REFRESH_SECRET_ACCOUNT)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("glr_device"),
+            "the cache must reflect the restored sibling"
+        );
+    }
+
+    /// Regression (intentd#2042 review, bounded settle): a sibling delete
+    /// still running past [`DEFAULT_SETTLE_TIMEOUT`] must not hang `update`
+    /// and must not be blind-restored over — the update returns the
+    /// unknown-state error, every account is left exactly as the failed write
+    /// left it, and the still-running delete stays tracked for a later settle.
+    #[tokio::test]
+    async fn forge_token_rollback_gives_up_when_a_timed_out_sibling_delete_outlives_the_cap() {
+        use intent_sourcecontrol::gitlab_token::{
+            EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+        };
+
+        let dir = crate::test_support::test_tempdir("settings-gitlab-token-sibling-cap");
+        let store = Store::open(&dir.path().join("state.db"))
+            .await
+            .expect("open store");
+        let raw_secrets = InMemorySecretStore::default();
+        raw_secrets.store(SECRET_ACCOUNT, "glo_device").unwrap();
+        raw_secrets
+            .store(REFRESH_SECRET_ACCOUNT, "glr_device")
+            .unwrap();
+        raw_secrets.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let parked: Arc<dyn SecretStore> = Arc::new(ParkedDeleteSecretStore {
+            inner: raw_secrets.clone(),
+            park_delete_for: REFRESH_SECRET_ACCOUNT,
+            parked: parked_tx,
+            release: Mutex::new(release_rx),
+            done: done_tx,
+        });
+        let secrets = AsyncSecretStore::with_timings(
+            parked,
+            Duration::from_secs(2),
+            Duration::from_millis(30),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .with_settle_timeout(Duration::from_millis(50));
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        let entries = json!([{ "path": SECRET_ACCOUNT, "value": "glpat-pasted" }]);
+        let started = Instant::now();
+        let err = svc
+            .update(&entries)
+            .await
+            .expect_err("the timed-out sibling clear must surface");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "update must return once the settle cap expires, not wait for the delete"
+        );
+        match &err {
+            Error::Internal(msg) => assert!(
+                msg.contains("credential state is unknown"),
+                "expected the unknown-state error, got {msg:?}"
+            ),
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+        parked_rx
+            .try_recv()
+            .expect("the sibling delete must have parked");
+        assert_eq!(
+            secrets.detached_len(REFRESH_SECRET_ACCOUNT),
+            1,
+            "the still-running delete must stay tracked for a later settle"
+        );
+        assert_eq!(
+            raw_secrets.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glpat-pasted"),
+            "no restore may be attempted while the delete is still running"
+        );
+        assert_eq!(
+            raw_secrets.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("glr_device"),
+            "the parked delete must not have landed"
+        );
+        assert_eq!(
+            raw_secrets
+                .load(EXPIRES_AT_SECRET_ACCOUNT)
+                .unwrap()
+                .as_deref(),
+            Some("1"),
+            "the sibling clear stops at the first failure, so later siblings are untouched"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("the parked delete must complete once released");
+        assert!(
+            secrets
+                .settle_detached(REFRESH_SECRET_ACCOUNT)
+                .await
+                .unwrap(),
+            "a later settle must still claim the late delete"
+        );
+        assert_eq!(
+            raw_secrets.load(REFRESH_SECRET_ACCOUNT).unwrap().as_deref(),
+            None,
+            "the late delete landed after the update had already given up"
+        );
+    }
+
+    /// Regression (intentd#2036 review): a `sourceControl.github.token`
+    /// written through `settings.update` replaces a device-flow token with a
+    /// PAT, so the `sourceControl.github.tokenMethod` marker the device flow
+    /// wrote must be cleared — `sourceControl.authStatus` reports `"pat"`
+    /// for it, not `"device"`. Other secrets have no siblings.
+    #[tokio::test]
+    async fn github_token_written_via_settings_clears_the_device_method_marker() {
+        use crate::github_auth_ops::SECRET_ACCOUNT;
+        use crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT;
+
+        let dir = crate::test_support::test_tempdir("settings-github-token-marker");
+        let store = Store::open(&dir.path().join("state.db"))
+            .await
+            .expect("open store");
+        let raw_secrets = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(raw_secrets.clone());
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        raw_secrets.store(SECRET_ACCOUNT, "gho_device").unwrap();
+        raw_secrets
+            .store(GITHUB_TOKEN_METHOD_ACCOUNT, "device")
+            .unwrap();
+        raw_secrets.store("linear.token", "lin_1").unwrap();
+
+        svc.update(&json!([{ "path": SECRET_ACCOUNT, "value": "ghp_pasted" }]))
+            .await
+            .expect("store the pat");
+        assert_eq!(
+            raw_secrets.load(SECRET_ACCOUNT).unwrap().as_deref(),
+            Some("ghp_pasted")
+        );
+        assert_eq!(
+            raw_secrets.load(GITHUB_TOKEN_METHOD_ACCOUNT).unwrap(),
+            None,
+            "the device marker must not outlive the token it described"
+        );
+
+        // A secret without siblings touches nothing else.
+        raw_secrets
+            .store(GITHUB_TOKEN_METHOD_ACCOUNT, "device")
+            .unwrap();
+        svc.update(&json!([{ "path": "linear.token", "value": "lin_2" }]))
+            .await
+            .expect("store another secret");
+        assert_eq!(
+            raw_secrets
+                .load(GITHUB_TOKEN_METHOD_ACCOUNT)
+                .unwrap()
+                .as_deref(),
+            Some("device")
+        );
+
+        let (_, changed) = svc.reset_with_change(SECRET_ACCOUNT).await.expect("reset");
+        assert!(changed);
+        assert_eq!(raw_secrets.load(SECRET_ACCOUNT).unwrap(), None);
+        assert_eq!(raw_secrets.load(GITHUB_TOKEN_METHOD_ACCOUNT).unwrap(), None);
     }
 
     /// Regression (intent#4383): the placeholder on a sensitive path with
@@ -4682,6 +5648,35 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// `[prCache]` exposes one TOML-backed number: `maxAgeSeconds` (default
+    /// 60, floor 10, max 600), whose catalog range agrees with the read-time
+    /// clamp constants.
+    #[test]
+    fn pr_cache_max_age_is_catalogued() {
+        let path = "prCache.maxAgeSeconds";
+        let def = find_definition(path).expect("prCache.maxAgeSeconds missing");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "prCache");
+        assert!(
+            matches!(
+                def.ty,
+                SettingType::Number {
+                    min: Some(10.0),
+                    max: Some(600.0),
+                    ..
+                }
+            ),
+            "range is [10, 600]: {:?}",
+            def.ty
+        );
+        assert_eq!(def.default_value, Some(json!(60.0)));
+        assert!(KNOWN_PATHS.contains(&path), "must be TOML-backed");
+        assert_eq!(intent_core::config::DEFAULT_PR_CACHE_MAX_AGE_SECONDS, 60);
+        assert_eq!(intent_core::config::MIN_PR_CACHE_MAX_AGE_SECONDS, 10);
+        assert_eq!(intent_core::config::MAX_PR_CACHE_MAX_AGE_SECONDS, 600);
     }
 
     /// `[updates]` exposes one TOML-backed boolean (`checkOnIdle`, default

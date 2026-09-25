@@ -479,8 +479,9 @@ pub(crate) async fn process_frame(
         // into the `intent://invite` link with this listener's own pairing
         // envelope (hosts / port / fingerprint, never the bearer token), so it
         // runs here where the pairing provider is in reach. Not local-only:
-        // a remote owner mints links too. `invite.redeem` is NOT served on
-        // authenticated connections — only on the `/invite` endpoint.
+        // a remote owner mints links too. The other `invite.*` methods are
+        // NOT served on authenticated connections — only on the `/invite`
+        // endpoint.
         if let Some(req) = crate::invite::classify(value) {
             if req.method == crate::invite::InviteMethod::Create {
                 let frame = panic_guard::guard_frame(
@@ -1005,7 +1006,10 @@ async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &Outbou
 /// A guarded subscriber's own unshare from `scoped_workspace` (the
 /// subscription's `workspaceId`, when one was given) ends the forwarder,
 /// like the scoped collection channels; a global stream stays alive for the
-/// subscriber's other member workspaces, the gate suppressing the rest.
+/// subscriber's other member workspaces, the gate suppressing the rest. A
+/// guarded subscriber's `agent:queue:updated` frames carry only the queue
+/// entries its principal may see
+/// ([`events::project_queue_event_for_current_caller`]).
 async fn forward_subscription(
     mut subscription: Subscription,
     membership: Option<(events::MembershipGate, Subscription)>,
@@ -1060,11 +1064,16 @@ async fn forward_subscription(
                         .await;
                     return;
                 };
-                for event in batch {
+                for mut event in batch {
                     if let Some(gate) = gate.as_mut() {
                         if !gate.allows(&event).await {
                             continue;
                         }
+                        // A gated (non-administrator) connection sees only
+                        // its own queue entries in `agent:queue:updated`, and
+                        // no `content` in `agent:queue:processing` for a
+                        // foreign entry.
+                        events::project_queue_event_for_current_caller(&mut event);
                     }
                     if let Some(key) = conflate::event_key(&event) {
                         let item = EventItem::new(&key, event);

@@ -101,9 +101,9 @@ pub(crate) struct ManagedScript {
     /// start (whether its launch succeeds or fails), or by a `stop` (the
     /// dismiss).
     lost_at_daemon_stop: bool,
-    /// Set by `stop_all` on every entry that was `running` when the shutdown
-    /// sweep began: `mark_exited` then leaves the `was_running` marker set
-    /// (instead of clearing it) so the next boot reads the run as lost. This
+    /// Set by `stop_all` on entries that were running or still carried a
+    /// previous boot's recovery marker when shutdown began. Exit and refused
+    /// registration then preserve that marker for the next boot. This
     /// is what covers a `script.run` command — its completion task has no
     /// supervisor handle for the sweep to await, so its exit could otherwise
     /// land after the sweep's marker write and erase it.
@@ -350,8 +350,10 @@ impl ScriptManager {
     /// registry with a fresh idle state (runtime state is never persisted,
     /// except the stored-on-write `was_running` marker — the script was
     /// running when the previous daemon process stopped). A marked service
-    /// hydrates `idle` with `previouslyRunning: true` (the restore-tab
-    /// affordance); a marked command-mode script hydrates as a terminal
+    /// starts automatically only when `auto_start` is enabled; otherwise it
+    /// stays `idle` with `previouslyRunning: true` (the restore-tab
+    /// affordance). A failed automatic launch retains that idle marker.
+    /// A marked command-mode script hydrates as a terminal
     /// `exited` with [`EXIT_CODE_UNOBSERVABLE`] and
     /// [`LOST_AT_DAEMON_STOP_ERROR`] — its run is gone and nothing can be
     /// restored, so a watcher waiting on `exited` settles instead of waiting
@@ -365,38 +367,52 @@ impl ScriptManager {
             .await?
             .into_iter()
             .collect();
-        let mut guard = self.scripts.lock().unwrap();
         let mut loaded = 0;
-        for def in defs {
-            let key = (WorkspaceId::from(def.workspace_id.as_str()), def.id.clone());
-            guard.entry(key).or_insert_with(|| {
-                loaded += 1;
-                let marked = was_running.contains(&(def.workspace_id.clone(), def.id.clone()));
-                let lost = marked && def.mode == ScriptMode::Command;
-                let state = if lost {
-                    ScriptRuntimeState {
-                        status: ScriptStatus::Exited,
-                        exit_code: Some(EXIT_CODE_UNOBSERVABLE),
-                        error: Some(LOST_AT_DAEMON_STOP_ERROR.to_string()),
-                        ..Default::default()
+        let mut restore = Vec::new();
+        {
+            let mut guard = self.scripts.lock().unwrap();
+            for def in defs {
+                let key = (WorkspaceId::from(def.workspace_id.as_str()), def.id.clone());
+                guard.entry(key.clone()).or_insert_with(|| {
+                    loaded += 1;
+                    let marked = was_running.contains(&(def.workspace_id.clone(), def.id.clone()));
+                    let lost = marked && def.mode == ScriptMode::Command;
+                    if marked && def.mode == ScriptMode::Service && def.auto_start == Some(true) {
+                        restore.push(key);
                     }
-                } else {
-                    ScriptRuntimeState {
-                        previously_running: marked.then_some(true),
-                        ..Default::default()
+                    let state = if lost {
+                        ScriptRuntimeState {
+                            status: ScriptStatus::Exited,
+                            exit_code: Some(EXIT_CODE_UNOBSERVABLE),
+                            error: Some(LOST_AT_DAEMON_STOP_ERROR.to_string()),
+                            ..Default::default()
+                        }
+                    } else {
+                        ScriptRuntimeState {
+                            previously_running: marked.then_some(true),
+                            ..Default::default()
+                        }
+                    };
+                    ManagedScript {
+                        def,
+                        state,
+                        pty_id: None,
+                        stopped_by_user: false,
+                        supervisor: None,
+                        generation: next_generation(),
+                        lost_at_daemon_stop: lost,
+                        running_at_shutdown: false,
                     }
-                };
-                ManagedScript {
-                    def,
-                    state,
-                    pty_id: None,
-                    stopped_by_user: false,
-                    supervisor: None,
-                    generation: next_generation(),
-                    lost_at_daemon_stop: lost,
-                    running_at_shutdown: false,
-                }
-            });
+                });
+            }
+        }
+        // Only newly hydrated entries are eligible. Launch through the normal
+        // supervisor after releasing the registry lock; one failure must not
+        // prevent other services (or the daemon itself) from starting.
+        for (ws, id) in restore {
+            if let Err(error) = self.start_inner(&ws, &id, true) {
+                tracing::warn!(workspace = %ws, script = %id, %error, "restore auto-start script failed");
+            }
         }
         Ok(loaded)
     }
@@ -663,11 +679,24 @@ impl ScriptManager {
     /// `stop` inside the window settles the status back to `idle`. The
     /// `script.restart` gap keeps its own `restarting` status.
     pub(crate) fn start(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
+        self.start_inner(workspace_id, script_id, false)
+    }
+
+    fn start_inner(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        restoring: bool,
+    ) -> Result<Value> {
         let key = (workspace_id.clone(), script_id.to_string());
         let mut guard = self.scripts.lock().unwrap();
         let m = guard
             .get_mut(&key)
             .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
+        // A stop/upsert racing boot hydration must not be undone by restoration.
+        if restoring && (m.stopped_by_user || m.state.previously_running != Some(true)) {
+            return Ok(json!({ "ok": true, "scriptId": script_id }));
+        }
         if matches!(
             m.state.status,
             ScriptStatus::Running | ScriptStatus::Starting
@@ -696,7 +725,7 @@ impl ScriptManager {
             if let Some(state) = launching {
                 mgr.emit_state(&ws, &sid, &state).await;
             }
-            mgr.supervise(ws, sid, def, generation).await;
+            mgr.supervise(ws, sid, def, generation, restoring).await;
         }));
         drop(guard);
         Ok(json!({ "ok": true, "scriptId": script_id }))
@@ -800,6 +829,8 @@ impl ScriptManager {
     /// `script.run` completion task's — which has no handle to await) leaves
     /// the marker set; the sweep re-persists it afterwards as a backstop for
     /// a supervisor that never settles.
+    /// A previous boot's recovery marker is also protected while restoration
+    /// is still starting: refusing its registration must not erase the marker.
     pub(crate) async fn stop_all(&self) -> (usize, usize) {
         struct Stopped {
             ws: WorkspaceId,
@@ -814,7 +845,7 @@ impl ScriptManager {
                 .map(|((ws, id), m)| {
                     m.stopped_by_user = true;
                     let running = m.state.status == ScriptStatus::Running;
-                    m.running_at_shutdown = running;
+                    m.running_at_shutdown = running || m.state.previously_running == Some(true);
                     Stopped {
                         ws: ws.clone(),
                         id: id.clone(),
@@ -952,7 +983,8 @@ impl ScriptManager {
             Ok(cwd) => cwd,
             Err(e) => {
                 reservation.armed = false;
-                self.fail(&ws, script_id, generation, &e.to_string()).await;
+                self.fail(&ws, script_id, generation, &e.to_string(), false)
+                    .await;
                 return Err(e);
             }
         };
@@ -960,7 +992,8 @@ impl ScriptManager {
             Ok(id) => id,
             Err(e) => {
                 reservation.armed = false;
-                self.fail(&ws, script_id, generation, &e.to_string()).await;
+                self.fail(&ws, script_id, generation, &e.to_string(), false)
+                    .await;
                 return Err(e);
             }
         };
@@ -1034,11 +1067,19 @@ impl ScriptManager {
     /// of the entry this supervisor was started for; every status write
     /// validates it so a stale supervisor can never mutate a recreated entry
     /// (monorepo#1194).
-    async fn supervise(self, ws: WorkspaceId, script_id: String, def: Script, generation: u64) {
+    async fn supervise(
+        self,
+        ws: WorkspaceId,
+        script_id: String,
+        def: Script,
+        generation: u64,
+        mut restoring: bool,
+    ) {
         let cwd = match self.resolve_cwd(&ws, &def).await {
             Ok(c) => c,
             Err(e) => {
-                self.fail(&ws, &script_id, generation, &e.to_string()).await;
+                self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
+                    .await;
                 return;
             }
         };
@@ -1051,7 +1092,8 @@ impl ScriptManager {
             let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
                 Ok(id) => id,
                 Err(e) => {
-                    self.fail(&ws, &script_id, generation, &e.to_string()).await;
+                    self.fail(&ws, &script_id, generation, &e.to_string(), restoring)
+                        .await;
                     return;
                 }
             };
@@ -1074,6 +1116,7 @@ impl ScriptManager {
                 self.pty.kill(pty_id).await;
                 return;
             }
+            restoring = false;
             let exit = self.run_one(&ws, &script_id, pty_id, detect).await;
             // The too-fast decision is based on the shell's actual runtime:
             // capture it before the straggler reap below, whose TERM-grace
@@ -1272,8 +1315,9 @@ impl ScriptManager {
     /// The eligibility check therefore runs twice: once to decide whether to
     /// write, once under the flip. A same-generation entry that a
     /// `stop`/`stop_all` flagged during the write is refused with the marker
-    /// cleared again (the fresh PTY is reaped by the caller, so nothing is
-    /// running); a removed or recreated entry is left alone — `script.remove`
+    /// cleared again, unless shutdown is preserving an undismissed recovery
+    /// marker (the fresh PTY is reaped by the caller, so nothing is running).
+    /// A removed or recreated entry is left alone — `script.remove`
     /// and the create-upsert await this supervisor and then delete/reset the
     /// row themselves.
     async fn mark_running(
@@ -1321,7 +1365,10 @@ impl ScriptManager {
                     m.state.previously_running = None;
                     Ok(m.state.clone())
                 }
-                None => Err(guard.get(&key).is_some_and(|m| m.generation == generation)),
+                None => Err(guard.get(&key).is_some_and(|m| {
+                    m.generation == generation
+                        && !(m.running_at_shutdown && m.state.previously_running == Some(true))
+                })),
             }
         };
         match flipped {
@@ -1329,8 +1376,8 @@ impl ScriptManager {
                 self.emit_state(ws, script_id, &state).await;
                 true
             }
-            Err(same_incarnation) => {
-                if same_incarnation {
+            Err(clear_marker) => {
+                if clear_marker {
                     self.persist_was_running(ws, script_id, false).await;
                 }
                 false
@@ -1409,8 +1456,16 @@ impl ScriptManager {
     /// flag and the persisted `was_running` marker are cleared, so the next
     /// boot hydrates it as plain `idle` rather than resurrecting the daemon
     /// loss. A service's `previouslyRunning` marker is untouched — the
-    /// restore affordance stays until `mark_running` or a dismiss.
-    async fn fail(&self, ws: &WorkspaceId, script_id: &str, generation: u64, err: &str) {
+    /// restore affordance stays until `mark_running` or a dismiss. Boot-time
+    /// restoration failures are logged and return to that marked idle state.
+    async fn fail(
+        &self,
+        ws: &WorkspaceId,
+        script_id: &str,
+        generation: u64,
+        err: &str,
+        restoring: bool,
+    ) {
         let (state, lost_superseded) = {
             let mut guard = self.scripts.lock().unwrap();
             let Some(m) = guard
@@ -1419,10 +1474,18 @@ impl ScriptManager {
             else {
                 return;
             };
-            m.state.status = ScriptStatus::Exited;
-            m.state.exit_code = Some(EXIT_CODE_UNOBSERVABLE);
-            m.state.error = Some(err.to_string());
-            m.state.stopped_at = Some(now_iso());
+            if restoring {
+                tracing::warn!(workspace = %ws, script = %script_id, error = %err, "restore auto-start script failed");
+                m.state = ScriptRuntimeState {
+                    previously_running: m.state.previously_running,
+                    ..Default::default()
+                };
+            } else {
+                m.state.status = ScriptStatus::Exited;
+                m.state.exit_code = Some(EXIT_CODE_UNOBSERVABLE);
+                m.state.error = Some(err.to_string());
+                m.state.stopped_at = Some(now_iso());
+            }
             m.pty_id = None;
             (m.state.clone(), std::mem::take(&mut m.lost_at_daemon_stop))
         };
@@ -2605,6 +2668,310 @@ mod tests {
         assert_eq!(svc2.hydrate_scripts().await.expect("re-hydrate"), 0);
     }
 
+    /// Boot restores only auto-start services that were actually running;
+    /// repeated hydration must not launch another supervisor or process.
+    #[intent_test_macros::daemon_test]
+    async fn hydrate_restores_running_autostart_service_once() {
+        let mut h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "auto-start".into(),
+                command: SERVICE_CMD.into(),
+                mode: ScriptMode::Service,
+                auto_start: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        h.services.shutdown_pty_sessions().await;
+
+        let park = Arc::new(SupervisePark::default());
+        h.services = Services::new(h.services.store().clone())
+            .with_event_bus(h.bus.clone())
+            .with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
+        let starting = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            starting["status"], "starting",
+            "restore accepted: {starting}"
+        );
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("restore reached spawn");
+        assert_eq!(
+            h.services
+                .hydrate_scripts()
+                .await
+                .expect("rehydrate launching"),
+            0
+        );
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let running = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap();
+        assert!(running["pid"].as_u64().is_some(), "real process: {running}");
+        assert!(
+            running.get("previouslyRunning").is_none(),
+            "restored: {running}"
+        );
+        assert_eq!(
+            h.services
+                .hydrate_scripts()
+                .await
+                .expect("rehydrate running"),
+            0
+        );
+        assert_eq!(
+            h.services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .unwrap(),
+            running
+        );
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("cleanup");
+    }
+
+    /// A shutdown after the launch eligibility check, but before its marker
+    /// write completes, must preserve an interrupted restoration for next boot.
+    /// An explicit stop still dismisses it, and a first launch that never became
+    /// running must not acquire a recovery marker from the in-flight write.
+    #[intent_test_macros::daemon_test]
+    async fn hydrate_shutdown_during_marker_write_preserves_only_recovery() {
+        use std::future::Future;
+
+        for (restoring, user_stop, shutdown_first) in [
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+            (false, false, false),
+        ] {
+            let mut h = harness().await;
+            let id = create(
+                &h,
+                ScriptCreateParams {
+                    name: "auto-start".into(),
+                    command: SERVICE_CMD.into(),
+                    mode: ScriptMode::Service,
+                    auto_start: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let store = h.services.store().clone();
+            store
+                .set_script_was_running(h.ws.as_str(), &id, restoring)
+                .await
+                .unwrap();
+            let park = Arc::new(SupervisePark::default());
+            h.services = Services::new(store.clone())
+                .with_event_bus(h.bus.clone())
+                .with_script_mark_running_park(park.clone());
+            assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
+            if !restoring {
+                h.services
+                    .script_start(h.ws.clone(), id.clone())
+                    .await
+                    .expect("first start");
+            }
+            tokio::time::timeout(LIVENESS, park.entered.notified())
+                .await
+                .expect("launch parked before marker write");
+            let state = h
+                .services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .unwrap();
+            assert_eq!(state["status"], "starting", "{state}");
+
+            let mut stop = Box::pin(async {
+                if user_stop && !shutdown_first {
+                    h.services
+                        .script_stop(h.ws.clone(), id.clone())
+                        .await
+                        .expect("explicit stop");
+                } else {
+                    h.services.shutdown_pty_sessions().await;
+                }
+            });
+            // Poll once: the synchronous stop flag is set before teardown
+            // awaits the parked supervisor. No timing sleep decides the race.
+            let first_poll =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(stop.as_mut().poll(cx))).await;
+            assert!(first_poll.is_pending(), "stop waits for the supervisor");
+            assert!(
+                h.services
+                    .script_manager()
+                    .scripts
+                    .lock()
+                    .unwrap()
+                    .get(&(h.ws.clone(), id.clone()))
+                    .unwrap()
+                    .stopped_by_user
+            );
+            if shutdown_first {
+                // Shutdown already owns the supervisor handle. A later user
+                // stop can dismiss the marker before its write resumes.
+                h.services
+                    .script_stop(h.ws.clone(), id.clone())
+                    .await
+                    .expect("explicit stop after shutdown started");
+                assert!(store
+                    .list_was_running_script_ids()
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+            park.release.notify_one();
+            tokio::time::timeout(LIVENESS, stop)
+                .await
+                .expect("stop settled");
+            assert_eq!(h.services.pty().count(), 0, "racing PTY reaped");
+
+            let should_restore = restoring && !user_stop;
+            let expected_markers = if should_restore {
+                vec![(h.ws.to_string(), id.clone())]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                store.list_was_running_script_ids().await.unwrap(),
+                expected_markers,
+                "restoring={restoring}, user_stop={user_stop}, shutdown_first={shutdown_first}"
+            );
+
+            h.services = Services::new(store).with_event_bus(h.bus.clone());
+            let mut sub = subscribe(&h);
+            assert_eq!(h.services.hydrate_scripts().await.expect("next boot"), 1);
+            if should_restore {
+                await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+                h.services
+                    .script_stop(h.ws.clone(), id.clone())
+                    .await
+                    .expect("cleanup restored service");
+            } else {
+                let state = h.services.script_status(h.ws.clone(), id).await.unwrap();
+                assert_eq!(state["status"], "idle", "{state}");
+                assert!(state.get("previouslyRunning").is_none(), "{state}");
+                assert_eq!(h.services.pty().count(), 0, "next boot launched nothing");
+            }
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn hydrate_leaves_explicitly_stopped_autostart_service_idle() {
+        let mut h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "auto-start".into(),
+                command: SERVICE_CMD.into(),
+                mode: ScriptMode::Service,
+                auto_start: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        h.services
+            .script_stop(h.ws.clone(), id.clone())
+            .await
+            .expect("user stop");
+        h.services.shutdown_pty_sessions().await;
+        assert!(h
+            .services
+            .store()
+            .list_was_running_script_ids()
+            .await
+            .unwrap()
+            .is_empty());
+        h.services = Services::new(h.services.store().clone());
+        assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
+        let state = h.services.script_status(h.ws.clone(), id).await.unwrap();
+        assert_eq!(state["status"], "idle", "user stop respected: {state}");
+        assert!(state.get("previouslyRunning").is_none(), "{state}");
+        assert!(
+            h.services.pty().list_scope(h.ws.as_str()).is_empty(),
+            "no process launched"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn hydrate_autostart_failure_preserves_idle_marker() {
+        // Exercise both cwd validation and PTY spawn failure, before a process runs.
+        for spawn_failure in [false, true] {
+            let mut h = harness_with_worktree(true).await;
+            let id = create(
+                &h,
+                ScriptCreateParams {
+                    name: "auto-start".into(),
+                    command: SERVICE_CMD.into(),
+                    mode: ScriptMode::Service,
+                    auto_start: Some(true),
+                    cwd: (!spawn_failure).then(|| "../escape".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let store = h.services.store().clone();
+            store
+                .set_script_was_running(h.ws.as_str(), &id, true)
+                .await
+                .unwrap();
+            h.services = Services::new(store.clone()).with_event_bus(h.bus.clone());
+            if spawn_failure {
+                h.services.pty().kill_all_sync();
+            }
+            let mut sub = subscribe(&h);
+            assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
+            await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "idle").await;
+            let state = h
+                .services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .unwrap();
+            assert_eq!(state["status"], "idle", "failed restore: {state}");
+            assert_eq!(state["previouslyRunning"], true, "retry available: {state}");
+            assert!(
+                state.get("pid").is_none() && state.get("exitCode").is_none(),
+                "no process ran: {state}"
+            );
+            assert_eq!(
+                store.list_was_running_script_ids().await.unwrap(),
+                vec![(h.ws.to_string(), id)]
+            );
+            assert_eq!(
+                h.services
+                    .hydrate_scripts()
+                    .await
+                    .expect("rehydrate failed"),
+                0
+            );
+        }
+    }
+
     /// A service running when the daemon dies hydrates as `idle` with
     /// `previouslyRunning: true` (the stored-on-write `was_running` marker),
     /// and the marker persists across repeated restarts until the script is
@@ -2843,7 +3210,17 @@ mod tests {
     async fn command_running_at_daemon_death_hydrates_exited_lost() {
         let h = harness().await;
         let mut sub = subscribe(&h);
-        let id = create_simple(&h, "cmd", SERVICE_CMD, ScriptMode::Command).await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "cmd".into(),
+                command: SERVICE_CMD.into(),
+                mode: ScriptMode::Command,
+                auto_start: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
         h.services
             .script_start(h.ws.clone(), id.clone())
             .await
@@ -3581,6 +3958,126 @@ mod tests {
             st["exitCode"], EXIT_CODE_UNOBSERVABLE,
             "sentinel retained: {st}"
         );
+    }
+
+    /// The completion contract a `script.start` watcher relies on
+    /// (intent-hq/intent#5577): `status === "exited"` is the one settled
+    /// condition across every outcome, and it is never reached without an
+    /// `exitCode`. A run that finished carries its real code (0 or non-zero,
+    /// `error` absent); a startup failure — no process ever ran — carries
+    /// [`EXIT_CODE_UNOBSERVABLE`] with the spawn error as `error` and a
+    /// `stoppedAt`, so a watcher keyed on `exitCode !== undefined` also
+    /// settles instead of polling until its TTL. `starting` is live: a
+    /// parked launch window never reads as settled.
+    #[intent_test_macros::daemon_test]
+    async fn script_start_completion_contract_covers_every_outcome() {
+        fn settled(st: &Value) -> bool {
+            st["status"] == "exited"
+        }
+        let h = harness_with_worktree(true).await;
+        let mut sub = subscribe(&h);
+
+        let ok = create_simple(&h, "ok", "exit 0", ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), ok.clone())
+            .await
+            .expect("start ok");
+        let ev = await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == ok.as_str() && settled(&v["data"])
+        })
+        .await;
+        assert_eq!(ev["data"]["exitCode"], 0, "successful exit: {ev}");
+        assert!(ev["data"]["error"].is_null(), "no error on success: {ev}");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), ok.clone())
+            .await
+            .expect("status");
+        assert!(settled(&st) && st["exitCode"] == 0, "settled ok: {st}");
+
+        let bad = create_simple(&h, "bad", "exit 7", ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), bad.clone())
+            .await
+            .expect("start bad");
+        let ev = await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == bad.as_str() && settled(&v["data"])
+        })
+        .await;
+        assert_eq!(ev["data"]["exitCode"], 7, "non-zero exit: {ev}");
+        assert!(
+            ev["data"]["error"].is_null(),
+            "no error on a real code: {ev}"
+        );
+
+        let failed = create(
+            &h,
+            ScriptCreateParams {
+                name: "spawn-failure".into(),
+                command: "echo never".into(),
+                mode: ScriptMode::Command,
+                cwd: Some("../escape".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        h.services
+            .script_start(h.ws.clone(), failed.clone())
+            .await
+            .expect("start failed");
+        let ev = await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == failed.as_str() && settled(&v["data"])
+        })
+        .await;
+        let d = &ev["data"];
+        assert_eq!(
+            d["exitCode"], EXIT_CODE_UNOBSERVABLE,
+            "no invented success code on a startup failure: {ev}"
+        );
+        assert!(
+            d["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("escapes workspace root"),
+            "spawn error text kept visible: {ev}"
+        );
+        assert!(d["stoppedAt"].is_string(), "stoppedAt set: {ev}");
+        assert!(d["pid"].is_null(), "no pid, no process ran: {ev}");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), failed)
+            .await
+            .expect("status");
+        assert!(settled(&st), "status settles on the failure: {st}");
+        assert_eq!(st["exitCode"], EXIT_CODE_UNOBSERVABLE, "{st}");
+        assert!(st["error"].is_string(), "{st}");
+
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let live = create_simple(&h, "live", SERVICE_CMD, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), live.clone())
+            .await
+            .expect("start live");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("spawn parked");
+        let st = services
+            .script_status(h.ws.clone(), live.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "starting", "{st}");
+        assert!(!settled(&st), "starting is live, never settled: {st}");
+        assert!(st["exitCode"].is_null(), "{st}");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == live.as_str() && v["data"]["status"] == "running"
+        })
+        .await;
+        services
+            .script_stop(h.ws.clone(), live)
+            .await
+            .expect("stop");
     }
 
     /// A `script.stop` inside the launch window (intent-hq/intent#4858) has no

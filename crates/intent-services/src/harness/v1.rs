@@ -88,6 +88,28 @@ pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message wa
 #[cfg(test)]
 pub(crate) const A2A_SENDER_NOTE_PREFIX: &str = "[MESSAGE FROM AGENT";
 
+/// Stable prefix of [`Harness::collaborator_sender_preamble`], asserted by
+/// the goldens. Like [`A2A_SENDER_NOTE_PREFIX`] it is NOT the annotation
+/// skip condition: the guard rebuilds the exact preamble from the bound
+/// caller's principal row and compares byte-for-byte.
+#[cfg(test)]
+pub(crate) const COLLABORATOR_SENDER_PREAMBLE_PREFIX: &str = "Message from ";
+
+/// Collapse control characters in a caller-visible display string to single
+/// spaces and drop a string that sanitizes to empty, so a hostile name
+/// cannot inject header-like lines into a single-line note.
+fn single_line_name(name: Option<&str>) -> Option<String> {
+    name.map(|n| {
+        n.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+    .filter(|n| !n.is_empty())
+}
+
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wakes.
 pub(crate) const HOOK_WAKE_LOGS_CAP: usize = 2048;
@@ -449,9 +471,36 @@ impl Harness for V1 {
         format!("[Role Reminder: You are a {name}. {reminder}]")
     }
 
+    fn setup_in_progress_notice(&self, terminal_name: &str) -> String {
+        format!(
+            "[System: workspace setup is still running — the setup script is executing in the \
+             \"{terminal_name}\" terminal. Worktree contents (submodules, tooling, generated \
+             files) are provisional while ws.workspace.details().setupStatus.state is \
+             \"pending\" or \"running\". Do not diagnose missing files or tools as bugs yet: \
+             wait with a self-checking background hook (ws.hook.schedule) that reads \
+             ws.workspace.details().setupStatus and dispatches as soon as state is anything \
+             other than \"pending\" or \"running\" (\"completed\", \"failed\", \"skipped\", or \
+             \"unknown\"), then re-check the worktree.]"
+        )
+    }
+
+    fn setup_failed_notice(&self, exit_code: Option<u32>, terminal_name: &str) -> String {
+        let outcome = match exit_code {
+            Some(code) => format!("the setup script exited with code {code}"),
+            None => "the setup script failed before it exited (no exit code)".to_string(),
+        };
+        format!(
+            "[System: workspace setup failed — {outcome}. Its output is in the \
+             \"{terminal_name}\" terminal (ws.terminal.list / ws.terminal.readOutput). The \
+             worktree may be missing submodules or tooling: read that output before \
+             diagnosing missing files, and tell the user setup needs attention.]"
+        )
+    }
+
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String {
         // Inside-out layering, `\n\n` joins: body ← role reminder ← naming
-        // nudge ← Context block ← snapshot line ← FirstTurnPrepend.
+        // nudge ← Context block ← setup notice ← snapshot line ←
+        // FirstTurnPrepend.
         let prompt_text = match params.role_reminder {
             Some(r) => format!("{r}\n\n{}", params.body),
             None => params.body.to_string(),
@@ -462,6 +511,10 @@ impl Harness for V1 {
         };
         let prompt_text = match params.stdin_context {
             Some(ctx) => format!("Context:\n{ctx}\n\n---\n\n{prompt_text}"),
+            None => prompt_text,
+        };
+        let prompt_text = match params.setup_notice {
+            Some(notice) => format!("{notice}\n\n{prompt_text}"),
             None => prompt_text,
         };
         let prompt_text = match params.snapshot_line {
@@ -494,20 +547,30 @@ impl Harness for V1 {
         // it): collapse newlines/control chars in the display name to
         // single spaces so a hostile agent name cannot inject header-like
         // lines, and drop a name that sanitizes to empty.
-        let name = name
-            .map(|n| {
-                n.chars()
-                    .map(|c| if c.is_control() { ' ' } else { c })
-                    .collect::<String>()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|n| !n.is_empty());
-        match name {
+        match single_line_name(name) {
             Some(name) => format!("[MESSAGE FROM AGENT {name} ({agent_id})]"),
             None => format!("[MESSAGE FROM AGENT ({agent_id})]"),
         }
+    }
+
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String {
+        // Single-line for the same reasons as `a2a_sender_note`: the
+        // exact-match idempotency guard keys on it and a client may strip
+        // it with a single-line pattern.
+        let who = match (single_line_name(login), single_line_name(display_name)) {
+            (Some(login), Some(name)) => format!("@{login} ({name})"),
+            (Some(login), None) => format!("@{login}"),
+            (None, Some(name)) => name,
+            (None, None) => format!("principal {principal_id}"),
+        };
+        format!(
+            "Message from {who}, a collaborator (guest) of this workspace — not the workspace owner."
+        )
     }
 
     fn wait_duration(&self, secs: i64) -> String {
@@ -1273,6 +1336,37 @@ impl Harness for V1 {
              monitor will not report to you again. Do not re-register a monitor on this \
              PR (ws.pr.monitor would be refused while your parent holds it); no other \
              action is needed."
+        )
+    }
+
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String {
+        let items: Vec<String> = hooks
+            .iter()
+            .map(|(name, id)| format!("hook \"{name}\" ({id})"))
+            .chain(monitors.iter().map(|label| format!("PR monitor {label}")))
+            .collect();
+        let cancelled = if items.len() == 1 {
+            "this background watch was cancelled and was NOT resumed"
+        } else {
+            "these background watches were cancelled and were NOT resumed"
+        };
+        let mut re_arm = Vec::new();
+        if !hooks.is_empty() {
+            re_arm.push("ws.hook.get(hookId) recovers a hook's script for ws.hook.schedule");
+        }
+        if !monitors.is_empty() {
+            re_arm.push("ws.pr.monitor re-registers a PR");
+        }
+        format!(
+            "[SYSTEM NOTICE] This workspace was archived and has since been unarchived. \
+             While it was archived, {cancelled}: {}. If a condition still matters, \
+             re-arm it: {}.",
+            items.join(", "),
+            re_arm.join("; ")
         )
     }
 

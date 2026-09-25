@@ -92,7 +92,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
 
 /// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
 /// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
-struct TempDb {
+pub(crate) struct TempDb {
     path: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -105,7 +105,7 @@ impl TempDb {
     }
 }
 
-async fn setup() -> (TempDb, Services, WorkspaceId) {
+pub(crate) async fn setup() -> (TempDb, Services, WorkspaceId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -200,6 +200,54 @@ fn golden_a2a_sender_note() {
             "header must start with the idempotency-guard prefix: {note}"
         );
         assert!(!note.contains('\n'), "header must be single-line: {note}");
+    }
+}
+
+/// The collaborator sender preamble (multiplayer) is a single plain-prose
+/// line naming the sender and their guest role: login + display name, then
+/// login alone, then display name alone, then the principal id. Control
+/// characters in either name collapse to spaces so a hostile profile
+/// cannot inject a second line.
+#[test]
+fn golden_collaborator_sender_preamble() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("octocat"), Some("The Octocat"), "p-1"),
+        "Message from @octocat (The Octocat), a collaborator (guest) of this workspace — not \
+         the workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("octocat"), None, "p-1"),
+        "Message from @octocat, a collaborator (guest) of this workspace — not the workspace \
+         owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(None, Some("The Octocat"), "p-1"),
+        "Message from The Octocat, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(None, None, "p-1"),
+        "Message from principal p-1, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("evil\nlogin"), Some("  \n"), "p-1"),
+        "Message from @evil login, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    for preamble in [
+        harness.collaborator_sender_preamble(Some("octocat"), Some("The Octocat"), "p-1"),
+        harness.collaborator_sender_preamble(None, None, "p-1"),
+    ] {
+        assert!(
+            preamble.starts_with(crate::harness::v1::COLLABORATOR_SENDER_PREAMBLE_PREFIX),
+            "preamble must start with the stable prefix: {preamble}"
+        );
+        assert!(
+            !preamble.contains('\n'),
+            "preamble must be single-line: {preamble}"
+        );
     }
 }
 
@@ -755,7 +803,7 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
     }
 }
 
-fn pr_monitor_row() -> intent_core::PrMonitor {
+pub(crate) fn pr_monitor_row() -> intent_core::PrMonitor {
     intent_core::PrMonitor {
         monitor_id: intent_core::PrMonitorId::from("prmon-1"),
         workspace_id: WorkspaceId::from("ws-1"),
@@ -906,8 +954,9 @@ fn golden_pr_monitor_checklist_branch_lines() {
     );
 }
 
-/// FE-cancel and archive-sweep notices for hooks and PR monitors: exact
-/// wake bytes delivered to the owning agent.
+/// FE-cancel notices for hooks and PR monitors: exact wake bytes delivered
+/// to the owning agent. (The archive sweep's consolidated notice is a v2.7
+/// surface, pinned in `v2_7_goldens.rs`.)
 #[tokio::test]
 async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
     let (_t, svc, ws) = setup().await;
@@ -937,7 +986,7 @@ async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
         texts,
         vec!["[Background hook \"watcher\"] This hook was cancelled from the app.".to_string()]
     );
-    // PR monitor FE-cancel + archive-sweep notices.
+    // PR monitor FE-cancel notice.
     let mut monitor = pr_monitor_row();
     monitor.workspace_id = ws.clone();
     monitor.agent_id = owner.clone();
@@ -954,54 +1003,6 @@ async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
         texts[1],
         "[PR monitor o/r#42] This monitor was cancelled from the app — it will not \
          report again."
-    );
-    let mut monitor2 = pr_monitor_row();
-    monitor2.monitor_id = intent_core::PrMonitorId::from("prmon-2");
-    monitor2.workspace_id = ws.clone();
-    monitor2.agent_id = owner.clone();
-    assert!(svc
-        .store()
-        .insert_pr_monitor(&monitor2)
-        .await
-        .expect("insert 2"));
-    svc.cancel_workspace_pr_monitors(&ws).await;
-    let texts = wake_texts_when(&svc, &owner, 3).await;
-    assert_eq!(
-        texts[2],
-        "[PR monitor o/r#42] This monitor was cancelled because its workspace was \
-         archived — it will not report again."
-    );
-}
-
-/// Archive-sweep hook cancel notice: exact wake bytes (framed like every
-/// hook wake).
-#[tokio::test]
-async fn golden_hook_archive_cancel_notice_bytes() {
-    let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
-    let svc = svc.with_event_bus(bus);
-    let owner = AgentId::from("agent-arch");
-    seed_agent(&svc, &ws, &owner).await;
-    svc.hook_schedule_op(
-        &ws,
-        &owner,
-        &json!({
-            "name": "sweeper",
-            "code": "return { dispatch: false };",
-            "delayMs": 10_000,
-        }),
-    )
-    .await
-    .expect("schedule");
-    svc.cancel_workspace_hooks(&ws).await;
-    let texts = wake_texts_when(&svc, &owner, 1).await;
-    assert_eq!(
-        texts,
-        vec![
-            "[Background hook \"sweeper\"] This hook was cancelled because its workspace \
-             was archived."
-                .to_string()
-        ]
     );
 }
 
@@ -1209,7 +1210,7 @@ fn golden_hook_state_notes_are_single_line_and_embed_hook_id() {
 // ---------------------------------------------------------------------------
 
 /// Seed a bare agent session row owned by `ws` (mirrors the hook tests).
-async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
+pub(crate) async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
     let ts = now_iso();
     let session = intent_core::AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -1268,7 +1269,7 @@ async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
 /// Wake persistence can lag the op return, so poll until at least `expected`
 /// messages are present (generous deadline, monorepo#1358 precedent); on
 /// timeout return whatever was seen and let the caller's assert report it.
-async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
+pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let session = svc.store().get_agent_session(id).await.expect("session");
@@ -1489,6 +1490,55 @@ fn golden_image_and_attachment_notice_bytes() {
         "[Attachment: \"notes.txt\" — attachmentId: att-2. The file is NOT inlined in this \
          message. Call ws.file.getAttachment(\"att-2\") to copy it into your working \
          directory, then read it from the returned path.]"
+    );
+}
+
+/// Workspace setup-stage notices (§6.5): exact bytes of the in-progress
+/// notice and of the failure notice with and without an exit code, plus the
+/// envelope slot — after the snapshot line, before the Context block.
+#[test]
+fn golden_setup_notice_bytes_and_envelope_slot() {
+    use crate::harness::TurnEnvelopeParams;
+    let h = crate::harness::resolve_entry("1.0").harness;
+    assert_eq!(
+        h.setup_in_progress_notice("Setup Script"),
+        "[System: workspace setup is still running — the setup script is executing in the \
+         \"Setup Script\" terminal. Worktree contents (submodules, tooling, generated files) \
+         are provisional while ws.workspace.details().setupStatus.state is \"pending\" or \
+         \"running\". Do not diagnose missing files or tools as bugs yet: wait with a \
+         self-checking background hook (ws.hook.schedule) that reads \
+         ws.workspace.details().setupStatus and dispatches as soon as state is anything \
+         other than \"pending\" or \"running\" (\"completed\", \"failed\", \"skipped\", or \
+         \"unknown\"), then re-check the worktree.]"
+    );
+    assert_eq!(
+        h.setup_failed_notice(Some(3), "Setup Script"),
+        "[System: workspace setup failed — the setup script exited with code 3. Its output is \
+         in the \"Setup Script\" terminal (ws.terminal.list / ws.terminal.readOutput). The \
+         worktree may be missing submodules or tooling: read that output before diagnosing \
+         missing files, and tell the user setup needs attention.]"
+    );
+    assert_eq!(
+        h.setup_failed_notice(None, "Setup Script"),
+        "[System: workspace setup failed — the setup script failed before it exited (no exit \
+         code). Its output is in the \"Setup Script\" terminal (ws.terminal.list / \
+         ws.terminal.readOutput). The worktree may be missing submodules or tooling: read \
+         that output before diagnosing missing files, and tell the user setup needs \
+         attention.]"
+    );
+    let composed = h.compose_turn_prompt(&TurnEnvelopeParams {
+        first_turn_prepend: Some("<system>sp</system>"),
+        snapshot_line: Some("current ws.agent.snapshot() => {}"),
+        setup_notice: Some("[System: setup]"),
+        stdin_context: Some("ctx"),
+        naming_nudge: None,
+        role_reminder: None,
+        body: "hello",
+    });
+    assert_eq!(
+        composed,
+        "<system>sp</system>\n\ncurrent ws.agent.snapshot() => {}\n\n[System: setup]\n\n\
+         Context:\nctx\n\n---\n\nhello"
     );
 }
 

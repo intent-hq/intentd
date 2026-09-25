@@ -1123,6 +1123,12 @@ pub(crate) struct ChatDeltaState {
     /// in both modes — a fragment there would clobber the client's
     /// accumulation.
     text_acc: HashMap<String, String>,
+    /// `blockId` → union of the `media` sidecar entries (§7.1) delivered for
+    /// a `text` block so far this turn. In full mode every chunk delta
+    /// carries the union (the block is full state, so latest-wins conflation
+    /// stays lossless); in incremental mode only the chunk's newly resolved
+    /// entries travel and this union backs the degraded terminal frame.
+    media_acc: HashMap<String, Map<String, Value>>,
     /// `blockId`s emitted at least once this turn (added vs updated discriminator).
     seen_ids: HashSet<String>,
     /// `blockId`s emitted live this turn (to compute orphan `removedIds` at end).
@@ -1153,6 +1159,7 @@ impl ChatDeltaState {
             encoding,
             projection,
             text_acc: HashMap::new(),
+            media_acc: HashMap::new(),
             seen_ids: HashSet::new(),
             emitted_ids: HashSet::new(),
             message_id: None,
@@ -1199,6 +1206,9 @@ impl ChatDeltaState {
                         self.remember_text_marker(bid, t);
                         if let Some(text) = block.get("text").and_then(Value::as_str) {
                             self.text_acc.insert(bid.to_string(), text.to_string());
+                        }
+                        if let Some(media) = block.get("media").and_then(Value::as_object) {
+                            self.media_acc.insert(bid.to_string(), media.clone());
                         }
                     }
                     _ => self.remember_block(bid, block),
@@ -1360,6 +1370,13 @@ impl ChatDeltaState {
     /// fragment as `textDelta` in incremental mode (monorepo#2675);
     /// non-text chunks pass through as the full block (`added`), stamped with the
     /// same id the persisted block carries.
+    ///
+    /// A text chunk's `media` (§7.1 image dimension sidecar — the entries the
+    /// chunk's completed Markdown image references resolved) is unioned into
+    /// [`Self::media_acc`] for the terminal frame; the emitted block carries
+    /// ONLY the chunk's own entries in BOTH encodings (§7.1's second
+    /// exception to full-current-block: the client unions them into the
+    /// in-flight block). Absent when the chunk resolved nothing.
     fn chunk_delta(&mut self, event: &Event) -> Option<Value> {
         let d = &event.data;
         let block_id = d.get("blockId").and_then(Value::as_str)?.to_string();
@@ -1371,7 +1388,14 @@ impl ChatDeltaState {
             let chunk = content.as_str().unwrap_or_default();
             let acc = self.text_acc.entry(block_id.clone()).or_default();
             acc.push_str(chunk);
-            let block = match self.encoding {
+            let chunk_media = d.get("media").and_then(Value::as_object);
+            if let Some(media) = chunk_media {
+                self.media_acc
+                    .entry(block_id.clone())
+                    .or_default()
+                    .extend(media.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            let mut block = match self.encoding {
                 DeltaEncoding::Full => {
                     json!({ "type": block_type, "id": block_id, "text": acc.clone() })
                 }
@@ -1383,6 +1407,9 @@ impl ChatDeltaState {
                     json!({ "type": block_type, "id": block_id, "textDelta": chunk })
                 }
             };
+            if let Some(media) = chunk_media {
+                block["media"] = Value::Object(media.clone());
+            }
             // A marker only — the full text lives once in `text_acc` and the
             // best-effort frame rebuilds it at emit time, so per-chunk cost
             // stays O(chunk), not O(accumulated text).
@@ -1548,6 +1575,7 @@ impl ChatDeltaState {
         }
         let delta = self.reconcile(api).await;
         self.text_acc.clear();
+        self.media_acc.clear();
         self.seen_ids.clear();
         self.emitted_ids.clear();
         self.message_id = None;
@@ -1683,7 +1711,11 @@ impl ChatDeltaState {
                 let block = match block.get("type").and_then(Value::as_str) {
                     Some(t) if block.get("text").is_none() && (t == "text" || t == "thinking") => {
                         let text = self.text_acc.get(id).map_or("", String::as_str);
-                        json!({ "type": t, "id": id, "text": text })
+                        let mut block = json!({ "type": t, "id": id, "text": text });
+                        if let Some(media) = self.media_acc.get(id) {
+                            block["media"] = Value::Object(media.clone());
+                        }
+                        block
                     }
                     _ => block.clone(),
                 };
@@ -2123,7 +2155,12 @@ pub(crate) fn visible_workspace_ids(snapshot: &Value) -> HashSet<String> {
 /// tombstone is emitted only for a workspace previously shown to this
 /// subscriber, and every successful re-read records the id as shown; the
 /// subscriber's own unshare removes it. Without it (administrator) every
-/// tombstone is emitted as before.
+/// tombstone is emitted as before. The re-read runs under the subscriber's
+/// caller, so a membership add of that caller (`workspace.members.add`, an
+/// invite join — `changes.addedPrincipalId`) is the first re-read that
+/// succeeds for a previously invisible workspace: it upserts as an
+/// `updated` delta (the channel's documented upsert semantics), which is
+/// how a connected guest's list gains the workspace without a reconnect.
 pub(crate) async fn workspace_delta(
     api: &dyn WorkspaceApi,
     event: &Event,

@@ -32,6 +32,8 @@ use super::{
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::microvm::{MicrovmVm, GUEST_WORKSPACE_DIR};
+#[cfg(unix)]
+use crate::npx_cli::guard_npx_version;
 use crate::test_support::test_tempdir;
 use crate::Services;
 
@@ -2324,6 +2326,7 @@ fn mock_handle() -> AgentHandle {
         _mcp_config: None,
         _rules_config: None,
         _pi_extension: None,
+        npx_launch_dir: None,
         antigravity_profile: None,
         session_mcp_servers: Vec::new(),
         spawned_model: None,
@@ -2851,13 +2854,9 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     let ws = WorkspaceId::from("ws-auto-unarchive");
     let id = AgentId::from("a-auto-unarchive");
     seed_agent(&mgr, &ws, &id).await;
-    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
-    row.status = WorkspaceStatus::Archived;
-    row.archived = true;
-    row.archived_at = Some(now_iso());
     mgr.services
         .store
-        .update_workspace(&row)
+        .archive_workspace_detaching_guests(&ws, &now_iso())
         .await
         .expect("archive row");
 
@@ -2981,13 +2980,9 @@ async fn suppressed_reclaim_persists_no_notice() {
     let ws = WorkspaceId::from("ws-suppressed-reclaim");
     let id = AgentId::from("a-suppressed-reclaim");
     seed_agent(&mgr, &ws, &id).await;
-    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
-    row.status = WorkspaceStatus::Archived;
-    row.archived = true;
-    row.archived_at = Some(now_iso());
     mgr.services
         .store
-        .update_workspace(&row)
+        .archive_workspace_detaching_guests(&ws, &now_iso())
         .await
         .expect("archive row");
 
@@ -3031,13 +3026,9 @@ async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
     let ws = WorkspaceId::from("ws-flag-hygiene");
     let id = AgentId::from("a-flag-hygiene");
     seed_agent(&mgr, &ws, &id).await;
-    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
-    row.status = WorkspaceStatus::Archived;
-    row.archived = true;
-    row.archived_at = Some(now_iso());
     mgr.services
         .store
-        .update_workspace(&row)
+        .archive_workspace_detaching_guests(&ws, &now_iso())
         .await
         .expect("archive row");
 
@@ -4655,6 +4646,7 @@ fn track_mock_agent_inner(
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            npx_launch_dir: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -4805,6 +4797,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
             _rules_config: None,
             _pi_extension: None,
             vm: None,
+            npx_launch_dir: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -8655,6 +8648,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            npx_launch_dir: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -12445,6 +12439,68 @@ async fn list_active_skips_busy_agent_with_missing_session_row() {
     assert_eq!(streams[0]["agentId"], json!(survivor));
 }
 
+/// `agent.listActive` issues a fixed number of SQL statements regardless of
+/// how many agents are busy: the busy set's `updated_at` read is ONE batched
+/// `IN`-list statement, not a per-agent lookup loop (intent-hq/intent#5626 —
+/// a real fan-out tripped the `rpc_profile` statement budget). Counted via
+/// sqlx's per-statement `sqlx::query` event, the same signal the daemon's
+/// `rpc_profile` counts.
+#[intent_test_macros::daemon_test]
+async fn list_active_statement_count_is_constant_in_busy_agents() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 64));
+    services.attach_agent_manager(&mgr);
+
+    const MANY: usize = 30;
+    let mut agents = Vec::with_capacity(MANY);
+    for i in 0..MANY {
+        let ws = WorkspaceId::from(format!("ws-list-active-count-{i}"));
+        let id = AgentId::from(format!("agent-list-active-count-{i}"));
+        seed_agent(&mgr, &ws, &id).await;
+        agents.push((id, ws));
+    }
+
+    // Warm the read pool uncounted so a lazy connect's PRAGMA setup batch
+    // cannot land inside a counted run.
+    services.agent_list_active_op().await.unwrap();
+
+    let (first, ws) = &agents[0];
+    assert!(mgr.try_begin(first, ws).await);
+    let (one, statements_with_one) =
+        crate::test_tracing::count_sqlx_statements(services.agent_list_active_op()).await;
+    assert_eq!(one.unwrap()["streams"].as_array().map(Vec::len), Some(1));
+
+    for (id, ws) in &agents[1..] {
+        assert!(mgr.try_begin(id, ws).await);
+    }
+    let (many, statements_with_many) =
+        crate::test_tracing::count_sqlx_statements(services.agent_list_active_op()).await;
+    assert_eq!(
+        many.unwrap()["streams"].as_array().map(Vec::len),
+        Some(MANY)
+    );
+
+    assert!(
+        statements_with_one >= 1,
+        "the busy-set read must reach SQLite at all (counter wiring): {statements_with_one}"
+    );
+    assert_eq!(
+        statements_with_many, statements_with_one,
+        "agent.listActive must not scale its statement count with the busy set \
+         (1 busy agent: {statements_with_one} statements, {MANY} busy agents: \
+         {statements_with_many})"
+    );
+    assert!(
+        statements_with_many <= 5,
+        "agent.listActive statement count must stay well under the rpc_profile \
+         budget: {statements_with_many}"
+    );
+}
+
 /// `try_begin` persists the runtime `Active` transition and publishes the
 /// self-sufficient `agent:status-changed` event so a hydrated client reflects
 /// the live runtime rather than the stored `Pending` placeholder.
@@ -14123,14 +14179,14 @@ enum TargetHome {
 /// Captures the `agent_manager` tracing events (fields rendered as
 /// `name=value`) so a test can assert on the session-workspace rebind log.
 #[derive(Clone, Default)]
-struct AgentManagerLogCapture(Arc<Mutex<Vec<String>>>);
+pub(super) struct AgentManagerLogCapture(Arc<Mutex<Vec<String>>>);
 
 impl AgentManagerLogCapture {
-    fn lines(&self) -> Vec<String> {
+    pub(super) fn lines(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
     }
 
-    fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
+    pub(super) fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
         crate::test_tracing::set_capture_default(self.clone())
     }
 }
@@ -14615,11 +14671,9 @@ async fn cross_workspace_interrupt_archived_gate_keys_on_target_workspace() {
     // workspace activity, which would auto-unarchive a row archived earlier.
     // Flip the flag on the row directly — `workspace.archive` refuses while
     // an agent is running.
-    let mut row = mgr.services.store.get_workspace(&home_ws).await.unwrap();
-    row.archived = true;
     mgr.services
         .store
-        .update_workspace(&row)
+        .archive_workspace_detaching_guests(&home_ws, &now_iso())
         .await
         .expect("archive the target's home workspace");
 
@@ -15925,7 +15979,9 @@ async fn resolve_spawn_strips_legacy_compound_model_rows() {
 fn resolve_npx_only_returns_pinned_package_and_errors_without_npx() {
     let provider = intent_providers::provider_config("claude-code");
 
-    let npx = PathBuf::from("/usr/local/bin/npx");
+    // A path that does not exist on any host: the version guard's probe
+    // fails → permissive Unknown, keeping this test free of a real spawn.
+    let npx = PathBuf::from("/nonexistent/intent-test/bin/npx");
     let (bin, pkg) = resolve_npx_only(provider, Some(npx.clone())).expect("npx present resolves");
     assert_eq!(bin, npx);
     assert_eq!(pkg, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
@@ -15945,6 +16001,109 @@ fn resolve_npx_only_returns_pinned_package_and_errors_without_npx() {
         msg.contains("Anthropic Claude Code"),
         "error must name the provider, got: {msg}"
     );
+}
+
+/// Write a fake `npx` script that prints `version` for `--version`.
+#[cfg(unix)]
+fn fake_npx_printing(dir: &std::path::Path, version: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let npx = dir.join("npx");
+    std::fs::write(&npx, format!("#!/bin/sh\necho {version}\n")).unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    npx
+}
+
+/// Spawn-time version guard (intent-hq/intent#5725): an npx that reports
+/// npm < 7 (`npx -y <pkg>` is rejected by npm 6 with "You must supply a
+/// command") is a hard `InvalidInput` error naming the stale npx path, the
+/// detected node path, and the remedy — instead of three doomed spawn
+/// retries ending in an opaque "agent stdout closed" handshake failure.
+#[cfg(unix)]
+#[test]
+fn resolve_npx_only_rejects_stale_npm6_npx_naming_both_paths() {
+    let dir = test_tempdir("intentd-stale-npx-");
+    let npx = fake_npx_printing(dir.path(), "6.14.18");
+    let node = dir.path().join("nvm/versions/node/v24.16.0/bin/node");
+
+    let err = guard_npx_version(&npx, Some(&node)).expect_err("npm 6 npx is rejected");
+    assert!(
+        matches!(err, intent_core::Error::InvalidInput(_)),
+        "stale npx is an environment misconfiguration, got: {err:?}"
+    );
+    let msg = err.to_string();
+    eprintln!("stale npx rejection: {msg}");
+    assert!(msg.contains(&npx.display().to_string()), "{msg}");
+    assert!(msg.contains(&node.display().to_string()), "{msg}");
+    assert!(msg.contains("6.14.18"), "{msg}");
+    assert!(msg.contains("PATH"), "{msg}");
+
+    // The guard is a fresh-spawn gate in `ensure_started`, not part of
+    // per-turn resolution: a reused live child never re-runs npx, so
+    // resolving the spawn inputs must not probe or reject.
+    let provider = intent_providers::provider_config("claude-code");
+    let (bin, _) = resolve_npx_only(provider, Some(npx.clone()))
+        .expect("resolution itself does not apply the guard");
+    assert_eq!(bin, npx);
+}
+
+/// The memoized verdict must follow the FILE behind the npx path, not the
+/// path alone: repointing `npx` from a stale npm-6 install to a repaired one
+/// whose target has the same size and mtime (published npm 6/7/11 archives
+/// all stamp `npx-cli.js` identically) must be re-probed and accepted, not
+/// rejected from cache for the daemon's lifetime.
+#[cfg(unix)]
+#[test]
+fn guard_npx_version_reprobes_when_npx_is_repointed_to_an_identical_looking_target() {
+    let dir = test_tempdir("intentd-repointed-npx-");
+    let stale_dir = dir.path().join("stale");
+    let fresh_dir = dir.path().join("fresh");
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    std::fs::create_dir_all(&fresh_dir).unwrap();
+    // Same byte length ("6.14.18" / "11.13.0") and the same mtime.
+    let stale = fake_npx_printing(&stale_dir, "6.14.18");
+    let fresh = fake_npx_printing(&fresh_dir, "11.13.0");
+    assert_eq!(
+        std::fs::metadata(&stale).unwrap().len(),
+        std::fs::metadata(&fresh).unwrap().len()
+    );
+    let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(499_162_500);
+    for script in [&stale, &fresh] {
+        std::fs::File::options()
+            .write(true)
+            .open(script)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+    }
+
+    let npx = dir.path().join("npx");
+    std::os::unix::fs::symlink(&stale, &npx).unwrap();
+    let err = guard_npx_version(&npx, None).expect_err("stale target is rejected");
+    assert!(err.to_string().contains("6.14.18"), "{err}");
+
+    std::fs::remove_file(&npx).unwrap();
+    std::os::unix::fs::symlink(&fresh, &npx).unwrap();
+    guard_npx_version(&npx, None).expect("repointed npx is re-probed and accepted");
+}
+
+/// npm 7+ and an unprobeable npx both pass the guard (permissive on Unknown,
+/// matching the pi/auggie gates), so a changed `--version` format never
+/// blocks a spawn.
+#[cfg(unix)]
+#[test]
+fn resolve_npx_only_accepts_modern_and_unprobeable_npx() {
+    let dir = test_tempdir("intentd-modern-npx-");
+    let npx = fake_npx_printing(dir.path(), "11.13.0");
+    guard_npx_version(&npx, None).expect("npm 11 passes");
+    let (bin, _) = resolve_npx_only(
+        intent_providers::provider_config("claude-code"),
+        Some(npx.clone()),
+    )
+    .expect("modern npx resolves");
+    assert_eq!(bin, npx);
+
+    let missing = dir.path().join("absent/npx");
+    guard_npx_version(&missing, None).expect("unprobeable npx is permissive");
 }
 
 /// Non-npx-only providers reject npx-only resolution (defensive seam guard).
@@ -19531,6 +19690,7 @@ mod harness_wake_tests {
             _mcp_config: None,
             _rules_config: None,
             _pi_extension: None,
+            npx_launch_dir: None,
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
@@ -20541,6 +20701,157 @@ mod model_change_notice_tests {
         assert_eq!(md["to"], json!("gpt-5"));
     }
 
+    /// A turn-start re-home (intent-hq/intent#5737) leaves a
+    /// `provider_rehomed` system row in the transcript: the identity change
+    /// it announces is real, but the `model_changed` row for that same
+    /// provider hop is suppressed — read back from the transcript, so it
+    /// holds however many spawn attempts, turns or restarts separate the
+    /// re-home from the first successful spawn — while the identity still
+    /// commits, so the following turn under the new pair is silent. The
+    /// suppression is scoped to the newest identity row: an explicit switch
+    /// back off the target gets its row, and retracing the hop afterwards is
+    /// an ordinary switch again.
+    #[tokio::test]
+    async fn rehomed_switch_commits_identity_without_model_changed_row() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-mc6"), AgentId::from("a-mc6"));
+        seed_agent(&mgr, &ws, &id).await;
+        let identity_rows = || async {
+            mgr.services
+                .store
+                .get_agent_messages(&id, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.metadata.unwrap()["type"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+        // The re-home persisted its notice and moved the session row; the
+        // identity commit is still pending (the spawn has not succeeded yet).
+        mgr.services
+            .store
+            .append_agent_message_with_metadata(
+                &id,
+                "system",
+                &json!([{ "type": "text", "text": "re-homed" }]),
+                Some(&json!({
+                    "type": "provider_rehomed",
+                    "reason": "provider_disabled",
+                    "from": "gpt-5",
+                    "to": "sonnet",
+                    "fromProvider": "auggie",
+                    "toProvider": "claude-code",
+                })),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        // Two successful spawns under the target identity (a retried first
+        // attempt, or a later turn) both find the hop announced.
+        for _ in 0..2 {
+            mgr.maybe_persist_model_change_notice(
+                &id,
+                &ws,
+                &resolved("claude-code", Some("sonnet")),
+            )
+            .await;
+        }
+        assert_eq!(
+            identity_rows().await,
+            vec!["provider_rehomed".to_string()],
+            "re-home suppresses the model_changed row"
+        );
+        let (m, p) = mgr
+            .services
+            .store
+            .get_agent_session_last_turn_model(&ws, &id)
+            .await
+            .unwrap();
+        assert_eq!(m.as_deref(), Some("sonnet"));
+        assert_eq!(p.as_deref(), Some("claude-code"));
+
+        // An explicit switch back onto the re-enabled provider is announced.
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+        assert_eq!(
+            identity_rows().await,
+            vec!["provider_rehomed".to_string(), "model_changed".to_string()],
+            "switching back is an ordinary change"
+        );
+        // Retracing the re-home hop explicitly is an ordinary change too:
+        // the stale `provider_rehomed` row is no longer the newest identity
+        // row, so it must not mute this switch.
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
+        assert_eq!(
+            identity_rows().await,
+            vec![
+                "provider_rehomed".to_string(),
+                "model_changed".to_string(),
+                "model_changed".to_string(),
+            ],
+            "a stale re-home row never mutes a later explicit switch"
+        );
+    }
+
+    /// The transcript-derived suppression matches the provider hop exactly:
+    /// a `provider_rehomed` row for a DIFFERENT hop, or a same-provider
+    /// model change under the re-homed provider, still gets its
+    /// `model_changed` row.
+    #[tokio::test]
+    async fn rehome_suppression_is_scoped_to_the_announced_hop() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-mc7"), AgentId::from("a-mc7"));
+        seed_agent(&mgr, &ws, &id).await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+        mgr.services
+            .store
+            .append_agent_message_with_metadata(
+                &id,
+                "system",
+                &json!([{ "type": "text", "text": "re-homed" }]),
+                Some(&json!({
+                    "type": "provider_rehomed",
+                    "reason": "provider_disabled",
+                    "from": "gpt-5",
+                    "to": null,
+                    "fromProvider": "codex",
+                    "toProvider": "claude-code",
+                })),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2, "a different hop is not announced");
+        assert_eq!(
+            messages[1].metadata.as_ref().unwrap()["type"],
+            json!("model_changed")
+        );
+
+        // Same-provider model change under the target: never a re-home.
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("opus")))
+            .await;
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 3, "same-provider change is announced");
+    }
+
     /// The recreate-replay body must exclude BOTH the current user message and
     /// the turn-start notice that trails it: `build_turn_body` truncates at
     /// the last user row, so a `model_changed` system row appended after the
@@ -21046,13 +21357,9 @@ mod archived_flush_gates {
     }
 
     async fn archive_row(mgr: &AgentManager, ws: &WorkspaceId) {
-        let mut row = mgr.services.store.get_workspace(ws).await.unwrap();
-        row.status = WorkspaceStatus::Archived;
-        row.archived = true;
-        row.archived_at = Some(now_iso());
         mgr.services
             .store
-            .update_workspace(&row)
+            .archive_workspace_detaching_guests(ws, &now_iso())
             .await
             .expect("archive row");
     }

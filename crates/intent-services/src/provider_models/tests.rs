@@ -1340,6 +1340,71 @@ fn parse_codex_models_collapse_live_1_9_0_new_model_catalog() {
 }
 
 #[test]
+fn codex_sol_and_luna_catalog_preserves_model_specific_effort_selection() {
+    use crate::agent_ops::{ensure_bare_model_matches_provider, ensure_effort_supported_by_model};
+    use crate::model_catalog::{source_for, ModelCatalogCache};
+
+    // The 1.13.1 ACP shape was captured with an authenticated account on
+    // 2026-09-24 (GPT-5.6 Sol/Luna). GPT-6 rows are fixtures: their IDs and
+    // effort sets come from Codex rust-v0.156.1 models-manager/models.json,
+    // not a claim that the test account can execute those models.
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-6-sol[low]", "name": "6 Sol (low)" },
+            { "modelId": "gpt-6-sol[medium]", "name": "6 Sol (medium)" },
+            { "modelId": "gpt-6-sol[high]", "name": "6 Sol (high)" },
+            { "modelId": "gpt-6-sol[xhigh]", "name": "6 Sol (xhigh)" },
+            { "modelId": "gpt-6-sol[max]", "name": "6 Sol (max)" },
+            { "modelId": "gpt-6-sol[ultra]", "name": "6 Sol (ultra)" },
+            { "modelId": "gpt-6-luna[low]", "name": "6 Luna (low)" },
+            { "modelId": "gpt-6-luna[medium]", "name": "6 Luna (medium)" },
+            { "modelId": "gpt-6-luna[high]", "name": "6 Luna (high)" },
+            { "modelId": "gpt-6-luna[xhigh]", "name": "6 Luna (xhigh)" },
+            { "modelId": "gpt-6-luna[max]", "name": "6 Luna (max)" }
+        ] },
+        "configOptions": [
+            { "id": "model", "category": "model", "type": "select", "options": [
+                { "value": "gpt-6-sol", "name": "6 Sol" },
+                { "value": "gpt-6-luna", "name": "6 Luna" }
+            ] }
+        ]
+    });
+    let levels = ["low", "medium", "high", "xhigh", "max", "ultra"];
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(
+        rows,
+        vec![
+            json!({ "id": "gpt-6-sol", "name": "6 Sol", "provider": "codex",
+                    "effortLevels": levels }),
+            json!({ "id": "gpt-6-luna", "name": "6 Luna", "provider": "codex",
+                    "effortLevels": levels[..5] }),
+        ]
+    );
+
+    // Drive the same catalog-backed guards used by agent creation and
+    // delegation. Sol's ultra must not leak into Luna's allowed efforts.
+    let cache = ModelCatalogCache::new(None);
+    let version = (source_for("codex").unwrap().version_key)();
+    cache.store_for_test("codex", &version, rows);
+    let reader = cache.reader(None);
+    for (model, supported) in [("gpt-6-sol", &levels[..]), ("gpt-6-luna", &levels[..5])] {
+        ensure_bare_model_matches_provider("agent.create", &reader, "codex", model).unwrap();
+        let scoped = format!("codex:{model}");
+        for effort in supported {
+            ensure_effort_supported_by_model("agent.create", &reader, Some(&scoped), effort)
+                .unwrap();
+        }
+    }
+    assert!(ensure_effort_supported_by_model(
+        "agent.create",
+        &reader,
+        Some("codex:gpt-6-luna"),
+        "ultra",
+    )
+    .is_err());
+}
+
+#[test]
 fn parse_codex_models_none_only_variant_has_no_effort_evidence() {
     let payload = json!({
         "models": { "availableModels": [
@@ -1861,32 +1926,37 @@ async fn acp_probe_child_receives_env_overrides() {
 }
 
 #[test]
-fn codex_probe_launch_npx_fallback_strips_codex_env() {
-    // The pinned npx fallback is daemon-managed: CODEX_PATH / CODEX_CONFIG
-    // must be removed from its child env (#555).
-    let cmd = super::codex_probe_launch(None, Some(std::path::PathBuf::from("/usr/local/bin/npx")))
-        .expect("npx fallback must produce a probe command");
+fn codex_probe_launch_enforces_both_subagent_settings() {
+    let cmd = super::codex_probe_launch(Some(std::path::PathBuf::from("/usr/local/bin/npx")))
+        .expect("npx must produce a probe command");
     let removed = cmd.removed_env_vars();
     assert!(removed.iter().any(|k| k == "CODEX_PATH"));
-    assert!(removed.iter().any(|k| k == "CODEX_CONFIG"));
+    assert!(!removed.iter().any(|k| k == "CODEX_CONFIG"));
+    let config = cmd
+        .env_vars()
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CODEX_CONFIG");
+    let value = config.map(|(_, value)| {
+        serde_json::from_str::<serde_json::Value>(value.to_str().unwrap()).unwrap()
+    });
+    assert_eq!(
+        value,
+        Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
+    );
 }
 
 #[test]
-fn codex_probe_launch_resolved_binary_keeps_codex_env() {
-    // A resolved codex-acp binary (providers.paths override / PATH scan) is
-    // the user's escape hatch — its env must be left untouched.
-    let cmd = super::codex_probe_launch(
-        Some(std::path::PathBuf::from("/custom/codex-acp")),
-        Some(std::path::PathBuf::from("/usr/local/bin/npx")),
-    )
-    .expect("resolved binary must produce a probe command");
-    assert!(cmd.removed_env_vars().is_empty());
-    assert!(cmd.env_vars().is_empty());
+fn codex_probe_launch_uses_selected_npx() {
+    let npx = std::path::PathBuf::from("/usr/local/bin/npx");
+    let cmd =
+        super::codex_probe_launch(Some(npx.clone())).expect("npx must produce a probe command");
+    assert_eq!(cmd.program(), npx.as_path());
 }
 
 #[test]
-fn codex_probe_launch_without_binary_or_npx_is_none() {
-    assert!(super::codex_probe_launch(None, None).is_none());
+fn codex_probe_launch_without_npx_is_none() {
+    assert!(super::codex_probe_launch(None).is_none());
 }
 
 #[cfg(unix)]

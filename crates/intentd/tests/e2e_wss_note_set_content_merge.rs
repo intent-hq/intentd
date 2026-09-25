@@ -5,9 +5,11 @@
 //! three-way-merging its intent onto the current text instead of failing with
 //! `-32005`. The response carries the post-write `rev` (equal to `note.get`),
 //! the merged content holds both edits, and each write emits exactly one
-//! `note:updated`. Drives a real [`WsApiServer`] over TLS with bearer auth
-//! and a fingerprint-pinned client, so the production wire path (TLS upgrade
-//! → JSON-RPC → router → services → store) is exercised end-to-end.
+//! `note:updated`. Also pins the committed-`rev` contract of `note.update` /
+//! `note.updateMetadata` (intent-hq/intent#5589). Drives a real
+//! [`WsApiServer`] over TLS with bearer auth and a fingerprint-pinned client,
+//! so the production wire path (TLS upgrade → JSON-RPC → router → services →
+//! store) is exercised end-to-end.
 
 #![cfg(unix)]
 
@@ -506,4 +508,197 @@ async fn note_set_content_future_rev_and_retry_exhaustion_conflict_over_wss() {
     assert_eq!(accepted["ok"], json!(true));
     assert_eq!(accepted["newContent"], json!("body accepted"));
     assert_eq!(accepted["rev"], json!(1));
+}
+
+/// Regression (intent-hq/intent#5589): every successful `note.update` and
+/// `note.updateMetadata` carries the committed `rev`, equal to `note.get`, so
+/// a client can chain the returned rev into its next `expectedVersion` —
+/// across a content write, a `@@@task` conversion write, the metadata arm of
+/// `note.update`, and `note.updateMetadata`. The rev each response supersedes
+/// is rejected with `-32005` without a write.
+#[intent_test_macros::daemon_test]
+async fn note_update_returns_committed_rev_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({ "title": "note.update rev e2e", "path": "." }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().unwrap().to_string();
+    let note = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Rev me", "content": "v0" }),
+    )
+    .await;
+    let note_id = note["note"]["id"].as_str().expect("note id").to_string();
+    assert_eq!(note["note"]["rev"], json!(0));
+
+    async fn get_note(rpc: &mut TlsWs, id: i64, ws_id: &str, note_id: &str) -> Value {
+        wss_rpc(
+            rpc,
+            id,
+            "note.get",
+            json!({ "workspaceId": ws_id, "noteId": note_id }),
+        )
+        .await["note"]
+            .clone()
+    }
+
+    // Content write at the created rev: the response is the committed row.
+    let content = wss_rpc(
+        &mut rpc,
+        3,
+        "note.update",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "content": "v1",
+            "expectedVersion": 0,
+        }),
+    )
+    .await;
+    let persisted = get_note(&mut rpc, 4, &ws_id, &note_id).await;
+    assert_eq!(persisted["rev"], json!(1));
+    assert_eq!(content["note"]["rev"], persisted["rev"], "{content}");
+    assert_eq!(content["note"]["updatedAt"], persisted["updatedAt"]);
+    assert_eq!(content["note"]["content"], json!("v1"));
+    let rev = content["note"]["rev"].as_i64().expect("rev");
+
+    // Chained: a `@@@task` block converts, and the response rev is the rev
+    // of the converted row, again equal to `note.get`.
+    let converted = wss_rpc(
+        &mut rpc,
+        5,
+        "note.update",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "content": "intro\n\n@@@task\n# Do it\nbody\n@@@\n",
+            "expectedVersion": rev,
+        }),
+    )
+    .await;
+    let persisted = get_note(&mut rpc, 6, &ws_id, &note_id).await;
+    assert!(
+        persisted["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("intent://local/task/")),
+        "conversion rewrote the fence: {persisted}"
+    );
+    assert_eq!(converted["note"]["rev"], persisted["rev"], "{converted}");
+    assert_eq!(converted["note"]["content"], persisted["content"]);
+    let rev = converted["note"]["rev"].as_i64().expect("rev");
+    assert!(
+        rev > 1,
+        "conversion advanced the rev past the content write"
+    );
+
+    // Chained: the metadata arm of `note.update` returns the committed row,
+    // content included.
+    let renamed = wss_rpc(
+        &mut rpc,
+        7,
+        "note.update",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "title": "Renamed",
+            "tags": ["x"],
+            "expectedVersion": rev,
+        }),
+    )
+    .await;
+    let persisted = get_note(&mut rpc, 8, &ws_id, &note_id).await;
+    assert_eq!(persisted["rev"], json!(rev + 1));
+    assert_eq!(renamed["note"]["rev"], persisted["rev"], "{renamed}");
+    assert_eq!(renamed["note"]["updatedAt"], persisted["updatedAt"]);
+    assert_eq!(renamed["note"]["title"], json!("Renamed"));
+    assert_eq!(renamed["note"]["tags"], json!(["x"]));
+    assert_eq!(renamed["note"]["content"], persisted["content"]);
+    let rev = renamed["note"]["rev"].as_i64().expect("rev");
+
+    // Chained: `note.updateMetadata` carries `rev` alongside the stored
+    // `updatedAt`.
+    let meta = wss_rpc(
+        &mut rpc,
+        9,
+        "note.updateMetadata",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "title": "Renamed again",
+            "expectedVersion": rev,
+        }),
+    )
+    .await;
+    let persisted = get_note(&mut rpc, 10, &ws_id, &note_id).await;
+    assert_eq!(persisted["rev"], json!(rev + 1));
+    assert_eq!(meta["ok"], json!(true));
+    assert_eq!(meta["rev"], persisted["rev"], "{meta}");
+    assert_eq!(meta["updatedAt"], persisted["updatedAt"]);
+    assert_eq!(meta["title"], json!("Renamed again"));
+    let committed = meta["rev"].as_i64().expect("rev");
+
+    // The rev the last response superseded is stale on both methods: -32005
+    // carrying the current entity, nothing written.
+    let stale_update = wss_rpc_raw(
+        &mut rpc,
+        11,
+        "note.update",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "content": "should-not-persist",
+            "expectedVersion": rev,
+        }),
+    )
+    .await;
+    assert_conflict_envelope(
+        &stale_update,
+        11,
+        persisted["content"].as_str().unwrap(),
+        committed,
+    );
+    let stale_meta = wss_rpc_raw(
+        &mut rpc,
+        12,
+        "note.updateMetadata",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "title": "should-not-persist",
+            "expectedVersion": rev,
+        }),
+    )
+    .await;
+    assert_conflict_envelope(
+        &stale_meta,
+        12,
+        persisted["content"].as_str().unwrap(),
+        committed,
+    );
+    let after = get_note(&mut rpc, 13, &ws_id, &note_id).await;
+    assert_eq!(after["rev"], json!(committed));
+    assert_eq!(after["title"], json!("Renamed again"));
+
+    // The committed rev still chains.
+    let next = wss_rpc(
+        &mut rpc,
+        14,
+        "note.updateMetadata",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "tags": ["y"],
+            "expectedVersion": committed,
+        }),
+    )
+    .await;
+    assert_eq!(next["rev"], json!(committed + 1));
 }

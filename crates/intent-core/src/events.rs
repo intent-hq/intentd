@@ -462,6 +462,22 @@ pub const SETTINGS_CHANGED: &str = "settings:changed";
 // device code — so subscribers refresh via `github.authStatus`.
 pub const GITHUB_AUTH_CHANGED: &str = "github:auth-changed";
 
+// Provider-generic forge auth events (new in intentd v10.5; PROTOCOL §5.27
+// "Provider-generic auth — `sourceControl.*`"). Emitted on every terminal
+// transition of any provider's auth surface: device-grant outcomes, a
+// successful PAT connect (`authorized`), and `sourceControl.revoke`
+// (`revoked`). Payload `{ provider, host, status }` — global like
+// `settings:changed`; never a token, device code or PAT. GitHub transitions
+// emit this event AND the unchanged `github:auth-changed`.
+pub const SOURCE_CONTROL_AUTH_CHANGED: &str = "sourceControl:auth-changed";
+
+// Primary-identity re-key (protocol 10.8). Emitted when the primary
+// principal's identity triple is replaced by an explicit `identity.provider`
+// change — never on the implicit refresh (the identity lock blocks those).
+// Payload `{ principalId, identity: { provider, host, externalUserId },
+// login? }`; owner-only, like `sourceControl:auth-changed`.
+pub const PRINCIPAL_IDENTITY_CHANGED: &str = "principal:identity-changed";
+
 // App-UI events (new in intentd; daemon-owned UI-driving surface for the
 // chief workspace). `app:ui-navigate` → `{ route, workspaceId, highlightId?,
 // durationMs? }`, `app:ui-highlight` → `{ id, workspaceId, durationMs? }`,
@@ -680,6 +696,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,
     GITHUB_AUTH_CHANGED,
+    SOURCE_CONTROL_AUTH_CHANGED,
+    PRINCIPAL_IDENTITY_CHANGED,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,
@@ -825,7 +843,8 @@ pub fn is_known_event_type(event_type: &str) -> bool {
 /// `workspace:transfer:*` and `git:clone:*` (host paths / transfer
 /// progress), `gitRoot:*` (host paths), `test:*` / `build:*` (host process
 /// results), `app:*` (steers a client's UI; owner clients only, like reverse
-/// RPCs), `settings:changed`, `github:auth-changed`, `mcp:*` /
+/// RPCs), `settings:changed`, `github:auth-changed`,
+/// `sourceControl:auth-changed`, `principal:identity-changed`, `mcp:*` /
 /// `mcp.servers:*`, and the agent-to-agent delivery bookkeeping events.
 pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (AGENT_ATTENTION_REQUESTED, "Agent lifecycle: an agent asked for input; { agentId, kind, reason }. Needed to render attention badges."),
@@ -920,7 +939,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (WORKSPACE_SETUP_COMPLETED, "Workspace: setup finished; id and outcome."),
     (WORKSPACE_SETUP_STARTED, "Workspace: setup started; id only."),
     (WORKSPACE_TOKEN_USAGE_CHANGED, "Workspace: token usage counters changed (workspace.getTokenUsage is Collaborator+)."),
-    (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta); `changes.members` + `removedPrincipalId` on a membership removal."),
+    (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta); `changes.members` + `removedPrincipalId` on a membership removal, `addedPrincipalId` on an add (invite join or `workspace.members.add`)."),
     (WORKSPACE_WAITING_CHANGED, "Workspace: the waiting marker changed (workspace channel delta)."),
 ];
 

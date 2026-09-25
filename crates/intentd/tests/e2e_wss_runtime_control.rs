@@ -1828,6 +1828,7 @@ async fn tunnel_settings_over_wss() {
 /// archive download and verification separately.
 #[tokio::test]
 async fn wss_exact_update_validates_reports_failure_and_restarts_without_channel_check() {
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     let dir = temp_data_dir();
     let data_dir = dir.path().to_path_buf();
@@ -1955,6 +1956,17 @@ async fn wss_exact_update_validates_reports_failure_and_restarts_without_channel
     intentd_sitter::state::save(&paths.state_path, &installed).unwrap();
     let binary = paths.daemon_binary("100.0.0");
     std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    // An already-staged modern release includes its required sidecar payload.
+    // Otherwise an exact update correctly attempts to repair the installation.
+    let libexec = binary.parent().unwrap().join("libexec");
+    std::fs::create_dir_all(&libexec).unwrap();
+    std::fs::write(libexec.join("tailcat"), b"sidecar fixture").unwrap();
+    std::fs::set_permissions(
+        libexec.join("tailcat"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(libexec.join("tailcat.LICENSE"), b"license fixture").unwrap();
     std::fs::write(binary, b"already verified/staged release fixture").unwrap();
     let r = wss_rpc(
         &mut ws,

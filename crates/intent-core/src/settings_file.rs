@@ -38,19 +38,19 @@ use crate::config::{
     ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN,
     DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, DEFAULT_HOOKS_MAX_PER_AGENT,
     DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
-    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
-    DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
-    DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST, DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE,
-    DEFAULT_SHARING_MAX_GUEST_CONNECTIONS, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, DEFAULT_UPDATES_CHECK_ON_IDLE,
-    DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATES_IDLE_GRACE_SECONDS,
-    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
-    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
-    MAX_CONCURRENT_ADAPTERS_LIMIT, MAX_SHARING_MAX_GUESTS_PER_WORKSPACE,
-    MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
-    TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+    DEFAULT_PR_CACHE_MAX_AGE_SECONDS, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
+    DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET, DEFAULT_PR_MONITOR_POLL_SECONDS,
+    DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT, DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
+    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST,
+    DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE, DEFAULT_SHARING_MAX_GUEST_CONNECTIONS,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
+    DEFAULT_UPDATES_CHECK_ON_IDLE, DEFAULT_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+    DEFAULT_UPDATES_IDLE_GRACE_SECONDS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT, HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+    HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN, MAX_CONCURRENT_ADAPTERS_LIMIT,
+    MAX_SHARING_MAX_GUESTS_PER_WORKSPACE, MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES,
+    MIN_UPDATES_IDLE_GRACE_SECONDS, TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
 use crate::error::{Error, Result};
 
@@ -71,6 +71,7 @@ pub struct SettingsFile {
     pub server: ServerSettings,
     pub sharing: SharingSettings,
     pub source_control: SourceControlSettings,
+    pub identity: IdentitySettings,
     pub accounts: AccountsSettings,
     pub voice: VoiceSettings,
     pub context: ContextSettings,
@@ -84,6 +85,7 @@ pub struct SettingsFile {
     pub agent_features: AgentFeaturesSettings,
     pub wake_resume: WakeResumeSettings,
     pub pr_monitor: PrMonitorSettings,
+    pub pr_cache: PrCacheSettings,
     pub updates: UpdatesSettings,
 }
 
@@ -639,7 +641,8 @@ impl Default for AuthSettings {
 }
 
 /// `[sourceControl]` — forge integration (`sourceControl.*`). The GitHub PAT
-/// (`sourceControl.github.token`) is a secret and lives in `.secrets.json`.
+/// (`sourceControl.github.token`) and the GitLab credential
+/// (`sourceControl.gitlab.token`) are secrets and live in `.secrets.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SourceControlSettings {
@@ -647,6 +650,42 @@ pub struct SourceControlSettings {
     pub active_provider: SourceControlProvider,
     /// `[sourceControl.github]` — GitHub client config.
     pub github: GithubSettings,
+    /// `[sourceControl.gitlab]` — GitLab instance config (§5.27
+    /// "Provider-generic auth — `sourceControl.*`").
+    pub gitlab: GitlabSettings,
+}
+
+/// Default `sourceControl.gitlab.host`: the hosted instance.
+pub const DEFAULT_GITLAB_HOST: &str = "gitlab.com";
+
+/// `[sourceControl.gitlab]` — GitLab instance config (`sourceControl.gitlab.*`).
+/// One bound instance per daemon; the credential itself is the
+/// `sourceControl.gitlab.token` secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct GitlabSettings {
+    /// `sourceControl.gitlab.host` — the bound instance as a bare
+    /// `host[:port]` (no scheme). Written by a successful
+    /// `sourceControl.connect { provider: "gitlab" }`.
+    pub host: String,
+    /// `sourceControl.gitlab.oauthClientId` — public OAuth application id for
+    /// the device authorization grant against `host`. Empty ⇒ the compiled
+    /// gitlab.com default applies on gitlab.com only.
+    pub oauth_client_id: String,
+    /// `sourceControl.gitlab.apiBaseUrl` — optional origin override for the
+    /// API calls to the bound host (test seam); never changes the reported
+    /// `host`.
+    pub api_base_url: Option<String>,
+}
+
+impl Default for GitlabSettings {
+    fn default() -> Self {
+        Self {
+            host: DEFAULT_GITLAB_HOST.to_string(),
+            oauth_client_id: String::new(),
+            api_base_url: None,
+        }
+    }
 }
 
 /// `sourceControl.activeProvider` values.
@@ -702,6 +741,20 @@ pub enum GithubTokenSource {
     Env,
     GhCli,
     Explicit,
+}
+
+/// `[identity]` — which linked forge account keys the primary principal
+/// (`identity.*`, protocol 10.8).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct IdentitySettings {
+    /// `identity.provider` — `"github"` | `"gitlab"`, or unset: the forge the
+    /// primary principal's identity triple is refreshed from. Unset, the
+    /// daemon uses the only connected forge (github when both are). Setting
+    /// it while the primary carries another forge's identity is the explicit
+    /// re-key (`principal:identity-changed`).
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub provider: Option<String>,
 }
 
 /// `[accounts]` — external account config (`accounts.*`). The Sentry API
@@ -1205,7 +1258,7 @@ pub struct PrMonitorSettings {
     /// exposed in the Settings UI).
     pub hourly_request_budget: u64,
     /// `prMonitor.quotaSharePercent` — the share of the forge's REMAINING
-    /// quota (read once per tick from its quota-free `rate_limit` probe)
+    /// quota (from a shared probe; GitHub probes at most once per minute)
     /// the loop may plan to spend before the window resets. Stretches the
     /// per-PR interval ahead of exhaustion; a host without the signal
     /// falls back to the hourly-budget model alone (config-file key; not
@@ -1220,6 +1273,26 @@ impl Default for PrMonitorSettings {
             poll_seconds: DEFAULT_PR_MONITOR_POLL_SECONDS,
             hourly_request_budget: DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
             quota_share_percent: DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+        }
+    }
+}
+
+/// `[prCache]` — the shared in-memory PR cache every PR read goes through
+/// (`prCache.*`). Read live like `prMonitor.*`; out-of-range values are
+/// clamped at read time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrCacheSettings {
+    /// `prCache.maxAgeSeconds` — how old a cached PR read may be and still
+    /// be served to an on-demand reader (`github.pulls.get`,
+    /// `ws.pr.snapshot`) without a forge call.
+    pub max_age_seconds: u64,
+}
+
+impl Default for PrCacheSettings {
+    fn default() -> Self {
+        Self {
+            max_age_seconds: DEFAULT_PR_CACHE_MAX_AGE_SECONDS,
         }
     }
 }
@@ -1923,6 +1996,24 @@ oauthClientId = "Ov23li8bvmPsd4B4pW38"
 # github.com-only credential helper (never raw GITHUB_TOKEN/GH_TOKEN).
 exposeGitCredentialToChildren = true
 
+[sourceControl.gitlab]
+# GitLab host -- the bound instance as a bare host[:port], no scheme. Written
+# by a successful sourceControl.connect { provider: "gitlab" }.
+host = "gitlab.com"
+# GitLab OAuth client ID -- public OAuth application id for the device
+# authorization grant against the host (empty: the built-in gitlab.com id
+# applies on gitlab.com only; self-managed instances need their own).
+oauthClientId = ""
+# GitLab API base URL -- optional origin override for API calls to the bound
+# host (test seam); never changes the reported host. Unset means the host.
+# apiBaseUrl = "https://gitlab.acme.internal"
+
+[identity]
+# Identity provider -- the linked forge the primary user's identity is keyed
+# by: "github" or "gitlab". Unset means the only connected forge (github when
+# both are connected). Changing it re-keys the primary identity.
+# provider = "gitlab"
+
 [accounts.sentry]
 # Sentry organization -- Sentry organization slug (non-secret companion of the
 # accounts.sentry.token secret).
@@ -2140,13 +2231,20 @@ pollSeconds = 30
 # exceeds it; requests are not counted or blocked against it (minimum 60,
 # maximum 5000).
 hourlyRequestBudget = 1500
-# PR monitor quota share percent -- the share of the forge's REMAINING core
-# quota (read once per tick from its quota-free rate_limit probe) the loop
+# PR monitor quota share percent -- the share of the forge's REMAINING PR-read
+# quota (from a shared probe; GitHub probes at most once per minute) the loop
 # may plan to spend before the window resets; the per-PR interval stretches
 # ahead of exhaustion so the monitor slows down before the rate-limit pause
 # has to stop it. A host without the signal uses the hourly budget alone
 # (minimum 1, maximum 100).
 quotaSharePercent = 50
+
+[prCache]
+# PR cache max age seconds -- how old (in seconds) a cached PR read may be
+# and still be served to an on-demand reader (github.pulls.get,
+# ws.pr.snapshot) without a forge call. PR-monitor polls refresh the cache
+# (minimum 10, maximum 600).
+maxAgeSeconds = 60
 
 [updates]
 # Check for updates when idle -- ask the sitter (via SIGUSR2) to check for
@@ -2235,6 +2333,9 @@ mod tests {
             DEFAULT_GITHUB_OAUTH_CLIENT_ID
         );
         assert!(d.source_control.github.expose_git_credential_to_children);
+        assert_eq!(d.source_control.gitlab.host, DEFAULT_GITLAB_HOST);
+        assert!(d.source_control.gitlab.oauth_client_id.is_empty());
+        assert_eq!(d.source_control.gitlab.api_base_url, None);
         assert_eq!(d.accounts.sentry.organization, None);
         assert_eq!(d.voice.provider, VoiceProvider::Elevenlabs);
         assert_eq!(d.voice.language, None);
@@ -3130,6 +3231,25 @@ mod tests {
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.pr_monitor, parsed.pr_monitor);
         assert!(templated.agent_features.pr_monitor);
+    }
+
+    #[test]
+    fn pr_cache_defaults_template_and_override_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.pr_cache.max_age_seconds,
+            DEFAULT_PR_CACHE_MAX_AGE_SECONDS
+        );
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[prCache]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.pr_cache, parsed.pr_cache);
+        let overridden =
+            SettingsFile::parse_str("[prCache]\nmaxAgeSeconds = 120\n").expect("override parses");
+        assert_eq!(overridden.pr_cache.max_age_seconds, 120);
+        let err = SettingsFile::parse_str("[prCache]\nmaxAge = 30\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("prCache"), "names the table: {msg}");
+        assert!(msg.contains("maxAge"), "names the bad key: {msg}");
     }
 
     #[test]

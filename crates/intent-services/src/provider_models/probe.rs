@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::acp_adapter::{
-    exited_detail, initialize_params, observe_exit_status, reap_child, spawn_adapter, SpawnError,
+    exited_detail, initialize_params, observe_exit_status, spawn_adapter, SpawnError,
 };
 
 /// The probe's launch description (shared with the one-shot runner).
@@ -139,7 +139,7 @@ where
         Ok(models) => Ok(models),
         Err(err) => Err(attribute_early_exit(err, &mut adapter.child, &adapter.conn).await),
     };
-    reap_child(&mut adapter.child).await;
+    adapter.child.reap().await;
     result
 }
 

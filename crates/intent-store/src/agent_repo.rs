@@ -8,8 +8,9 @@
 //! a derived snapshot and is never persisted — sessions load with `stats: None`.
 
 use intent_core::{
-    AgentId, AgentListRowScope, AgentMessage, AgentScopeCounts, AgentSession, AgentStatus, Error,
-    NoteId, Result, TokenUsageTotals, UsageCost, WorkspaceId, PENDING_QUESTIONS_MESSAGE_ID_KEY,
+    AgentDelegatedCounts, AgentId, AgentListRowScope, AgentMessage, AgentParentDelegatedCounts,
+    AgentScopeCounts, AgentSession, AgentStatus, Error, NoteId, Result, TokenUsageTotals,
+    UsageCost, WorkspaceId, PENDING_QUESTIONS_MESSAGE_ID_KEY,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -116,14 +117,18 @@ pub(crate) fn session_message_projections_sql(retired_filter: &str) -> String {
 }
 
 /// SQL predicate fragment (leading ` AND`, unqualified column names so it
-/// applies to both the summary read and the `agent_session s` projection
-/// read) selecting one `agent.list { scope }` bin (§5.5), plus the extra
-/// bind it needs (`parent_agent_id = ?` for a parent-narrowed `delegated`
-/// read). The three bins partition the non-retired rows:
+/// applies to both the summary read and the projection read — both select
+/// `FROM agent_session s`, the alias the orphan fragment's correlated
+/// subquery names) selecting one `agent.list { scope }` bin (§5.5), plus
+/// the extra bind it needs (`parent_agent_id = ?` for a parent-narrowed
+/// `delegated` read). The three bins partition the non-retired rows:
 /// `parent_agent_id IS NULL` splits on `is_background` (`= 0` / `<> 0`,
 /// always written as 0/1), `parent_agent_id IS NOT NULL` is `delegated`.
-/// Every fragment carries `retired_at IS NULL` — retired sessions are their
-/// own bin. Compile-time fragments only, never caller input.
+/// The `orphanedOnly` sub-filter is [`ORPHANED_DELEGATED_PREDICATE`] — the
+/// same parent-liveness rule [`delegated_counts_sql`] joins on, on top of
+/// the delegated predicate. Every fragment carries `retired_at IS NULL` —
+/// retired sessions are their own bin. Compile-time fragments only, never
+/// caller input.
 pub(crate) fn scope_predicate(scope: &AgentListRowScope) -> (&'static str, Option<&str>) {
     match scope {
         AgentListRowScope::TopLevel => (
@@ -132,12 +137,18 @@ pub(crate) fn scope_predicate(scope: &AgentListRowScope) -> (&'static str, Optio
         ),
         AgentListRowScope::Delegated {
             parent_agent_id: None,
+            orphaned_only: false,
         } => (
             " AND parent_agent_id IS NOT NULL AND retired_at IS NULL",
             None,
         ),
         AgentListRowScope::Delegated {
+            parent_agent_id: None,
+            orphaned_only: true,
+        } => (ORPHANED_DELEGATED_PREDICATE, None),
+        AgentListRowScope::Delegated {
             parent_agent_id: Some(parent),
+            ..
         } => (
             " AND parent_agent_id = ? AND retired_at IS NULL",
             Some(parent.as_str()),
@@ -149,12 +160,31 @@ pub(crate) fn scope_predicate(scope: &AgentListRowScope) -> (&'static str, Optio
     }
 }
 
+/// The `orphanedOnly` variant of the `delegated` scope fragment (§5.5,
+/// within 10.6): the delegated predicate plus the orphan rule as a
+/// correlated predicate over the outer `agent_session s` row — no
+/// non-retired `agent_session` row of the SAME workspace has the child's
+/// `parent_agent_id` as its id (the parent was deleted, soft-retired, or
+/// never was a session of this workspace). Decided by the DIRECT parent's
+/// liveness only — a child of a live background parent or of an orphan is
+/// not an orphan. The subquery is a primary-key probe on `p.id`, so it adds
+/// one index lookup per candidate row (plan-shape test below). The same
+/// rule, spelled as a LEFT JOIN, is what [`delegated_counts_sql`]
+/// aggregates into `delegatedCounts.orphaned`.
+pub(crate) const ORPHANED_DELEGATED_PREDICATE: &str =
+    " AND parent_agent_id IS NOT NULL AND retired_at IS NULL \
+    AND NOT EXISTS (\
+    SELECT 1 FROM agent_session p \
+    WHERE p.id = s.parent_agent_id AND p.workspace_id = s.workspace_id \
+    AND p.retired_at IS NULL)";
+
 /// SQL behind [`Store::list_scoped_agent_session_summaries`], extracted so
 /// the plan-shape test runs `EXPLAIN` on the exact production statement.
+/// The `s` alias is what the orphan fragment's correlated subquery names.
 pub(crate) fn scoped_session_summaries_sql(scope: &AgentListRowScope) -> String {
     let (predicate, _) = scope_predicate(scope);
     format!(
-        "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+        "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session s \
          WHERE workspace_id = ?{predicate} ORDER BY created_at"
     )
 }
@@ -170,6 +200,49 @@ pub(crate) fn scope_counts_sql() -> &'static str {
         COALESCE(SUM(parent_agent_id IS NOT NULL), 0) AS delegated, \
         COALESCE(SUM(parent_agent_id IS NULL AND is_background <> 0), 0) AS background \
      FROM agent_session WHERE workspace_id = ? AND retired_at IS NULL"
+}
+
+/// SQL behind [`Store::count_delegated_agent_sessions_by_parent`] — ONE
+/// grouped statement over the workspace's non-retired delegated rows (the
+/// `delegated` predicate of [`scope_predicate`]) yielding `delegatedCounts`
+/// (§5.5): one row per direct parent with the child count, the subset
+/// whose persisted status is running, and whether that parent is NOT a
+/// non-retired session of the same workspace (`orphaned`, the rule
+/// [`ORPHANED_DELEGATED_PREDICATE`] spells for the rows read — here a LEFT JOIN
+/// on the parent row keeping `p.id IS NULL`; every child of one parent
+/// shares its liveness, so the flag is constant per group and the caller
+/// sums the flagged groups into `delegatedCounts.orphaned`). The running
+/// set is derived from [`AgentStatus::is_running_turn`] over
+/// [`AgentStatus::ALL`] (the serde names, which is how the column is
+/// written), so the aggregate cannot drift from the daemon's rule. Same
+/// `idx_agent_workspace` search as [`scope_counts_sql`] (the join is one
+/// primary-key probe per candidate child row, no extra statement), so
+/// `SUM(total)` over the result always equals `scopeCounts.delegated`.
+pub(crate) fn delegated_counts_sql() -> String {
+    let running = AgentStatus::ALL
+        .iter()
+        .filter(|s| s.is_running_turn())
+        .map(|s| {
+            format!(
+                "'{}'",
+                enum_to_db(s).expect("AgentStatus encodes as a string")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT \
+            c.parent_agent_id, \
+            COUNT(*) AS total, \
+            COALESCE(SUM(c.status IN ({running})), 0) AS running, \
+            MAX(p.id IS NULL) AS orphaned \
+         FROM agent_session c \
+         LEFT JOIN agent_session p \
+            ON p.id = c.parent_agent_id AND p.workspace_id = c.workspace_id \
+            AND p.retired_at IS NULL \
+         WHERE c.workspace_id = ? AND c.retired_at IS NULL AND c.parent_agent_id IS NOT NULL \
+         GROUP BY c.parent_agent_id"
+    )
 }
 
 /// SQL predicate selecting an **unread top-level session** row (§5.1): a
@@ -807,7 +880,11 @@ impl Store {
             );
             let mut last_message_id: Option<String> = None;
             for (idx, (role, _, metadata, created_at)) in owned_messages.iter().enumerate() {
-                let (content_json, payload_rows) = &prepared[idx];
+                let PreparedContent {
+                    content_json,
+                    payload_rows,
+                    ..
+                } = &prepared[idx];
                 let metadata_json = match metadata {
                     Some(md) => Some(serde_json::to_string(md).map_err(|e| {
                         Error::Internal(format!("encode message metadata failed: {e}"))
@@ -1049,6 +1126,43 @@ impl Store {
         }
     }
 
+    /// Batched `updated_at` projection: the timestamp of every id in `ids`
+    /// in ONE `IN`-list statement (the `agent.listActive` busy-set read —
+    /// intent-hq/intent#5626). Replaces a per-agent
+    /// [`Self::get_agent_session_updated_at`] loop so the caller stays at a
+    /// fixed statement count regardless of how many agents are busy. Ids
+    /// without a session row are simply absent from the map (the caller's
+    /// missing-row skip); an empty `ids` issues no statement. The id list is
+    /// chunked well under `SQLite`'s 32766 bind-variable cap (same defense as
+    /// [`Self::get_agent_statuses`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_agent_session_updated_at_batch(
+        &self,
+        ids: &[AgentId],
+    ) -> Result<std::collections::HashMap<AgentId, String>> {
+        const IDS_PER_STATEMENT: usize = 32_000;
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(IDS_PER_STATEMENT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql =
+                format!("SELECT id, updated_at FROM agent_session WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(&id.0);
+            }
+            let rows = query.fetch_all(self.read_pool()).await.map_err(|e| {
+                Error::Internal(format!("get agent session updated_at batch failed: {e}"))
+            })?;
+            for row in &rows {
+                out.insert(AgentId(row.get::<String, _>("id")), row.get("updated_at"));
+            }
+        }
+        Ok(out)
+    }
+
     /// Lightweight name-only lookup used by hot paths that just need the
     /// session's display name (e.g. note-version author stamping). Skips the
     /// full message-log fetch that `get_agent_session` performs.
@@ -1281,6 +1395,52 @@ impl Store {
             delegated: count("delegated"),
             background: count("background"),
         })
+    }
+
+    /// Per-parent counts of the workspace's non-retired delegated sessions —
+    /// the `delegatedCounts` field served on every `agent.list` response
+    /// variant (§5.5), including its `orphaned` sub-aggregate (the groups
+    /// whose parent is not a non-retired session of this workspace). One
+    /// grouped statement ([`delegated_counts_sql`]) over the workspace's
+    /// `idx_agent_workspace` entries — O(delegated rows), the same order as
+    /// the default rows read it accompanies. No rows are hydrated. A parent
+    /// with no non-retired children has no entry; keys are the raw
+    /// `parent_agent_id` values, so a cross-workspace parent still appears
+    /// (and its children count as orphaned).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn count_delegated_agent_sessions_by_parent(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<AgentDelegatedCounts> {
+        let sql = delegated_counts_sql();
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "count delegated agent sessions by parent failed: {e}"
+                ))
+            })?;
+        let mut counts = AgentDelegatedCounts::default();
+        for row in &rows {
+            let count = |col: &str| -> u64 { u64::try_from(row.get::<i64, _>(col)).unwrap_or(0) };
+            let parent = AgentId::from(row.get::<String, _>("parent_agent_id"));
+            let entry = AgentParentDelegatedCounts {
+                total: count("total"),
+                running: count("running"),
+            };
+            counts.running += entry.running;
+            if row.get::<i64, _>("orphaned") != 0 {
+                counts.orphaned.total += entry.total;
+                counts.orphaned.running += entry.running;
+            }
+            counts.by_parent.insert(parent, entry);
+        }
+        Ok(counts)
     }
 
     /// Get message count, whether any assistant message exists, and the total
@@ -1905,6 +2065,39 @@ impl Store {
         Ok(())
     }
 
+    /// Metadata of the agent's newest `role: "system"` transcript row that
+    /// records a spawn-identity change — a `model_changed` or a
+    /// `provider_rehomed` notice — or `None` when the transcript carries
+    /// neither. The model-change notice path reads it to tell a re-home's
+    /// deferred last-turn commit (the newest such row is the
+    /// `provider_rehomed` notice for this very provider hop) from an
+    /// ordinary switch, durably across spawn retries, later turns and
+    /// daemon restarts (intent-hq/intent#5737). Newest-first over the
+    /// `(agent_id, role, seq DESC)` index; system rows are rare, so the
+    /// scan is short. Unparseable metadata reads as `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn latest_agent_identity_notice(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<serde_json::Value>> {
+        let raw = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT metadata FROM agent_message \
+             WHERE agent_id=? AND role='system' \
+               AND json_extract(metadata, '$.type') IN ('model_changed', 'provider_rehomed') \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&agent_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("latest agent identity notice failed: {e}")))?;
+        Ok(raw
+            .flatten()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok()))
+    }
+
     /// Read one session's `model`, `resolved_model` (D14 display identity of
     /// an explicit pick, if any), `provider`, and its persisted cumulative
     /// end-of-turn `token_usage` snapshot (§5.23) in a single row read. This
@@ -2229,6 +2422,67 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
         Ok(())
+    }
+
+    /// Re-home a session onto another provider at turn start
+    /// (intent-hq/intent#5737): a narrow write of `provider`, `model`,
+    /// `reasoning_effort` (cleared — the old provider's effort vocabulary
+    /// does not carry over) and `updated_at` only. The daemon-initiated
+    /// sibling of [`Store::set_agent_session_model`] for a session whose
+    /// provider was disabled in settings: like that writer it is allowed to
+    /// change `provider` after first real use (the case
+    /// [`Store::update_agent_session`]'s immutability guard rejects), and
+    /// unlike it the model may be `None` (the target provider's CLI default).
+    /// Compare-and-set on the `provider` column: the write lands only while
+    /// the row still carries `expected_provider` (the value the caller read
+    /// and found disabled; `None` matches a NULL column), so a concurrent
+    /// `agent.setModel` that moved the session elsewhere between the
+    /// caller's read and this write is never overwritten — the call then
+    /// returns `Ok(false)` and mutates nothing. Scoped to `workspace_id`
+    /// (defense-in-depth). `NotFound` if the session is absent or the
+    /// workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn rehome_agent_session_provider(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_provider: Option<&str>,
+        provider: &str,
+        model: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, updated_at=? \
+             WHERE id=? AND workspace_id=? AND provider IS ?",
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?
+        .rows_affected();
+        if rows > 0 {
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?;
+        if exists == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(false)
     }
 
     /// Persist the assembled system prompt (the spawn path): a narrow write
@@ -3299,7 +3553,8 @@ fn map_session_row_with_heavy_cols(
 /// model to (provider `b`, model `c`), discarding the migrated provider. No
 /// real model id contains a ':' (the wire rejects compound ids), so this is
 /// accepted rather than special-cased.
-fn normalize_compound_model(
+#[must_use]
+pub fn normalize_compound_model(
     model: Option<String>,
     provider: Option<String>,
 ) -> (Option<String>, Option<String>) {
@@ -3349,27 +3604,48 @@ const MESSAGE_INSERT_COLUMNS: &str = MESSAGE_COLUMNS;
 /// CPU for a multi-MB screenshot), so callers MUST await this BEFORE opening
 /// the write transaction / entering the `with_write_txn_retry` closure — never
 /// inside — and the work itself runs on a blocking thread, off the tokio
-/// worker. The cheap `needs_thumbnails` pre-check keeps the common
-/// no-oversized-image message free of the clone + thread hop.
-async fn thumbnails_payload_row(
+/// worker. The same hop stamps the intrinsic `width`/`height` onto the
+/// message's base64 `image` blocks (v10.7 sidecar; header-only decode) and
+/// returns the stamped content — `None` when no block needed stamping — so
+/// the thumbnail map and the persisted blocks come from one clone. The cheap
+/// `needs_dimensions` / `needs_thumbnails` pre-checks keep the common
+/// no-image message free of the clone + thread hop.
+async fn image_dimensions_and_thumbnails(
     content: &serde_json::Value,
-) -> Option<crate::message_payload::PayloadRow> {
-    if !crate::message_thumbnails::needs_thumbnails(content) {
-        return None;
+) -> (
+    Option<serde_json::Value>,
+    Option<crate::message_payload::PayloadRow>,
+) {
+    if !crate::message_thumbnails::needs_dimensions(content)
+        && !crate::message_thumbnails::needs_thumbnails(content)
+    {
+        return (None, None);
     }
-    let owned = content.clone();
-    let map = match tokio::task::spawn_blocking(move || {
-        crate::message_thumbnails::generate_message_thumbnails(&owned)
+    let mut owned = content.clone();
+    let (stamped, map) = match tokio::task::spawn_blocking(move || {
+        let stamped = crate::message_thumbnails::stamp_image_dimensions(&mut owned);
+        let map = if crate::message_thumbnails::needs_thumbnails(&owned) {
+            crate::message_thumbnails::generate_message_thumbnails(&owned)
+        } else {
+            None
+        };
+        (stamped.then_some(owned), map)
     })
     .await
     {
-        Ok(map) => map?,
+        Ok(out) => out,
         Err(e) => {
-            tracing::warn!(error = %e, "thumbnail generation task failed; persisting none");
-            return None;
+            tracing::warn!(
+                error = %e,
+                "image dimension/thumbnail task failed; persisting blocks as-is"
+            );
+            return (None, None);
         }
     };
-    match serde_json::to_vec(&map) {
+    let Some(map) = map else {
+        return (stamped, None);
+    };
+    let row = match serde_json::to_vec(&map) {
         Ok(json) => {
             let (encoding, body) = crate::message_payload::encode_body(&json);
             Some(crate::message_payload::PayloadRow {
@@ -3383,21 +3659,36 @@ async fn thumbnails_payload_row(
             tracing::warn!(error = %e, "encode message thumbnails failed; persisting none");
             None
         }
-    }
+    };
+    (stamped, row)
+}
+
+/// One message content prepared for persistence by
+/// [`content_col_and_payload_rows`].
+struct PreparedContent {
+    /// The `content` column value.
+    content_json: String,
+    /// The `agent_message_payload` rows to insert alongside.
+    payload_rows: Vec<crate::message_payload::PayloadRow>,
+    /// The caller's content with intrinsic `width`/`height` stamped on its
+    /// image blocks — what the column actually holds — or `None` when no
+    /// block needed stamping (the caller's value is what was persisted).
+    stamped: Option<serde_json::Value>,
 }
 
 /// Prepare one message content for persistence: the `content` column value
-/// (slim when any heavy body crossed the 0108 extraction threshold) plus the
-/// `agent_message_payload` rows to insert alongside — extracted bodies and
-/// the write-time thumbnails map. Extraction + compression of a multi-MB
-/// body is CPU-bound, so like thumbnail generation it runs on a blocking
-/// thread and MUST be awaited BEFORE the write transaction opens; the cheap
-/// `needs_extraction` pre-check keeps the common all-small message free of
-/// the clone + thread hop, and the blocking task consumes the one clone it
-/// is handed (`extract_payloads` takes the value) — no second multi-MB copy.
-async fn content_col_and_payload_rows(
-    content: &serde_json::Value,
-) -> Result<(String, Vec<crate::message_payload::PayloadRow>)> {
+/// (image blocks stamped with `width`/`height`; slim when any heavy body
+/// crossed the 0108 extraction threshold) plus the `agent_message_payload`
+/// rows to insert alongside — extracted bodies and the write-time thumbnails
+/// map. Extraction + compression of a multi-MB body is CPU-bound, so like
+/// thumbnail generation it runs on a blocking thread and MUST be awaited
+/// BEFORE the write transaction opens; the cheap `needs_extraction` pre-check
+/// keeps the common all-small message free of the clone + thread hop, and
+/// the blocking task consumes the one clone it is handed (`extract_payloads`
+/// takes the value) — no second multi-MB copy.
+async fn content_col_and_payload_rows(content: &serde_json::Value) -> Result<PreparedContent> {
+    let (stamped, thumbnails_row) = image_dimensions_and_thumbnails(content).await;
+    let content = stamped.as_ref().unwrap_or(content);
     let extracted = if crate::message_payload::needs_extraction(content) {
         let owned = content.clone();
         Some(
@@ -3414,10 +3705,14 @@ async fn content_col_and_payload_rows(
     };
     let content_json = serde_json::to_string(to_encode.as_ref())
         .map_err(|e| Error::Internal(format!("encode message content failed: {e}")))?;
-    if let Some(row) = thumbnails_payload_row(content).await {
+    if let Some(row) = thumbnails_row {
         rows.push(row);
     }
-    Ok((content_json, rows))
+    Ok(PreparedContent {
+        content_json,
+        payload_rows: rows,
+        stamped,
+    })
 }
 
 /// [`content_col_and_payload_rows`] for a whole batch, positionally aligned
@@ -3425,7 +3720,7 @@ async fn content_col_and_payload_rows(
 /// `SQLITE_BUSY` retry re-runs only the SQL, never the extraction/image work.
 async fn batch_content_cols_and_payload_rows(
     messages: &[OwnedBatchMessage],
-) -> Result<Vec<(String, Vec<crate::message_payload::PayloadRow>)>> {
+) -> Result<Vec<PreparedContent>> {
     let mut out = Vec::with_capacity(messages.len());
     for (_, content, _, _) in messages {
         out.push(content_col_and_payload_rows(content).await?);
@@ -3862,7 +4157,8 @@ impl Store {
     /// heavy body is unrecoverable; reads serve the stored preview).
     ///
     /// The returned [`AgentMessage`] echoes `content` as passed (placeholders
-    /// included); full-fidelity read paths hydrate the staged bodies back,
+    /// included, image blocks stamped with their `width`/`height` like every
+    /// append); full-fidelity read paths hydrate the staged bodies back,
     /// byte-identical to a one-shot append of the pre-extraction content.
     ///
     /// # Errors
@@ -3950,9 +4246,13 @@ impl Store {
             None => None,
         };
         // Awaited before any write transaction below opens: payload
-        // extraction/compression and thumbnail generation are CPU-bound and
-        // run on blocking threads.
-        let (content_json, payload_rows) = content_col_and_payload_rows(content).await?;
+        // extraction/compression, image dimension stamping and thumbnail
+        // generation are CPU-bound and run on blocking threads.
+        let PreparedContent {
+            content_json,
+            payload_rows,
+            stamped,
+        } = content_col_and_payload_rows(content).await?;
         // Prestaged reconciliation (0109): staged rows the final content no
         // longer references — not a placeholder block's key and not about to
         // be (re-)inserted — are stale (the block was re-patched below the
@@ -4082,7 +4382,7 @@ impl Store {
             agent_id: agent_id.clone(),
             seq,
             role: role.to_string(),
-            content: content.clone(),
+            content: stamped.unwrap_or_else(|| content.clone()),
             app_message_id: intent_core::lift_app_message_id(metadata),
             author: None,
             metadata: metadata.cloned(),
@@ -5052,7 +5352,11 @@ impl Store {
                 if role == "user" || role == "assistant" {
                     last_message_id = Some(id.clone());
                 }
-                let (content_json, payload_rows) = &prepared[idx];
+                let PreparedContent {
+                    content_json,
+                    payload_rows,
+                    stamped,
+                } = &prepared[idx];
                 let metadata_json = match metadata {
                     Some(md) => Some(serde_json::to_string(md).map_err(|e| {
                         Error::Internal(format!("encode replaced message metadata failed: {e}"))
@@ -5078,7 +5382,7 @@ impl Store {
                     agent_id: agent_id.clone(),
                     seq,
                     role: role.clone(),
-                    content: content.clone(),
+                    content: stamped.as_ref().unwrap_or(content).clone(),
                     app_message_id: intent_core::lift_app_message_id(metadata.as_ref()),
                     author: None,
                     metadata: metadata.clone(),
@@ -5437,6 +5741,7 @@ where
 mod tests {
     use super::*;
     use crate::Store;
+    use intent_core::AgentOrphanedDelegatedCounts;
 
     /// A unique temp DB path whose `.db`/`-wal`/`-shm` files are removed on
     /// drop, including on panic (mirrors `crate::tests::TempDb`, which is
@@ -5530,33 +5835,52 @@ mod tests {
     /// the default read visits, and a covering index over
     /// `(workspace_id, retired_at, parent_agent_id, is_background)` would
     /// only trade a row fetch per session for write amplification on every
-    /// session mutation.
+    /// session mutation. The `orphanedOnly` rows read and the
+    /// `delegatedCounts` parent join add a primary-key probe on the parent
+    /// row (`p`) — still a SEARCH, never a SCAN.
     #[tokio::test]
     async fn scoped_reads_use_an_index_search_not_a_scan() {
         let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let parent = AgentId::from("agent-00000000-0000-4000-8000-000000000001");
         let scopes = [
-            AgentListRowScope::TopLevel,
-            AgentListRowScope::Delegated {
-                parent_agent_id: None,
-            },
-            AgentListRowScope::Delegated {
-                parent_agent_id: Some(parent),
-            },
-            AgentListRowScope::Background,
+            (
+                "delegated",
+                AgentListRowScope::Delegated {
+                    parent_agent_id: None,
+                    orphaned_only: false,
+                },
+            ),
+            (
+                "delegated/parent",
+                AgentListRowScope::Delegated {
+                    parent_agent_id: Some(parent),
+                    orphaned_only: false,
+                },
+            ),
+            (
+                "delegated/orphanedOnly",
+                AgentListRowScope::Delegated {
+                    parent_agent_id: None,
+                    orphaned_only: true,
+                },
+            ),
+            ("topLevel", AgentListRowScope::TopLevel),
+            ("background", AgentListRowScope::Background),
         ];
-        let mut statements: Vec<(String, String, Option<String>)> =
-            vec![("counts".to_string(), scope_counts_sql().to_string(), None)];
-        for scope in &scopes {
+        let mut statements: Vec<(String, String, Option<String>)> = vec![
+            ("counts".to_string(), scope_counts_sql().to_string(), None),
+            ("delegatedCounts".to_string(), delegated_counts_sql(), None),
+        ];
+        for (label, scope) in &scopes {
             let (predicate, bind) = scope_predicate(scope);
             statements.push((
-                format!("rows/{}", scope.wire_name()),
+                format!("rows/{label}"),
                 scoped_session_summaries_sql(scope),
                 bind.map(str::to_string),
             ));
             statements.push((
-                format!("projections/{}", scope.wire_name()),
+                format!("projections/{label}"),
                 session_message_projections_sql(predicate),
                 bind.map(str::to_string),
             ));
@@ -5585,6 +5909,466 @@ mod tests {
                 "{label} must not scan agent_session, plan: {details:?}"
             );
         }
+    }
+
+    /// The `delegatedCounts.running` predicate is generated from
+    /// `AgentStatus::is_running_turn`, so the emitted SQL carries exactly the
+    /// golden running set as persisted serde names; the `orphaned` flag is
+    /// the parent-liveness LEFT JOIN keeping `p.id IS NULL` — the same rule
+    /// the `orphanedOnly` rows predicate spells as a correlated `NOT EXISTS`.
+    #[test]
+    fn delegated_counts_sql_running_set_matches_core_rule() {
+        let sql = delegated_counts_sql();
+        assert!(
+            sql.contains("c.status IN ('pending', 'active', 'Processing')"),
+            "sql: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "LEFT JOIN agent_session p ON p.id = c.parent_agent_id \
+                 AND p.workspace_id = c.workspace_id AND p.retired_at IS NULL"
+            ),
+            "sql: {sql}"
+        );
+        assert!(sql.contains("MAX(p.id IS NULL) AS orphaned"), "sql: {sql}");
+        assert!(
+            ORPHANED_DELEGATED_PREDICATE.contains(
+                "NOT EXISTS (SELECT 1 FROM agent_session p WHERE p.id = s.parent_agent_id \
+                 AND p.workspace_id = s.workspace_id AND p.retired_at IS NULL)"
+            ),
+            "predicate: {ORPHANED_DELEGATED_PREDICATE}"
+        );
+    }
+
+    /// `delegatedCounts.orphaned` and the `orphanedOnly` rows read (§5.5,
+    /// within 10.6) follow the DIRECT parent's liveness only: a child whose
+    /// parent row was deleted, is soft-retired, or belongs to another
+    /// workspace is an orphan; a child of a live standalone background parent
+    /// is not; a child of an orphan is not (its parent is live); retired
+    /// children are excluded; `running` is the `is_running_turn` subset of
+    /// the orphans; `orphaned.total ≤ scopeCounts.delegated`; and the
+    /// `orphanedOnly` rows are exactly the counted set, a subset of the
+    /// whole-bin `delegated` read. Retiring a live parent turns its children
+    /// into orphans on the next read; restoring it turns them back.
+    #[tokio::test]
+    async fn delegated_counts_orphaned_follow_direct_parent_liveness() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-orphaned".to_string());
+        let other_ws = WorkspaceId("ws-other".to_string());
+        for w in [&ws, &other_ws] {
+            insert_test_workspace(&store, w).await;
+        }
+        let ts = "2026-01-01T00:00:00Z";
+        let id = |n: u32| AgentId::from(format!("agent-00000000-0000-4000-8000-{n:012}"));
+        let seed = |agent: AgentId,
+                    ws: &WorkspaceId,
+                    parent: Option<&AgentId>,
+                    status: AgentStatus,
+                    background: bool,
+                    retired: bool| {
+            let mut s = baseline_test_session(&agent, ws, ts, None);
+            s.parent_agent_id = parent.cloned();
+            s.status = status;
+            s.is_background = background;
+            s.retired_at = retired.then(|| ts.to_string());
+            s
+        };
+        let (live_top, live_bg, retired_top, deleted_top, foreign_top) =
+            (id(1), id(2), id(3), id(4), id(5));
+        let sessions = [
+            seed(
+                live_top.clone(),
+                &ws,
+                None,
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            seed(live_bg.clone(), &ws, None, AgentStatus::Idle, true, false),
+            seed(
+                retired_top.clone(),
+                &ws,
+                None,
+                AgentStatus::Idle,
+                false,
+                true,
+            ),
+            // A parent that exists only in ANOTHER workspace.
+            seed(
+                foreign_top.clone(),
+                &other_ws,
+                None,
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // Not orphans: a live foreground parent, a live background parent.
+            seed(
+                id(10),
+                &ws,
+                Some(&live_top),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            seed(
+                id(11),
+                &ws,
+                Some(&live_bg),
+                AgentStatus::Pending,
+                false,
+                false,
+            ),
+            // Orphans: parent retired (running + idle), parent deleted
+            // (never inserted), parent in another workspace.
+            seed(
+                id(20),
+                &ws,
+                Some(&retired_top),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            seed(
+                id(21),
+                &ws,
+                Some(&retired_top),
+                AgentStatus::Idle,
+                true,
+                false,
+            ),
+            seed(
+                id(22),
+                &ws,
+                Some(&deleted_top),
+                AgentStatus::Processing,
+                false,
+                false,
+            ),
+            seed(
+                id(23),
+                &ws,
+                Some(&foreign_top),
+                AgentStatus::Waiting,
+                false,
+                false,
+            ),
+            // A retired orphan is excluded entirely.
+            seed(
+                id(24),
+                &ws,
+                Some(&deleted_top),
+                AgentStatus::Active,
+                false,
+                true,
+            ),
+            // The orphan 20's own child is NOT an orphan (its parent is live).
+            seed(
+                id(30),
+                &ws,
+                Some(&id(20)),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // Another workspace's orphan never leaks in.
+            seed(
+                id(40),
+                &other_ws,
+                Some(&deleted_top),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+        ];
+        for s in &sessions {
+            store.insert_agent_session(s).await.expect("insert session");
+        }
+
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("delegated counts");
+        assert_eq!(
+            counts.orphaned,
+            AgentOrphanedDelegatedCounts {
+                total: 4,
+                running: 2
+            },
+            "orphans: 20 (active), 21 (idle), 22 (Processing), 23 (waiting); counts: {counts:?}"
+        );
+        // byParent is unchanged in meaning: every parent key, orphaned or not
+        // (live_top, live_bg, retired_top, deleted_top, foreign_top, 20).
+        assert_eq!(counts.by_parent.len(), 6);
+        assert_eq!(
+            counts.by_parent[&id(20)].total,
+            1,
+            "the orphan's child counts under it"
+        );
+        let scope_counts = store
+            .count_agent_sessions_by_scope(&ws)
+            .await
+            .expect("scope counts");
+        assert_eq!(scope_counts.delegated, 7);
+        assert!(counts.orphaned.total <= scope_counts.delegated);
+
+        let orphan_scope = AgentListRowScope::Delegated {
+            parent_agent_id: None,
+            orphaned_only: true,
+        };
+        let whole_bin = AgentListRowScope::Delegated {
+            parent_agent_id: None,
+            orphaned_only: false,
+        };
+        let ids = |rows: &[AgentSession]| -> std::collections::BTreeSet<String> {
+            rows.iter().map(|s| s.id.0.clone()).collect()
+        };
+        let orphan_rows = store
+            .list_scoped_agent_session_summaries(&ws, &orphan_scope)
+            .await
+            .expect("orphanedOnly rows");
+        assert_eq!(
+            ids(&orphan_rows),
+            [id(20), id(21), id(22), id(23)]
+                .iter()
+                .map(|a| a.0.clone())
+                .collect()
+        );
+        assert_eq!(orphan_rows.len() as u64, counts.orphaned.total);
+        let bin_rows = store
+            .list_scoped_agent_session_summaries(&ws, &whole_bin)
+            .await
+            .expect("delegated rows");
+        assert!(ids(&orphan_rows).is_subset(&ids(&bin_rows)));
+        assert_eq!(bin_rows.len() as u64, scope_counts.delegated);
+        // The projection read narrows on the same predicate.
+        let orphan_projections = store
+            .get_scoped_agent_session_message_projections(&ws, &orphan_scope)
+            .await
+            .expect("orphanedOnly projections");
+        assert_eq!(
+            orphan_projections
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ids(&orphan_rows)
+        );
+
+        // Retiring the live parent orphans its child; restoring it undoes that.
+        store
+            .set_agent_session_retired_at(&ws, &live_top, Some(ts), ts)
+            .await
+            .expect("retire live_top");
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("counts after retire");
+        assert_eq!(
+            counts.orphaned,
+            AgentOrphanedDelegatedCounts {
+                total: 5,
+                running: 3
+            }
+        );
+        store
+            .set_agent_session_retired_at(&ws, &live_top, None, ts)
+            .await
+            .expect("restore live_top");
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("counts after restore");
+        assert_eq!(
+            counts.orphaned,
+            AgentOrphanedDelegatedCounts {
+                total: 4,
+                running: 2
+            }
+        );
+    }
+
+    /// The grouped `delegatedCounts` aggregate (§5.5): one entry per DIRECT
+    /// parent with its non-retired child count, `running` counting only the
+    /// `pending` / `active` / legacy `Processing` statuses; retired children
+    /// are excluded (a parent whose only child is retired has NO entry); a
+    /// background child counts under its parent like any delegated row; a
+    /// grandchild counts under its own parent, never the grandparent; the
+    /// key set includes a parent that is not a session of this workspace
+    /// (cross-workspace delegation); other workspaces' rows never leak in;
+    /// the top-level `running` is the sum over parents; and `Σ total` equals
+    /// `scopeCounts.delegated` from the same store. An empty workspace
+    /// answers `{ running: 0, byParent: {}, orphaned: { total: 0, running: 0 } }`.
+    #[tokio::test]
+    async fn delegated_counts_group_non_retired_children_by_parent() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-delegated-counts".to_string());
+        let other_ws = WorkspaceId("ws-other".to_string());
+        let empty_ws = WorkspaceId("ws-empty".to_string());
+        for w in [&ws, &other_ws, &empty_ws] {
+            insert_test_workspace(&store, w).await;
+        }
+        let ts = "2026-01-01T00:00:00Z";
+        let id = |n: u32| AgentId::from(format!("agent-00000000-0000-4000-8000-{n:012}"));
+        let (top_a, top_b, childless, foreign_parent) = (id(1), id(2), id(3), id(9));
+        let seed = |agent: AgentId,
+                    ws: &WorkspaceId,
+                    parent: Option<&AgentId>,
+                    status: AgentStatus,
+                    background: bool,
+                    retired: bool| {
+            let mut s = baseline_test_session(&agent, ws, ts, None);
+            s.parent_agent_id = parent.cloned();
+            s.status = status;
+            s.is_background = background;
+            s.retired_at = retired.then(|| ts.to_string());
+            s
+        };
+        let sessions = [
+            seed(top_a.clone(), &ws, None, AgentStatus::Active, false, false),
+            seed(top_b.clone(), &ws, None, AgentStatus::Idle, false, false),
+            seed(
+                childless.clone(),
+                &ws,
+                None,
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // top_a: three live children (pending, Processing, idle-background), one retired active.
+            seed(
+                id(10),
+                &ws,
+                Some(&top_a),
+                AgentStatus::Pending,
+                false,
+                false,
+            ),
+            seed(
+                id(11),
+                &ws,
+                Some(&top_a),
+                AgentStatus::Processing,
+                false,
+                false,
+            ),
+            seed(
+                id(12),
+                &ws,
+                Some(&top_a),
+                AgentStatus::RuntimeIdle,
+                true,
+                false,
+            ),
+            seed(id(13), &ws, Some(&top_a), AgentStatus::Active, false, true),
+            // A grandchild under child 10 counts under 10, not top_a.
+            seed(
+                id(14),
+                &ws,
+                Some(&id(10)),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // top_b: one live waiting child, one retired child.
+            seed(
+                id(20),
+                &ws,
+                Some(&top_b),
+                AgentStatus::Waiting,
+                false,
+                false,
+            ),
+            seed(id(21), &ws, Some(&top_b), AgentStatus::Pending, false, true),
+            // A parent that is not a session of this workspace.
+            seed(
+                id(30),
+                &ws,
+                Some(&foreign_parent),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+            // Another workspace's delegated rows never leak in.
+            seed(
+                id(40),
+                &other_ws,
+                Some(&top_a),
+                AgentStatus::Active,
+                false,
+                false,
+            ),
+        ];
+        for s in &sessions {
+            store.insert_agent_session(s).await.expect("insert session");
+        }
+
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("delegated counts");
+        let entry = |total: u64, running: u64| AgentParentDelegatedCounts { total, running };
+        assert_eq!(
+            counts,
+            AgentDelegatedCounts {
+                running: 4,
+                by_parent: [
+                    (top_a.clone(), entry(3, 2)),
+                    (id(10), entry(1, 1)),
+                    (top_b.clone(), entry(1, 0)),
+                    (foreign_parent.clone(), entry(1, 1)),
+                ]
+                .into_iter()
+                .collect(),
+                // Only the foreign parent's child has no live parent here.
+                orphaned: AgentOrphanedDelegatedCounts {
+                    total: 1,
+                    running: 1
+                },
+            }
+        );
+        assert!(
+            !counts.by_parent.contains_key(&childless),
+            "a parent without children has no entry"
+        );
+        let scope_counts = store
+            .count_agent_sessions_by_scope(&ws)
+            .await
+            .expect("scope counts");
+        assert_eq!(
+            counts.by_parent.values().map(|c| c.total).sum::<u64>(),
+            scope_counts.delegated,
+            "Σ byParent[*].total == scopeCounts.delegated"
+        );
+        assert_eq!(
+            counts.by_parent.values().map(|c| c.running).sum::<u64>(),
+            counts.running
+        );
+
+        // Retiring top_b's last live child drops its entry entirely.
+        store
+            .set_agent_session_retired_at(&ws, &id(20), Some(ts), ts)
+            .await
+            .expect("retire");
+        let counts = store
+            .count_delegated_agent_sessions_by_parent(&ws)
+            .await
+            .expect("delegated counts after retire");
+        assert!(!counts.by_parent.contains_key(&top_b));
+        assert_eq!(counts.by_parent.len(), 3);
+
+        // Wire shape: `byParent` is always an object, empty on a workspace
+        // with no delegated sessions.
+        let empty = store
+            .count_delegated_agent_sessions_by_parent(&empty_ws)
+            .await
+            .expect("empty workspace");
+        assert_eq!(empty, AgentDelegatedCounts::default());
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap(),
+            serde_json::json!({ "running": 0, "byParent": {}, "orphaned": { "total": 0, "running": 0 } })
+        );
     }
 
     /// The three unread-derivation statements (single-workspace EXISTS
@@ -6525,7 +7309,9 @@ mod tests {
     /// getter returns it keyed by message id, and text-only / under-budget
     /// rows persist NULL (absent from the getter's map). Legacy rows
     /// (thumbnails column NULL) are simply absent — the slim read then
-    /// serves the block with data omitted.
+    /// serves the block with data omitted. The same append stamps the
+    /// image block's intrinsic `width`/`height` (v10.7) on the returned
+    /// message and on the stored row.
     #[tokio::test]
     async fn append_persists_image_thumbnails_and_page_getter_reads_them() {
         use base64::Engine as _;
@@ -6568,6 +7354,21 @@ mod tests {
             )
             .await
             .expect("append image message");
+        assert_eq!(
+            with_image.content[1]["width"], 512,
+            "{}",
+            with_image.content
+        );
+        assert_eq!(with_image.content[1]["height"], 384);
+        assert!(with_image.content[0].get("width").is_none());
+        let stored = store
+            .get_agent_message_by_id(&agent_id, &with_image.id)
+            .await
+            .expect("read stored row")
+            .expect("row exists");
+        assert_eq!(stored.content[1]["width"], 512, "{}", stored.content);
+        assert_eq!(stored.content[1]["height"], 384);
+        assert_eq!(stored.content[1]["data"], data, "full data intact");
         let text_only = store
             .append_agent_message(
                 &agent_id,
@@ -6603,6 +7404,104 @@ mod tests {
                 .is_empty(),
             "empty id list short-circuits"
         );
+    }
+
+    /// Legacy transfer/replace path (pre-v10.7 slim shape): a
+    /// `dataIsThumbnail: true` image block WITHOUT `width`/`height` re-persisted
+    /// via `replace_agent_messages` must stay dimensionless — its `data` is the
+    /// downscaled thumbnail, so decoding it would record the thumbnail's size
+    /// as the original's. A sibling full image block in the same replaced
+    /// message is still stamped, and a slim block that already carries the
+    /// original dimensions keeps them.
+    #[tokio::test]
+    async fn replace_leaves_legacy_thumbnail_blocks_unstamped() {
+        use base64::Engine as _;
+        use intent_core::now_iso;
+
+        fn noise_png(w: u32, h: u32) -> String {
+            let img = image::RgbImage::from_fn(w, h, |x, y| {
+                let v = (x.wrapping_mul(31).wrapping_add(y.wrapping_mul(17)) % 251) as u8;
+                image::Rgb([v, v.wrapping_add(97), v.wrapping_add(193)])
+            });
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .expect("encode test png");
+            base64::engine::general_purpose::STANDARD.encode(&buf)
+        }
+
+        let tmp = TempDb::new("test-legacy-thumb-replace");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-legacy-thumb".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-legacy-thumb".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "placeholder" }]),
+                &ts,
+            )
+            .await
+            .expect("append placeholder");
+
+        let thumb = noise_png(8, 8);
+        let full = noise_png(16, 4);
+        let legacy = serde_json::json!({
+            "type": "image", "data": thumb, "mimeType": "image/png",
+            "dataIsThumbnail": true, "dataTruncated": true, "dataBytes": 123_456,
+        });
+        let stamped_slim = serde_json::json!({
+            "type": "image", "data": thumb, "mimeType": "image/png",
+            "dataIsThumbnail": true, "width": 1024, "height": 768,
+        });
+        let content = serde_json::json!([
+            legacy.clone(),
+            { "type": "image", "data": full, "mimeType": "image/png" },
+            stamped_slim.clone(),
+        ]);
+        let swapped = store
+            .replace_agent_messages(
+                &agent_id,
+                &[ReplaceMessage {
+                    role: "user",
+                    content: &content,
+                    metadata: None,
+                    created_at: &ts,
+                }],
+            )
+            .await
+            .expect("replace");
+        assert_eq!(swapped.len(), 1);
+        assert_eq!(
+            swapped[0].content[0], legacy,
+            "legacy thumbnail block returned unstamped"
+        );
+        assert_eq!(swapped[0].content[1]["width"], 16);
+        assert_eq!(swapped[0].content[1]["height"], 4);
+        assert_eq!(swapped[0].content[2], stamped_slim);
+
+        let stored = store
+            .get_agent_message_by_id(&agent_id, &swapped[0].id)
+            .await
+            .expect("read stored row")
+            .expect("row exists");
+        assert_eq!(
+            stored.content[0], legacy,
+            "legacy thumbnail block persisted unstamped: {}",
+            stored.content
+        );
+        assert_eq!(stored.content[1]["width"], 16);
+        assert_eq!(stored.content[1]["height"], 4);
+        assert_eq!(stored.content[2], stamped_slim);
     }
 
     /// 0108 heavy-payload extraction: an over-threshold `tool_result.output`
@@ -10569,6 +11468,253 @@ mod tests {
         assert_eq!(after.name, "Baseline", "unrelated columns untouched");
     }
 
+    /// The narrow `rehome_agent_session_provider` writer
+    /// (intent-hq/intent#5737): a turn-start re-home off a disabled provider
+    /// lands after first real use, may clear `model` (target CLI default),
+    /// always clears `reasoning_effort`, and leaves `acp_session_id` and
+    /// unrelated columns untouched. Wrong-workspace writes are `NotFound` and
+    /// mutate nothing; a stale `expected_provider` (a concurrent
+    /// `agent.setModel` moved the row) returns `Ok(false)` and mutates
+    /// nothing.
+    #[tokio::test]
+    async fn rehome_agent_session_provider_switches_provider_and_clears_effort() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-rehome".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("auggie".to_string());
+        session.model = Some("opus4.7".to_string());
+        session.reasoning_effort = Some("high".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let err = store
+            .rehome_agent_session_provider(
+                &WorkspaceId("ws-other".to_string()),
+                &agent_id,
+                Some("auggie"),
+                "codex",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect_err("cross-workspace write must not mutate");
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("auggie"));
+        assert_eq!(unchanged.model.as_deref(), Some("opus4.7"));
+        assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
+
+        // Stale expectation (a concurrent setModel moved the row): no write.
+        let landed = store
+            .rehome_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                Some("claude-code"),
+                "codex",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("stale expected provider is not an error");
+        assert!(!landed, "compare-and-set must not land on a mismatch");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("auggie"));
+        assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
+
+        let updated_at = now_iso();
+        let landed = store
+            .rehome_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                Some("auggie"),
+                "codex",
+                None,
+                &updated_at,
+            )
+            .await
+            .expect("re-home after first real use");
+        assert!(landed);
+        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        assert_eq!(after.provider.as_deref(), Some("codex"));
+        assert_eq!(after.model, None, "target CLI default clears the model");
+        assert_eq!(after.reasoning_effort, None, "effort never carries over");
+        assert_eq!(after.updated_at, updated_at);
+        assert_eq!(after.acp_session_id.as_deref(), Some("acp-live"));
+        assert_eq!(after.name, "Baseline", "unrelated columns untouched");
+
+        let landed = store
+            .rehome_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                Some("codex"),
+                "mock",
+                Some("m-1"),
+                &now_iso(),
+            )
+            .await
+            .expect("re-home with a settings default model");
+        assert!(landed);
+        let with_model = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(with_model.provider.as_deref(), Some("mock"));
+        assert_eq!(with_model.model.as_deref(), Some("m-1"));
+
+        // A NULL provider column (session resolving to the disabled default)
+        // is matched by `expected_provider = None`.
+        let null_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut null_session = baseline_test_session(&null_id, &ws_id, &ts, None);
+        null_session.provider = None;
+        store
+            .insert_agent_session(&null_session)
+            .await
+            .expect("insert");
+        assert!(
+            !store
+                .rehome_agent_session_provider(
+                    &ws_id,
+                    &null_id,
+                    Some("codex"),
+                    "mock",
+                    None,
+                    &now_iso()
+                )
+                .await
+                .expect("mismatch is not an error"),
+            "Some(expected) never matches a NULL column"
+        );
+        assert!(
+            store
+                .rehome_agent_session_provider(&ws_id, &null_id, None, "mock", None, &now_iso())
+                .await
+                .expect("NULL column re-home"),
+            "None matches a NULL column"
+        );
+        let after = store.get_agent_session(&null_id).await.expect("get");
+        assert_eq!(after.provider.as_deref(), Some("mock"));
+    }
+
+    /// `latest_agent_identity_notice` (intent-hq/intent#5737) returns the
+    /// newest system `model_changed` / `provider_rehomed` row's metadata
+    /// only: other system rows, user/assistant rows carrying those types,
+    /// and other agents' rows never count; no such row reads as `None`.
+    #[tokio::test]
+    async fn latest_agent_identity_notice_returns_newest_identity_system_row() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-notice".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        store.insert_agent_session(&session).await.expect("insert");
+        let other_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let other = baseline_test_session(&other_id, &ws_id, &ts, None);
+        store.insert_agent_session(&other).await.expect("insert");
+
+        let text = serde_json::json!([{ "type": "text", "text": "x" }]);
+        let append = |agent: &AgentId, role: &str, metadata: serde_json::Value| {
+            let agent = agent.clone();
+            let role = role.to_string();
+            let text = text.clone();
+            let store = &store;
+            async move {
+                store
+                    .append_agent_message_with_metadata(
+                        &agent,
+                        &role,
+                        &text,
+                        Some(&metadata),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("append")
+            }
+        };
+
+        assert_eq!(
+            store
+                .latest_agent_identity_notice(&agent_id)
+                .await
+                .expect("read"),
+            None,
+            "empty transcript"
+        );
+        append(
+            &agent_id,
+            "user",
+            serde_json::json!({ "type": "provider_rehomed" }),
+        )
+        .await;
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "auto_unarchived" }),
+        )
+        .await;
+        append(
+            &other_id,
+            "system",
+            serde_json::json!({ "type": "model_changed", "toProvider": "other" }),
+        )
+        .await;
+        assert_eq!(
+            store
+                .latest_agent_identity_notice(&agent_id)
+                .await
+                .expect("read"),
+            None,
+            "only system rows of the two identity types count, per agent"
+        );
+
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "provider_rehomed", "fromProvider": "a", "toProvider": "b" }),
+        )
+        .await;
+        let latest = store
+            .latest_agent_identity_notice(&agent_id)
+            .await
+            .expect("read")
+            .expect("rehome row");
+        assert_eq!(latest["type"], "provider_rehomed");
+        assert_eq!(latest["toProvider"], "b");
+
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "model_changed", "fromProvider": "b", "toProvider": "a" }),
+        )
+        .await;
+        append(
+            &agent_id,
+            "assistant",
+            serde_json::json!({ "type": "provider_rehomed" }),
+        )
+        .await;
+        let latest = store
+            .latest_agent_identity_notice(&agent_id)
+            .await
+            .expect("read")
+            .expect("model_changed row");
+        assert_eq!(latest["type"], "model_changed", "newest identity row wins");
+        assert_eq!(latest["toProvider"], "a");
+    }
+
     /// monorepo#1936 regression: the spawn path's system-prompt persist is a
     /// narrow write, so an `agent.setModel` that lands between the spawn's
     /// session read and the prompt persist survives — the prompt write must
@@ -11458,6 +12604,66 @@ mod tests {
             .get_agent_statuses(&[])
             .await
             .expect("empty id list")
+            .is_empty());
+    }
+
+    /// `get_agent_session_updated_at_batch` returns the `updated_at` of every
+    /// requested id that has a session row in one batched query, omits ids
+    /// without a row, and issues no statement for an empty id list
+    /// (intent-hq/intent#5626 — the `agent.listActive` busy-set read).
+    #[tokio::test]
+    async fn get_agent_session_updated_at_batch_returns_present_ids_only() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-updated-at-batch".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let first = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let second = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&first, &ws_id, &ts, None))
+            .await
+            .expect("insert first session");
+        store
+            .insert_agent_session(&baseline_test_session(&second, &ws_id, &ts, None))
+            .await
+            .expect("insert second session");
+        let first_updated_at = store
+            .get_agent_session_updated_at(&first)
+            .await
+            .expect("first updated_at");
+        let second_updated_at = store
+            .get_agent_session_updated_at(&second)
+            .await
+            .expect("second updated_at");
+
+        let missing = AgentId("agent-missing".to_string());
+        let batch = store
+            .get_agent_session_updated_at_batch(&[first.clone(), missing.clone(), second.clone()])
+            .await
+            .expect("batched updated_at");
+        assert_eq!(
+            batch.len(),
+            2,
+            "missing id is absent, not an error: {batch:?}"
+        );
+        assert_eq!(batch.get(&first), Some(&first_updated_at));
+        assert_eq!(batch.get(&second), Some(&second_updated_at));
+        assert!(!batch.contains_key(&missing));
+
+        // An empty id list must not touch the pool at all: with the pools
+        // closed any statement would fail, so `Ok(empty)` proves none ran.
+        store.close().await;
+        assert!(store
+            .get_agent_session_updated_at_batch(&[])
+            .await
+            .expect("empty id list issues no statement")
             .is_empty());
     }
 

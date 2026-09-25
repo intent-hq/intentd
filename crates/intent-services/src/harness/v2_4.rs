@@ -132,6 +132,14 @@ impl Harness for V2_4 {
         V1.role_reminder_prefix(name, reminder)
     }
 
+    fn setup_in_progress_notice(&self, terminal_name: &str) -> String {
+        V1.setup_in_progress_notice(terminal_name)
+    }
+
+    fn setup_failed_notice(&self, exit_code: Option<u32>, terminal_name: &str) -> String {
+        V1.setup_failed_notice(exit_code, terminal_name)
+    }
+
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String {
         V1.compose_turn_prompt(params)
     }
@@ -146,6 +154,15 @@ impl Harness for V2_4 {
 
     fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String {
         V1.a2a_sender_note(name, agent_id)
+    }
+
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String {
+        V1.collaborator_sender_preamble(login, display_name, principal_id)
     }
 
     fn wait_duration(&self, secs: i64) -> String {
@@ -350,6 +367,14 @@ impl Harness for V2_4 {
 
     fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String {
         V1.pr_monitor_transferred_to_parent_notice(label, parent_id)
+    }
+
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String {
+        V1.workspace_archived_watches_cancelled_notice(hooks, monitors)
     }
 
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String {

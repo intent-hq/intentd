@@ -19,7 +19,8 @@ on:
   # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
   # merged tree before it lands on main. CI is tiered by event: pull_request
   # runs the fast feedback jobs (check / build / pr-title / conflict-markers /
-  # deb-packaging / release-scripts) plus coverage-changed, which runs only
+  # monorepo-consumer-checks / deb-packaging / release-scripts) plus
+  # coverage-changed, which runs only
   # the PR's own changed tests under llvm-cov (pull_request-ONLY; see its
   # comment); merge_group additionally runs the full instrumented coverage
   # jobs (coverage-e2e / coverage-all), which are merge_group-ONLY — they no
@@ -435,6 +436,10 @@ jobs:
           shared-key: gh-burst-check
       - name: Format check
         run: cargo fmt --check
+      - name: Acquire the shared transfer selection contract
+        uses: ./.github/actions/transfer-selection-fixtures
+      - name: Real import and public session contract
+        run: "cargo test -p intent-services --lib transfer_selection_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
       # tinybox slots rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
@@ -1141,6 +1146,8 @@ jobs:
       - uses: taiki-e/install-action@nextest
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Acquire the shared transfer selection contract
+        uses: ./.github/actions/transfer-selection-fixtures
       - name: Run combined coverage
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
@@ -1374,6 +1381,9 @@ jobs:
         if: steps.select.outputs.has_selection == 'true'
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Acquire the shared transfer selection contract
+        if: steps.select.outputs.has_selection == 'true'
+        uses: ./.github/actions/transfer-selection-fixtures
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
         # Armed bound-caller seam — see coverage-e2e's run step. The plan
@@ -1480,6 +1490,31 @@ jobs:
           fi
           echo "No conflict markers in ${#files[@]} changed file(s)."
 
+  # Monorepo consumer checks: runs intent-hq/intent's `make consumer-checks`
+  # list (method catalog, event catalog, protocol→FE field parity, docs-check,
+  # check-makefile-targets) with this PR head in place of packages/intentd, so
+  # a change that would break a monorepo consumer check is red here before it
+  # merges instead of turning monorepo `main` red or stalling the rolling
+  # `auto/submodule-bump` PR after the fact (intent-hq/intent#4558, #5479,
+  # #5489, #5497). Fix order when red: the checks compare this head against
+  # monorepo `main` and every checker tolerates docs that lead the pin, so land
+  # the monorepo docs PR first (the job summary names the file to update), then
+  # re-run this job; the later submodule bump then lands green.
+  # check-mcp-bindings is advisory here (its generated index must match the
+  # pinned help text line for line, so the docs cannot lead an intentd change
+  # to a binding's help line); it stays a hard error in the monorepo.
+  # Runs on merge_group and same-repo pull_request (fork PRs get no CI — see
+  # the `pull_request` trigger comment); skipped on push to main, where the
+  # tree was already checked by its PR run. Seconds-long on ubuntu-latest.
+  monorepo-consumer-checks:
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      contents: read
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@main
+    with:
+      component: intentd
+      head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+
   # Packaging assets guard: asserts the systemd user unit keeps the exact
   # semantics the daemon's `service install` used to generate (Type=simple,
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
@@ -1517,8 +1552,8 @@ jobs:
           dpkg-deb --contents intentd_0.0.0_amd64.deb
           test "$(dpkg-deb --field intentd_0.0.0_amd64.deb Package)" = intentd
           test "$(dpkg-deb --field intentd_0.0.0_amd64.deb Architecture)" = amd64
-          dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/bin/intentd$'
-          dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
+          dpkg-deb --contents intentd_0.0.0_amd64.deb | grep ' \./usr/bin/intentd$' >/dev/null
+          dpkg-deb --contents intentd_0.0.0_amd64.deb | grep ' \./usr/lib/systemd/user/intentd\.service$' >/dev/null
 
   # Release-script regression tests: runs the stubbed-gh harnesses for
   # scripts/aggregate-channel-notes.sh (an idempotent re-promotion must
@@ -1533,11 +1568,14 @@ jobs:
   # is never a purge candidate; an unmarked idle one is), plus the
   # stubbed-cargo harness for scripts/changed-tests.sh (the changed-tests
   # selection the monorepo's `make test-changed` delegates to, and its
-  # --instrumented llvm-cov form; intent-hq/intentd#1947). Seconds-long like
+  # --instrumented llvm-cov form; intent-hq/intentd#1947), and the stub-root
+  # harness for the repo-root Makefile (every gate target forwards to the
+  # monorepo root make with its command-line variables; a standalone clone or
+  # an unrelated parent Makefile gets the exit-2 refusal). Seconds-long like
   # the other utility jobs, so it runs directly on ubuntu-latest.
   release-scripts:
     runs-on: ubuntu-latest
-    # Runs on push and same-repo PRs; skipped on fork PRs (see the
+    # Runs on push, merge_group and same-repo PRs; skipped on fork PRs (see the
     # `pull_request` trigger comment).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
@@ -1553,6 +1591,10 @@ jobs:
         run: ./scripts/test-ci-target-slot.sh
       - name: Test changed-tests.sh
         run: ./scripts/test-changed-tests.sh
+      - name: Test the Makefile gate forwarder
+        run: ./scripts/test-makefile-forwarder.sh
+      - name: Test the Codex ACP rolling pin PR automation
+        run: python3 -S scripts/test-auto-pin-codex-acp.py
 
   # install.ps1's Windows-only paths (intent-hq/intent#3229): the `check`
   # job's install_ps1_owner suite runs the installer's ownership check under
@@ -1603,6 +1645,62 @@ jobs:
           if ($result.SkippedCount -ne 0) { throw "install.ps1 Pester tests skipped on Windows: $($result.SkippedCount) (is the ScheduledTasks module missing?)" }
           if ($result.PassedCount -eq 0) { throw 'install.ps1 Pester tests: nothing ran' }
 
+  # Exercise the shipping Pi ACP package through real session/new, prompt and
+  # session/load traffic. CMD quoting needs native Windows, not compilation or
+  # Linux platform simulation. The Unix matrix also covers extension forwarding.
+  # The shipping-pin matrix is strict and required by CI Gate.
+  pi-session-paths:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install the exact production adapter pin
+        run: |
+          pin=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_ACP_NPX_PACKAGE: &str = "(pi-acp@[^"]+)";/); if (!m) throw new Error("Missing production Pi adapter pin"); console.log(m[1]);')
+          mkdir -p pi-path-evidence
+          printf '%s\n' "$pin" > pi-path-evidence/package.txt
+          npm install --prefix .pi-acp-test --no-save --ignore-scripts --no-audit --no-fund "$pin"
+          cp .pi-acp-test/node_modules/.package-lock.json pi-path-evidence/package-lock.json
+      - name: Test the pinned adapter (strict)
+        env:
+          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
+          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
+        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs | tee pi-path-evidence/test.tap
+      - name: Test cleanup failure observability
+        if: ${{ !cancelled() }}
+        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs | tee pi-path-evidence/cleanup-checks.tap
+      - name: Install the real minimum Pi CLI
+        if: runner.os == 'Linux'
+        run: |
+          minimum=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_CLI_MIN_VERSION: &str = "([^"]+)";/); if (!m) throw new Error("Missing Pi CLI minimum"); console.log(m[1]);')
+          npm install --prefix .pi-runtime-test --no-save --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@$minimum"
+          cp .pi-runtime-test/node_modules/.package-lock.json pi-path-evidence/pi-package-lock.json
+      - name: Test real Pi lifecycle and supported MCP extension delivery
+        if: runner.os == 'Linux'
+        env:
+          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
+          PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
+        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs | tee pi-path-evidence/runtime.tap
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: pi-session-pinned-${{ matrix.os }}-node${{ matrix.node }}
+          path: pi-path-evidence
+          if-no-files-found: error
+
   # Single required status check for branch protection: fans in check, build,
   # coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers,
   # deb-packaging, release-scripts, and install-ps1 (ported from cloudlands-fe's "CI Gate"
@@ -1629,12 +1727,15 @@ jobs:
   # both carry `if: github.event_name == 'pull_request'` and are legitimately
   # skipped on push and merge_group runs (PR-metadata checks, already
   # validated on the PR) — requiring strict success there would fail the
-  # gate outside pull_request events. Net per event: pull_request requires
-  # check / build / coverage-changed / deb-packaging / release-scripts /
-  # install-ps1 / pr-title / conflict-markers; merge_group requires check /
-  # build / deb-packaging / release-scripts / install-ps1 / coverage-e2e /
-  # coverage-all against the queue's merged tree; push requires build /
-  # deb-packaging / release-scripts / install-ps1.
+  # gate outside pull_request events. monorepo-consumer-checks follows the
+  # check pattern: success on pull_request and merge_group, success or
+  # skipped on push (see its comment). Net per event: pull_request requires
+  # check / build / coverage-changed / monorepo-consumer-checks /
+  # deb-packaging / release-scripts / install-ps1 / pr-title /
+  # conflict-markers; merge_group requires check / build /
+  # monorepo-consumer-checks / deb-packaging / release-scripts / install-ps1 /
+  # coverage-e2e / coverage-all against the queue's merged tree; push
+  # requires build / deb-packaging / release-scripts / install-ps1.
   gate:
     name: CI Gate
     # Seconds-long job: pinned to ubuntu-latest (see pr-title).
@@ -1645,13 +1746,14 @@ jobs:
     # would run the gate against all-skipped needs and report a spurious
     # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, deb-packaging, release-scripts, install-ps1]
+    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
           if [ "${{ needs.build.result }}" != "success" ] || \
              [ "${{ needs.deb-packaging.result }}" != "success" ] || \
              [ "${{ needs.release-scripts.result }}" != "success" ] || \
+             [ "${{ needs.pi-session-paths.result }}" != "success" ] || \
              [ "${{ needs.install-ps1.result }}" != "success" ]; then
             echo "One or more required jobs failed"
             exit 1
@@ -1669,6 +1771,21 @@ jobs:
             esac
           elif [ "${{ needs.check.result }}" != "success" ]; then
             echo "One or more required jobs failed"
+            exit 1
+          fi
+          # Event-aware on purpose: monorepo-consumer-checks must succeed
+          # outright on pull_request and merge_group; only push runs (where it
+          # is job-skipped as already checked by the PR run) accept skipped.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            case "${{ needs.monorepo-consumer-checks.result }}" in
+              success|skipped) ;;
+              *)
+                echo "monorepo-consumer-checks did not succeed or skip"
+                exit 1
+                ;;
+            esac
+          elif [ "${{ needs.monorepo-consumer-checks.result }}" != "success" ]; then
+            echo "monorepo-consumer-checks must succeed outright on pull_request / merge_group"
             exit 1
           fi
           # Event-aware on purpose: coverage-changed is pull_request-only, so

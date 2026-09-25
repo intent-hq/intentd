@@ -63,6 +63,13 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        // The mock ACP agent is a Node child of the daemon and inherits its
+        // env. Host-injected Node instrumentation (e.g. a Datadog
+        // `NODE_OPTIONS=--require .../dd-trace/init.js`) adds ~500 ms to
+        // every Node start and would eat the whole handshake budget below
+        // (intent-hq/intent#5649), so the daemon starts without it.
+        .env_remove("NODE_OPTIONS")
+        .env("DD_TRACE_ENABLED", "false")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     eprintln!("[spawn_serve] setting env vars:");
@@ -71,6 +78,17 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     cmd.spawn().expect("spawn intentd serve")
+}
+
+/// Handshake budget (`INTENTD_SESSION_SETUP_TIMEOUT_MS` /
+/// `INTENTD_ACP_INITIALIZE_TIMEOUT_MS`) for the fast-retry scenarios: 500 ms
+/// base, scaled by `INTENTD_TEST_TIMEOUT_MULTIPLIER` like every other budget
+/// so slow (instrumented/coverage) hosts extend it instead of timing out the
+/// attempts the scenario expects to succeed.
+fn handshake_budget_ms() -> String {
+    common::test_timeout(Duration::from_millis(500))
+        .as_millis()
+        .to_string()
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -323,14 +341,15 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
         "response": "retry succeeded",
     })
     .to_string();
-    // Fast retry: 500ms timeouts + 100ms,200ms backoff for fast e2e
+    // Fast retry: 500ms (scaled) timeouts + 100ms,200ms backoff for fast e2e
+    let budget = handshake_budget_ms();
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
-        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "500"),
-        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", "500"),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", &budget),
+        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", &budget),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -427,10 +446,54 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
     assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
 }
 
+/// Drop ANSI SGR sequences (`ESC [ … m`): the daemon's stderr layer styles
+/// field names even when redirected to the log file, so `attempt=1` is not
+/// byte-contiguous in the raw line.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Bounded poll: the daemon log's lines containing `needle` (ANSI-stripped),
+/// once at least one exists (empty when it never appears within the budget).
+async fn await_daemon_log_lines_containing(data_dir: &Path, needle: &str) -> Vec<String> {
+    let log_path = data_dir.join("daemon.log");
+    for _ in 0..200 {
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default();
+        let lines: Vec<String> = log
+            .lines()
+            .map(strip_ansi)
+            .filter(|l| l.contains(needle))
+            .collect();
+        if !lines.is_empty() {
+            return lines;
+        }
+        // timing-guard: bounded poll of the daemon's log file — the WARN has no wire-observable event to await
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Vec::new()
+}
+
 /// RETRY-1b: stdout closed (immediate exit) → retry with status hint → success.
 /// Mock exits immediately on launch for the first attempt (handshake failure),
 /// then succeeds on retry. Assert agent:stream:status retry hint is observed
-/// before the turn completes.
+/// before the turn completes, and that the attempt-1 WARN in the daemon log
+/// names the stderr capture dir holding the dead child's last words — the
+/// successful retry must not hide where the first failure's diagnostics went.
 #[tokio::test]
 async fn agent_spawn_retry_stdout_closed_over_wss() {
     let Some(script) = gate("WSS spawn retry stdout closed E2E") else {
@@ -446,13 +509,14 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
         "response": "retry succeeded after exit",
     })
     .to_string();
+    let budget = handshake_budget_ms();
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
-        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "500"),
-        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", "500"),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", &budget),
+        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", &budget),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -540,6 +604,45 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
     }
     assert!(chunks >= 1, "at least one agent:stream:activity over WSS");
     assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
+
+    // The attempt-1 child logged "exiting immediately" to stderr before
+    // dying; its capture lives under the per-agent dir (scan every daily
+    // file: the writer rotates by UTC date).
+    let capture_dir = intent_core::agent_logs_root(&data_dir).join(&agent_id);
+    let mut captured = String::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&capture_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(c) = tokio::fs::read_to_string(entry.path()).await {
+                captured.push_str(&c);
+            }
+        }
+    }
+    assert!(
+        captured.contains("exiting immediately (attempt 1/1)"),
+        "stderr capture under {} holds the attempt-1 child's last words; got: {captured:?}",
+        capture_dir.display()
+    );
+
+    // The per-attempt WARN for attempt 1 — logged BEFORE the retry, not only
+    // on terminal exhaustion — names that capture dir, and no other attempt
+    // failed (so nothing later obscures it).
+    let attempt_warns =
+        await_daemon_log_lines_containing(&data_dir, "agent spawn attempt failed").await;
+    assert_eq!(
+        attempt_warns.len(),
+        1,
+        "exactly one failed spawn attempt in the daemon log: {attempt_warns:?}"
+    );
+    let first = &attempt_warns[0];
+    assert!(
+        first.contains("attempt=1"),
+        "the failed attempt is attempt one: {first}"
+    );
+    let expected_hint = format!("agent stderr captured at {}", capture_dir.display());
+    assert!(
+        first.contains(&expected_hint),
+        "attempt-1 WARN names the stderr capture dir {expected_hint:?}: {first}"
+    );
 }
 
 /// RETRY-1c: terminal failure (always fails session/new) → agent:failed +
@@ -561,13 +664,14 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
         "ignoreSessionNewAttempts": 999,
     })
     .to_string();
+    let budget = handshake_budget_ms();
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
-        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "500"),
-        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", "500"),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", &budget),
+        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", &budget),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -687,13 +791,14 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
         "response": "retry recovery succeeded",
     })
     .to_string();
+    let budget = handshake_budget_ms();
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
-        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "500"),
-        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", "500"),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", &budget),
+        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", &budget),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -914,11 +1019,11 @@ async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
 
-    // Fake `pi` that reports a version older than PI_CLI_MIN_VERSION.
+    // The previously supported minimum lacks the 0.81.0 thinking-level RPC.
     let fake_pi = data_dir.join("fake-pi");
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.79.0\n").expect("write fake pi");
+        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.80.4\n").expect("write fake pi");
         std::fs::set_permissions(&fake_pi, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake pi");
     }
@@ -1019,7 +1124,7 @@ async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
     let error = failed_error.expect("terminal agent:failed observed over WSS");
     assert!(error.contains("cannot start Pi agent"), "{error}");
     assert!(
-        error.contains("0.79.0"),
+        error.contains("0.80.4"),
         "gate names the found version: {error}"
     );
     assert!(

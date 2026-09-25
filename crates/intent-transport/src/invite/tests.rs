@@ -1,5 +1,5 @@
 //! Unit tests for the invite fast paths: link construction, classify, the
-//! `invite.redeem` phase split, and the invite-error `data.code` mapping.
+//! `/invite` dispatch and throttle, and the invite-error `data.code` mapping.
 
 use std::sync::Arc;
 
@@ -8,29 +8,26 @@ use serde_json::{json, Value};
 
 use super::*;
 
+/// The invite link is tunnel-only: no `host` parameter at all (not even an
+/// empty one), `tc` always present, never the bearer token.
 #[test]
-fn invite_uri_carries_envelope_minus_token_plus_invite_fields() {
-    let uri = build_invite_uri(
-        &["192.168.1.10".to_string(), "10.0.0.5".to_string()],
-        7443,
-        "AB:CD",
-        "inv-1",
-        "s3cret",
-        None,
-    );
+fn invite_uri_is_tunnel_only_without_a_host_parameter() {
+    let uri = build_invite_uri(7443, "AB:CD", "inv-1", "s3cret", "tc-abc");
     assert_eq!(
         uri,
-        "intent://invite?v=1&host=192.168.1.10,10.0.0.5&port=7443&fp=AB:CD&inviteId=inv-1&secret=s3cret"
+        "intent://invite?v=1&port=7443&fp=AB:CD&inviteId=inv-1&secret=s3cret&tc=tc-abc"
     );
+    assert!(!uri.contains("host="), "{uri}");
     assert!(!uri.contains("token="));
-    let with_tc = build_invite_uri(&[], 7443, "AB", "i", "s", Some("tc-abc"));
-    assert!(with_tc.ends_with("&tc=tc-abc"), "{with_tc}");
-    let encoded = build_invite_uri(&[], 1, "AB", "a&b", "x=y", None);
-    assert!(encoded.contains("inviteId=a%26b&secret=x%3Dy"), "{encoded}");
+    let encoded = build_invite_uri(1, "AB", "a&b", "x=y", "tc a");
+    assert!(
+        encoded.contains("inviteId=a%26b&secret=x%3Dy&tc=tc%20a"),
+        "{encoded}"
+    );
 }
 
 #[test]
-fn classify_picks_the_two_invite_methods_only() {
+fn classify_picks_the_invite_methods_only() {
     let create = classify(&json!({
         "jsonrpc": "2.0", "id": 1, "method": "workspace.invite.create",
         "params": { "workspaceId": "ws" }
@@ -38,25 +35,45 @@ fn classify_picks_the_two_invite_methods_only() {
     .expect("classified");
     assert_eq!(create.method, InviteMethod::Create);
     assert!(create.id_present);
-    let redeem =
-        classify(&json!({ "jsonrpc": "2.0", "method": "invite.redeem" })).expect("classified");
-    assert_eq!(redeem.method, InviteMethod::Redeem);
-    assert!(!redeem.id_present);
+    assert!(!create.method.on_invite_endpoint());
+    let inspect =
+        classify(&json!({ "jsonrpc": "2.0", "method": "invite.inspect" })).expect("classified");
+    assert_eq!(inspect.method, InviteMethod::Inspect);
+    assert!(!inspect.id_present);
+    assert!(inspect.method.on_invite_endpoint());
+    let accept = classify(&json!({ "jsonrpc": "2.0", "id": 3, "method": "invite.accept" }))
+        .expect("classified");
+    assert_eq!(accept.method, InviteMethod::Accept);
+    assert!(accept.method.on_invite_endpoint());
+    let challenge = classify(&json!({ "jsonrpc": "2.0", "id": 4, "method": "invite.challenge" }))
+        .expect("classified");
+    assert_eq!(challenge.method, InviteMethod::Challenge);
+    assert!(challenge.method.on_invite_endpoint());
+    let prove = classify(&json!({ "jsonrpc": "2.0", "id": 5, "method": "invite.prove" }))
+        .expect("classified");
+    assert_eq!(prove.method, InviteMethod::Prove);
+    assert!(prove.method.on_invite_endpoint());
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "workspace.invite.list" }))
             .is_none()
     );
-    assert!(classify(&json!({ "jsonrpc": "1.0", "id": 1, "method": "invite.redeem" })).is_none());
-    assert!(classify(&json!({ "jsonrpc": "2.0", "id": {}, "method": "invite.redeem" })).is_none());
+    // The retired host-side device flow is not an invite method any more:
+    // it falls through to the `-32001` refusal on `/invite`.
+    assert!(classify(&json!({ "jsonrpc": "2.0", "id": 6, "method": "invite.redeem" })).is_none());
+    assert!(classify(&json!({ "jsonrpc": "1.0", "id": 1, "method": "invite.inspect" })).is_none());
+    assert!(classify(&json!({ "jsonrpc": "2.0", "id": {}, "method": "invite.inspect" })).is_none());
 }
 
-/// Records which redeem phase ran and returns a canned invite error.
+/// Records which `/invite` service method ran; each answers its canned
+/// payload for the `GOOD_*` inputs and a canned invite error otherwise.
 struct RedeemStub {
     calls: std::sync::Mutex<Vec<String>>,
 }
 
+const GOOD_SECRET: &str = "good";
+
 impl WorkspaceApi for RedeemStub {
-    fn invite_redeem_start(
+    fn invite_inspect(
         &self,
         invite_id: String,
         secret: String,
@@ -64,63 +81,591 @@ impl WorkspaceApi for RedeemStub {
         self.calls
             .lock()
             .unwrap()
-            .push(format!("start:{invite_id}:{secret}"));
-        Box::pin(async { Err(intent_core::Error::Invite(InviteErrorKind::Expired)) })
+            .push(format!("inspect:{invite_id}:{secret}"));
+        Box::pin(async move {
+            if secret == GOOD_SECRET {
+                Ok(json!({ "workspaceId": "ws-1", "workspaceTitle": "Shared" }))
+            } else {
+                Err(intent_core::Error::Invite(InviteErrorKind::Revoked))
+            }
+        })
     }
-    fn invite_redeem_wait(
+    fn invite_accept(
         &self,
-        flow_id: String,
+        invite_id: String,
+        secret: String,
+        credential: String,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
-        self.calls.lock().unwrap().push(format!("wait:{flow_id}"));
-        Box::pin(async { Ok(json!({ "status": "authorized", "token": "t" })) })
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("accept:{invite_id}:{secret}:{credential}"));
+        Box::pin(async move {
+            if credential == GOOD_CREDENTIAL {
+                Ok(json!({
+                    "status": "authorized",
+                    "token": "fresh",
+                    "principalId": "p-1",
+                    "login": "guest",
+                    "workspaceId": "ws-1",
+                }))
+            } else {
+                Err(intent_core::Error::Invite(
+                    InviteErrorKind::CredentialInvalid,
+                ))
+            }
+        })
+    }
+    fn invite_challenge(
+        &self,
+        invite_id: String,
+        secret: String,
+    ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("challenge:{invite_id}:{secret}"));
+        Box::pin(async move {
+            if secret == GOOD_SECRET {
+                Ok(json!({
+                    "workspaceId": "ws-1",
+                    "workspaceTitle": "Shared",
+                    "nonce": GOOD_NONCE,
+                    "nonceExpiresAt": "2026-01-01T00:10:00Z",
+                }))
+            } else {
+                Err(intent_core::Error::Invite(InviteErrorKind::Expired))
+            }
+        })
+    }
+    fn invite_prove(
+        &self,
+        invite_id: String,
+        secret: String,
+        nonce: String,
+        claim: InviteProofClaim,
+    ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+        let InviteProofClaim {
+            proof_id,
+            login,
+            provider,
+            host,
+        } = claim;
+        let forge = match (provider, host) {
+            (None, None) => String::new(),
+            (provider, host) => format!(
+                ":{}@{}",
+                provider.unwrap_or_default(),
+                host.unwrap_or_default()
+            ),
+        };
+        self.calls.lock().unwrap().push(format!(
+            "prove:{invite_id}:{secret}:{nonce}:{proof_id}:{login}{forge}"
+        ));
+        Box::pin(async move {
+            match nonce.as_str() {
+                GOOD_NONCE => Ok(json!({
+                    "status": "authorized",
+                    "token": "fresh",
+                    "principalId": "p-1",
+                    "login": "guest",
+                    "workspaceId": "ws-1",
+                })),
+                "expired" => Err(intent_core::Error::Invite(InviteErrorKind::ProofExpired)),
+                "down" => Err(intent_core::Error::Invite(
+                    InviteErrorKind::GithubUnreachable,
+                )),
+                "unverifiable" => Err(intent_core::Error::IdentityUnverifiable {
+                    host: "gitlab.example".to_string(),
+                }),
+                _ => Err(intent_core::Error::Invite(InviteErrorKind::ProofInvalid)),
+            }
+        })
     }
 }
 
+const GOOD_CREDENTIAL: &str = "cred";
+const GOOD_NONCE: &str = "nonce-1";
+
+/// `invite.challenge`: `{ inviteId, secret }` reaches the service as-is, the
+/// result carries the inspect payload plus `nonce` / `nonceExpiresAt` and
+/// the host identity decoration, an invite refusal maps to
+/// `error.data.code`, and a missing param is `-32602` before any service
+/// call.
 #[tokio::test]
-async fn redeem_routes_phases_and_maps_invite_errors_to_data_code() {
+async fn challenge_decorates_like_an_inspect_and_maps_invite_errors() {
     let stub = Arc::new(RedeemStub {
         calls: std::sync::Mutex::new(Vec::new()),
     });
     let api: Arc<dyn WorkspaceApi> = stub.clone();
 
     let req = classify(&json!({
-        "jsonrpc": "2.0", "id": 7, "method": "invite.redeem",
-        "params": { "inviteId": "inv", "secret": "sec" }
+        "jsonrpc": "2.0", "id": 1, "method": "invite.challenge",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET }
     }))
     .unwrap();
-    let frame: Value = serde_json::from_str(&handle_redeem(req, &api).await.unwrap()).unwrap();
-    assert_eq!(frame["id"], json!(7));
+    let frame: Value = serde_json::from_str(
+        &handle_challenge(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let result = &frame["result"];
+    assert_eq!(frame["id"], json!(1));
+    assert_eq!(result["workspaceId"], json!("ws-1"), "{frame}");
+    assert_eq!(result["workspaceTitle"], json!("Shared"));
+    assert_eq!(result["nonce"], json!(GOOD_NONCE));
+    assert_eq!(result["nonceExpiresAt"], json!("2026-01-01T00:10:00Z"));
+    assert_eq!(result["hostname"], json!(crate::local_hostname()));
+    assert_eq!(result["prettyHostname"], json!(crate::pretty_hostname()));
+    assert!(result.get("flowId").is_none(), "no device flow: {frame}");
+    assert!(result.get("userCode").is_none(), "no device flow: {frame}");
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "invite.challenge",
+        "params": { "inviteId": "inv", "secret": "stale" }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_challenge(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(frame["error"]["data"]["code"], json!("invite-expired"));
+    assert_eq!(frame["error"]["code"], json!(-32602));
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "invite.challenge",
+        "params": { "secret": GOOD_SECRET }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_challenge(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602));
+
+    assert_eq!(
+        *stub.calls.lock().unwrap(),
+        vec![
+            format!("challenge:inv:{GOOD_SECRET}"),
+            "challenge:inv:stale".to_string()
+        ],
+        "the missing-param request never reached the service"
+    );
+}
+
+/// `invite.prove`: `{ inviteId, secret, nonce, gistId, login }` reaches the
+/// service as-is and the `authorized` shape comes back undecorated;
+/// the three proof refusals surface as `error.data.code` `proof-invalid` /
+/// `proof-expired` / `github-unreachable`; a missing param is `-32602`
+/// before any service call.
+#[tokio::test]
+async fn prove_returns_the_authorized_shape_and_maps_proof_errors() {
+    let stub = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+    let prove = |id: u64, nonce: &str| {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "invite.prove",
+            "params": {
+                "inviteId": "inv", "secret": GOOD_SECRET, "nonce": nonce,
+                "gistId": "abc123", "login": "guest",
+            }
+        }))
+        .unwrap()
+    };
+
+    let frame: Value =
+        serde_json::from_str(&handle_prove(prove(1, GOOD_NONCE), &api).await.unwrap()).unwrap();
+    assert_eq!(
+        frame["result"],
+        json!({
+            "status": "authorized",
+            "token": "fresh",
+            "principalId": "p-1",
+            "login": "guest",
+            "workspaceId": "ws-1",
+        }),
+        "{frame}"
+    );
+    for (nonce, code, rpc) in [
+        ("bogus", "proof-invalid", -32602),
+        ("expired", "proof-expired", -32602),
+        (
+            "down",
+            "github-unreachable",
+            intent_core::Error::Invite(InviteErrorKind::GithubUnreachable).code(),
+        ),
+    ] {
+        let frame: Value =
+            serde_json::from_str(&handle_prove(prove(2, nonce), &api).await.unwrap()).unwrap();
+        assert_eq!(frame["error"]["data"]["code"], json!(code), "{frame}");
+        assert_eq!(frame["error"]["code"], json!(rpc), "{frame}");
+    }
+    // 10.8: the host-half proof refusal keeps its typed `data` on `/invite`
+    // too — `host` names the instance the guest must be told about.
+    let unverifiable = intent_core::Error::IdentityUnverifiable {
+        host: "gitlab.example".to_string(),
+    };
+    let frame: Value =
+        serde_json::from_str(&handle_prove(prove(2, "unverifiable"), &api).await.unwrap()).unwrap();
     assert_eq!(
         frame["error"]["code"],
-        json!(intent_core::Error::Invite(InviteErrorKind::Expired).code())
+        json!(unverifiable.code()),
+        "{frame}"
+    );
+    assert_eq!(
+        frame["error"]["data"],
+        json!({ "code": "identity-unverifiable", "host": "gitlab.example" }),
+        "{frame}"
     );
 
     let req = classify(&json!({
-        "jsonrpc": "2.0", "id": 8, "method": "invite.redeem",
-        "params": { "flowId": " flow-1 " }
+        "jsonrpc": "2.0", "id": 3, "method": "invite.prove",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest" }
     }))
     .unwrap();
-    let frame: Value = serde_json::from_str(&handle_redeem(req, &api).await.unwrap()).unwrap();
-    assert_eq!(frame["result"]["status"], json!("authorized"));
-
-    let req =
-        classify(&json!({ "jsonrpc": "2.0", "id": 9, "method": "invite.redeem", "params": {} }))
-            .unwrap();
-    let frame: Value = serde_json::from_str(&handle_redeem(req, &api).await.unwrap()).unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
     assert_eq!(frame["error"]["code"], json!(-32602));
-
-    let req =
-        classify(&json!({ "jsonrpc": "2.0", "method": "invite.redeem", "params": {} })).unwrap();
     assert!(
-        handle_redeem(req, &api).await.is_none(),
-        "notification: no frame"
+        frame["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("gistId") && m.contains("proofId")),
+        "{frame}"
+    );
+
+    // 10.8: `proofId` aliases `gistId`; `provider` / `host` ride along.
+    // Both spellings at once are a caller error before any service call —
+    // even when they agree (exactly one of the two).
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 4, "method": "invite.prove",
+        "params": {
+            "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest",
+            "proofId": "77", "provider": "gitlab", "host": "gitlab.example",
+        }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["result"]["status"], json!("authorized"), "{frame}");
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 5, "method": "invite.prove",
+        "params": {
+            "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest",
+            "proofId": "77", "gistId": "abc123",
+        }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602), "{frame}");
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 6, "method": "invite.prove",
+        "params": {
+            "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest",
+            "proofId": "abc123", "gistId": "abc123",
+        }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602), "{frame}");
+    assert!(
+        frame["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("exactly one")),
+        "{frame}"
     );
 
     assert_eq!(
         *stub.calls.lock().unwrap(),
-        vec!["start:inv:sec".to_string(), "wait:flow-1".to_string()]
+        vec![
+            format!("prove:inv:{GOOD_SECRET}:{GOOD_NONCE}:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:bogus:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:expired:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:down:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:unverifiable:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:{GOOD_NONCE}:77:guest:gitlab@gitlab.example"),
+        ]
     );
+}
+
+/// `invite.inspect`: `{ inviteId, secret }` reaches the service as-is, the
+/// result carries the workspace hint plus the host identity (the same
+/// decoration as a challenge), an invite refusal maps to `error.data.code`,
+/// and a missing param is `-32602` before any service call.
+#[tokio::test]
+async fn inspect_decorates_like_a_challenge_and_maps_invite_errors() {
+    let stub = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "invite.inspect",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_inspect(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let result = &frame["result"];
+    assert_eq!(frame["id"], json!(1));
+    assert_eq!(result["workspaceId"], json!("ws-1"), "{frame}");
+    assert_eq!(result["workspaceTitle"], json!("Shared"));
+    assert_eq!(result["hostname"], json!(crate::local_hostname()));
+    assert_eq!(result["prettyHostname"], json!(crate::pretty_hostname()));
+    assert!(result.get("flowId").is_none(), "no device flow: {frame}");
+    assert!(result.get("userCode").is_none(), "no device flow: {frame}");
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "invite.inspect",
+        "params": { "inviteId": "inv", "secret": "stale" }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_inspect(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(frame["error"]["data"]["code"], json!("invite-revoked"));
+    assert_eq!(
+        frame["error"]["code"],
+        json!(intent_core::Error::Invite(InviteErrorKind::Revoked).code())
+    );
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "invite.inspect",
+        "params": { "inviteId": "inv" }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_inspect(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602));
+
+    assert_eq!(
+        *stub.calls.lock().unwrap(),
+        vec![
+            format!("inspect:inv:{GOOD_SECRET}"),
+            "inspect:inv:stale".to_string()
+        ],
+        "the missing-param request never reached the service"
+    );
+}
+
+/// `invite.accept`: `{ inviteId, secret, credential }` reaches the service
+/// as-is and the `authorized` shape comes back undecorated (no host
+/// identity); an unknown credential is `credential-invalid`; a missing
+/// `credential` is `-32602` before any service call.
+#[tokio::test]
+async fn accept_returns_the_authorized_shape_and_maps_credential_invalid() {
+    let stub = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "invite.accept",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET, "credential": GOOD_CREDENTIAL }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_accept(req, &api).await.unwrap()).unwrap();
+    assert_eq!(
+        frame["result"],
+        json!({
+            "status": "authorized",
+            "token": "fresh",
+            "principalId": "p-1",
+            "login": "guest",
+            "workspaceId": "ws-1",
+        }),
+        "{frame}"
+    );
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "invite.accept",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET, "credential": "revoked" }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_accept(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["data"]["code"], json!("credential-invalid"));
+    assert_eq!(frame["error"]["code"], json!(-32602));
+
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "invite.accept",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_accept(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602));
+    assert!(
+        frame["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("credential")),
+        "{frame}"
+    );
+
+    assert_eq!(
+        *stub.calls.lock().unwrap(),
+        vec![
+            format!("accept:inv:{GOOD_SECRET}:{GOOD_CREDENTIAL}"),
+            format!("accept:inv:{GOOD_SECRET}:revoked"),
+        ]
+    );
+}
+
+/// The `/invite` dispatcher routes every endpoint method to its handler and
+/// answers `workspace.invite.create` — never served there — with the same
+/// `-32001` as any non-invite method.
+#[tokio::test]
+async fn invite_endpoint_dispatch_routes_by_method() {
+    let stub = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+    for (method, params) in [
+        (
+            "invite.inspect",
+            json!({ "inviteId": "inv", "secret": GOOD_SECRET }),
+        ),
+        (
+            "invite.accept",
+            json!({ "inviteId": "inv", "secret": GOOD_SECRET, "credential": GOOD_CREDENTIAL }),
+        ),
+        (
+            "invite.challenge",
+            json!({ "inviteId": "inv", "secret": GOOD_SECRET }),
+        ),
+        (
+            "invite.prove",
+            json!({
+                "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE,
+                "gistId": "abc123", "login": "guest",
+            }),
+        ),
+    ] {
+        let req =
+            classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+                .unwrap();
+        let frame: Value = serde_json::from_str(
+            &handle_invite_endpoint(req, &api, host_identity(None, None))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(frame.get("result").is_some(), "{method}: {frame}");
+    }
+    assert_eq!(
+        *stub.calls.lock().unwrap(),
+        vec![
+            format!("inspect:inv:{GOOD_SECRET}"),
+            format!("accept:inv:{GOOD_SECRET}:{GOOD_CREDENTIAL}"),
+            format!("challenge:inv:{GOOD_SECRET}"),
+            format!("prove:inv:{GOOD_SECRET}:{GOOD_NONCE}:abc123:guest"),
+        ]
+    );
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 4, "method": "workspace.invite.create",
+        "params": { "workspaceId": "ws" }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(
+        &handle_invite_endpoint(req, &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32001));
+    assert_eq!(
+        frame["error"]["message"],
+        json!(INVITE_ENDPOINT_ONLY_MESSAGE)
+    );
+    let note = classify(&json!({ "jsonrpc": "2.0", "method": "workspace.invite.create" })).unwrap();
+    assert!(
+        handle_invite_endpoint(note, &api, host_identity(None, None))
+            .await
+            .is_none()
+    );
+}
+
+/// A `/invite` notification (no id) is handled without producing a frame.
+#[tokio::test]
+async fn invite_endpoint_notification_yields_no_frame() {
+    let stub = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "method": "invite.challenge",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET }
+    }))
+    .unwrap();
+    assert!(
+        handle_invite_endpoint(req, &api, host_identity(None, None))
+            .await
+            .is_none(),
+        "notification: no frame"
+    );
+    assert_eq!(
+        *stub.calls.lock().unwrap(),
+        vec![format!("challenge:inv:{GOOD_SECRET}")]
+    );
+}
+
+/// The inspect result names the host from the identity the caller hands in
+/// — the listener's cached `HostEnvironment` (the one `system.status` /
+/// `server.pairingInfo` report), never a fresh OS probe on the RPC path.
+#[tokio::test]
+async fn inspect_extends_the_service_result_with_the_cached_host_identity() {
+    let api: Arc<dyn WorkspaceApi> = Arc::new(RedeemStub {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 10, "method": "invite.inspect",
+        "params": { "inviteId": "inv", "secret": GOOD_SECRET }
+    }))
+    .unwrap();
+    let cached = crate::host_env::HostEnvironment {
+        hostname: "cached-host".to_string(),
+        pretty_hostname: "Cached Host".to_string(),
+        device_kind: Some("desktop".to_string()),
+        hardware_model: None,
+    };
+    let frame: Value =
+        serde_json::from_str(&handle_inspect(req, &api, cached).await.unwrap()).unwrap();
+    let result = &frame["result"];
+    assert_eq!(result["workspaceTitle"], json!("Shared"), "{frame}");
+    assert_eq!(result["hostname"], json!("cached-host"), "{frame}");
+    assert_eq!(result["prettyHostname"], json!("Cached Host"), "{frame}");
+    assert!(
+        result.get("deviceKind").is_none(),
+        "only the two name fields are stamped: {frame}"
+    );
+}
+
+/// `host_identity` reads the cached identity from the control surface first,
+/// then the pairing provider; the OS probes back the result only when the
+/// listener has neither (test harnesses).
+#[test]
+fn host_identity_prefers_the_cached_environment_over_the_os_probes() {
+    let (provider, _dir) = stub_provider(Some(1), None);
+    let from_provider = host_identity(None, Some(&provider));
+    assert_eq!(from_provider.hostname, "test");
+    assert_eq!(from_provider.pretty_hostname, "test");
+
+    let probed = host_identity(None, None);
+    assert_eq!(probed.hostname, crate::local_hostname());
+    assert_eq!(probed.pretty_hostname, crate::pretty_hostname());
 }
 
 #[tokio::test]
@@ -217,12 +762,14 @@ fn stub_provider(
 
 /// The services-facing resolver rebuilds exactly the link `create` mints —
 /// same envelope, same formatter — and answers `None` rather than an error
-/// when the listener is down or nothing is dialable (loopback bind, no
-/// tunnel), so `workspace.invite.list` never fails for it.
+/// when the listener is down or the tunnel is not running, so
+/// `workspace.invite.list` never fails for it (a listed invite simply has no
+/// `url` while the tunnel is down).
 #[tokio::test]
-async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
+async fn link_resolver_rebuilds_the_minted_link_and_is_none_without_a_tunnel() {
     let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
     let minted = link_envelope(Some(&provider)).await.expect("envelope");
+    assert_eq!(minted.tc_address, "tc-abc");
     let resolved = InviteLinkResolver::new(provider.clone())
         .invite_link_envelope()
         .await
@@ -232,10 +779,11 @@ async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
     assert_eq!(
         url,
         format!(
-            "intent://invite?v=1&host=&port=7443&fp={}&inviteId=inv-1&secret=s3cret&tc=tc-abc",
+            "intent://invite?v=1&port=7443&fp={}&inviteId=inv-1&secret=s3cret&tc=tc-abc",
             encode_query_value(&minted.fingerprint)
         )
     );
+    assert!(!url.contains("host="), "{url}");
 
     let (down, _dir) = stub_provider(None, Some("tc-abc"));
     assert!(matches!(
@@ -247,15 +795,29 @@ async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
         .await
         .is_none());
 
-    let (undialable, _dir) = stub_provider(Some(7443), None);
+    let (tunnel_down, _dir) = stub_provider(Some(7443), None);
     assert!(matches!(
-        link_envelope(Some(&undialable)).await,
-        Err(Error::Unsupported(_))
+        link_envelope(Some(&tunnel_down)).await,
+        Err(Error::TunnelDown)
     ));
-    assert!(InviteLinkResolver::new(undialable)
+    assert!(InviteLinkResolver::new(tunnel_down)
         .invite_link_envelope()
         .await
         .is_none());
+}
+
+/// The stub snapshot binds loopback only, so this exercises the contract
+/// that the envelope ignores the bind addresses altogether: a LAN bind
+/// address would not make an invite dialable without the tunnel either.
+#[tokio::test]
+async fn link_envelope_never_carries_direct_hosts() {
+    let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
+    let envelope = link_envelope(Some(&provider)).await.expect("envelope");
+    assert_eq!(envelope.port, 7443);
+    assert_eq!(envelope.tc_address, "tc-abc");
+    let url = envelope.invite_url("inv-1", "s3cret");
+    assert!(!url.contains("127.0.0.1"), "{url}");
+    assert!(!url.contains("host="), "{url}");
 }
 
 /// Service half of `workspace.invite.create`: answers `{ invite, secret }`
@@ -268,7 +830,7 @@ impl WorkspaceApi for CreateStub {
     fn workspace_invite_create(
         &self,
         workspace_id: WorkspaceId,
-        _pin_login: Option<String>,
+        _pin: Option<InvitePin>,
         _expires_in_secs: Option<u64>,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -282,9 +844,10 @@ impl WorkspaceApi for CreateStub {
 }
 
 /// `create` resolves the envelope once and stamps the one link it formats
-/// as both the top-level `url` and `invite.url`; when no link can be built
-/// (listener down) the create is refused before the service mints anything,
-/// so neither `url` can exist without the other.
+/// as both the top-level `url` and `invite.url`; the result carries
+/// `hosts: []` and the tunnel address; when no link can be built (listener
+/// down, or tunnel down) the create is refused before the service mints
+/// anything, so neither `url` can exist without the other.
 #[tokio::test]
 async fn create_stamps_the_same_link_as_url_and_invite_url() {
     let stub = Arc::new(CreateStub {
@@ -319,6 +882,11 @@ async fn create_stamps_the_same_link_as_url_and_invite_url() {
     );
     assert_eq!(r["secret"], json!("s3cret"));
     assert_eq!(r["invite"]["id"], json!("inv-1"));
+    assert_eq!(r["hosts"], json!([]), "{r}");
+    assert_eq!(r["port"], json!(7443));
+    assert_eq!(r["tcAddress"], json!("tc-abc"), "{r}");
+    assert!(url.contains("&tc=tc-abc"), "{url}");
+    assert!(!url.contains("host="), "{url}");
     assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     let (down, _dir) = stub_provider(None, Some("tc-abc"));
@@ -333,11 +901,32 @@ async fn create_stamps_the_same_link_as_url_and_invite_url() {
         json!("listener-down"),
         "{frame}"
     );
+    assert_eq!(frame["error"]["code"], json!(-32603), "{frame}");
     assert!(frame.get("result").is_none(), "{frame}");
     assert_eq!(
         stub.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "nothing minted without an envelope"
+    );
+
+    let (tunnel_down, _dir) = stub_provider(Some(7443), None);
+    let frame: Value = serde_json::from_str(
+        &handle_create(create_req(), &api, Some(&tunnel_down))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        frame["error"]["data"]["code"],
+        json!("tunnel-down"),
+        "{frame}"
+    );
+    assert_eq!(frame["error"]["code"], json!(-32603), "{frame}");
+    assert!(frame.get("result").is_none(), "{frame}");
+    assert_eq!(
+        stub.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "nothing minted while the tunnel is down"
     );
 }
 
@@ -350,71 +939,77 @@ fn non_invite_method_on_invite_endpoint_is_unauthorized() {
     assert_eq!(v["error"]["code"], json!(-32001));
     assert_eq!(v["error"]["message"], json!(INVITE_ENDPOINT_ONLY_MESSAGE));
     assert!(refuse_non_invite(&json!({ "jsonrpc": "2.0", "method": "workspace.list" })).is_none());
+    // The retired `invite.redeem` is refused exactly like any other
+    // non-invite method.
+    let frame = refuse_non_invite(&json!({ "jsonrpc": "2.0", "id": 4, "method": "invite.redeem" }))
+        .expect("frame");
+    let v: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(v["error"]["code"], json!(-32001));
+    assert_eq!(v["error"]["message"], json!(INVITE_ENDPOINT_ONLY_MESSAGE));
 }
 
-fn start_req(id: i64) -> InviteRequest {
+fn challenge_req(id: i64) -> InviteRequest {
     classify(&json!({
-        "jsonrpc": "2.0", "id": id, "method": "invite.redeem",
+        "jsonrpc": "2.0", "id": id, "method": "invite.challenge",
         "params": { "inviteId": "inv", "secret": format!("guess-{id}") }
     }))
     .unwrap()
 }
 
-/// The start throttle is a token bucket: the burst is admitted, the next
-/// serial attempt is refused with `invite-flow-busy` until a whole refill
-/// interval has elapsed, one token comes back per interval, and the bucket
-/// never overfills past the burst.
+/// The throttle is a token bucket: the burst is admitted, the next serial
+/// attempt is refused with `invite-flow-busy` until a whole refill interval
+/// has elapsed, one token comes back per interval, and the bucket never
+/// overfills past the burst.
 #[test]
-fn redeem_start_throttle_refuses_after_the_burst_until_refill() {
+fn throttle_refuses_after_the_burst_until_refill() {
     let t0 = Instant::now();
     let throttle = Arc::new(Mutex::new(RedeemThrottle::new(t0)));
     for i in 0..INVITE_START_BURST {
         assert!(
-            admit_redeem(&start_req(i64::from(i)), &throttle, t0).is_ok(),
+            admit_redeem(&challenge_req(i64::from(i)), &throttle, t0).is_ok(),
             "burst attempt {i} admitted"
         );
     }
-    let refused = admit_redeem(&start_req(100), &throttle, t0).expect_err("burst exhausted");
+    let refused = admit_redeem(&challenge_req(100), &throttle, t0).expect_err("burst exhausted");
     let v: Value = serde_json::from_str(&refused.expect("frame")).unwrap();
     assert_eq!(v["id"], json!(100));
     assert_eq!(v["error"]["data"]["code"], json!("invite-flow-busy"));
     let just_short = t0 + INVITE_START_REFILL.saturating_sub(Duration::from_millis(1));
     assert!(
-        admit_redeem(&start_req(101), &throttle, just_short).is_err(),
+        admit_redeem(&challenge_req(101), &throttle, just_short).is_err(),
         "still refused just before the refill interval"
     );
     let refilled = t0 + INVITE_START_REFILL;
     assert!(
-        admit_redeem(&start_req(102), &throttle, refilled).is_ok(),
+        admit_redeem(&challenge_req(102), &throttle, refilled).is_ok(),
         "one token back after one interval"
     );
     assert!(
-        admit_redeem(&start_req(103), &throttle, refilled).is_err(),
+        admit_redeem(&challenge_req(103), &throttle, refilled).is_err(),
         "exactly one token per interval"
     );
     let much_later = t0 + INVITE_START_REFILL * (INVITE_START_BURST * 4);
     for i in 0..INVITE_START_BURST {
         assert!(
-            admit_redeem(&start_req(200 + i64::from(i)), &throttle, much_later).is_ok(),
+            admit_redeem(&challenge_req(200 + i64::from(i)), &throttle, much_later).is_ok(),
             "refilled burst attempt {i}"
         );
     }
     assert!(
-        admit_redeem(&start_req(300), &throttle, much_later).is_err(),
+        admit_redeem(&challenge_req(300), &throttle, much_later).is_err(),
         "never overfills past the burst"
     );
     // A throttled notification is dropped without a frame.
     let note =
-        classify(&json!({ "jsonrpc": "2.0", "method": "invite.redeem", "params": { "inviteId": "inv", "secret": "s" } }))
+        classify(&json!({ "jsonrpc": "2.0", "method": "invite.challenge", "params": { "inviteId": "inv", "secret": "s" } }))
             .unwrap();
     assert_eq!(admit_redeem(&note, &throttle, much_later), Err(None));
 }
 
-/// Phase-2 waits are never throttled (the start already paid), and a
-/// throttled start reaches neither the store nor the upstream flow: the
-/// refusal is produced before `handle_redeem` runs.
+/// A throttled request reaches neither the store nor GitHub: the refusal is
+/// produced before the handler runs, so the service sees no call.
 #[tokio::test]
-async fn throttled_starts_make_no_upstream_calls_and_waits_pass() {
+async fn throttled_requests_make_no_service_calls() {
     let stub = Arc::new(RedeemStub {
         calls: std::sync::Mutex::new(Vec::new()),
     });
@@ -422,29 +1017,96 @@ async fn throttled_starts_make_no_upstream_calls_and_waits_pass() {
     let t0 = Instant::now();
     let throttle = Arc::new(Mutex::new(RedeemThrottle::new(t0)));
     for i in 0..INVITE_START_BURST {
-        assert!(admit_redeem(&start_req(i64::from(i)), &throttle, t0).is_ok());
+        assert!(admit_redeem(&challenge_req(i64::from(i)), &throttle, t0).is_ok());
     }
     let mut refusals = 0;
     for i in 0..20 {
-        match admit_redeem(&start_req(500 + i), &throttle, t0) {
+        match admit_redeem(&challenge_req(500 + i), &throttle, t0) {
             Ok(()) => {
-                handle_redeem(start_req(500 + i), &api).await;
+                handle_challenge(challenge_req(500 + i), &api, host_identity(None, None)).await;
             }
             Err(_) => refusals += 1,
         }
     }
-    assert_eq!(refusals, 20, "every post-burst start refused");
+    assert_eq!(refusals, 20, "every post-burst request refused");
     assert!(
         stub.calls.lock().unwrap().is_empty(),
         "no store/upstream call while throttled: {:?}",
         stub.calls.lock().unwrap()
     );
-    let wait = classify(&json!({
-        "jsonrpc": "2.0", "id": 9, "method": "invite.redeem", "params": { "flowId": "flow-1" }
-    }))
+    // Once a token is back, the admitted request does reach the service.
+    let later = t0 + INVITE_START_REFILL;
+    assert_eq!(admit_redeem(&challenge_req(9), &throttle, later), Ok(()));
+    let frame: Value = serde_json::from_str(
+        &handle_challenge(challenge_req(9), &api, host_identity(None, None))
+            .await
+            .unwrap(),
+    )
     .unwrap();
-    assert_eq!(admit_redeem(&wait, &throttle, t0), Ok(()));
-    let frame: Value = serde_json::from_str(&handle_redeem(wait, &api).await.unwrap()).unwrap();
-    assert_eq!(frame["result"]["status"], json!("authorized"));
-    assert_eq!(*stub.calls.lock().unwrap(), vec!["wait:flow-1".to_string()]);
+    assert_eq!(frame["error"]["data"]["code"], json!("invite-expired"));
+    assert_eq!(
+        *stub.calls.lock().unwrap(),
+        vec!["challenge:inv:guess-9".to_string()]
+    );
+}
+
+/// `invite.inspect`, `invite.accept`, `invite.challenge` and `invite.prove`
+/// all hash the secret against the store, so they draw from the same
+/// listener-wide bucket: once the burst is spent they are refused
+/// `invite-flow-busy` alike, and a mixed stream shares one budget.
+#[test]
+fn every_invite_method_shares_the_throttle() {
+    let t0 = Instant::now();
+    let throttle = Arc::new(Mutex::new(RedeemThrottle::new(t0)));
+    let inspect = |id: i64| {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "invite.inspect",
+            "params": { "inviteId": "inv", "secret": format!("guess-{id}") }
+        }))
+        .unwrap()
+    };
+    let accept = |id: i64| {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "invite.accept",
+            "params": { "inviteId": "inv", "secret": format!("guess-{id}"), "credential": "c" }
+        }))
+        .unwrap()
+    };
+    let challenge = |id: i64| {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "invite.challenge",
+            "params": { "inviteId": "inv", "secret": format!("guess-{id}") }
+        }))
+        .unwrap()
+    };
+    let prove = |id: i64| {
+        classify(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "invite.prove",
+            "params": {
+                "inviteId": "inv", "secret": format!("guess-{id}"), "nonce": "n",
+                "gistId": "g", "login": "guest",
+            }
+        }))
+        .unwrap()
+    };
+    assert!(hashes_secret(&inspect(0)) && hashes_secret(&accept(0)));
+    assert!(hashes_secret(&challenge(0)) && hashes_secret(&prove(0)));
+    let mut admitted = 0;
+    for i in 0..i64::from(INVITE_START_BURST) {
+        let req = match i % 4 {
+            0 => challenge(i),
+            1 => inspect(i),
+            2 => prove(i),
+            _ => accept(i),
+        };
+        if admit_redeem(&req, &throttle, t0).is_ok() {
+            admitted += 1;
+        }
+    }
+    assert_eq!(admitted, INVITE_START_BURST, "the burst admits any mix");
+    for req in [inspect(100), accept(101), challenge(103), prove(104)] {
+        let refused = admit_redeem(&req, &throttle, t0).expect_err("bucket empty");
+        let v: Value = serde_json::from_str(&refused.expect("frame")).unwrap();
+        assert_eq!(v["error"]["data"]["code"], json!("invite-flow-busy"), "{v}");
+    }
 }

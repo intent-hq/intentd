@@ -35,8 +35,8 @@
 //! request is counted or blocked against it, and actual spend can differ
 //! (the 3-call unit is a single-page estimate: a multi-page review list or
 //! a degraded-path REST fallback costs more; GraphQL reads ride their own
-//! quota). Ahead of genuine exhaustion, each due-sweep tick also spends one
-//! quota-free `rate_limit` probe and stretches the interval further when
+//! quota). Ahead of genuine exhaustion, each due-sweep tick also consults the
+//! shared quota probe and stretches the interval further when
 //! the projected spend to the window's reset would exceed
 //! `prMonitor.quotaSharePercent` of the REMAINING quota
 //! ([`plan_quota_cadence`]) — and defers every poll until the window
@@ -55,12 +55,19 @@
 //! mergeability — is unchanged since the last full fetch, bounded by
 //! [`PR_MONITOR_MAX_CHEAP_POLLS`] and [`PR_MONITOR_MAX_CHEAP_AGE`] so
 //! signals the fingerprint does not cover (check runs, merge-queue events)
-//! are still re-read regularly ([`PrMonitorFetchCache`]). A forge that
-//! reports no `updatedAt` gets no cheap polls at all: without it the
-//! fingerprint is blind to the comment / review / thread movement the
-//! monitor exists to report.
+//! are still re-read regularly. A forge that reports no `updatedAt` gets no
+//! cheap polls at all: without it the fingerprint is blind to the comment /
+//! review / thread movement the monitor exists to report.
+//!
+//! Every read lands in the shared PR cache ([`PrCache`], one per
+//! [`Services`]): the sweep polls through it ([`PrReadPolicy::Poll`]), the
+//! on-demand paths (registration, check-now, and — via
+//! [`Services::read_pr`] — `github.pulls.get` / `ws.pr.snapshot`) fetch
+//! fully or are served from it ([`PrReadPolicy::Serve`]), so a monitor poll
+//! refreshes what the next hover serves and a hover seeds what the next
+//! hover serves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,13 +85,15 @@ use intent_sourcecontrol::{
 use intent_store::{NewEvent, PrMonitorListEntry, PrMonitorPollUpdate};
 use serde_json::{json, Value};
 
+use crate::hook_manager::CancelSettlement;
 use crate::pr_ops::{self, MergeRequirements};
 use crate::rate_limit::RATE_LIMIT_MAX_PAUSE;
 use crate::workspace_status::MonitorPrSignals;
 use crate::{publish_event, system_actor, Services};
 
 use intent_core::config::{
-    MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET, MAX_PR_MONITOR_QUOTA_SHARE_PERCENT,
+    MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+    MAX_PR_MONITOR_QUOTA_SHARE_PERCENT, MIN_PR_CACHE_MAX_AGE_SECONDS,
     MIN_PR_MONITOR_DEBOUNCE_SECONDS, MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     MIN_PR_MONITOR_POLL_SECONDS, MIN_PR_MONITOR_QUOTA_SHARE_PERCENT,
 };
@@ -128,7 +137,7 @@ pub(crate) fn effective_pr_monitor_interval_secs(
     poll_secs.max(needed)
 }
 
-/// The forge's remaining quota as read by the tick's quota-free probe,
+/// The forge's remaining quota as read by the tick's quota probe,
 /// reduced to what the cadence math needs: the requests left in the window
 /// and how long the window still runs. Absent whenever the probe failed or
 /// the host lacks either signal, in which case the cadence falls back to
@@ -453,13 +462,13 @@ impl PrMonitorSnapshot {
 /// count at materialization time rather than fabricating a "comments
 /// removed" change from a sibling monitor's baseline.
 #[derive(Debug, Clone)]
-pub(crate) struct SharedPrSnapshot {
-    title: String,
-    url: String,
-    head_sha: Option<String>,
-    conversation_count: Option<i64>,
-    review_comment_count: i64,
-    requirements: MergeRequirements,
+pub struct SharedPrSnapshot {
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) head_sha: Option<String>,
+    pub(crate) conversation_count: Option<i64>,
+    pub(crate) review_comment_count: i64,
+    pub(crate) requirements: MergeRequirements,
     /// Whether the merge-requirements probe answered this poll. The probe is
     /// the only source of `mergeQueueEjection`, so `false` means that field
     /// is "unknown", not "no ejection" (see [`Self::materialize`]).
@@ -469,6 +478,10 @@ pub(crate) struct SharedPrSnapshot {
     /// review-decision, check-run or review-thread read leaves a default in
     /// the checklist that the forge may answer on the next read.
     requirements_complete: bool,
+    /// The host's merge-queue state as reported by this read
+    /// ([`pr_ops::MergeRequirementsRead::merge_queue_reported`]) — what
+    /// `github.pulls.get` carries as `isInMergeQueue` (`None` → key absent).
+    pub(crate) merge_queue_reported: Option<bool>,
 }
 
 impl SharedPrSnapshot {
@@ -524,7 +537,7 @@ impl SharedPrSnapshot {
 /// on every review, comment, thread, label, title, or push), the head SHA,
 /// the lifecycle/draft flags and the forge's mergeability verdict. A poll
 /// whose fingerprint equals the previous FULL fetch's reuses that fetch's
-/// sub-reads ([`fetch_shared_snapshot_cached`]).
+/// sub-reads ([`PrReadPolicy::Poll`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrFingerprint {
     updated_at: String,
@@ -568,17 +581,79 @@ pub(crate) const PR_MONITOR_MAX_CHEAP_POLLS: u32 = 5;
 /// combine with the poll-count bound into an arbitrarily old checklist.
 pub(crate) const PR_MONITOR_MAX_CHEAP_AGE: Duration = Duration::from_secs(15 * 60);
 
-/// One PR's last FULL sweep fetch, remembered between sweeps.
+/// Retention of a cache entry no active monitor keeps alive: it is dropped
+/// by the retention pass ([`retain_pr_cache`]) once its full fetch is this
+/// old. Entries under an active monitor live as long as the monitor.
+pub(crate) const PR_CACHE_MAX_IDLE: Duration = Duration::from_secs(10 * 60);
+
+/// Hard bound on the UNMONITORED entries the cache holds, enforced by the
+/// retention pass on every write ([`retain_pr_cache`]): past it the
+/// unmonitored entries with the oldest full fetch are evicted down to the
+/// cap. Monitored entries never count against it.
+pub(crate) const PR_CACHE_MAX_ENTRIES: usize = 256;
+
+/// How a PR read may use the shared cache ([`Services::read_pr`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrReadPolicy {
+    /// Return the cached entry when a forge read confirmed it current less
+    /// than `max_age` ago — no forge call; otherwise fetch fully (the folded
+    /// observation, else the per-signal reads), store the result and return
+    /// it. The on-demand readers' policy (`github.pulls.get`,
+    /// `ws.pr.snapshot`) with `max_age` = `prCache.maxAgeSeconds`.
+    Serve { max_age: Duration },
+    /// Always read the PR record (the change detector: the folded
+    /// observation, else `get_pr`); reuse the cached sub-reads while the
+    /// fingerprint is unchanged (bounded by [`PR_MONITOR_MAX_CHEAP_POLLS`]
+    /// and [`PR_MONITOR_MAX_CHEAP_AGE`]), else issue them; store the
+    /// result unless an on-demand read superseded it meanwhile. The sweep's
+    /// policy.
+    Poll,
+}
+
+impl PrReadPolicy {
+    /// A full fetch whatever the cache holds, stored for later reads — the
+    /// registration, re-registration, adoption and check-now paths.
+    pub const REFRESH: Self = Self::Serve {
+        max_age: Duration::ZERO,
+    };
+}
+
+/// One PR's last full read, remembered between reads.
 #[derive(Debug, Clone)]
-pub(crate) struct PrMonitorFetchCacheEntry {
+pub struct PrCacheEntry {
+    /// The PR record as of the newest read that confirmed this entry: the
+    /// full fetch, or a later cheap poll whose record carried the same
+    /// fingerprint.
+    pub pr: PullRequest,
+    /// The shared snapshot composed by the full fetch (materialize per
+    /// monitor with [`SharedPrSnapshot::materialize`]).
+    pub snapshot: SharedPrSnapshot,
+    /// When the full fetch behind `snapshot` was issued — the cheap-poll age
+    /// bound and the retention pass's order key.
+    pub fetched_at: Instant,
+    /// When a forge read last confirmed the entry current: `fetched_at`,
+    /// or the newest cheap poll since — the freshness anchor
+    /// [`PrReadPolicy::Serve`] ages against, so a PR under an active monitor
+    /// is served from the monitor's last poll whether that poll was full
+    /// or cheap.
+    pub refreshed_at: Instant,
     fingerprint: PrFingerprint,
-    snapshot: SharedPrSnapshot,
-    fetched_at: Instant,
     /// Polls that reused `snapshot` since `fetched_at`.
     cheap_polls: u32,
 }
 
-impl PrMonitorFetchCacheEntry {
+impl PrCacheEntry {
+    fn new(pr: PullRequest, snapshot: SharedPrSnapshot, now: Instant) -> Self {
+        Self {
+            fingerprint: PrFingerprint::of(&pr),
+            pr,
+            snapshot,
+            fetched_at: now,
+            refreshed_at: now,
+            cheap_polls: 0,
+        }
+    }
+
     /// Whether a poll that just read `fingerprint` at `now` may reuse this
     /// entry's sub-fetches: a fingerprint that can detect changes at all
     /// ([`PrFingerprint::detects_changes`]) and is unchanged, a complete
@@ -592,48 +667,132 @@ impl PrMonitorFetchCacheEntry {
     }
 }
 
-/// One PR's slot in the sweep's fetch cache: the last full sweep fetch (if
-/// any is held) plus an invalidation generation bumped by every on-demand
-/// full fetch of the PR (registration, re-registration, check-now). A sweep
-/// fetch records the generation before its `get_pr` and only stores its
-/// result if the generation is unchanged when it finishes, so an on-demand
-/// fetch that completed mid-sweep — and persisted a NEWER snapshot — can
-/// never be shadowed by the sweep's older result on later polls.
+/// One PR's slot in the cache: the last full read (if any is held) plus a
+/// generation bumped by every on-demand full read of the PR (a `Serve`
+/// miss, registration, re-registration, check-now). A sweep poll records
+/// the generation before its `get_pr` and only stores its result if the
+/// generation is unchanged when it finishes, so an on-demand read that
+/// completed mid-sweep — and stored a NEWER snapshot — can never be
+/// shadowed by the sweep's older result on later reads.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PrMonitorFetchCacheSlot {
+pub(crate) struct PrCacheSlot {
     generation: u64,
-    entry: Option<PrMonitorFetchCacheEntry>,
+    entry: Option<PrCacheEntry>,
 }
 
-/// The sweep's per-PR memory of its last full fetch, keyed like the
-/// in-sweep dedupe ([`PrKey`]). Consulted ONLY by the sweep: registration,
-/// re-registration and the explicit check-now path always fetch fully and
-/// then INVALIDATE the PR's slot ([`invalidate_fetch_cache`]), so the sweep
-/// after an on-demand fetch fetches fully too rather than reusing a
-/// checklist older than the snapshot that fetch persisted. Slots for PRs no
-/// longer under any active monitor are pruned at the top of each sweep.
-/// In-memory only — a daemon restart starts with a full fetch per PR.
-/// Shared across [`Services`] clones.
-pub(crate) type PrMonitorFetchCache = Arc<Mutex<HashMap<PrKey, PrMonitorFetchCacheSlot>>>;
+/// The shared PR cache: every PR read's memory of its last full read, keyed
+/// like the in-sweep dedupe ([`PrKey`]). Written by the sweep's polls and by
+/// every on-demand read alike, so a monitor poll refreshes what the next
+/// on-demand read serves and an on-demand read on an unmonitored PR seeds
+/// the next one. Every write ends with the retention pass
+/// ([`retain_pr_cache`]), which the sweep also runs at the top of each tick
+/// to drop the entries of monitors that have since gone. In-memory only — a
+/// daemon restart starts cold. Shared across [`Services`] clones.
+pub(crate) type PrCache = Arc<Mutex<HashMap<PrKey, PrCacheSlot>>>;
 
-/// Drop any cached sweep fetch for `key` and bump its generation, so a
-/// sweep fetch already in flight for the PR does not repopulate the slot
-/// with its (possibly older) result. Called by every on-demand full fetch
-/// once that fetch has completed.
-fn invalidate_fetch_cache(cache: &PrMonitorFetchCache, key: &PrKey) {
+/// Store an on-demand full read and bump the slot's generation, so a sweep
+/// poll already in flight for the PR does not overwrite it with its
+/// (possibly older) result. `monitored` is the set of PRs under an active
+/// monitor, for the write's retention pass ([`retain_pr_cache`]).
+fn store_on_demand(
+    cache: &PrCache,
+    key: PrKey,
+    pr: PullRequest,
+    snapshot: SharedPrSnapshot,
+    monitored: &HashSet<PrKey>,
+) -> PrCacheEntry {
+    let now = Instant::now();
+    let entry = PrCacheEntry::new(pr, snapshot, now);
     let mut cache = cache.lock().unwrap();
-    let slot = cache.entry(key.clone()).or_default();
+    let slot = cache.entry(key).or_default();
     slot.generation += 1;
-    slot.entry = None;
+    slot.entry = Some(entry.clone());
+    retain_pr_cache(&mut cache, monitored, now);
+    entry
 }
 
-/// Fetch the current shared state of one PR: the merge-requirements
-/// checklist (which already degrades per-signal) plus the
-/// conversation-comment count (`None` when that read fails). Quota
-/// exhaustion is the one non-degrading failure: [`Error::RateLimited`] from
-/// ANY forge read — the load-bearing `get_pr`, a checklist sub-read, or the
-/// comment count — propagates so the sweep pauses the shared gate instead of
-/// persisting a degraded snapshot as a successful poll.
+/// The retention pass, run under the cache lock after EVERY write (a
+/// `Serve` miss, a registration / check-now refresh, a sweep poll) and at
+/// the top of each sweep: slots under an active monitor (`monitored`) are
+/// exempt from both rules and kept; any other slot is dropped once its full
+/// read is [`PR_CACHE_MAX_IDLE`] old (or it holds none), and the
+/// unmonitored slots left are then bounded by [`PR_CACHE_MAX_ENTRIES`],
+/// evicting the oldest `fetched_at` first. Running on the write path — not
+/// only in the sweep — is what makes the cap a hard bound: on-demand reads
+/// keep landing while the sweep is skipped by the forge rate-limit pause.
+fn retain_pr_cache(
+    cache: &mut HashMap<PrKey, PrCacheSlot>,
+    monitored: &HashSet<PrKey>,
+    now: Instant,
+) {
+    cache.retain(|key, slot| {
+        monitored.contains(key)
+            || slot.entry.as_ref().is_some_and(|entry| {
+                now.saturating_duration_since(entry.fetched_at) < PR_CACHE_MAX_IDLE
+            })
+    });
+    let mut unmonitored: Vec<(Instant, PrKey)> = cache
+        .iter()
+        .filter(|(key, _)| !monitored.contains(*key))
+        .map(|(key, slot)| {
+            (
+                slot.entry.as_ref().map_or(now, |entry| entry.fetched_at),
+                key.clone(),
+            )
+        })
+        .collect();
+    let excess = unmonitored.len().saturating_sub(PR_CACHE_MAX_ENTRIES);
+    if excess == 0 {
+        return;
+    }
+    unmonitored.sort();
+    for (_, key) in unmonitored.into_iter().take(excess) {
+        cache.remove(&key);
+    }
+}
+
+/// The sweep's retention pass: [`retain_pr_cache`] against the active
+/// monitors, so the entries of monitors cancelled or completed since the
+/// last write stop being exempt.
+fn prune_pr_cache(cache: &PrCache, monitored: &HashSet<PrKey>) {
+    retain_pr_cache(&mut cache.lock().unwrap(), monitored, Instant::now());
+}
+
+#[cfg(test)]
+fn backdate_pr_cache(cache: &PrCache, by: Duration) {
+    for slot in cache.lock().unwrap().values_mut() {
+        if let Some(entry) = slot.entry.as_mut() {
+            entry.fetched_at = entry.fetched_at.checked_sub(by).unwrap_or(entry.fetched_at);
+            entry.refreshed_at = entry
+                .refreshed_at
+                .checked_sub(by)
+                .unwrap_or(entry.refreshed_at);
+        }
+    }
+}
+
+#[cfg(test)]
+fn pr_cache_len(cache: &PrCache) -> usize {
+    cache
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|slot| slot.entry.is_some())
+        .count()
+}
+
+/// The "no active monitor" set for cache-level tests of [`read_pr_via`].
+#[cfg(test)]
+static NONE: std::sync::LazyLock<HashSet<PrKey>> = std::sync::LazyLock::new(HashSet::new);
+
+/// Fetch the current state of one PR in full: the PR record plus the shared
+/// snapshot — the merge-requirements checklist (which already degrades
+/// per-signal) and the conversation-comment count (`None` when that read
+/// fails). Quota exhaustion is the one non-degrading failure:
+/// [`Error::RateLimited`] from ANY forge read — the load-bearing `get_pr`,
+/// a checklist sub-read, or the comment count — propagates so the sweep
+/// pauses the shared gate instead of persisting a degraded snapshot as a
+/// successful poll.
 ///
 /// Forge requests per fetch, measured with the stub forge (trait-level
 /// reads; the GitHub HTTP count in parentheses where it differs):
@@ -645,15 +804,25 @@ fn invalidate_fetch_cache(cache: &PrMonitorFetchCache, key: &PrKey) {
 /// | REST fallback (probe + threads down), host without a folded read | 8 | 8, unchanged |
 /// | REST fallback, host with a folded read whose GraphQL is down | 8 | 9 — the failed `pr_observation` attempt, then the 8 |
 /// | cached cheap poll (fingerprint unchanged) | 1 (`get_pr`) | 1 (`pr_observation`) |
-pub(crate) async fn fetch_shared_snapshot(
+async fn fetch_pr_full(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-) -> Result<SharedPrSnapshot> {
+) -> Result<(PullRequest, SharedPrSnapshot)> {
     if let Some(observation) = observe_pr(sc, repo_ref, number).await? {
         return shared_snapshot_from_observation(sc, repo_ref, number, observation).await;
     }
-    let (pr, read) = pr_ops::fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
+    // The load-bearing read: a PR the forge does not know is reported by
+    // number and repo (the message `ws.pr.snapshot` documents), the rest
+    // maps as every other forge error.
+    let pr = sc.get_pr(repo_ref, number).await.map_err(|e| match e {
+        intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
+            "PR #{number} not found in {}/{}",
+            repo_ref.owner, repo_ref.name
+        )),
+        other => pr_ops::map_sc_err(other),
+    })?;
+    let read = pr_ops::merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
     finish_shared_snapshot(sc, repo_ref, number, pr, read).await
 }
 
@@ -691,43 +860,115 @@ async fn shared_snapshot_from_observation(
     repo_ref: &RepoRef,
     number: u64,
     observation: PrObservation,
-) -> Result<SharedPrSnapshot> {
+) -> Result<(PullRequest, SharedPrSnapshot)> {
     let read =
         pr_ops::merge_requirements_from_observation(sc, repo_ref, number, &observation).await?;
-    Ok(SharedPrSnapshot {
-        title: observation.pr.title,
-        url: observation.pr.url,
-        head_sha: observation.pr.head_sha,
+    let snapshot = SharedPrSnapshot {
+        title: observation.pr.title.clone(),
+        url: observation.pr.url.clone(),
+        head_sha: observation.pr.head_sha.clone(),
         conversation_count: Some(observation.conversation_count),
         review_comment_count: read.review_comment_count,
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
-    })
+        merge_queue_reported: read.merge_queue_reported,
+    };
+    Ok((observation.pr, snapshot))
 }
 
-/// [`fetch_shared_snapshot`] for a PR the sweep has already read: the PR
-/// record is always read (it is the change detector — the folded
-/// observation where the host has one, else `get_pr`), but the remaining
-/// reads — branch rules after a folded observation; merge-requirements
-/// probe, reviews, review threads, conversation comments after a `get_pr`
-/// — are skipped when `cache` holds a reusable full fetch for `key` with
-/// the same [`PrFingerprint`] (see [`PrMonitorFetchCacheEntry::reusable`]).
-/// A full fetch replaces the cache entry unless an on-demand fetch
-/// invalidated the slot meanwhile (see [`PrMonitorFetchCacheSlot`]); a
-/// failed one leaves it untouched (the next poll decides again from a fresh
-/// read).
-pub(crate) async fn fetch_shared_snapshot_cached(
+/// Read one PR through the shared cache under `policy`
+/// ([`PrReadPolicy`]); [`Services::read_pr`] with the source control
+/// resolved by the caller (the sweep resolves it once per tick).
+///
+/// `Serve`: a cached entry confirmed within `max_age` is returned with no
+/// forge call ([`cached_pr_within`]); otherwise the PR is fetched fully
+/// ([`fetch_pr_full`]) and stored, bumping the slot's generation
+/// ([`store_on_demand`]).
+///
+/// `Poll`: the PR record is always read (it is the change detector — the
+/// folded observation where the host has one, else `get_pr`), but the
+/// remaining reads — branch rules after a folded observation;
+/// merge-requirements probe, reviews, review threads, conversation comments
+/// after a `get_pr` — are skipped when the cache holds a reusable entry
+/// with the same [`PrFingerprint`] (see [`PrCacheEntry::reusable`]); the
+/// entry is then re-stamped as confirmed. A full fetch replaces the entry
+/// unless an on-demand read stored a newer one meanwhile (see
+/// [`PrCacheSlot`]); a failed one leaves it untouched (the next poll
+/// decides again from a fresh read).
+///
+/// `monitored` — the PRs under an active monitor — feeds the retention pass
+/// every store runs ([`retain_pr_cache`]).
+pub(crate) async fn read_pr_via(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-    cache: &PrMonitorFetchCache,
-    key: &PrKey,
-) -> Result<SharedPrSnapshot> {
-    let generation = cache
+    cache: &PrCache,
+    policy: PrReadPolicy,
+    monitored: &HashSet<PrKey>,
+) -> Result<PrCacheEntry> {
+    read_pr_via_with_fetched(sc, repo_ref, number, cache, policy, monitored)
+        .await
+        .map(|(entry, _)| entry)
+}
+
+/// [`read_pr_via`] also reporting whether the read reached the forge for
+/// the PR record: `false` only for a `Serve` hit, decided by the branch that
+/// returned the entry (never inferred from an earlier lookup), so a caller
+/// with a side effect keyed on a real fetch sees the exact outcome even
+/// when a concurrent reader filled the slot meanwhile. `Poll` always reads
+/// the record and reports `true`.
+pub(crate) async fn read_pr_via_with_fetched(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    cache: &PrCache,
+    policy: PrReadPolicy,
+    monitored: &HashSet<PrKey>,
+) -> Result<(PrCacheEntry, bool)> {
+    let key = pr_key_for(repo_ref, number.cast_signed());
+    let max_age = match policy {
+        PrReadPolicy::Poll => {
+            let entry = poll_pr(sc, repo_ref, number, cache, key, monitored).await?;
+            return Ok((entry, true));
+        }
+        PrReadPolicy::Serve { max_age } => max_age,
+    };
+    if let Some(entry) = cached_pr_within(cache, &key, max_age) {
+        tracing::trace!(pr_number = number, "pr cache: serving the cached read");
+        return Ok((entry, false));
+    }
+    let (pr, snapshot) = fetch_pr_full(sc, repo_ref, number).await?;
+    Ok((store_on_demand(cache, key, pr, snapshot, monitored), true))
+}
+
+/// The cached entry for `key` when a forge read confirmed it current less
+/// than `max_age` ago — what [`PrReadPolicy::Serve`] returns without a
+/// forge call; `None` when the entry is absent or older.
+fn cached_pr_within(cache: &PrCache, key: &PrKey, max_age: Duration) -> Option<PrCacheEntry> {
+    let now = Instant::now();
+    cache
         .lock()
         .unwrap()
         .get(key)
+        .and_then(|slot| slot.entry.as_ref())
+        .filter(|entry| now.saturating_duration_since(entry.refreshed_at) < max_age)
+        .cloned()
+}
+
+/// [`read_pr_via`] under [`PrReadPolicy::Poll`].
+async fn poll_pr(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    cache: &PrCache,
+    key: PrKey,
+    monitored: &HashSet<PrKey>,
+) -> Result<PrCacheEntry> {
+    let generation = cache
+        .lock()
+        .unwrap()
+        .get(&key)
         .map_or(0, |slot| slot.generation);
     let observation = observe_pr(sc, repo_ref, number).await?;
     let pr = match &observation {
@@ -741,54 +982,51 @@ pub(crate) async fn fetch_shared_snapshot_cached(
     let now = Instant::now();
     let reused = {
         let mut cache = cache.lock().unwrap();
-        match cache.get_mut(key).and_then(|slot| slot.entry.as_mut()) {
+        match cache.get_mut(&key).and_then(|slot| slot.entry.as_mut()) {
             Some(entry) if entry.reusable(&fingerprint, now) => {
                 entry.cheap_polls += 1;
-                Some(entry.snapshot.clone())
+                entry.refreshed_at = now;
+                entry.pr = pr.clone();
+                Some(entry.clone())
             }
             _ => None,
         }
     };
-    if let Some(snapshot) = reused {
+    if let Some(entry) = reused {
         tracing::trace!(
             pr_number = number,
             "pr monitor: PR fingerprint unchanged; reusing previous full fetch"
         );
-        return Ok(snapshot);
+        return Ok(entry);
     }
-    let snapshot = match observation {
+    let (pr, snapshot) = match observation {
         Some(observation) => {
             shared_snapshot_from_observation(sc, repo_ref, number, observation).await?
         }
         None => fetch_shared_snapshot_for(sc, repo_ref, number, pr).await?,
     };
-    if fingerprint.detects_changes() {
-        let mut cache = cache.lock().unwrap();
-        let slot = cache.entry(key.clone()).or_default();
-        if slot.generation == generation {
-            slot.entry = Some(PrMonitorFetchCacheEntry {
-                fingerprint,
-                snapshot: snapshot.clone(),
-                fetched_at: now,
-                cheap_polls: 0,
-            });
-        } else {
-            tracing::trace!(
-                pr_number = number,
-                "pr monitor: on-demand fetch superseded this sweep fetch; not caching it"
-            );
-        }
+    let entry = PrCacheEntry::new(pr, snapshot, now);
+    let mut cache = cache.lock().unwrap();
+    let slot = cache.entry(key).or_default();
+    if slot.generation == generation {
+        slot.entry = Some(entry.clone());
+    } else {
+        tracing::trace!(
+            pr_number = number,
+            "pr monitor: on-demand read superseded this sweep read; not caching it"
+        );
     }
-    Ok(snapshot)
+    retain_pr_cache(&mut cache, monitored, now);
+    Ok(entry)
 }
 
-/// The sub-reads of [`fetch_shared_snapshot`] for an already-read `pr`.
+/// The sub-reads of [`fetch_pr_full`] for an already-read `pr`.
 async fn fetch_shared_snapshot_for(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
     pr: PullRequest,
-) -> Result<SharedPrSnapshot> {
+) -> Result<(PullRequest, SharedPrSnapshot)> {
     let read = pr_ops::merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
     finish_shared_snapshot(sc, repo_ref, number, pr, read).await
 }
@@ -801,7 +1039,7 @@ async fn finish_shared_snapshot(
     number: u64,
     pr: PullRequest,
     read: pr_ops::MergeRequirementsRead,
-) -> Result<SharedPrSnapshot> {
+) -> Result<(PullRequest, SharedPrSnapshot)> {
     let conversation_count = match sc.list_comments(repo_ref, number).await {
         Ok(comments) => Some(i64::try_from(comments.len()).expect("value fits in i64")),
         Err(intent_sourcecontrol::Error::RateLimited(detail)) => {
@@ -816,29 +1054,18 @@ async fn finish_shared_snapshot(
             None
         }
     };
-    Ok(SharedPrSnapshot {
-        title: pr.title,
-        url: pr.url,
-        head_sha: pr.head_sha,
+    let snapshot = SharedPrSnapshot {
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        head_sha: pr.head_sha.clone(),
         conversation_count,
         review_comment_count: read.review_comment_count,
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
-    })
-}
-
-/// Fetch + materialize in one step — the registration path, where exactly
-/// one monitor consumes the read.
-pub(crate) async fn fetch_snapshot(
-    sc: &dyn SourceControl,
-    repo_ref: &RepoRef,
-    number: u64,
-    previous: Option<&PrMonitorSnapshot>,
-) -> Result<PrMonitorSnapshot> {
-    Ok(fetch_shared_snapshot(sc, repo_ref, number)
-        .await?
-        .materialize(previous))
+        merge_queue_reported: read.merge_queue_reported,
+    };
+    Ok((pr, snapshot))
 }
 
 /// One human-readable line per detected change between two snapshots, in a
@@ -893,7 +1120,11 @@ pub enum PrMonitorRegistration {
     /// The caller now owns an active monitor on the PR.
     Registered {
         monitor: Box<PrMonitor>,
-        requirements: MergeRequirements,
+        /// The freshly fetched checklist, or `None` when the baseline fetch
+        /// was DEFERRED because the forge quota is exhausted: the row is
+        /// persisted without a baseline and the first post-pause poll
+        /// adopts the PR's state then (nothing pending).
+        requirements: Option<MergeRequirements>,
         /// `Some(previous owner)` when the row was ADOPTED from an agent
         /// that can no longer receive wakes (intent-hq/intent#5079);
         /// `None` for a fresh registration or the owner's own re-arm.
@@ -1207,6 +1438,7 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
         mergeable: m.snapshot_mergeable,
         mergeable_state: None,
         is_draft: m.snapshot_is_draft,
+        is_in_merge_queue: None,
     }
 }
 
@@ -1366,6 +1598,144 @@ pub(crate) fn render_terminal_wake(
 }
 
 impl Services {
+    /// Read one PR through the shared cache under `policy` — the one entry
+    /// point for every PR read that should see (and refresh) what the
+    /// monitor's polls and the other on-demand readers saw. See
+    /// [`read_pr_via`] for the policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no source-control provider is configured or
+    /// the forge read fails; a `Serve` hit never reaches the forge.
+    pub(crate) async fn read_pr(
+        &self,
+        repo_ref: &RepoRef,
+        number: u64,
+        policy: PrReadPolicy,
+    ) -> Result<PrCacheEntry> {
+        self.read_pr_with_fetched(repo_ref, number, policy)
+            .await
+            .map(|(entry, _)| entry)
+    }
+
+    /// [`Self::read_pr`] also reporting whether the read reached the forge
+    /// for the PR record ([`read_pr_via_with_fetched`]): `false` for a
+    /// `Serve` hit — the preflight one that skips the source-control and
+    /// store reads, or the shared path's authoritative one when a concurrent
+    /// reader filled the slot between the two — decided by the branch that
+    /// produced the entry, never inferred beforehand.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_pr`].
+    pub(crate) async fn read_pr_with_fetched(
+        &self,
+        repo_ref: &RepoRef,
+        number: u64,
+        policy: PrReadPolicy,
+    ) -> Result<(PrCacheEntry, bool)> {
+        // A `Serve` hit costs neither a forge call nor a store read.
+        if let PrReadPolicy::Serve { max_age } = policy {
+            let key = pr_key_for(repo_ref, number.cast_signed());
+            if let Some(entry) = cached_pr_within(&self.pr_cache, &key, max_age) {
+                tracing::trace!(pr_number = number, "pr cache: serving the cached read");
+                return Ok((entry, false));
+            }
+        }
+        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+        let monitored = self.monitored_pr_keys().await;
+        // Test seam: park in the miss→fetch window so a test can land a
+        // concurrent fill before the shared path's authoritative lookup.
+        if let Some(park) = &self.pr_read_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+        read_pr_via_with_fetched(
+            sc.as_ref(),
+            repo_ref,
+            number,
+            &self.pr_cache,
+            policy,
+            &monitored,
+        )
+        .await
+    }
+
+    /// [`Self::read_pr_with_fetched`] under the on-demand readers' policy —
+    /// `Serve` at `prCache.maxAgeSeconds` ([`Self::pr_cache_max_age`]). The
+    /// flag is exact: `false` whenever the cached entry was served, `true`
+    /// only when this read fetched the record itself.
+    ///
+    /// Every successful serve passively folds the served snapshot into the
+    /// daemon-owned PR state ([`Services::fold_served_pr`]) so
+    /// `github.pulls.get` and `ws.pr.snapshot` behave identically: a fetch
+    /// folds the fresh record whole, a hit projects only the queue signal
+    /// onto same-head copies whose signal differs — a hit costs no forge
+    /// call either way (intent-hq/intent#5654). The fold is fail-soft: the
+    /// caller always gets its entry, a fold failure only costs the
+    /// daemon-owned state its early refresh.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_pr`].
+    pub(crate) async fn serve_pr(
+        &self,
+        repo_ref: &RepoRef,
+        number: u64,
+    ) -> Result<(PrCacheEntry, bool)> {
+        let max_age = self.pr_cache_max_age();
+        let (entry, fetched) = self
+            .read_pr_with_fetched(repo_ref, number, PrReadPolicy::Serve { max_age })
+            .await?;
+        if let Err(e) = self
+            .fold_served_pr(
+                repo_ref,
+                &entry.pr,
+                entry.snapshot.merge_queue_reported,
+                fetched,
+            )
+            .await
+        {
+            tracing::warn!(
+                owner = %repo_ref.owner,
+                repo = %repo_ref.name,
+                pr_number = number,
+                fetched,
+                error = %e,
+                "pr serve: folding the served PR into workspace PR state failed"
+            );
+        }
+        Ok((entry, fetched))
+    }
+
+    /// The PRs under an active monitor, for the cache's retention pass
+    /// ([`retain_pr_cache`]). A store failure yields the empty set — the
+    /// write then only bounds the cache harder, and the next sweep (which
+    /// loads the same rows) re-exempts the monitored entries.
+    async fn monitored_pr_keys(&self) -> HashSet<PrKey> {
+        match self.store.load_active_pr_monitors().await {
+            Ok(monitors) => monitors.iter().map(pr_key).collect(),
+            Err(e) => {
+                tracing::debug!(error = %e, "pr cache: could not load active monitors");
+                HashSet::new()
+            }
+        }
+    }
+
+    /// How old a cached PR read may be and still be served to an on-demand
+    /// reader without a forge call (`prCache.maxAgeSeconds`), clamped into
+    /// [[`MIN_PR_CACHE_MAX_AGE_SECONDS`], [`MAX_PR_CACHE_MAX_AGE_SECONDS`]].
+    /// Read live from the settings registry like the monitor knobs; an
+    /// explicit override wins when wired.
+    #[must_use]
+    pub fn pr_cache_max_age(&self) -> Duration {
+        let secs = self
+            .pr_cache_max_age_seconds
+            .unwrap_or_else(|| self.effective_settings().pr_cache.max_age_seconds)
+            .clamp(MIN_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_CACHE_MAX_AGE_SECONDS);
+        Duration::from_secs(secs)
+    }
+
     /// The tick cadence of the centralized monitor loop and the per-PR poll
     /// interval floor (`prMonitor.pollSeconds`), clamped to
     /// [`MIN_PR_MONITOR_POLL_SECONDS`]. Read live from the settings registry
@@ -1410,7 +1780,7 @@ impl Services {
             )
     }
 
-    /// The tick's one quota-free `rate_limit` probe, reduced to the window
+    /// The tick's one shared quota probe, reduced to the window
     /// the cadence plans on ([`QuotaWindow`]). `probed` is a status an
     /// earlier step of the same tick already paid for (the early lift,
     /// [`Services::maybe_lift_rate_limit_pause`]) — reused rather than
@@ -1424,16 +1794,7 @@ impl Services {
     ) -> Option<QuotaWindow> {
         let status = match probed {
             Some(status) => status,
-            None => match sc.rate_limit_status().await {
-                Ok(status) => status,
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "pr monitor sweep: quota probe failed; planning the cadence on the hourly budget alone"
-                    );
-                    return None;
-                }
-            },
+            None => self.sweep_rate_limit.probe_status(sc.as_ref()).await?,
         };
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1522,10 +1883,12 @@ impl Services {
     }
 
     /// Register (or idempotently re-arm) a monitor on `(repo, pr_number)` for
-    /// `agent_id`, returning the row plus the freshly fetched checklist. A
-    /// re-register of an existing ACTIVE monitor never duplicates the row: it
-    /// refreshes the baseline and clears any pending changes, so the agent's
-    /// next wake reports only what moves from here.
+    /// `agent_id`, returning the row plus the freshly fetched checklist —
+    /// `None` when the fetch was deferred under the forge rate-limit pause
+    /// (see [`Services::pr_monitor_try_register`]). A re-register of an
+    /// existing ACTIVE monitor never duplicates the row: it refreshes the
+    /// baseline and clears any pending changes, so the agent's next wake
+    /// reports only what moves from here.
     ///
     /// The direct-service convenience over [`Services::pr_monitor_try_register`]:
     /// a workspace-level refusal (another live agent already holds the PR's
@@ -1544,7 +1907,7 @@ impl Services {
         repo_owner: &str,
         repo_name: &str,
         pr_number: u64,
-    ) -> Result<(PrMonitor, MergeRequirements)> {
+    ) -> Result<(PrMonitor, Option<MergeRequirements>)> {
         match self
             .pr_monitor_try_register(workspace_id, agent_id, repo_owner, repo_name, pr_number)
             .await?
@@ -1589,7 +1952,16 @@ impl Services {
     ///
     /// The initial fetch is load-bearing — a forge that cannot read the PR
     /// (unsupported host, missing PR, no token) fails registration rather
-    /// than persisting a monitor that could never poll.
+    /// than persisting a monitor that could never poll — with ONE exception:
+    /// forge quota exhaustion. A rate limit is transient and says nothing
+    /// about the PR, so the registration is never lost to it
+    /// ([`Services::fetch_registration_baseline`]): the row is persisted
+    /// (or re-armed / adopted) WITHOUT a baseline — `lastSnapshot` /
+    /// `baselineSnapshot` / `lastPolledAt` cleared, `lastError` naming the
+    /// pause — the fetch joins the global forge rate-limit pause the sweeps
+    /// share, and the outcome carries `requirements: None`; the first
+    /// post-pause poll adopts the PR's state then with nothing pending
+    /// (exactly the fresh-baseline semantics, delayed to the reset).
     ///
     /// # Errors
     ///
@@ -1643,14 +2015,22 @@ impl Services {
 
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = RepoRef::new(repo_owner, repo_name);
-        let mut snapshot = fetch_snapshot(sc.as_ref(), &repo_ref, pr_number, None).await?;
-        invalidate_fetch_cache(
-            &self.pr_monitor_fetch_cache,
-            &pr_key_for(&repo_ref, pr_number.cast_signed()),
-        );
+        // A full fetch, stored for the sweep and the on-demand readers
+        // (the generation bump keeps an in-flight sweep read from
+        // overwriting it) — or deferred while the forge quota is exhausted.
+        let fetched = self
+            .fetch_registration_baseline(&sc, &repo_ref, pr_number)
+            .await?;
         let now = now_iso();
-        snapshot.observed_at = Some(now.clone());
-        let baseline = serde_json::to_string(&snapshot).ok();
+        let (baseline, requirements) = match fetched {
+            Some(mut snapshot) => {
+                snapshot.observed_at = Some(now.clone());
+                let baseline = serde_json::to_string(&snapshot).ok();
+                (baseline, Some(snapshot.requirements))
+            }
+            None => (None, None),
+        };
+        let deferred = requirements.is_none();
 
         let mut adopted_from = None;
         let mut monitor = match existing {
@@ -1692,25 +2072,41 @@ impl Services {
             }
         }
         if monitor.is_none() {
-            let m = PrMonitor {
-                monitor_id: PrMonitorId::new(),
-                workspace_id: workspace_id.clone(),
-                agent_id: agent_id.clone(),
-                repo_owner: repo_owner.to_string(),
-                repo_name: repo_name.to_string(),
-                pr_number: pr_number.cast_signed(),
-                state: PrMonitorState::Active,
-                last_snapshot: baseline.clone(),
-                baseline_snapshot: baseline.clone(),
-                pending_changes: Vec::new(),
-                pending_since: None,
-                last_change_at: None,
-                last_polled_at: Some(now.clone()),
-                last_error: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
+            // A deferred baseline is no poll: the row sorts oldest for the
+            // first post-pause due-sweep. The pause stamp it is born with
+            // and the insert are one gate critical section
+            // ([`crate::rate_limit::RateLimitGate::reconcile`]): the row is
+            // stamped from the gate's LIVE state and a lift's clear — which
+            // runs under the same section — cannot land between the two,
+            // so the row never carries a pause the gate already released.
+            let inserted = {
+                let _reconcile = self.sweep_rate_limit.reconcile().await;
+                let m = PrMonitor {
+                    monitor_id: PrMonitorId::new(),
+                    workspace_id: workspace_id.clone(),
+                    agent_id: agent_id.clone(),
+                    repo_owner: repo_owner.to_string(),
+                    repo_name: repo_name.to_string(),
+                    pr_number: pr_number.cast_signed(),
+                    state: PrMonitorState::Active,
+                    last_snapshot: baseline.clone(),
+                    baseline_snapshot: baseline.clone(),
+                    pending_changes: Vec::new(),
+                    pending_since: None,
+                    last_change_at: None,
+                    last_polled_at: (!deferred).then(|| now.clone()),
+                    last_error: deferred
+                        .then(|| {
+                            self.sweeps_rate_limited()
+                                .then(|| self.rate_limit_pause_error())
+                        })
+                        .flatten(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                };
+                self.store.insert_pr_monitor(&m).await?.then_some(m)
             };
-            if self.store.insert_pr_monitor(&m).await? {
+            if let Some(m) = inserted {
                 monitor = Some(m);
             } else if let Some(winner) = self
                 .store
@@ -1751,11 +2147,24 @@ impl Services {
                 }
             }
         }
-        let monitor = monitor.ok_or_else(|| {
+        let mut monitor = monitor.ok_or_else(|| {
             Error::Internal(
                 "pr.monitor: registration raced a concurrent monitor mutation; retry".to_string(),
             )
         })?;
+        if deferred {
+            // A re-armed / adopted row keeps the pause annotation the gate
+            // transition stamped on it (the guarded write composes with it
+            // in SQL); re-read so the returned image names the pause too.
+            monitor = self.store.get_pr_monitor(&monitor.monitor_id).await?;
+            tracing::info!(
+                monitor = %monitor.monitor_id,
+                label = %monitor_label(&monitor),
+                paused_until = ?self.sweep_rate_limit_paused_until(),
+                "pr monitor: forge rate limited; registered without a baseline, \
+                 first poll deferred to the end of the pause"
+            );
+        }
         let extra = adopted_from
             .as_ref()
             .map(|from| json!({ "adoptedFrom": from }));
@@ -1772,9 +2181,45 @@ impl Services {
         self.maybe_emit_waiting_changed(workspace_id).await;
         Ok(PrMonitorRegistration::Registered {
             monitor: Box::new(monitor),
-            requirements: snapshot.requirements,
+            requirements,
             adopted_from,
         })
+    }
+
+    /// The registration fetch behind [`Services::pr_monitor_try_register`]:
+    /// the PR's fresh snapshot, or `None` when the fetch is DEFERRED
+    /// because the forge quota is exhausted. The gate is the same global
+    /// rate-limit pause the sweeps share (monorepo#2961): while it is
+    /// closed the call consults the shared quota probe
+    /// ([`Services::maybe_lift_rate_limit_pause`]) — exactly like a sweep
+    /// tick — and fetches only if that lifts the pause; and a fetch that
+    /// fails with [`Error::RateLimited`] opens (or extends) the pause
+    /// ([`Services::pause_sweeps_for_rate_limit`]) instead of failing the
+    /// registration. Every other forge failure propagates unchanged — the
+    /// fetch stays load-bearing for "can this PR be read at all". The fetch
+    /// itself is a [`PrReadPolicy::REFRESH`] read through the shared cache
+    /// ([`Services::read_pr`]), so the sweep and the on-demand readers see
+    /// it.
+    async fn fetch_registration_baseline(
+        &self,
+        sc: &Arc<dyn SourceControl>,
+        repo_ref: &RepoRef,
+        pr_number: u64,
+    ) -> Result<Option<PrMonitorSnapshot>> {
+        if self.sweeps_rate_limited() && self.maybe_lift_rate_limit_pause(sc).await.is_none() {
+            return Ok(None);
+        }
+        match self
+            .read_pr(repo_ref, pr_number, PrReadPolicy::REFRESH)
+            .await
+        {
+            Ok(entry) => Ok(Some(entry.snapshot.materialize(None))),
+            Err(Error::RateLimited(detail)) => {
+                self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The workspace-level duplicate check behind [`Services::pr_monitor_try_register`]:
@@ -1912,7 +2357,10 @@ impl Services {
     /// reports only what moves from here rather than the dead owner's
     /// backlog. Returns `None` when the guarded write loses — the row was
     /// cancelled/completed/polled/adopted concurrently — so the caller can
-    /// re-read instead of clobbering.
+    /// re-read instead of clobbering. A `None` baseline is a DEFERRED
+    /// registration fetch (forge rate limited): the snapshots are cleared
+    /// and `lastPolledAt` is NOT stamped, so the first post-pause sweep
+    /// polls the row first and adopts the PR's state then.
     async fn adopt_pr_monitor(
         &self,
         mut m: PrMonitor,
@@ -1920,6 +2368,7 @@ impl Services {
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
+        let polled_at = baseline.is_some().then_some(now);
         let updated = self
             .store
             .adopt_pr_monitor(
@@ -1930,7 +2379,7 @@ impl Services {
                     last_snapshot: baseline.as_deref(),
                     baseline_snapshot: baseline.as_deref(),
                     pending_changes: &[],
-                    last_polled_at: Some(now),
+                    last_polled_at: polled_at,
                     updated_at: now,
                     expected_updated_at: &m.updated_at,
                     ..Default::default()
@@ -1958,7 +2407,7 @@ impl Services {
         m.pending_changes = Vec::new();
         m.pending_since = None;
         m.last_change_at = None;
-        m.last_polled_at = Some(now.to_string());
+        m.last_polled_at = polled_at.map(str::to_string);
         m.last_error = None;
         m.updated_at = now.to_string();
         Ok(Some(m))
@@ -1968,13 +2417,17 @@ impl Services {
     /// refresh the baseline, clear the pending state, and reset the debounce
     /// anchors. Returns `None` when the guarded write loses — the row was
     /// cancelled/completed/re-registered concurrently — so the caller can
-    /// fall back instead of clobbering.
+    /// fall back instead of clobbering. A `None` baseline is a DEFERRED
+    /// registration fetch (forge rate limited): the snapshots are cleared
+    /// and `lastPolledAt` is NOT stamped, so the first post-pause sweep
+    /// polls the row first and adopts the PR's state then.
     async fn rearm_pr_monitor(
         &self,
         mut m: PrMonitor,
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
+        let polled_at = baseline.is_some().then_some(now);
         let updated = self
             .store
             .update_pr_monitor_poll(
@@ -1983,7 +2436,7 @@ impl Services {
                     last_snapshot: baseline.as_deref(),
                     baseline_snapshot: baseline.as_deref(),
                     pending_changes: &[],
-                    last_polled_at: Some(now),
+                    last_polled_at: polled_at,
                     updated_at: now,
                     expected_updated_at: &m.updated_at,
                     ..Default::default()
@@ -1998,7 +2451,7 @@ impl Services {
         m.pending_changes = Vec::new();
         m.pending_since = None;
         m.last_change_at = None;
-        m.last_polled_at = Some(now.to_string());
+        m.last_polled_at = polled_at.map(str::to_string);
         m.last_error = None;
         m.updated_at = now.to_string();
         Ok(Some(m))
@@ -2141,10 +2594,11 @@ impl Services {
         let notice = caller.is_none().then(|| {
             crate::harness::latest().pr_monitor_cancelled_from_app_notice(&monitor_label(&monitor))
         });
-        match self
-            .cancel_active_pr_monitor(monitor, notice.as_deref())
-            .await?
-        {
+        let settlement = match notice.as_deref() {
+            Some(notice) => CancelSettlement::Notify(notice),
+            None => CancelSettlement::Resettle,
+        };
+        match self.cancel_active_pr_monitor(monitor, settlement).await? {
             Some(monitor) => Ok(monitor),
             // A concurrent cancel/complete won between our read and the
             // guarded write; the monitor is no longer active either way.
@@ -2158,20 +2612,16 @@ impl Services {
     /// Core cancel transition shared by [`Services::pr_monitor_cancel`] and
     /// the archive sweep ([`Services::cancel_workspace_pr_monitors`]),
     /// mirroring [`Services::cancel_active_hook`]: guarded CAS write to
-    /// `cancelled`, catch-up-marker removal, `prMonitor:cancelled` emit.
-    /// With a `wake_notice` the owner is woken (the wake runs the deferral
-    /// backstop itself, inside `wake_pr_monitor_owner`, after the delivery
-    /// attempt); without one, no wake is delivered — a deferred completion
-    /// watch on the (idle) owner would otherwise never settle when this was
-    /// its last active monitor, so the backstop runs directly. Ends with the
-    /// transition-only displayStatus recompute (§6.5). Returns `Ok(None)`
-    /// when a concurrent cancel/complete won the CAS — the monitor is no
-    /// longer active either way. The caller must have verified the monitor
-    /// is ACTIVE.
+    /// `cancelled`, catch-up-marker removal, `prMonitor:cancelled` emit. How
+    /// the owner's deferred completion watches settle is the caller's
+    /// [`CancelSettlement`] choice. Ends with the transition-only
+    /// displayStatus recompute (§6.5). Returns `Ok(None)` when a concurrent
+    /// cancel/complete won the CAS — the monitor is no longer active either
+    /// way. The caller must have verified the monitor is ACTIVE.
     async fn cancel_active_pr_monitor(
         &self,
         mut monitor: PrMonitor,
-        wake_notice: Option<&str>,
+        settlement: CancelSettlement<'_>,
     ) -> Result<Option<PrMonitor>> {
         let now = now_iso();
         if !self
@@ -2189,15 +2639,16 @@ impl Services {
             .remove(&monitor.monitor_id);
         self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
             .await;
-        match wake_notice {
-            Some(notice) => {
+        match settlement {
+            CancelSettlement::Notify(notice) => {
                 self.wake_pr_monitor_owner(&monitor, notice, "cancelled")
                     .await;
             }
-            None => {
+            CancelSettlement::Resettle => {
                 self.resettle_owner_after_pr_monitor_terminal(&monitor)
                     .await;
             }
+            CancelSettlement::Deferred => {}
         }
         // A cancelled monitor's open-PR signal lapses — the derived
         // displayStatus can drop off `pr_open`/`pr_ready` (§6.5) — and the
@@ -2213,17 +2664,25 @@ impl Services {
     /// in the workspace through the shared cancel transition
     /// ([`Services::cancel_active_pr_monitor`]), mirroring the hook sweep
     /// ([`Services::cancel_workspace_hooks`]) — state persisted to
-    /// `cancelled`, `prMonitor:cancelled` emitted, owner woken with a notice
-    /// so the agent learns why its watch stopped. Runs AFTER the archived
-    /// row is persisted: the wake rides the archived gate in
-    /// [`Services::deliver_wake_message`], so it parks in the queue (at
-    /// most) and never starts a turn while the workspace is archived.
+    /// `cancelled`, `prMonitor:cancelled` emitted, waiting recomputed
+    /// (§5.1). Each cancel is SILENT (no per-monitor wake) and DEFERRED
+    /// ([`CancelSettlement::Deferred`]: no per-item completion backstop
+    /// either): the cancelled monitors are returned grouped by owner as
+    /// `(label, monitor_id)` pairs, and the archive tail
+    /// ([`crate::Services::notify_owners_of_archived_watches`]) folds them
+    /// with the swept hooks into ONE consolidated notice per agent and only
+    /// THEN runs the backstop, so a deferred completion watch on the owner
+    /// stays armed behind the queued notice.
     /// Terminal monitors are untouched, and unarchive does NOT resurrect
     /// cancelled monitors — the notice tells the owner to re-register if the
     /// PR still matters. Best-effort per monitor: a store failure is logged
     /// and the sweep moves on — archiving must not fail because one monitor
     /// row would not update.
-    pub(crate) async fn cancel_workspace_pr_monitors(&self, workspace_id: &WorkspaceId) {
+    pub(crate) async fn cancel_workspace_pr_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> BTreeMap<AgentId, Vec<(String, PrMonitorId)>> {
+        let mut cancelled: BTreeMap<AgentId, Vec<(String, PrMonitorId)>> = BTreeMap::new();
         let monitors = match self
             .store
             .list_active_pr_monitors_by_workspace(workspace_id)
@@ -2236,24 +2695,34 @@ impl Services {
                     error = %e,
                     "archive pr-monitor sweep: monitor list failed; skipping"
                 );
-                return;
+                return cancelled;
             }
         };
         for monitor in monitors {
             let monitor_id = monitor.monitor_id.clone();
-            let notice = crate::harness::latest()
-                .pr_monitor_cancelled_workspace_archived_notice(&monitor_label(&monitor));
-            // `Ok(None)` = a concurrent cancel/complete won the CAS between
-            // the list read and the guarded write; no longer active either way.
-            if let Err(e) = self.cancel_active_pr_monitor(monitor, Some(&notice)).await {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    monitor = %monitor_id.0,
-                    error = %e,
-                    "archive pr-monitor sweep: cancel failed; continuing"
-                );
+            match self
+                .cancel_active_pr_monitor(monitor, CancelSettlement::Deferred)
+                .await
+            {
+                Ok(Some(monitor)) => cancelled
+                    .entry(monitor.agent_id.clone())
+                    .or_default()
+                    .push((monitor_label(&monitor), monitor.monitor_id)),
+                // A concurrent cancel/complete won the CAS between the list
+                // read and the guarded write; no longer active either way,
+                // and not this sweep's to report.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        monitor = %monitor_id.0,
+                        error = %e,
+                        "archive pr-monitor sweep: cancel failed; continuing"
+                    );
+                }
             }
         }
+        cancelled
     }
 
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE PR monitor
@@ -2284,7 +2753,10 @@ impl Services {
             let monitor_id = monitor.monitor_id.clone();
             // `Ok(None)` = a concurrent cancel/complete won the CAS between
             // the list read and the guarded write; no longer active either way.
-            if let Err(e) = self.cancel_active_pr_monitor(monitor, None).await {
+            if let Err(e) = self
+                .cancel_active_pr_monitor(monitor, CancelSettlement::Resettle)
+                .await
+            {
                 tracing::warn!(
                     agent = %agent_id.0,
                     monitor = %monitor_id.0,
@@ -2342,17 +2814,24 @@ impl Services {
         }
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = monitor.repo();
-        let shared =
-            match fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number.cast_unsigned())
-                .await
-            {
-                Ok(shared) => shared,
-                Err(e) => {
-                    self.record_pr_monitor_error(&monitor, &e.to_string()).await;
-                    return Err(e);
-                }
-            };
-        invalidate_fetch_cache(&self.pr_monitor_fetch_cache, &pr_key(&monitor));
+        let monitored = self.monitored_pr_keys().await;
+        // A full fetch, stored for the sweep and the on-demand readers.
+        let shared = match read_pr_via(
+            sc.as_ref(),
+            &repo_ref,
+            monitor.pr_number.cast_unsigned(),
+            &self.pr_cache,
+            PrReadPolicy::REFRESH,
+            &monitored,
+        )
+        .await
+        {
+            Ok(entry) => entry.snapshot,
+            Err(e) => {
+                self.record_pr_monitor_error(&monitor, &e.to_string()).await;
+                return Err(e);
+            }
+        };
         // The poll itself can deliver the wake (the terminal final wake, or
         // a debounce window that had already elapsed).
         if self.poll_one_pr_monitor(&monitor, &shared).await? {
@@ -2410,27 +2889,18 @@ impl Services {
         self.sweep_pr_monitors(true).await;
     }
 
-    /// Age every fetch-cache entry by `by`, so a test can cross
-    /// [`PR_MONITOR_MAX_CHEAP_AGE`] without sleeping.
+    /// Age every cache entry by `by` (both its full-fetch and confirmed
+    /// stamps), so a test can cross [`PR_MONITOR_MAX_CHEAP_AGE`],
+    /// [`PR_CACHE_MAX_IDLE`] or a `Serve` window without sleeping.
     #[cfg(test)]
-    pub(crate) fn backdate_pr_monitor_fetch_cache(&self, by: Duration) {
-        for slot in self.pr_monitor_fetch_cache.lock().unwrap().values_mut() {
-            if let Some(entry) = slot.entry.as_mut() {
-                entry.fetched_at = entry.fetched_at.checked_sub(by).unwrap_or(entry.fetched_at);
-            }
-        }
+    pub(crate) fn backdate_pr_cache(&self, by: Duration) {
+        backdate_pr_cache(&self.pr_cache, by);
     }
 
-    /// The number of PRs the sweep's fetch cache currently holds a full
-    /// fetch for (invalidated slots do not count).
+    /// The number of PRs the cache currently holds a full read for.
     #[cfg(test)]
-    pub(crate) fn pr_monitor_fetch_cache_len(&self) -> usize {
-        self.pr_monitor_fetch_cache
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|slot| slot.entry.is_some())
-            .count()
+    pub(crate) fn pr_cache_len(&self) -> usize {
+        pr_cache_len(&self.pr_cache)
     }
 
     /// One sweep over the active monitors. Per-monitor failures are logged
@@ -2444,16 +2914,17 @@ impl Services {
     /// monitor, so an unreachable PR costs one fetch attempt per tick, not
     /// one per monitor.
     ///
-    /// Across sweeps, each fetch goes through the per-PR fetch cache
-    /// ([`fetch_shared_snapshot_cached`]): `get_pr` is always issued, and
-    /// the sub-reads are skipped while the PR's change fingerprint is
-    /// unchanged (bounded by [`PR_MONITOR_MAX_CHEAP_POLLS`] and
+    /// Across sweeps, each fetch goes through the shared PR cache
+    /// ([`PrReadPolicy::Poll`]): `get_pr` is always issued, and the
+    /// sub-reads are skipped while the PR's change fingerprint is unchanged
+    /// (bounded by [`PR_MONITOR_MAX_CHEAP_POLLS`] and
     /// [`PR_MONITOR_MAX_CHEAP_AGE`]), so a quiet PR costs one forge call per
-    /// poll instead of five or six.
+    /// poll instead of five or six. The tick opens with the cache's
+    /// retention pass ([`prune_pr_cache`]) against the active monitors.
     ///
     /// The sweep honours the global forge rate-limit gate shared with the
     /// PR-refresh and git-root sweeps (monorepo#2961): while the gate is
-    /// paused the tick spends one quota-free `rate_limit` probe
+    /// paused the tick consults the shared quota probe
     /// ([`Services::maybe_lift_rate_limit_pause`]) and, unless that lifts
     /// the pause early, is skipped before any forge call (no `lastError`
     /// churn; catch-up markers survive for the post-pause sweep), and a
@@ -2496,16 +2967,10 @@ impl Services {
                 return;
             }
         };
+        let monitored: HashSet<PrKey> = monitors.iter().map(pr_key).collect();
+        prune_pr_cache(&self.pr_cache, &monitored);
         if monitors.is_empty() {
-            self.pr_monitor_fetch_cache.lock().unwrap().clear();
             return;
-        }
-        {
-            let active = monitors.iter().map(pr_key).collect::<HashSet<_>>();
-            self.pr_monitor_fetch_cache
-                .lock()
-                .unwrap()
-                .retain(|key, _| active.contains(key));
         }
         let sc = match pr_ops::resolve_source_control(self.source_control.clone()).await {
             Ok(sc) => sc,
@@ -2549,12 +3014,13 @@ impl Services {
                     // wedging the sweep for every other monitor.
                     let fetched = match tokio::time::timeout(
                         self.pr_monitor_fetch_timeout,
-                        fetch_shared_snapshot_cached(
+                        read_pr_via(
                             sc.as_ref(),
                             &repo_ref,
                             monitor.pr_number.cast_unsigned(),
-                            &self.pr_monitor_fetch_cache,
-                            &key,
+                            &self.pr_cache,
+                            PrReadPolicy::Poll,
+                            &monitored,
                         ),
                     )
                     .await
@@ -2564,7 +3030,9 @@ impl Services {
                             rate_limited = true;
                             Err(self.rate_limit_pause_error())
                         }
-                        Ok(result) => result.map_err(|e| e.to_string()),
+                        Ok(result) => result
+                            .map(|entry| entry.snapshot)
+                            .map_err(|e| e.to_string()),
                         Err(_) => Err(format!(
                             "PR fetch timed out after {:?}",
                             self.pr_monitor_fetch_timeout
@@ -3271,12 +3739,24 @@ impl Services {
     }
 
     /// `ws.pr.monitor`: register (idempotently) a monitor and return
-    /// `{ ok, monitor, requirements }` — the row the UI lists plus the
-    /// freshly fetched merge-requirements checklist the model acts on.
-    /// When another agent in the workspace already holds the PR's active
-    /// monitor the call is REFUSED with a structured, non-error payload
-    /// (`ok: false, refused: true, reason: "already-monitored"`) naming the
-    /// owner, so the model can coordinate instead of retrying.
+    /// `{ ok, monitor, requirements, pausedUntil? }` — the row the UI lists
+    /// plus the freshly fetched merge-requirements checklist the model acts
+    /// on. `requirements` is `null` exactly when the baseline fetch was
+    /// DEFERRED under the forge rate-limit pause
+    /// ([`Services::pr_monitor_try_register`]); `pausedUntil` (RFC 3339)
+    /// is present while that pause is closed AT RESULT TIME — alongside a
+    /// `null` checklist unless a probe lifted the pause between the
+    /// deferral and this sample (the row then carries no pause either and
+    /// is due on the very next sweep), and alongside a fresh one only if a
+    /// sibling sweep closed the gate between the fetch and this result —
+    /// and omitted (never null) otherwise. The gate is one in-memory
+    /// value read at distinct instants, so the two are never re-fetched
+    /// into agreement; a consumer treats `requirements: null` as "deferred,
+    /// poll pending" and `pausedUntil` as "and the pause still stands".
+    /// When another agent in the workspace already holds the
+    /// PR's active monitor the call is REFUSED with a structured, non-error
+    /// payload (`ok: false, refused: true, reason: "already-monitored"`)
+    /// naming the owner, so the model can coordinate instead of retrying.
     pub(crate) async fn pr_monitor_start_op(
         &self,
         workspace_id: &WorkspaceId,
@@ -3300,6 +3780,9 @@ impl Services {
                     "monitor": pr_monitor_wire(&monitor, paused_until.as_deref()),
                     "requirements": requirements,
                 });
+                if let Some(until) = paused_until {
+                    payload["pausedUntil"] = json!(until);
+                }
                 if let Some(from) = adopted_from {
                     payload["adoptedFrom"] = json!(from);
                 }
@@ -3562,6 +4045,15 @@ mod tests {
     use super::*;
     use crate::events::EventBus;
 
+    /// [`fetch_pr_full`] without the PR record — an uncached full read.
+    async fn fetch_shared_snapshot(
+        sc: &dyn SourceControl,
+        repo_ref: &RepoRef,
+        number: u64,
+    ) -> Result<SharedPrSnapshot> {
+        Ok(fetch_pr_full(sc, repo_ref, number).await?.1)
+    }
+
     struct TempDb {
         path: PathBuf,
     }
@@ -3621,8 +4113,12 @@ mod tests {
         /// `None` is the host-without-signal default (no early lift).
         rate_limit_remaining: Option<u64>,
         rate_limit_limit: Option<u64>,
-        /// `rate_limit_status` itself fails (the free probe erroring).
+        /// `rate_limit_status` itself fails (the quota probe erroring).
         fail_rate_limit_status: bool,
+        /// A quota probe pends until its caller cancels the request.
+        hang_rate_limit_status: bool,
+        /// Metered hosts share a bounded probe cadence across all sweeps.
+        rate_limit_probe_interval: Duration,
         /// A real RFC 3339 `updatedAt` for the PR record, overriding the
         /// opaque `rev-N` stand-in when a test needs a comparable timestamp.
         updated_at: Option<String>,
@@ -3630,6 +4126,9 @@ mod tests {
         /// without a folded read, so every existing test keeps exercising
         /// the per-signal reads.
         folded: Option<FoldedRead>,
+        /// The host's merge-queue report on the probe signals (`None` is
+        /// a host not reporting it).
+        in_merge_queue: Option<bool>,
         /// Stands in for the forge's `updatedAt`: bumped by every
         /// [`StubForge::edit`] (as GitHub bumps it on reviews, comments,
         /// threads and pushes), left alone by [`StubForge::edit_quiet`] (as
@@ -3705,8 +4204,11 @@ mod tests {
                 rate_limit_remaining: None,
                 rate_limit_limit: None,
                 fail_rate_limit_status: false,
+                hang_rate_limit_status: false,
+                rate_limit_probe_interval: Duration::ZERO,
                 updated_at: None,
                 folded: None,
+                in_merge_queue: None,
             }
         }
     }
@@ -3758,7 +4260,7 @@ mod tests {
                 checks: self.checks.clone(),
                 checks_known: true,
                 branch_rules: None,
-                is_in_merge_queue: None,
+                is_in_merge_queue: self.in_merge_queue,
                 merge_queue_removal: self.merge_queue_removal.clone(),
             }
         }
@@ -3839,7 +4341,7 @@ mod tests {
         }
 
         /// Snapshot-fetch attempts so far: `get_pr` is called exactly once
-        /// per [`fetch_shared_snapshot`] attempt (successful or not).
+        /// per [`fetch_pr_full`] attempt (successful or not).
         fn fetches(&self) -> usize {
             self.get_pr_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -3918,6 +4420,10 @@ mod tests {
         }
         async fn rate_limit_status(&self) -> intent_sourcecontrol::Result<RateLimitStatus> {
             self.count_sub_fetch("rate_limit_status");
+            let hangs = self.state.lock().unwrap().hang_rate_limit_status;
+            if hangs {
+                std::future::pending::<()>().await;
+            }
             let s = self.state.lock().unwrap();
             if s.fail_rate_limit_status {
                 return Err(intent_sourcecontrol::Error::Api(
@@ -3929,6 +4435,9 @@ mod tests {
                 remaining: s.rate_limit_remaining,
                 limit: s.rate_limit_limit,
             })
+        }
+        fn rate_limit_probe_interval(&self) -> Duration {
+            self.state.lock().unwrap().rate_limit_probe_interval
         }
         async fn get_pr(
             &self,
@@ -4892,6 +5401,7 @@ mod tests {
             requirements: s.requirements.clone(),
             ejection_known,
             requirements_complete: ejection_known,
+            merge_queue_reported: s.requirements.is_in_merge_queue,
         }
     }
 
@@ -5114,7 +5624,7 @@ mod tests {
             .await
             .expect("register");
         assert_eq!(first.state, PrMonitorState::Active);
-        assert_eq!(requirements.state, "open");
+        assert_eq!(requirements.expect("baseline fetched").state, "open");
         assert!(first.last_snapshot.is_some(), "baseline captured");
 
         // A change lands, then the SAME (agent, repo, pr) re-registers: the
@@ -5177,7 +5687,7 @@ mod tests {
             .pr_monitor_register(&ws, &owner, "o", "r", 42)
             .await
             .expect("register");
-        assert_one_passed_each(&requirements.checks);
+        assert_one_passed_each(&requirements.expect("baseline fetched").checks);
 
         // Same data, then reordered, then back: every poll is quiet. The
         // edits bump the PR's fingerprint so each poll is a FULL fetch that
@@ -6694,7 +7204,10 @@ mod tests {
         row.pr_number = Some(42);
         row.pr_url = Some("https://github.com/o/r/pull/42".into());
         row.pr_status = Some(intent_core::PullRequestStatus::Open);
-        svc.store().update_workspace(&row).await.unwrap();
+        svc.store()
+            .update_workspace_with_branch(&row, Some(&row.branch))
+            .await
+            .unwrap();
         register(&svc, &ws, &owner).await;
 
         forge.edit(|s| s.pr_state = PrState::Merged);
@@ -7088,23 +7601,28 @@ mod tests {
             .collect()
     }
 
-    /// Quiet PR: three consecutive sweeps issue three `get_pr` reads but
-    /// exactly ONE set of sub-reads — the first sweep fetches fully and the
-    /// next two reuse it because the fingerprint did not move.
+    /// Quiet PR: registration plus three consecutive sweeps issue four
+    /// `get_pr` reads but exactly ONE set of sub-reads — registration's
+    /// baseline read fetches fully and seeds the shared cache, and every
+    /// sweep reuses it because the fingerprint did not move.
     #[tokio::test]
     async fn unchanged_fingerprint_polls_reuse_the_previous_sub_fetches() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         let svc = svc.with_pr_monitor_debounce_seconds(3600);
-        let monitor = register(&svc, &ws, &owner).await;
-
         let get_pr_before = forge.fetches();
         let subs_before = sub_fetch_totals(&forge);
+        let monitor = register(&svc, &ws, &owner).await;
+
         for _ in 0..3 {
             svc.poll_pr_monitors().await;
         }
-        assert_eq!(forge.fetches() - get_pr_before, 3, "get_pr every poll");
+        assert_eq!(
+            forge.fetches() - get_pr_before,
+            4,
+            "get_pr at registration and every poll"
+        );
         for ((method, before), (_, after)) in subs_before.iter().zip(sub_fetch_totals(&forge)) {
-            assert_eq!(after - before, 1, "{method}: one full fetch, two reused");
+            assert_eq!(after - before, 1, "{method}: one full fetch, three reused");
         }
         let row = svc
             .store()
@@ -7114,7 +7632,7 @@ mod tests {
         assert_eq!(row.state, PrMonitorState::Active);
         assert!(row.pending_changes.is_empty(), "nothing moved");
         assert!(row.last_error.is_none());
-        assert_eq!(svc.pr_monitor_fetch_cache_len(), 1);
+        assert_eq!(svc.pr_cache_len(), 1);
     }
 
     /// A change the forge reflects in the PR record (a review, which bumps
@@ -7161,7 +7679,9 @@ mod tests {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         let svc = svc.with_pr_monitor_debounce_seconds(3600);
         let monitor = register(&svc, &ws, &owner).await;
-        // Full fetch seeding the cache.
+        // Registration seeded the cache; age it out so the next sweep is a
+        // full fetch that restarts the cheap-poll count from zero.
+        svc.backdate_pr_cache(PR_MONITOR_MAX_CHEAP_AGE + Duration::from_secs(1));
         svc.poll_pr_monitors().await;
 
         forge.edit_quiet(|s| s.checks[0].state = CheckState::Failure);
@@ -7213,7 +7733,7 @@ mod tests {
 
         svc.poll_pr_monitors().await;
         let subs_after_cheap = sub_fetch_totals(&forge);
-        svc.backdate_pr_monitor_fetch_cache(PR_MONITOR_MAX_CHEAP_AGE + Duration::from_secs(1));
+        svc.backdate_pr_cache(PR_MONITOR_MAX_CHEAP_AGE + Duration::from_secs(1));
         svc.poll_pr_monitors().await;
         for ((method, before), (_, after)) in subs_after_cheap.iter().zip(sub_fetch_totals(&forge))
         {
@@ -7343,17 +7863,18 @@ mod tests {
         }
     }
 
-    /// An on-demand full fetch (check-now) invalidates the sweep's cached
-    /// fetch: a check that moved quietly (no `updatedAt` bump) and was
+    /// An on-demand full fetch (check-now) stores its result in the shared
+    /// cache: a check that moved quietly (no `updatedAt` bump) and was
     /// delivered by check-now must not be "reversed" on the next sweep by
-    /// the older cached checklist — that sweep fetches fully instead.
+    /// an older cached checklist — that sweep reuses check-now's fresh
+    /// entry (the fingerprint is unchanged) and issues no sub-read.
     #[tokio::test]
-    async fn check_now_invalidates_the_sweep_fetch_cache() {
+    async fn check_now_stores_the_fresh_fetch_for_the_sweep() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         let svc = svc.with_pr_monitor_debounce_seconds(3600);
         let monitor = register(&svc, &ws, &owner).await;
         svc.poll_pr_monitors().await;
-        assert_eq!(svc.pr_monitor_fetch_cache_len(), 1, "seeded");
+        assert_eq!(svc.pr_cache_len(), 1, "seeded");
 
         forge.edit_quiet(|s| s.checks[0].state = CheckState::Failure);
         svc.poll_pr_monitors().await;
@@ -7374,13 +7895,15 @@ mod tests {
             "check-now fetches fully and delivers the failure"
         );
         assert!(owner_messages(&svc, &owner).await.contains("build"));
-        assert_eq!(svc.pr_monitor_fetch_cache_len(), 0, "invalidated");
+        assert_eq!(svc.pr_cache_len(), 1, "check-now's fetch is the entry");
 
         let subs_before = sub_fetch_totals(&forge);
         svc.poll_pr_monitors().await;
-        for ((method, before), (_, after)) in subs_before.iter().zip(sub_fetch_totals(&forge)) {
-            assert_eq!(after - before, 1, "{method}: full fetch after check-now");
-        }
+        assert_eq!(
+            sub_fetch_totals(&forge),
+            subs_before,
+            "the sweep reuses check-now's fresh fetch"
+        );
         let row = svc
             .store()
             .get_pr_monitor(&monitor.monitor_id)
@@ -7388,53 +7911,84 @@ mod tests {
             .unwrap();
         assert!(
             row.pending_changes.is_empty(),
-            "no false reversal from the stale cache: {:?}",
+            "no false reversal from a stale cache: {:?}",
             row.pending_changes
         );
-        assert_eq!(svc.pr_monitor_fetch_cache_len(), 1, "re-seeded");
+        assert_eq!(svc.pr_cache_len(), 1);
     }
 
     /// Re-registration (the same agent re-arming its monitor) is an
-    /// on-demand full fetch too, and invalidates the slot the same way.
+    /// on-demand full fetch too, and stores its result the same way.
     #[tokio::test]
-    async fn re_registration_invalidates_the_sweep_fetch_cache() {
+    async fn re_registration_stores_the_fresh_fetch_for_the_sweep() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         let svc = svc.with_pr_monitor_debounce_seconds(3600);
         register(&svc, &ws, &owner).await;
         svc.poll_pr_monitors().await;
-        assert_eq!(svc.pr_monitor_fetch_cache_len(), 1);
+        assert_eq!(svc.pr_cache_len(), 1);
 
+        forge.edit_quiet(|s| s.checks[0].state = CheckState::Failure);
+        let subs_before = sub_fetch_totals(&forge);
         register(&svc, &ws, &owner).await;
-        assert_eq!(svc.pr_monitor_fetch_cache_len(), 0, "invalidated");
+        for ((method, before), (_, after)) in subs_before.iter().zip(sub_fetch_totals(&forge)) {
+            assert_eq!(after - before, 1, "{method}: re-registration fetches fully");
+        }
+        assert_eq!(
+            svc.pr_cache_len(),
+            1,
+            "re-registration's fetch is the entry"
+        );
         let subs_before = sub_fetch_totals(&forge);
         svc.poll_pr_monitors().await;
-        for ((method, before), (_, after)) in subs_before.iter().zip(sub_fetch_totals(&forge)) {
-            assert_eq!(after - before, 1, "{method}: full fetch after re-register");
-        }
+        assert_eq!(
+            sub_fetch_totals(&forge),
+            subs_before,
+            "the sweep reuses re-registration's fresh fetch"
+        );
     }
 
-    /// The generation guard: a sweep fetch that was in flight when an
-    /// on-demand fetch invalidated the slot must not repopulate it with
-    /// its own (potentially older) result.
+    /// The generation guard: a sweep read that was in flight when an
+    /// on-demand read stored a newer entry must not overwrite that entry
+    /// with its own (potentially older) result.
     #[tokio::test]
-    async fn an_in_flight_sweep_fetch_does_not_repopulate_an_invalidated_slot() {
+    async fn an_in_flight_sweep_read_does_not_overwrite_a_newer_on_demand_entry() {
         let forge = StubForge::new();
-        let cache: PrMonitorFetchCache = Arc::default();
+        let cache: PrCache = Arc::default();
         let repo = RepoRef::new("o", "r");
         let key = pr_key_for(&repo, 42);
+        let (mut pr, mut snapshot) = fetch_pr_full(&forge, &repo, 42).await.expect("fetch");
+        // The on-demand read saw a NEWER PR record than the sweep's read,
+        // so the sweep cannot reuse it and fetches fully.
+        pr.updated_at = format!("{}-later", pr.updated_at);
+        snapshot.conversation_count = Some(99);
         let key_for_hook = key.clone();
         let cache_for_hook = cache.clone();
-        // The on-demand fetch "completes" while the sweep's `get_pr` runs.
+        // The on-demand read "completes" while the sweep's `get_pr` runs.
         forge.set_on_get_pr(Some(Box::new(move |_| {
-            invalidate_fetch_cache(&cache_for_hook, &key_for_hook);
+            store_on_demand(
+                &cache_for_hook,
+                key_for_hook.clone(),
+                pr.clone(),
+                snapshot.clone(),
+                &HashSet::new(),
+            );
         })));
-        fetch_shared_snapshot_cached(&forge, &repo, 42, &cache, &key)
+        let polled = read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)
             .await
-            .expect("fetch");
+            .expect("poll");
+        assert_ne!(polled.snapshot.conversation_count, Some(99));
         let guard = cache.lock().unwrap();
         let slot = guard.get(&key).expect("slot");
-        assert!(slot.entry.is_none(), "superseded result not cached");
         assert_eq!(slot.generation, 1);
+        assert_eq!(
+            slot.entry
+                .as_ref()
+                .expect("entry")
+                .snapshot
+                .conversation_count,
+            Some(99),
+            "the on-demand entry survives the sweep read"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7608,27 +8162,384 @@ mod tests {
         let forge = StubForge::new();
         forge.edit(busy_pr);
         forge.edit(|s| s.folded = Some(FoldedRead::default()));
-        let cache: PrMonitorFetchCache = Arc::default();
-        let key = pr_key_for(&repo, 42);
+        let cache: PrCache = Arc::default();
         for expected in [
             vec![("pr_observation", 1), ("branch_rules", 1)],
             vec![("pr_observation", 2), ("branch_rules", 1)],
             vec![("pr_observation", 3), ("branch_rules", 1)],
         ] {
-            fetch_shared_snapshot_cached(&forge, &repo, 42, &cache, &key)
+            read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)
                 .await
                 .expect("fetch");
             assert_eq!(forge_reads(&forge), expected);
         }
         forge.edit(|s| s.conversation_comments += 1);
-        let snapshot = fetch_shared_snapshot_cached(&forge, &repo, 42, &cache, &key)
+        let entry = read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)
             .await
             .expect("fetch");
         assert_eq!(
             forge_reads(&forge),
             vec![("pr_observation", 4), ("branch_rules", 2)]
         );
-        assert_eq!(snapshot.conversation_count, Some(4));
+        assert_eq!(entry.snapshot.conversation_count, Some(4));
+    }
+
+    // -----------------------------------------------------------------------
+    // The shared PR cache's on-demand policy (`Serve`) and retention.
+    // -----------------------------------------------------------------------
+
+    /// A `Serve` read within `max_age` of the cached entry issues no forge
+    /// request at all; a miss (cold cache) or an expired entry costs one
+    /// full fetch, which is stored for the next read.
+    #[tokio::test]
+    async fn serve_hits_issue_no_forge_read_and_misses_fetch_fully_once() {
+        let repo = RepoRef::new("o", "r");
+        let forge = StubForge::new();
+        forge.edit(busy_pr);
+        forge.edit(|s| s.folded = Some(FoldedRead::default()));
+        let cache: PrCache = Arc::default();
+        let serve = PrReadPolicy::Serve {
+            max_age: Duration::from_secs(60),
+        };
+
+        let first = read_pr_via(&forge, &repo, 42, &cache, serve, &NONE)
+            .await
+            .expect("cold read");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![("pr_observation", 1), ("branch_rules", 1)],
+            "a miss costs one folded full fetch"
+        );
+        assert_eq!(pr_cache_len(&cache), 1, "stored");
+        assert_eq!(first.pr.number, 42);
+
+        forge.edit(|s| s.conversation_comments += 1);
+        let second = read_pr_via(&forge, &repo, 42, &cache, serve, &NONE)
+            .await
+            .expect("warm read");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![("pr_observation", 1), ("branch_rules", 1)],
+            "a hit issues no forge read"
+        );
+        assert_eq!(
+            second.snapshot.conversation_count, first.snapshot.conversation_count,
+            "served as cached, forge movement unseen"
+        );
+
+        backdate_pr_cache(&cache, Duration::from_secs(61));
+        let third = read_pr_via(&forge, &repo, 42, &cache, serve, &NONE)
+            .await
+            .expect("expired read");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![("pr_observation", 2), ("branch_rules", 2)],
+            "an expired entry is fetched fully again"
+        );
+        assert_eq!(third.snapshot.conversation_count, Some(4));
+    }
+
+    /// A `Serve` fetch seeds the cache for the sweep: a `Poll` that follows
+    /// it reuses its sub-reads while the fingerprint is unchanged, exactly
+    /// as after a sweep's own full fetch.
+    #[tokio::test]
+    async fn a_poll_after_a_serve_fetch_reuses_its_sub_reads() {
+        let repo = RepoRef::new("o", "r");
+        let forge = StubForge::new();
+        forge.edit(busy_pr);
+        forge.edit(|s| s.folded = Some(FoldedRead::default()));
+        let cache: PrCache = Arc::default();
+        read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::REFRESH, &NONE)
+            .await
+            .expect("on-demand read");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![("pr_observation", 1), ("branch_rules", 1)]
+        );
+        read_pr_via(&forge, &repo, 42, &cache, PrReadPolicy::Poll, &NONE)
+            .await
+            .expect("poll");
+        assert_eq!(
+            forge_reads(&forge),
+            vec![("pr_observation", 2), ("branch_rules", 1)],
+            "the poll read the record only"
+        );
+    }
+
+    /// A monitor poll refreshes the entry a later `Serve` returns: the
+    /// forge moves, the sweep's full re-fetch stores the new state, and the
+    /// on-demand read serves it without a forge request.
+    #[tokio::test]
+    async fn a_monitor_poll_refreshes_what_serve_returns() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_debounce_seconds(3600)
+            .with_pr_cache_max_age_seconds(60);
+        register(&svc, &ws, &owner).await;
+        let repo = RepoRef::new("o", "r");
+        let serve = PrReadPolicy::Serve {
+            max_age: svc.pr_cache_max_age(),
+        };
+        let before = svc.read_pr(&repo, 42, serve).await.expect("serve");
+
+        forge.edit(|s| s.conversation_comments += 1);
+        svc.poll_pr_monitors().await;
+        let get_pr_after_poll = forge.fetches();
+        let after = svc.read_pr(&repo, 42, serve).await.expect("serve");
+        assert_eq!(
+            forge.fetches(),
+            get_pr_after_poll,
+            "served without a forge read"
+        );
+        assert_eq!(
+            after.snapshot.conversation_count,
+            before.snapshot.conversation_count.map(|n| n + 1),
+            "the sweep's refresh is what Serve returns"
+        );
+    }
+
+    /// The registration paths' full fetch (`REFRESH`) is served to a
+    /// following `Serve` read: registering a monitor seeds the entry the
+    /// on-demand readers use.
+    #[tokio::test]
+    async fn registration_seeds_the_entry_serve_returns() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        register(&svc, &ws, &owner).await;
+        let fetches = forge.fetches();
+        let repo = RepoRef::new("o", "r");
+        let entry = svc
+            .read_pr(
+                &repo,
+                42,
+                PrReadPolicy::Serve {
+                    max_age: svc.pr_cache_max_age(),
+                },
+            )
+            .await
+            .expect("serve");
+        assert_eq!(
+            forge.fetches(),
+            fetches,
+            "served from the registration fetch"
+        );
+        assert_eq!(entry.pr.number, 42);
+    }
+
+    /// `serve_pr`'s flag is the read's exact outcome: a cold read fetches
+    /// (`true`), a read within `max_age` is served (`false`), and an entry
+    /// aged past the window is fetched again (`true`).
+    #[tokio::test]
+    async fn serve_pr_reports_fetch_versus_hit_exactly() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+        let repo = RepoRef::new("o", "r");
+
+        let (cold, fetched) = svc.serve_pr(&repo, 42).await.expect("cold");
+        assert!(fetched, "a cold read fetches");
+        assert_eq!(cold.pr.number, 42);
+        assert_eq!(forge.fetches(), 1);
+
+        let (_, fetched) = svc.serve_pr(&repo, 42).await.expect("hit");
+        assert!(!fetched, "a read within max_age is a hit");
+        assert_eq!(forge.fetches(), 1, "a hit costs no forge request");
+
+        svc.backdate_pr_cache(Duration::from_secs(61));
+        let (_, fetched) = svc.serve_pr(&repo, 42).await.expect("aged");
+        assert!(fetched, "an entry older than max_age is fetched again");
+        assert_eq!(forge.fetches(), 2);
+    }
+
+    /// Regression (intent-hq/intentd#2064 review): a concurrent fill landing
+    /// between `read_pr_with_fetched`'s preflight miss and the shared path's
+    /// authoritative lookup makes that lookup a hit — and the flag says so.
+    /// The parked read answers the concurrently stored entry, costs no forge
+    /// request of its own, and reports `false`; a flag inferred from the
+    /// preflight miss would have reported a fetch that never happened.
+    #[tokio::test]
+    async fn serve_pr_reports_a_hit_when_a_concurrent_fill_lands_in_the_miss_window() {
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let svc = svc
+            .with_pr_cache_max_age_seconds(60)
+            .with_pr_read_park(park.clone());
+        let repo = RepoRef::new("o", "r");
+
+        let parked = tokio::spawn({
+            let svc = svc.clone();
+            let repo = repo.clone();
+            async move { svc.serve_pr(&repo, 42).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("serve_pr reaches the miss→fetch window");
+        assert_eq!(forge.fetches(), 0, "parked before its own fetch");
+
+        // The concurrent fill: another reader stores #42 while the first
+        // sits parked past its preflight miss.
+        forge.edit(|s| s.conversation_comments += 1);
+        let filled = read_pr_via(
+            &forge,
+            &repo,
+            42,
+            &svc.pr_cache,
+            PrReadPolicy::REFRESH,
+            &NONE,
+        )
+        .await
+        .expect("concurrent fill");
+        assert_eq!(forge.fetches(), 1);
+        park.release.notify_one();
+
+        let (entry, fetched) = parked.await.expect("join").expect("serve_pr");
+        assert!(!fetched, "the authoritative lookup hit the concurrent fill");
+        assert_eq!(
+            forge.fetches(),
+            1,
+            "the parked read costs no forge request of its own"
+        );
+        assert_eq!(
+            entry.snapshot.conversation_count, filled.snapshot.conversation_count,
+            "the parked read answers the concurrently stored entry"
+        );
+    }
+
+    /// `prCache.maxAgeSeconds` is clamped into [10, 600] at read time; the
+    /// production wiring reads the schema default.
+    #[tokio::test]
+    async fn pr_cache_max_age_is_clamped() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        assert_eq!(svc.pr_cache_max_age(), Duration::from_secs(60));
+        assert_eq!(
+            svc.clone()
+                .with_pr_cache_max_age_seconds(0)
+                .pr_cache_max_age(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            svc.clone()
+                .with_pr_cache_max_age_seconds(10_000)
+                .pr_cache_max_age(),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            svc.with_pr_cache_max_age_seconds(120).pr_cache_max_age(),
+            Duration::from_secs(120)
+        );
+    }
+
+    /// Retention: an unmonitored entry expires once its full fetch is
+    /// [`PR_CACHE_MAX_IDLE`] old; a monitored one of the same age is kept.
+    #[tokio::test]
+    async fn unmonitored_entries_expire_and_monitored_ones_are_kept() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        register(&svc, &ws, &owner).await;
+        let repo = RepoRef::new("o", "r");
+        svc.read_pr(&repo, 7, PrReadPolicy::REFRESH)
+            .await
+            .expect("unmonitored read");
+        assert_eq!(svc.pr_cache_len(), 2);
+
+        svc.poll_pr_monitors().await;
+        assert_eq!(svc.pr_cache_len(), 2, "young entries survive the sweep");
+
+        svc.backdate_pr_cache(PR_CACHE_MAX_IDLE + Duration::from_secs(1));
+        svc.poll_pr_monitors().await;
+        assert_eq!(svc.pr_cache_len(), 1, "o/r#7 expired, o/r#42 is monitored");
+        assert!(svc
+            .pr_cache
+            .lock()
+            .unwrap()
+            .contains_key(&pr_key_for(&repo, 42)));
+    }
+
+    /// Retention: [`PR_CACHE_MAX_ENTRIES`] is a hard bound on the
+    /// UNMONITORED entries, enforced by the write itself with no sweep in
+    /// between — including while the forge rate-limit pause skips the
+    /// sweep entirely — evicting the oldest full fetch first. Monitored
+    /// entries neither count against the cap nor expire: one older than
+    /// [`PR_CACHE_MAX_IDLE`] survives both rules while every unmonitored
+    /// entry of that age is dropped by the next write.
+    #[tokio::test]
+    async fn the_cap_bounds_unmonitored_entries_on_every_write() {
+        fn unmonitored_len(svc: &Services, monitored: &PrKey) -> usize {
+            svc.pr_cache
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, slot)| *key != monitored && slot.entry.is_some())
+                .count()
+        }
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let repo = RepoRef::new("o", "r");
+        let monitored = 5_000_u64;
+        let monitored_key = pr_key_for(&repo, monitored.cast_signed());
+        svc.pr_monitor_register(&ws, &owner, "o", "r", monitored)
+            .await
+            .expect("register");
+        // No sweep runs from here on: the pause gate is closed by a
+        // rate-limited sweep, and the on-demand reads below do not consult it.
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        svc.poll_pr_monitors().await;
+        assert!(
+            svc.sweep_rate_limit.paused_remaining().is_some(),
+            "the sweep is paused"
+        );
+        forge.edit(|s| s.rate_limit_get_pr = false);
+        forge.take_fetched_numbers();
+
+        let oldest = 1_000_u64;
+        svc.read_pr(&repo, oldest, PrReadPolicy::REFRESH)
+            .await
+            .expect("oldest read");
+        svc.backdate_pr_cache(Duration::from_secs(30));
+        let overflow = 8;
+        for written in 1..=PR_CACHE_MAX_ENTRIES + overflow {
+            let number = written as u64;
+            svc.read_pr(&repo, number, PrReadPolicy::REFRESH)
+                .await
+                .expect("read");
+            assert_eq!(
+                unmonitored_len(&svc, &monitored_key),
+                (written + 1).min(PR_CACHE_MAX_ENTRIES),
+                "bounded after write #{number}"
+            );
+        }
+        {
+            let cache = svc.pr_cache.lock().unwrap();
+            assert_eq!(cache.len(), PR_CACHE_MAX_ENTRIES + 1, "cap + monitored");
+            assert!(
+                !cache.contains_key(&pr_key_for(&repo, oldest.cast_signed())),
+                "the oldest full fetch went first"
+            );
+            for number in 1..=overflow as u64 {
+                assert!(
+                    !cache.contains_key(&pr_key_for(&repo, number.cast_signed())),
+                    "#{number} was evicted in fetch order"
+                );
+            }
+            assert!(cache.contains_key(&monitored_key), "monitored kept");
+        }
+        assert!(
+            svc.sweep_rate_limit.paused_remaining().is_some(),
+            "no sweep ran meanwhile"
+        );
+
+        // Idle expiry on the write path: age everything past the idle
+        // window; the next write drops every unmonitored entry but its own
+        // and keeps the monitored one, which is just as old.
+        svc.backdate_pr_cache(PR_CACHE_MAX_IDLE + Duration::from_secs(1));
+        svc.read_pr(&repo, oldest, PrReadPolicy::REFRESH)
+            .await
+            .expect("another read");
+        let cache = svc.pr_cache.lock().unwrap();
+        assert_eq!(cache.len(), 2, "the fresh write and the monitored entry");
+        assert!(
+            cache.contains_key(&monitored_key),
+            "monitored survives expiry"
+        );
+        assert!(cache.contains_key(&pr_key_for(&repo, oldest.cast_signed())));
     }
 
     /// A PR that outgrew the observation's windows falls back to the paged
@@ -7800,10 +8711,12 @@ mod tests {
         assert!(!owner_messages(&svc, &owner).await.contains("PR monitor"));
     }
 
-    /// Cache hygiene: an entry outlives its monitors only until the next
-    /// sweep, which prunes PRs no longer under any active monitor.
+    /// Cache hygiene: an entry outlives its monitor — a cancelled monitor's
+    /// PR stays served to on-demand readers — until its full fetch is
+    /// [`PR_CACHE_MAX_IDLE`] old, when the next sweep evicts it; a PR still
+    /// under a monitor is kept at any age.
     #[tokio::test]
-    async fn the_fetch_cache_is_pruned_to_active_prs() {
+    async fn a_cancelled_monitors_entry_expires_after_the_idle_window() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         let svc = svc.with_pr_monitor_debounce_seconds(3600);
         let monitor = register(&svc, &ws, &owner).await;
@@ -7813,19 +8726,24 @@ mod tests {
             .expect("other pr")
             .0;
         svc.poll_pr_monitors().await;
-        assert_eq!(svc.pr_monitor_fetch_cache_len(), 2);
+        assert_eq!(svc.pr_cache_len(), 2);
 
         svc.pr_monitor_cancel(&ws, &other.monitor_id, Some(&owner))
             .await
             .expect("cancel");
         svc.poll_pr_monitors().await;
-        assert_eq!(svc.pr_monitor_fetch_cache_len(), 1, "o/r#7 pruned");
+        assert_eq!(svc.pr_cache_len(), 2, "o/r#7 outlives its monitor");
+
+        svc.backdate_pr_cache(PR_CACHE_MAX_IDLE + Duration::from_secs(1));
+        svc.poll_pr_monitors().await;
+        assert_eq!(svc.pr_cache_len(), 1, "o/r#7 expired; o/r#42 monitored");
 
         svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
             .await
             .expect("cancel");
+        svc.backdate_pr_cache(PR_CACHE_MAX_IDLE + Duration::from_secs(1));
         svc.poll_pr_monitors().await;
-        assert_eq!(svc.pr_monitor_fetch_cache_len(), 0, "no active monitors");
+        assert_eq!(svc.pr_cache_len(), 0, "no active monitors, all idle");
         let _ = &forge;
     }
 
@@ -8547,6 +9465,283 @@ mod tests {
         }
     }
 
+    /// A registration whose baseline fetch hits the exhausted forge quota
+    /// is NOT lost to it: the row is persisted without a baseline (no
+    /// snapshots, no `lastPolledAt`, the pause as `lastError`), the fetch
+    /// opens the shared rate-limit pause, and the outcome carries no
+    /// checklist. While the gate stays closed, a re-register of a monitor
+    /// that already has a baseline defers the same way — clearing the
+    /// baseline instead of keeping a stale one — and spends one quota
+    /// probe and no PR fetch; the MCP payload reports `requirements: null`
+    /// plus the pause deadline as `pausedUntil`.
+    #[tokio::test]
+    async fn a_rate_limited_registration_persists_the_monitor_and_defers_its_baseline() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let probes = || forge.sub_fetches("rate_limit_status");
+
+        // A monitor registered BEFORE the quota ran out has a baseline.
+        let (armed, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("register 7");
+        assert!(armed.last_snapshot.is_some());
+        forge.take_fetched_numbers();
+
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        let (m, requirements) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 42)
+            .await
+            .expect("a rate limit never fails registration");
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![42],
+            "the fetch was attempted"
+        );
+        assert_eq!(probes(), 1, "opening the pause reads the reset once");
+        assert!(
+            svc.sweeps_rate_limited(),
+            "the fetch opened the shared pause"
+        );
+        assert!(requirements.is_none(), "no checklist to return");
+        let pause_error = expected_pause_error(&svc);
+        assert_eq!(m.state, PrMonitorState::Active);
+        assert_eq!(m.last_snapshot, None);
+        assert_eq!(m.baseline_snapshot, None);
+        assert_eq!(m.last_polled_at, None, "a deferred fetch is no poll");
+        assert_eq!(m.last_error.as_deref(), Some(pause_error.as_str()));
+        let row = svc.store().get_pr_monitor(&m.monitor_id).await.unwrap();
+        assert_eq!(row, m, "the returned image is the persisted row");
+        assert_eq!(
+            svc.pr_monitors_for_agent(&owner).await.unwrap().len(),
+            2,
+            "both monitors are active"
+        );
+
+        // Re-registering the armed monitor while paused: one quota probe, no
+        // PR fetch, the same row re-armed WITHOUT its now-unobservable
+        // baseline, still naming the pause.
+        let (rearmed, requirements) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("re-register 7");
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "no PR fetch while paused"
+        );
+        assert_eq!(probes(), 2, "one lift probe per paused registration");
+        assert!(requirements.is_none());
+        assert_eq!(rearmed.monitor_id, armed.monitor_id, "no duplicate row");
+        assert_eq!(rearmed.last_snapshot, None, "the stale baseline is cleared");
+        assert_eq!(rearmed.baseline_snapshot, None);
+        assert_eq!(rearmed.last_polled_at, None);
+        assert_eq!(rearmed.last_error.as_deref(), Some(pause_error.as_str()));
+
+        // The MCP payload: `requirements: null`, `pausedUntil` on the
+        // payload and the row, the same monitor.
+        let until = svc.sweep_rate_limit_paused_until().unwrap();
+        let payload = svc
+            .pr_monitor_start_op(&ws, &owner, 42, Some("o/r".into()))
+            .await
+            .expect("op");
+        assert_eq!(payload["ok"], json!(true), "{payload}");
+        assert!(payload["requirements"].is_null(), "{payload}");
+        assert_eq!(payload["pausedUntil"], json!(until), "{payload}");
+        assert_eq!(
+            payload["monitor"]["monitorId"],
+            json!(m.monitor_id),
+            "{payload}"
+        );
+        assert_eq!(payload["monitor"]["pausedUntil"], json!(until), "{payload}");
+        assert_eq!(
+            payload["monitor"]["lastError"],
+            json!(pause_error),
+            "{payload}"
+        );
+        assert!(
+            payload["monitor"].get("lastSnapshot").is_none(),
+            "{payload}"
+        );
+        assert!(payload.get("adoptedFrom").is_none(), "{payload}");
+        assert!(forge.take_fetched_numbers().is_empty());
+
+        // Any OTHER fetch failure still fails registration: the fetch stays
+        // load-bearing for "can this PR be read at all".
+        elapse_pause(&svc).await;
+        forge.edit(|s| {
+            s.rate_limit_get_pr = false;
+            s.fail_get_pr = true;
+        });
+        svc.pr_monitor_register(&ws, &owner, "o", "r", 43)
+            .await
+            .expect_err("a forge that cannot read the PR fails registration");
+        assert!(
+            svc.store()
+                .find_active_pr_monitor(&owner, "o", "r", 43)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing persisted"
+        );
+    }
+
+    /// A deferred fresh registration's insert runs under the gate's
+    /// reconcile section ([`crate::rate_limit::RateLimitGate::reconcile`])
+    /// and stamps the gate's LIVE state: the insert waits for a held
+    /// section, and a lift that lands first leaves the new row without the
+    /// pause it read before the lock — otherwise the lift's clear (scoped to
+    /// rows that exist) would miss the row and it would carry a released
+    /// pause until its old deadline, since successful polls keep an
+    /// annotation whose deadline has not passed.
+    #[tokio::test]
+    async fn a_deferred_registration_inserts_under_the_gate_and_stamps_its_live_state() {
+        // The deferral is decided by the registration's one quota probe;
+        // once that probe is counted, the next await is the gate section.
+        async fn probed(forge: &StubForge, n: usize) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while forge.sub_fetches("rate_limit_status") < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for probe {n}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        svc.pr_monitor_register(&ws, &owner, "o", "r", 42)
+            .await
+            .expect("the first registration opens the pause");
+        assert!(svc.sweeps_rate_limited());
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+        assert_eq!(forge.take_fetched_numbers(), vec![42]);
+        let pause_error = expected_pause_error(&svc);
+        let active = |svc: &Services| {
+            let (svc, owner) = (svc.clone(), owner.clone());
+            async move { svc.pr_monitors_for_agent(&owner).await.unwrap().len() }
+        };
+
+        // Held section: the deferral is decided (one probe, no fetch) but
+        // the row does not land until the section is released.
+        let held = svc.sweep_rate_limit.reconcile().await;
+        let register = tokio::spawn({
+            let (svc, ws, owner) = (svc.clone(), ws.clone(), owner.clone());
+            async move { svc.pr_monitor_register(&ws, &owner, "o", "r", 43).await }
+        });
+        probed(&forge, 2).await;
+        assert!(!register.is_finished(), "the insert waits for the section");
+        assert_eq!(active(&svc).await, 1, "no row landed under a held section");
+        drop(held);
+        let (m, requirements) = register.await.unwrap().expect("register 43");
+        assert!(requirements.is_none());
+        assert!(forge.take_fetched_numbers().is_empty(), "no PR fetch");
+        assert_eq!(m.last_polled_at, None);
+        assert_eq!(m.last_error.as_deref(), Some(pause_error.as_str()));
+        assert_eq!(active(&svc).await, 2);
+
+        // A lift landing inside the window between the deferral decision and
+        // the insert: the row is born without the released pause, and the
+        // wire payload says so consistently — `requirements: null` (the
+        // fetch WAS deferred) with no `pausedUntil` and no `lastError`.
+        let held = svc.sweep_rate_limit.reconcile().await;
+        let register = tokio::spawn({
+            let (svc, ws, owner) = (svc.clone(), ws.clone(), owner.clone());
+            async move {
+                svc.pr_monitor_start_op(&ws, &owner, 44, Some("o/r".into()))
+                    .await
+            }
+        });
+        probed(&forge, 3).await;
+        assert!(!register.is_finished(), "the insert waits for the section");
+        assert!(svc.sweep_rate_limit.lift(), "lifted under the held section");
+        drop(held);
+        let payload = register.await.unwrap().expect("register 44");
+        assert_eq!(payload["ok"], json!(true), "{payload}");
+        assert!(
+            payload["requirements"].is_null(),
+            "the deferral decision stands: {payload}"
+        );
+        assert!(payload.get("pausedUntil").is_none(), "{payload}");
+        assert!(payload["monitor"].get("pausedUntil").is_none(), "{payload}");
+        assert!(
+            payload["monitor"].get("lastError").is_none(),
+            "no stamp for a pause the gate released: {payload}"
+        );
+        assert!(
+            payload["monitor"].get("lastPolledAt").is_none(),
+            "{payload}"
+        );
+        assert!(
+            payload["monitor"].get("lastSnapshot").is_none(),
+            "{payload}"
+        );
+        let row = svc
+            .store()
+            .find_active_pr_monitor(&owner, "o", "r", 44)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert_eq!(row.last_error, None);
+        assert_eq!(row.last_polled_at, None, "still due on the first sweep");
+        assert_eq!(row.last_snapshot, None);
+        assert_eq!(active(&svc).await, 3);
+    }
+
+    /// The first post-pause poll of a baseline-less monitor adopts the PR's
+    /// state as its baseline with NOTHING pending and no wake — exactly what
+    /// a registration fetch would have recorded, delayed to the reset — and
+    /// clears the pause error; the monitor then reports only what moves
+    /// from there. A never-polled row is due on the first sweep, so the
+    /// deferral costs no extra interval once the gate opens.
+    #[tokio::test]
+    async fn the_first_post_pause_poll_adopts_the_deferred_baseline_without_a_wake() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        forge.edit(|s| s.rate_limit_get_pr = true);
+        let (m, requirements) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 42)
+            .await
+            .expect("register");
+        assert!(requirements.is_none());
+        forge.take_fetched_numbers();
+
+        // Paused: the due-sweep spends nothing on the forge and leaves the
+        // baseline-less row alone.
+        svc.poll_due_pr_monitors().await;
+        assert!(forge.take_fetched_numbers().is_empty(), "paused: no fetch");
+        assert_eq!(svc.store().get_pr_monitor(&m.monitor_id).await.unwrap(), m);
+
+        // The PR moved while the quota was exhausted: that history is not
+        // reportable — the monitor never observed the earlier state.
+        forge.edit(|s| s.conversation_comments = 5);
+        elapse_pause(&svc).await;
+        forge.edit(|s| s.rate_limit_get_pr = false);
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![42],
+            "due on the first open sweep"
+        );
+        let row = svc.store().get_pr_monitor(&m.monitor_id).await.unwrap();
+        assert!(row.last_snapshot.is_some(), "baseline adopted");
+        assert_eq!(row.baseline_snapshot, row.last_snapshot);
+        assert!(row.pending_changes.is_empty(), "nothing pending: {row:?}");
+        assert!(row.last_polled_at.is_some());
+        assert_eq!(row.last_error, None, "the pause error is cleared");
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("PR monitor"),
+            "adopting a baseline is not a change"
+        );
+
+        // From here the monitor diffs against the adopted baseline.
+        forge.edit(|s| s.conversation_comments = 6);
+        svc.poll_pr_monitors().await;
+        let row = svc.store().get_pr_monitor(&m.monitor_id).await.unwrap();
+        assert_eq!(row.pending_changes.len(), 1, "{:?}", row.pending_changes);
+    }
+
     /// The shared gate is re-consulted before EVERY vacant-cache fetch, not
     /// only at the top of the sweep: when a sibling sweep (PR refresh, git
     /// roots) pauses the gate while this sweep is mid-flight, the PRs not
@@ -8584,7 +9779,7 @@ mod tests {
         // shared gate while it is in flight.
         let gate = Arc::clone(&svc.sweep_rate_limit);
         forge.set_on_get_pr(Some(Box::new(move |_| {
-            gate.pause_for(Duration::from_secs(300));
+            gate.pause_for(Duration::from_secs(300), true);
         })));
         forge.edit(|s| s.conversation_comments = 7);
         svc.poll_due_pr_monitors().await;
@@ -8759,7 +9954,10 @@ mod tests {
         linked.branch = "feature".into();
         linked.pr_number = Some(42);
         linked.pr_url = Some("https://github.com/o/r/pull/42".into());
-        svc.store().update_workspace(&linked).await.unwrap();
+        svc.store()
+            .update_workspace_with_branch(&linked, Some(&linked.branch))
+            .await
+            .unwrap();
         forge.edit(|s| s.rate_limit_get_pr = true);
         svc.refresh_all_workspace_prs(0).await;
         assert!(
@@ -9100,7 +10298,8 @@ mod tests {
 
         // Schedule 2 — the pause EXTENDS after the gate read: the gate says
         // T1 (the capture composes T1), the row already names T2.
-        svc.sweep_rate_limit.pause_for(Duration::from_secs(600));
+        svc.sweep_rate_limit
+            .pause_for(Duration::from_secs(600), true);
         let gate_t1 = expected_pause_error(&svc);
         assert!(gate_t1 >= t1, "{gate_t1} >= {t1}");
         let t2 = pause_at(1800);
@@ -9239,7 +10438,195 @@ mod tests {
         assert_eq!(terminal.last_error.as_deref(), Some("old failure"));
     }
 
-    /// While paused, each sweep tick spends exactly one quota-free
+    #[tokio::test]
+    async fn preview_reads_keep_the_fresh_cache_and_ungated_refresh_contract() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let repo = RepoRef::new("o", "r");
+        svc.serve_pr(&repo, 42).await.expect("prime fresh cache");
+        forge.take_fetched_numbers();
+        forge.edit(|s| {
+            s.rate_limit_get_pr = true;
+            s.rate_limit_remaining = Some(0);
+            s.rate_limit_limit = Some(5000);
+        });
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        svc.pause_sweeps_for_rate_limit(&sc, "API rate limit exceeded")
+            .await;
+        let probes = forge.sub_fetches("rate_limit_status");
+
+        let (_, fetched) = svc.serve_pr(&repo, 42).await.expect("fresh cache survives");
+        assert!(!fetched);
+        assert!(forge.take_fetched_numbers().is_empty());
+        assert!(matches!(
+            svc.serve_pr(&repo, 43).await,
+            Err(Error::RateLimited(_))
+        ));
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![43],
+            "on-demand misses remain ungated"
+        );
+
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + Duration::from_secs(1));
+        assert!(matches!(
+            svc.serve_pr(&repo, 42).await,
+            Err(Error::RateLimited(_))
+        ));
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![42],
+            "expired cache must refresh"
+        );
+        assert_eq!(
+            forge.sub_fetches("rate_limit_status"),
+            probes,
+            "hovers never probe quota"
+        );
+
+        forge.edit(|s| s.rate_limit_get_pr = false);
+        let (_, fetched) = svc
+            .serve_pr(&repo, 43)
+            .await
+            .expect("later success resumes previews");
+        assert!(fetched);
+        assert!(
+            svc.sweeps_rate_limited(),
+            "one-shot success does not lift the background gate"
+        );
+        assert_eq!(forge.take_fetched_numbers(), vec![43]);
+    }
+
+    /// A quota rejection followed immediately by a healthy probe is not
+    /// evidence of recovery: the rejection may be a secondary limit or a
+    /// resource the probe cannot measure. Keep the fallback pause instead
+    /// of resuming and re-opening it on every tick (intent#5837).
+    #[tokio::test]
+    async fn a_healthy_probe_contradicting_a_rejection_cannot_lift_its_pause() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(4999);
+            s.rate_limit_limit = Some(5000);
+            s.rate_limit_reset_at = Some(u64::MAX);
+        });
+        svc.pause_sweeps_for_rate_limit(&sc, "API rate limit exceeded")
+            .await;
+        let until = svc.sweep_rate_limit_paused_until();
+        for _ in 0..2 {
+            assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+            assert_eq!(svc.sweep_rate_limit_paused_until(), until);
+        }
+        assert!(
+            svc.sweep_rate_limit.paused_remaining().unwrap()
+                <= crate::rate_limit::RATE_LIMIT_FALLBACK_PAUSE
+        );
+    }
+
+    #[tokio::test]
+    async fn metered_quota_probes_are_shared_across_concurrent_sweeps_and_recovery() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| {
+            s.rate_limit_probe_interval = Duration::from_secs(60);
+            s.rate_limit_remaining = Some(0);
+            s.rate_limit_limit = Some(5000);
+        });
+        svc.pause_sweeps_for_rate_limit(&sc, "API rate limit exceeded")
+            .await;
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..12 {
+            let (svc, sc) = (svc.clone(), sc.clone());
+            calls.spawn(async move {
+                assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+                svc.pr_monitor_quota_window(&sc, None).await;
+                svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+            });
+        }
+        while let Some(result) = calls.join_next().await {
+            result.expect("probe caller");
+        }
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+
+        forge.edit(|s| s.rate_limit_remaining = Some(4500));
+        assert!(
+            svc.maybe_lift_rate_limit_pause(&sc).await.is_none(),
+            "respect the probe interval"
+        );
+        svc.sweep_rate_limit.expire_probe().await;
+        assert!(
+            svc.maybe_lift_rate_limit_pause(&sc).await.is_some(),
+            "a later healthy probe lifts"
+        );
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 2);
+        assert!(!svc.sweeps_rate_limited());
+
+        // A cached healthy cadence result cannot lift a NEW rejection.
+        svc.pause_sweeps_for_rate_limit(&sc, "secondary rate limit")
+            .await;
+        assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 2);
+        assert!(svc.sweeps_rate_limited());
+    }
+
+    #[tokio::test]
+    async fn metered_probe_failures_also_keep_the_shared_probe_interval() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| {
+            s.rate_limit_probe_interval = Duration::from_secs(60);
+            s.fail_rate_limit_status = true;
+        });
+        svc.pause_sweeps_for_rate_limit(&sc, "quota").await;
+        for _ in 0..3 {
+            assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+            assert!(svc.pr_monitor_quota_window(&sc, None).await.is_none());
+        }
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+        svc.sweep_rate_limit.expire_probe().await;
+        assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_metered_probe_keeps_the_interval_and_cannot_claim_recovery() {
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        let sc: Arc<dyn SourceControl> = Arc::new(forge.clone());
+        forge.edit(|s| {
+            s.rate_limit_probe_interval = Duration::from_secs(60);
+            s.hang_rate_limit_status = true;
+            s.rate_limit_remaining = Some(5_000);
+            s.rate_limit_limit = Some(5_000);
+        });
+        svc.sweep_rate_limit
+            .pause_for(Duration::from_secs(300), true);
+
+        // Start a recovery probe, then cancel its caller while the network
+        // read is pending, as a workspace API evaluation timeout can do.
+        let mut request = Box::pin(svc.maybe_lift_rate_limit_pause(&sc));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(request.as_mut(), &mut context).is_pending());
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+        drop(request);
+
+        forge.edit(|s| s.hang_rate_limit_status = false);
+        for _ in 0..3 {
+            assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_none());
+        }
+        assert!(svc.sweeps_rate_limited(), "cancellation is not recovery");
+        assert_eq!(forge.sub_fetches("rate_limit_status"), 1);
+
+        svc.sweep_rate_limit.expire_probe().await;
+        assert!(svc.maybe_lift_rate_limit_pause(&sc).await.is_some());
+        assert!(!svc.sweeps_rate_limited());
+        svc.pr_monitor_quota_window(&sc, None).await;
+        assert_eq!(
+            forge.sub_fetches("rate_limit_status"),
+            2,
+            "completed evidence retains its own shared interval"
+        );
+    }
+
+    /// While paused, each sweep tick spends exactly one quota
     /// `rate_limit` probe and lifts the gate EARLY — before the `reset +
     /// margin` deadline — once the probe reports the quota recovered
     /// (`remaining ≥ max(500, 10% of limit)`): the lifted tick polls right
@@ -9486,7 +10873,7 @@ mod tests {
     /// not from `lastPolledAt`: rows older than the reset horizon and
     /// catch-up-marked rows (which bypass the interval) are not fetched
     /// either, and the deferral holds as the horizon shrinks tick after
-    /// tick. Each tick still spends its single quota-free probe, the
+    /// tick. Each tick still spends its single quota probe, the
     /// catch-up markers survive, and the first tick under a fresh window
     /// polls the stale and catch-up rows.
     #[tokio::test]
@@ -10211,6 +11598,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         };
 
         // T3: a failed poll advances `last_polled_at` past T2 with an error.
@@ -11258,6 +12646,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         };
         let mut polled = mk(
             PrMonitorState::Active,
@@ -11416,6 +12805,9 @@ mod tests {
         );
 
         forge.edit(|s| s.pr_state = PrState::Merged);
+        // The hover must MISS the cache (registration seeded it) to reach
+        // the forge and fold: age the entry past `prCache.maxAgeSeconds`.
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + Duration::from_secs(1));
         svc.github_pulls_get("o".into(), "r".into(), 42)
             .await
             .expect("pulls.get");
@@ -11496,8 +12888,10 @@ mod tests {
             "the failed attempt is later than the close"
         );
 
-        // T4: the passive fold reads the closed PR straight from the forge.
+        // T4: the passive fold reads the closed PR straight from the forge
+        // — the cached registration read must have aged out first.
         forge.edit(|s| s.fail_get_pr = false);
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + Duration::from_secs(1));
         svc.github_pulls_get("o".into(), "r".into(), 42)
             .await
             .expect("pulls.get");
@@ -11516,6 +12910,170 @@ mod tests {
             "the closed fold outranks the stale open snapshot despite the failed poll: {:?}",
             after.display_status
         );
+    }
+
+    /// `github.pulls.get` is served from the shared PR cache: the first
+    /// hover MISSES (one full read, `isInMergeQueue` carried from the
+    /// monitor's own checklist), a second hover within `prCache.maxAgeSeconds`
+    /// costs no forge call and answers the same object, and once the entry
+    /// ages out the hover re-reads and reflects the forge's merge-queue
+    /// movement.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_serves_the_shared_cache_with_is_in_merge_queue() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        forge.edit_quiet(|s| s.in_merge_queue = Some(true));
+
+        let first = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(first["pull"]["number"], 42);
+        assert_eq!(
+            first["pull"]["isInMergeQueue"],
+            serde_json::json!(true),
+            "the hover carries the checklist's merge-queue report: {first}"
+        );
+        let reads = forge_reads(&forge);
+        assert_eq!(forge.fetches(), 1, "a miss is one PR read: {reads:?}");
+        assert_eq!(svc.pr_cache_len(), 1, "the miss seeded the cache");
+
+        // A hover within the cache window reads nothing from the forge, even
+        // though the forge has since moved (the entry is what it answers).
+        forge.edit_quiet(|s| s.in_merge_queue = Some(false));
+        let second = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get again");
+        assert_eq!(second, first, "a hit answers the cached object");
+        assert_eq!(
+            forge_reads(&forge),
+            reads,
+            "a hit within prCache.maxAgeSeconds costs no forge call"
+        );
+
+        // Aged out: the hover re-reads and carries the movement.
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + Duration::from_secs(1));
+        let third = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get after expiry");
+        assert_eq!(third["pull"]["isInMergeQueue"], serde_json::json!(false));
+        assert_eq!(forge.fetches(), 2, "the expired entry cost one more read");
+    }
+
+    /// Presence detection survives the cache: a host that does not report
+    /// the merge-queue flag on its probe signals (REST-only) yields a hover
+    /// card WITHOUT `isInMergeQueue`, hit or miss — never a fabricated
+    /// `false`.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_omits_is_in_merge_queue_when_the_host_does_not_report_it() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, _ws, _owner) = setup().await;
+        assert_eq!(forge.state.lock().unwrap().in_merge_queue, None);
+        for pass in ["miss", "hit"] {
+            let v = svc
+                .github_pulls_get("o".into(), "r".into(), 42)
+                .await
+                .expect("pulls.get");
+            assert_eq!(v["pull"]["number"], 42);
+            assert!(
+                v["pull"].get("isInMergeQueue").is_none(),
+                "{pass}: an unreported flag stays absent: {v}"
+            );
+        }
+        assert_eq!(forge.fetches(), 1);
+    }
+
+    /// The cache is one object shared by every reader: a hover, a
+    /// `ws.pr.snapshot`, a registration and a poll all serve and refresh the
+    /// same entry, so a snapshot right after a hover costs no forge call and
+    /// carries the hover's `isInMergeQueue`, a hover right after a poll
+    /// carries the poll's, and the two RPCs describe the same PR object
+    /// (each in its own projection of the merge-queue flag).
+    #[intent_test_macros::daemon_test]
+    async fn snapshot_and_pulls_get_share_one_cache_entry() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit_quiet(|s| s.in_merge_queue = Some(true));
+
+        // Hover seeds; the snapshot is served from the hover's entry.
+        let hover = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(forge.fetches(), 1);
+        let snap = svc
+            .pr_state(ws.clone(), 42, Some("o/r".into()))
+            .await
+            .expect("snapshot");
+        assert_eq!(forge.fetches(), 1, "the snapshot reused the hover's read");
+        assert_eq!(snap["repo"], "o/r");
+        assert_eq!(snap["prNumber"], 42);
+        assert_eq!(
+            snap["requirements"]["isInMergeQueue"],
+            serde_json::json!(true)
+        );
+        assert_eq!(snap["state"], "open");
+        assert_eq!(snap["headSha"], hover["pull"]["headSha"]);
+        assert_eq!(snap["updatedAt"], hover["pull"]["updatedAt"]);
+        assert_eq!(snap["title"], hover["pull"]["title"]);
+
+        // Registration always takes a fresh baseline read (REFRESH) and
+        // writes the same entry: the monitor's stored checklist is the
+        // object the two RPCs answer from now on.
+        let monitor = register(&svc, &ws, &owner).await;
+        assert_eq!(forge.fetches(), 2, "registration re-read the PR");
+        let stored: PrMonitorSnapshot =
+            serde_json::from_str(monitor.last_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(stored.requirements.is_in_merge_queue, Some(true));
+        assert_eq!(
+            serde_json::to_value(&stored.requirements).unwrap(),
+            snap["requirements"],
+            "the snapshot's checklist IS the monitor's"
+        );
+        let snap = svc
+            .pr_state(ws.clone(), 42, Some("o/r".into()))
+            .await
+            .expect("snapshot after registration");
+        assert_eq!(
+            forge.fetches(),
+            2,
+            "the snapshot reused the registration's read"
+        );
+        assert_eq!(
+            snap["requirements"],
+            serde_json::to_value(&stored.requirements).unwrap()
+        );
+
+        // The queue ejects the PR (no `updatedAt` bump); a FULL poll — past
+        // the cheap-poll age bound, so the sub-reads are re-issued —
+        // observes it and rewrites the shared entry, so the next hover and
+        // snapshot carry the ejection without a forge call of their own.
+        forge.edit_quiet(|s| s.in_merge_queue = Some(false));
+        svc.backdate_pr_cache(
+            PR_MONITOR_MAX_CHEAP_AGE.max(svc.pr_cache_max_age()) + Duration::from_secs(1),
+        );
+        svc.poll_pr_monitors().await;
+        let polled = forge.fetches();
+        assert_eq!(polled, 3, "the poll re-read the aged entry");
+        let hover = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get after poll");
+        let snap = svc
+            .pr_state(ws, 42, Some("o/r".into()))
+            .await
+            .expect("snapshot after poll");
+        assert_eq!(forge.fetches(), polled, "both served from the poll's write");
+        // Same entry, two projections: the hover card keeps the reported
+        // `false`; the checklist is presence-only and drops the key.
+        assert_eq!(hover["pull"]["isInMergeQueue"], serde_json::json!(false));
+        assert!(
+            snap["requirements"].get("isInMergeQueue").is_none(),
+            "an ejected PR is no longer queued on the checklist: {snap}"
+        );
+        assert_eq!(snap["headSha"], hover["pull"]["headSha"]);
     }
 
     /// Orthogonality with the PR stages: a workspace whose linked PR reads
@@ -11539,6 +13097,7 @@ mod tests {
             mergeable: Some(true),
             mergeable_state: Some("clean".into()),
             is_draft: Some(false),
+            is_in_merge_queue: None,
         });
         svc.store().update_workspace(&row).await.expect("update");
         register(&svc, &ws, &owner).await;

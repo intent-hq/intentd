@@ -475,16 +475,23 @@ async fn await_idle(sub: &mut TlsWs, agent_id: &str, deadline: tokio::time::Inst
     let _ = await_idle_event(sub, agent_id, deadline).await;
 }
 
-/// Serialized conversation text for an agent.
-async fn conversation_text(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> String {
-    let convo = wss_rpc(
+/// The `agent.getConversation` page for an agent.
+async fn conversation_page(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> Value {
+    wss_rpc(
         rpc,
         id,
         "agent.getConversation",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
-    .await;
-    convo.to_string()
+    .await
+}
+
+/// Serialized conversation text for an agent (substring assertions only —
+/// cross-time equality goes through `common::conversation_fingerprint`).
+async fn conversation_text(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> String {
+    conversation_page(rpc, id, ws_id, agent_id)
+        .await
+        .to_string()
 }
 
 /// Poll the watcher's conversation until `needle` appears (or panic at the
@@ -512,21 +519,31 @@ async fn await_conversation_contains(
 }
 
 /// Poll until the agent's conversation stops changing across two consecutive
-/// reads 400ms apart (all queued wake turns drained). Returns the settled text.
+/// reads 400ms apart with no turn in flight (all queued wake turns drained).
+/// "Changing" is judged on the `common::conversation_fingerprint` (persisted
+/// row identity/content), not the raw payload, so read-time `author`
+/// hydration cannot keep the loop spinning (intent-hq/intent#5603). A turn
+/// persists nothing until it ends, so the page-level `turnInFlight` flag
+/// (dropped by the fingerprint) is checked separately: matching fingerprints
+/// while a wake turn is still running do not count as settled. Returns the
+/// settled page.
 async fn await_conversation_settled(
     rpc: &mut TlsWs,
     req_id: &mut i64,
     ws_id: &str,
     agent_id: &str,
     deadline: tokio::time::Instant,
-) -> String {
-    let mut prev = conversation_text(rpc, *req_id, ws_id, agent_id).await;
+) -> Value {
+    let mut prev = conversation_page(rpc, *req_id, ws_id, agent_id).await;
     *req_id += 1;
     loop {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let next = conversation_text(rpc, *req_id, ws_id, agent_id).await;
+        let next = conversation_page(rpc, *req_id, ws_id, agent_id).await;
         *req_id += 1;
-        if next == prev {
+        let turn_in_flight = next["turnInFlight"].as_bool() == Some(true);
+        if !turn_in_flight
+            && common::conversation_fingerprint(&next) == common::conversation_fingerprint(&prev)
+        {
             return next;
         }
         prev = next;
@@ -1121,15 +1138,20 @@ async fn agent_unwatch_stops_further_wakes_over_wss() {
         budget.step(60),
     )
     .await;
-    // Drain any wake turns still in flight before taking the baseline.
-    let baseline = await_conversation_settled(
-        &mut fx.setup.rpc,
-        &mut fx.req_id,
-        &fx.ws_id,
-        &fx.watcher,
-        budget.step(60),
-    )
-    .await;
+    // Drain any wake turns still in flight before taking the baseline. The
+    // baseline/after comparison is on the row fingerprint (id/seq/role/
+    // contentBlocks/timestamp): the read-time `author` projection may hydrate
+    // between the two reads and must not count as a wake (#5603).
+    let baseline = common::conversation_fingerprint(
+        &await_conversation_settled(
+            &mut fx.setup.rpc,
+            &mut fx.req_id,
+            &fx.ws_id,
+            &fx.watcher,
+            budget.step(60),
+        )
+        .await,
+    );
     let sent = wss_rpc(
         &mut fx.setup.rpc,
         60,
@@ -1150,8 +1172,14 @@ async fn agent_unwatch_stops_further_wakes_over_wss() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let after = conversation_text(&mut fx.setup.rpc, 61, &fx.ws_id, &fx.watcher).await;
-    assert_eq!(baseline, after, "no wake may be delivered after unwatch");
+    let after = common::conversation_fingerprint(
+        &conversation_page(&mut fx.setup.rpc, 61, &fx.ws_id, &fx.watcher).await,
+    );
+    assert!(
+        baseline == after,
+        "no wake may be delivered after unwatch; changed rows:\n{}",
+        common::fingerprint_diff(&baseline, &after)
+    );
 }
 
 /// WATCH-2d: the target's terminal failure wakes the watcher ("Watched agent
@@ -1497,7 +1525,8 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
     tokio::time::sleep(Duration::from_millis(800)).await;
     let text =
         await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &coord, budget.step(60))
-            .await;
+            .await
+            .to_string();
     assert!(
         !text.contains("Watched agent") && !text.contains("Child agent"),
         "no completion wake may be delivered on the interim idle: {text}"
@@ -1671,7 +1700,8 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
         &watcher,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         !text.contains("Watched agent") && !text.contains("Child agent"),
         "re-arm on an idle-but-waiting target must not fire synthetically: {text}"
@@ -2047,7 +2077,8 @@ async fn in_turn_progress_is_followed_by_terminal_wake_over_wss() {
         &parent,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         text.contains("completed."),
         "same-cycle terminal wake must be distinct from progress: {text}"
@@ -2247,7 +2278,8 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
         &watcher,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         !text.contains("Watched agent") && !text.contains("Child agent"),
         "watch on a reported hook-waiting child must not fire instantly: {text}"
@@ -2548,7 +2580,8 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
         &parent,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         text.contains("completed."),
         "the reported child's idle delivers the terminal wake: {text}"
@@ -2890,7 +2923,8 @@ async fn monitoring_idle_advisories_leave_watch_armed_until_genuine_completion_o
         &parent,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         !text.contains("completed."),
         "no completion wake while the child still monitors: {text}"

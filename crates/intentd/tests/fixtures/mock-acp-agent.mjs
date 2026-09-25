@@ -64,16 +64,23 @@ function log(msg) {
 }
 
 // Session-lifecycle log: one JSON line per session/new | session/load —
-// { method, sessionId, pid, meta, nodeOptions } — when MOCK_AGENT_SESSION_LOG
-// points at a file. Lets e2e tests assert exactly which session ids the daemon
-// offered to which child process (e.g. that a cross-provider switch never
-// issues session/load with the old provider's id — monorepo#907). `meta`
-// carries the request's `_meta` verbatim (null when absent) so tests can
-// assert the exact provider-specific payload on the wire (e.g. codex
-// `sessionTitle`, monorepo#3151). `nodeOptions` is the child's inherited
-// NODE_OPTIONS (null when unset) so tests can assert the daemon-injected V8
-// heap cap (`agents.acpNodeMaxOldSpaceMb`, intent-hq/intent#4330).
-function logSessionCall(method, sessionId, meta) {
+// { method, sessionId, pid, meta, nodeOptions, cwd, processCwd, argv } — when
+// MOCK_AGENT_SESSION_LOG points at a file. Lets e2e tests assert exactly
+// which session ids the daemon offered to which child process (e.g. that a
+// cross-provider switch never issues session/load with the old provider's id
+// — monorepo#907). `meta` carries the request's `_meta` verbatim (null when
+// absent) so tests can assert the exact provider-specific payload on the wire
+// (e.g. codex `sessionTitle`, monorepo#3151). `nodeOptions` is the child's
+// inherited NODE_OPTIONS (null when unset) so tests can assert the
+// daemon-injected V8 heap cap (`agents.acpNodeMaxOldSpaceMb`,
+// intent-hq/intent#4330). `cwd` is the request's `cwd` param (the ACP
+// session directory, null when absent) and `processCwd` this child's actual
+// working directory, so tests can prove the two are decoupled for npx
+// launches (intent-hq/intent#5738). `argv` records only the arguments passed
+// to this fixture, excluding the Node executable and script path, so tests
+// can verify provider selection. MOCK_AGENT_LOG_CODEX_POLICY opts into only
+// the daemon-owned policy JSON and CODEX_PATH presence, never other env values.
+function logSessionCall(method, sessionId, meta, cwd) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
   try {
@@ -85,6 +92,15 @@ function logSessionCall(method, sessionId, meta) {
         pid: process.pid,
         meta: meta ?? null,
         nodeOptions: process.env.NODE_OPTIONS ?? null,
+        cwd: cwd ?? null,
+        processCwd: process.cwd(),
+        argv: process.argv.slice(2),
+        ...(process.env.MOCK_AGENT_LOG_CODEX_POLICY === '1'
+          ? { codexPolicy: {
+              config: process.env.CODEX_CONFIG ? JSON.parse(process.env.CODEX_CONFIG) : null,
+              pathPresent: Object.hasOwn(process.env, 'CODEX_PATH'),
+            } }
+          : {}),
       }) + '\n'
     );
   } catch (err) {
@@ -342,7 +358,7 @@ function sessionConfigOptions(behavior = {}) {
         {
           id: 'effort', name: 'Effort', category: 'thought_level', type: 'select',
           currentValue: effectiveEffort,
-          options: ['low', 'medium', 'high'].map(value => ({ value, name: value })),
+          options: modelEffortValues(behavior).map(value => ({ value, name: value })),
         },
       ],
     };
@@ -365,6 +381,14 @@ function sessionConfigOptions(behavior = {}) {
       },
     ],
   };
+}
+
+function modelEffortValues(behavior) {
+  return behavior.modelSelection?.thinking?.[effectiveModel]?.values ?? ['low', 'medium', 'high'];
+}
+
+function modelDefaultEffort(behavior) {
+  return behavior.modelSelection?.thinking?.[effectiveModel]?.current ?? 'high';
 }
 
 async function handlePrompt(id, params) {
@@ -932,7 +956,7 @@ async function dispatch(msg) {
     case 'session/new': {
       if (behavior.modelSelection) {
         effectiveModel = behavior.modelSelection.defaultModel;
-        effectiveEffort = 'high';
+        effectiveEffort = modelDefaultEffort(behavior);
       }
       // Deterministic failure mode: ignore session/new for the first N attempts
       if (typeof behavior.ignoreSessionNewAttempts === 'number' && behavior.ignoreSessionNewAttempts > 0) {
@@ -960,20 +984,20 @@ async function dispatch(msg) {
         ? msg.params.mcpServers
         : [];
       sessionFromLoad = false;
-      logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta);
+      logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta, msg.params && msg.params.cwd);
       return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions(behavior) });
     }
     case 'session/load':
       if (behavior.modelSelection) {
         effectiveModel = behavior.modelSelection.defaultModel;
-        effectiveEffort = 'high';
+        effectiveEffort = modelDefaultEffort(behavior);
       }
       // Mirror session/new's stash-overwrite so a loadSession-capable run (or
       // a test sending session/load first) can't observe a stale list.
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
         ? msg.params.mcpServers
         : [];
-      logSessionCall('session/load', msg.params && msg.params.sessionId, msg.params && msg.params._meta);
+      logSessionCall('session/load', msg.params && msg.params.sessionId, msg.params && msg.params._meta, msg.params && msg.params.cwd);
       // With `loadSession: true` behavior, accept ANY session id — including a
       // foreign one — modelling the worst-case provider monorepo#907 guards
       // against. With `advertiseLoadSession`, accept the resume (all
@@ -1024,8 +1048,8 @@ async function dispatch(msg) {
       // call ({ sessionId, configId, value }) — when MOCK_AGENT_CONFIG_LOG
       // points at a file, so e2e tests can assert the daemon issued the call
       // with the stored model exactly once per fresh session. The real
-      // adapter's response echoes the updated configOptions list; the daemon
-      // only checks for success, so a minimal echo suffices.
+      // adapter's response echoes the updated configOptions list; the
+      // modelSelection behavior includes model-specific thinking options.
       const configLog = process.env.MOCK_AGENT_CONFIG_LOG;
       if (configLog) {
         try {
@@ -1054,7 +1078,8 @@ async function dispatch(msg) {
         const { configId, value } = msg.params || {};
         if (configId === 'model' && behavior.modelSelection.models.includes(value)) {
           effectiveModel = value;
-        } else if (configId === 'effort' && ['low', 'medium', 'high'].includes(value)) {
+          if (behavior.modelSelection.thinking) effectiveEffort = modelDefaultEffort(behavior);
+        } else if (configId === 'effort' && modelEffortValues(behavior).includes(value)) {
           effectiveEffort = value;
         } else {
           return send({

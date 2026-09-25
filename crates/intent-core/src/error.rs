@@ -105,6 +105,17 @@ pub enum Error {
     )]
     ListenerDown,
 
+    /// The tunnel is not running, so `workspace.invite.create` has no `tc`
+    /// address to embed in the (tunnel-only) invite link. Surfaces as
+    /// `-32603` with machine-readable `error.data = { code: "tunnel-down" }`
+    /// so clients route it without matching on prose. Distinct from
+    /// [`Error::ListenerDown`]: the WSS listener IS up here.
+    #[error(
+        "tunnel is not running — invite links are tunnel-only; enable the tunnel \
+         (server.tunnel.enabled) and wait for it to come up before inviting"
+    )]
+    TunnelDown,
+
     /// A `repo.warmCache` request was rejected because an opportunistic warm
     /// is already in flight (global single-flight — at most one warm
     /// daemon-wide). Surfaces as `-32603` with machine-readable
@@ -133,6 +144,24 @@ pub enum Error {
         limit: u32,
     },
 
+    /// `sourceControl.connect { method: "device" }` against a forge host that
+    /// cannot run an OAuth device grant: no client id resolves for it, or the
+    /// instance rejected the grant (GitLab < 17.1 / application not enabled
+    /// for it). Surfaces as `-32603` with machine-readable
+    /// `error.data = { code: "device-grant-unsupported", provider, host }` —
+    /// the FE keys its PAT fallback on this code (PROTOCOL §5.27).
+    #[error("device grant unsupported on {provider} host {host}")]
+    DeviceGrantUnsupported { provider: String, host: String },
+
+    /// The forge rejected a source-control credential: a PAT offered to
+    /// `sourceControl.connect { method: "pat" }` that fails the host's user
+    /// probe (nothing is stored), or a stored/env credential the host rejects
+    /// on `sourceControl.getUser`. Surfaces as `-32603` with machine-readable
+    /// `error.data = { code: "source-control-unauthorized", provider, host }`.
+    /// A merely *absent* credential is not an error (PROTOCOL §5.27).
+    #[error("{provider} host {host} rejected the credential")]
+    SourceControlUnauthorized { provider: String, host: String },
+
     /// The source-control forge rate-limited a request (REST 403/429 with an
     /// exhausted quota). Distinct from `Internal` so background sweeps can
     /// detect the class and pause globally until the quota window resets, and
@@ -155,11 +184,97 @@ pub enum Error {
     /// key off machine-readably (multiplayer w4): the invite is unknown /
     /// expired / revoked / already redeemed, the pinned GitHub login does not
     /// match the authorizing account, the owner has no GitHub identity to
-    /// invite from, or the identity-only device flow was denied / expired /
-    /// is not known. Surfaces as `-32602` (`-32603` for the daemon-side
-    /// conditions) with `error.data = { code: kind.as_str() }`.
+    /// invite from, or the gist identity proof did not check out. Surfaces
+    /// as `-32602` (`-32603` for the daemon-side conditions) with
+    /// `error.data = { code: kind.as_str() }`.
     #[error("{}", .0.message())]
     Invite(InviteErrorKind),
+
+    /// A guest-side identity-proof operation
+    /// (`sourceControl.identityProof.create` / `.delete`, or the
+    /// `github.identityProof.*` aliases) was refused for a reason the client
+    /// must key off machine-readably: no token is stored for the provider,
+    /// the stored token lacks the scope the proof needs, or the forge could
+    /// not be reached. Surfaces as `-32603` with
+    /// `error.data = { code: kind.as_str() }`.
+    #[error("{}", .0.message())]
+    IdentityProof(IdentityProofErrorKind),
+
+    /// Host half of the identity proof: the forge at `host` will not serve
+    /// the guest's proof to this daemon — anonymous reads are restricted on
+    /// that instance and the host holds no credential for it (or the one it
+    /// holds was refused) — so the claimed identity can be neither confirmed
+    /// nor denied. Surfaces as `-32603` with
+    /// `error.data = { code: "identity-unverifiable", host }` (protocol 10.8).
+    #[error("cannot verify identity on {host}")]
+    IdentityUnverifiable { host: String },
+}
+
+/// Machine-readable reason an identity-proof operation was refused,
+/// surfaced on the wire as `error.data.code`. The GitHub kinds are the
+/// gist proof's original codes; the GitLab kinds are their snippet-proof
+/// twins (protocol 10.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProofErrorKind {
+    /// No GitHub token is stored (`github.connect` never completed, or the
+    /// token was revoked / rejected by GitHub).
+    NotConnected,
+    /// The stored token lacks the `gist` OAuth scope; the user must
+    /// re-authorize (`github.connect`) to grant it.
+    ScopeMissing,
+    /// GitHub could not be reached.
+    Unreachable,
+    /// No GitLab token is stored for the instance (`sourceControl.connect`
+    /// never completed for it, the instance is not the bound one, or the
+    /// token was revoked / rejected).
+    GitlabNotConnected,
+    /// The stored GitLab token lacks the `api` scope snippets need; the user
+    /// must reconnect with a token that grants it.
+    GitlabScopeMissing,
+    /// The GitLab instance could not be reached.
+    GitlabUnreachable,
+}
+
+impl IdentityProofErrorKind {
+    /// Stable wire identifier for this kind (`error.data.code`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentityProofErrorKind::NotConnected => "github-not-connected",
+            IdentityProofErrorKind::ScopeMissing => "github-scope-missing",
+            IdentityProofErrorKind::Unreachable => "github-unreachable",
+            IdentityProofErrorKind::GitlabNotConnected => "gitlab-not-connected",
+            IdentityProofErrorKind::GitlabScopeMissing => "gitlab-scope-missing",
+            IdentityProofErrorKind::GitlabUnreachable => "gitlab-unreachable",
+        }
+    }
+
+    /// Human-readable message for this kind.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            IdentityProofErrorKind::NotConnected => {
+                "internal error: GitHub is not connected — sign in (github.connect) before \
+                 proving your identity"
+            }
+            IdentityProofErrorKind::ScopeMissing => {
+                "internal error: the stored GitHub token lacks the `gist` scope — sign in again \
+                 (github.connect) to grant it"
+            }
+            IdentityProofErrorKind::Unreachable => "internal error: GitHub could not be reached",
+            IdentityProofErrorKind::GitlabNotConnected => {
+                "internal error: GitLab is not connected for this host — sign in \
+                 (sourceControl.connect) before proving your identity"
+            }
+            IdentityProofErrorKind::GitlabScopeMissing => {
+                "internal error: the stored GitLab token lacks the `api` scope — reconnect \
+                 (sourceControl.connect) with a token that grants it"
+            }
+            IdentityProofErrorKind::GitlabUnreachable => {
+                "internal error: the GitLab instance could not be reached"
+            }
+        }
+    }
 }
 
 /// Machine-readable reason an invite / join operation was refused, surfaced
@@ -184,16 +299,10 @@ pub enum InviteErrorKind {
     /// The primary user's GitHub identity cannot change while other
     /// principals or open invites exist (reconnect guard).
     IdentityLocked,
-    /// The invitee denied the identity-only device flow.
-    FlowDenied,
-    /// The identity-only device flow's codes expired before authorization.
-    FlowExpired,
-    /// Polling the identity-only device flow failed repeatedly.
-    FlowError,
-    /// No identity-only device flow has this id (or its result was already
-    /// collected).
-    FlowNotFound,
-    /// Too many identity-only device flows are in flight; retry later.
+    /// The host is throttling unauthenticated invite requests: the
+    /// listener-wide start budget (a token bucket, so a burst of serial
+    /// requests trips it with nothing in flight) or the outstanding-nonce
+    /// cap is spent; retry later.
     FlowBusy,
     /// The workspace's guest cap (`sharing.maxGuestsPerWorkspace`) is spent
     /// by its collaborators plus open invites; no further invite is minted.
@@ -201,6 +310,30 @@ pub enum InviteErrorKind {
     /// The workspace's collaborators already reach the guest cap; the join
     /// is refused and the invite stays open.
     WorkspaceFull,
+    /// The `credential` an `invite.accept` presented is unknown to this host
+    /// or was revoked; the guest must join through the gist identity proof.
+    CredentialInvalid,
+    /// The gist an `invite.prove` named does not prove the claimed login:
+    /// unknown gist, another owner, no proof file or a first line that is
+    /// not the nonce, a gist created before the nonce was issued, or a
+    /// nonce this host never issued for the invite (or already consumed).
+    ProofInvalid,
+    /// The nonce an `invite.prove` presented was issued but its 10-minute
+    /// lifetime passed; the guest must start over with `invite.challenge`.
+    ProofExpired,
+    /// GitHub could not be reached (or answered a server error) while
+    /// verifying the proof gist; the nonce stays valid for a retry.
+    GithubUnreachable,
+    /// The proven (or credential-bound) GitHub account is the host owner's
+    /// own — the primary principal. The owner cannot join its own host as a
+    /// guest: no per-principal credential is ever minted for the primary
+    /// row, and the invite stays open.
+    OwnerSelfJoin,
+    /// The workspace is archived: archiving detaches every guest and closes
+    /// every open invite, so no invite is minted, no member is added and no
+    /// join is committed against it until it is unarchived. Nothing was
+    /// written.
+    WorkspaceArchived,
 }
 
 impl InviteErrorKind {
@@ -216,13 +349,15 @@ impl InviteErrorKind {
             InviteErrorKind::PinUnknown => "invite-pin-unknown",
             InviteErrorKind::GithubIdentityRequired => "github-identity-required",
             InviteErrorKind::IdentityLocked => "primary-identity-locked",
-            InviteErrorKind::FlowDenied => "invite-flow-denied",
-            InviteErrorKind::FlowExpired => "invite-flow-expired",
-            InviteErrorKind::FlowError => "invite-flow-error",
-            InviteErrorKind::FlowNotFound => "invite-flow-not-found",
             InviteErrorKind::FlowBusy => "invite-flow-busy",
             InviteErrorKind::GuestLimit => "guest-limit",
             InviteErrorKind::WorkspaceFull => "workspace-full",
+            InviteErrorKind::CredentialInvalid => "credential-invalid",
+            InviteErrorKind::ProofInvalid => "proof-invalid",
+            InviteErrorKind::ProofExpired => "proof-expired",
+            InviteErrorKind::GithubUnreachable => "github-unreachable",
+            InviteErrorKind::OwnerSelfJoin => "owner-self-join",
+            InviteErrorKind::WorkspaceArchived => "workspace-archived",
         }
     }
 
@@ -241,21 +376,15 @@ impl InviteErrorKind {
                 "invalid params: pinLogin does not name a GitHub account"
             }
             InviteErrorKind::GithubIdentityRequired => {
-                "unsupported: inviting requires a linked GitHub identity — connect GitHub \
-                 (github.connect) before creating an invite"
+                "unsupported: inviting requires a linked forge identity — connect GitHub \
+                 (github.connect) or GitLab (sourceControl.connect) before creating an invite"
             }
             InviteErrorKind::IdentityLocked => {
                 "unsupported: the primary GitHub identity cannot change while other \
                  principals or open invites exist"
             }
-            InviteErrorKind::FlowDenied => "invalid params: the GitHub authorization was denied",
-            InviteErrorKind::FlowExpired => {
-                "invalid params: the GitHub device code expired before authorization"
-            }
-            InviteErrorKind::FlowError => "internal error: polling the GitHub device flow failed",
-            InviteErrorKind::FlowNotFound => "invalid params: unknown invite flow",
             InviteErrorKind::FlowBusy => {
-                "internal error: too many invite redemptions in flight; retry shortly"
+                "internal error: the host is throttling invite requests; retry shortly"
             }
             InviteErrorKind::GuestLimit => {
                 "invalid params: this workspace has reached its guest limit (collaborators \
@@ -264,6 +393,28 @@ impl InviteErrorKind {
             InviteErrorKind::WorkspaceFull => {
                 "invalid params: this workspace has reached its guest limit; ask the owner \
                  to make room"
+            }
+            InviteErrorKind::CredentialInvalid => {
+                "invalid params: the credential is unknown to this host or was revoked; \
+                 join through the GitHub identity proof instead"
+            }
+            InviteErrorKind::ProofInvalid => {
+                "invalid params: the gist does not prove the claimed GitHub identity for \
+                 this invite"
+            }
+            InviteErrorKind::ProofExpired => {
+                "invalid params: the identity-proof nonce expired; request a new challenge"
+            }
+            InviteErrorKind::GithubUnreachable => {
+                "internal error: GitHub could not be reached to verify the identity proof"
+            }
+            InviteErrorKind::OwnerSelfJoin => {
+                "invalid params: this GitHub account owns the host; open it from your \
+                 paired daemons instead of joining as a guest"
+            }
+            InviteErrorKind::WorkspaceArchived => {
+                "invalid params: this workspace is archived; unarchive it before inviting \
+                 or adding members"
             }
         }
     }
@@ -278,15 +429,17 @@ impl InviteErrorKind {
             | InviteErrorKind::Redeemed
             | InviteErrorKind::PinMismatch
             | InviteErrorKind::PinUnknown
-            | InviteErrorKind::FlowDenied
-            | InviteErrorKind::FlowExpired
-            | InviteErrorKind::FlowNotFound
             | InviteErrorKind::GuestLimit
-            | InviteErrorKind::WorkspaceFull => -32602,
+            | InviteErrorKind::WorkspaceFull
+            | InviteErrorKind::CredentialInvalid
+            | InviteErrorKind::ProofInvalid
+            | InviteErrorKind::ProofExpired
+            | InviteErrorKind::OwnerSelfJoin
+            | InviteErrorKind::WorkspaceArchived => -32602,
             InviteErrorKind::GithubIdentityRequired
             | InviteErrorKind::IdentityLocked
-            | InviteErrorKind::FlowError
-            | InviteErrorKind::FlowBusy => -32603,
+            | InviteErrorKind::FlowBusy
+            | InviteErrorKind::GithubUnreachable => -32603,
         }
     }
 }
@@ -362,9 +515,14 @@ impl Error {
             Error::Internal(_)
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
+            | Error::TunnelDown
             | Error::WarmInFlight { .. }
             | Error::AdapterBusy { .. }
+            | Error::DeviceGrantUnsupported { .. }
+            | Error::SourceControlUnauthorized { .. }
             | Error::RateLimited(_)
+            | Error::IdentityProof(_)
+            | Error::IdentityUnverifiable { .. }
             // Unsupported: map to internal error for now
             | Error::Unsupported(_)
             | Error::ExecutionEnvironmentNotImplemented { .. } => -32603,

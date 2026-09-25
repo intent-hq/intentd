@@ -18,6 +18,7 @@ use intent_services::{
     live_adapters, max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes,
     AgentManager, AgentMemorySnapshot, BusEventSink, EventBus, GitStatusRefresher,
     PermissionPolicy, ProcessSample, Services, TreeMemoryProbe, TreeSample, WatcherRegistry,
+    WorkspaceSetupStates,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -1262,6 +1263,7 @@ async fn cmd_import_legacy(
             // running daemon learns about the rows via `system.importLegacy`
             // or its next boot, both of which publish.
             event_bus: None,
+            setup_states: None,
         },
     )
     .await?;
@@ -1641,6 +1643,10 @@ async fn cmd_serve(
     // observe a missing row before either inserts it, turning the loser's
     // idempotent skip into a spurious `insert failed` failure-summary entry.
     let legacy_import_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // Per-workspace setup-stage map shared by the services surface and the
+    // legacy importer (both the first-boot task and `system.importLegacy`),
+    // so an imported row reads `skipped` from `ws.workspace.details()`.
+    let workspace_setup_states = WorkspaceSetupStates::default();
     // First-boot legacy workspace import: the eligibility decision (fresh DB
     // / marker state) is made synchronously here, but the import itself runs
     // in a spawned background task concurrently with the transports coming up
@@ -1664,6 +1670,7 @@ async fn cmd_serve(
                 let assets_root = Some(config.data_dir.join("assets"));
                 let app_dir = legacy_import::default_app_dir();
                 let event_bus = Some(bus.clone());
+                let setup_states = Some(workspace_setup_states.clone());
                 let lock = legacy_import_lock.clone();
                 let resumed = decision == legacy_import::FirstBootDecision::Resume;
                 Some(intent_core::spawn_daemon(async move {
@@ -1674,6 +1681,7 @@ async fn cmd_serve(
                         assets_root,
                         app_dir,
                         event_bus,
+                        setup_states,
                         resumed,
                     )
                     .await;
@@ -1795,6 +1803,7 @@ async fn cmd_serve(
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(&config.data_dir.clone())
         .with_event_bus(bus.clone())
+        .with_workspace_setup_states(workspace_setup_states.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
@@ -2039,6 +2048,13 @@ async fn cmd_serve(
         Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
         Err(e) => tracing::warn!(error = %e, "PR monitor rehydration failed"),
     }
+    // Populate the primary principal's GitHub identity once at boot when the
+    // row still predates the GitHub connection (`login: null`), so roster
+    // reads do not wait for a `principal.me` (intent-hq/intent#5534).
+    // Fire-and-forget: only spawns the bounded off-path refresh (one refresh
+    // per IDENTITY_REFRESH_INTERVAL across all trigger sites); a no-op
+    // without GitHub auth and never a startup failure.
+    services.refresh_primary_identity_at_startup().await;
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
     // recursive removal (monorepo#473). Spawned so the potentially multi-GB
@@ -2083,7 +2099,7 @@ async fn cmd_serve(
     // each PR on an effective interval stretched to fit the `[prMonitor]
     // hourlyRequestBudget` cost model (a cadence planner, not a request
     // limiter) and stretched further ahead of exhaustion when the tick's
-    // quota-free probe shows the remaining quota would not cover the
+    // shared quota probe shows the remaining quota would not cover the
     // projected spend to reset within `quotaSharePercent`, a capped
     // oldest-first subset per tick — diff each
     // against its persisted baseline, and deliver one consolidated wake once
@@ -2384,6 +2400,7 @@ async fn cmd_serve(
         legacy_import_assets_root: assets_root,
         legacy_import_lock: legacy_import_lock.clone(),
         legacy_import_bus: bus.clone(),
+        legacy_import_setup_states: workspace_setup_states.clone(),
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
         exact_update: exact_update::ExactUpdate::default(),
@@ -2814,6 +2831,9 @@ struct DaemonControl {
     /// Event bus for `workspace:created` publishes on imported rows, so live
     /// subscribers learn about workspaces the importer writes through `Store`.
     legacy_import_bus: EventBus,
+    /// Setup-state map shared with `Services`, so imported rows record
+    /// `skipped` alongside their `workspace:setup:completed` publish.
+    legacy_import_setup_states: WorkspaceSetupStates,
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
@@ -4072,6 +4092,7 @@ impl SystemControl for DaemonControl {
                     assets_root: Some(self.legacy_import_assets_root.clone()),
                     app_dir: legacy_import::default_app_dir(),
                     event_bus: Some(self.legacy_import_bus.clone()),
+                    setup_states: Some(self.legacy_import_setup_states.clone()),
                 },
             )
             .await
@@ -6929,7 +6950,7 @@ async fn report_provider_availability(config: &Config) {
             println!("  [--] {} ({})", provider.id, reason);
             continue;
         }
-        // npx-only providers (claude-code, pi) never resolve a local binary;
+        // npx-only providers (claude-code, codex, pi) never resolve a local binary;
         // report npx availability instead (the auth probe would need a package
         // download, so it is skipped — auth is the external `claude` CLI).
         // A valid `providers.paths` adapter override (claude-code opts in,
@@ -6970,15 +6991,14 @@ async fn report_provider_availability(config: &Config) {
                             println!("  [--] {} unavailable{verdict}", provider.id);
                         }
                         None => {
-                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display());
+                            println!(
+                                "{}",
+                                npx_provider_availability_line(provider.id, pkg, Some(npx))
+                            );
                         }
                     }
                 }
-                None => println!(
-                    "  [--] {} unavailable (npx not found — {} is required)",
-                    provider.id,
-                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
-                ),
+                None => println!("{}", npx_provider_availability_line(provider.id, pkg, None)),
             }
             continue;
         }
@@ -7014,6 +7034,21 @@ async fn report_provider_availability(config: &Config) {
         );
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
+    }
+}
+
+/// Format the ordinary npx doctor line from discovery's result without probing again.
+fn npx_provider_availability_line(id: &str, package: &str, npx: Option<&Path>) -> String {
+    match npx {
+        Some(npx) => format!("  [ok] {id} via npx: {} -y {package}", npx.display()),
+        None if id == "codex" => format!(
+            "  [--] {id} unavailable ({})",
+            intent_providers::CODEX_ACP_PREREQUISITE_ERROR
+        ),
+        None => format!(
+            "  [--] {id} unavailable (npx not found — {} is required)",
+            intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+        ),
     }
 }
 
@@ -7280,6 +7315,52 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_codex_unavailable_names_both_runtime_prerequisites() {
+        // Codex discovery returns None when Node is missing even if npx
+        // exists, as well as when npx or both are missing. The provider
+        // resolver tests cover that executable matrix without touching PATH.
+        let line =
+            npx_provider_availability_line("codex", intent_providers::CODEX_ACP_NPX_PACKAGE, None);
+        assert_eq!(
+            line,
+            format!(
+                "  [--] codex unavailable ({})",
+                intent_providers::CODEX_ACP_PREREQUISITE_ERROR
+            )
+        );
+        assert!(!line.contains("npx not found"));
+    }
+
+    #[test]
+    fn doctor_npx_unavailable_keeps_other_provider_diagnostics() {
+        for id in ["claude-code", "pi"] {
+            let provider = intent_providers::find_provider(id).unwrap();
+            assert_eq!(
+                npx_provider_availability_line(id, provider.npx_only_package.unwrap(), None),
+                format!(
+                    "  [--] {id} unavailable (npx not found — {} is required)",
+                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_available_npx_provider_keeps_selected_package_and_path() {
+        let npx = Path::new("/toolchain/npx");
+        for id in ["codex", "claude-code"] {
+            let package = intent_providers::find_provider(id)
+                .unwrap()
+                .npx_only_package
+                .unwrap();
+            assert_eq!(
+                npx_provider_availability_line(id, package, Some(npx)),
+                format!("  [ok] {id} via npx: {} -y {package}", npx.display())
+            );
+        }
+    }
 
     /// Regression guard for [`WORKER_THREAD_STACK_BYTES`]: a task whose
     /// frame needs more than the 2 MiB std default must still complete on a

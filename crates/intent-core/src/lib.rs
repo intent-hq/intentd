@@ -29,6 +29,8 @@ pub mod git_remote_url;
 pub mod ids;
 pub mod model;
 pub mod path_utils;
+#[doc(hidden)]
+pub mod queue_visibility_contract;
 pub mod replay_preview;
 pub mod repo_ref;
 pub mod secrets;
@@ -40,19 +42,27 @@ pub(crate) mod traits;
 pub mod transfer;
 pub mod turn_attachments;
 
-pub use agent_configs::{agent_configs_root, create_agent_configs_dir, sweep_agent_configs};
+pub use agent_configs::{
+    agent_configs_root, create_agent_configs_dir, is_npx_launch_dir_name, sweep_agent_configs,
+    NPX_LAUNCH_DIR_PREFIX,
+};
 pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
 };
-pub use caller::{current_caller, spawn_daemon, with_caller, Caller};
+pub use caller::{
+    current_caller, is_human_authored_metadata, project_queue_for_caller,
+    queue_attribution_visible_to, queue_attribution_with, queue_entry_attribution,
+    queue_processing_event_attribution, queue_processing_event_metadata, queue_visible_to,
+    spawn_daemon, with_caller, Caller, QueueAttribution, QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY,
+};
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd};
 pub use clock::{
     iso_from_unix_secs, iso_minutes_ago, iso_ms_from_now, now_epoch_ms, now_iso, parse_iso,
 };
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
-pub use error::{CloneErrorCategory, Error, InviteErrorKind, Result};
+pub use error::{CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, Result};
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
 pub use ids::{
@@ -74,10 +84,12 @@ pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
-    cap_json_value, format_key_bytes_table, last_tool_use_preview, note_list_slim_row,
-    serialized_key_bytes, slim_body_size, slim_heavy_body, AgentListRowScope, AgentScopeCounts,
-    ConversationProjection, NoteListProjection, AGENT_LIST_NAME_CAP_BYTES,
-    AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
+    cap_json_value, fit_agent_list_frame, format_key_bytes_table, last_tool_use_preview,
+    note_list_slim_row, serialized_key_bytes, slim_body_size, slim_heavy_body,
+    AgentDelegatedCounts, AgentListFrameFit, AgentListRowScope, AgentOrphanedDelegatedCounts,
+    AgentParentDelegatedCounts, AgentScopeCounts, ConversationProjection, NoteListProjection,
+    AGENT_LIST_FRAME_BUDGET_BYTES, AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES,
+    AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
     AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS,
     SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
@@ -112,7 +124,8 @@ pub use model::{
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage,
     WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus, WorkspaceTask,
+    WorkspaceTaskStats, WorkspaceUpdate,
     SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
@@ -121,8 +134,8 @@ pub use model::{
     BrowserTabVisibility,
 };
 pub use model::{
-    Principal, PrincipalCredential, WorkspaceInvite, WorkspaceMember, WorkspaceMembership,
-    WorkspaceRole,
+    InvitePin, InviteProofClaim, Principal, PrincipalCredential, PrincipalIdentity,
+    WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
 };
 pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,

@@ -10,7 +10,7 @@ use intent_core::transfer::{
     TransferAsset, TransferAttachment, TransferGitSummary, TransferManifest, TransferPlan,
     TransferSubmoduleSummary, TransferTableStat, TransferWarning, TRANSFER_FORMAT_VERSION,
 };
-use intent_core::{clock::now_iso, AgentStatus, Error, Result, Workspace, WorkspaceId};
+use intent_core::{clock::now_iso, Error, Result, Workspace, WorkspaceId};
 use intent_store::SandboxStatus;
 
 use crate::transfer_submodules::{
@@ -116,13 +116,7 @@ impl Services {
         let sessions = self.store.list_agent_session_summaries(&id).await?;
         let running = sessions
             .iter()
-            .filter(|s| {
-                s.is_active
-                    || matches!(
-                        s.status,
-                        AgentStatus::Active | AgentStatus::Pending | AgentStatus::Processing
-                    )
-            })
+            .filter(|s| s.is_active || s.status.is_running_turn())
             .count();
         if running > 0 {
             warnings.push(TransferWarning {

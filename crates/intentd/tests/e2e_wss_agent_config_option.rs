@@ -1677,6 +1677,233 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     );
 }
 
+/// Pi 0.0.34 returns thinking options for the effective model. Opening on a
+/// non-reasoning default must not suppress a saved effort for a selected
+/// reasoning model. Exercise actual daemon startup, live model switches,
+/// cold resume/recreate, persistence, and clearing effort on the live child.
+async fn assert_model_specific_thinking_options(load_session: bool) {
+    let Some(script) = gate() else { return };
+    let data_dir = temp_data_dir();
+    let prompt_log = data_dir.path().join("prompts.jsonl");
+    let rpc_log = data_dir.path().join("rpc.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy();
+    let rpc_log_str = rpc_log.to_string_lossy();
+    let levels = json!(["off", "minimal", "low", "medium", "high"]);
+    let behavior = json!({
+        "advertiseLoadSession": load_session,
+        "modelSelection": {
+            "defaultModel": "local/plain",
+            "models": ["local/plain", "local/reasoner"],
+            "thinking": {
+                "local/plain": {"current": "off", "values": ["off"]},
+                "local/reasoner": {"current": "medium", "values": levels},
+            },
+        },
+    })
+    .to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_str.as_ref()),
+        ("MOCK_AGENT_RPC_LOG", rpc_log_str.as_ref()),
+    ];
+    let mut daemon = Daemon {
+        child: spawn_serve(data_dir.path(), "both", &env),
+    };
+    let socket = data_dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({
+            "title": "Model-specific thinking", "noPrompt": true,
+        }),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["agent:*"], "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Thinking", "provider": "mock",
+            "model": "local/reasoner", "reasoningEffort": "high",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap();
+
+    // The first turn selects the saved model. Subsequent turns switch both
+    // ways while the daemon is live, then restart it to load/recreate.
+    for (turn, (model, requested, effective, expected_levels)) in [
+        ("local/reasoner", "high", "high", levels.clone()),
+        ("local/plain", "high", "off", json!(["off"])),
+        ("local/reasoner", "low", "low", levels.clone()),
+        ("local/reasoner", "low", "low", levels.clone()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if turn == 3 {
+            daemon.child.kill().expect("stop isolated daemon");
+            daemon.child.wait().expect("reap isolated daemon");
+            daemon.child = spawn_serve(data_dir.path(), "both", &env);
+            assert!(await_uds(&socket).await, "daemon did not restart");
+            let status = common::await_wss_status(&socket).await;
+            let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+            let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+            rpc = connect_ws(port, cfg.clone()).await;
+            sub = connect_ws(port, cfg).await;
+            wss_rpc(
+                &mut sub,
+                2,
+                "events.subscribe",
+                json!({
+                    "eventTypes": ["agent:*"], "workspaceId": ws_id,
+                }),
+            )
+            .await;
+        } else if turn > 0 {
+            wss_rpc(
+                &mut rpc,
+                10,
+                "agent.setModel",
+                json!({
+                    "workspaceId": ws_id, "agentId": agent_id,
+                    "modelId": model, "providerId": "mock",
+                }),
+            )
+            .await;
+            wss_rpc(
+                &mut rpc,
+                11,
+                "agent.update",
+                json!({
+                    "workspaceId": ws_id, "agentId": agent_id,
+                    "changes": {"reasoningEffort": requested},
+                }),
+            )
+            .await;
+        }
+        wss_rpc(
+            &mut rpc,
+            12,
+            "agent.sendMessage",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id, "content": format!("turn {turn}"),
+            }),
+        )
+        .await;
+        await_stream_end(&mut sub, agent_id).await;
+        // stream:end precedes the worker's final state write. Wait until it
+        // is idle before changing settings or restarting the test daemon.
+        let mut idle = false;
+        for _ in 0..120 {
+            let frame = wss_event(&mut sub, 30).await;
+            let event = &frame["params"]["event"];
+            if event["type"] == "agent:idle" && event["data"]["agentId"] == agent_id {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle, "turn must settle before changing model or effort");
+        let prompts = read_config_log(&prompt_log);
+        assert_eq!(prompts.len(), turn + 1, "{prompts:?}");
+        assert_eq!(prompts[turn]["effectiveModel"], model);
+        assert_eq!(
+            prompts[turn]["effectiveEffort"], effective,
+            "turn {turn}: use the selected model's thinking options"
+        );
+        let agent = wss_rpc(
+            &mut rpc,
+            13,
+            "agent.get",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id,
+            }),
+        )
+        .await;
+        assert_eq!(
+            agent["agent"]["effortLevels"], expected_levels,
+            "persist the effective model's choices on turn {turn}"
+        );
+    }
+
+    // Clearing restores the selected model's default (medium), not the
+    // non-reasoning opening model's off. It must reuse the existing child.
+    wss_rpc(
+        &mut rpc,
+        14,
+        "agent.update",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id,
+            "changes": {"reasoningEffort": null},
+        }),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id, "content": "clear effort",
+        }),
+    )
+    .await;
+    await_stream_end(&mut sub, agent_id).await;
+    let prompts = read_config_log(&prompt_log);
+    assert_eq!(prompts.len(), 5);
+    assert_eq!(prompts[4]["effectiveEffort"], "medium");
+    let calls = read_config_log(&rpc_log);
+    let opens: Vec<_> = calls
+        .iter()
+        .filter(|c| c["method"] == "session/new" || c["method"] == "session/load")
+        .collect();
+    assert_eq!(
+        opens.len(),
+        4,
+        "each model switch respawns; clearing reuses: {opens:?}"
+    );
+    assert_eq!(opens[0]["method"], "session/new");
+    for open in &opens[1..] {
+        assert_eq!(
+            open["method"],
+            if load_session {
+                "session/load"
+            } else {
+                "session/new"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn model_specific_thinking_options_survive_live_switch_and_resume() {
+    assert_model_specific_thinking_options(true).await;
+}
+
+#[tokio::test]
+async fn model_specific_thinking_options_survive_live_switch_and_recreate() {
+    assert_model_specific_thinking_options(false).await;
+}
+
 /// PROTOCOL §5.5 (Option C): the effort levels a provider's `thought_level`
 /// select advertises at session open are persisted and served as
 /// `effortLevels` on the agent wire payloads — announced by an

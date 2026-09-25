@@ -240,6 +240,22 @@ pub(crate) fn pull_to_json(pr: &PullRequest) -> Value {
     })
 }
 
+/// [`pull_to_json`] plus the additive, presence-detected `isInMergeQueue`
+/// — the `github.pulls.get` shape served from the shared PR cache: the key
+/// is present exactly when the cached read reported the host's merge-queue
+/// state (`true` / `false`), and absent (never `null`) when it did not
+/// (REST-only fallback, older GHES).
+pub(crate) fn pull_to_json_with_merge_queue(
+    pr: &PullRequest,
+    is_in_merge_queue: Option<bool>,
+) -> Value {
+    let mut v = pull_to_json(pr);
+    if let (Value::Object(map), Some(queued)) = (&mut v, is_in_merge_queue) {
+        map.insert("isInMergeQueue".into(), json!(queued));
+    }
+    v
+}
+
 /// [`pull_to_json`] plus the `owner` / `repo` the PR belongs to — the
 /// `github.pulls.search` item shape, where a multi-repo scope makes the
 /// addressing part of every hit.

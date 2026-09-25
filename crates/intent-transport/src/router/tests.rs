@@ -606,6 +606,7 @@ impl WorkspaceApi for FakeApi {
                 updated_at: Some("t1".to_string()),
                 skipped: None,
                 reason: None,
+                rev: Some(1),
             })
         })
     }
@@ -1275,6 +1276,7 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async {
             Ok(serde_json::json!({
                 "ok": true,
+                "flowId": "7",
                 "userCode": "ABCD-1234",
                 "verificationUri": "https://github.com/login/device",
                 "expiresIn": 900,
@@ -1283,8 +1285,13 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async { Ok(serde_json::json!({ "ok": true, "cancelled": true })) })
+    fn github_cancel_auth(&self, flow_id: Option<String>) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "cancelled": flow_id.as_deref().is_none_or(|id| id == "7"),
+            }))
+        })
     }
 
     fn github_revoke(&self) -> BoxFuture<'_, Result<Value>> {
@@ -1309,6 +1316,78 @@ impl WorkspaceApi for FakeApi {
                 "users": [],
                 "echoQuery": query,
                 "echoLimit": limit,
+            }))
+        })
+    }
+
+    fn github_identity_proof_create(
+        &self,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            // The fake refuses a sentinel nonce with the bounded scope error
+            // so the wire mapping (`-32603` + `data.code`) is exercised.
+            if nonce == "no-scope" {
+                return Err(Error::IdentityProof(
+                    intent_core::IdentityProofErrorKind::ScopeMissing,
+                ));
+            }
+            Ok(serde_json::json!({
+                "gistId": "g1",
+                "login": "octocat",
+                "echoNonce": nonce,
+                "echoHostLabel": host_label,
+            }))
+        })
+    }
+
+    fn github_identity_proof_delete(&self, gist_id: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true, "echoGistId": gist_id })) })
+    }
+
+    fn source_control_identity_proof_create(
+        &self,
+        provider: String,
+        host: Option<String>,
+        nonce: String,
+        host_label: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            // Sentinel nonces exercise the two typed refusals' wire shapes.
+            if nonce == "no-scope" {
+                return Err(Error::IdentityProof(
+                    intent_core::IdentityProofErrorKind::GitlabScopeMissing,
+                ));
+            }
+            if nonce == "unverifiable" {
+                return Err(Error::IdentityUnverifiable {
+                    host: "gitlab.example".to_string(),
+                });
+            }
+            Ok(serde_json::json!({
+                "proofId": "77",
+                "login": "glab-octocat",
+                "echoProvider": provider,
+                "echoHost": host,
+                "echoNonce": nonce,
+                "echoHostLabel": host_label,
+            }))
+        })
+    }
+
+    fn source_control_identity_proof_delete(
+        &self,
+        provider: String,
+        host: Option<String>,
+        proof_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "echoProvider": provider,
+                "echoHost": host,
+                "echoProofId": proof_id,
             }))
         })
     }
@@ -2538,6 +2617,27 @@ fn voice_not_configured_maps_to_structured_error_data() {
     assert_eq!(
         rpc.data.expect("structured data"),
         serde_json::json!({ "code": "voice-no-api-key", "detail": detail })
+    );
+}
+
+#[test]
+fn rate_limited_maps_to_structured_error_data() {
+    // Forge rate limiting (intent-hq/intent#5627) — any cause the
+    // source-control layer classifies as `RateLimited` — keeps the -32603
+    // code and the exact `source control rate limited: <detail>` message,
+    // and carries `error.data = { code: "rate-limited" }` so the invite flow
+    // routes "wait for the limit to reset" instead of a sign-in prompt.
+    let rpc = super::domain_to_rpc(intent_core::Error::RateLimited(
+        "API rate limit exceeded for user ID 1.".to_string(),
+    ));
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.message,
+        "source control rate limited: API rate limit exceeded for user ID 1."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({ "code": "rate-limited" })
     );
 }
 
@@ -3776,8 +3876,10 @@ async fn singular_event_subscribe_aliases_are_not_routable() {
 
 /// `agent.list` row-scope params (§5.5): an unknown or non-string `scope` is
 /// `-32602` (never coerced, unlike the lenient retired flags), a bin scope
-/// cannot ride with either retired flag, and `parentAgentId` must be a
-/// canonical `agent-{uuid}` paired with `scope: "delegated"`.
+/// cannot ride with either retired flag, `parentAgentId` must be a
+/// canonical `agent-{uuid}` paired with `scope: "delegated"`, and
+/// `orphanedOnly` must be a boolean paired with `scope: "delegated"` and
+/// never with `parentAgentId`.
 #[tokio::test]
 async fn agent_list_scope_params_are_validated() {
     let scope_msg = "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"";
@@ -3818,10 +3920,46 @@ async fn agent_list_scope_params_are_validated() {
             r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
             "parentAgentId requires scope \"delegated\"",
         ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":"yes"}}"#,
+            "orphanedOnly must be a boolean",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":1}}"#,
+            "orphanedOnly must be a boolean",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"background","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":true,"parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+            "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
+        ),
     ] {
         let v = call(frame).await.unwrap();
         assert_eq!(err_code(&v), -32602, "{frame}: {v}");
         assert_eq!(v["error"]["message"], serde_json::json!(expected), "{frame}");
+    }
+    // `orphanedOnly: false` reads as absent on any scope: the frame passes
+    // param validation into the trait default (`Internal` → `-32603`),
+    // like a valid `orphanedOnly: true` delegated read.
+    for frame in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","orphanedOnly":false}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","orphanedOnly":false}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":false,"parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":true}}"#,
+    ] {
+        let v = call(frame).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "{frame}: {v}");
     }
     // The retired-flag contradiction still wins over a scope combination.
     let v = call(
@@ -4681,6 +4819,155 @@ async fn github_users_search_requires_query() {
 }
 
 #[tokio::test]
+async fn github_identity_proof_create_routes_nonce_and_host_label() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{"nonce":"n1","hostLabel":"Studio"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["gistId"], serde_json::json!("g1"));
+    assert_eq!(v["result"]["login"], serde_json::json!("octocat"));
+    assert_eq!(v["result"]["echoNonce"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["echoHostLabel"], serde_json::json!("Studio"));
+}
+
+#[tokio::test]
+async fn github_identity_proof_create_requires_nonce_and_host_label() {
+    for params in ["{}", r#"{"nonce":"n1"}"#, r#"{"hostLabel":"h"}"#] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
+}
+
+#[tokio::test]
+async fn github_identity_proof_refusal_carries_bounded_data_code() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.create","params":{"nonce":"no-scope","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "github-scope-missing" })
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("gist")),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn github_identity_proof_delete_routes_gist_id_and_requires_it() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.delete","params":{"gistId":"g1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["echoGistId"], serde_json::json!("g1"));
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.identityProof.delete","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn source_control_identity_proof_create_routes_provider_host_nonce_and_host_label() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"gitlab","host":"gitlab.example","nonce":"n1","hostLabel":"Studio"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["proofId"], serde_json::json!("77"));
+    assert_eq!(v["result"]["echoProvider"], serde_json::json!("gitlab"));
+    assert_eq!(v["result"]["echoHost"], serde_json::json!("gitlab.example"));
+    assert_eq!(v["result"]["echoNonce"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["echoHostLabel"], serde_json::json!("Studio"));
+    // `host` is optional (absent / null ⇒ omitted) but strictly typed.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"github","host":null,"nonce":"n1","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoHost"], Value::Null, "{v}");
+    for params in [
+        "{}",
+        r#"{"nonce":"n1","hostLabel":"h"}"#,
+        r#"{"provider":"gitlab","hostLabel":"h"}"#,
+        r#"{"provider":"gitlab","nonce":"n1"}"#,
+        r#"{"provider":"gitlab","host":123,"nonce":"n1","hostLabel":"h"}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
+}
+
+#[tokio::test]
+async fn source_control_identity_proof_refusals_carry_bounded_data() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"gitlab","nonce":"no-scope","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "gitlab-scope-missing" })
+    );
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"gitlab","nonce":"unverifiable","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "identity-unverifiable", "host": "gitlab.example" })
+    );
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("cannot verify identity on gitlab.example")
+    );
+}
+
+#[tokio::test]
+async fn source_control_identity_proof_delete_routes_proof_id_and_requires_it() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.delete","params":{"provider":"gitlab","host":"gitlab.example","proofId":"77"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["echoProvider"], serde_json::json!("gitlab"));
+    assert_eq!(v["result"]["echoHost"], serde_json::json!("gitlab.example"));
+    assert_eq!(v["result"]["echoProofId"], serde_json::json!("77"));
+    for params in [
+        "{}",
+        r#"{"proofId":"77"}"#,
+        r#"{"provider":"gitlab"}"#,
+        r#"{"provider":"gitlab","gistId":"77"}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.delete","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
+}
+
+#[tokio::test]
 async fn github_users_search_routes_query_and_optional_limit() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"github.users.search","params":{"query":"octo","limit":3}}"#,
@@ -4819,6 +5106,8 @@ async fn github_auth_status_connect_revoke_get_user_route_without_params() {
         serde_json::json!("https://github.com/login/device")
     );
 
+    assert_eq!(connect["result"]["flowId"], serde_json::json!("7"));
+
     let cancel = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{}}"#)
         .await
         .unwrap();
@@ -4838,6 +5127,44 @@ async fn github_auth_status_connect_revoke_get_user_route_without_params() {
         serde_json::json!("octocat")
     );
     assert!(user["result"]["user"].get("id").is_none());
+}
+
+/// `github.cancelAuth` takes an optional string `flowId`: the connect-issued
+/// id is forwarded verbatim (the stub cancels only its own "7"); only an
+/// OMITTED key is the unscoped cancel, and any present non-string — an
+/// explicit `null` included — is `-32602` rather than silently widening it.
+#[tokio::test]
+async fn github_cancel_auth_forwards_flow_id_and_rejects_non_string() {
+    let own =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{"flowId":"7"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(own["result"]["cancelled"], serde_json::json!(true));
+
+    let other =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{"flowId":"6"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(other["result"]["ok"], serde_json::json!(true));
+    assert_eq!(other["result"]["cancelled"], serde_json::json!(false));
+
+    let omitted = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(omitted["result"]["cancelled"], serde_json::json!(true));
+
+    for bad in ["null", "7", "true", "{}", r#"["7"]"#] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{{"flowId":{bad}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "flowId {bad}: {v}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("flowId must be a string")
+        );
+    }
 }
 
 #[tokio::test]
@@ -6379,6 +6706,266 @@ mod mark_seen_dispatch {
         assert!(
             api.seen.lock().unwrap().is_none(),
             "the API must not be called on a malformed request"
+        );
+    }
+}
+
+/// `sourceControl.*` (PROTOCOL §5.27) optional-field parsing is strict: an
+/// absent or `null` `host` / `method` / `token` is forwarded as `None`, but a
+/// present non-string is `-32602` before the API is called. Regression for the
+/// lax `opt_str` path where `{"provider":"gitlab","host":123}` was routed as
+/// host-omitted — on `revoke`, acting on the bound credential instead of failing.
+mod source_control_optional_fields_strict {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{BoxFuture, Result, WorkspaceApi};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    type HostCall = (&'static str, String, Option<String>);
+    type Connect = (String, Option<String>, Option<String>, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingApi {
+        calls: Arc<Mutex<Vec<HostCall>>>,
+        connects: Arc<Mutex<Vec<Connect>>>,
+    }
+
+    impl RecordingApi {
+        fn record(
+            &self,
+            method: &'static str,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push((method, provider, host));
+                Ok(json!({ "ok": true }))
+            })
+        }
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        fn source_control_auth_status(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("authStatus", provider, host)
+        }
+        fn source_control_connect(
+            &self,
+            provider: String,
+            host: Option<String>,
+            method: Option<String>,
+            token: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let connects = self.connects.clone();
+            Box::pin(async move {
+                connects
+                    .lock()
+                    .unwrap()
+                    .push((provider, host, method, token));
+                Ok(json!({ "status": "pending" }))
+            })
+        }
+        fn source_control_cancel_auth(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("cancelAuth", provider, host)
+        }
+        fn source_control_revoke(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("revoke", provider, host)
+        }
+        fn source_control_get_user(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("getUser", provider, host)
+        }
+    }
+
+    async fn rpc(api: &RecordingApi, method: &str, params: Value) -> Value {
+        let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+        let out = handle_message(api, &msg.to_string())
+            .await
+            .expect("response");
+        serde_json::from_str(&out).unwrap()
+    }
+
+    const HOST_METHODS: [&str; 4] = [
+        "sourceControl.authStatus",
+        "sourceControl.cancelAuth",
+        "sourceControl.revoke",
+        "sourceControl.getUser",
+    ];
+
+    fn wrong_types() -> Vec<Value> {
+        vec![json!(123), json!(1.5), json!(true), json!([]), json!({})]
+    }
+
+    #[tokio::test]
+    async fn revoke_with_numeric_host_is_invalid_params_and_binding_untouched() {
+        let api = RecordingApi::default();
+        let v = rpc(
+            &api,
+            "sourceControl.revoke",
+            json!({ "provider": "gitlab", "host": 123 }),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], json!(-32602), "{v}");
+        assert_eq!(v["error"]["data"]["code"], json!("invalid-params"));
+        assert_eq!(v["error"]["message"], json!("host must be a string"));
+        assert!(v.get("result").is_none());
+        assert!(
+            api.calls.lock().unwrap().is_empty(),
+            "revoke must not reach the service on a non-string host"
+        );
+    }
+
+    #[tokio::test]
+    async fn present_non_string_host_is_invalid_params_on_every_host_method() {
+        let api = RecordingApi::default();
+        for method in HOST_METHODS {
+            for bad in wrong_types() {
+                let v = rpc(&api, method, json!({ "provider": "gitlab", "host": bad })).await;
+                assert_eq!(v["error"]["code"], json!(-32602), "{method} host={bad}");
+                assert_eq!(v["error"]["message"], json!("host must be a string"));
+            }
+        }
+        for bad in wrong_types() {
+            let v = rpc(
+                &api,
+                "sourceControl.connect",
+                json!({ "provider": "gitlab", "host": bad.clone() }),
+            )
+            .await;
+            assert_eq!(v["error"]["code"], json!(-32602), "connect host={bad}");
+        }
+        assert!(api.calls.lock().unwrap().is_empty());
+        assert!(api.connects.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_with_non_string_method_or_token_is_invalid_params_no_flow_started() {
+        let api = RecordingApi::default();
+        for (params, expected) in [
+            (
+                json!({ "provider": "gitlab", "method": 1 }),
+                "method must be a string",
+            ),
+            (
+                json!({ "provider": "gitlab", "method": ["pat"] }),
+                "method must be a string",
+            ),
+            (
+                json!({ "provider": "gitlab", "method": "pat", "token": 42 }),
+                "token must be a string",
+            ),
+            (
+                json!({ "provider": "gitlab", "method": "pat", "token": { "v": "x" } }),
+                "token must be a string",
+            ),
+            (
+                json!({ "provider": "github", "method": true }),
+                "method must be a string",
+            ),
+        ] {
+            let v = rpc(&api, "sourceControl.connect", params.clone()).await;
+            assert_eq!(v["error"]["code"], json!(-32602), "params: {params}");
+            assert_eq!(v["error"]["data"]["code"], json!("invalid-params"));
+            assert_eq!(v["error"]["message"], json!(expected), "params: {params}");
+        }
+        assert!(
+            api.connects.lock().unwrap().is_empty(),
+            "no device flow / PAT exchange may start on malformed params"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_and_null_optional_fields_are_forwarded_as_none() {
+        let api = RecordingApi::default();
+        for method in HOST_METHODS {
+            let v = rpc(&api, method, json!({ "provider": "gitlab" })).await;
+            assert_eq!(v["result"]["ok"], json!(true), "{method} absent");
+            let v = rpc(&api, method, json!({ "provider": "gitlab", "host": null })).await;
+            assert_eq!(v["result"]["ok"], json!(true), "{method} null");
+        }
+        let calls = api.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), HOST_METHODS.len() * 2);
+        assert!(calls.iter().all(|(_, p, h)| p == "gitlab" && h.is_none()));
+
+        let v = rpc(
+            &api,
+            "sourceControl.connect",
+            json!({ "provider": "gitlab", "host": null, "method": null, "token": null }),
+        )
+        .await;
+        assert_eq!(v["result"]["status"], json!("pending"));
+        let v = rpc(
+            &api,
+            "sourceControl.connect",
+            json!({ "provider": "gitlab" }),
+        )
+        .await;
+        assert_eq!(v["result"]["status"], json!("pending"));
+        let connects = api.connects.lock().unwrap().clone();
+        assert_eq!(
+            connects,
+            vec![
+                ("gitlab".to_string(), None, None, None),
+                ("gitlab".to_string(), None, None, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn string_optional_fields_are_forwarded_verbatim() {
+        let api = RecordingApi::default();
+        let v = rpc(
+            &api,
+            "sourceControl.revoke",
+            json!({ "provider": "gitlab", "host": "gitlab.example.com" }),
+        )
+        .await;
+        assert_eq!(v["result"]["ok"], json!(true));
+        let v = rpc(
+            &api,
+            "sourceControl.connect",
+            json!({
+                "provider": "gitlab",
+                "host": "gitlab.example.com",
+                "method": "pat",
+                "token": "glpat-x"
+            }),
+        )
+        .await;
+        assert_eq!(v["result"]["status"], json!("pending"));
+        assert_eq!(
+            api.calls.lock().unwrap().clone(),
+            vec![(
+                "revoke",
+                "gitlab".to_string(),
+                Some("gitlab.example.com".to_string())
+            )]
+        );
+        assert_eq!(
+            api.connects.lock().unwrap().clone(),
+            vec![(
+                "gitlab".to_string(),
+                Some("gitlab.example.com".to_string()),
+                Some("pat".to_string()),
+                Some("glpat-x".to_string()),
+            )]
         );
     }
 }

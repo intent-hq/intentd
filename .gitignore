@@ -1,4 +1,5 @@
 /target
+/.transfer-selection-contract
 lcov.info
 /guest-image/out/
 *.rlib

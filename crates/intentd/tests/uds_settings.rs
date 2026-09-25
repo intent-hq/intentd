@@ -592,6 +592,16 @@ async fn settings_round_trip_redaction_validation_and_event() {
         assert!(e.get("sensitive").is_none(), "{path}");
     }
 
+    // `[prCache]` — the shared PR cache's serve window: one non-secret
+    // TOML-backed number (default 60, floor 10, max 600).
+    let e = entry(&list, "prCache.maxAgeSeconds");
+    assert_eq!(e["type"], "number");
+    assert_eq!(e["value"], json!(60.0));
+    assert_eq!(e["category"], "prCache");
+    assert_eq!(e["min"], json!(10.0));
+    assert_eq!(e["max"], json!(600.0));
+    assert!(e.get("sensitive").is_none());
+
     // `[updates]` — the idle-triggered update-check knobs: one non-secret
     // TOML-backed boolean (default on) and two numbers (floors 5 and 10).
     let e = entry(&list, "updates.checkOnIdle");

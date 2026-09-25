@@ -763,6 +763,320 @@ async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
     );
 }
 
+/// Text-block `media` sidecar (PROTOCOL §7.1) over the real WSS wire: the
+/// daemon probes the dimensions of a `workspace-asset://` Markdown image the
+/// provider streams — a reference split across chunks resolves on the chunk
+/// that completes it, so that chunk's `chat:stream:delta` carries `media`
+/// keyed by the exact `src` while the chunks before and after carry none.
+/// On the canonical `chat.subscribe` channel the same holds in BOTH
+/// `deltaEncoding` modes (only the entries that chunk resolved travel, never
+/// the accumulated map), the terminal reconcile frame carries the persisted
+/// union, and the persisted text block on `agent.getConversation` carries the
+/// same entry, so a reloading client can reserve the layout box without a
+/// round-trip.
+#[intent_test_macros::daemon_test]
+async fn text_block_media_sidecar_over_wss() {
+    let Some(script) = gate("WSS media sidecar E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // A real 20×10 PNG in the daemon's asset layout
+    // (`<data_dir>/assets/<workspaceId>/<assetId>`).
+    let asset_dir = data_dir.join("assets").join(&ws_id);
+    std::fs::create_dir_all(&asset_dir).expect("mkdir assets");
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(20, 10, image::Rgb([10, 20, 30]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode png");
+    std::fs::write(asset_dir.join("shot.png"), png.into_inner()).expect("write png");
+    let src = format!("workspace-asset://{ws_id}/shot.png");
+    let (head, tail) = src.split_at(src.len() - 6);
+    let behavior = json!({
+        "rawUpdates": [
+            { "sessionUpdate": "agent_message_chunk",
+              "content": { "type": "text", "text": format!("Here: ![shot]({head}") } },
+            { "sessionUpdate": "agent_message_chunk",
+              "content": { "type": "text", "text": format!("{tail})") } },
+            { "sessionUpdate": "agent_message_chunk",
+              "content": { "type": "text", "text": " done" } },
+        ],
+        "omitResponse": true,
+    })
+    .to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-MEDIA", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Canonical chat channels, one per `deltaEncoding`, subscribed BEFORE the
+    // turn so every live delta is observed.
+    let mut chat_full = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat_full,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed (full): {chat_resp}"
+    );
+    let snap = wss_push(&mut chat_full, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+    let mut chat_inc = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat_inc,
+        21,
+        "chat.subscribe",
+        json!({ "agentId": agent_id, "deltaEncoding": "incremental" }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed (incremental): {chat_resp}"
+    );
+    let snap = wss_push(&mut chat_inc, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+    assert_eq!(
+        snap["params"]["snapshot"]["deltaEncoding"], "incremental",
+        "the daemon honored the incremental encoding: {snap}"
+    );
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "show me" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    let expected_media = json!({ &src: { "width": 20, "height": 10 } });
+    let full_text = format!("Here: ![shot]({src}) done");
+    let mut deltas: Vec<Value> = Vec::new();
+    let mut message_id: Option<String> = None;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("chat:stream:delta") if event["data"]["blockType"] == json!("text") => {
+                deltas.push(event["data"].clone());
+            }
+            Some("agent:stream:end") => {
+                message_id = event["data"]["messageId"].as_str().map(str::to_string);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        deltas.len(),
+        3,
+        "one text delta per streamed chunk: {deltas:?}"
+    );
+    assert!(
+        deltas[0].get("media").is_none(),
+        "the chunk that only OPENS the reference carries no media: {}",
+        deltas[0]
+    );
+    assert_eq!(
+        deltas[1]["media"], expected_media,
+        "the chunk that COMPLETES the reference carries its dimensions: {}",
+        deltas[1]
+    );
+    assert!(
+        deltas[2].get("media").is_none(),
+        "a later chunk that resolves nothing carries no media: {}",
+        deltas[2]
+    );
+    assert!(
+        deltas.iter().all(|d| d["blockId"] == deltas[0]["blockId"]),
+        "all chunks belong to the same text block: {deltas:?}"
+    );
+
+    // Drain one chat channel: the live text-block entities in order, then the
+    // terminal reconcile entity (`streamingComplete: true`) for that block.
+    // Single total deadline (per-frame reads would reset on heartbeat Pings).
+    async fn drain_text_block<S>(
+        chat: &mut WebSocketStream<S>,
+        agent_id: &str,
+    ) -> (Vec<Value>, Value)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        timeout(Duration::from_secs(30), async {
+            let mut live: Vec<Value> = Vec::new();
+            loop {
+                let frame = wss_push(chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = &frame["params"]["delta"];
+                let entities = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .filter(|e| {
+                        e["agentId"] == agent_id
+                            && e["role"] == "assistant"
+                            && e["block"]["type"] == "text"
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for entity in entities {
+                    if entity["streamingComplete"] == true {
+                        return (live, entity);
+                    }
+                    live.push(entity);
+                }
+            }
+        })
+        .await
+        .expect("chat channel settled the text block")
+    }
+
+    let (full_live, full_terminal) = drain_text_block(&mut chat_full, &agent_id).await;
+    assert_eq!(
+        full_live.len(),
+        3,
+        "full mode: one entity per streamed chunk: {full_live:?}"
+    );
+    assert!(
+        full_live[0]["block"].get("media").is_none(),
+        "full mode: opening chunk carries no media: {}",
+        full_live[0]
+    );
+    assert_eq!(
+        full_live[1]["block"]["media"], expected_media,
+        "full mode: completing chunk carries only what it resolved: {}",
+        full_live[1]
+    );
+    assert!(
+        full_live[2]["block"].get("media").is_none(),
+        "full mode: a chunk that resolves nothing omits media (never resends the union): {}",
+        full_live[2]
+    );
+    assert_eq!(
+        full_live[2]["block"]["text"].as_str(),
+        Some(full_text.as_str()),
+        "full mode still carries the accumulated text: {}",
+        full_live[2]
+    );
+    assert_eq!(
+        full_terminal["block"]["media"], expected_media,
+        "full mode: the terminal reconcile carries the persisted union: {full_terminal}"
+    );
+
+    let (inc_live, inc_terminal) = drain_text_block(&mut chat_inc, &agent_id).await;
+    assert_eq!(
+        inc_live.len(),
+        3,
+        "incremental mode: one entity per streamed chunk: {inc_live:?}"
+    );
+    assert!(
+        inc_live[0]["block"].get("media").is_none(),
+        "incremental mode: opening chunk carries no media: {}",
+        inc_live[0]
+    );
+    assert_eq!(
+        inc_live[1]["block"]["media"], expected_media,
+        "incremental mode: completing chunk carries only what it resolved: {}",
+        inc_live[1]
+    );
+    assert_eq!(
+        inc_live[1]["block"]["textDelta"].as_str(),
+        Some(format!("{tail})").as_str()),
+        "incremental mode carries only the fragment: {}",
+        inc_live[1]
+    );
+    assert!(
+        inc_live[2]["block"].get("media").is_none(),
+        "incremental mode: a chunk that resolves nothing omits media: {}",
+        inc_live[2]
+    );
+    assert_eq!(
+        inc_terminal["block"]["media"], expected_media,
+        "incremental mode: the terminal reconcile carries the persisted union: {inc_terminal}"
+    );
+
+    // Durable half: the persisted block carries the same sidecar.
+    let message_id = message_id.expect("stream:end carries the persisted messageId");
+    let convo = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let assistant = convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"] == json!(message_id))
+        .expect("assistant row from the turn present in the transcript")
+        .clone();
+    let block = assistant["contentBlocks"]
+        .as_array()
+        .expect("contentBlocks")
+        .iter()
+        .find(|b| b["type"] == json!("text"))
+        .expect("persisted text block")
+        .clone();
+    assert_eq!(
+        block["text"].as_str(),
+        Some(format!("Here: ![shot]({src}) done").as_str()),
+        "chunks concatenated into one text block: {block}"
+    );
+    assert_eq!(
+        block["media"], expected_media,
+        "the persisted text block carries the media sidecar: {block}"
+    );
+}
+
 /// intent-hq/monorepo#2669 over the real WSS wire: a turn that resolves a
 /// clean `end_turn` after a sustained stream-silence tail (the incident
 /// signature of a silently-truncated turn under session bloat) gets the
@@ -6220,6 +6534,7 @@ async fn collaborator_steer_runs_host_exec_through_bound_bridge_over_wss() {
     let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: Some("Guest User".to_string()),
@@ -9405,6 +9720,7 @@ async fn workspace_create_by_collaborator_is_forbidden_over_wss() {
     let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: Some("Guest User".to_string()),
@@ -12473,6 +12789,649 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
     }
 }
 
+/// intent-hq/intent#5669 (part 2): a session interrupted MID TOOL-CALL must
+/// settle and drain its queue. The mock parks after emitting a `tool_call`
+/// (`in_progress`); two normal-priority messages queue behind the parked
+/// turn; an interrupt-priority send then lands. The contract:
+///
+/// 1. The interrupt is NOT parked (`queued: false`) — the parked turn is
+///    cancellable, so it is preempted (`agent:stream:end` with
+///    `interruptReason: "preempted_by_message"`).
+/// 2. The interrupt message is delivered NEXT, on the same child (the
+///    mock streams `resumed`), ahead of the two entries queued before it.
+/// 3. The queue then drains to empty and the session settles: the
+///    settlement `agent:idle` fires, `agent.getQueue` is empty, `agent.get`
+///    reports `idle`, and the transcript carries every user row in delivery
+///    order (`first` → `urgent` → queued one → queued two) plus the
+///    interrupted marker row.
+///
+/// Pre-incident shape: the session stayed `responding` after the mid
+/// tool-call interrupt and the queued interrupt-priority entry was never
+/// delivered.
+#[intent_test_macros::daemon_test]
+async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
+    let Some(script) = gate("interrupt mid tool-call settle + drain E2E (#5669)") else {
+        return;
+    };
+    const QUEUED_ONE: &str = "queued behind the tool call one";
+    const QUEUED_TWO: &str = "queued behind the tool call two";
+    const URGENT: &str = "urgent interrupt mid tool-call";
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "parkMidToolCall": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "MIDTOOL5669", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Kick-off: the mock emits a tool_call (in_progress) then parks.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "kick-off ok: {sent}");
+    assert_eq!(sent["queued"], false, "kick-off streams: {sent}");
+
+    let mut saw_tool_call = false;
+    for _ in 0..50 {
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:tool:call" {
+                saw_tool_call = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_tool_call, "must be mid tool-call before queueing");
+
+    // Two normal-priority entries park behind the busy turn.
+    let q1 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.queueMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": QUEUED_ONE }),
+    )
+    .await;
+    assert_eq!(q1["success"], true, "queue one: {q1}");
+    let q2 = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.queueMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": QUEUED_TWO }),
+    )
+    .await;
+    assert_eq!(q2["success"], true, "queue two: {q2}");
+    let queue = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getQueue",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    assert_eq!(
+        queue["queue"].as_array().map(Vec::len),
+        Some(2),
+        "both entries parked behind the tool call: {queue}"
+    );
+
+    // (1) The interrupt lands mid tool-call: preempted, never parked.
+    let interrupted = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": URGENT,
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(interrupted["success"], true, "interrupt ok: {interrupted}");
+    assert_eq!(
+        interrupted["queued"], false,
+        "a mid tool-call interrupt preempts and streams, never queues: {interrupted}"
+    );
+
+    // (2)+(3) Preempt end → interrupt turn → queue drain → settlement idle.
+    // A fresh child would park its first prompt again (`parkMidToolCall`
+    // gates on prompt #1) and never stream `resumed`, so the `resumed` chunk
+    // proves the interrupt turn ran on the SAME child.
+    let mut saw_preempt_end = false;
+    let mut saw_interrupt_chunk = false;
+    let mut stream_ends = 0usize;
+    let mut saw_settle_idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"]
+            .as_str()
+            .is_some_and(|id| id != agent_id)
+        {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:stream:end") => {
+                stream_ends += 1;
+                if !saw_preempt_end {
+                    assert_eq!(
+                        event["data"]["interruptReason"], "preempted_by_message",
+                        "the parked tool-call turn is cut short by the interrupt: {event}"
+                    );
+                    saw_preempt_end = true;
+                }
+            }
+            Some("chat:stream:delta") => {
+                let text = event["data"]["content"].as_str().unwrap_or_default();
+                if text.contains("resumed") {
+                    assert!(
+                        saw_preempt_end,
+                        "the interrupt turn starts only after the preempted turn's stream:end"
+                    );
+                    saw_interrupt_chunk = true;
+                }
+            }
+            Some("agent:idle") if saw_preempt_end => {
+                assert_ne!(
+                    event["data"]["reason"], "interrupted",
+                    "a preemption is not a settlement — no synthetic interrupted idle: {event}"
+                );
+                saw_settle_idle = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_preempt_end,
+        "preemption emitted its terminal stream:end"
+    );
+    assert!(
+        saw_interrupt_chunk,
+        "the interrupt message ran on the SAME child (streamed `resumed`)"
+    );
+    assert!(
+        saw_settle_idle,
+        "the session settled (agent:idle) after draining the queue; stream:ends seen = {stream_ends}"
+    );
+    assert!(
+        stream_ends >= 3,
+        "preempt end + interrupt turn end + at least one drained turn end: {stream_ends}"
+    );
+
+    // Settled: nothing left parked, status idle.
+    let queue = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getQueue",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    assert_eq!(
+        queue["queue"].as_array().map(Vec::len),
+        Some(0),
+        "queue drained after the mid tool-call interrupt: {queue}"
+    );
+    let got = wss_rpc(&mut rpc, 17, "agent.get", json!({ "agentId": &agent_id })).await;
+    assert_eq!(
+        got["agent"]["status"], "idle",
+        "session settled to idle, not stuck responding: {got}"
+    );
+
+    // Transcript: every user row landed, in delivery order, after the marker.
+    let conv = wss_rpc(
+        &mut rpc,
+        18,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let user_idx = |needle: &str| {
+        messages.iter().position(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|b| {
+                        b["type"] == "text"
+                            && b["text"].as_str().is_some_and(|t| t.contains(needle))
+                    })
+        })
+    };
+    let first_idx = user_idx("first").expect("kick-off user row");
+    let urgent_idx = user_idx(URGENT).expect("interrupt user row");
+    let one_idx = user_idx(QUEUED_ONE).expect("queued one delivered");
+    let two_idx = user_idx(QUEUED_TWO).expect("queued two delivered");
+    assert!(
+        first_idx < urgent_idx && urgent_idx < one_idx && one_idx < two_idx,
+        "delivery order first={first_idx} urgent={urgent_idx} one={one_idx} two={two_idx}"
+    );
+    let marker = messages
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["metadata"]["interrupted"] == true)
+        .expect("interrupted marker row for the preempted tool-call turn");
+    assert_eq!(
+        marker["metadata"]["interruptReason"], "preempted_by_message",
+        "{marker}"
+    );
+    let marker_idx = messages
+        .iter()
+        .position(|m| m == marker)
+        .expect("marker index");
+    assert!(
+        first_idx < marker_idx && marker_idx < urgent_idx,
+        "marker row sits between the preempted message and the interrupt: marker={marker_idx}"
+    );
+}
+
+/// intent-hq/intent#5669 (part 2), agent-to-agent variant: the interrupt is
+/// an automatic `ws.agent.send` (default interrupt priority) from a SIBLING
+/// agent, landing while the target's turn is inside a REAL in-flight
+/// `workspace_api` tool call served by the daemon's MCP server (the agent JS
+/// polls `ws.note.list` until a release note exists). Zero assistant output
+/// has streamed at that point, so the preemption takes the combined-delivery
+/// path (the preempted message rides the interrupt prompt). Two
+/// normal-priority entries are parked behind the target before the
+/// interrupt. The contract is the same as the user-interrupt variant: the
+/// sibling's send reports `delivered` (not queued), the target settles
+/// (`agent:idle`, `agent.get` idle, empty queue), and the transcript carries
+/// the interrupt row ahead of both parked entries.
+#[intent_test_macros::daemon_test]
+async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() {
+    let Some(script) = gate("A2A interrupt during in-flight tool call E2E (#5669)") else {
+        return;
+    };
+    const SPIN_MARKER: &str = "spin on the release note";
+    const RELAY_MARKER: &str = "relay an urgent interrupt";
+    const QUEUED_ONE: &str = "queued behind the spinning tool one";
+    const QUEUED_TWO: &str = "queued behind the spinning tool two";
+    const URGENT: &str = "urgent sibling interrupt";
+    const RELEASE_NOTE: &str = "release-5669";
+    const RELAY_RESULT_NOTE: &str = "relay-result-5669";
+    const ENTERED_NOTE: &str = "entered-tool-5669";
+    const EXHAUSTED_NOTE: &str = "exhausted-5669";
+
+    // Entered-tool barrier: the tool call announces itself (a `note:created`
+    // the test awaits) BEFORE polling, so the interrupt is provably sent while
+    // the workspace_api eval is in flight. The poll is bounded (each iteration
+    // is one bridge round trip) so the call can never outlive the eval budget;
+    // exhaustion leaves an observable note the test asserts is absent.
+    let spin_code = format!(
+        "await ws.note.create('{ENTERED_NOTE}', 'in'); \
+         for (let i = 0; i < 4000; i++) {{ \
+           const notes = await ws.note.list(); \
+           if (notes.some(n => n.title === '{RELEASE_NOTE}')) return 'released'; \
+         }} \
+         await ws.note.create('{EXHAUSTED_NOTE}', 'poll exhausted before release'); \
+         return 'gave up';"
+    );
+    let relay_code = format!(
+        "const agents = await ws.agent.list(true); \
+         const target = agents.find(a => a.name === 'TARGET5669'); \
+         const r = await ws.agent.send(target.id, '{URGENT}'); \
+         await ws.note.create('{RELAY_RESULT_NOTE}', JSON.stringify(r)); \
+         return 'sent';"
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": SPIN_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spin_code, "summary": "long tool call" }
+                },
+                "response": "spun"
+            },
+            {
+                "ifPromptContains": RELAY_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": relay_code, "summary": "sibling interrupt" }
+                },
+                "response": "relayed"
+            }
+        ],
+        "response": "plain reply"
+    })
+    .to_string();
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "note:*"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut ids = Vec::new();
+    for (id, name) in [(10, "TARGET5669"), (11, "SENDER5669")] {
+        let created = wss_rpc(
+            &mut rpc,
+            id,
+            "agent.create",
+            json!({ "workspaceId": &ws_id, "name": name, "model": "default", "provider": "mock" }),
+        )
+        .await;
+        ids.push(
+            created["agent"]["id"]
+                .as_str()
+                .expect("agent id")
+                .to_string(),
+        );
+    }
+    let sender_id = ids.pop().expect("sender id");
+    let target_id = ids.pop().expect("target id");
+
+    // Target kick-off: its turn enters the spinning tool call.
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &target_id, "content": format!("first {SPIN_MARKER}") }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "kick-off ok: {sent}");
+    assert_eq!(sent["queued"], false, "kick-off streams: {sent}");
+
+    // Barrier: the target's workspace_api eval has started (it created the
+    // entered note) and its turn has NOT ended — every step below happens
+    // while the real tool call is in flight.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut entered = false;
+    while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
+        let event = &frame["params"]["event"];
+        if event["type"] == "note:created" && event["data"]["title"] == ENTERED_NOTE {
+            entered = true;
+            break;
+        }
+        assert!(
+            !(event["type"] == "agent:stream:end" && event["data"]["agentId"] == json!(target_id)),
+            "the target's turn ended before its tool call was entered: {event}"
+        );
+    }
+    assert!(
+        entered,
+        "the target's tool call announced itself (entered note)"
+    );
+
+    // Two normal-priority entries park behind the busy turn.
+    for (id, content) in [(13, QUEUED_ONE), (14, QUEUED_TWO)] {
+        let q = wss_rpc(
+            &mut rpc,
+            id,
+            "agent.queueMessage",
+            json!({ "workspaceId": &ws_id, "agentId": &target_id, "content": content }),
+        )
+        .await;
+        assert_eq!(q["success"], true, "queue: {q}");
+    }
+    let queue = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getQueue",
+        json!({ "agentId": &target_id }),
+    )
+    .await;
+    assert_eq!(
+        queue["queue"].as_array().map(Vec::len),
+        Some(2),
+        "both entries parked behind the tool call: {queue}"
+    );
+
+    // The sibling relays an interrupt-priority send into the busy target.
+    let relayed = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &sender_id, "content": RELAY_MARKER }),
+    )
+    .await;
+    assert_eq!(relayed["success"], true, "sender kick-off ok: {relayed}");
+
+    // Wait for the sender's turn to end (its tool call completed → the
+    // relay result note exists), then read the send outcome. The target's
+    // preemption end may land during this wait, so it is tracked here too.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut sender_done = false;
+    let mut saw_preempt_end = false;
+    let mut target_complete_ends = 0usize;
+    let is_target_stream_end = |event: &Value| {
+        event["type"] == "agent:stream:end" && event["data"]["agentId"] == json!(target_id)
+    };
+    let is_target_preempt_end =
+        |event: &Value| event["data"]["interruptReason"] == "preempted_by_message";
+    while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
+        let event = &frame["params"]["event"];
+        if is_target_stream_end(event) {
+            if is_target_preempt_end(event) {
+                saw_preempt_end = true;
+            } else {
+                target_complete_ends += 1;
+            }
+        }
+        assert!(
+            !(event["type"] == "agent:idle" && event["data"]["agentId"] == json!(target_id)),
+            "the target must not go idle before the interrupt turn has run: {event}"
+        );
+        if event["type"] == "agent:stream:end" && event["data"]["agentId"] == json!(sender_id) {
+            sender_done = true;
+            break;
+        }
+    }
+    assert!(sender_done, "the sibling's relay turn completed");
+    let listed = wss_rpc(&mut rpc, 17, "note.list", json!({ "workspaceId": &ws_id })).await;
+    let relay_note_id = listed["notes"]
+        .as_array()
+        .expect("notes array")
+        .iter()
+        .find(|n| n["title"] == RELAY_RESULT_NOTE)
+        .unwrap_or_else(|| panic!("relay result note: {listed}"))["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    let got = wss_rpc(
+        &mut rpc,
+        18,
+        "note.get",
+        json!({ "workspaceId": &ws_id, "noteId": relay_note_id }),
+    )
+    .await;
+    let relay_result: Value =
+        serde_json::from_str(got["note"]["content"].as_str().expect("note content"))
+            .expect("relay result JSON");
+    assert_eq!(
+        relay_result["success"], true,
+        "sibling send ok: {relay_result}"
+    );
+    assert_ne!(
+        relay_result["queued"],
+        json!(true),
+        "the interrupt preempted the in-flight tool call, it was not parked: {relay_result}"
+    );
+
+    // Release the spinning tool call (the aborted original AND the combined
+    // redelivery both exit their poll now).
+    let released = wss_rpc(
+        &mut rpc,
+        19,
+        "note.create",
+        json!({ "workspaceId": &ws_id, "title": RELEASE_NOTE, "content": "go" }),
+    )
+    .await;
+    assert!(
+        released["note"]["id"].is_string(),
+        "release note: {released}"
+    );
+
+    // Settlement: the target drains its queue and goes idle.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut saw_settle_idle = false;
+    while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
+        let event = &frame["params"]["event"];
+        if is_target_stream_end(event) {
+            if is_target_preempt_end(event) {
+                saw_preempt_end = true;
+            } else {
+                target_complete_ends += 1;
+            }
+        }
+        if event["type"] == "agent:idle" && event["data"]["agentId"] == json!(target_id) {
+            assert_ne!(
+                event["data"]["reason"], "interrupted",
+                "a preemption is not a settlement — no synthetic interrupted idle: {event}"
+            );
+            saw_settle_idle = true;
+            break;
+        }
+    }
+    assert!(
+        saw_preempt_end,
+        "the in-flight tool-call turn ended with interruptReason=preempted_by_message"
+    );
+    assert!(
+        target_complete_ends >= 2,
+        "the interrupt turn and at least one drained turn completed: {target_complete_ends}"
+    );
+    assert!(
+        saw_settle_idle,
+        "the target settled (agent:idle) after the A2A interrupt"
+    );
+    let listed = wss_rpc(&mut rpc, 23, "note.list", json!({ "workspaceId": &ws_id })).await;
+    assert!(
+        !listed["notes"]
+            .as_array()
+            .expect("notes array")
+            .iter()
+            .any(|n| n["title"] == EXHAUSTED_NOTE),
+        "the spinning tool call exited via the release, not poll exhaustion: {listed}"
+    );
+    let queue = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.getQueue",
+        json!({ "agentId": &target_id }),
+    )
+    .await;
+    assert_eq!(
+        queue["queue"].as_array().map(Vec::len),
+        Some(0),
+        "queue drained after the A2A interrupt: {queue}"
+    );
+    let got = wss_rpc(&mut rpc, 21, "agent.get", json!({ "agentId": &target_id })).await;
+    assert_eq!(
+        got["agent"]["status"], "idle",
+        "target settled to idle, not stuck responding: {got}"
+    );
+
+    let conv = wss_rpc(
+        &mut rpc,
+        22,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &target_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let user_idx = |needle: &str| {
+        messages.iter().position(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|b| {
+                        b["type"] == "text"
+                            && b["text"].as_str().is_some_and(|t| t.contains(needle))
+                    })
+        })
+    };
+    let urgent_idx = user_idx(URGENT).expect("interrupt user row");
+    let one_idx = user_idx(QUEUED_ONE).expect("queued one delivered");
+    let two_idx = user_idx(QUEUED_TWO).expect("queued two delivered");
+    assert!(
+        urgent_idx < one_idx && one_idx < two_idx,
+        "the interrupt row lands ahead of both parked entries: urgent={urgent_idx} one={one_idx} two={two_idx}"
+    );
+    let marker = messages
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["metadata"]["interrupted"] == true)
+        .expect("interrupted marker row for the preempted tool-call turn");
+    assert_eq!(
+        marker["metadata"]["interruptReason"], "preempted_by_message",
+        "{marker}"
+    );
+    assert_eq!(
+        marker["metadata"]["interruptedBy"]["agentId"],
+        json!(sender_id),
+        "the marker attributes the preemption to the sibling: {marker}"
+    );
+}
+
 /// STAB-133 regression: `agent.sendMessage` with `imageBlocks` / `fileBlocks`
 /// on the runtime manager path must persist the attachments into the user's
 /// transcript row (after the text block) so `agent.getConversation` — the
@@ -12617,6 +13576,10 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
         .expect("image block persisted on the user row");
     assert_eq!(image["data"], image_data);
     assert_eq!(image["mimeType"], "image/png");
+    // v10.7 image dimension sidecar: the write path stamps the intrinsic
+    // pixel dimensions of the (1x1) PNG onto the persisted block.
+    assert_eq!(image["width"], 1, "{image}");
+    assert_eq!(image["height"], 1, "{image}");
     let file = blocks
         .iter()
         .find(|b| b["type"] == "file")
@@ -15204,6 +16167,235 @@ async fn usage_update_cost_captured_over_wss() {
         row["contextUsage"]["used"], 61_000,
         "agent.list carries the same overlay: {listed}"
     );
+}
+
+/// Observe Codex's real child argv, including after an idle child is lost.
+/// Drive the selected npx package even when an explicit custom adapter and
+/// a PATH adapter are present. The fake npx captures the actual launch argv.
+async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(script) = gate("WSS Codex selected npx subagent policy E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path();
+    let ws_id = seed_workspace_only(data_dir).await;
+    let toolchain = common::codex_npx::install(data_dir, &script);
+    let wrapper = data_dir.join("fake-codex-acp");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nexec \"$MOCK_AGENT_NODE\" \"$MOCK_AGENT_SCRIPT_PATH\" \"$@\"\n",
+    )
+    .expect("write Codex wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod Codex wrapper");
+    // A genuine native executable and a JS adapter must both lose to the
+    // selected package. The explicit custom path must also be ignored.
+    let installed = data_dir.join("codex-toolchain/codex-acp");
+    if advertise_load {
+        std::fs::write(&installed, "#!/usr/bin/env node\nprocess.exit(91);\n")
+            .expect("write installed JS adapter");
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod installed JS adapter");
+    } else {
+        std::os::unix::fs::symlink("/bin/false", &installed).expect("install native tripwire");
+    }
+    std::fs::write(
+        data_dir.join("config.toml"),
+        format!("[providers.paths]\ncodex = {}\n", json!(wrapper)),
+    )
+    .expect("seed custom path that selected npx must ignore");
+    let session_log = data_dir.join("sessions.jsonl");
+    let behavior = json!({
+        "response": "Codex policy turn complete",
+        "advertiseLoadSession": advertise_load,
+    })
+    .to_string();
+    let mut env: Vec<(&str, &str)> = toolchain
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    env.extend([
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_LOG_CODEX_POLICY", "1"),
+        ("CODEX_PATH", "/must-not-be-used/codex"),
+        (
+            "CODEX_CONFIG",
+            r#"{"agents":{"enabled":true},"features":{"multi_agent_v2":true}}"#,
+        ),
+        (
+            "MOCK_AGENT_SESSION_LOG",
+            session_log.to_str().expect("log path"),
+        ),
+    ]);
+    let child = spawn_serve(data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("port fits u16");
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let subscribed = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string());
+    let mut rpc = connect_ws(port, cfg).await;
+    // Deliberately omit model and reasoningEffort: the launch policy must
+    // apply even when there are no model config overrides to assemble.
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Codex policy", "provider": "codex" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().expect("agent id");
+    assert!(
+        created["agent"]["model"].is_null(),
+        "no explicit model: {created}"
+    );
+
+    let mut first_pid = None;
+    for turn in 0..2 {
+        let sent = wss_rpc(
+            &mut rpc,
+            3 + turn,
+            "agent.sendMessage",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id,
+                "content": format!("Codex policy turn {turn}"),
+            }),
+        )
+        .await;
+        assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut ended = false;
+        let mut idle = false;
+        while !(ended && idle) {
+            let frame = wss_event_opt_until(&mut sub, deadline)
+                .await
+                .expect("Codex policy turn completed and became idle");
+            let event = &frame["params"]["event"];
+            if event["data"]["agentId"].as_str() != Some(agent_id) {
+                continue;
+            }
+            match event["type"].as_str() {
+                Some("agent:failed") => panic!("Codex policy turn failed: {event}"),
+                Some("agent:stream:end") => {
+                    assert_eq!(
+                        event["data"]["lastAgentResponse"], "Codex policy turn complete",
+                        "{event}"
+                    );
+                    ended = true;
+                }
+                Some("agent:status-changed") if event["data"]["status"] == "idle" => idle = true,
+                _ => {}
+            }
+        }
+
+        let entries: Vec<Value> = std::fs::read_to_string(&session_log)
+            .expect("read session log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("session log JSON"))
+            .collect();
+        assert_eq!(entries.len(), usize::try_from(turn + 1).unwrap());
+        let session = entries.last().expect("session log entry");
+        assert_eq!(
+            session["method"],
+            if turn > 0 && advertise_load {
+                "session/load"
+            } else {
+                "session/new"
+            },
+            "expected create/recreate or resume path: {entries:?}"
+        );
+        let argv: Vec<&str> = session["argv"]
+            .as_array()
+            .expect("fixture captured child argv")
+            .iter()
+            .map(|arg| arg.as_str().expect("argv string"))
+            .collect();
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("model=")),
+            "launch must exercise the no-model path: {argv:?}"
+        );
+        assert!(
+            argv.contains(&"-y"),
+            "npx must select the pinned package: {argv:?}"
+        );
+        assert_eq!(
+            argv.iter()
+                .filter(|arg| **arg == intent_providers::CODEX_ACP_NPX_PACKAGE)
+                .count(),
+            1,
+            "each launch must use the selected adapter exactly once: {argv:?}"
+        );
+        assert_eq!(
+            session["codexPolicy"],
+            json!({"config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}, "pathPresent": false}),
+            "daemon policy must replace enabling environment on every launch: {session}"
+        );
+        let pid = session["pid"].as_u64().expect("mock child pid");
+        if turn == 0 {
+            first_pid = Some(pid);
+            // As in the Codex session-title regression, wait for the daemon's
+            // exit watcher to reap the idle child before sending the next turn.
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid fits i32")),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .expect("kill idle mock child");
+            timeout(Duration::from_secs(15), async {
+                let mut interval = tokio::time::interval(Duration::from_millis(25));
+                loop {
+                    interval.tick().await;
+                    if tokio::fs::read_to_string(data_dir.join("daemon.log"))
+                        .await
+                        .expect("daemon log")
+                        .contains("idle agent child exited unexpectedly; handle reaped")
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("daemon reaped the idle mock child");
+        } else {
+            assert_ne!(
+                Some(pid),
+                first_pid,
+                "second turn must launch a fresh process"
+            );
+            if advertise_load {
+                assert_eq!(
+                    session["sessionId"], entries[0]["sessionId"],
+                    "resume original session"
+                );
+            }
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn codex_npx_subagent_policy_without_model_survives_recreate_over_wss() {
+    assert_codex_npx_subagent_policy_over_wss(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn codex_npx_subagent_policy_without_model_survives_resume_over_wss() {
+    assert_codex_npx_subagent_policy_over_wss(true).await;
 }
 
 /// Pin the `grok` provider binary to a wrapper around the mock ACP fixture
