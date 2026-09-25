@@ -1692,54 +1692,6 @@ jobs:
           path: pi-path-evidence
           if-no-files-found: error
 
-  # Temporary immutable comparison, after all old-pin runs have finished. This
-  # source build is NOT the production dependency and cannot make a red shipping
-  # pin green. Remove this comparison when adopting a validated official release.
-  pi-session-comparison:
-    needs: [pi-session-paths]
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node: [22, 24]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ matrix.node }}
-      - uses: actions/checkout@v7
-        with:
-          repository: svkozak/pi-acp
-          ref: c6a813f492fae7d3bfb41a7e8c977b63d5a6df19
-          path: .pi-acp-comparison
-          persist-credentials: false
-      - name: Build immutable comparison only
-        working-directory: .pi-acp-comparison
-        run: |
-          test "$(git rev-parse HEAD)" = c6a813f492fae7d3bfb41a7e8c977b63d5a6df19
-          npm ci --no-audit --no-fund
-          npm run build
-      - name: Test comparison with the same strict assertions
-        env:
-          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-comparison/dist/index.js
-          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
-        run: |
-          mkdir -p pi-path-evidence
-          git -C .pi-acp-comparison rev-parse HEAD > pi-path-evidence/source-sha.txt
-          node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs | tee pi-path-evidence/test.tap
-      - uses: actions/upload-artifact@v6
-        if: always()
-        with:
-          name: pi-session-comparison-${{ matrix.os }}-node${{ matrix.node }}
-          path: pi-path-evidence
-          if-no-files-found: error
-
   # Single required status check for branch protection: fans in check, build,
   # coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers,
   # deb-packaging, release-scripts, and install-ps1 (ported from cloudlands-fe's "CI Gate"
@@ -1785,7 +1737,7 @@ jobs:
     # would run the gate against all-skipped needs and report a spurious
     # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths, pi-session-comparison]
+    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -1793,7 +1745,6 @@ jobs:
              [ "${{ needs.deb-packaging.result }}" != "success" ] || \
              [ "${{ needs.release-scripts.result }}" != "success" ] || \
              [ "${{ needs.pi-session-paths.result }}" != "success" ] || \
-             [ "${{ needs.pi-session-comparison.result }}" != "success" ] || \
              [ "${{ needs.install-ps1.result }}" != "success" ]; then
             echo "One or more required jobs failed"
             exit 1

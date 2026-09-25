@@ -1,7 +1,7 @@
 // Run against an installed *actual* adapter, not a reimplementation of its spawn:
 // PI_ACP_TEST_ENTRY=/absolute/path/to/pi-acp/dist/index.js node --test <this file>
-// CI reads the shipping pin from intent-providers/src/config.rs. The source-build
-// comparison in CI is evidence only; it never substitutes for the required pin.
+// CI reads the shipping pin from intent-providers/src/config.rs and requires
+// every native Windows and Unix matrix case, including the cleanup audit.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
