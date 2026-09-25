@@ -476,7 +476,7 @@ pub fn find_auggie_candidates(explicit_path: Option<&str>) -> Vec<PathBuf> {
 /// [`find_auggie_candidates`] with `home` and the enhanced dirs injected
 /// (test seam — avoids mutating process-global `HOME`/`PATH` in parallel
 /// tests). Builds the ordered, de-duplicated candidate list; the precedence
-/// mirrors [`find_provider_binary_with_home_and_dirs`] for auggie exactly, so
+/// mirrors [`find_provider_binary_with_source_and_dirs`] for auggie exactly, so
 /// the first element always equals what `find_provider_binary` would return.
 fn find_auggie_candidates_with_home_and_dirs(
     explicit_path: Option<&str>,
@@ -537,7 +537,7 @@ fn find_provider_binary_with_home(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn find_provider_binary_with_home_and_dirs(
     provider_id: &str,
     command: &str,
