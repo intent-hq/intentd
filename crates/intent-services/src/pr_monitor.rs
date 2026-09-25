@@ -3241,6 +3241,10 @@ impl Services {
         let now = now_iso();
         let mut fresh = shared.materialize(previous.as_ref());
         fresh.observed_at = Some(now.clone());
+        // Older monitors may already have silently learned a passing name in
+        // the last poll only. Recover that evidence before learning this poll's
+        // values, which may have changed again in the meantime.
+        let last_observed = previous.clone();
 
         // Upgrade backfill: an anchor persisted before ejection tracking
         // existed has no event field at all, so the first tracked poll would
@@ -3272,19 +3276,45 @@ impl Services {
                 // known value in the emit anchor too, so a later real flip is
                 // reportable even if no unrelated wake advanced the anchor.
                 let mut known = s.known_required_checks();
-                let fresh_known = fresh.known_required_checks();
-                let fresh_by_name: HashMap<_, _> = fresh
-                    .requirements
-                    .checks
-                    .items
-                    .iter()
-                    .map(|c| (&c.name, c.required))
-                    .collect();
-                for check in &mut s.requirements.checks.items {
-                    if !known.contains(&check.name) && fresh_known.contains(&check.name) {
-                        if let Some(&required) = fresh_by_name.get(&check.name) {
-                            check.required = required;
-                            known.insert(check.name.clone());
+                for observed in last_observed
+                    .as_ref()
+                    .filter(|p| p.head_sha == fresh.head_sha)
+                    .into_iter()
+                    .chain(std::iter::once(&fresh))
+                {
+                    let observed_known = observed.known_required_checks();
+                    // A check first seen passing is silent too. Retain it even
+                    // while its flag is unknown. Copy only missing passing
+                    // names, keeping failures/removals pending for delivery.
+                    let names: HashSet<_> = s
+                        .requirements
+                        .checks
+                        .items
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    s.requirements.checks.items.extend(
+                        observed
+                            .requirements
+                            .checks
+                            .items
+                            .iter()
+                            .filter(|c| c.status == "passed" && !names.contains(&c.name))
+                            .cloned(),
+                    );
+                    let by_name: HashMap<_, _> = observed
+                        .requirements
+                        .checks
+                        .items
+                        .iter()
+                        .map(|c| (&c.name, c.required))
+                        .collect();
+                    for check in &mut s.requirements.checks.items {
+                        if !known.contains(&check.name) && observed_known.contains(&check.name) {
+                            if let Some(&required) = by_name.get(&check.name) {
+                                check.required = required;
+                                known.insert(check.name.clone());
+                            }
                         }
                     }
                 }

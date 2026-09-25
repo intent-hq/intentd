@@ -586,6 +586,268 @@ async fn required_flip_after_rest_check(name: &str, was_known: bool) {
         .any(|c| c.contains("required to merge")));
 }
 
+#[tokio::test]
+async fn qwen_silent_passing_discovery_reports_later_required_flip_once() {
+    silent_passing_discovery_required_flip(false).await;
+}
+
+#[tokio::test]
+async fn qwen_silent_discovery_repairs_missing_emitted_evidence_from_last_poll() {
+    silent_passing_discovery_required_flip(true).await;
+}
+
+async fn silent_passing_discovery_required_flip(missing_emitted_evidence: bool) {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Standalone;
+        s.pr["updatedAt"] = json!("");
+        s.pr["mergeStateStatus"] = json!(null);
+    });
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    assert_quiet(&svc, &monitor, &owner).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        s.nodes
+            .push(json!({"__typename":"CheckRun", "name":"fresh-green",
+            "status":"COMPLETED", "conclusion":"SUCCESS", "isRequired":false,
+            "startedAt":"2026-09-25T06:00:00Z"}));
+    });
+    full_poll(&svc, &mock).await;
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    assert_quiet(&svc, &monitor, &owner).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Standalone;
+        s.nodes.last_mut().unwrap()["isRequired"] = json!(true);
+    });
+    full_poll(&svc, &mock).await;
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    assert_quiet(&svc, &monitor, &owner).await;
+    let learned = row(&svc, &monitor).await;
+    if missing_emitted_evidence {
+        // A monitor persisted before this repair can already know the flag in
+        // its last poll while the emitted anchor still lacks the passing name.
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                intent_store::PrMonitorPollUpdate {
+                    last_snapshot: learned.last_snapshot.as_deref(),
+                    baseline_snapshot: monitor.baseline_snapshot.as_deref(),
+                    pending_changes: &[],
+                    pending_since: None,
+                    last_change_at: None,
+                    last_polled_at: learned.last_polled_at.as_deref(),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &learned.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+    }
+    mock.edit(|s| s.nodes.last_mut().unwrap()["isRequired"] = json!(false));
+    full_poll(&svc, &mock).await;
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    let delivered = owner_messages(&svc, &owner).await;
+    assert_eq!(
+        delivered
+            .matches("check fresh-green is no longer required to merge")
+            .count(),
+        1,
+        "R5: no earlier wake may populate the comparison baseline: {delivered}"
+    );
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&owner)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    for saved in [learned.last_snapshot, learned.baseline_snapshot] {
+        let snapshot: PrMonitorSnapshot = serde_json::from_str(saved.as_deref().unwrap()).unwrap();
+        let check = snapshot
+            .requirements
+            .checks
+            .items
+            .iter()
+            .find(|c| c.name == "fresh-green")
+            .expect("persist silent discovery in both anchors");
+        assert_eq!(check.status, "passed");
+        assert!(check.required);
+        assert!(snapshot.known_required_checks().contains("fresh-green"));
+    }
+    for mode in [ReadMode::Rest, ReadMode::Standalone] {
+        mock.edit(|s| s.mode = mode);
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        let current = row(&svc, &monitor).await;
+        assert!(current.pending_changes.is_empty());
+        assert!(current.last_change_at.is_none());
+        assert_eq!(owner_messages(&svc, &owner).await, delivered);
+    }
+}
+
+#[tokio::test]
+async fn qwen_silent_discovery_and_learning_preserve_mixed_pending_changes() {
+    silent_discovery_with_pending_changes("passed").await;
+}
+
+#[tokio::test]
+async fn qwen_silent_discovery_failure_before_learning_preserves_pending_changes() {
+    silent_discovery_with_pending_changes("failed").await;
+}
+
+#[tokio::test]
+async fn qwen_silent_discovery_removal_before_learning_preserves_pending_changes() {
+    silent_discovery_with_pending_changes("removed").await;
+}
+
+async fn silent_discovery_with_pending_changes(outcome: &str) {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Standalone;
+        s.pr["updatedAt"] = json!("");
+        s.pr["mergeStateStatus"] = json!(null);
+        s.nodes
+            .push(json!({"__typename":"CheckRun", "name":"removed-old",
+            "status":"COMPLETED", "conclusion":"SUCCESS", "isRequired":false,
+            "startedAt":"2026-09-25T06:00:00Z"}));
+    });
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        s.nodes.retain(|n| n["name"] != "removed-old");
+        for (name, conclusion) in [("route", "FAILURE"), ("fresh-green", "SUCCESS")] {
+            s.nodes.push(json!({"__typename":"CheckRun", "name":name,
+                "status":"COMPLETED", "conclusion":conclusion, "isRequired":false,
+                "startedAt":"2026-09-25T06:00:00Z"}));
+        }
+    });
+    full_poll(&svc, &mock).await;
+    let discovered = row(&svc, &monitor).await;
+    let mut expected = vec!["check route: passed → failed", "check removed: removed-old"];
+    assert_eq!(discovered.pending_changes, expected);
+    let emitted: PrMonitorSnapshot =
+        serde_json::from_str(discovered.baseline_snapshot.as_deref().unwrap()).unwrap();
+    let green = emitted
+        .requirements
+        .checks
+        .items
+        .iter()
+        .find(|c| c.name == "fresh-green")
+        .unwrap();
+    assert_eq!(green.status, "passed");
+    assert!(!emitted.known_required_checks().contains("fresh-green"));
+
+    // The newly discovered name can change again before a complete read learns
+    // its flag. That must not erase its original passing comparison evidence.
+    mock.edit(|s| match outcome {
+        "failed" => s.nodes.last_mut().unwrap()["conclusion"] = json!("FAILURE"),
+        "removed" => s.nodes.retain(|n| n["name"] != "fresh-green"),
+        _ => {}
+    });
+    full_poll(&svc, &mock).await;
+    match outcome {
+        "failed" => expected.push("check fresh-green: passed → failed"),
+        "removed" => expected.push("check removed: fresh-green"),
+        _ => {}
+    }
+    let pending = row(&svc, &monitor).await;
+    for change in &expected {
+        assert!(
+            pending.pending_changes.iter().any(|c| c == change),
+            "{pending:?}"
+        );
+    }
+    mock.edit(|s| {
+        s.mode = ReadMode::Standalone;
+        s.pr["mergeStateStatus"] = json!("BEHIND");
+        for run in s.nodes.iter_mut().filter(|n| n["name"] == "fresh-green") {
+            run["isRequired"] = json!(true);
+        }
+    });
+    full_poll(&svc, &mock).await;
+    let learned = row(&svc, &monitor).await;
+    for change in &expected {
+        assert!(
+            learned.pending_changes.iter().any(|c| c == change),
+            "{learned:?}"
+        );
+    }
+    assert!(learned
+        .pending_changes
+        .iter()
+        .any(|c| c == "branch is now behind its base"));
+    assert!(!learned
+        .pending_changes
+        .iter()
+        .any(|c| c.contains("required to merge")));
+    assert_eq!(learned.pending_since, discovered.pending_since);
+    assert!(!owner_messages(&svc, &owner)
+        .await
+        .contains("pr_monitor_wake"));
+
+    // A second silent discovery must leave the full coalesced set (including
+    // non-check changes) untouched, even as a now-known flag really changes.
+    mock.edit(|s| {
+        for run in s.nodes.iter_mut().filter(|n| n["name"] == "fresh-green") {
+            run["isRequired"] = json!(false);
+        }
+        s.nodes
+            .push(json!({"__typename":"CheckRun", "name":"later-green",
+            "status":"COMPLETED", "conclusion":"SUCCESS", "isRequired":true,
+            "startedAt":"2026-09-25T06:01:00Z"}));
+    });
+    full_poll(&svc, &mock).await;
+    let pending = row(&svc, &monitor).await;
+    let mut expected = learned.pending_changes;
+    if outcome != "removed" {
+        expected.push("check fresh-green is no longer required to merge".into());
+    }
+    expected.sort();
+    let mut actual = pending.pending_changes.clone();
+    actual.sort();
+    assert_eq!(actual, expected);
+    assert_eq!(pending.pending_since, discovered.pending_since);
+    assert!(!owner_messages(&svc, &owner)
+        .await
+        .contains("pr_monitor_wake"));
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    let delivered = owner_messages(&svc, &owner).await;
+    for change in expected {
+        assert_eq!(delivered.matches(&change).count(), 1, "{delivered}");
+    }
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&owner)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    for _ in 0..2 {
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+        assert_eq!(owner_messages(&svc, &owner).await, delivered);
+    }
+}
+
 #[test]
 fn qwen_old_legacy_subset_stays_fixed_through_new_runs_and_head_changes() {
     let original = snapshot(|s| {

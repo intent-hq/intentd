@@ -3104,6 +3104,94 @@ async fn poll_qwen_after_debounce(fx: &Fixture, monitor: &intent_core::PrMonitor
 }
 
 #[intent_test_macros::daemon_test]
+async fn qwen_silent_passing_discovery_reports_required_flip_once_over_wss() {
+    let mock = qwen::MockQwen::start(11506).await;
+    mock.edit(|s| {
+        s.mode = qwen::ReadMode::Standalone;
+        s.pr["updatedAt"] = json!("");
+        s.pr["mergeStateStatus"] = json!(null);
+    });
+    let fx = boot_with_source_control(Some(mock.sc.clone())).await;
+    let (monitor, _) = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"workspaceId":fx.ws_id, "eventTypes":["prMonitor:changed"]}),
+    )
+    .await;
+    for stage in 0..2 {
+        mock.edit(|s| {
+            if stage == 0 {
+                s.mode = qwen::ReadMode::Rest;
+                s.nodes
+                    .push(json!({"__typename":"CheckRun", "name":"fresh-green",
+                    "status":"COMPLETED", "conclusion":"SUCCESS", "isRequired":false,
+                    "startedAt":"2026-09-25T06:00:00Z"}));
+            } else {
+                s.mode = qwen::ReadMode::Standalone;
+                s.nodes.last_mut().unwrap()["isRequired"] = json!(true);
+            }
+        });
+        fx.services.poll_pr_monitors().await;
+        poll_qwen_after_debounce(&fx, &monitor).await;
+        assert!(!owner_messages(&fx).await.contains("pr_monitor_wake"));
+        assert_no_event(&mut sub, "prMonitor:changed").await;
+    }
+    mock.edit(|s| s.nodes.last_mut().unwrap()["isRequired"] = json!(false));
+    fx.services.poll_pr_monitors().await;
+    let transition = "check fresh-green is no longer required to merge";
+    let event = next_event(&mut sub, "prMonitor:changed").await;
+    assert_eq!(event["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(event["data"]["changes"], json!([transition]));
+    poll_qwen_after_debounce(&fx, &monitor).await;
+    let delivered = owner_messages(&fx).await;
+    assert_eq!(delivered.matches(transition).count(), 1, "{delivered}");
+    assert_eq!(
+        fx.services
+            .store()
+            .get_agent_session(&fx.agent_id)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    for mode in [qwen::ReadMode::Rest, qwen::ReadMode::Standalone] {
+        mock.edit(|s| s.mode = mode);
+        poll_qwen_after_debounce(&fx, &monitor).await;
+        let listed = wss_call(
+            &mut rpc,
+            2,
+            "prMonitor.list",
+            json!({"workspaceId":fx.ws_id}),
+        )
+        .await;
+        assert_eq!(listed["jsonrpc"], "2.0");
+        assert_eq!(listed["id"], 2);
+        assert!(listed.get("error").is_none(), "{listed}");
+        let row = &listed["result"]["monitors"][0];
+        assert_eq!(row["pendingChanges"], json!([]));
+        for private in [
+            "checksUnobserved",
+            "checksSeedPending",
+            "statusChecks",
+            "requiredCheckNames",
+        ] {
+            assert!(row["lastSnapshot"].get(private).is_none());
+        }
+        assert_eq!(owner_messages(&fx).await, delivered);
+    }
+    mock.assert_check_queries();
+}
+
+#[intent_test_macros::daemon_test]
 async fn qwen_old_snapshot_recovery_and_known_required_flip_over_wss() {
     let mock = qwen::MockQwen::start(11506).await;
     mock.edit(|s| {
