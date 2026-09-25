@@ -1627,6 +1627,8 @@ jobs:
         run: ./scripts/test-aggregate-channel-notes.sh
       - name: Test notify-fixed-issues.sh
         run: ./scripts/test-notify-fixed-issues.sh
+      - name: Test publish-channel-manifest.sh
+        run: ./scripts/test-publish-channel-manifest.sh
       - name: Test ci-lld-retry.sh
         run: ./scripts/test-ci-lld-retry.sh
       - name: Test ci-target-slot.sh
