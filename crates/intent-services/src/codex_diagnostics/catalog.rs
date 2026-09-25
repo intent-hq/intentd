@@ -22,6 +22,7 @@ pub enum CatalogFailure {
     RuntimeUnverified,
     AuthenticationUnavailable,
     UnsupportedCapability,
+    UnsupportedPlatform,
     IsolationFailed,
     SpawnFailed,
     TimedOut,
@@ -42,6 +43,7 @@ impl CatalogFailure {
             Self::RuntimeUnverified => "selected adapter's runtime could not be verified",
             Self::AuthenticationUnavailable => "authentication is unavailable for this probe",
             Self::UnsupportedCapability => "provider does not support this diagnostic conversation",
+            Self::UnsupportedPlatform => UnknownReason::UnsupportedPlatform.message(),
             Self::IsolationFailed | Self::FileMissing => {
                 "isolated diagnostic state could not be prepared"
             }
@@ -67,6 +69,7 @@ impl From<UnknownReason> for CatalogFailure {
             UnknownReason::CleanupFailed => Self::CleanupFailed,
             UnknownReason::TimedOut => Self::TimedOut,
             UnknownReason::OutputLimit => Self::OutputLimit,
+            UnknownReason::UnsupportedPlatform => Self::UnsupportedPlatform,
             _ => Self::SpawnFailed,
         }
     }
@@ -217,6 +220,11 @@ impl CodexLaunch {
     /// and process cleanup have their own deadlines. No prompt/login is sent.
     /// Discovery should already have run off the async executor.
     pub async fn fresh_catalogs(&self) -> CodexCatalogReport {
+        // Capability rejection precedes reading authentication, npm startup,
+        // and temporary-state creation. Unsupported is not an auth failure.
+        if let Err(reason) = super::process::ensure_supported() {
+            return self.unsupported_catalogs(reason).await;
+        }
         let auth = tokio::time::timeout(PHASE_TIMEOUT, Authentication::capture(self))
             .await
             .unwrap_or(Err(CatalogFailure::TimedOut));
@@ -228,6 +236,9 @@ impl CodexLaunch {
         auth: Result<Authentication, CatalogFailure>,
         limits: Limits,
     ) -> CodexCatalogReport {
+        if let Err(reason) = super::process::ensure_supported() {
+            return self.unsupported_catalogs(reason).await;
+        }
         let mut inspection = self.inspect_local().await;
         let mut auth = match auth {
             Ok(auth) => auth,
@@ -344,10 +355,19 @@ impl CodexLaunch {
         finish(inspection, acp, raw, &auth)
     }
 
+    async fn unsupported_catalogs(&self, reason: UnknownReason) -> CodexCatalogReport {
+        CodexCatalogReport {
+            runtime: self.inspect_local().await.report,
+            acp: CatalogOutcome::Failed(reason.into()),
+            raw: CatalogOutcome::Failed(reason.into()),
+        }
+    }
+
     async fn start_acp(
         &self,
         auth: &Authentication,
     ) -> Result<(ProbeProcess, std::path::PathBuf), CatalogFailure> {
+        super::process::ensure_supported()?;
         let home = auth.home().await?;
         let path = home.path().to_owned();
         let mut command = intent_acp::spawn::build_command(&self.spawn_options());
@@ -386,6 +406,7 @@ impl CodexLaunch {
         limits: Limits,
         dependency: Option<ProbeDependency>,
     ) -> Result<Catalog, CatalogFailure> {
+        super::process::ensure_supported()?;
         let deadline = tokio::time::Instant::now() + limits.timeout;
         let home = tokio::time::timeout_at(deadline, auth.home())
             .await

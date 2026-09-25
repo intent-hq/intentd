@@ -19,14 +19,22 @@ pub async fn report(settings: SettingsFile, live: bool) {
         return;
     };
     if live {
-        println!("  [--] codex fresh catalogs: checking (may download the managed npm package)");
+        if !cfg!(target_os = "macos") {
+            println!(
+                "  [--] codex fresh catalogs: checking (may download the managed npm package)"
+            );
+        }
         let report = launch.fresh_catalogs().await;
         print!("{}", render_runtime(&report.runtime));
         print!("{}", render_catalogs(&report));
     } else {
         let inspection = launch.inspect_local().await;
         print!("{}", render_runtime(&inspection.report));
-        println!("    Fresh catalogs not requested; use intentd doctor --codex-models (may download the managed package).");
+        if cfg!(target_os = "macos") {
+            println!("    macOS diagnostics inspect selection and local package metadata only; version and fresh catalog probes are unsupported.");
+        } else {
+            println!("    Fresh catalogs not requested; use intentd doctor --codex-models (may download the managed package).");
+        }
     }
 }
 
@@ -56,6 +64,13 @@ fn render_runtime(report: &CodexRuntimeReport) -> String {
     }
     if let Some(path) = &report.adapter_path {
         writeln!(text, "    adapter path: {path}").unwrap();
+    }
+    if let Some(version) = &report.adapter_package_version {
+        writeln!(
+            text,
+            "    adapter package version (metadata, not measured): {version}"
+        )
+        .unwrap();
     }
     render_version(&mut text, "adapter", &report.adapter_version);
     let runtime_source = match report.runtime_source {
@@ -136,6 +151,11 @@ fn render_catalogs(report: &CodexCatalogReport) -> String {
     }
     if ids.is_empty() {
         text.push_str("    No model IDs available to compare.\n");
+        if matches!(&report.acp, CatalogOutcome::Failed(_))
+            || matches!(&report.raw, CatalogOutcome::Failed(_))
+        {
+            text.push_str("    Catalog comparison is inconclusive.\n");
+        }
     } else {
         text.push_str("    Exact model ID/alias comparison:\n");
         for id in ids {
@@ -160,6 +180,7 @@ mod tests {
             configured_package: "@agentclientprotocol/codex-acp@1.13.1",
             removes_codex_overrides: true,
             adapter_path: None,
+            adapter_package_version: None,
             adapter_version: VersionMeasurement::Unknown(UnknownReason::ManagedPackageNotInspected),
             runtime_source: RuntimeSource::Unknown,
             runtime_path: None,
@@ -174,6 +195,32 @@ mod tests {
         assert!(text.contains("adapter version: unknown"));
         assert!(text.contains("runtime version: unknown"));
         assert!(!text.contains("[ok] measured"));
+    }
+
+    #[test]
+    fn macos_metadata_and_unsupported_catalogs_remain_unmeasured_and_inconclusive() {
+        let mut runtime = runtime();
+        runtime.adapter_package_version = Some("2.4.6".into());
+        runtime.adapter_version = VersionMeasurement::Unknown(UnknownReason::UnsupportedPlatform);
+        runtime.runtime_version = runtime.adapter_version.clone();
+        let text = render_runtime(&runtime);
+        assert!(text.contains("adapter package version (metadata, not measured): 2.4.6"));
+        assert!(text.contains("process probes are unsupported on macOS"));
+        assert!(!text.contains("[ok] measured"));
+        let report = CodexCatalogReport {
+            runtime,
+            acp: CatalogOutcome::Failed(CatalogFailure::UnsupportedPlatform),
+            raw: CatalogOutcome::Failed(CatalogFailure::UnsupportedPlatform),
+        };
+        let text = render_catalogs(&report);
+        assert_eq!(
+            text.matches("catalog: unavailable (process probes are unsupported on macOS")
+                .count(),
+            2
+        );
+        assert!(text.contains("Catalog comparison is inconclusive."));
+        assert!(!text.contains("catalog: advertised"));
+        assert!(!text.contains("authentication is unavailable"));
     }
 
     #[test]

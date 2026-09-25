@@ -12,15 +12,27 @@ mod resources;
 pub(crate) use resources::ProbeDependency;
 use resources::ProbeHome;
 
-#[cfg(all(test, unix))]
+// The read-only implementation is also built and tested on other hosts. Only
+// macOS selects its uninhabited process owner; Linux/Windows keep real owners.
+mod macos;
+pub(super) use macos::inspect_metadata;
+
+pub(super) fn ensure_supported() -> Result<(), UnknownReason> {
+    if cfg!(target_os = "macos") {
+        Err(UnknownReason::UnsupportedPlatform)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 pub(super) mod test_control;
 
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
 mod platform;
 #[cfg(target_os = "macos")]
-#[path = "macos.rs"]
-mod platform;
+use macos as platform;
 #[cfg(windows)]
 #[path = "windows.rs"]
 mod platform;
@@ -41,7 +53,7 @@ pub(crate) struct ProbeProcess {
     dependency: Option<ProbeHome>,
     cleanup_task: Option<tokio::task::JoinHandle<Result<(), UnknownReason>>>,
     cleanup_result: Option<Result<(), UnknownReason>>,
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, target_os = "linux"))]
     cleanup_hook: Option<test_control::CleanupHook>,
 }
 
@@ -62,7 +74,10 @@ impl ProbeProcess {
         home: tempfile::TempDir,
         dependency: Option<ProbeDependency>,
     ) -> Result<Self, UnknownReason> {
-        #[cfg(all(test, unix))]
+        // Reject before acquiring a lease: no child can use these directories,
+        // so an unsupported probe must not retain them as unconfirmed cleanup.
+        ensure_supported()?;
+        #[cfg(all(test, target_os = "linux"))]
         let cleanup_hook = test_control::capture(&command, home.path());
         // On cancellation during platform startup, keep the directory until
         // ownership can confirm cleanup instead of dropping it prematurely.
@@ -83,7 +98,7 @@ impl ProbeProcess {
                 dependency,
                 cleanup_task: None,
                 cleanup_result: None,
-                #[cfg(all(test, unix))]
+                #[cfg(all(test, target_os = "linux"))]
                 cleanup_hook,
             })
         } else {
@@ -135,18 +150,18 @@ impl ProbeProcess {
         let ownership = self.ownership.take().ok_or(UnknownReason::CleanupFailed)?;
         let home = self.home.take();
         let dependency = self.dependency.take();
-        #[cfg(all(test, unix))]
+        #[cfg(all(test, target_os = "linux"))]
         let hook = self.cleanup_hook.take();
         drop(self.stdin.take());
         drop(self.stdout.take());
         drop(self.stderr.take());
         self.cleanup_task = Some(handle.spawn(async move {
-            #[cfg(all(test, unix))]
+            #[cfg(all(test, target_os = "linux"))]
             if let Some(hook) = &hook {
                 hook.before().await;
             }
             let cleaned = tokio::time::timeout(Duration::from_secs(5), ownership.cleanup()).await;
-            #[cfg(all(test, unix))]
+            #[cfg(all(test, target_os = "linux"))]
             let cleaned = if hook.as_ref().is_some_and(test_control::CleanupHook::fail) {
                 Ok(Err(std::io::Error::other(
                     "test cleanup confirmation unavailable",
@@ -164,7 +179,7 @@ impl ProbeProcess {
                 }
                 _ => Err(UnknownReason::CleanupFailed),
             };
-            #[cfg(all(test, unix))]
+            #[cfg(all(test, target_os = "linux"))]
             if let Some(hook) = &hook {
                 hook.after();
             }

@@ -118,6 +118,10 @@ enum Command {
         /// budgets. Missing models and partial failures remain advisory; catalog
         /// membership does not verify account entitlement. Without this flag,
         /// Codex checks only local provenance/versions and never resolves npm.
+        /// On macOS, only launch selection and local package metadata are
+        /// inspected: version and catalog process probes are unsupported,
+        /// because descendant cleanup cannot be guaranteed. No npm resolution
+        /// or diagnostic authentication capture occurs on macOS.
         #[arg(long)]
         codex_models: bool,
     },

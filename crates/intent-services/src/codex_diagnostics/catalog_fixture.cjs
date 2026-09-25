@@ -16,7 +16,7 @@ if (seed.includes('mcp_servers')) {
   fs.writeFileSync(path.join(fixture, 'mcp-launched'), 'bad');
   failure();
 }
-const isolation = {cwd:process.cwd()===home,home:process.env.HOME===home,
+const isolation = {cwd:fs.realpathSync(process.cwd())===fs.realpathSync(home),home:process.env.HOME===home,
   profile:process.env.USERPROFILE===home,xdg:process.env.XDG_CONFIG_HOME===home,
   config:!process.env.CODEX_CONFIG,
   preload:!process.env.NODE_OPTIONS?.includes('intentd-inherited-preload-canary'),

@@ -28,6 +28,8 @@ pub(super) struct Authentication {
 
 impl Authentication {
     pub async fn capture(launch: &CodexLaunch) -> Result<Self, CatalogFailure> {
+        // Also protect this boundary if a future caller bypasses fresh_catalogs.
+        super::process::ensure_supported()?;
         let command = intent_acp::spawn::build_command(&launch.spawn_options());
         let non_empty = |name| super::effective_env(&command, name).filter(|s| !s.is_empty());
         let source = non_empty("CODEX_HOME").map(PathBuf::from).or_else(|| {

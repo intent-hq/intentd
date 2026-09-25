@@ -48,7 +48,72 @@ fn malformed_empty_and_absent_catalogs_are_distinct() {
     );
 }
 
-#[cfg(unix)]
+#[tokio::test]
+async fn command_isolation_replaces_inherited_configuration_and_preloads() {
+    let root = crate::test_support::test_tempdir("codex-command-isolation");
+    let launch = CodexLaunch {
+        selection: ProviderLaunch::Managed {
+            npx: root.path().join("npx"),
+            package: intent_providers::config::CODEX_ACP_NPX_PACKAGE,
+        },
+        path: root.path().as_os_str().to_owned(),
+        codex_path: None,
+    };
+    let auth = Authentication::read(None, vec![("OPENAI_API_KEY", "sk-fixture-key".into())])
+        .await
+        .unwrap();
+    let home = auth.home().await.unwrap();
+    let mut command = Command::new(root.path().join("adapter"));
+    for key in [
+        "NODE_OPTIONS",
+        "CODEX_CONFIG",
+        "CODEX_PATH",
+        "npm_config_workspace",
+        "UNRELATED_SECRET",
+    ] {
+        command.env(key, "intentd-inherited-preload-canary");
+    }
+    auth.isolate(&mut command, &launch, home.path());
+    let keys: Vec<_> = command
+        .as_std()
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|_| key))
+        .collect();
+    for key in [
+        "NODE_OPTIONS",
+        "CODEX_CONFIG",
+        "CODEX_PATH",
+        "npm_config_workspace",
+        "UNRELATED_SECRET",
+    ] {
+        assert!(!keys.contains(&std::ffi::OsStr::new(key)));
+    }
+    assert!(keys.contains(&std::ffi::OsStr::new("OPENAI_API_KEY")));
+    assert_eq!(command.as_std().get_current_dir(), Some(home.path()));
+}
+
+#[tokio::test]
+async fn invalid_auth_material_is_not_silently_a_logged_out_probe() {
+    let root = crate::test_support::test_tempdir("codex-catalog-auth");
+    for text in [
+        "not json".to_owned(),
+        "null".to_owned(),
+        "x".repeat(catalog_io::FILE_LIMIT + 1),
+    ] {
+        std::fs::write(root.path().join("auth.json"), text).unwrap();
+        assert!(matches!(
+            Authentication::read(Some(root.path()), vec![]).await,
+            Err(CatalogFailure::AuthenticationUnavailable)
+        ));
+    }
+    let auth = Authentication::read(None, vec![]).await.unwrap();
+    let home = auth.home().await.unwrap();
+    assert!(!home.path().join("auth.json").exists());
+}
+
+// These fixtures execute providers and assert descendant cleanup. macOS has
+// separate read-only and pre-execution rejection tests; portable checks stay above.
+#[cfg(target_os = "linux")]
 mod unix {
     use super::super::super::process::test_control::{self, Control, Stage};
     use super::super::super::{LaunchSource, RuntimeSource, VersionMeasurement};
@@ -233,40 +298,6 @@ child.on('exit',code=>process.exit(code||0));
             panic!("expected successful catalog, got {outcome:?}")
         };
         catalog
-    }
-
-    #[tokio::test]
-    async fn command_isolation_replaces_inherited_configuration_and_preloads() {
-        let fixture = Fixture::new(&json!({}));
-        let auth = fixture.auth().await;
-        let home = auth.home().await.unwrap();
-        let mut command = Command::new(&fixture.adapter);
-        for key in [
-            "NODE_OPTIONS",
-            "CODEX_CONFIG",
-            "CODEX_PATH",
-            "npm_config_workspace",
-            "UNRELATED_SECRET",
-        ] {
-            command.env(key, "intentd-inherited-preload-canary");
-        }
-        auth.isolate(&mut command, &fixture.launch(true), home.path());
-        let keys: Vec<_> = command
-            .as_std()
-            .get_envs()
-            .filter_map(|(key, value)| value.map(|_| key))
-            .collect();
-        for key in [
-            "NODE_OPTIONS",
-            "CODEX_CONFIG",
-            "CODEX_PATH",
-            "npm_config_workspace",
-            "UNRELATED_SECRET",
-        ] {
-            assert!(!keys.contains(&std::ffi::OsStr::new(key)));
-        }
-        assert!(keys.contains(&std::ffi::OsStr::new("OPENAI_API_KEY")));
-        assert_eq!(command.as_std().get_current_dir(), Some(home.path()));
     }
 
     #[tokio::test]
@@ -812,24 +843,5 @@ child.on('exit',code=>process.exit(code||0));
             .unwrap();
         assert_eq!(boot["codexPath"], json!(custom.runtime));
         fixture.assert_clean();
-    }
-
-    #[tokio::test]
-    async fn invalid_auth_material_is_not_silently_a_logged_out_probe() {
-        let root = crate::test_support::test_tempdir("codex-catalog-auth");
-        for text in [
-            "not json".to_owned(),
-            "null".to_owned(),
-            "x".repeat(catalog_io::FILE_LIMIT + 1),
-        ] {
-            std::fs::write(root.path().join("auth.json"), text).unwrap();
-            assert!(matches!(
-                Authentication::read(Some(root.path()), vec![]).await,
-                Err(CatalogFailure::AuthenticationUnavailable)
-            ));
-        }
-        let auth = Authentication::read(None, vec![]).await.unwrap();
-        let home = auth.home().await.unwrap();
-        assert!(!home.path().join("auth.json").exists());
     }
 }

@@ -60,6 +60,7 @@ pub enum UnknownReason {
     InvalidVersion,
     InspectionFailed,
     CleanupFailed,
+    UnsupportedPlatform,
 }
 
 impl UnknownReason {
@@ -89,6 +90,9 @@ impl UnknownReason {
             Self::InspectionFailed => "local package inspection failed",
             Self::CleanupFailed => {
                 "probe cleanup could not be confirmed; temporary configuration was retained"
+            }
+            Self::UnsupportedPlatform => {
+                "process probes are unsupported on macOS; descendant cleanup cannot be guaranteed"
             }
         }
     }
@@ -120,6 +124,8 @@ pub struct CodexRuntimeReport {
     /// Whether production removes `CODEX_PATH` and `CODEX_CONFIG` for this launch.
     pub removes_codex_overrides: bool,
     pub adapter_path: Option<String>,
+    /// Declared package.json version, never evidence from executing the adapter.
+    pub adapter_package_version: Option<String>,
     pub adapter_version: VersionMeasurement,
     pub runtime_source: RuntimeSource,
     pub runtime_path: Option<String>,
@@ -254,6 +260,7 @@ impl CodexLaunch {
                 )
                 .is_empty(),
                 adapter_path: None,
+                adapter_package_version: None,
                 adapter_version: VersionMeasurement::Unknown(reason),
                 runtime_source: RuntimeSource::Unknown,
                 runtime_path: None,
@@ -269,6 +276,9 @@ impl CodexLaunch {
         pin: Option<&str>,
         dependency: Option<&process::ProbeDependency>,
     ) -> CodexInspection {
+        if process::ensure_supported().is_err() {
+            return process::inspect_metadata(self, adapter, pin).await;
+        }
         let mut result = self.unknown(UnknownReason::OpaqueAdapter);
         result.report.adapter_path = Some(safe_text(&adapter.to_string_lossy()));
         // Even --version on an opaque wrapper can install packages. Inspect
@@ -509,6 +519,7 @@ async fn local_output_with_dependency(
     timeout: Duration,
     dependency: Option<process::ProbeDependency>,
 ) -> Result<Vec<u8>, UnknownReason> {
+    process::ensure_supported()?;
     let directory = tempfile::Builder::new()
         .prefix("intentd-codex-diagnostic-")
         .tempdir()

@@ -41,8 +41,10 @@ mod unix {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     struct Cleanup(i32);
 
+    #[cfg(target_os = "linux")]
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = nix::sys::signal::kill(
@@ -65,8 +67,13 @@ mod unix {
             let root = crate::test_support::test_tempdir("codex-diagnostic-fixture");
             let bin = root.path().join("bin");
             std::fs::create_dir(&bin).unwrap();
-            let node = intent_providers::find_node().expect("development host requires Node");
-            symlink(std::fs::canonicalize(node).unwrap(), bin.join("node")).unwrap();
+            #[cfg(target_os = "linux")]
+            {
+                let node = intent_providers::find_node().expect("development host requires Node");
+                symlink(std::fs::canonicalize(node).unwrap(), bin.join("node")).unwrap();
+            }
+            #[cfg(target_os = "macos")]
+            executable(&bin.join("node"), "#!/bin/sh\nexit 93\n");
             let package_root = root
                 .path()
                 .join("node_modules/@agentclientprotocol/codex-acp");
@@ -135,6 +142,7 @@ mod unix {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn local_and_managed_report_distinct_measured_versions_never_path_codex() {
         let local = Fixture::new("2.4.6", "0.222.3");
@@ -190,6 +198,7 @@ mod unix {
             .contains("@openai/codex/bin/codex.js"));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn package_metadata_is_not_a_measured_version() {
         let pin = CODEX_ACP_NPX_PACKAGE.rsplit_once('@').unwrap().1;
@@ -221,6 +230,7 @@ mod unix {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn recognized_local_adapter_retains_actual_runtime_override() {
         let fixture = Fixture::new("2.4.6", "0.222.3");
@@ -276,11 +286,19 @@ mod unix {
             let result = launch.inspect_local().await;
             assert_eq!(
                 result.report.adapter_version,
-                VersionMeasurement::Unknown(UnknownReason::OpaqueAdapter)
+                VersionMeasurement::Unknown(if cfg!(target_os = "macos") {
+                    UnknownReason::UnsupportedPlatform
+                } else {
+                    UnknownReason::OpaqueAdapter
+                })
             );
             assert_eq!(
                 result.report.runtime_version,
-                VersionMeasurement::Unknown(UnknownReason::OpaqueAdapter)
+                VersionMeasurement::Unknown(if cfg!(target_os = "macos") {
+                    UnknownReason::UnsupportedPlatform
+                } else {
+                    UnknownReason::OpaqueAdapter
+                })
             );
             assert!(result.runtime.is_none());
         }
@@ -298,11 +316,16 @@ mod unix {
         });
         assert_eq!(
             launch.inspect_local().await.report.runtime_version,
-            VersionMeasurement::Unknown(UnknownReason::OpaqueAdapter)
+            VersionMeasurement::Unknown(if cfg!(target_os = "macos") {
+                UnknownReason::UnsupportedPlatform
+            } else {
+                UnknownReason::OpaqueAdapter
+            })
         );
         assert!(!fixture.path_marker.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn missing_dependency_and_wrong_managed_pin_stay_unknown() {
         let fixture = Fixture::new("2.4.6", "0.222.3");
@@ -348,10 +371,15 @@ mod unix {
         };
         assert_eq!(
             launch.inspect_local().await.report.runtime_version,
-            VersionMeasurement::Measured("0.222.3".into())
+            if cfg!(target_os = "macos") {
+                VersionMeasurement::Unknown(UnknownReason::UnsupportedPlatform)
+            } else {
+                VersionMeasurement::Measured("0.222.3".into())
+            }
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn child_failures_are_sanitized_and_checks_are_isolated_and_bounded() {
         let fixture = Fixture::new("2.4.6", "0.222.3");
@@ -444,12 +472,17 @@ mod unix {
         let json = serde_json::to_string(&result.report).unwrap();
         assert_eq!(
             result.report.adapter_version,
-            VersionMeasurement::Unknown(UnknownReason::UnsuccessfulExit)
+            VersionMeasurement::Unknown(if cfg!(target_os = "macos") {
+                UnknownReason::UnsupportedPlatform
+            } else {
+                UnknownReason::UnsuccessfulExit
+            })
         );
         assert!(!json.contains("secret"));
         assert!(!json.contains("user@example.com"));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn probe_process_preserves_stdio_and_keeps_home_until_cleanup() {
         use tokio::io::AsyncWriteExt;
@@ -517,26 +550,31 @@ mod unix {
 
     /// The child reports its process tree over a local socket before the test
     /// cancels it. No timing sleep is used to guess whether spawning finished.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cancellation_reaps_the_process_tree_and_removes_temporary_home() {
         cancellation_case(false).await;
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cancellation_during_teardown_keeps_the_escaped_descendant_snapshot() {
         cancellation_case(true).await;
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn early_exit_reaps_detached_child_before_removing_home() {
         early_exit_case(false).await;
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn early_exit_with_inherited_stdout_reaps_detached_child_on_timeout() {
         early_exit_case(true).await;
     }
 
+    #[cfg(target_os = "linux")]
     async fn early_exit_case(inherit_stdout: bool) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -647,6 +685,7 @@ child.once('message', () => {
         );
     }
 
+    #[cfg(target_os = "linux")]
     async fn cancellation_case(during_teardown: bool) {
         use tokio::io::AsyncReadExt;
         let fixture = Fixture::new("2.4.6", "0.222.3");

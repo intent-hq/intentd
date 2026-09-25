@@ -392,7 +392,17 @@ does not establish runtime provenance. An unrelated `codex` on PATH is never use
 evidence of the selected adapter's bundled runtime. Managed launches remove `CODEX_PATH`
 and `CODEX_CONFIG`; local launches retain production's runtime override policy.
 
-Ordinary doctor adds no npm resolution or live model request. To compare fresh catalogs:
+On macOS, the first version reports the selected launch, configured managed pin, and
+the selected local adapter's package version when its declared bin can be verified.
+That version is labeled **metadata, not measured**. It does not execute Node, the
+adapter, or Codex, and does not infer a runtime from PATH or neighboring packages.
+Version and catalog process probes are explicitly unsupported because detached-child
+cleanup cannot be guaranteed. Even with `--codex-models`, macOS performs no diagnostic
+authentication capture, npm resolution, or temporary probe setup; catalog comparison
+remains inconclusive. This does not change normal agent/provider execution.
+
+Ordinary doctor adds no npm resolution or live model request. On Linux and Windows,
+compare fresh catalogs with:
 
 ```bash
 intentd doctor --codex-models

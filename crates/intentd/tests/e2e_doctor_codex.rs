@@ -1,7 +1,7 @@
 //! Exercise the real doctor CLI with isolated, prompt-free ACP/npm fixtures.
 //! Linux execution is evidence for Linux only; native ownership has its own tests.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod common;
 
@@ -46,9 +46,15 @@ impl Fixture {
         let root = common::test_tempdir("doctor-codex");
         let bin = root.path().join("bin");
         fs::create_dir(&bin).unwrap();
-        let node = fs::canonicalize(intent_providers::find_node().expect("Node required")).unwrap();
-        // A symlink would make production pair this Node with the host's real npx.
-        fs::copy(&node, bin.join("node")).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let node =
+                fs::canonicalize(intent_providers::find_node().expect("Node required")).unwrap();
+            // A symlink would make production pair this Node with the host's real npx.
+            fs::copy(&node, bin.join("node")).unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        executable(&bin.join("node"), &format!("#!/bin/sh\nprintf invoked > '{}'\nprintf 'credential-canary'\nprintf 'account-canary' >&2\nexit 93\n", root.path().join("node-ran").display()));
         let adapter = root
             .path()
             .join("node_modules/@agentclientprotocol/codex-acp/dist/index.js");
@@ -265,6 +271,7 @@ impl Fixture {
         assert!(!self.root.path().join("path-codex-ran").exists());
         assert!(!self.root.path().join("mcp-launched").exists());
         assert!(!self.root.path().join("opaque-adapter-ran").exists());
+        assert!(!self.root.path().join("node-ran").exists());
         assert!(fs::read_dir(self.root.path()).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()
@@ -307,12 +314,19 @@ fn fixture_launch_is_selected() {
     let config = PathBuf::from(std::env::var_os("INTENTD_CONFIG").unwrap());
     let settings = SettingsFile::load_or_init(&config).unwrap();
     let launch = CodexLaunch::discover(&settings);
+    // macOS temporary roots can be aliases such as /var -> /private/var.
+    // Compare file identity after resolution, while still requiring the exact
+    // fixture executable before doctor can run any provider check.
+    let root = fs::canonicalize(config.parent().unwrap()).unwrap();
     match (expected.as_str(), launch.selection()) {
         ("managed", ProviderLaunch::Managed { npx, .. }) => {
-            assert_eq!(npx, &config.parent().unwrap().join("bin/npx"));
+            assert_eq!(fs::canonicalize(npx).unwrap(), root.join("bin/npx"));
         }
         ("override" | "discovered", ProviderLaunch::Local(binary)) => {
-            assert!(binary.path.starts_with(config.parent().unwrap()));
+            assert_eq!(
+                fs::canonicalize(&binary.path).unwrap(),
+                root.join("node_modules/@agentclientprotocol/codex-acp/dist/index.js")
+            );
         }
         _ => panic!("host provider resolution escaped the doctor fixture"),
     }
@@ -326,10 +340,15 @@ fn default_managed_reports_configuration_without_materializing_or_querying() {
     assert!(stdout.contains(intent_providers::config::CODEX_ACP_NPX_PACKAGE));
     assert!(stdout.contains("configured managed package (not a measured version)"));
     assert!(stdout.contains("no package was installed"));
-    assert!(stdout.contains("--codex-models"));
+    if cfg!(target_os = "macos") {
+        assert!(stdout.contains("version and fresh catalog probes are unsupported"));
+    } else {
+        assert!(stdout.contains("--codex-models"));
+    }
     assert!(fixture.events().is_empty());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn default_local_measures_selected_dependency_and_ignores_path_codex() {
     let fixture = Fixture::new("override", &json!({}));
@@ -352,6 +371,7 @@ fn default_local_discovery_is_distinct_from_an_override() {
         .contains("selected adapter: local discovery"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn local_runtime_override_follows_production_selection() {
     let fixture = Fixture::new("override", &json!({}));
@@ -387,10 +407,15 @@ fn default_opaque_adapter_is_unknown_without_execution() {
         ),
     );
     let stdout = fixture.run(false);
-    assert!(stdout.contains("wrapper or native adapter cannot be inspected"));
+    assert!(stdout.contains(if cfg!(target_os = "macos") {
+        "process probes are unsupported on macOS"
+    } else {
+        "wrapper or native adapter cannot be inspected"
+    }));
     assert!(fixture.events().is_empty());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn live_managed_uses_resolved_package_and_reports_original_catalog_fields() {
     let fixture = Fixture::new("managed", &json!({}));
@@ -414,6 +439,7 @@ fn live_managed_uses_resolved_package_and_reports_original_catalog_fields() {
     println!("{stdout}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn missing_runtime_keeps_acp_success_and_an_advisory_raw_failure() {
     let fixture = Fixture::new("override", &json!({}));
@@ -427,6 +453,7 @@ fn missing_runtime_keeps_acp_success_and_an_advisory_raw_failure() {
     ));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn raw_error_preserves_acp_observations_and_withholds_child_errors() {
     let fixture = Fixture::new("override", &json!({"raw":"rpcError"}));
@@ -437,6 +464,7 @@ fn raw_error_preserves_acp_observations_and_withholds_child_errors() {
     assert!(stdout.contains("comparison unavailable"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn acp_error_preserves_raw_observations() {
     let fixture = Fixture::new("override", &json!({"acp":"unsupported"}));
@@ -447,6 +475,7 @@ fn acp_error_preserves_raw_observations() {
     assert!(stdout.contains("raw runtime catalog: advertised"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn unavailable_authentication_is_separate_from_an_empty_catalog() {
     let fixture = Fixture::new("override", &json!({"acp":"auth","raw":"auth"}));
@@ -460,6 +489,7 @@ fn unavailable_authentication_is_separate_from_an_empty_catalog() {
     assert!(!stdout.contains("catalog: advertised"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn unreadable_authentication_does_not_start_live_probes() {
     let fixture = Fixture::new("managed", &json!({}));
@@ -478,6 +508,7 @@ fn unreadable_authentication_does_not_start_live_probes() {
     assert!(fixture.events().is_empty());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn advertised_empty_catalogs_are_observations_not_account_restrictions() {
     let fixture = Fixture::new(
@@ -496,6 +527,7 @@ fn advertised_empty_catalogs_are_observations_not_account_restrictions() {
     assert!(!stdout.contains("authentication is unavailable"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn missing_acp_advertisement_cannot_claim_raw_only_membership() {
     let fixture = Fixture::new(
@@ -508,6 +540,7 @@ fn missing_acp_advertisement_cannot_claim_raw_only_membership() {
     assert!(!stdout.contains("ID observed only in the selected runtime catalog"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn sensitive_ids_and_metadata_are_withheld_from_both_output_streams() {
     let fixture = Fixture::new(
@@ -524,6 +557,7 @@ fn sensitive_ids_and_metadata_are_withheld_from_both_output_streams() {
     assert!(stdout.contains("comparison unavailable"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn local_version_timeout_and_invalid_output_are_safe_unknowns() {
     let fixture = Fixture::new(
@@ -539,6 +573,7 @@ fn local_version_timeout_and_invalid_output_are_safe_unknowns() {
         .all(|event| event["version"] == true));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn live_catalog_deadline_is_advisory_and_preserves_the_other_catalog() {
     let fixture = Fixture::new("override", &json!({"raw":"timeout"}));
@@ -579,7 +614,83 @@ fn doctor_help_discloses_opt_in_and_its_limits() {
         "authentication",
         "prompts",
         "advisory",
+        "macOS",
+        "metadata",
+        "unsupported",
     ] {
         assert!(stdout.contains(expected), "missing help text: {expected}");
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_local_selection_and_metadata_never_execute_provider_or_path_codex() {
+    for selection in ["override", "discovered"] {
+        let fixture = Fixture::new(selection, &json!({}));
+        let stdout = fixture.run(false);
+        let pin = intent_providers::config::CODEX_ACP_NPX_PACKAGE
+            .rsplit_once('@')
+            .unwrap()
+            .1;
+        assert!(stdout.contains(&format!(
+            "adapter package version (metadata, not measured): {pin}"
+        )));
+        assert!(stdout.contains(if selection == "override" {
+            "providers.paths override"
+        } else {
+            "local discovery"
+        }));
+        assert!(stdout.contains("process probes are unsupported on macOS"));
+        assert!(stdout.contains("runtime source: unknown"));
+        assert!(!stdout.contains("[ok] measured"));
+        assert!(!stdout.contains("99.99.99"));
+        assert!(fixture.events().is_empty());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_catalog_rejection_precedes_npm_authentication_and_probe_state() {
+    for selection in ["managed", "override"] {
+        let fixture = Fixture::new(selection, &json!({}));
+        // A FIFO is invalid auth material. Capability rejection must take
+        // precedence over authentication failure without provider/home setup.
+        let auth = fixture.root.path().join("user/auth.json");
+        fs::remove_file(&auth).unwrap();
+        nix::unistd::mkfifo(
+            &auth,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let mut command = fixture.doctor_command(true);
+        command.env("CODEX_PATH", &fixture.runtime);
+        let (success, stdout) = fixture.run_command(command);
+        assert!(success);
+        assert_eq!(
+            stdout
+                .matches("catalog: unavailable (process probes are unsupported on macOS")
+                .count(),
+            2
+        );
+        assert!(stdout.contains("Catalog comparison is inconclusive."));
+        assert!(!stdout.contains("catalog: advertised"));
+        assert!(!stdout.contains("authentication is unavailable"));
+        assert!(!stdout.contains("fresh catalogs: checking"));
+        assert!(fixture.events().is_empty());
+        fixture.assert_clean();
+        println!("{stdout}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_malformed_metadata_is_not_reported_as_a_version_or_an_error_payload() {
+    let fixture = Fixture::new("override", &json!({}));
+    fs::write(fixture.adapter.parent().unwrap().parent().unwrap().join("package.json"),
+        json!({"name":"@agentclientprotocol/codex-acp", "version":"credential-canary", "bin":{"codex-acp":"dist/index.js"}}).to_string()).unwrap();
+    let stdout = fixture.run(false);
+    assert!(!stdout.contains("adapter package version"));
+    assert!(!stdout.contains("[ok] measured"));
+    assert!(stdout.contains("process probes are unsupported on macOS"));
+    assert!(fixture.events().is_empty());
 }
