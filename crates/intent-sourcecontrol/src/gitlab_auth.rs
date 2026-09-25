@@ -52,7 +52,7 @@ pub const GITLAB_COM_HOST: &str = "gitlab.com";
 /// the device grant is reported unsupported and the PAT path is the only
 /// connection method.
 pub const GITLAB_COM_OAUTH_CLIENT_ID: &str =
-    "e65857695d3980e00e7e7b0fa99816b55381b932627c68fc8fd320179f88df89";
+    "039fc60c98dfdb1b25c2b2b00c7f07ee4f3f2d6a3b6aa5e6ec763cd0fa95a47e";
 
 /// Scopes requested by the device grant. `api` (rather than the narrower
 /// `read_api` + `write_repository`) because snippet create/delete — planned
