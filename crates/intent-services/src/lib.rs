@@ -147,6 +147,8 @@ mod transfer_model_selection;
 mod transfer_remotes;
 #[cfg(test)]
 mod transfer_roundtrip;
+#[cfg(all(test, unix))]
+mod transfer_selection_contract;
 mod transfer_submodules;
 mod unsloth_server;
 mod voice_ops;
