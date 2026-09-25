@@ -60,5 +60,16 @@ nix = { workspace = true, features = ["signal", "process"] }
 pprof = "0.15"
 libc = { workspace = true }
 
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
 [lints]
 workspace = true

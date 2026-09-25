@@ -68,6 +68,7 @@ pub mod browser_ops;
 mod browser_tabs;
 mod capability;
 mod clone_ops;
+pub mod codex_diagnostics;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;

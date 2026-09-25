@@ -416,8 +416,34 @@ pub fn find_provider_binary(
     command: &str,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
+    find_provider_binary_with_source(provider_id, command, explicit_path).map(|found| found.path)
+}
+
+/// The source of a selected local executable. Discovery includes native
+/// installers, managed local bins, and enhanced PATH, in the usual order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderBinarySource {
+    SettingsOverride,
+    LocalDiscovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderBinary {
+    pub path: PathBuf,
+    pub source: ProviderBinarySource,
+}
+
+/// The ordinary discovery result with provenance recorded at the selecting
+/// tier. Diagnostics must not infer an accepted override merely from its
+/// presence in settings (invalid overrides fall through).
+#[must_use]
+pub fn find_provider_binary_with_source(
+    provider_id: &str,
+    command: &str,
+    explicit_path: Option<&str>,
+) -> Option<ProviderBinary> {
     let home = home_dir();
-    find_provider_binary_with_home_and_dirs(
+    find_provider_binary_with_source_and_dirs(
         provider_id,
         command,
         explicit_path,
@@ -450,7 +476,7 @@ pub fn find_auggie_candidates(explicit_path: Option<&str>) -> Vec<PathBuf> {
 /// [`find_auggie_candidates`] with `home` and the enhanced dirs injected
 /// (test seam — avoids mutating process-global `HOME`/`PATH` in parallel
 /// tests). Builds the ordered, de-duplicated candidate list; the precedence
-/// mirrors [`find_provider_binary_with_home_and_dirs`] for auggie exactly, so
+/// mirrors [`find_provider_binary_with_source_and_dirs`] for auggie exactly, so
 /// the first element always equals what `find_provider_binary` would return.
 fn find_auggie_candidates_with_home_and_dirs(
     explicit_path: Option<&str>,
@@ -511,6 +537,7 @@ fn find_provider_binary_with_home(
     )
 }
 
+#[cfg(all(test, unix))]
 fn find_provider_binary_with_home_and_dirs(
     provider_id: &str,
     command: &str,
@@ -518,15 +545,84 @@ fn find_provider_binary_with_home_and_dirs(
     home: Option<&std::path::Path>,
     enhanced_dirs: &[PathBuf],
 ) -> Option<PathBuf> {
+    find_provider_binary_with_source_and_dirs(
+        provider_id,
+        command,
+        explicit_path,
+        home,
+        enhanced_dirs,
+    )
+    .map(|found| found.path)
+}
+
+/// Selected inputs to ACP's launch policy. Local-first providers may use a
+/// pinned npm fallback; npx-only Codex uses production's Node+npx resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderLaunch {
+    Local(ProviderBinary),
+    Managed { npx: PathBuf, package: &'static str },
+    Bare { command: &'static str },
+}
+
+/// Shared by production agent spawning and diagnostics. Npx-only providers
+/// use their separate override policy, not this local-first selector.
+#[must_use]
+pub fn resolve_fallback_launch(
+    provider: &ProviderConfig,
+    explicit_path: Option<&str>,
+) -> ProviderLaunch {
+    select_fallback_launch(
+        provider,
+        find_provider_binary_with_source(
+            provider.primary_binary_provider_id(),
+            provider.command,
+            explicit_path,
+        ),
+        find_npx,
+    )
+}
+
+fn select_fallback_launch(
+    provider: &ProviderConfig,
+    binary: Option<ProviderBinary>,
+    npx: impl FnOnce() -> Option<PathBuf>,
+) -> ProviderLaunch {
+    if let Some(binary) = binary {
+        ProviderLaunch::Local(binary)
+    } else {
+        provider
+            .fallback_npx_package
+            .and_then(|package| npx().map(|npx| ProviderLaunch::Managed { npx, package }))
+            .unwrap_or(ProviderLaunch::Bare {
+                command: provider.command,
+            })
+    }
+}
+
+fn find_provider_binary_with_source_and_dirs(
+    provider_id: &str,
+    command: &str,
+    explicit_path: Option<&str>,
+    home: Option<&std::path::Path>,
+    enhanced_dirs: &[PathBuf],
+) -> Option<ProviderBinary> {
+    let explicit = |path| ProviderBinary {
+        path,
+        source: ProviderBinarySource::SettingsOverride,
+    };
+    let discovered = |path| ProviderBinary {
+        path,
+        source: ProviderBinarySource::LocalDiscovery,
+    };
     // 1. Explicit setting wins (must be executable and absolute)
     if let Some(path) = explicit_path {
         // An Antigravity custom path is an explicit choice, including when its
         // official bundle is incomplete. Do not silently replace that choice.
         if provider_id == "antigravity" && !path.trim().is_empty() {
-            return resolve_explicit_path(provider_id, path);
+            return resolve_explicit_path(provider_id, path).map(explicit);
         }
         if let Some(pb) = resolve_explicit_path(provider_id, path) {
-            return Some(pb);
+            return Some(explicit(pb));
         }
     }
 
@@ -536,7 +632,7 @@ fn find_provider_binary_with_home_and_dirs(
     // wrappers can emit update banners before real stdout).
     if let Some(home) = home {
         if let Some(native) = find_provider_native_binary_in(provider_id, command, home) {
-            return Some(native);
+            return Some(discovered(native));
         }
     }
 
@@ -545,7 +641,7 @@ fn find_provider_binary_with_home_and_dirs(
         if is_executable_file(&managed)
             && (provider_id != "antigravity" || crate::antigravity::is_complete_candidate(&managed))
         {
-            return Some(managed);
+            return Some(discovered(managed));
         }
     }
 
@@ -557,7 +653,7 @@ fn find_provider_binary_with_home_and_dirs(
     // parity with `intent_context::discovery::find_auggie`).
     if provider_id == "auggie" {
         if let Some(marked) = auggie_marker_path_with_home(home) {
-            return Some(marked);
+            return Some(discovered(marked));
         }
     }
 
@@ -576,9 +672,10 @@ fn find_provider_binary_with_home_and_dirs(
                 crate::antigravity::supported_host()
                     .then(|| home.and_then(crate::antigravity::managed_binary))
                     .flatten()
-            });
+            })
+            .map(discovered);
     }
-    find_in_dirs(enhanced_dirs, command)
+    find_in_dirs(enhanced_dirs, command).map(discovered)
 }
 
 /// The explicit-override tier ALONE for an npx-only provider
@@ -943,6 +1040,74 @@ pub fn find_pi_cli(command: &str) -> Option<PathBuf> {
 mod find_provider_binary_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn local_first_launch_records_the_selecting_tier_and_fallback_policy() {
+        let dir = unique_temp_dir("codex-launch");
+        let local = dir.path().join(if cfg!(windows) {
+            "codex-acp.exe"
+        } else {
+            "codex-acp"
+        });
+        let explicit = dir.path().join(if cfg!(windows) {
+            "override.exe"
+        } else {
+            "override"
+        });
+        make_executable(&local);
+        make_executable(&explicit);
+        let dirs = vec![dir.path().to_path_buf()];
+        // A synthetic local-first provider exercises the generic selector.
+        // Production Codex is npx-only and deliberately does not use it.
+        let mut config = *crate::provider_config("codex");
+        config.npx_only_package = None;
+        config.fallback_npx_package = Some(crate::config::CODEX_ACP_NPX_PACKAGE);
+        let provider = &config;
+        let resolve = |setting, dirs: &[PathBuf]| {
+            find_provider_binary_with_source_and_dirs("codex", "codex-acp", setting, None, dirs)
+        };
+        for (setting, expected, source) in [
+            (
+                Some(explicit.to_str().unwrap()),
+                &explicit,
+                ProviderBinarySource::SettingsOverride,
+            ),
+            (None, &local, ProviderBinarySource::LocalDiscovery),
+            (
+                Some("invalid/relative/override"),
+                &local,
+                ProviderBinarySource::LocalDiscovery,
+            ),
+            (Some("  "), &local, ProviderBinarySource::LocalDiscovery),
+        ] {
+            let found = resolve(setting, &dirs).unwrap();
+            assert_eq!(&found.path, expected);
+            assert_eq!(found.source, source);
+            assert_eq!(
+                select_fallback_launch(provider, Some(found.clone()), || panic!(
+                    "local launch must not discover npm"
+                )),
+                ProviderLaunch::Local(found)
+            );
+        }
+        let npx = dir.path().join("npx");
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            select_fallback_launch(provider, resolve(missing.to_str(), &[]), || Some(
+                npx.clone()
+            )),
+            ProviderLaunch::Managed {
+                npx,
+                package: crate::config::CODEX_ACP_NPX_PACKAGE
+            }
+        );
+        assert_eq!(
+            select_fallback_launch(provider, resolve(None, &[]), || None),
+            ProviderLaunch::Bare {
+                command: "codex-acp"
+            }
+        );
+    }
 
     /// A fresh RAII temp directory for `tag` under the system temp root. The
     /// returned guard removes the dir on drop (including on panic); set
