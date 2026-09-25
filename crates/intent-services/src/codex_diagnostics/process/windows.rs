@@ -663,6 +663,7 @@ mod tests {
     struct Control {
         stream: BufReader<tokio::net::TcpStream>,
         process: ObservedProcess,
+        pid: u32,
     }
 
     impl Control {
@@ -677,8 +678,13 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let process = ObservedProcess::open(pid.trim().parse().unwrap());
-            Self { stream, process }
+            let pid = pid.trim().parse().unwrap();
+            let process = ObservedProcess::open(pid);
+            Self {
+                stream,
+                process,
+                pid,
+            }
         }
 
         async fn exit(&mut self, code: u32) {
@@ -688,6 +694,65 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    async fn collect_history(
+        ownership: &mut Ownership,
+        omitted_pid: Option<u32>,
+    ) -> JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+        let mut omitted_seen = false;
+        let result = timeout(TEST_TIMEOUT, async {
+            loop {
+                if let Some(omitted) = omitted_pid {
+                    for _ in 0..MESSAGE_BATCH {
+                        let Some((message, pid)) = ownership.job.next_message().unwrap() else {
+                            break;
+                        };
+                        if message == JOB_OBJECT_MSG_NEW_PROCESS {
+                            if pid == omitted {
+                                omitted_seen = true;
+                            } else {
+                                // Preserve every other member, including ones
+                                // the fixture did not explicitly create.
+                                ownership.processes.observe(pid).unwrap();
+                            }
+                        }
+                    }
+                } else {
+                    ownership.collect_processes().unwrap();
+                }
+                let accounting = ownership.job.accounting().unwrap();
+                if ownership.processes.entries.len() + usize::from(omitted_seen)
+                    == usize::try_from(accounting.TotalProcesses).unwrap()
+                    && omitted_seen == omitted_pid.is_some()
+                {
+                    return accounting;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await;
+        // Count/PID-only diagnostics are bounded and contain no image paths,
+        // command arguments, environment values or account data.
+        let recorded = ownership
+            .processes
+            .entries
+            .keys()
+            .take(16)
+            .collect::<Vec<_>>();
+        let accounting = result.unwrap_or_else(|_| {
+            panic!(
+                "incomplete fixture history: total={:?}, recorded={}, first_pids={recorded:?}, omitted={omitted_pid:?}, omitted_seen={omitted_seen}",
+                ownership.job.accounting().map(|info| info.TotalProcesses),
+                ownership.processes.entries.len(),
+            );
+        });
+        eprintln!(
+            "fixture history: total={}, recorded={}, first_pids={recorded:?}, omitted={omitted_pid:?}",
+            accounting.TotalProcesses,
+            ownership.processes.entries.len(),
+        );
+        accounting
     }
 
     async fn tree(mode: &str) -> (super::super::Started, Control, Control) {
@@ -1017,21 +1082,23 @@ mod tests {
     #[tokio::test]
     async fn empty_accounting_never_substitutes_for_a_signaled_process() {
         let (mut started, mut leader, descendant) = tree("tree_inherit").await;
+        assert_eq!(started.ownership.child.id(), leader.pid);
+        assert_ne!(leader.pid, descendant.pid);
         leader.exit(0).await;
         started.ownership.wait().await.unwrap();
-        timeout(TEST_TIMEOUT, async {
-            while started.ownership.processes.entries.len() != 2 {
-                started.ownership.collect_processes().unwrap();
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        })
-        .await
-        .unwrap();
+        let mut accounting = collect_history(&mut started.ownership, None).await;
+        assert!(started
+            .ownership
+            .processes
+            .entries
+            .contains_key(&leader.pid));
+        assert!(started.ownership.processes.entries[&descendant.pid].is_some());
+        assert!(leader.process.stopped());
+        assert!(!descendant.process.stopped());
         // Model the native failure deterministically: accounting has already
         // reached zero, but the independently retained descendant is still live.
-        let mut accounting = started.ownership.job.accounting().unwrap();
         accounting.ActiveProcesses = 0;
-        assert_eq!(accounting.TotalProcesses, 2);
+        assert!(started.ownership.processes.reconciles(&accounting));
         assert!(!started.ownership.processes.confirmed(&accounting).unwrap());
         assert!(!descendant.process.stopped());
         started.ownership.cleanup().await.unwrap();
@@ -1060,16 +1127,36 @@ mod tests {
     #[tokio::test]
     async fn naturally_exited_descendant_remains_in_cleanup_history() {
         let (mut started, mut leader, mut descendant) = tree("tree_closed").await;
+        assert_eq!(started.ownership.child.id(), leader.pid);
+        assert_ne!(leader.pid, descendant.pid);
+        let descendant_pid = descendant.pid;
+        assert!(!started
+            .ownership
+            .processes
+            .entries
+            .contains_key(&descendant_pid));
         descendant.exit(0).await;
         descendant.process.wait_stopped().await;
+        assert!(descendant.process.stopped());
         // Release the independent observer before collecting notifications.
         // Cleanup must also handle a process object that has already vanished.
         drop(descendant);
         leader.exit(0).await;
         started.ownership.wait().await.unwrap();
+        let accounting = collect_history(&mut started.ownership, None).await;
+        assert!(started
+            .ownership
+            .processes
+            .entries
+            .contains_key(&leader.pid));
+        assert!(started
+            .ownership
+            .processes
+            .entries
+            .contains_key(&descendant_pid));
         assert_eq!(
-            started.ownership.job.accounting().unwrap().TotalProcesses,
-            2
+            started.ownership.processes.entries.len(),
+            usize::try_from(accounting.TotalProcesses).unwrap(),
         );
         started.ownership.cleanup().await.unwrap();
         assert!(leader.process.stopped());
@@ -1088,23 +1175,20 @@ mod tests {
         let leader = Control::accept(&listener).await;
         let descendant = Control::accept(&listener).await;
         let ownership = process.ownership.as_mut().unwrap();
-        timeout(TEST_TIMEOUT, async {
-            loop {
-                if let Some((message, pid)) = ownership.job.next_message().unwrap() {
-                    if message == JOB_OBJECT_MSG_NEW_PROCESS && pid != ownership.child.id() {
-                        break;
-                    }
-                } else {
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        // Deliberately consume the descendant's sole start notification without
-        // recording it. An empty port/count must not imply confirmed cleanup.
-        assert_eq!(ownership.job.accounting().unwrap().TotalProcesses, 2);
-        assert_eq!(ownership.processes.entries.len(), 1);
+        assert_eq!(ownership.child.id(), leader.pid);
+        assert_ne!(leader.pid, descendant.pid);
+        // Omit only the independently acknowledged descendant, never an
+        // incidental member whose notification happens to arrive first.
+        let mut accounting = collect_history(ownership, Some(descendant.pid)).await;
+        assert!(ownership.processes.entries.contains_key(&leader.pid));
+        assert!(!ownership.processes.entries.contains_key(&descendant.pid));
+        assert!(!descendant.process.stopped());
+        assert_eq!(
+            ownership.processes.entries.len() + 1,
+            usize::try_from(accounting.TotalProcesses).unwrap(),
+        );
+        accounting.ActiveProcesses = 0;
+        assert!(!ownership.processes.reconciles(&accounting));
         assert!(matches!(
             process.cleanup().await,
             Err(super::super::UnknownReason::CleanupFailed)
