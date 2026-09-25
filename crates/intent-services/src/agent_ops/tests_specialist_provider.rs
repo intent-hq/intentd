@@ -5,7 +5,7 @@ use std::{path::Path, sync::Arc};
 
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{AgentCreateExtra, AgentDelegateInput, AgentId, WorkspaceApi, WorkspaceId};
-use intent_store::Store;
+use intent_store::{EventQuery, Store};
 use serde_json::{json, Value};
 
 use super::tests::{workspace, TempDb};
@@ -319,7 +319,7 @@ async fn specialist_provider_invalid_pins_leave_no_creation_side_effects() {
         let notes = svc.store().list_all_notes().await.unwrap().len();
         let events = svc
             .store()
-            .query_events(&Default::default())
+            .query_events(&EventQuery::default())
             .await
             .unwrap()
             .len();
@@ -383,7 +383,7 @@ async fn specialist_provider_invalid_pins_leave_no_creation_side_effects() {
         assert_eq!(svc.store().list_all_notes().await.unwrap().len(), notes);
         assert_eq!(
             svc.store()
-                .query_events(&Default::default())
+                .query_events(&EventQuery::default())
                 .await
                 .unwrap()
                 .len(),
