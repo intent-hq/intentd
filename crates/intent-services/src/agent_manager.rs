@@ -10315,6 +10315,22 @@ fn resolve_spawn(
     settings: &intent_core::settings_file::SettingsFile,
     chief_cwd_root: Option<&Path>,
 ) -> Result<ResolvedSpawn> {
+    resolve_spawn_with_codex_node(
+        session,
+        workspace,
+        settings,
+        chief_cwd_root,
+        intent_providers::find_codex_node,
+    )
+}
+
+fn resolve_spawn_with_codex_node(
+    session: &AgentSession,
+    workspace: Option<&intent_core::Workspace>,
+    settings: &intent_core::settings_file::SettingsFile,
+    chief_cwd_root: Option<&Path>,
+    find_codex_node: impl FnOnce() -> Option<PathBuf>,
+) -> Result<ResolvedSpawn> {
     let provider_id = session_provider_id(
         session,
         crate::agent_session::derived_default_provider(settings).as_deref(),
@@ -10565,7 +10581,7 @@ fn resolve_spawn(
     };
 
     let bundled_codex_node = if provider.id == "codex" && provider_binary.is_none() {
-        Some(resolve_codex_node(intent_providers::find_codex_node())?)
+        Some(resolve_codex_node(find_codex_node())?)
     } else {
         None
     };
@@ -17854,12 +17870,11 @@ mod provider_path_override_tests {
                 session.provider = Some("codex".to_string());
                 session.model = Some(model.to_string());
                 session.reasoning_effort = explicit.map(str::to_string);
-                let result = resolve_spawn(&session, None, &settings, None);
-                if intent_providers::find_codex_node().is_none() {
-                    assert!(matches!(result, Err(Error::InvalidInput(_))));
-                    continue;
-                }
-                let resolved = result.unwrap();
+                let resolved =
+                    resolve_spawn_with_codex_node(&session, None, &settings, None, || {
+                        Some(PathBuf::from("/fixture/node"))
+                    })
+                    .unwrap();
                 assert_eq!(resolved.model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(resolved.reasoning_effort.as_deref(), Some(expected));
                 assert!(
