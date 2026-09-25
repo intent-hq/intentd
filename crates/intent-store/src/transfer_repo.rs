@@ -195,6 +195,22 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          against THIS daemon; an open invite is meaningless on the target",
     ),
     (
+        "host_member",
+        "host authority never transfers with a workspace",
+    ),
+    (
+        "host_membership_state",
+        "host-local authority counters and revocation clock",
+    ),
+    (
+        "principal_revocation",
+        "host-local principal revocation generations",
+    ),
+    (
+        "host_invite",
+        "host-local invitations and secrets, unrelated to workspace transfer",
+    ),
+    (
         "agent_message_fts",
         "derived FTS5 index over `agent_message`; the target's insert triggers \
          rebuild it from the imported rows",

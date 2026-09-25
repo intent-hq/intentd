@@ -17,6 +17,7 @@ use sqlx::Row;
 
 use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
+mod host_membership;
 mod workspace_delete;
 
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the
@@ -8149,10 +8150,16 @@ async fn principals_migration_backfills_existing_workspaces() {
     let ws_b = WorkspaceId::from("ws-mig-b");
     {
         let store = Store::open(&tmp.path).await.expect("open store");
-        // 0130 re-widens the recreated `principal` (and `workspace_invite`),
-        // so it is rewound too.
+        // 0130 re-widens the recreated principal/invite tables; 0132 adds
+        // host tables and triggers referencing principal. Rewind both before
+        // removing the principal table, then let the real migrations replay.
         for sql in [
-            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126, 130)",
+            "DELETE FROM _sqlx_migrations WHERE version IN (125, 126, 130, 132)",
+            "DROP TABLE host_invite",
+            "DROP TABLE host_member",
+            "DROP TABLE principal_revocation",
+            "DROP TABLE host_membership_state",
+            "DROP INDEX workspace_invite_issuer_idx",
             "ALTER TABLE workspace_invite DROP COLUMN pin_identity_provider",
             "ALTER TABLE workspace_invite DROP COLUMN pin_instance_host",
             "ALTER TABLE workspace_invite DROP COLUMN pin_external_user_id",

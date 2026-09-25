@@ -28,6 +28,7 @@ mod draft_repo;
 mod event_repo;
 mod event_subscription_repo;
 mod hook_repo;
+mod host_membership_repo;
 mod idempotency_repo;
 mod known_repo_repo;
 mod mcp_oauth_repo;
@@ -68,6 +69,9 @@ pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::NewDiff;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
+pub use host_membership_repo::{
+    HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
+};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;

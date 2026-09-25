@@ -19,13 +19,13 @@ use sqlx::Row;
 
 use crate::{enum_from_db, enum_to_db, Store};
 
-const PRINCIPAL_COLUMNS: &str = "id, github_user_id, login, display_name, avatar_url, \
+pub(crate) const PRINCIPAL_COLUMNS: &str = "id, github_user_id, login, display_name, avatar_url, \
      is_primary, created_at, updated_at, identity_provider, instance_host, external_user_id";
 
 /// The `ON CONFLICT(id)` clause shared by every principal upsert: identity
 /// (triple and github projection) and cached profile fields are overwritten
 /// and `updated_at` bumped; `is_primary` / `created_at` are never touched.
-const PRINCIPAL_UPSERT_SET: &str = "github_user_id = excluded.github_user_id, \
+pub(crate) const PRINCIPAL_UPSERT_SET: &str = "github_user_id = excluded.github_user_id, \
      login = excluded.login, \
      display_name = excluded.display_name, \
      avatar_url = excluded.avatar_url, \
@@ -48,7 +48,7 @@ pub(crate) const INVITE_COLUMNS: &str =
 /// row aliased `i`: not revoked, not expired (one `?` bound to now), and —
 /// for a pinned, single-use invite — not yet redeemed. An unpinned invite is
 /// reusable and stays open across redemptions (migration `0129`).
-const INVITE_OPEN: &str = "i.revoked_at IS NULL AND i.expires_at > ? \
+pub(crate) const INVITE_OPEN: &str = "i.revoked_at IS NULL AND i.expires_at > ? \
      AND ((i.pin_identity_provider IS NULL AND i.pin_github_user_id IS NULL) \
           OR i.redeemed_at IS NULL)";
 
@@ -1568,12 +1568,15 @@ async fn sync_workspace_owner(
 
 /// `WHERE` body selecting a principal by its identity triple; bind the three
 /// parts with [`bind_identity`].
-const PRINCIPAL_BY_IDENTITY: &str =
+pub(crate) const PRINCIPAL_BY_IDENTITY: &str =
     "identity_provider = ? AND instance_host = ? AND external_user_id = ?";
 
 type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
 
-fn bind_identity<'q>(query: SqliteQuery<'q>, identity: &'q PrincipalIdentity) -> SqliteQuery<'q> {
+pub(crate) fn bind_identity<'q>(
+    query: SqliteQuery<'q>,
+    identity: &'q PrincipalIdentity,
+) -> SqliteQuery<'q> {
     query
         .bind(identity.provider.as_str())
         .bind(identity.host.as_str())
@@ -1583,7 +1586,7 @@ fn bind_identity<'q>(query: SqliteQuery<'q>, identity: &'q PrincipalIdentity) ->
 /// Bind a principal's values in `PRINCIPAL_COLUMNS` order for an insert /
 /// upsert, with the identity columns dual-written
 /// ([`principal_identity_columns`]).
-fn bind_principal<'q>(query: SqliteQuery<'q>, p: &'q Principal) -> SqliteQuery<'q> {
+pub(crate) fn bind_principal<'q>(query: SqliteQuery<'q>, p: &'q Principal) -> SqliteQuery<'q> {
     let (identity, github_user_id) = principal_identity_columns(p);
     query
         .bind(&p.id.0)
@@ -1616,7 +1619,7 @@ fn map_identity_columns(
     })
 }
 
-fn map_principal_row(r: &SqliteRow) -> Principal {
+pub(crate) fn map_principal_row(r: &SqliteRow) -> Principal {
     Principal {
         id: PrincipalId(r.get("id")),
         identity: map_identity_columns(r, "identity_provider", "instance_host", "external_user_id"),
