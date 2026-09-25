@@ -91,6 +91,7 @@ mod git_status_cache;
 mod git_status_singleflight;
 pub mod host_exec;
 pub mod host_exec_stream;
+mod workspace_mutations;
 
 mod github_ops;
 
@@ -1259,6 +1260,9 @@ pub struct Services {
     /// restart drops every pending deletion. Shared across clones so every
     /// front door observes one set.
     pending_workspace_deletes: delete_grace::PendingDeletes,
+    workspace_mutations: workspace_mutations::WorkspaceMutations,
+    #[cfg(test)]
+    workspace_delete_test_gate: tests::workspace_delete::DeleteGate,
     /// In-memory pending agent-session deletions for the delete grace window
     /// (§5.5): `agent.delete` with `undoDelayMs > 0` registers the timer
     /// here; `agent.cancelDelete` removes it. Keyed by agent id, in a
@@ -1499,6 +1503,9 @@ impl Services {
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
+            workspace_mutations: workspace_mutations::WorkspaceMutations::default(),
+            #[cfg(test)]
+            workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
@@ -9411,6 +9418,14 @@ impl Services {
                 )
                 .await
         } else {
+            // The runtime send path already owns admission. Its store-only
+            // counterpart must fence the actual destination before persisting.
+            let session = self
+                .store
+                .get_agent_session_summary(&parent_agent_id)
+                .await?;
+            let workspace_id = &session.workspace_id;
+            let _mutation = self.workspace_mutations.enter(workspace_id)?;
             // Delivery-time unblocked hints (monorepo#2044): the
             // store-only persist IS this path's delivery, so the section
             // is resolved here — matching the manager path's direct-send
@@ -10430,6 +10445,7 @@ impl Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> Result<TaskUpdateNoteStatusResult> {
+        let _mutation = self.workspace_mutations.enter(workspace_id)?;
         let store = &self.store;
         let bus = self.event_bus.as_ref();
         let mut note = fetch_note(store, workspace_id, note_id).await?;
@@ -17891,6 +17907,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
@@ -17941,6 +17958,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
@@ -17979,6 +17997,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
@@ -21420,6 +21439,10 @@ impl WorkspaceApi for Services {
             // has already claimed (removed) its entry before calling here,
             // so this is a no-op for it.
             services.pending_workspace_deletes.cancel(id.as_str());
+            // Close producer admission before the snapshot. Existing admitted
+            // creates/sends finish first; unrelated workspaces stay writable.
+            // Keep the permit through cleanup and terminal event publication.
+            let _deletion = services.workspace_mutations.delete(&id).await;
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are
@@ -21498,6 +21521,24 @@ impl WorkspaceApi for Services {
             // in this workspace) are kept — the `agent:deleted` events
             // published just below still wake the cross-workspace parent.
             // Poison recovery mirrors the per-session sweep above.
+            let parent_watch_ids: Vec<String> = {
+                let registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registry
+                    .subscriptions
+                    .iter()
+                    .filter(|s| s.parent_workspace_id == id)
+                    .map(|s| s.id.clone())
+                    .collect()
+            };
+            // These rows have no FK cascade. Delete each outside the registry
+            // lock before forgetting it in memory, so failure/cancellation
+            // leaves its id available for retry. Admission also covers any
+            // delayed registration write, so none can land behind this sweep.
+            for watch_id in &parent_watch_ids {
+                store.delete_completion_watch(watch_id).await?;
+            }
             {
                 let mut registry = agent_subscriptions
                     .lock()
@@ -21626,11 +21667,8 @@ impl WorkspaceApi for Services {
             // the tasks and deletes the rows (chief-anchored subscriptions
             // scoped to OTHER workspaces are untouched — this removes only
             // subscriptions whose events came from the deleted workspace).
-            // Residual race: an `agent.subscribe` landing between this sweep
-            // and the store cascade below can still register (the agent row
-            // is not yet gone) — its task idles harmlessly (the workspace
-            // emits no further events) and the row is pruned by the next
-            // startup heal's workspace-existence check.
+            // Producer admission is already closed: no new subscription can
+            // register behind this sweep while the store cleanup yields.
             services.remove_event_subscriptions_for_workspace(&id).await;
             // Eagerly abort the workspace's live hook scheduler tasks BEFORE
             // the store cascade drops their rows — otherwise each task would
@@ -21646,6 +21684,8 @@ impl WorkspaceApi for Services {
                 .workspace_branch_auto_generated(&id)
                 .await
                 .unwrap_or(false);
+            #[cfg(test)]
+            services.workspace_delete_test_gate.pause(&id).await;
             // Idempotent DB delete: swallow `NotFound` so retries and
             // orphan-dir-only cleanups don't surface as `"Failed to delete
             // space"` on the FE. Any other error still propagates. Publish
@@ -23495,6 +23535,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&id)?;
             self.require_member(&id).await?;
             store.get_workspace(&id).await?;
             let persisted = store.replace_workspace_context_items(&id, &items).await?;
@@ -23545,6 +23586,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             // Target workspace first (the link row lives there), then the
             // referenced agent's workspace.
             self.require_member(&workspace_id).await?;
@@ -23636,7 +23678,10 @@ impl WorkspaceApi for Services {
             // returns the freshly-seeded row when the winning insert already
             // committed, or the pre-existing empty/other shape when the
             // reseed genuinely could not run.
-            if !id.is_chief() {
+            // A list may reseed Spec, so it joins producer admission. During
+            // deletion it stays a pure read and cannot replenish the sweep.
+            let reseed = self.workspace_mutations.enter(&id).ok();
+            if !id.is_chief() && reseed.is_some() {
                 if let Err(e) = ensure_spec_note(&store, bus.as_ref(), &id).await {
                     if matches!(e, Error::NotFound(_)) {
                         return Err(e);
@@ -23697,6 +23742,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             if let Some(content) = input.content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
@@ -23783,6 +23829,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             if let Some(content) = input.content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
@@ -23883,6 +23930,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
@@ -23971,6 +24019,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             if input.old.is_empty() {
                 return Err(Error::Internal(
@@ -24063,6 +24112,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
@@ -24151,6 +24201,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             // Guard before the merge so a rejected write touches neither the
             // store nor the merge state.
@@ -24561,6 +24612,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             let version = store.get_note_version(&workspace_id, &note_id, v).await?;
@@ -24644,7 +24696,8 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             if task_text.is_empty() {
                 return Err(Error::Internal(
@@ -24740,7 +24793,7 @@ impl WorkspaceApi for Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
             self.require_member(&workspace_id).await?;
             let new_status = parse_task_status_strict(&status)?;
             self.set_task_note_status(
@@ -24767,7 +24820,8 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             if text.is_none() && status.is_none() {
                 return Err(Error::Internal(
@@ -25099,7 +25153,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
         let store = self.store.clone();
         let services = self.clone();
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             let new_status =
                 serde_json::from_value::<TaskStatus>(serde_json::Value::String(status.clone()))
@@ -25416,6 +25471,7 @@ impl WorkspaceApi for Services {
         // the outer write's caller-agent context.
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             services
                 .convert_task_blocks_op(workspace_id, note_id, caller_agent_id.as_ref())
@@ -25434,6 +25490,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             if let Some(content) = content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
@@ -25490,7 +25547,8 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             // Target workspace first (the task note and its status live
             // there), then the referenced agent's workspace.
             self.require_member(&workspace_id).await?;
@@ -25678,6 +25736,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             // A collaborator's comment is attributed by the daemon, not the
             // client (multiplayer w4).
@@ -26151,6 +26210,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             // A collaborator's reply is attributed by the daemon, not the
             // client (multiplayer w4).
@@ -26561,6 +26621,7 @@ impl WorkspaceApi for Services {
         batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             if event_types.is_empty() {
                 return Err(Error::Internal(
@@ -26709,6 +26770,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_agent_member(&agent_id).await?;
             let ws = svc.store.get_workspace(&workspace_id).await?;
             let trimmed = path.trim();
@@ -29958,6 +30020,7 @@ impl WorkspaceApi for Services {
         batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             // Same empty-types guard as `event.subscribe`: an empty filter
             // would match EVERY event (and persist that across restarts).
@@ -32764,6 +32827,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Option<String>>> {
         let svc = self.clone();
         Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_agent_member(&agent_id).await?;
             svc.drafts_set(workspace_id, agent_id, client_id, text, attachments)
                 .await

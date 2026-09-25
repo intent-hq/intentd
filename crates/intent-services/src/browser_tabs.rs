@@ -371,6 +371,7 @@ impl Services {
         host: ClientId,
         tab: BrowserTabInput,
     ) -> Result<BrowserTab> {
+        let _mutation = self.workspace_mutations.enter(&tab.workspace_id)?;
         let _gate = self.browser_tab_gate.lock().await;
         let outcome = self.store.upsert_browser_tab(&host, tab).await?;
         match &outcome {
@@ -416,6 +417,10 @@ impl Services {
         host: ClientId,
         tabs: Vec<BrowserTabInput>,
     ) -> Result<Vec<String>> {
+        let _mutations = tabs
+            .iter()
+            .map(|tab| self.workspace_mutations.enter(&tab.workspace_id))
+            .collect::<Result<Vec<_>>>()?;
         let _gate = self.browser_tab_gate.lock().await;
         let result = self.store.sync_browser_tabs(&host, tabs).await?;
         let bus = self.event_bus.as_ref();
