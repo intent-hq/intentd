@@ -2975,6 +2975,123 @@ async fn join_all_pinned<T>(
 mod tests {
     use super::*;
 
+    #[intent_test_macros::daemon_test]
+    async fn config_write_failure_preserves_update_and_reset_state_and_events() {
+        use crate::events::SubscriptionFilter;
+        use intent_core::WorkspaceApi;
+
+        for reset in [false, true] {
+            let dir = crate::test_support::test_tempdir("settings-write-failure");
+            let store = Store::open(&dir.path().join("settings.db")).await.unwrap();
+            let path = dir.path().join("config.toml");
+            let seed = "# keep me\n[git]\nautoCommit = false\n";
+            std::fs::write(&path, seed).unwrap();
+            let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
+            let bus = crate::EventBus::new(store.clone());
+            let services = crate::Services::new(store)
+                .with_settings_registry(registry.clone())
+                .with_event_bus(bus.clone());
+            let mut events = bus.subscribe(SubscriptionFilter {
+                event_types: vec![intent_core::events::SETTINGS_CHANGED.to_string()],
+                ..Default::default()
+            });
+            let before = services
+                .settings_get("git.autoCommit".into())
+                .await
+                .unwrap();
+            let registry_events = registry.subscribe();
+            let saved = dir.path().join("saved.toml");
+            std::fs::rename(&path, &saved).unwrap();
+            std::fs::create_dir(&path).unwrap();
+
+            let result = if reset {
+                services.settings_reset("git.autoCommit".into()).await
+            } else {
+                services
+                    .settings_update(json!([
+                        {"path": "git.autoCommit", "value": true},
+                        {"path": "model.default", "value": "rejected-model"}
+                    ]))
+                    .await
+            };
+            assert!(matches!(result, Err(Error::Internal(_))), "{result:?}");
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&saved, &path).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), seed);
+            assert_eq!(
+                services
+                    .settings_get("git.autoCommit".into())
+                    .await
+                    .unwrap(),
+                before,
+                "failed update/reset must preserve value, origin, and revision"
+            );
+            assert_eq!(registry.generation(), 0);
+            assert!(!registry_events.has_changed().unwrap());
+
+            // The next successful update is also an event-ordering barrier:
+            // no settings:changed notification from the failed write may
+            // precede it, and its revision must only advance once.
+            let applied = services
+                .settings_update(json!([{"path": "rtk.enabled", "value": true}]))
+                .await
+                .unwrap();
+            assert_eq!(applied["revision"], json!(1));
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("successful update event")
+                .unwrap();
+            assert_eq!(event.len(), 1);
+            assert_eq!(event[0].data["revision"], applied["revision"]);
+            assert_eq!(event[0].data["changes"], applied["applied"]);
+            let fresh = SettingsRegistry::load(&path).unwrap();
+            assert_eq!(fresh.get("git.autoCommit"), Some(json!(false)));
+            assert_eq!(fresh.origin("git.autoCommit"), Some(SettingOrigin::File));
+            assert_eq!(fresh.get("model.default"), Some(Value::Null));
+            assert_eq!(fresh.origin("model.default"), Some(SettingOrigin::Default));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_settings_batches_preserve_all_stores() {
+        for (invalid_path, invalid_value) in [
+            ("future.setting", json!(true)),
+            ("agents.flushQueuedMessages", json!("future-policy")),
+            (
+                "quickActions.providerSettings",
+                json!({"future-provider": {"option": null}}),
+            ),
+        ] {
+            let dir = crate::test_support::test_tempdir("settings-validation");
+            let store = Store::open(&dir.path().join("settings.db")).await.unwrap();
+            let path = dir.path().join("config.toml");
+            let seed = "# keep me\n[git]\nautoCommit = true\n";
+            std::fs::write(&path, seed).unwrap();
+            let registry = SettingsRegistry::load(&path).unwrap();
+            let raw_secrets = Arc::new(InMemorySecretStore::default());
+            let secrets = AsyncSecretStore::new(raw_secrets.clone());
+            let svc = SettingsService::new(&store, &secrets, Some(&registry));
+            let before = svc.get("git.autoCommit").await.unwrap();
+            let rx = registry.subscribe();
+            let err = svc
+                .update(&json!([
+                    {"path": "git.autoCommit", "value": false},
+                    {"path": "linear.token", "value": "must-not-be-stored"},
+                    {"path": invalid_path, "value": invalid_value}
+                ]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+            assert!(err.to_string().contains(invalid_path), "{err}");
+            assert_eq!(svc.get("git.autoCommit").await.unwrap(), before);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), seed);
+            assert_eq!(raw_secrets.load("linear.token").unwrap(), None);
+            assert_eq!(store.get_setting("git.autoCommit").await.unwrap(), None);
+            assert_eq!(registry.generation(), 0);
+            assert!(!rx.has_changed().unwrap());
+        }
+    }
+
     /// `linear.token` must be a sensitive catalog entry so `settings.update`
     /// persists it to the shared secrets store under account `linear.token`
     /// (account = setting path) — the exact entry `intent-linear`'s token
