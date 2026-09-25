@@ -366,6 +366,9 @@ mod tests_stab115;
 mod tests_specialist_frontmatter;
 
 #[cfg(test)]
+mod tests_specialist_provider;
+
+#[cfg(test)]
 mod tests_delegate_provider_resolution;
 
 #[cfg(test)]
@@ -868,14 +871,10 @@ fn resolve_delegate_provider(
 ) -> Result<Option<String>> {
     let settings = services.effective_settings();
 
-    if let Some(spec_id) = specialist {
-        let specialists_svc = services.specialists_service();
-        let explicit = specialists_svc.resolve_coding_agent(spec_id, workspace_path);
-        if let Some(provider_id) = explicit {
-            ensure_known_provider("agent.delegate", &provider_id)?;
-            ensure_provider_available("agent.delegate", &provider_id, &settings.providers)?;
-            return Ok(Some(provider_id));
-        }
+    if let Some(provider) =
+        resolve_specialist_provider(services, "agent.delegate", specialist, workspace_path)?
+    {
+        return Ok(Some(provider));
     }
 
     match crate::agent_session::derived_default_provider(&settings) {
@@ -888,6 +887,28 @@ fn resolve_delegate_provider(
             "agent.delegate",
         )),
     }
+}
+
+/// Resolve and validate only the specialist's provider pin. Shared by create
+/// and delegate before model resolution; an absent pin leaves each caller's
+/// existing settings-default behavior intact. Call on the blocking pool:
+/// specialist resolution walks the project > user > bundled directories.
+fn resolve_specialist_provider(
+    services: &Services,
+    method: &str,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> Result<Option<String>> {
+    let provider = specialist.and_then(|id| {
+        services
+            .specialists_service()
+            .resolve_coding_agent(id, workspace_path)
+    });
+    if let Some(provider) = provider.as_deref() {
+        ensure_known_provider(method, provider)?;
+        ensure_provider_available(method, provider, &services.effective_settings().providers)?;
+    }
+    Ok(provider)
 }
 
 /// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
@@ -3116,7 +3137,17 @@ impl Services {
         session
             .harness_features
             .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .and_then(|v| {
+                let mut snapshot = v.clone();
+                // Older snapshots without peerAgents captured that capability
+                // as off; do not inherit the new configuration default.
+                if let Some(fields) = snapshot.as_object_mut() {
+                    fields
+                        .entry("peerAgents")
+                        .or_insert(serde_json::Value::Bool(false));
+                }
+                serde_json::from_value(snapshot).ok()
+            })
             .unwrap_or_else(|| self.effective_settings().agent_features)
     }
 
@@ -4060,9 +4091,9 @@ impl Services {
         // rides the same seam: a provider the daemon already observed as
         // not-logged-in must fail fast with the login remedy instead of
         // persisting a session that dies auth-required on its first turn.
-        // Installed-ness stays delegate-only (`ensure_provider_available`):
-        // direct creates on a known, enabled-but-uninstalled provider keep
-        // their existing spawn-time failure mode.
+        // Explicit/default-provider direct creates keep their existing
+        // spawn-time installed-ness check. A derived specialist pin is
+        // already checked by `plan_agent_create`, like delegation.
         if let Some(p) =
             crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
         {
@@ -4114,10 +4145,10 @@ impl Services {
         }
         // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
         // `agent.create` naming a specialist consults the same model-option >
-        // frontmatter order the delegate/wakeOrCreate seams do, keyed on the
-        // model that was actually resolved above. Those seams pre-decide the
-        // effort and pass it down as a param, so this only fires for callers
-        // that did not (`reasoning_effort_decided == false`) — which is also
+        // frontmatter order as delegation, keyed on the model that was
+        // actually resolved above. Delegate may pre-decide the effort and
+        // pass it down as a param, so this only fires for callers that did
+        // not (`reasoning_effort_decided == false`) — which is also
         // what keeps the specialist rungs ahead of the settings default below.
         let reasoning_effort = if reasoning_effort_decided {
             reasoning_effort
@@ -4430,6 +4461,32 @@ impl Services {
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
+
+        // With neither caller choice supplied, honor the specialist's
+        // provider before resolving its model/effort. Explicit model-only
+        // creates deliberately retain the settings-provider behavior, as
+        // they do in delegate. Persist the effective pin in the plan so
+        // spawn and previews use the same pair; reject unusable pins here,
+        // before even workspace.create's workspace row can be written.
+        let provider = if provider.is_none() && model.is_none() && specialist.is_some() {
+            let services = self.clone();
+            let specialist = specialist.clone();
+            let spec_wp = spec_wp.clone();
+            tokio::task::spawn_blocking(move || {
+                resolve_specialist_provider(
+                    &services,
+                    method,
+                    specialist.as_deref(),
+                    spec_wp.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("{method} provider resolution task failed: {e}"))
+            })??
+        } else {
+            provider
+        };
 
         // Resolve the default model when none is explicitly supplied, via the
         // single daemon-side resolver (steps 2–5; see
@@ -13119,68 +13176,13 @@ impl Services {
             .or(create_opts.model.clone());
         let provider = create_opts.provider.clone();
         let agent_type = create_opts.agent_type.clone();
-        // Reasoning effort (PROTOCOL §5.11), create branch only: the
-        // wake-level param wins over `create.reasoningEffort`, then the chosen
-        // model option's effort, then the specialist frontmatter. Validated
-        // against the cached catalog's `effortLevels` for the resolved model
-        // before the child is created, so a `-32602` leaves no orphan.
-        // Same effective-model rule as `agent.delegate`: fall through to the
-        // full default-model resolution (specialist pin, then the settings
-        // chain) so a `modelOptions` entry keyed on the settings default
-        // model is still matched.
-        // Same tier-walking resolvers as `agent.delegate` — blocking pool
-        // (monorepo#4148).
-        let (effort_model, reasoning_effort) = {
-            let services = self.clone();
-            let model = model.clone();
-            let specialist = specialist.clone();
-            let workspace_path = workspace_path.clone();
-            let provider = provider.clone();
-            let effort_param = input
-                .reasoning_effort
-                .clone()
-                .or_else(|| create_opts.reasoning_effort.clone());
-            tokio::task::spawn_blocking(move || {
-                let effort_model = model.or_else(|| {
-                    resolve_agent_default_model(
-                        &services,
-                        specialist.as_deref(),
-                        workspace_path.as_deref(),
-                        provider.as_deref(),
-                    )
-                });
-                // Same effective-provider rule as `agent.delegate`: without
-                // an explicit `create.provider`, `agent_create_op` persists
-                // the settings-derived default, so the model-option pair
-                // match keys on that same provider.
-                let effective_provider = provider.clone().or_else(|| {
-                    crate::agent_session::derived_default_provider(&services.effective_settings())
-                });
-                let reasoning_effort = resolve_delegate_reasoning_effort(
-                    &services,
-                    effort_param.as_deref(),
-                    specialist.as_deref(),
-                    effective_provider.as_deref(),
-                    effort_model.as_deref(),
-                    workspace_path.as_deref(),
-                );
-                (effort_model, reasoning_effort)
-            })
-            .await
-            .map_err(|e| {
-                Error::Internal(format!("agent.wakeOrCreate resolution task failed: {e}"))
-            })?
-        };
-        // A blank resolved value is an explicit clear (see
-        // `resolve_delegate_reasoning_effort`); only a real level is validated.
-        if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
-            ensure_effort_supported_by_model(
-                "agent.wakeOrCreate",
-                &self.cached_models(),
-                effort_model.as_deref(),
-                effort,
-            )?;
-        }
+        // Preserve explicit effort precedence, including a blank clear. Let
+        // the create planner derive and validate the remaining effort only
+        // after it selects the effective specialist provider and model.
+        let reasoning_effort = input
+            .reasoning_effort
+            .clone()
+            .or_else(|| create_opts.reasoning_effort.clone());
 
         // B5: rich create payload (`name` default `Task: {title}`,
         // `contextReferences` + provenance metadata folded into the persisted

@@ -245,16 +245,14 @@ pub(crate) const PRELUDE: &str = r"
 pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (reason) =>\n            host({ method: 'agent.requestDiscussion', args: { reason } }),\n        reportBlocker: (reason) =>\n            host({ method: 'agent.reportBlocker', args: { reason } }),\n";
 
 /// The `ws.agent.retire` installer lines inside [`PRELUDE`], removed when
-/// `agentFeatures.peerAgents` is off — the default, since the toggle is
-/// opt-in (a unit test guards that this segment still matches the prelude
-/// verbatim).
+/// `agentFeatures.peerAgents` is explicitly off (a unit test guards that
+/// this segment still matches the prelude verbatim).
 pub(crate) const RETIRE_PRELUDE_SEGMENT: &str = "        retire: (reason) =>\n            host({ method: 'agent.retire', args: { reason } }),\n";
 
 /// Feature-aware `ws.agent` prelude: with `agentFeatures.attentionRequests`
 /// off the two attention-request installers are omitted, and with
-/// `agentFeatures.peerAgents` off (the default — it is the one opt-in
-/// toggle) the `retire` installer is omitted, so agent code touching them
-/// fails with a clear `not a function` `TypeError`. Every other
+/// `agentFeatures.peerAgents` off the `retire` installer is omitted, so agent
+/// code touching them fails with a clear `not a function` `TypeError`. Every other
 /// `ws.agent.*` method (including `reportToParent`) stays un-gated. With
 /// both toggles on this borrows [`PRELUDE`] byte-identically.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str> {

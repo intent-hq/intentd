@@ -528,12 +528,17 @@ mod prelude_tests {
         assert!(agent::PRELUDE.contains(agent::RETIRE_PRELUDE_SEGMENT));
     }
 
-    // `peerAgents` defaults OFF (the one opt-in toggle): the default prelude
-    // omits the `retire` installer; opting in installs it, and the
-    // `ws.agent` scrubs compose independently.
+    // `peerAgents` defaults ON: the default prelude installs `retire`;
+    // opting out omits it, and the `ws.agent` scrubs compose independently.
     #[test]
     fn peer_agents_gates_retire_installer_in_prelude() {
         let js = prelude_for(&AgentFeaturesSettings::default());
+        assert!(js.contains("retire:"), "default must install retire");
+
+        let js = prelude_for(&AgentFeaturesSettings {
+            peer_agents: false,
+            ..AgentFeaturesSettings::default()
+        });
         assert!(
             !js.contains("retire:"),
             "retire installed with peerAgents off"
@@ -544,13 +549,6 @@ mod prelude_tests {
         );
 
         let js = prelude_for(&AgentFeaturesSettings {
-            peer_agents: true,
-            ..AgentFeaturesSettings::default()
-        });
-        assert!(js.contains("retire:"), "opting in must install retire");
-
-        let js = prelude_for(&AgentFeaturesSettings {
-            peer_agents: true,
             attention_requests: false,
             ..AgentFeaturesSettings::default()
         });

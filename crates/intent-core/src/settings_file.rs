@@ -1134,8 +1134,8 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on** except the opt-in `peerAgents`;
-/// changes apply to new agent sessions only.
+/// (`agentFeatures.*`). All default **on**; changes apply to new agent
+/// sessions only.
 // One bool per independent settings toggle; the flat shape IS the settings
 // file contract.
 #[expect(clippy::struct_excessive_bools)]
@@ -1187,8 +1187,8 @@ pub struct AgentFeaturesSettings {
     /// intent-hq/monorepo#2445 — before the default flipped).
     pub task_graph: bool,
     /// `agentFeatures.peerAgents` — expose independent top-level-agent
-    /// creation (`ws.agent.create({ topLevel: true })`) to agents. Defaults
-    /// **off** (opt-in), unlike the other toggles.
+    /// creation (`ws.agent.create({ topLevel: true })`) and self-retirement
+    /// (`ws.agent.retire`) to agents. Defaults **on**.
     pub peer_agents: bool,
     /// `agentFeatures.mcpTools` — expose the user's external MCP servers'
     /// tools to agents (`ws.mcp.*`). Unlike the prompt-gating toggles, this
@@ -1211,7 +1211,7 @@ impl Default for AgentFeaturesSettings {
             state_snapshot: true,
             pr_monitor: true,
             task_graph: true,
-            peer_agents: false,
+            peer_agents: true,
             mcp_tools: true,
         }
     }
@@ -1810,8 +1810,9 @@ fn toml_table_remove(table: &mut toml::Table, path: &str) -> Option<toml::Value>
 /// [`SettingsFile::load_or_init`] when no file exists. Every key appears with
 /// its default value (or a commented-out example when there is no default),
 /// annotated with its catalog label and description — except
-/// `agentFeatures.taskGraph`, deliberately not seeded so configs without the
-/// key track default flips automatically (intent-hq/monorepo#2643).
+/// `agentFeatures.taskGraph` (intent-hq/monorepo#2643) and
+/// `agentFeatures.peerAgents`, deliberately not seeded so configs without
+/// those keys track default flips automatically.
 /// Parsing this template must yield exactly [`SettingsFile::default`]
 /// (enforced by a unit test).
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret settings).
@@ -2381,7 +2382,7 @@ mod tests {
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
         assert!(d.agent_features.state_snapshot);
-        assert!(!d.agent_features.peer_agents);
+        assert!(d.agent_features.peer_agents);
         assert_eq!(d.wake_resume.enabled, DEFAULT_WAKE_RESUME_ENABLED);
         assert_eq!(
             d.wake_resume.threshold_seconds,
@@ -2421,8 +2422,7 @@ mod tests {
         assert!(parsed.agent_features.state_snapshot);
         assert!(parsed.agent_features.pr_monitor);
         assert!(parsed.agent_features.task_graph);
-        // peerAgents is the one default-off toggle.
-        assert!(!parsed.agent_features.peer_agents);
+        assert!(parsed.agent_features.peer_agents);
     }
 
     #[test]
@@ -2450,6 +2450,33 @@ mod tests {
         let parsed = SettingsFile::parse_str("[agentFeatures]\ntaskGraph = false\n")
             .expect("override parses");
         assert!(!parsed.agent_features.task_graph);
+    }
+
+    #[test]
+    fn peer_agents_defaults_on_and_opts_out() {
+        for config in [
+            "",
+            "[agentFeatures]\n",
+            "[agentFeatures]\nhostExec = false\n",
+        ] {
+            let parsed = SettingsFile::parse_str(config).expect("config parses");
+            assert!(parsed.agent_features.peer_agents);
+        }
+        // The shipped template leaves the toggle unset so new files track
+        // the default without recording an explicit user choice.
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("peerAgents"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert!(templated.agent_features.peer_agents);
+
+        for enabled in [false, true] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agentFeatures]\npeerAgents = {enabled}\n"))
+                    .expect("explicit setting parses");
+            assert_eq!(parsed.agent_features.peer_agents, enabled);
+            let saved = toml::to_string(&parsed).expect("serialize settings");
+            let reloaded = SettingsFile::parse_str(&saved).expect("saved settings parse");
+            assert_eq!(reloaded.agent_features.peer_agents, enabled);
+        }
     }
 
     #[test]

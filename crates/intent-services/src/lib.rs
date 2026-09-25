@@ -11644,14 +11644,9 @@ pub(crate) fn reject_compound_model(param: &str, value: &str) -> Result<()> {
 
 /// Resolve the specialist preview provider context (`specialist.get`/`.list`
 /// optional `provider` param): a supplied id must be a registered provider
-/// (unknown → `-32602` via `InvalidParams`); absent/empty defaults to the
-/// settings-derived default provider (`model.defaultProvider`). `None` when
-/// neither is set (monorepo#3044: no positional last resort) — the preview
-/// decoration is skipped and clients render "Provider default".
-fn specialist_preview_provider(
-    services: &Services,
-    provider: Option<String>,
-) -> Result<Option<String>> {
+/// (unknown → `-32602` via `InvalidParams`). Leave absent/empty unset so
+/// decoration resolves each specialist's own pin before the settings default.
+fn specialist_preview_provider(provider: Option<String>) -> Result<Option<String>> {
     match nonempty_owned(provider) {
         Some(p) => {
             if intent_providers::find_provider(&p).is_none() {
@@ -11659,9 +11654,7 @@ fn specialist_preview_provider(
             }
             Ok(Some(p))
         }
-        None => Ok(agent_session::derived_default_provider(
-            &services.effective_settings(),
-        )),
+        None => Ok(None),
     }
 }
 
@@ -11677,15 +11670,12 @@ fn specialist_preview_provider(
 /// matching `{ provider, model }`, else the `reasoningEffort` frontmatter
 /// scalar — i.e. the effort a no-`reasoningEffort` delegate would apply.
 ///
-/// `provider` is the caller/settings context from
-/// [`specialist_preview_provider`]; `None` (no `provider` param, no
-/// settings-derived default — monorepo#3044) falls back to the specialist's
-/// OWN provider pin (frontmatter `codingAgent`, or a compound `model`
+/// `provider` is the explicit caller context from
+/// [`specialist_preview_provider`]; `None` resolves the specialist's
+/// own provider pin first (frontmatter `codingAgent`, or a compound `model`
 /// prefix, via [`agent_ops::resolve_delegate_provider_preview`]) — the
-/// provider a no-model `agent.delegate` would actually spawn on — so a
-/// pinned specialist never previews "Provider default" while creation would
-/// pin a concrete provider. A specialist with no pin of its own stays
-/// undecorated.
+/// provider a no-model create/delegate would actually spawn on — then the
+/// settings-derived default. With neither, the specialist stays undecorated.
 fn decorate_specialist_resolved(
     services: &Services,
     def: &mut serde_json::Value,
@@ -18468,7 +18458,7 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let provider = specialist_preview_provider(&services, provider)?;
+                let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);
                 let mut result = services.specialists_service().list(ws_path)?;
                 if let Some(specs) = result
@@ -18527,7 +18517,7 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let provider = specialist_preview_provider(&services, provider)?;
+                let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);
                 let mut result = services.specialists_service().get(&id, ws_path)?;
                 if let Some(def) = result.get_mut("specialist") {
