@@ -1038,23 +1038,19 @@ mod tests {
     /// The unbound-refusal tests observe the production behaviour — the
     /// plain `Forbidden` — which the armed seam turns into an abort. CI's
     /// coverage jobs run the suite with [`ASSERT_BOUND_CALLER_ENV`] set, so
-    /// when it is, this re-runs `test` (a name under `capability::tests`) in
+    /// when it is, this re-runs `test` (its full test-harness name) in
     /// a copy of this binary with the variable removed, asserts that it
     /// passed, and answers `true` so the caller returns; unarmed (locally,
     /// and inside that child) it answers `false` and the caller runs its
     /// body inline. A re-exec rather than `remove_var`: the harness is
     /// multi-threaded.
-    fn reran_unarmed(test: &str) -> bool {
+    pub(super) fn reran_unarmed(test: &str) -> bool {
         if std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none() {
             return false;
         }
         let exe = std::env::current_exe().expect("test binary");
         let out = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                &format!("capability::tests::{test}"),
-                "--nocapture",
-            ])
+            .args(["--exact", test, "--nocapture"])
             .env_remove(ASSERT_BOUND_CALLER_ENV)
             .output()
             .expect("run unarmed child");
@@ -1077,7 +1073,7 @@ mod tests {
     async fn unbound_caller_is_forbidden_on_every_gate() {
         // Unarmed: the production behaviour under test is the refusal, not
         // the test seam's abort.
-        if reran_unarmed("unbound_caller_is_forbidden_on_every_gate") {
+        if reran_unarmed("capability::tests::unbound_caller_is_forbidden_on_every_gate") {
             return;
         }
         let tmp = TempDb::new();
@@ -1191,7 +1187,9 @@ mod tests {
     /// `InvalidParams`; the collaborator passes the same calls.
     #[tokio::test]
     async fn presence_entry_points_fail_closed_unbound_and_refuse_non_members() {
-        if reran_unarmed("presence_entry_points_fail_closed_unbound_and_refuse_non_members") {
+        if reran_unarmed(
+            "capability::tests::presence_entry_points_fail_closed_unbound_and_refuse_non_members",
+        ) {
             return;
         }
         let tmp = TempDb::new();

@@ -184,6 +184,11 @@ async fn host_member_lifecycle_uses_existing_archive_and_incremental_delete() {
 
 #[tokio::test]
 async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
+    if super::tests::reran_unarmed(
+        "capability::host_role_tests::workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities",
+    ) {
+        return;
+    }
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let shared = WorkspaceId::from("shared");
