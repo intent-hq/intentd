@@ -46754,6 +46754,7 @@ mod harness_versioning {
         // spot-check the defaults (all on, taskGraph included).
         assert_eq!(features["taskGraph"], true);
         assert_eq!(features["backgroundHooks"], true);
+        assert_eq!(features["peerAgents"], true);
 
         // Persisted, not projected: the row itself carries the stamp.
         let id = AgentId::from(agent["id"].as_str().unwrap());
@@ -46764,6 +46765,7 @@ mod harness_versioning {
         );
         let persisted = session.harness_features.expect("persisted snapshot");
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
+        assert_eq!(persisted["peerAgents"], serde_json::json!(true));
     }
 
     /// Delegation mints LATEST, never inherits: a child created by a parent
@@ -46862,12 +46864,13 @@ mod harness_versioning {
         let created = create_agent(&svc, &ws, None).await;
         let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-        // Pin the persisted snapshot to a non-default shape (hostExec off —
-        // live default is on).
+        // Pin the persisted snapshot to explicit opt-outs while the live
+        // defaults are on.
         let mut pinned =
             serde_json::to_value(intent_core::settings_file::AgentFeaturesSettings::default())
                 .unwrap();
         pinned["hostExec"] = serde_json::json!(false);
+        pinned["peerAgents"] = serde_json::json!(false);
         sqlx::query("UPDATE agent_session SET harness_features = ? WHERE id = ?")
             .bind(pinned.to_string())
             .bind(&id.0)
@@ -46882,9 +46885,14 @@ mod harness_versioning {
             "respawn read follows the persisted snapshot (hostExec off), not live settings"
         );
         assert!(
+            !features.peer_agents,
+            "respawn preserves a session's captured peerAgents opt-out"
+        );
+        assert!(
             svc.effective_settings().agent_features.host_exec,
             "live settings still default hostExec on — the snapshot diverged deliberately"
         );
+        assert!(svc.effective_settings().agent_features.peer_agents);
 
         // Legacy NULL-snapshot rows fall back to the live settings.
         sqlx::query("UPDATE agent_session SET harness_features = NULL WHERE id = ?")

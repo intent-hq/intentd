@@ -2,7 +2,7 @@
 //
 // Drives the full toggle flow over the real WSS transport:
 //   1. `settings.get` / `settings.update` / `settings.reset` round-trip for all
-//      eleven `agentFeatures.*` paths (defaults on).
+//      tested `agentFeatures.*` paths (defaults on).
 //   2. Full session (defaults on): assembled system prompt CONTAINS the gated
 //      sections, the per-agent MCP bridge advertises the full `workspace_api`
 //      surface, and the gated `host({...})` methods dispatch successfully.
@@ -43,9 +43,8 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-/// The eleven `agentFeatures.*` settings paths with their defaults — all on
-/// (`taskGraph` included since the default flip; intent-hq/monorepo#2445).
-const FEATURE_PATHS: [(&str, bool); 11] = [
+/// The tested `agentFeatures.*` settings paths with their defaults — all on.
+const FEATURE_PATHS: [(&str, bool); 12] = [
     ("agentFeatures.backgroundHooks", true),
     ("agentFeatures.hostExec", true),
     ("agentFeatures.scripts", true),
@@ -57,6 +56,7 @@ const FEATURE_PATHS: [(&str, bool); 11] = [
     ("agentFeatures.stateSnapshot", true),
     ("agentFeatures.prMonitor", true),
     ("agentFeatures.taskGraph", true),
+    ("agentFeatures.peerAgents", true),
 ];
 
 struct Daemon {
@@ -394,7 +394,7 @@ impl BridgeClient {
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: settings round-trip for all nine agentFeatures.* paths over WSS.
+// Test 1: settings round-trip for the agentFeatures.* paths over WSS.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1103,7 +1103,7 @@ async fn specialist_model_options_surface_in_bridge_description() {
 
 #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 #[tokio::test]
-async fn create_top_level_creates_independent_agent_over_wss() {
+async fn peer_agents_default_creation_retirement_and_opt_out_over_wss() {
     let Some(script) = gate("create topLevel E2E") else {
         return;
     };
@@ -1156,7 +1156,7 @@ async fn create_top_level_creates_independent_agent_over_wss() {
     .await;
     assert_eq!(toon_off["result"]["applied"][0]["value"], json!(false));
 
-    // ===== Session A: peerAgents at its default (off) =====
+    // ===== Session A: peerAgents at its default (on) =====
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -1183,81 +1183,32 @@ async fn create_top_level_creates_independent_agent_over_wss() {
         .to_string();
     await_stream_end(&mut sub, &agent_a).await;
 
-    // A's bridge (captured with the default-off gate) denies topLevel with
-    // the explicit settings error; plain create is unaffected by the gate.
+    // No peerAgents override: the first session advertises retirement and
+    // can create an independent top-level agent using the shipped default.
     let configs_a = mcp_config_files(&data_dir);
     assert_eq!(configs_a.len(), 1, "one agent → one config: {configs_a:?}");
     let mut bridge_a = BridgeClient::connect(&bridge_addr_from_config(&configs_a[0])).await;
-    let (err, text) = bridge_a
-        .call_js(
-            "return await ws.agent.create('DeniedPeer', 'nope', { topLevel: true, model: 'default', provider: 'mock' })",
-        )
-        .await;
-    assert!(err, "topLevel must be denied with peerAgents off: {text}");
-    assert!(
-        text.contains("agentFeatures.peerAgents = false"),
-        "denial must name the toggle: {text}"
-    );
+    assert!(bridge_a
+        .workspace_api_description()
+        .await
+        .contains("ws.agent.retire"));
 
-    // ===== Flip peerAgents on; session B (created after) gets the gate =====
-    let flip = wss_rpc(
-        &mut rpc,
-        20,
-        "settings.update",
-        json!({ "changes": [{ "path": "agentFeatures.peerAgents", "value": true }] }),
-    )
-    .await;
-    assert_eq!(flip["result"]["applied"][0]["value"], json!(true));
-
-    let created_b = wss_rpc(
-        &mut rpc,
-        30,
-        "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "Sponsor B", "model": "default", "provider": "mock" }),
-    )
-    .await;
-    let agent_b = created_b["result"]["agent"]["id"]
-        .as_str()
-        .expect("agent B id")
-        .to_string();
-    let sent = wss_rpc(
-        &mut rpc,
-        31,
-        "agent.sendMessage",
-        json!({ "workspaceId": &ws_id, "agentId": &agent_b, "content": "say done" }),
-    )
-    .await;
-    assert_eq!(sent["result"]["success"], true, "sendMessage ok: {sent}");
-    await_stream_end(&mut sub, &agent_b).await;
-
-    let configs_b = mcp_config_files(&data_dir);
-    assert_eq!(
-        configs_b.len(),
-        2,
-        "two agents → two configs: {configs_b:?}"
-    );
-    let config_b = configs_b
-        .iter()
-        .find(|p| !configs_a.contains(p))
-        .expect("new mcp config for agent B");
-    let mut bridge_b = BridgeClient::connect(&bridge_addr_from_config(config_b)).await;
-
-    // The MCP front door: B creates an independent top-level agent. The tool
+    // The MCP front door: A creates an independent top-level agent. The tool
     // result carries `sponsorAgentId` and — the no-watch seam — NO
     // `subscriptionId`.
-    let (err, text) = bridge_b
+    let (err, text) = bridge_a
         .call_js(
             "return await ws.agent.create('PeerAgent', 'independent hello', { topLevel: true, model: 'default', provider: 'mock' })",
         )
         .await;
-    assert!(!err, "topLevel create must succeed on B: {text}");
+    assert!(!err, "topLevel create must succeed on A: {text}");
     let result: Value = serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("topLevel create result must be JSON ({e}): {text}"));
     assert_eq!(result["ok"], json!(true), "result ok: {result}");
     assert_eq!(result["name"], json!("PeerAgent"));
     assert_eq!(
         result["sponsorAgentId"],
-        json!(&agent_b),
+        json!(&agent_a),
         "result must carry the sponsor attribution: {result}"
     );
     assert!(
@@ -1265,18 +1216,6 @@ async fn create_top_level_creates_independent_agent_over_wss() {
         "topLevel create must NOT register a completion watch: {result}"
     );
     let peer_id = result["agentId"].as_str().expect("peer id").to_string();
-
-    // Control on the SAME bridge: a plain (sub-agent) create still
-    // auto-subscribes — the no-watch behavior is specific to topLevel.
-    let (err, text) = bridge_b
-        .call_js("return await ws.agent.create('ControlChild', 'hi', { model: 'default', provider: 'mock' })")
-        .await;
-    assert!(!err, "plain create must succeed on B: {text}");
-    let control: Value = serde_json::from_str(&text).expect("plain create result JSON");
-    assert!(
-        control["subscriptionId"].is_string(),
-        "plain create must keep the completion watch: {control}"
-    );
 
     // The persisted peer row over WSS `agent.get`: parentless (no
     // `parentAgentId`, no `createdByAgentId`), foreground, sponsor-attributed.
@@ -1290,6 +1229,7 @@ async fn create_top_level_creates_independent_agent_over_wss() {
     )
     .await;
     let peer = &got["result"]["agent"];
+    assert_eq!(peer["harnessFeatures"]["peerAgents"], true);
     assert!(
         peer.get("parentAgentId").is_none(),
         "peer must persist parentless: {peer}"
@@ -1300,7 +1240,7 @@ async fn create_top_level_creates_independent_agent_over_wss() {
     );
     assert_eq!(
         peer["metadata"]["sponsorAgentId"],
-        json!(&agent_b),
+        json!(&agent_a),
         "peer metadata must carry the sponsor attribution: {peer}"
     );
     assert_eq!(
@@ -1323,7 +1263,7 @@ async fn create_top_level_creates_independent_agent_over_wss() {
         .as_str()
         .expect("initialMessage persisted");
     assert!(
-        initial.starts_with("[You were spawned as an independent top-level agent by Sponsor B ("),
+        initial.starts_with("[You were spawned as an independent top-level agent by Sponsor A ("),
         "persisted kickoff must open with the sponsor preamble: {initial}"
     );
     assert!(
@@ -1345,26 +1285,169 @@ async fn create_top_level_creates_independent_agent_over_wss() {
         .as_array()
         .expect("messages array")
         .iter()
-        .find(|m| {
-            m["role"] == "user"
-                && m["contentBlocks"][0]["text"]
-                    .as_str()
-                    .is_some_and(|t| t.starts_with("[You were spawned"))
-        })
+        .find(|m| m["role"] == "user" && m["metadata"]["fromAgentId"] == agent_a)
         .unwrap_or_else(|| panic!("kickoff row persisted: {conv}"))
         .clone();
     assert_eq!(
         row["contentBlocks"][0]["text"].as_str().expect("text"),
-        initial,
-        "delivered kickoff must equal the persisted initialMessage"
+        format!("[MESSAGE FROM AGENT Sponsor A ({agent_a})]\n\n{initial}"),
+        "delivered kickoff must carry the sender header and persisted initialMessage"
     );
     assert_eq!(
         row["metadata"],
         json!({
             "type": "agent_message",
-            "fromAgentId": agent_b,
-            "fromAgentName": "Sponsor B",
+            "fromAgentId": agent_a,
+            "fromAgentName": "Sponsor A",
         }),
         "kickoff must carry the daemon-stamped sender attribution: {row}"
+    );
+
+    // The peer's own session also captured the default before any override.
+    let configs_peer = mcp_config_files(&data_dir);
+    assert_eq!(
+        configs_peer.len(),
+        2,
+        "peer bridge created: {configs_peer:?}"
+    );
+    let config_peer = configs_peer
+        .iter()
+        .find(|p| !configs_a.contains(p))
+        .expect("peer config");
+    let mut bridge_peer = BridgeClient::connect(&bridge_addr_from_config(config_peer)).await;
+
+    // Control on the SAME bridge: a plain (sub-agent) create still
+    // auto-subscribes — the no-watch behavior is specific to topLevel.
+    let (err, text) = bridge_a
+        .call_js("return await ws.agent.create('ControlChild', 'hi', { model: 'default', provider: 'mock' })")
+        .await;
+    assert!(!err, "plain create must succeed on A: {text}");
+    let control: Value = serde_json::from_str(&text).expect("plain create result JSON");
+    assert!(
+        control["subscriptionId"].is_string(),
+        "plain create must keep the completion watch: {control}"
+    );
+
+    let control_id = control["agentId"].as_str().expect("control child id");
+    await_stream_end(&mut sub, control_id).await;
+
+    // ===== Explicit opt-out: newly created session B loses both surfaces =====
+    let flip = wss_rpc(
+        &mut rpc,
+        50,
+        "settings.update",
+        json!({ "changes": [{ "path": "agentFeatures.peerAgents", "value": false }] }),
+    )
+    .await;
+    assert_eq!(flip["result"]["applied"][0]["value"], json!(false));
+    let configs_before_b = mcp_config_files(&data_dir);
+    let created_b = wss_rpc(
+        &mut rpc,
+        51,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "Opted out B", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_b = created_b["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent B id");
+    assert_eq!(
+        created_b["result"]["agent"]["harnessFeatures"]["peerAgents"],
+        false
+    );
+    let sent = wss_rpc(
+        &mut rpc,
+        52,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": agent_b, "content": "say done" }),
+    )
+    .await;
+    assert_eq!(sent["result"]["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, agent_b).await;
+    let configs_b = mcp_config_files(&data_dir);
+    let config_b = configs_b
+        .iter()
+        .find(|p| !configs_before_b.contains(p))
+        .expect("new config for B");
+    let mut bridge_b = BridgeClient::connect(&bridge_addr_from_config(config_b)).await;
+    assert!(!bridge_b
+        .workspace_api_description()
+        .await
+        .contains("ws.agent.retire"));
+    let (err, text) = bridge_b.call_js("return typeof ws.agent.retire;").await;
+    assert!(!err, "binding probe succeeds: {text}");
+    assert_eq!(text, "\"undefined\"");
+    for code in [
+        "return await ws.agent.create('DeniedPeer', 'nope', { topLevel: true, model: 'default', provider: 'mock' });",
+        "return await host({ method: 'agent.retire', args: {} });",
+    ] {
+        let (err, text) = bridge_b.call_js(code).await;
+        assert!(err, "explicit opt-out must deny the call: {text}");
+        assert!(text.contains("agentFeatures.peerAgents = false"), "denial must name the toggle: {text}");
+    }
+
+    // The existing default-enabled peer retains its captured feature flag:
+    // it can retire even though the live setting is now false.
+    let (err, text) = bridge_peer
+        .call_js("return await ws.agent.retire('default-enabled retirement');")
+        .await;
+    assert!(!err, "default-enabled peer can retire: {text}");
+    let retired: Value = serde_json::from_str(&text).expect("retire result JSON");
+    assert_eq!(retired["ok"], true);
+    assert_eq!(retired["retired"], true);
+    assert_eq!(retired["agentId"], peer_id);
+    assert!(retired["retiredAt"].is_string());
+    let retired_event = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let event = &frame["params"]["event"];
+            if event["type"] == "agent:retired" && event["data"]["agentId"] == peer_id {
+                assert_eq!(frame["jsonrpc"], "2.0");
+                return event.clone();
+            }
+        }
+    })
+    .await
+    .expect("peer retirement event");
+    assert_eq!(retired_event["data"]["agentName"], "PeerAgent");
+    assert_eq!(
+        retired_event["data"]["reason"],
+        "default-enabled retirement"
+    );
+    assert_eq!(retired_event["data"]["retiredAt"], retired["retiredAt"]);
+    let listed = wss_rpc(&mut rpc, 53, "agent.list", json!({ "workspaceId": &ws_id })).await;
+    assert!(listed["result"]["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .all(|a| a["id"] != peer_id));
+    let got = wss_rpc(
+        &mut rpc,
+        54,
+        "agent.get",
+        json!({ "workspaceId": &ws_id, "agentId": &peer_id }),
+    )
+    .await;
+    assert_eq!(got["result"]["agent"]["retiredAt"], retired["retiredAt"]);
+
+    // Reset returns the shipped default without changing B's captured opt-out.
+    let reset = wss_rpc(
+        &mut rpc,
+        55,
+        "settings.reset",
+        json!({ "path": "agentFeatures.peerAgents" }),
+    )
+    .await;
+    assert_eq!(reset["result"]["value"], true);
+    let (err, text) = bridge_b
+        .call_js("return await ws.agent.create('StillDeniedPeer', 'nope', { topLevel: true });")
+        .await;
+    assert!(
+        err,
+        "existing opted-out session stays disabled after reset: {text}"
+    );
+    assert!(
+        text.contains("agentFeatures.peerAgents = false"),
+        "captured opt-out denial: {text}"
     );
 }
