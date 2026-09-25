@@ -64,19 +64,19 @@ pub const CODEX_ACP_PREREQUISITE_ERROR: &str =
      Install Node.js (with npm) on the daemon host and try again.";
 
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
-/// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
-/// bumping the version is a deliberate code change. Also feeds the pi
-/// model-catalog probe in `intent-services::provider_models`.
-pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.33";
+/// `npx -y`). This is the only production pin; bumping the version is a
+/// deliberate code change. Also feeds the pi model-catalog probe in
+/// `intent-services::provider_models`.
+pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.34";
 
 /// Minimum `pi` CLI version the pinned [`PI_ACP_NPX_PACKAGE`] adapter
-/// requires. Feeds the pure version-gate decision in
-/// [`crate::version_gate`]; re-check when bumping the pin.
-pub const PI_CLI_MIN_VERSION: &str = "0.80.4";
+/// requires for model-specific `get_available_thinking_levels`. Feeds the pure
+/// version-gate decision in [`crate::version_gate`]; re-check when bumping the pin.
+pub const PI_CLI_MIN_VERSION: &str = "0.81.0";
 
 /// Pi CLI version requirement for user-facing messages. Must match
 /// [`PI_CLI_MIN_VERSION`]; re-check when bumping the pin.
-pub const PI_CLI_REQUIREMENT: &str = "Pi CLI 0.80.4+";
+pub const PI_CLI_REQUIREMENT: &str = "Pi CLI 0.81.0+";
 
 /// Minimum `auggie` CLI version the ACP agent-spawn path requires. The daemon
 /// launches auggie with `--acp --allow-indexing --model … --remove-tool …`;
@@ -538,7 +538,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         runtime: ProviderRuntime::Node,
         can_be_disabled: true,
-        // pi-acp (0.0.33) has no `_meta` system-prompt path and no rules/MCP
+        // pi-acp (0.0.34) has no `_meta` system-prompt path and no rules/MCP
         // CLI flags (it advertises `mcpCapabilities: { http: false, sse:
         // false }` and does not wire `session/new` `mcpServers` into the pi
         // process), so the assembled prompt is prepended on the first turn.
@@ -551,7 +551,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // The adapter's `session/new` result advertises the model as a
         // `configOptions[id="model"]` select; the stored model is applied
         // post-session via `session/set_config_option` (verified against
-        // pi-acp@0.0.33's `setSessionConfigOption`; no CLI model flag).
+        // pi-acp@0.0.34's `setSessionConfigOption`; no CLI model flag).
         supports_config_option_model: true,
         login_docs_url: Some("https://pi.dev/docs/latest/quickstart"),
         npx_only_package: Some(PI_ACP_NPX_PACKAGE),

@@ -1866,11 +1866,11 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
 
-    // Fake `pi` that reports a version older than PI_CLI_MIN_VERSION.
+    // The previously supported minimum lacks the 0.81.0 thinking-level RPC.
     let fake_pi = data_dir.join("fake-pi");
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.79.0\n").expect("write fake pi");
+        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.80.4\n").expect("write fake pi");
         std::fs::set_permissions(&fake_pi, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake pi");
     }
@@ -1912,7 +1912,7 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
     assert_eq!(pi["cliCommand"], fake_pi_str, "{pi}");
     assert_eq!(pi["cliResolved"], true, "{pi}");
     assert_eq!(pi["cliResolvedPath"], fake_pi_str, "{pi}");
-    assert_eq!(pi["cliVersion"], "0.79.0", "{pi}");
+    assert_eq!(pi["cliVersion"], "0.80.4", "{pi}");
     assert_eq!(pi["cliVersionOk"], false, "{pi}");
     assert_eq!(
         pi["cliRequirement"],
@@ -1922,7 +1922,7 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
     let reason = pi["unavailableReason"]
         .as_str()
         .expect("gated pi must carry unavailableReason");
-    assert!(reason.contains("0.79.0"), "{pi}");
+    assert!(reason.contains("0.80.4"), "{pi}");
     assert!(
         reason.contains(intent_providers::PI_CLI_REQUIREMENT),
         "{pi}"
