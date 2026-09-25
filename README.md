@@ -383,19 +383,24 @@ database (`intentd.db`) and the socket (`intentd.sock`).
 
 ### Codex diagnostics
 
-`intentd doctor` reports the Codex adapter Intent selects: a `providers.paths.codex`
-override, local discovery, or the managed npm fallback. The configured managed package
-pin is configuration, not a measured version. Adapter and runtime versions are measured
-separately when their local package entrypoints can be verified; opaque wrappers,
-missing runtimes, and failed checks remain explicitly unknown. Named-binary availability
-does not establish runtime provenance. An unrelated `codex` on PATH is never used as
-evidence of the selected adapter's bundled runtime. Managed launches remove `CODEX_PATH`
-and `CODEX_CONFIG`; local launches retain production's runtime override policy.
+`intentd doctor` reports the pinned managed Codex ACP adapter and whether Node.js and
+npx are available on the daemon host. Both are required. Production selection ignores
+`providers.paths.codex`, local `codex-acp` installations on PATH, and `CODEX_PATH`.
+The adapter receives the daemon-owned, fixed `CODEX_CONFIG` policy that disables
+built-in subagents; inherited configuration is replaced, not merged.
 
-On macOS, the first version reports the selected launch, configured managed pin, and
-the selected local adapter's package version when its declared bin can be verified.
-That version is labeled **metadata, not measured**. It does not execute Node, the
-adapter, or Codex, and does not infer a runtime from PATH or neighboring packages.
+The configured managed package pin is configuration, not a measured version. Ordinary
+doctor does not resolve or install the package, so adapter and runtime versions remain
+unknown. Package metadata applies only to an established selected entrypoint: a declared
+package version is labeled **metadata, not measured** and does not prove the running
+adapter or bundled runtime version. On Linux and Windows, the opt-in check below measures
+adapter and runtime versions separately after verifying their package entrypoints;
+opaque wrappers, missing runtimes, and failed checks remain explicitly unknown. An
+unrelated `codex` on PATH never supplies evidence of the selected adapter's runtime.
+
+On macOS, diagnostics report the selected launch and configured managed pin without
+resolving the package or inspecting ignored local adapters. They do not execute Node,
+the adapter, or Codex, or infer a runtime from PATH or neighboring packages.
 Version and catalog process probes are explicitly unsupported because detached-child
 cleanup cannot be guaranteed. Even with `--codex-models`, macOS performs no diagnostic
 authentication capture, npm resolution, or temporary probe setup; catalog comparison
