@@ -9418,6 +9418,14 @@ impl Services {
                 )
                 .await
         } else {
+            // The runtime send path already owns admission. Its store-only
+            // counterpart must fence the actual destination before persisting.
+            let session = self
+                .store
+                .get_agent_session_summary(&parent_agent_id)
+                .await?;
+            let workspace_id = &session.workspace_id;
+            let _mutation = self.workspace_mutations.enter(workspace_id)?;
             // Delivery-time unblocked hints (monorepo#2044): the
             // store-only persist IS this path's delivery, so the section
             // is resolved here — matching the manager path's direct-send

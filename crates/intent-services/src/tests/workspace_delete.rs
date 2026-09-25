@@ -13,6 +13,45 @@ use tokio::sync::Notify;
 
 const ROWS: i64 = 1_201;
 
+#[derive(Clone, Copy, Debug)]
+enum TranscriptMutation {
+    Append,
+    Replace,
+}
+
+impl TranscriptMutation {
+    async fn run(
+        self,
+        svc: &Services,
+        agent: &AgentId,
+        requested_workspace: &WorkspaceId,
+    ) -> intent_core::Result<serde_json::Value> {
+        match self {
+            Self::Append => {
+                svc.agent_append_message(
+                    agent.clone(),
+                    Some(requested_workspace.clone()),
+                    "user".into(),
+                    json!([{"type":"text", "text":"late append"}]),
+                    None,
+                )
+                .await
+            }
+            Self::Replace => {
+                let messages: Vec<_> = (0..ROWS)
+                    .map(|n| json!({"role":"user", "contentBlocks":[{"type":"text", "text":format!("replacement {n}")}]}))
+                    .collect();
+                svc.agent_replace_messages(
+                    agent.clone(),
+                    Some(requested_workspace.clone()),
+                    json!(messages),
+                )
+                .await
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct DeleteGate(Arc<Mutex<Option<DeletePause>>>);
 
@@ -1003,4 +1042,432 @@ async fn admitted_task_update_keeps_ownership_through_linked_status_materializat
     deleting.await.unwrap();
     let mut conn = h.store.write_pool().acquire().await.unwrap();
     conn.lock_handle().await.unwrap().remove_update_hook();
+}
+
+async fn transcript_mutation_cannot_refill_completed_sweep(mutation: TranscriptMutation) {
+    let h = Harness::new().await;
+    let (ws, agents) = h.workspace("transcript-delete", 1).await;
+    let agent = &agents[0];
+    let (keeper, _) = h.workspace("transcript-keeper", 0).await;
+    sqlx::query("INSERT INTO agent_queue(id,agent_id,position,payload,created_at) VALUES('gate',?,0,'{}','t0')")
+        .bind(&agent.0).execute(h.store.write_pool()).await.unwrap();
+    sqlx::query("CREATE TABLE cascade_audit(messages INTEGER, payloads INTEGER); CREATE TRIGGER before_session_delete BEFORE DELETE ON agent_session BEGIN INSERT INTO cascade_audit SELECT (SELECT COUNT(*) FROM agent_message WHERE agent_id=OLD.id), (SELECT COUNT(*) FROM agent_message_payload WHERE agent_id=OLD.id); END")
+        .execute(h.store.write_pool()).await.unwrap();
+    sqlx::query("CREATE TABLE keeper_progress(root_present INTEGER); CREATE TRIGGER capture_keeper_progress AFTER INSERT ON note WHEN NEW.workspace_id='transcript-keeper' BEGIN INSERT INTO keeper_progress SELECT COUNT(*) FROM workspace WHERE id='transcript-delete'; END")
+        .execute(h.store.write_pool()).await.unwrap();
+    let reached = Arc::new(Notify::new());
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    {
+        let mut conn = h.store.write_pool().acquire().await.unwrap();
+        let mut handle = conn.lock_handle().await.unwrap();
+        let reached = reached.clone();
+        let mut blocked = Some(blocked);
+        handle.set_update_hook(move |update| {
+            if update.table == "agent_queue"
+                && update.operation == sqlx::sqlite::SqliteOperation::Delete
+            {
+                if let Some(blocked) = blocked.take() {
+                    reached.notify_one();
+                    blocked.recv_timeout(Duration::from_secs(30)).unwrap();
+                }
+            }
+        });
+    }
+    let mut deleting = h.svc.delete_workspace(ws.clone());
+    tokio::select! {
+        () = reached.notified() => {},
+        result = &mut deleting => panic!("deletion missed the post-sweep gate: {result:?}"),
+    }
+    let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_message WHERE agent_id=?")
+        .bind(&agent.0)
+        .fetch_one(h.store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(messages, 0, "message sweep has committed");
+    assert_eq!(h.remaining(&ws).await, 0, "payload sweep has committed");
+    assert!(h.svc.workspace_mutations.enter(&ws).is_err());
+
+    // Deliberately supply a different workspace: admission must follow the
+    // agent's persisted home, not this optional caller hint. Drive the public
+    // operation through its async reads while the worker holds the write pool.
+    let mut writing = Box::pin(mutation.run(&h.svc, agent, &keeper));
+    let mut early = None;
+    for _ in 0..100 {
+        if let std::task::Poll::Ready(result) =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(writing.as_mut().poll(cx))).await
+        {
+            early = Some(result);
+            break;
+        }
+        sqlx::query("SELECT 1")
+            .execute(h.store.read_pool())
+            .await
+            .unwrap();
+    }
+    let mut unrelated = h.svc.create_note(
+        keeper.clone(),
+        intent_core::NoteCreate {
+            title: "Still writable".into(),
+            ..Default::default()
+        },
+        None,
+        None,
+    );
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(unrelated.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    release.send(()).unwrap();
+    let finish_write = async {
+        match early {
+            Some(result) => result,
+            None => writing.await,
+        }
+    };
+    // Both futures must progress after releasing the SQLite worker. Awaiting
+    // the writer alone can deadlock behind a connection still owned by delete.
+    let (deleted, result, unrelated) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(deleting, finish_write, unrelated)
+    })
+    .await
+    .unwrap();
+    {
+        let mut conn = h.store.write_pool().acquire().await.unwrap();
+        conn.lock_handle().await.unwrap().remove_update_hook();
+    }
+    deleted.unwrap();
+    unrelated.unwrap();
+    let cascade: (i64, i64) = sqlx::query_as("SELECT messages,payloads FROM cascade_audit")
+        .fetch_one(h.store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        cascade,
+        (0, 0),
+        "{mutation:?} refilled swept history; admitted={}",
+        result.is_ok()
+    );
+    assert!(
+        matches!(result, Err(Error::NotFound(ref reason)) if reason.contains("being deleted")),
+        "{mutation:?} must reject at admission: {result:?}"
+    );
+    let present: i64 = sqlx::query_scalar("SELECT root_present FROM keeper_progress")
+        .fetch_one(h.store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        present, 1,
+        "another workspace stays writable during deletion"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn transcript_append_cannot_refill_completed_sweep() {
+    transcript_mutation_cannot_refill_completed_sweep(TranscriptMutation::Append).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn transcript_replace_cannot_refill_completed_sweep() {
+    transcript_mutation_cannot_refill_completed_sweep(TranscriptMutation::Replace).await;
+}
+
+async fn admitted_transcript_finishes_before_delete(mutation: TranscriptMutation) {
+    let h = Harness::new().await;
+    let (ws, _) = h.workspace("admitted-transcript", 0).await;
+    let agent = h.create(&ws, "writer").await.unwrap();
+    let reached = Arc::new(Notify::new());
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    {
+        let mut conn = h.store.write_pool().acquire().await.unwrap();
+        let mut handle = conn.lock_handle().await.unwrap();
+        let reached = reached.clone();
+        let mut blocked = Some(blocked);
+        handle.set_update_hook(move |update| {
+            if update.table == "agent_message"
+                && update.operation == sqlx::sqlite::SqliteOperation::Insert
+            {
+                if let Some(blocked) = blocked.take() {
+                    reached.notify_one();
+                    blocked.recv_timeout(Duration::from_secs(30)).unwrap();
+                }
+            }
+        });
+    }
+    let mut writing = Box::pin(mutation.run(&h.svc, &agent, &ws));
+    tokio::select! {
+        () = reached.notified() => {},
+        result = &mut writing => panic!("mutation missed insert gate: {result:?}"),
+    }
+    let (snapshot, resume) = h.svc.workspace_delete_test_gate.arm(ws.clone());
+    let mut deleting = h.svc.delete_workspace(ws.clone());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(deleting.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    assert!(
+        h.svc.workspace_mutations.enter(&ws).is_err(),
+        "delete closes new admission"
+    );
+    let finished = AtomicBool::new(false);
+    release.send(()).unwrap();
+    let write = async {
+        let result = writing.await;
+        assert!(
+            result.is_ok(),
+            "earlier {mutation:?} must finish: {result:?}"
+        );
+        finished.store(true, Ordering::SeqCst);
+    };
+    let delete = async {
+        tokio::select! {
+            () = snapshot.notified() => {},
+            result = &mut deleting => panic!("deletion missed snapshot gate: {result:?}"),
+        }
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "delete swept runtime before {mutation:?} finished"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_message WHERE agent_id=?")
+            .bind(&agent.0)
+            .fetch_one(h.store.read_pool())
+            .await
+            .unwrap();
+        let expected = match mutation {
+            TranscriptMutation::Append => 1,
+            TranscriptMutation::Replace => ROWS,
+        };
+        assert_eq!(
+            count, expected,
+            "entire transcript mutation precedes the sweep"
+        );
+        resume.notify_one();
+        deleting.await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(write, delete)
+    })
+    .await
+    .unwrap();
+    let mut conn = h.store.write_pool().acquire().await.unwrap();
+    conn.lock_handle().await.unwrap().remove_update_hook();
+}
+
+#[intent_test_macros::daemon_test]
+async fn admitted_transcript_append_finishes_before_delete() {
+    admitted_transcript_finishes_before_delete(TranscriptMutation::Append).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn admitted_transcript_replace_finishes_before_delete() {
+    admitted_transcript_finishes_before_delete(TranscriptMutation::Replace).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn transcript_mutations_reuse_live_admission_behind_queued_delete() {
+    let h = Harness::new().await;
+    let (ws, _) = h.workspace("nested-transcript", 0).await;
+    let agent = h.create(&ws, "writer").await.unwrap();
+    let (entered, seen) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    let writing = crate::workspace_mutations::scope(async {
+        let _admitted = h.svc.workspace_mutations.enter(&ws).unwrap();
+        entered.send(()).unwrap();
+        resumed.await.unwrap();
+        for mutation in [TranscriptMutation::Append, TranscriptMutation::Replace] {
+            mutation
+                .run(&h.svc, &agent, &ws)
+                .await
+                .expect("nested transcript mutation keeps its live admission");
+        }
+    });
+    let deleting = async {
+        seen.await.unwrap();
+        let mut deleting = h.svc.delete_workspace(ws.clone());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(deleting.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert!(
+            h.svc.workspace_mutations.enter(&ws).is_err(),
+            "sibling cannot inherit admission"
+        );
+        resume.send(()).unwrap();
+        deleting.await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(writing, deleting)
+    })
+    .await
+    .unwrap();
+}
+
+#[intent_test_macros::daemon_test]
+async fn transcript_mutation_errors_release_admission_for_retry() {
+    for mutation in [TranscriptMutation::Append, TranscriptMutation::Replace] {
+        let h = Harness::new().await;
+        let (ws, _) = h.workspace("failed-transcript", 0).await;
+        let agent = h.create(&ws, "writer").await.unwrap();
+        sqlx::query("CREATE TRIGGER fail_transcript BEFORE INSERT ON agent_message BEGIN SELECT RAISE(ABORT, 'injected transcript failure'); END")
+            .execute(h.store.write_pool()).await.unwrap();
+        let error = mutation.run(&h.svc, &agent, &ws).await.unwrap_err();
+        assert!(
+            error.to_string().contains("injected transcript failure"),
+            "{error}"
+        );
+        let deletion = tokio::time::timeout(
+            Duration::from_secs(10),
+            h.svc.workspace_mutations.delete(&ws),
+        )
+        .await
+        .expect("failed transcript write must release admission");
+        drop(deletion);
+        sqlx::query("DROP TRIGGER fail_transcript")
+            .execute(h.store.write_pool())
+            .await
+            .unwrap();
+        mutation
+            .run(&h.svc, &agent, &ws)
+            .await
+            .expect("retry after write failure");
+        h.svc.delete_workspace(ws).await.unwrap();
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn cancelled_transcript_mutations_release_admission_for_delete_retry() {
+    for mutation in [TranscriptMutation::Append, TranscriptMutation::Replace] {
+        let h = Harness::new().await;
+        let (ws, _) = h.workspace("cancelled-transcript", 0).await;
+        let agent = h.create(&ws, "writer").await.unwrap();
+        // Block before the first side effect by retaining the scratch writer.
+        let writer = h.store.write_pool().acquire().await.unwrap();
+        let mut writing = Box::pin(mutation.run(&h.svc, &agent, &ws));
+        // Detect the operation's live permit by polling a deletion request.
+        // An acquired permit is dropped immediately; a queued one proves the
+        // write was admitted and is now parked on the database connection.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    writing.as_mut().poll(cx)
+                ))
+                .await
+                .is_pending());
+                let mut exclusive = Box::pin(h.svc.workspace_mutations.delete(&ws));
+                match std::future::poll_fn(|cx| std::task::Poll::Ready(exclusive.as_mut().poll(cx)))
+                    .await
+                {
+                    std::task::Poll::Pending => break,
+                    std::task::Poll::Ready(permit) => drop(permit),
+                }
+                sqlx::query("SELECT 1")
+                    .execute(h.store.read_pool())
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("transcript mutation must acquire admission before its write");
+        drop(writing);
+        let exclusive = tokio::time::timeout(
+            Duration::from_secs(10),
+            h.svc.workspace_mutations.delete(&ws),
+        )
+        .await
+        .expect("cancellation must release the transcript permit");
+        drop(exclusive);
+        drop(writer);
+        mutation
+            .run(&h.svc, &agent, &ws)
+            .await
+            .expect("retry after cancellation");
+        h.svc.delete_workspace(ws).await.unwrap();
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn equivalent_transcript_writers_reject_closed_admission_without_side_effects() {
+    let mut bypasses = Vec::new();
+    for method in [
+        "queued",
+        "wake",
+        "parent_wake",
+        "attention",
+        "resume",
+        "abandon",
+    ] {
+        let h = Harness::new().await;
+        let (ws, _) = h.workspace("other-transcript", 0).await;
+        let agent = h.create(&ws, "writer").await.unwrap();
+        let queued = h
+            .svc
+            .agent_queue_message(agent.clone(), "queued transcript".into(), None, None, None)
+            .await
+            .unwrap();
+        let queued_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+        h.store
+            .insert_interrupted_agent(&agent, &ws, "active", "t0")
+            .await
+            .unwrap();
+        let _exclusive = h.svc.workspace_mutations.delete(&ws).await;
+        let result = match method {
+            "queued" => {
+                h.svc
+                    .agent_send_queued_message_now(ws.clone(), agent.clone(), queued_id)
+                    .await
+            }
+            "wake" => h.svc.deliver_wake_message(&ws, &agent, "wake", None).await,
+            "parent_wake" => {
+                h.svc
+                    .deliver_parent_wake(&ws, agent.clone(), "parent wake".into(), None)
+                    .await
+            }
+            "attention" => {
+                h.svc
+                    .agent_request_attention(
+                        ws.clone(),
+                        "discussion".into(),
+                        "transcript notice".into(),
+                        Some(agent.clone()),
+                    )
+                    .await
+            }
+            "resume" => h
+                .svc
+                .resume_interrupted_agent(&agent)
+                .await
+                .map(|()| json!(null)),
+            "abandon" => h
+                .svc
+                .abandon_interrupted_agent(&agent)
+                .await
+                .map(|()| json!(null)),
+            _ => unreachable!(),
+        };
+        let session = h.store.get_agent_session(&agent).await.unwrap();
+        let queue_len = h.svc.queue_snapshot(&agent).len();
+        let interrupted = h
+            .store
+            .get_interrupted_agent(&agent)
+            .await
+            .unwrap()
+            .is_some();
+        if !matches!(result, Err(Error::NotFound(ref reason)) if reason.contains("being deleted"))
+            || !session.messages.is_empty()
+            || session.attention_request_kind.is_some()
+            || queue_len != 1
+            || !interrupted
+        {
+            bypasses.push(format!(
+                "{method}: result={result:?}, messages={}, attention={:?}, queued={queue_len}, interrupted={interrupted}",
+                session.messages.len(), session.attention_request_kind
+            ));
+        }
+    }
+    assert!(
+        bypasses.is_empty(),
+        "unguarded transcript writers: {bypasses:?}"
+    );
 }
