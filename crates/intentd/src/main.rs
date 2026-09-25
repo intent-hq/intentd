@@ -118,7 +118,7 @@ enum Command {
         /// budgets. Missing models and partial failures remain advisory; catalog
         /// membership does not verify account entitlement. Without this flag,
         /// Codex reports the pinned launch and Node.js/npx prerequisites without
-        /// resolving npm. Configured/PATH adapters and CODEX_PATH are ignored.
+        /// resolving npm. Configured/PATH adapters and `CODEX_PATH` are ignored.
         /// Package metadata is meaningful only for an established selected
         /// entrypoint. On macOS, version and catalog process probes are unsupported,
         /// because descendant cleanup cannot be guaranteed. No npm resolution
