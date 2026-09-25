@@ -541,3 +541,466 @@ async fn completion_watch_persistence_keeps_admission_until_its_async_write_fini
         .unwrap();
     assert_eq!(watches, 0, "no late watch survives workspace cleanup");
 }
+
+#[intent_test_macros::daemon_test]
+async fn admitted_chief_wait_finishes_registration_before_queued_target_deletion() {
+    let h = Harness::new().await;
+    for name in ["child-a-ws", "child-b-ws"] {
+        h.workspace(name, 0).await;
+    }
+    for (id, ws) in [
+        ("parent", "__chief__"),
+        ("child-a", "child-a-ws"),
+        ("child-b", "child-b-ws"),
+    ] {
+        let session = serde_json::from_value(json!({
+            "id": id, "workspaceId": ws, "name": id, "status": "active",
+            "createdAt": "t0", "updatedAt": "t0"
+        }))
+        .unwrap();
+        h.store.insert_agent_session(&session).await.unwrap();
+    }
+    let chief = WorkspaceId::from("__chief__");
+    let parent = AgentId::from("parent");
+    let writer = h.store.write_pool().acquire().await.unwrap();
+    let mut waiting = h.svc.app_agents_wait(
+        chief.clone(),
+        parent.clone(),
+        vec!["child-a".into(), "child-b".into()],
+        Some("after_all".into()),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            if h.svc
+                .agent_subscriptions
+                .lock()
+                .unwrap()
+                .subscriptions
+                .len()
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut deleting = h.svc.delete_workspace(WorkspaceId::from("child-b-ws"));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(deleting.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    drop(writer);
+    let result = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .unwrap();
+    deleting.await.unwrap();
+    h.svc
+        .delete_workspace(WorkspaceId::from("child-a-ws"))
+        .await
+        .unwrap();
+    let subscriptions = h
+        .svc
+        .agent_get_subscriptions(chief, parent.clone())
+        .await
+        .unwrap();
+    for group in subscriptions["delegationGroups"].as_array().unwrap() {
+        for child in ["child-a", "child-b"] {
+            assert!(
+                group["deletedAgentIds"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(child)),
+                "unwatched deleted child strands Chief: {subscriptions}; wait={result:?}"
+            );
+        }
+    }
+    result.expect("already admitted operation must finish all registrations");
+    assert!(subscriptions["subscriptions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let group = h.svc.seal_group_for_parent(&parent).await.unwrap();
+    assert!(
+        h.svc.take_group_if_ready(&group).is_some(),
+        "both deletions must let the Chief group settle"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn task_materialization_cannot_recreate_history_after_version_sweep() {
+    let h = Harness::new().await;
+    let (ws, _) = h.workspace("task-delete", 0).await;
+    let (keeper, _) = h.workspace("task-keeper", 0).await;
+    sqlx::query("WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<5001) INSERT INTO note(id,workspace_id,title,content,created_at,updated_at) SELECT 'padding-'||n,'task-delete','Padding','','t0','t0' FROM rows")
+        .execute(h.store.write_pool()).await.unwrap();
+    let mut ids = Vec::new();
+    for title in ["Task", "Unmarked"] {
+        ids.push(
+            h.svc
+                .create_note(
+                    ws.clone(),
+                    intent_core::NoteCreate {
+                        title: title.into(),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .note
+                .id,
+        );
+    }
+    h.svc
+        .mark_as_task(
+            ws.clone(),
+            ids[0].clone(),
+            "not_started".into(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    h.svc.create_note(ws.clone(), intent_core::NoteCreate {
+        title: "Parent".into(), content: Some(format!("- [ ] [Task](intent://local/task/{})\n- [ ] [Unmarked](intent://local/task/{})", ids[0], ids[1])), ..Default::default()
+    }, None, None).await.unwrap();
+    sqlx::query("INSERT OR REPLACE INTO note_line_attribution(note_id,workspace_id,computed_at,attributions_json) SELECT id,workspace_id,'t0','[]' FROM note WHERE workspace_id='task-delete'").execute(h.store.write_pool()).await.unwrap();
+    sqlx::query("CREATE TABLE late_versions(n INTEGER); CREATE TRIGGER capture_late_version AFTER INSERT ON note_version WHEN NEW.workspace_id='task-delete' BEGIN INSERT INTO late_versions VALUES(1); END").execute(h.store.write_pool()).await.unwrap();
+    sqlx::query("CREATE TABLE keeper_progress(root_present INTEGER); CREATE TRIGGER capture_keeper_progress AFTER INSERT ON note WHEN NEW.workspace_id='task-keeper' BEGIN INSERT INTO keeper_progress SELECT COUNT(*) FROM workspace WHERE id='task-delete'; END").execute(h.store.write_pool()).await.unwrap();
+    let reached = Arc::new(Notify::new());
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    {
+        let mut conn = h.store.write_pool().acquire().await.unwrap();
+        let mut handle = conn.lock_handle().await.unwrap();
+        let reached = reached.clone();
+        let mut blocked = Some(blocked);
+        handle.set_update_hook(move |update| {
+            if update.table == "note_line_attribution"
+                && update.operation == sqlx::sqlite::SqliteOperation::Delete
+            {
+                if let Some(blocked) = blocked.take() {
+                    reached.notify_one();
+                    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            }
+        });
+    }
+    let mut deleting = h.svc.delete_workspace(ws.clone());
+    tokio::select! {
+        () = reached.notified() => {},
+        result = &mut deleting => panic!("delete passed sweep barrier: {result:?}"),
+    }
+    let versions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM note_version WHERE workspace_id='task-delete'")
+            .fetch_one(h.store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(versions, 0, "version sweep has completed");
+    let mut changes = Box::pin(async {
+        tokio::join!(
+            h.svc.task_update_note_status(
+                ws.clone(),
+                ids[0].clone(),
+                "complete".into(),
+                None,
+                None
+            ),
+            h.svc.mark_as_task(
+                ws.clone(),
+                ids[1].clone(),
+                "complete".into(),
+                vec![],
+                None,
+                None,
+                None,
+                None
+            )
+        )
+    });
+    let early = std::future::poll_fn(|cx| std::task::Poll::Ready(changes.as_mut().poll(cx))).await;
+    let mut unrelated = h.svc.create_note(
+        keeper.clone(),
+        intent_core::NoteCreate {
+            title: "Still writable".into(),
+            ..Default::default()
+        },
+        None,
+        None,
+    );
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(unrelated.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    release.send(()).unwrap();
+    let mutations = async {
+        match early {
+            std::task::Poll::Ready(r) => r,
+            std::task::Poll::Pending => changes.await,
+        }
+    };
+    let (deleted, (status, marked), unrelated) = tokio::join!(deleting, mutations, unrelated);
+    {
+        let mut conn = h.store.write_pool().acquire().await.unwrap();
+        conn.lock_handle().await.unwrap().remove_update_hook();
+    }
+    deleted.unwrap();
+    unrelated.unwrap();
+    assert!(
+        status.is_err(),
+        "late task status bypassed admission: {status:?}"
+    );
+    assert!(
+        marked.is_err(),
+        "late task marking bypassed admission: {marked:?}"
+    );
+    let recreated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM late_versions")
+        .fetch_one(h.store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        recreated, 0,
+        "task operations must not refill swept note history"
+    );
+    let present: i64 = sqlx::query_scalar("SELECT root_present FROM keeper_progress LIMIT 1")
+        .fetch_one(h.store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        present, 1,
+        "unrelated write completed before deleting workspace disappeared"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn admitted_delegation_finishes_create_assign_watch_and_send_before_delete() {
+    let h = Harness::new().await;
+    let chief = WorkspaceId::from("__chief__");
+    let parent = h.create(&chief, "chief").await.unwrap();
+    let (ws, _) = h.workspace("delegation-target", 0).await;
+    let task = h
+        .svc
+        .create_note(
+            ws.clone(),
+            intent_core::NoteCreate {
+                title: "Child task".into(),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .note;
+    h.svc
+        .mark_as_task(
+            ws.clone(),
+            task.id.clone(),
+            "not_started".into(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let reached = Arc::new(Notify::new());
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    {
+        let mut conn = h.store.write_pool().acquire().await.unwrap();
+        let mut handle = conn.lock_handle().await.unwrap();
+        let reached = reached.clone();
+        let mut blocked = Some(blocked);
+        handle.set_update_hook(move |update| {
+            if update.table == "agent_session"
+                && update.operation == sqlx::sqlite::SqliteOperation::Insert
+            {
+                if let Some(blocked) = blocked.take() {
+                    reached.notify_one();
+                    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            }
+        });
+    }
+    let input = serde_json::from_value(
+        json!({"taskNoteId":task.id,"agentInstructions":"work", "waitMode":"after_all"}),
+    )
+    .unwrap();
+    let mut delegate = Box::pin(
+        h.svc
+            .agent_delegate_op(ws.clone(), input, Some(parent.clone())),
+    );
+    tokio::select! {
+        () = reached.notified() => {},
+        result = &mut delegate => panic!("delegate finished before create barrier: {result:?}"),
+    }
+    let mut deleting = h.svc.delete_workspace(ws.clone());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(deleting.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    release.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), delegate)
+        .await
+        .unwrap()
+        .unwrap();
+    let child = AgentId::from(result["agentId"].as_str().unwrap());
+    assert!(h
+        .store
+        .get_note(&ws, &task.id)
+        .await
+        .unwrap()
+        .metadata
+        .task
+        .unwrap()
+        .assigned_agent_ids
+        .contains(&child));
+    let before = h
+        .svc
+        .agent_get_subscriptions(chief.clone(), parent.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        before["subscriptions"].as_array().unwrap().len(),
+        1,
+        "delegated child must have a watch: {result}"
+    );
+    deleting.await.unwrap();
+    {
+        let mut conn = h.store.write_pool().acquire().await.unwrap();
+        conn.lock_handle().await.unwrap().remove_update_hook();
+    }
+    let after = h
+        .svc
+        .agent_get_subscriptions(chief, parent.clone())
+        .await
+        .unwrap();
+    assert!(after["subscriptions"].as_array().unwrap().is_empty());
+    let group = h.svc.seal_group_for_parent(&parent).await.unwrap();
+    assert!(
+        h.svc.take_group_if_ready(&group).is_some(),
+        "deleted delegated child must settle: {after}"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn admitted_task_update_keeps_ownership_through_linked_status_materialization() {
+    let h = Harness::new().await;
+    let (ws, _) = h.workspace("task-update-target", 0).await;
+    let task = h
+        .svc
+        .create_note(
+            ws.clone(),
+            intent_core::NoteCreate {
+                title: "Task".into(),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .note;
+    h.svc
+        .mark_as_task(
+            ws.clone(),
+            task.id.clone(),
+            "not_started".into(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let parent = h
+        .svc
+        .create_note(
+            ws.clone(),
+            intent_core::NoteCreate {
+                title: "Parent".into(),
+                content: Some(format!("- [ ] [Task](intent://local/task/{})", task.id)),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .note;
+    let reached = Arc::new(Notify::new());
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    {
+        let mut conn = h.store.write_pool().acquire().await.unwrap();
+        let mut handle = conn.lock_handle().await.unwrap();
+        let reached = reached.clone();
+        let mut blocked = Some(blocked);
+        handle.set_update_hook(move |update| {
+            if update.table == "note" && update.operation == sqlx::sqlite::SqliteOperation::Update {
+                if let Some(blocked) = blocked.take() {
+                    reached.notify_one();
+                    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            }
+        });
+    }
+    let mut changing = h.svc.task_update(
+        ws.clone(),
+        parent.id.clone(),
+        1,
+        None,
+        Some("done".into()),
+        None,
+        None,
+    );
+    tokio::select! {
+        () = reached.notified() => {},
+        result = &mut changing => panic!("task update missed parent-write barrier: {result:?}"),
+    }
+    let mut deleting = h.svc.delete_workspace(ws.clone());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(deleting.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    release.send(()).unwrap();
+    changing
+        .await
+        .expect("nested status helper reuses the admitted parent write");
+    assert_eq!(
+        h.store
+            .get_note(&ws, &task.id)
+            .await
+            .unwrap()
+            .metadata
+            .task
+            .unwrap()
+            .status,
+        intent_core::TaskStatus::Complete
+    );
+    assert!(h
+        .store
+        .get_note(&ws, &parent.id)
+        .await
+        .unwrap()
+        .content
+        .starts_with("- [x]"));
+    deleting.await.unwrap();
+    let mut conn = h.store.write_pool().acquire().await.unwrap();
+    conn.lock_handle().await.unwrap().remove_update_hook();
+}

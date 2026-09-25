@@ -9177,6 +9177,20 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        crate::workspace_mutations::scope(self.agent_delegate_op_admitted(
+            workspace_id,
+            input,
+            parent_agent_id,
+        ))
+        .await
+    }
+
+    async fn agent_delegate_op_admitted(
+        &self,
+        workspace_id: WorkspaceId,
+        input: intent_core::AgentDelegateInput,
+        parent_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
         // Resolve the child's first message up front so it can be persisted as
         // `AgentSession.initial_message` on the created session (harvested from
         // the `metadata.initialMessage` create param; served by
@@ -11140,6 +11154,22 @@ impl Services {
     }
 
     pub(crate) async fn app_agents_wait_op(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        agent_ids: Vec<String>,
+        wait_mode: Option<String>,
+    ) -> Result<Value> {
+        crate::workspace_mutations::scope(self.app_agents_wait_op_admitted(
+            workspace_id,
+            caller_agent_id,
+            agent_ids,
+            wait_mode,
+        ))
+        .await
+    }
+
+    async fn app_agents_wait_op_admitted(
         &self,
         workspace_id: WorkspaceId,
         caller_agent_id: AgentId,

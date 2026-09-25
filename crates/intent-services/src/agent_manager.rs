@@ -7552,60 +7552,63 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
-        // Every queue fallback below (archived gate, busy race, quarantine
-        // park, append-failure auto-queue) must park this message at the FRONT of
-        // the queue (spec §Decisions: interrupts always enter ahead of
-        // normal entries, arrival-ordered among themselves).
-        options.interrupt_priority = true;
-        // monorepo#564: reject nonexistent targets BEFORE the dedup record or
-        // any preemption — same fail-closed guard as `send_message`.
-        let session = self.services.require_agent_session(&agent_id).await?;
-        // Same session-workspace binding as `send_message`
-        // (intent-hq/intent#5017): the archived gate below keys on the
-        // target's home workspace, not the sender's bridge scope.
-        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
-        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
-        // Duplicate-delivery guard: check-and-record is atomic under the lock,
-        // so of two racing duplicates exactly one proceeds. Runs BEFORE the
-        // archived gate below so a parked interrupt still records its id and
-        // keeps the same at-most-once contract as one that streamed
-        // immediately.
-        if let Some(mid) = message_id.as_deref() {
-            let mut ids = self.interrupt_ids.lock().unwrap();
-            if ids.get(&agent_id).map(String::as_str) == Some(mid) {
-                return Ok(json!({
-                    "success": true,
-                    "queued": false,
-                    "messageId": mid,
-                    "deduplicated": true,
-                }));
+        crate::workspace_mutations::scope(async move {
+            // Every queue fallback below (archived gate, busy race, quarantine
+            // park, append-failure auto-queue) must park this message at the FRONT of
+            // the queue (spec §Decisions: interrupts always enter ahead of
+            // normal entries, arrival-ordered among themselves).
+            options.interrupt_priority = true;
+            // monorepo#564: reject nonexistent targets BEFORE the dedup record or
+            // any preemption — same fail-closed guard as `send_message`.
+            let session = self.services.require_agent_session(&agent_id).await?;
+            // Same session-workspace binding as `send_message`
+            // (intent-hq/intent#5017): the archived gate below keys on the
+            // target's home workspace, not the sender's bridge scope.
+            let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+            let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+            // Duplicate-delivery guard: check-and-record is atomic under the lock,
+            // so of two racing duplicates exactly one proceeds. Runs BEFORE the
+            // archived gate below so a parked interrupt still records its id and
+            // keeps the same at-most-once contract as one that streamed
+            // immediately.
+            if let Some(mid) = message_id.as_deref() {
+                let mut ids = self.interrupt_ids.lock().unwrap();
+                if ids.get(&agent_id).map(String::as_str) == Some(mid) {
+                    return Ok(json!({
+                        "success": true,
+                        "queued": false,
+                        "messageId": mid,
+                        "deduplicated": true,
+                    }));
+                }
+                ids.insert(agent_id.clone(), mid.to_string());
             }
-            ids.insert(agent_id.clone(), mid.to_string());
-        }
-        // Archived-workspace gate (intent-hq/monorepo#2732): an automatic
-        // interrupt into an archived workspace is ALSO parked — skip the
-        // preemption (cancelling a turn only to park the interrupt behind
-        // the archived gate would be pure loss) and let `send_message`'s
-        // archived gate park the message front-of-queue. Same fail-open
-        // semantics as that gate: only an affirmatively-archived row parks.
-        if !options.origin.is_user()
-            && !workspace_id.is_chief()
-            && matches!(
-                self.services.store.get_workspace(&workspace_id).await,
-                Ok(ws) if ws.archived
-            )
-        {
-            return self
-                .send_message(agent_id, workspace_id, content, message_id, options)
-                .await;
-        }
-        self.preempt_busy_turn(&agent_id, &mut options).await;
-        // The slot was just released (or was never held): the send path claims
-        // it and streams the interrupt message right away rather than queueing.
-        // If a concurrent send wins the race the message queues instead — it is
-        // still delivered by that worker's drain loop, never dropped.
-        self.send_message(agent_id, workspace_id, content, message_id, options)
-            .await
+            // Archived-workspace gate (intent-hq/monorepo#2732): an automatic
+            // interrupt into an archived workspace is ALSO parked — skip the
+            // preemption (cancelling a turn only to park the interrupt behind
+            // the archived gate would be pure loss) and let `send_message`'s
+            // archived gate park the message front-of-queue. Same fail-open
+            // semantics as that gate: only an affirmatively-archived row parks.
+            if !options.origin.is_user()
+                && !workspace_id.is_chief()
+                && matches!(
+                    self.services.store.get_workspace(&workspace_id).await,
+                    Ok(ws) if ws.archived
+                )
+            {
+                return self
+                    .send_message(agent_id, workspace_id, content, message_id, options)
+                    .await;
+            }
+            self.preempt_busy_turn(&agent_id, &mut options).await;
+            // The slot was just released (or was never held): the send path claims
+            // it and streams the interrupt message right away rather than queueing.
+            // If a concurrent send wins the race the message queues instead — it is
+            // still delivered by that worker's drain loop, never dropped.
+            self.send_message(agent_id, workspace_id, content, message_id, options)
+                .await
+        })
+        .await
     }
 
     /// Shared keep-alive preemption for the interrupt-priority delivery paths

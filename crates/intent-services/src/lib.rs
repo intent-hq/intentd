@@ -10436,6 +10436,7 @@ impl Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> Result<TaskUpdateNoteStatusResult> {
+        let _mutation = self.workspace_mutations.enter(workspace_id)?;
         let store = &self.store;
         let bus = self.event_bus.as_ref();
         let mut note = fetch_note(store, workspace_id, note_id).await?;
@@ -24696,7 +24697,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             if task_text.is_empty() {
@@ -24793,7 +24794,7 @@ impl WorkspaceApi for Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
             self.require_member(&workspace_id).await?;
             let new_status = parse_task_status_strict(&status)?;
             self.set_task_note_status(
@@ -24820,7 +24821,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             if text.is_none() && status.is_none() {
@@ -25153,7 +25154,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
         let store = self.store.clone();
         let services = self.clone();
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             let new_status =
                 serde_json::from_value::<TaskStatus>(serde_json::Value::String(status.clone()))
@@ -25546,7 +25548,8 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
-        Box::pin(async move {
+        workspace_mutations::boxed(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             // Target workspace first (the task note and its status live
             // there), then the referenced agent's workspace.
             self.require_member(&workspace_id).await?;
