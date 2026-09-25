@@ -4,7 +4,10 @@
 use std::{path::Path, sync::Arc};
 
 use intent_acp::WorkspaceMcpServer;
-use intent_core::{AgentCreateExtra, AgentDelegateInput, AgentId, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
+    NoteCreate, NoteId, WorkspaceApi, WorkspaceId,
+};
 use intent_store::{EventQuery, Store};
 use serde_json::{json, Value};
 
@@ -101,6 +104,150 @@ async fn assert_pinned(svc: &Services, id: &str) {
     assert_eq!(session.model.as_deref(), Some("pinned-model"));
     assert_eq!(session.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(session.specialist.as_deref(), Some("pinned"));
+}
+
+async fn seed_task(svc: &Services, ws: &WorkspaceId) -> NoteId {
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Pinned task".into(),
+                content: Some("Do work".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note;
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "not_started".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("mark task");
+    note.id
+}
+
+#[intent_test_macros::daemon_test]
+async fn specialist_provider_wake_create_resolves_effort_after_provider() {
+    let (_tmp, svc, ws) = setup().await;
+    for default_provider in ["grok", ""] {
+        set(&svc, "model.defaultProvider", json!(default_provider));
+        let task = seed_task(&svc, &ws).await;
+        let result = svc
+            .agent_wake_or_create_op(
+                ws.clone(),
+                task,
+                "Do work".into(),
+                AgentWakeOrCreateInput {
+                    create: Some(AgentWakeCreateOptions {
+                        specialist: Some("pin-alias".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("wake creates pinned agent");
+        assert_eq!(result["created"], true);
+        assert_pinned(&svc, result["agentId"].as_str().unwrap()).await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn specialist_provider_wake_create_ignores_unselected_scalar_effort() {
+    let (_tmp, svc, ws) = setup().await;
+    // The selected model option supports high; the specialist's fallback
+    // scalar low must neither override it nor cause a validation failure.
+    svc.models_catalog.store_for_test(
+        "auggie",
+        &(crate::model_catalog::source_for("auggie")
+            .unwrap()
+            .version_key)(),
+        vec![
+            json!({"id": "pinned-model", "name": "pinned-model", "provider": "auggie",
+                    "effortLevels": ["high"]}),
+        ],
+    );
+    let task = seed_task(&svc, &ws).await;
+    let result = svc
+        .agent_wake_or_create_op(
+            ws,
+            task,
+            "Do work".into(),
+            AgentWakeOrCreateInput {
+                create: Some(AgentWakeCreateOptions {
+                    specialist: Some("pin-alias".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("only the selected effort is validated");
+    assert_pinned(&svc, result["agentId"].as_str().unwrap()).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn specialist_provider_wake_create_preserves_explicit_choices() {
+    let (_tmp, svc, ws) = setup().await;
+    for (wake_effort, create_effort, provider, model, expected_effort) in [
+        (Some("low"), Some("high"), None, None, Some("low")),
+        (Some(""), Some("high"), None, None, None),
+        (None, Some("low"), None, None, Some("low")),
+        (None, Some(""), None, None, None),
+        (None, None, Some("grok"), None, Some("low")),
+        (None, None, None, Some("default-model"), Some("low")),
+    ] {
+        let task = seed_task(&svc, &ws).await;
+        let result = svc
+            .agent_wake_or_create_op(
+                ws.clone(),
+                task,
+                "Do work".into(),
+                AgentWakeOrCreateInput {
+                    model: model.map(str::to_string),
+                    reasoning_effort: wake_effort.map(str::to_string),
+                    create: Some(AgentWakeCreateOptions {
+                        specialist: Some("pin-alias".into()),
+                        provider: provider.map(str::to_string),
+                        reasoning_effort: create_effort.map(str::to_string),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("wake creates with explicit choices");
+        let session = svc
+            .store()
+            .get_agent_session(&AgentId::from(result["agentId"].as_str().unwrap()))
+            .await
+            .expect("persisted session");
+        let use_pin = provider.is_none() && model.is_none();
+        assert_eq!(
+            session.provider.as_deref(),
+            if use_pin { Some("auggie") } else { provider }
+        );
+        assert_eq!(
+            session.model.as_deref(),
+            Some(if use_pin {
+                "pinned-model"
+            } else {
+                "default-model"
+            })
+        );
+        assert_eq!(session.reasoning_effort.as_deref(), expected_effort);
+    }
 }
 
 #[tokio::test]

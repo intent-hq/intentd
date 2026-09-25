@@ -4135,10 +4135,10 @@ impl Services {
         }
         // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
         // `agent.create` naming a specialist consults the same model-option >
-        // frontmatter order the delegate/wakeOrCreate seams do, keyed on the
-        // model that was actually resolved above. Those seams pre-decide the
-        // effort and pass it down as a param, so this only fires for callers
-        // that did not (`reasoning_effort_decided == false`) — which is also
+        // frontmatter order as delegation, keyed on the model that was
+        // actually resolved above. Delegate may pre-decide the effort and
+        // pass it down as a param, so this only fires for callers that did
+        // not (`reasoning_effort_decided == false`) — which is also
         // what keeps the specialist rungs ahead of the settings default below.
         let reasoning_effort = if reasoning_effort_decided {
             reasoning_effort
@@ -13105,68 +13105,13 @@ impl Services {
             .or(create_opts.model.clone());
         let provider = create_opts.provider.clone();
         let agent_type = create_opts.agent_type.clone();
-        // Reasoning effort (PROTOCOL §5.11), create branch only: the
-        // wake-level param wins over `create.reasoningEffort`, then the chosen
-        // model option's effort, then the specialist frontmatter. Validated
-        // against the cached catalog's `effortLevels` for the resolved model
-        // before the child is created, so a `-32602` leaves no orphan.
-        // Same effective-model rule as `agent.delegate`: fall through to the
-        // full default-model resolution (specialist pin, then the settings
-        // chain) so a `modelOptions` entry keyed on the settings default
-        // model is still matched.
-        // Same tier-walking resolvers as `agent.delegate` — blocking pool
-        // (monorepo#4148).
-        let (effort_model, reasoning_effort) = {
-            let services = self.clone();
-            let model = model.clone();
-            let specialist = specialist.clone();
-            let workspace_path = workspace_path.clone();
-            let provider = provider.clone();
-            let effort_param = input
-                .reasoning_effort
-                .clone()
-                .or_else(|| create_opts.reasoning_effort.clone());
-            tokio::task::spawn_blocking(move || {
-                let effort_model = model.or_else(|| {
-                    resolve_agent_default_model(
-                        &services,
-                        specialist.as_deref(),
-                        workspace_path.as_deref(),
-                        provider.as_deref(),
-                    )
-                });
-                // Same effective-provider rule as `agent.delegate`: without
-                // an explicit `create.provider`, `agent_create_op` persists
-                // the settings-derived default, so the model-option pair
-                // match keys on that same provider.
-                let effective_provider = provider.clone().or_else(|| {
-                    crate::agent_session::derived_default_provider(&services.effective_settings())
-                });
-                let reasoning_effort = resolve_delegate_reasoning_effort(
-                    &services,
-                    effort_param.as_deref(),
-                    specialist.as_deref(),
-                    effective_provider.as_deref(),
-                    effort_model.as_deref(),
-                    workspace_path.as_deref(),
-                );
-                (effort_model, reasoning_effort)
-            })
-            .await
-            .map_err(|e| {
-                Error::Internal(format!("agent.wakeOrCreate resolution task failed: {e}"))
-            })?
-        };
-        // A blank resolved value is an explicit clear (see
-        // `resolve_delegate_reasoning_effort`); only a real level is validated.
-        if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
-            ensure_effort_supported_by_model(
-                "agent.wakeOrCreate",
-                &self.cached_models(),
-                effort_model.as_deref(),
-                effort,
-            )?;
-        }
+        // Preserve explicit effort precedence, including a blank clear. Let
+        // the create planner derive and validate the remaining effort only
+        // after it selects the effective specialist provider and model.
+        let reasoning_effort = input
+            .reasoning_effort
+            .clone()
+            .or_else(|| create_opts.reasoning_effort.clone());
 
         // B5: rich create payload (`name` default `Task: {title}`,
         // `contextReferences` + provenance metadata folded into the persisted
