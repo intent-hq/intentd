@@ -366,6 +366,9 @@ mod tests_stab115;
 mod tests_specialist_frontmatter;
 
 #[cfg(test)]
+mod tests_specialist_provider;
+
+#[cfg(test)]
 mod tests_delegate_provider_resolution;
 
 #[cfg(test)]
@@ -868,14 +871,10 @@ fn resolve_delegate_provider(
 ) -> Result<Option<String>> {
     let settings = services.effective_settings();
 
-    if let Some(spec_id) = specialist {
-        let specialists_svc = services.specialists_service();
-        let explicit = specialists_svc.resolve_coding_agent(spec_id, workspace_path);
-        if let Some(provider_id) = explicit {
-            ensure_known_provider("agent.delegate", &provider_id)?;
-            ensure_provider_available("agent.delegate", &provider_id, &settings.providers)?;
-            return Ok(Some(provider_id));
-        }
+    if let Some(provider) =
+        resolve_specialist_provider(services, "agent.delegate", specialist, workspace_path)?
+    {
+        return Ok(Some(provider));
     }
 
     match crate::agent_session::derived_default_provider(&settings) {
@@ -888,6 +887,28 @@ fn resolve_delegate_provider(
             "agent.delegate",
         )),
     }
+}
+
+/// Resolve and validate only the specialist's provider pin. Shared by create
+/// and delegate before model resolution; an absent pin leaves each caller's
+/// existing settings-default behavior intact. Call on the blocking pool:
+/// specialist resolution walks the project > user > bundled directories.
+fn resolve_specialist_provider(
+    services: &Services,
+    method: &str,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> Result<Option<String>> {
+    let provider = specialist.and_then(|id| {
+        services
+            .specialists_service()
+            .resolve_coding_agent(id, workspace_path)
+    });
+    if let Some(provider) = provider.as_deref() {
+        ensure_known_provider(method, provider)?;
+        ensure_provider_available(method, provider, &services.effective_settings().providers)?;
+    }
+    Ok(provider)
 }
 
 /// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
@@ -4060,9 +4081,9 @@ impl Services {
         // rides the same seam: a provider the daemon already observed as
         // not-logged-in must fail fast with the login remedy instead of
         // persisting a session that dies auth-required on its first turn.
-        // Installed-ness stays delegate-only (`ensure_provider_available`):
-        // direct creates on a known, enabled-but-uninstalled provider keep
-        // their existing spawn-time failure mode.
+        // Explicit/default-provider direct creates keep their existing
+        // spawn-time installed-ness check. A derived specialist pin is
+        // already checked by `plan_agent_create`, like delegation.
         if let Some(p) =
             crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
         {
@@ -4430,6 +4451,32 @@ impl Services {
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
+
+        // With neither caller choice supplied, honor the specialist's
+        // provider before resolving its model/effort. Explicit model-only
+        // creates deliberately retain the settings-provider behavior, as
+        // they do in delegate. Persist the effective pin in the plan so
+        // spawn and previews use the same pair; reject unusable pins here,
+        // before even workspace.create's workspace row can be written.
+        let provider = if provider.is_none() && model.is_none() && specialist.is_some() {
+            let services = self.clone();
+            let specialist = specialist.clone();
+            let spec_wp = spec_wp.clone();
+            tokio::task::spawn_blocking(move || {
+                resolve_specialist_provider(
+                    &services,
+                    method,
+                    specialist.as_deref(),
+                    spec_wp.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("{method} provider resolution task failed: {e}"))
+            })??
+        } else {
+            provider
+        };
 
         // Resolve the default model when none is explicitly supplied, via the
         // single daemon-side resolver (steps 2–5; see
