@@ -2003,7 +2003,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Top-level agent spawning & retirement",
             "Expose spawning independent top-level agents (ws.agent.create with topLevel: true) and agent-initiated retirement (ws.agent.retire) to agents; applies to new sessions only",
             "agentFeatures",
-            false,
+            true,
         )
         .with_token_impact("~80 tokens/session"),
         boolean(
@@ -5182,9 +5182,8 @@ mod tests {
     }
 
     /// The `agentFeatures.*` toggles are TOML-backed booleans — all default
-    /// `true` except `peerAgents` (opt-in, default `false`): each has a
-    /// catalog entry in the `agentFeatures` category and a `KNOWN_PATHS`
-    /// entry, and each round-trips through the registry-wired service
+    /// `true`: each has a catalog entry in the `agentFeatures` category and
+    /// a `KNOWN_PATHS` entry, and each round-trips through the registry-wired service
     /// (default origin → file override → reset).
     #[tokio::test]
     async fn agent_features_toggles_round_trip_via_registry() {
@@ -5200,7 +5199,7 @@ mod tests {
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
             ("agentFeatures.taskGraph", true),
-            ("agentFeatures.peerAgents", false),
+            ("agentFeatures.peerAgents", true),
             ("agentFeatures.mcpTools", true),
         ];
         for (path, default) in paths {
@@ -5241,6 +5240,18 @@ mod tests {
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["value"], json!(!default), "{path} updated");
             assert_eq!(got["origin"], json!("file"), "{path} origin");
+            let reloaded = SettingsRegistry::load(&config_path).expect("reload saved config");
+            let reloaded_svc = SettingsService::new(&store, &secrets, Some(&reloaded));
+            let persisted = reloaded_svc
+                .get(path)
+                .await
+                .expect("get persisted override");
+            assert_eq!(persisted["value"], json!(!default), "{path} persisted");
+            assert_eq!(
+                persisted["origin"],
+                json!("file"),
+                "{path} persisted origin"
+            );
             assert_eq!(
                 store.get_setting(path).await.expect("read settings table"),
                 None,

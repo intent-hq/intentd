@@ -670,7 +670,7 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
     }
     if !features.peer_agents {
         // Method-level: `ws.agent.retire` is the only whole `ws.agent.*`
-        // surface gated by the opt-in peerAgents toggle (default off).
+        // surface gated by the peerAgents toggle (default on).
         // `ws.agent.create({ topLevel: true })` is also peerAgents-gated,
         // but arg-conditionally — that gate lives in the dispatch layer,
         // not here (plain `create` is never feature-gated).
@@ -2084,15 +2084,15 @@ mod tests {
     }
 
     // Size budget for the system-prompt copy: the all-defaults non-chief
-    // rendering (the common case for truncating providers) stays under 22k
-    // chars — roughly half the ~40k full text.
+    // rendering (the common case for truncating providers) includes the
+    // retirement binding by default, adding ~330 bytes to the 22k budget.
     #[test]
     fn condensed_description_size_budget() {
         let condensed =
             condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
         assert!(
-            condensed.len() < 22_000,
-            "condensed all-on description is {} bytes, over the 22k budget",
+            condensed.len() < 22_400,
+            "condensed all-on description is {} bytes, over the 22.4k budget",
             condensed.len()
         );
     }
@@ -2355,9 +2355,8 @@ mod tests {
 
     // Each toggle mapped to the `ws.` doc prefixes it prunes and a mutator
     // that flips it off. Iterated by the assembly tests below so a new toggle
-    // cannot ship without joining the sweep. Cases mutate from
-    // [`all_gates_open`], not the defaults — `peerAgents` defaults off, so
-    // the defaults are not the fully-open baseline.
+    // cannot ship without joining the sweep. Cases mutate from the
+    // fully-open defaults returned by [`all_gates_open`].
     fn feature_cases() -> Vec<FeatureCase> {
         vec![
             (&["ws.hook."], |f| f.background_hooks = false),
@@ -2381,13 +2380,9 @@ mod tests {
         ]
     }
 
-    // Every gate open: the defaults (all toggles on, `taskGraph` included
-    // since the default flip) plus the opt-in `peerAgents` (default off).
+    // Every gate is open by default.
     fn all_gates_open() -> AgentFeaturesSettings {
-        AgentFeaturesSettings {
-            peer_agents: true,
-            ..AgentFeaturesSettings::default()
-        }
+        AgentFeaturesSettings::default()
     }
 
     // Hard requirement: with every gate open (the defaults), the assembled
@@ -3103,8 +3098,8 @@ const run = async (s, out) => {{
         // Sibling `ws.agent.*` methods pass even with attentionRequests off.
         assert_eq!(denied_feature(&all_off, "agent.reportToParent"), None);
         assert_eq!(denied_feature(&all_off, "agent.list"), None);
-        // `peerAgents` gates exactly `agent.retire` at the method level —
-        // off by DEFAULT (the one opt-in toggle), so the defaults deny it.
+        // `peerAgents` gates exactly `agent.retire` at the method level;
+        // the default-enabled feature allows it unless explicitly disabled.
         // The `agent.create` + `topLevel: true` gate is arg-conditional and
         // lives in the dispatch layer, so plain `agent.create` never appears
         // here.
@@ -3114,7 +3109,7 @@ const run = async (s, out) => {{
         );
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "agent.retire"),
-            Some("agentFeatures.peerAgents")
+            None
         );
         assert_eq!(denied_feature(&all_gates_open(), "agent.retire"), None);
         assert_eq!(denied_feature(&all_off, "agent.create"), None);

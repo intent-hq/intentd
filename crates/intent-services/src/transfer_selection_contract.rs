@@ -139,6 +139,8 @@ async fn import_case(root: &Path, contract: &Value, case: &Value, fault: &str) -
     let bin = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".augment/bin");
     registry
         .apply(&[
+            // Keep the model-selection snapshots on their explicit feature opt-out.
+            ("agentFeatures.peerAgents".into(), json!(false)),
             ("model.defaultProvider".into(), defaults["provider"].clone()),
             ("model.default".into(), defaults["model"].clone()),
             (
