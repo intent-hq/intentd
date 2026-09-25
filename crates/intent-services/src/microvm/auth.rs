@@ -18,7 +18,21 @@ use std::path::{Path, PathBuf};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::task::JoinHandle;
 
+use super::guest_fs::{GuestFsError, RootfsWriter};
 use super::MicrovmError;
+
+/// Guest home directory, relative to the rootfs root. Every staging path is
+/// resolved below the ROOTFS root (not the home) through [`RootfsWriter`], so
+/// a guest that swaps `/root` itself for a symlink is refused too.
+pub const GUEST_HOME_REL: &str = "root";
+
+fn home_rel(guest_rel: &str) -> String {
+    format!("{GUEST_HOME_REL}/{guest_rel}")
+}
+
+fn stage_err(e: &GuestFsError) -> MicrovmError {
+    MicrovmError::AuthStage(e.to_string())
+}
 
 /// One host auth file staged into the guest home. `guest_rel` is relative to
 /// the guest home directory (`/root`).
@@ -79,56 +93,54 @@ pub fn staging_catalog(home: &Path) -> Vec<StagedAuthFile> {
     ]
 }
 
-/// Copy one staged file into the guest home with a 0600 atomic temp+rename
-/// (the rotation watcher reuses this for pushes into running VMs). Returns
-/// `false` without writing when the host file is absent OR the destination
-/// already holds identical bytes — refreshers rewrite credential files on a
-/// timer without changing them, and re-pushing those would spam the rotation
-/// log and guest I/O for nothing.
+/// Copy one staged file into the guest home (`<rootfs>/root/<guest_rel>`)
+/// with a 0600 atomic temp+rename through the rootfs-contained
+/// [`RootfsWriter`] (the rotation watcher reuses this for pushes into running
+/// VMs, whose rootfs the guest may have tampered with — a symlink anywhere on
+/// the destination path is refused, never followed). Returns `false` without
+/// writing when the host file is absent OR the destination already holds
+/// identical bytes — refreshers rewrite credential files on a timer without
+/// changing them, and re-pushing those would spam the rotation log and guest
+/// I/O for nothing.
 ///
 /// # Errors
 ///
-/// Returns `MicrovmError::AuthStage` when a filesystem step fails.
-pub fn stage_file(entry: &StagedAuthFile, guest_home: &Path) -> Result<bool, MicrovmError> {
+/// Returns `MicrovmError::AuthStage` when a filesystem step fails or the
+/// destination path is not contained in the rootfs.
+pub fn stage_file(entry: &StagedAuthFile, rootfs: &Path) -> Result<bool, MicrovmError> {
     if !entry.host.is_file() {
         return Ok(false);
     }
-    let dst = guest_home.join(entry.guest_rel);
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| MicrovmError::AuthStage(format!("mkdir {}: {e}", parent.display())))?;
-    }
     let bytes = std::fs::read(&entry.host)
         .map_err(|e| MicrovmError::AuthStage(format!("read {}: {e}", entry.host.display())))?;
-    if matches!(std::fs::read(&dst), Ok(existing) if existing == bytes) {
+    let writer = RootfsWriter::open(rootfs).map_err(|e| stage_err(&e))?;
+    let rel = home_rel(entry.guest_rel);
+    if writer
+        .read_file(&rel)
+        .map_err(|e| stage_err(&e))?
+        .is_some_and(|existing| existing == bytes)
+    {
         return Ok(false);
     }
-    let tmp = dst.with_extension("intentd-staging");
-    std::fs::write(&tmp, &bytes)
-        .map_err(|e| MicrovmError::AuthStage(format!("write {}: {e}", tmp.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, &dst)
-        .map_err(|e| MicrovmError::AuthStage(format!("rename to {}: {e}", dst.display())))?;
+    writer
+        .write_file(&rel, &bytes, 0o600)
+        .map_err(|e| stage_err(&e))?;
     Ok(true)
 }
 
-/// Stage the full catalog into `guest_home`, returning the entries that were
-/// actually staged (host file present). Presence — not `stage_file`'s
-/// "wrote bytes" bool — decides membership, so an entry whose destination
-/// already matched still gets rotation-watched.
+/// Stage the full catalog into the guest home under `rootfs`, returning the
+/// entries that were actually staged (host file present). Presence — not
+/// `stage_file`'s "wrote bytes" bool — decides membership, so an entry whose
+/// destination already matched still gets rotation-watched.
 ///
 /// # Errors
 ///
 /// Returns `MicrovmError::AuthStage` when staging an entry fails.
-pub fn stage_all(home: &Path, guest_home: &Path) -> Result<Vec<StagedAuthFile>, MicrovmError> {
+pub fn stage_all(home: &Path, rootfs: &Path) -> Result<Vec<StagedAuthFile>, MicrovmError> {
     let mut staged = Vec::new();
     for entry in staging_catalog(home) {
         let host_present = entry.host.is_file();
-        stage_file(&entry, guest_home)?;
+        stage_file(&entry, rootfs)?;
         if host_present {
             staged.push(entry);
         }
@@ -152,20 +164,26 @@ pub fn filtered_gitconfig(host_gitconfig: &str) -> String {
 }
 
 /// Stage the host git identity: `~/.gitconfig` copied through
-/// [`filtered_gitconfig`]. Missing host file ⇒ no-op.
+/// [`filtered_gitconfig`] into `<rootfs>/root/.gitconfig` via the
+/// rootfs-contained writer. Missing host file ⇒ no-op.
 ///
 /// # Errors
 ///
 /// Returns `MicrovmError::AuthStage` when writing the filtered file fails.
-pub fn stage_gitconfig(home: &Path, guest_home: &Path) -> Result<(), MicrovmError> {
+pub fn stage_gitconfig(home: &Path, rootfs: &Path) -> Result<(), MicrovmError> {
     let src = home.join(".gitconfig");
     let Ok(content) = std::fs::read_to_string(&src) else {
         return Ok(());
     };
-    let dst = guest_home.join(".gitconfig");
-    std::fs::write(&dst, filtered_gitconfig(&content))
-        .map_err(|e| MicrovmError::AuthStage(format!("write {}: {e}", dst.display())))?;
-    Ok(())
+    RootfsWriter::open(rootfs)
+        .and_then(|w| {
+            w.write_file(
+                &home_rel(".gitconfig"),
+                filtered_gitconfig(&content).as_bytes(),
+                0o644,
+            )
+        })
+        .map_err(|e| stage_err(&e))
 }
 
 /// Debounce window for rotation pushes (editors/refreshers write in bursts).
@@ -173,7 +191,8 @@ const ROTATION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(
 
 /// Host-side rotation watcher: watches the parent directories of the staged
 /// host files and re-copies a changed file into the guest home (atomic
-/// temp+rename via [`stage_file`]). Directory-level watches survive the
+/// rootfs-contained temp+rename via [`stage_file`] — the VM is running by
+/// now, so its rootfs is guest-tainted). Directory-level watches survive the
 /// rename/atomic-save pattern token refreshers use (same rationale as
 /// `crate::config_watcher`). Dropping the handle stops the watcher.
 pub struct RotationWatcher {
@@ -188,16 +207,17 @@ impl Drop for RotationWatcher {
     }
 }
 
-/// Start a rotation watcher pushing `staged` entries from the host into
-/// `guest_home`. Only entries that were staged at spawn are watched — a file
-/// that did not exist then cannot rotate into the VM (next spawn picks it up).
+/// Start a rotation watcher pushing `staged` entries from the host into the
+/// guest home under `rootfs`. Only entries that were staged at spawn are
+/// watched — a file that did not exist then cannot rotate into the VM (next
+/// spawn picks it up).
 ///
 /// # Errors
 ///
 /// Returns `MicrovmError::AuthStage` when the filesystem watcher cannot start.
 pub fn watch_rotations(
     staged: Vec<StagedAuthFile>,
-    guest_home: PathBuf,
+    rootfs: PathBuf,
 ) -> Result<RotationWatcher, MicrovmError> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -235,7 +255,7 @@ pub fn watch_rotations(
             }
             for entry in &staged {
                 if touched.contains(&entry.host) {
-                    match stage_file(entry, &guest_home) {
+                    match stage_file(entry, &rootfs) {
                         Ok(true) => tracing::info!(
                             provider = entry.provider,
                             guest_rel = entry.guest_rel,
@@ -295,29 +315,38 @@ mod tests {
         assert!(!rels.iter().any(|r| r.contains("claude")));
     }
 
-    #[test]
-    fn stage_file_skips_unchanged_content_and_pushes_changed() {
-        let host_home = tempfile::tempdir().unwrap();
-        let guest_home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(host_home.path().join(".augment")).unwrap();
-        let host_file = host_home.path().join(".augment/session.json");
+    /// A host home with one auggie session file plus an empty guest rootfs
+    /// (with its `root/` home), both under one tempdir.
+    fn staging_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, StagedAuthFile) {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_home = tmp.path().join("home");
+        std::fs::create_dir_all(host_home.join(".augment")).unwrap();
+        let host_file = host_home.join(".augment/session.json");
         std::fs::write(&host_file, b"{\"t\":1}").unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join(GUEST_HOME_REL)).unwrap();
         let entry = StagedAuthFile {
-            host: host_file.clone(),
+            host: host_file,
             guest_rel: ".augment/session.json",
             provider: "auggie",
         };
+        (tmp, host_home, rootfs, entry)
+    }
+
+    #[test]
+    fn stage_file_skips_unchanged_content_and_pushes_changed() {
+        let (_tmp, _host_home, rootfs, entry) = staging_fixture();
 
         // First push writes.
-        assert!(stage_file(&entry, guest_home.path()).unwrap());
+        assert!(stage_file(&entry, &rootfs).unwrap());
         // Identical-content rewrite (refresher touch) is skipped.
-        std::fs::write(&host_file, b"{\"t\":1}").unwrap();
-        assert!(!stage_file(&entry, guest_home.path()).unwrap());
+        std::fs::write(&entry.host, b"{\"t\":1}").unwrap();
+        assert!(!stage_file(&entry, &rootfs).unwrap());
         // Real rotation pushes again.
-        std::fs::write(&host_file, b"{\"t\":2}").unwrap();
-        assert!(stage_file(&entry, guest_home.path()).unwrap());
+        std::fs::write(&entry.host, b"{\"t\":2}").unwrap();
+        assert!(stage_file(&entry, &rootfs).unwrap());
         assert_eq!(
-            std::fs::read(guest_home.path().join(".augment/session.json")).unwrap(),
+            std::fs::read(rootfs.join("root/.augment/session.json")).unwrap(),
             b"{\"t\":2}"
         );
     }
@@ -326,32 +355,22 @@ mod tests {
     fn stage_all_includes_already_matching_entries() {
         // A destination that already matches must still be returned (so the
         // rotation watcher covers it) even though no bytes were written.
-        let host_home = tempfile::tempdir().unwrap();
-        let guest_home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(host_home.path().join(".augment")).unwrap();
-        std::fs::write(host_home.path().join(".augment/session.json"), b"{\"t\":1}").unwrap();
-        std::fs::create_dir_all(guest_home.path().join(".augment")).unwrap();
-        std::fs::write(
-            guest_home.path().join(".augment/session.json"),
-            b"{\"t\":1}",
-        )
-        .unwrap();
+        let (_tmp, host_home, rootfs, _entry) = staging_fixture();
+        std::fs::create_dir_all(rootfs.join("root/.augment")).unwrap();
+        std::fs::write(rootfs.join("root/.augment/session.json"), b"{\"t\":1}").unwrap();
 
-        let staged = stage_all(host_home.path(), guest_home.path()).unwrap();
+        let staged = stage_all(&host_home, &rootfs).unwrap();
         assert_eq!(staged.len(), 1);
         assert_eq!(staged[0].guest_rel, ".augment/session.json");
     }
 
     #[test]
     fn stage_all_copies_present_files_with_0600() {
-        let host_home = tempfile::tempdir().unwrap();
-        let guest_home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(host_home.path().join(".augment")).unwrap();
-        std::fs::write(host_home.path().join(".augment/session.json"), b"{\"t\":1}").unwrap();
+        let (_tmp, host_home, rootfs, _entry) = staging_fixture();
 
-        let staged = stage_all(host_home.path(), guest_home.path()).unwrap();
+        let staged = stage_all(&host_home, &rootfs).unwrap();
         assert_eq!(staged.len(), 1);
-        let dst = guest_home.path().join(".augment/session.json");
+        let dst = rootfs.join("root/.augment/session.json");
         assert_eq!(std::fs::read(&dst).unwrap(), b"{\"t\":1}");
         #[cfg(unix)]
         {
@@ -359,5 +378,70 @@ mod tests {
             let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// Regression (#873 review, `auth.rs:107`): a running guest that swaps
+    /// the staging destination — or its parent directory, or the staging
+    /// temp name — for a symlink to an absolute host path must make the next
+    /// rotation push fail instead of truncating the host file. The
+    /// "already identical" read must not follow the symlink either.
+    #[test]
+    fn stage_file_refuses_guest_planted_symlinks_without_touching_host() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, _host_home, rootfs, entry) = staging_fixture();
+        let host_target = tmp.path().join("daemon-writable-host-file");
+        std::fs::write(&host_target, b"host bytes").unwrap();
+        let host_mtime = std::fs::metadata(&host_target).unwrap().modified().unwrap();
+        let assert_host_untouched = || {
+            assert_eq!(std::fs::read(&host_target).unwrap(), b"host bytes");
+            assert_eq!(
+                std::fs::metadata(&host_target).unwrap().modified().unwrap(),
+                host_mtime
+            );
+        };
+        let guest_dir = rootfs.join("root/.augment");
+        let guest_dst = guest_dir.join("session.json");
+
+        // Symlinked destination: refused on the (no-follow) read already.
+        std::fs::create_dir_all(&guest_dir).unwrap();
+        symlink(&host_target, &guest_dst).unwrap();
+        let err = stage_file(&entry, &rootfs).unwrap_err();
+        assert!(matches!(err, MicrovmError::AuthStage(_)), "{err}");
+        assert_host_untouched();
+        assert!(guest_dst.is_symlink());
+        std::fs::remove_file(&guest_dst).unwrap();
+
+        // Symlinked temp-file name.
+        let tmp_name = guest_dir.join(super::super::guest_fs::temp_name("session.json"));
+        symlink(&host_target, &tmp_name).unwrap();
+        let err = stage_file(&entry, &rootfs).unwrap_err();
+        assert!(matches!(err, MicrovmError::AuthStage(_)), "{err}");
+        assert_host_untouched();
+        assert!(!guest_dst.exists());
+        std::fs::remove_file(&tmp_name).unwrap();
+
+        // Symlinked parent directory (pointing at the host target's dir).
+        std::fs::remove_dir_all(&guest_dir).unwrap();
+        symlink(tmp.path(), &guest_dir).unwrap();
+        let err = stage_file(&entry, &rootfs).unwrap_err();
+        assert!(matches!(err, MicrovmError::AuthStage(_)), "{err}");
+        assert_host_untouched();
+        assert!(!tmp.path().join("session.json").exists());
+
+        // Symlinked guest home (`/root`) itself.
+        std::fs::remove_file(&guest_dir).unwrap();
+        std::fs::remove_dir(rootfs.join(GUEST_HOME_REL)).unwrap();
+        symlink(tmp.path(), rootfs.join(GUEST_HOME_REL)).unwrap();
+        let err = stage_file(&entry, &rootfs).unwrap_err();
+        assert!(matches!(err, MicrovmError::AuthStage(_)), "{err}");
+        assert_host_untouched();
+        assert!(!tmp.path().join(".augment").exists());
+
+        // Same for the gitconfig write.
+        std::fs::write(tmp.path().join("home/.gitconfig"), "[user]\n\tname = t\n").unwrap();
+        let err = stage_gitconfig(&tmp.path().join("home"), &rootfs).unwrap_err();
+        assert!(matches!(err, MicrovmError::AuthStage(_)), "{err}");
+        assert!(!tmp.path().join(".gitconfig").exists());
     }
 }

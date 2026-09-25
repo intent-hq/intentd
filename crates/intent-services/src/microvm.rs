@@ -14,6 +14,8 @@
 //! - [`rootfs`] — rootfs archive extraction cache + per-VM `CoW` clone
 //! - [`auth`] — credential staging into the guest home, rotation watcher,
 //!   teardown scrub (the per-VM directory removal deletes every staged copy)
+//! - [`guest_fs`] — the rootfs-contained writer every host write into a
+//!   guest tree goes through (no-follow `openat` walk, temp + `renameat`)
 //! - [`orchestrator`] — helper boot, guest setup, provider exec, teardown
 //! - [`host_probe`] — cached `intentd-microvm-helper --probe` run behind
 //!   `microvmSupported` / the `sandbox.options` `microvm` row
@@ -28,6 +30,8 @@
 pub mod auth;
 #[cfg(unix)]
 pub mod exec;
+#[cfg(unix)]
+pub mod guest_fs;
 pub mod host_probe;
 #[cfg(unix)]
 pub mod orchestrator;

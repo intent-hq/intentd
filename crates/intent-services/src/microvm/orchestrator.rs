@@ -13,6 +13,7 @@ use tokio::process::{Child, Command};
 
 use super::auth::{self, RotationWatcher};
 use super::exec::{self, ExecRequest};
+use super::guest_fs::RootfsWriter;
 use super::rootfs;
 use super::{MicrovmError, GUEST_INTENT_DIR, GUEST_WORKSPACE_DIR, WORKSPACE_VIRTIOFS_TAG};
 use crate::sandbox_image::CachedImage;
@@ -221,32 +222,36 @@ impl MicrovmVm {
         rootfs::clone_vm_rootfs(&tree, &vm_rootfs).await?;
 
         // 2. Stage credentials + git identity into the guest home, and the
-        // spawn-material directory (/intent) into the rootfs.
-        let guest_home = vm_rootfs.join("root");
+        // spawn-material directory (/intent) into the rootfs. Every write
+        // goes through the rootfs-contained writer: the clone is fresh here,
+        // but the image tree it came from is not ours and the same paths are
+        // rewritten into the running (guest-tainted) VM later.
         let host_home = spec.host_home.clone();
-        let guest_home_clone = guest_home.clone();
+        let rootfs_for_staging = vm_rootfs.clone();
         let stage_claude = spec.stage_claude_onboarding;
         let staged = tokio::task::spawn_blocking(move || {
-            let staged = auth::stage_all(&host_home, &guest_home_clone)?;
-            auth::stage_gitconfig(&host_home, &guest_home_clone)?;
+            let staged = auth::stage_all(&host_home, &rootfs_for_staging)?;
+            auth::stage_gitconfig(&host_home, &rootfs_for_staging)?;
+            let writer = RootfsWriter::open(&rootfs_for_staging)
+                .map_err(|e| MicrovmError::AuthStage(e.to_string()))?;
             if stage_claude {
                 // Minimal onboarding state the Claude Agent SDK checks; the
                 // token itself rides the provider exec env, never disk.
-                std::fs::write(
-                    guest_home_clone.join(".claude.json"),
-                    b"{\"hasCompletedOnboarding\":true}",
-                )
-                .map_err(|e| MicrovmError::AuthStage(format!("write .claude.json: {e}")))?;
+                writer
+                    .write_file(
+                        &format!("{}/.claude.json", auth::GUEST_HOME_REL),
+                        b"{\"hasCompletedOnboarding\":true}",
+                        0o644,
+                    )
+                    .map_err(|e| MicrovmError::AuthStage(format!("write .claude.json: {e}")))?;
             }
+            writer
+                .ensure_dir(GUEST_INTENT_DIR)
+                .map_err(|e| MicrovmError::Io(format!("create /intent dir: {e}")))?;
             Ok::<_, MicrovmError>(staged)
         })
         .await
         .map_err(|e| MicrovmError::AuthStage(format!("staging task panicked: {e}")))??;
-
-        let intent_dir = vm_rootfs.join(GUEST_INTENT_DIR);
-        tokio::fs::create_dir_all(&intent_dir)
-            .await
-            .map_err(|e| MicrovmError::Io(format!("create /intent dir: {e}")))?;
 
         // 3. Spawn the helper. The guest command is the image's init
         // entrypoint; everything else rides the exec protocol later. The exec
@@ -322,7 +327,7 @@ impl MicrovmVm {
         let boot_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         // 5. Rotation watcher for the staged credentials.
-        let rotation_watcher = match auth::watch_rotations(staged, guest_home) {
+        let rotation_watcher = match auth::watch_rotations(staged, vm_rootfs.clone()) {
             Ok(w) => Some(w),
             Err(e) => {
                 // Non-fatal: rotations just won't push until the next spawn.
@@ -389,30 +394,38 @@ impl MicrovmVm {
     ///
     /// # Errors
     ///
-    /// Returns `MicrovmError::Io` when the write fails.
+    /// Returns `MicrovmError::Io` when the write fails or the guest replaced
+    /// a component of the path with a symlink.
     pub async fn stage_mcp_bridge(&self) -> Result<(), MicrovmError> {
-        let path = self.rootfs.join(GUEST_INTENT_DIR).join("mcp-bridge.mjs");
-        tokio::fs::write(&path, GUEST_MCP_BRIDGE_SOURCE)
+        self.stage_intent_file("mcp-bridge.mjs", GUEST_MCP_BRIDGE_SOURCE.as_bytes())
             .await
-            .map_err(|e| MicrovmError::Io(format!("stage mcp bridge: {e}")))?;
-        Ok(())
+            .map(|_| ())
     }
 
-    /// Write `content` into the guest at `/intent/<name>`, returning the
-    /// guest-absolute path.
+    /// Write `content` into the guest at `/intent/<name>` (0644, atomic,
+    /// through the rootfs-contained writer — the VM is running, so the
+    /// rootfs is guest-tainted), returning the guest-absolute path.
     ///
     /// # Errors
     ///
-    /// Returns `MicrovmError::Io` when the write fails.
+    /// Returns `MicrovmError::Io` when the write fails, `name` is not a
+    /// plain file name, or the guest replaced a component with a symlink.
     pub async fn stage_intent_file(
         &self,
         name: &str,
         content: &[u8],
     ) -> Result<String, MicrovmError> {
-        let path = self.rootfs.join(GUEST_INTENT_DIR).join(name);
-        tokio::fs::write(&path, content)
-            .await
-            .map_err(|e| MicrovmError::Io(format!("stage {name}: {e}")))?;
+        let rootfs = self.rootfs.clone();
+        let rel = format!("{GUEST_INTENT_DIR}/{name}");
+        let owned_name = name.to_string();
+        let content = content.to_vec();
+        tokio::task::spawn_blocking(move || {
+            RootfsWriter::open(&rootfs)
+                .and_then(|w| w.write_file(&rel, &content, 0o644))
+                .map_err(|e| MicrovmError::Io(format!("stage {owned_name}: {e}")))
+        })
+        .await
+        .map_err(|e| MicrovmError::Io(format!("stage {name}: task panicked: {e}")))??;
         Ok(format!("/{GUEST_INTENT_DIR}/{name}"))
     }
 
@@ -868,6 +881,77 @@ mod tests {
             !vm_dir.exists(),
             "vm dir (rootfs clone + staged credentials) must be scrubbed after a readiness failure"
         );
+    }
+
+    /// Regression (#873 review): the post-boot `/intent` writes go into a
+    /// rootfs the running guest owns. A guest that swapped `/intent` (or the
+    /// destination file) for a symlink to a host path must make the stage
+    /// fail without touching the host target; a plain name still lands
+    /// 0644 under `<rootfs>/intent/`.
+    #[tokio::test]
+    async fn stage_intent_file_is_rootfs_contained() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vm_dir = tmp.path().join("microvm").join("agent-contained");
+        let rootfs = vm_dir.join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let host_target = tmp.path().join("host-target");
+        std::fs::write(&host_target, b"host bytes").unwrap();
+        let vm = MicrovmVm {
+            vm_dir: vm_dir.clone(),
+            rootfs: rootfs.clone(),
+            exec_sock: tmp.path().join("agent-contained.sock"),
+            child: None,
+            rotation_watcher: None,
+            boot_ms: 0,
+            stop_event: None,
+        };
+
+        // Happy path creates /intent and lands the file.
+        let guest_path = vm.stage_intent_file("rules.md", b"# rules").await.unwrap();
+        assert_eq!(guest_path, "/intent/rules.md");
+        let dst = rootfs.join("intent/rules.md");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"# rules");
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        vm.stage_mcp_bridge().await.unwrap();
+        assert!(rootfs.join("intent/mcp-bridge.mjs").is_file());
+
+        // Guest swaps the destination file for a symlink to a host path.
+        std::fs::remove_file(&dst).unwrap();
+        symlink(&host_target, &dst).unwrap();
+        let err = vm
+            .stage_intent_file("rules.md", b"pwned")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MicrovmError::Io(_)), "{err}");
+        assert_eq!(std::fs::read(&host_target).unwrap(), b"host bytes");
+
+        // Guest swaps the whole /intent dir for a symlink to a host dir.
+        std::fs::remove_dir_all(rootfs.join("intent")).unwrap();
+        symlink(tmp.path(), rootfs.join("intent")).unwrap();
+        let err = vm
+            .stage_intent_file("rules.md", b"pwned")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MicrovmError::Io(_)), "{err}");
+        let err = vm.stage_mcp_bridge().await.unwrap_err();
+        assert!(matches!(err, MicrovmError::Io(_)), "{err}");
+        assert!(!tmp.path().join("rules.md").exists());
+        assert!(!tmp.path().join("mcp-bridge.mjs").exists());
+
+        // A name that is not a plain file name is refused up front.
+        let err = vm
+            .stage_intent_file("../escape.md", b"x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MicrovmError::Io(_)), "{err}");
+        assert!(!rootfs.join("escape.md").exists());
+        drop(vm);
+        await_pending_scrub(&vm_dir).await;
     }
 
     fn exit_status(code: i32) -> ExitStatus {
