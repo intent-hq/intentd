@@ -2343,6 +2343,39 @@ fn guest_mcp_servers(bridge_connect_addr: String) -> NormalizedMcpServers {
     servers
 }
 
+/// Structural microVM provider gate, evaluated before any boot cost: `Some`
+/// carries the `execution-environment-unavailable` reason for a provider
+/// that cannot run in the guest, `None` lets the spawn proceed to the
+/// credential and image-manifest checks.
+///
+/// - opencode (and unsloth, which rides the opencode runtime) cannot run in
+///   the libkrun guest (libkrunfw#137).
+/// - Providers whose workspace-tool delivery rides the bundled pi extension
+///   (`mcp_via_pi_extension`) get that delivery host-side only: neither the
+///   wrapper nor the extension is staged into the guest rootfs, so an
+///   in-guest spawn would come up with no `workspace_api` tools. Refused
+///   rather than silently degraded until the delivery is staged in-guest.
+fn microvm_provider_gate(provider: &ProviderConfig) -> Option<String> {
+    if provider.id == "opencode" || provider.id == "unsloth" {
+        return Some(format!(
+            "the {} provider is not available in microVM sandboxes \
+             (guest runtime limitation); pick another provider or a \
+             non-microVM execution environment",
+            provider.id
+        ));
+    }
+    if provider.mcp_via_pi_extension {
+        return Some(format!(
+            "the {} provider is not available in microVM sandboxes \
+             (workspace tools ride a host-side pi extension that is not \
+             staged into the guest); pick another provider or a \
+             non-microVM execution environment",
+            provider.id
+        ));
+    }
+    None
+}
+
 /// One live agent: its ACP [`Connection`] (own id space + pending map), the
 /// streaming-notification receiver consumed during a turn, the client-served
 /// request loop, the owned child (its process group is killed on teardown via
@@ -3277,15 +3310,17 @@ impl AgentManager {
         // pi process, so the spawn env routes pi-acp's pi spawn through a
         // wrapper script adding `-e <extension>` (PI_ACP_PI_COMMAND) and the
         // extension dials the same bridge endpoint (INTENTD_MCP_BRIDGE_ADDR).
-        // microVM spawns stage the extension + wrapper into the VM rootfs
-        // instead.
+        // This delivery is host-only: microVM spawns have no in-guest
+        // equivalent, so `spawn_in_microvm` refuses pi structurally
+        // (`microvm_provider_gate`) before any boot cost — never a silent
+        // spawn without workspace tools.
         //
         // Fail fast before spawning when the `pi` CLI the wrapper would exec
         // is missing or known-too-old for the pinned pi-acp adapter
         // (monorepo#1662) — a clear error instead of a silent hang. The probe
         // is blocking (subprocess, ≤3s budget), so it runs off the runtime.
         // The probe checks the HOST pi binary, so it is skipped for microVM
-        // spawns where pi runs inside the guest rootfs.
+        // spawns (which the gate above refuses for pi anyway).
         if opts.provider.mcp_via_pi_extension && microvm_ws.is_none() {
             let status = tokio::task::spawn_blocking(crate::pi_cli::probe_pi_cli)
                 .await
@@ -3638,11 +3673,12 @@ impl AgentManager {
     /// wired over the vsock byte stream (stdin/stdout = the socket halves,
     /// stderr = a host-side tail of the guest `/intent/acp.err` log).
     ///
-    /// Provider gating happens FIRST (before any boot cost): opencode/unsloth
-    /// are structurally unavailable in-guest (libkrunfw#137), claude-code
-    /// requires the `providers.claudeCodeOauthToken` sensitive setting, and
-    /// any provider the image manifest does not include is rejected. A
-    /// backend failure is a hard spawn error — no silent host fallback.
+    /// Provider gating happens FIRST (before any boot cost): the structural
+    /// refusals in [`microvm_provider_gate`] (opencode/unsloth, pi),
+    /// claude-code requires the `providers.claudeCodeOauthToken` sensitive
+    /// setting, and any provider the image manifest does not include is
+    /// rejected. A backend failure is a hard spawn error — no silent host
+    /// fallback.
     #[expect(clippy::too_many_arguments)]
     async fn spawn_in_microvm(
         &self,
@@ -3659,15 +3695,8 @@ impl AgentManager {
             environment: "microvm".to_string(),
             reason,
         };
-        // Structural gating: opencode (and unsloth, which rides the opencode
-        // runtime) cannot run in the libkrun guest (libkrunfw#137).
-        if provider.id == "opencode" || provider.id == "unsloth" {
-            return Err(unavailable(format!(
-                "the {} provider is not available in microVM sandboxes \
-                 (guest runtime limitation); pick another provider or a \
-                 non-microVM execution environment",
-                provider.id
-            )));
+        if let Some(reason) = microvm_provider_gate(provider) {
+            return Err(unavailable(reason));
         }
         // claude-code cannot use the macOS Keychain in-guest: require the
         // long-lived OAuth token minted via `claude setup-token`.
@@ -18885,6 +18914,75 @@ mod pi_extension_delivery_tests {
                 provider.id
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod microvm_provider_gate_tests {
+    //! The structural microVM provider gate (`spawn_in_microvm`'s first
+    //! check): opencode/unsloth are refused (libkrunfw#137), pi is refused
+    //! because its workspace-tool delivery (wrapper + extension) is
+    //! host-only, and every other registry provider passes through to the
+    //! credential / image-manifest checks.
+
+    use super::*;
+
+    #[test]
+    fn pi_is_refused_because_extension_delivery_is_host_only() {
+        let pi = intent_providers::find_provider("pi").unwrap();
+        assert!(
+            pi.mcp_via_pi_extension,
+            "precondition: pi rides the extension"
+        );
+        let reason = microvm_provider_gate(pi).expect("pi must be refused in microVM");
+        assert!(
+            reason.contains("the pi provider is not available in microVM sandboxes"),
+            "got: {reason}"
+        );
+        assert!(
+            reason.contains("host-side pi extension"),
+            "reason must name the missing in-guest delivery: {reason}"
+        );
+    }
+
+    #[test]
+    fn opencode_and_unsloth_are_refused_as_guest_runtime_limitation() {
+        for id in ["opencode", "unsloth"] {
+            let provider = intent_providers::find_provider(id).unwrap();
+            let reason = microvm_provider_gate(provider).expect("must be refused");
+            assert!(
+                reason.contains(&format!("the {id} provider is not available in microVM"))
+                    && reason.contains("guest runtime limitation"),
+                "got: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_providers_pass_the_structural_gate() {
+        for provider in intent_providers::ACP_PROVIDERS
+            .iter()
+            .filter(|p| !matches!(p.id, "opencode" | "unsloth") && !p.mcp_via_pi_extension)
+        {
+            assert!(
+                microvm_provider_gate(provider).is_none(),
+                "{} must pass the structural gate",
+                provider.id
+            );
+        }
+    }
+
+    /// The gate is the FIRST check in `spawn_in_microvm`, so the refusal is
+    /// the structured `execution-environment-unavailable` error (`-32602`),
+    /// never a boot attempt.
+    #[test]
+    fn refusal_maps_to_structured_unavailable_error() {
+        let pi = intent_providers::find_provider("pi").unwrap();
+        let err = Error::ExecutionEnvironmentUnavailable {
+            environment: "microvm".to_string(),
+            reason: microvm_provider_gate(pi).unwrap(),
+        };
+        assert_eq!(err.code(), -32602);
     }
 }
 
