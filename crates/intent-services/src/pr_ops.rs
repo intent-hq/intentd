@@ -981,7 +981,7 @@ pub struct MergeRequirementsChecks {
 }
 
 impl MergeRequirementsChecks {
-    fn from_items(items: Vec<MergeRequirementCheck>, required_known: bool) -> Self {
+    pub(crate) fn from_items(items: Vec<MergeRequirementCheck>, required_known: bool) -> Self {
         let tally = |word: &str| {
             i64::try_from(items.iter().filter(|c| c.status == word).count())
                 .expect("value fits in i64")
@@ -1010,19 +1010,15 @@ impl MergeRequirementsChecks {
     pub(crate) fn retain_status_evidence(
         &mut self,
         previous: &Self,
-        statuses: Option<&[MergeRequirementCheck]>,
+        statuses: &[MergeRequirementCheck],
+        required_check_names: &std::collections::BTreeSet<String>,
     ) {
         let before: HashMap<_, _> = previous.items.iter().map(|c| (&c.name, c)).collect();
-        let required_known =
-            previous.required_known && self.items.iter().all(|c| before.contains_key(&c.name));
         for check in &mut self.items {
             if let Some(prior) = before.get(&check.name) {
                 check.required = prior.required;
             }
         }
-        // Older persisted snapshots have no provenance. Their combined entries
-        // may contain legacy failures; only a full rollup can disprove them.
-        let statuses = statuses.unwrap_or(&previous.items);
         let severity = |status: &str| match status {
             "failed" => 2,
             "pending" => 1,
@@ -1047,6 +1043,13 @@ impl MergeRequirementsChecks {
                 self.items.push(status.clone());
             }
         }
+        let required_known = if self.items.is_empty() {
+            previous.required_known
+        } else {
+            self.items
+                .iter()
+                .all(|c| required_check_names.contains(&c.name))
+        };
         *self = Self::from_items(std::mem::take(&mut self.items), required_known);
     }
 }

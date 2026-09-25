@@ -801,6 +801,7 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         checks_unobserved: false,
         checks_seed_pending: false,
         status_checks: Some(Vec::new()),
+        required_check_names: None,
         observed_at: None,
     }
 }

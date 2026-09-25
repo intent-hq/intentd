@@ -361,6 +361,307 @@ async fn qwen_partial_fallback_reports_fresh_runs_and_legacy_recovery_once() {
 }
 
 #[tokio::test]
+async fn qwen_old_snapshot_rest_failure_and_recovery_each_deliver_once() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        s.pr["updatedAt"] = json!("");
+    });
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    assert_eq!(check_map(&monitor)["route"], "passed");
+    let mut old: serde_json::Value =
+        serde_json::from_str(monitor.last_snapshot.as_deref().unwrap()).unwrap();
+    for field in [
+        "checksUnobserved",
+        "checksSeedPending",
+        "statusChecks",
+        "requiredCheckNames",
+    ] {
+        old.as_object_mut().unwrap().remove(field);
+    }
+    let old = serde_json::to_string(&old).unwrap();
+    assert!(svc
+        .store()
+        .update_pr_monitor_poll(
+            &monitor.monitor_id,
+            intent_store::PrMonitorPollUpdate {
+                last_snapshot: Some(&old),
+                baseline_snapshot: Some(&old),
+                pending_changes: &[],
+                pending_since: None,
+                last_change_at: None,
+                last_polled_at: monitor.last_polled_at.as_deref(),
+                last_error: None,
+                updated_at: &now_iso(),
+                expected_updated_at: &monitor.updated_at,
+            },
+        )
+        .await
+        .unwrap());
+    for (conclusion, when, expected) in [
+        ("FAILURE", "2026-09-25T06:00:00Z", "failed"),
+        ("SUCCESS", "2026-09-25T06:01:00Z", "passed"),
+    ] {
+        mock.edit(|s| {
+            let mut run = s
+                .nodes
+                .iter()
+                .find(|n| n["name"] == "route")
+                .unwrap()
+                .clone();
+            run["conclusion"] = json!(conclusion);
+            run["startedAt"] = json!(when);
+            s.nodes.push(run);
+        });
+        full_poll(&svc, &mock).await;
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        let current = row(&svc, &monitor).await;
+        let messages = owner_messages(&svc, &owner).await;
+        assert_eq!(check_map(&current)["route"], expected, "R3: {messages}");
+        for saved in [
+            current.last_snapshot.as_deref(),
+            current.baseline_snapshot.as_deref(),
+        ] {
+            let saved: serde_json::Value = serde_json::from_str(saved.unwrap()).unwrap();
+            let original: serde_json::Value = serde_json::from_str(&old).unwrap();
+            assert_eq!(
+                saved["statusChecks"],
+                original["requirements"]["checks"]["items"]
+            );
+        }
+        assert!(current.pending_changes.is_empty());
+    }
+    let delivered = owner_messages(&svc, &owner).await;
+    for transition in [
+        "check route: passed → failed",
+        "check route: failed → passed",
+    ] {
+        assert_eq!(delivered.matches(transition).count(), 1, "R3: {delivered}");
+    }
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&owner)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        2
+    );
+    for _ in 0..2 {
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+        assert_eq!(owner_messages(&svc, &owner).await, delivered);
+    }
+}
+
+#[tokio::test]
+async fn qwen_known_required_flip_survives_delivered_new_rest_check() {
+    required_flip_after_rest_check("route", true).await;
+}
+
+#[tokio::test]
+async fn qwen_unknown_required_flag_seeds_silently_then_reports_a_real_flip() {
+    required_flip_after_rest_check("fresh-run", false).await;
+}
+
+async fn required_flip_after_rest_check(name: &str, was_known: bool) {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Standalone;
+        s.pr["updatedAt"] = json!("");
+        s.pr["mergeStateStatus"] = json!(null);
+    });
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    let registered: PrMonitorSnapshot =
+        serde_json::from_str(monitor.last_snapshot.as_deref().unwrap()).unwrap();
+    assert!(registered.requirements.checks.required_known);
+    assert!(
+        !registered
+            .requirements
+            .checks
+            .items
+            .iter()
+            .find(|c| c.name == "route")
+            .unwrap()
+            .required
+    );
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        s.nodes
+            .push(json!({"__typename":"CheckRun", "name":"fresh-run",
+            "status":"COMPLETED", "conclusion":"FAILURE", "isRequired":false,
+            "startedAt":"2026-09-25T06:00:00Z"}));
+    });
+    full_poll(&svc, &mock).await;
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    let first = owner_messages(&svc, &owner).await;
+    assert_eq!(
+        first.matches("check started: fresh-run (failed)").count(),
+        1
+    );
+    assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+    mock.edit(|s| {
+        s.mode = ReadMode::Standalone;
+        for run in s.nodes.iter_mut().filter(|n| n["name"] == name) {
+            run["isRequired"] = json!(true);
+        }
+    });
+    full_poll(&svc, &mock).await;
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    let delivered = owner_messages(&svc, &owner).await;
+    let expected = format!("check {name} is now required to merge");
+    assert_eq!(
+        delivered.matches(&expected).count(),
+        usize::from(was_known),
+        "R4: {delivered}"
+    );
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&owner)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        if was_known { 2 } else { 1 }
+    );
+    for mode in [ReadMode::Rest, ReadMode::Standalone] {
+        mock.edit(|s| s.mode = mode);
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+        assert_eq!(owner_messages(&svc, &owner).await, delivered);
+    }
+    if !was_known {
+        // No wake advanced the emit anchor when the unknown flag became known.
+        // Its next genuine change must still be compared with that learned value.
+        mock.edit(|s| {
+            for run in s.nodes.iter_mut().filter(|n| n["name"] == name) {
+                run["isRequired"] = json!(false);
+            }
+        });
+        full_poll(&svc, &mock).await;
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        let delivered = owner_messages(&svc, &owner).await;
+        assert_eq!(
+            delivered
+                .matches("check fresh-run is no longer required to merge")
+                .count(),
+            1
+        );
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+        assert_eq!(owner_messages(&svc, &owner).await, delivered);
+    }
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        s.pr["headRefOid"] = json!("new-head");
+    });
+    full_poll(&svc, &mock).await;
+    let changed = row(&svc, &monitor).await;
+    let snapshot: PrMonitorSnapshot =
+        serde_json::from_str(changed.last_snapshot.as_deref().unwrap()).unwrap();
+    assert!(snapshot.known_required_checks().is_empty());
+    assert!(snapshot
+        .requirements
+        .checks
+        .items
+        .iter()
+        .all(|c| !c.required));
+    assert!(!changed
+        .pending_changes
+        .iter()
+        .any(|c| c.contains("required to merge")));
+}
+
+#[test]
+fn qwen_old_legacy_subset_stays_fixed_through_new_runs_and_head_changes() {
+    let original = snapshot(|s| {
+        s.status_checks = None;
+        s.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(
+            [
+                ("route", "failed", true),
+                ("legacy-only", "failed", true),
+                ("fresh-run", "passed", false),
+            ]
+            .into_iter()
+            .map(|(name, status, required)| pr_ops::MergeRequirementCheck {
+                name: name.into(),
+                status: status.into(),
+                required,
+                url: None,
+            })
+            .collect(),
+            true,
+        );
+    });
+    let mut previous = original.clone();
+    for status in ["failed", "passed", "failed", "passed"] {
+        let mut rest = shared_from(&snapshot(|_| {}), false);
+        rest.status_checks = None;
+        rest.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(
+            [("route", "passed"), ("fresh-run", status)]
+                .into_iter()
+                .map(|(name, status)| pr_ops::MergeRequirementCheck {
+                    name: name.into(),
+                    status: status.into(),
+                    required: false,
+                    url: None,
+                })
+                .collect(),
+            false,
+        );
+        let fresh = rest.materialize(Some(&previous));
+        assert_eq!(
+            fresh.status_checks.as_ref().unwrap(),
+            &original.requirements.checks.items
+        );
+        let by_name: BTreeMap<_, _> = fresh
+            .requirements
+            .checks
+            .items
+            .iter()
+            .map(|c| (c.name.as_str(), c))
+            .collect();
+        assert_eq!(by_name["fresh-run"].status, status);
+        for name in ["route", "legacy-only"] {
+            assert_eq!(by_name[name].status, "failed");
+            assert!(by_name[name].required);
+        }
+        previous = serde_json::from_str(&serde_json::to_string(&fresh).unwrap()).unwrap();
+        rest.head_sha = Some("new-head".into());
+        let new_head = rest.materialize(Some(&previous));
+        assert!(new_head.status_checks.as_ref().unwrap().is_empty());
+        assert!(new_head.known_required_checks().is_empty());
+        assert_eq!(new_head.requirements.checks.items[0].status, "passed");
+        assert!(new_head
+            .requirements
+            .checks
+            .items
+            .iter()
+            .all(|c| !c.required && c.name != "legacy-only"));
+    }
+    let mut complete = shared_from(&snapshot(|_| {}), true);
+    complete.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(Vec::new(), true);
+    let cleared = complete.materialize(Some(&previous));
+    assert!(cleared.requirements.checks.items.is_empty());
+    assert!(cleared.status_checks.as_ref().unwrap().is_empty());
+    assert!(cleared.known_required_checks().is_empty());
+}
+
+#[tokio::test]
 async fn qwen_older_snapshot_preserves_unknown_status_provenance_until_full_read() {
     let (_db, _root, svc, _forge, ws, owner) = setup().await;
     let mock = MockQwen::start(11506).await;
@@ -375,7 +676,12 @@ async fn qwen_older_snapshot_preserves_unknown_status_provenance_until_full_read
     let baseline = check_map(&monitor);
     let mut old: serde_json::Value =
         serde_json::from_str(monitor.last_snapshot.as_deref().unwrap()).unwrap();
-    for field in ["checksUnobserved", "checksSeedPending", "statusChecks"] {
+    for field in [
+        "checksUnobserved",
+        "checksSeedPending",
+        "statusChecks",
+        "requiredCheckNames",
+    ] {
         old.as_object_mut().unwrap().remove(field);
     }
     let old = serde_json::to_string(&old).unwrap();
