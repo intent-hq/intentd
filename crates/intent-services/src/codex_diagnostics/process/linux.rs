@@ -86,9 +86,15 @@ fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
 
 fn supervisor(command: &Command, control: &OwnedFd, status: &OwnedFd) -> Command {
     let command = command.as_std();
-    let mut owner = Command::new("/bin/sh");
+    // Bash can close arbitrary inherited descriptor numbers. Disable startup
+    // files, imported functions and shell options from the provider environment.
+    // If unavailable, spawn fails without executing the provider or a fallback.
+    let mut owner = Command::new("/bin/bash");
     owner
         .args([
+            "--noprofile",
+            "--norc",
+            "-p",
             "-c",
             include_str!("supervise.sh"),
             "intentd-codex-diagnostic",
@@ -218,12 +224,23 @@ async fn read_frame(
 }
 
 fn terminated(pid: i32) -> io::Result<bool> {
-    match read_proc(&format!("/proc/{pid}/stat")) {
+    terminated_stat(read_proc(&format!("/proc/{pid}/stat")))
+}
+
+fn terminated_stat(stat: io::Result<String>) -> io::Result<bool> {
+    match stat {
         Ok(stat) => stat
             .rsplit_once(") ")
             .map(|(_, rest)| rest.starts_with('Z'))
             .ok_or_else(|| io::ErrorKind::InvalidData.into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        // The process can be reaped after open but before read; procfs then
+        // returns ESRCH instead of the ENOENT from opening an absent path.
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(true)
+        }
         Err(error) => Err(error),
     }
 }

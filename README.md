@@ -398,6 +398,11 @@ adapter and runtime versions separately after verifying their package entrypoint
 opaque wrappers, missing runtimes, and failed checks remain explicitly unknown. An
 unrelated `codex` on PATH never supplies evidence of the selected adapter's runtime.
 
+On Linux, diagnostic process probes also require `/bin/bash` for private process
+supervision. If it is unavailable, probes report a failure and their results remain
+unknown; diagnostics do not install Bash or fall back to another shell. This requirement
+applies only to diagnostic probes, not normal provider launches.
+
 On macOS, diagnostics report the selected launch and configured managed pin without
 resolving the package or inspecting ignored local adapters. They do not execute Node,
 the adapter, or Codex, or infer a runtime from PATH or neighboring packages.

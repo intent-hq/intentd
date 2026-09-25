@@ -2,6 +2,13 @@
 # carry private lifetime/status traffic; all provider stdio remains unchanged.
 exec 3<"/proc/self/fd/$1"
 exec 4>"/proc/self/fd/$2"
+# Bash's descriptor variables also close multi-digit originals. Do this before
+# either fork and before saving stdin on 5, which may be an original descriptor.
+control_fd=$1
+status_fd=$2
+exec {control_fd}<&-
+exec {status_fd}>&-
+unset control_fd status_fd
 shift 2
 trap ':' TERM INT HUP
 # A non-interactive shell replaces descriptor 0 for background commands.
