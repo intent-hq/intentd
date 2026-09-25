@@ -3970,7 +3970,7 @@ impl AgentManager {
     /// effort. A successful model change can replace the opening selector
     /// (Pi may open with only `off`, then offer reasoning levels). Missing
     /// or malformed config options preserve the opening selector for older
-    /// adapters. An explicit list without thought_level clears it.
+    /// adapters. An explicit list without `thought_level` clears it.
     /// Opening levels are persisted by open/resume/recreate with their CAS
     /// guard; refreshed levels come from a subsequent response for the
     /// canonical session, never from a losing session/new candidate.
