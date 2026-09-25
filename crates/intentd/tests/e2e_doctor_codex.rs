@@ -587,15 +587,26 @@ fn live_catalog_deadline_is_advisory_and_preserves_the_other_catalog() {
 #[test]
 fn daemon_health_failure_still_fails_with_catalog_diagnostics_enabled() {
     let fixture = Fixture::new("managed", &json!({}));
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut command = fixture.doctor_command(true);
-    command.env(
-        "INTENTD_TCP_PORT",
-        port.local_addr().unwrap().port().to_string(),
+    // Reserve the exact wildcard endpoint that doctor's health check probes.
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    assert_eq!(
+        std::net::TcpListener::bind(address)
+            .expect_err("the fixture must make doctor's endpoint unbindable")
+            .kind(),
+        std::io::ErrorKind::AddrInUse
     );
+    let mut command = fixture.doctor_command(true);
+    command.env("INTENTD_TCP_PORT", address.port().to_string());
     let (success, stdout) = fixture.run_command(command);
-    assert!(!success);
-    assert!(stdout.contains("not bindable"));
+    assert!(
+        !success,
+        "daemon health failure must remain fatal: {stdout}"
+    );
+    assert!(stdout.contains(&format!("[FAIL] WSS port {} not bindable", address.port())));
+    assert!(stdout.contains("codex effective runtime:"));
+    assert!(stdout.contains("ACP catalog:"));
+    assert!(stdout.contains("raw runtime catalog:"));
     fixture.assert_clean();
 }
 

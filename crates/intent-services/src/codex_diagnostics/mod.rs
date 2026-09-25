@@ -577,7 +577,7 @@ async fn local_output_with_dependency(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn local_output(
     command: Command,
     path: &OsStr,
