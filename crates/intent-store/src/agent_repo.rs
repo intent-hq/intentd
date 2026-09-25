@@ -3371,26 +3371,10 @@ impl Store {
         // Retired hooks/monitors and queued messages can also accumulate.
         // Drain them before the session cascade, including delivery markers
         // referencing either endpoint of a parent/child pair.
-        for (table, predicate) in [
-            ("agent_queue", "agent_id = ?1"),
-            ("hook", "agent_id = ?1"),
-            ("pr_monitor", "agent_id = ?1"),
-            (
-                "completion_wake_delivery",
-                "parent_agent_id = ?1 OR child_agent_id = ?1",
-            ),
-            (
-                "advisory_wake_delivery",
-                "parent_agent_id = ?1 OR child_agent_id = ?1",
-            ),
-        ] {
-            let sql = format!(
-                "DELETE FROM {table} WHERE rowid IN \
-                 (SELECT rowid FROM {table} WHERE {predicate} LIMIT ?2)"
-            );
+        for sql in delete_agent_metadata_batch_statements() {
             delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
         }
-        let result = sqlx::query("DELETE FROM agent_session WHERE id = ? AND workspace_id = ?")
+        let result = sqlx::query(DELETE_AGENT_SESSION_SQL)
             .bind(&id.0)
             .bind(&workspace_id.0)
             .execute(self.write_pool())
@@ -3398,6 +3382,33 @@ impl Store {
             .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
         Ok(result.rows_affected() > 0)
     }
+}
+
+pub(crate) const DELETE_AGENT_SESSION_SQL: &str =
+    "DELETE FROM agent_session WHERE id = ? AND workspace_id = ?";
+
+/// Shared with query-plan regressions for explicit batches and hidden FK work.
+pub(crate) fn delete_agent_metadata_batch_statements() -> impl Iterator<Item = String> {
+    [
+        ("agent_queue", "agent_id = ?1"),
+        ("hook", "agent_id = ?1"),
+        ("pr_monitor", "agent_id = ?1"),
+        (
+            "completion_wake_delivery",
+            "parent_agent_id = ?1 OR child_agent_id = ?1",
+        ),
+        (
+            "advisory_wake_delivery",
+            "parent_agent_id = ?1 OR child_agent_id = ?1",
+        ),
+    ]
+    .into_iter()
+    .map(|(table, predicate)| {
+        format!(
+            "DELETE FROM {table} WHERE rowid IN \
+                 (SELECT rowid FROM {table} WHERE {predicate} LIMIT ?2)"
+        )
+    })
 }
 
 /// Max child rows removed per statement in session/workspace delete sweeps.

@@ -21,6 +21,18 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
     browser_client_id";
 
+// Shared with deletion query-cost regressions so they exercise the exact
+// production statements, including their candidate-selection work.
+pub(crate) const CLEAR_NOTE_PARENT_BATCH_SQL: &str =
+    "UPDATE note SET parent_id = NULL WHERE rowid IN \
+    (SELECT rowid FROM note WHERE workspace_id = ? AND parent_id IS NOT NULL LIMIT ?)";
+pub(crate) const DELETE_NOTE_COMMENT_BATCH_SQL: &str = "DELETE FROM comment WHERE rowid IN \
+    (SELECT rowid FROM comment WHERE workspace_id = ? AND note_id IS NOT NULL LIMIT ?)";
+pub(crate) const DELETE_WORKSPACE_BROWSER_BATCH_SQL: &str =
+    "DELETE FROM browser_tab WHERE rowid IN \
+    (SELECT rowid FROM browser_tab WHERE workspace_id = ? LIMIT ?) RETURNING tab_id";
+pub(crate) const DELETE_WORKSPACE_SQL: &str = "DELETE FROM workspace WHERE id = ?";
+
 /// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
 /// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
 /// statement (see `SESSION_MESSAGE_STATS_SQL` for the precedent).
@@ -740,6 +752,8 @@ impl Store {
     /// cancellation can leave a live workspace with partially removed data;
     /// retry resumes cleanup. Only the final row delete and tombstone are
     /// atomic. Cleanup errors propagate without falling back to a cascade.
+    /// A started browser batch or final transaction finishes its commit and
+    /// overlay eviction even if the caller is cancelled.
     ///
     /// The final transaction uses whole-transaction retry to eliminate
     /// `SQLITE_BUSY` (code 5) lock-upgrade failures under concurrent load (STAB-7).
@@ -779,21 +793,17 @@ impl Store {
         // before the notes themselves. All predicates remain workspace-scoped.
         delete_in_bounded_batches(
             self.write_pool(),
-            "UPDATE note SET parent_id = NULL WHERE rowid IN \
-             (SELECT rowid FROM note WHERE workspace_id = ? AND parent_id IS NOT NULL LIMIT ?)",
+            CLEAR_NOTE_PARENT_BATCH_SQL,
             &id.0,
             DELETE_CASCADE_BATCH,
         )
         .await?;
-        // comment's index starts with note_id, not workspace_id. Join from
-        // the workspace's notes to avoid rescanning unrelated comments for
-        // every batch, and preserve rows with no note (no cascade before).
+        // Partial indexes contain only remaining parent links and note-bound
+        // comments, so batches do not rescan processed notes or no-note rows.
+        // Preserve comments with no note (no cascade before).
         delete_in_bounded_batches(
             self.write_pool(),
-            "DELETE FROM comment WHERE rowid IN \
-             (SELECT c.rowid FROM note n JOIN comment c \
-              ON c.note_id = n.id AND c.workspace_id = n.workspace_id \
-              WHERE n.workspace_id = ? LIMIT ?)",
+            DELETE_NOTE_COMMENT_BATCH_SQL,
             &id.0,
             DELETE_CASCADE_BATCH,
         )
@@ -820,29 +830,50 @@ impl Store {
             delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
         }
 
-        // Browser rows need their ids after commit to evict the process-local
-        // overlay. RETURNING completes the implicit transaction before the
-        // successful fetch_all returns, keeping each batch and eviction paired.
+        // SQLite can commit RETURNING while fetch_all's caller is suspended.
+        // Give each started batch independent ownership through eviction;
+        // cancelling the caller detaches only that batch, not the whole sweep.
         loop {
-            let tab_ids: Vec<String> = sqlx::query_scalar(
-                "DELETE FROM browser_tab WHERE rowid IN \
-                 (SELECT rowid FROM browser_tab WHERE workspace_id = ? LIMIT ?) RETURNING tab_id",
-            )
-            .bind(&id.0)
-            .bind(DELETE_CASCADE_BATCH)
-            .fetch_all(self.write_pool())
+            let store = self.clone();
+            let id = id.clone();
+            let deleted = tokio::spawn(async move {
+                // Keep the writer until eviction so a subsequent writer also
+                // observes the completed batch's overlay cleanup.
+                let mut conn = store.write_pool().acquire().await.map_err(|e| {
+                    Error::Internal(format!("delete workspace browser acquire failed: {e}"))
+                })?;
+                let tab_ids: Vec<String> = sqlx::query_scalar(DELETE_WORKSPACE_BROWSER_BATCH_SQL)
+                    .bind(&id.0)
+                    .bind(DELETE_CASCADE_BATCH)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("delete workspace browser tabs failed: {e}"))
+                    })?;
+                store
+                    .browser_tab_displayed
+                    .forget_all(tab_ids.iter().map(String::as_str));
+                Ok::<_, Error>(tab_ids.len())
+            })
             .await
-            .map_err(|e| Error::Internal(format!("delete workspace browser tabs failed: {e}")))?;
-            self.browser_tab_displayed
-                .forget_all(tab_ids.iter().map(String::as_str));
-            if i64::try_from(tab_ids.len()) != Ok(DELETE_CASCADE_BATCH) {
+            .map_err(|e| Error::Internal(format!("delete workspace browser task failed: {e}")))??;
+            if i64::try_from(deleted) != Ok(DELETE_CASCADE_BATCH) {
                 break;
             }
             tokio::task::yield_now().await;
         }
 
-        let pool = self.write_pool();
+        // The final commit can also remove late browser rows; its eviction
+        // must survive cancellation at the commit boundary for the same reason.
+        let store = self.clone();
         let id = id.clone();
+        tokio::spawn(async move { store.finish_workspace_delete(&id).await })
+            .await
+            .map_err(|e| Error::Internal(format!("delete workspace final task failed: {e}")))?
+    }
+
+    async fn finish_workspace_delete(&self, id: &WorkspaceId) -> Result<()> {
+        let pool = self.write_pool();
 
         let tab_ids = crate::with_write_txn_retry(|| async {
             let mut tx = pool
@@ -866,7 +897,7 @@ impl Store {
                     "workspace {id} gained an agent during deletion; retry cleanup"
                 )));
             }
-            let tab_ids = crate::browser_tab_repo::workspace_tab_ids(&mut tx, &id).await?;
+            let tab_ids = crate::browser_tab_repo::workspace_tab_ids(&mut tx, id).await?;
             // Child-table cleanup first (defensive ordering); on the NotFound
             // early-return below the rollback undoes it.
             sqlx::query("DELETE FROM draft WHERE workspace_id = ?")
@@ -874,7 +905,7 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace drafts failed: {e}")))?;
-            let res = sqlx::query("DELETE FROM workspace WHERE id = ?")
+            let res = sqlx::query(DELETE_WORKSPACE_SQL)
                 .bind(&id.0)
                 .execute(&mut *tx)
                 .await

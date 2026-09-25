@@ -11,6 +11,8 @@ use std::time::Duration;
 const HISTORY_ROWS: i64 = 1_201;
 const PRESTAGED_ROWS: i64 = 7;
 
+mod review;
+
 async fn seed_history(store: &Store, workspace: &WorkspaceId, name: &str, count: i64) -> AgentId {
     let agent = AgentId::from(name);
     store
