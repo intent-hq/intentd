@@ -273,7 +273,8 @@ mod unix {
             let adapter = fixture.root.path().join(name);
             executable(&adapter, "#!/bin/sh\nprintf 'codex-acp 3.5.7\\n'\n");
             if name == "native-adapter" {
-                std::fs::copy("/bin/true", &adapter).unwrap();
+                // The running test binary is a native executable on every Unix test host.
+                std::fs::copy(std::env::current_exe().unwrap(), &adapter).unwrap();
             }
             let launch = CodexLaunch {
                 selection: ProviderLaunch::Local(ProviderBinary {
