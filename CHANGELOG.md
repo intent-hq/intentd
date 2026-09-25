@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.109] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- Keep workspace deletion responsive with bounded cleanup ([#2121](https://github.com/intent-hq/intentd/pull/2121))
+- Keep PR check observations complete and stable ([#2123](https://github.com/intent-hq/intentd/pull/2123))
+
+
 ## [0.9.108] - 2026-09-25
 
 ### 🚀 Features
