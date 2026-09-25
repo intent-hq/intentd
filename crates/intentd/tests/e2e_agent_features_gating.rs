@@ -1323,16 +1323,18 @@ async fn create_top_level_creates_independent_agent_over_wss() {
         .as_str()
         .expect("initialMessage persisted");
     assert!(
-        initial.starts_with("[You were spawned as an independent top-level agent by Sponsor B ("),
+        initial.starts_with(&format!(
+            "[You were spawned as an independent top-level agent by Sponsor B ({agent_b}) (your sponsor)."
+        )),
         "persisted kickoff must open with the sponsor preamble: {initial}"
     );
     assert!(
-        initial.ends_with("independent hello"),
+        initial.ends_with("\n\nindependent hello"),
         "caller message follows the preamble: {initial}"
     );
 
-    // The delivered kickoff row: same preamble text, daemon-stamped sender
-    // attribution (§5.5 `agent_message`).
+    // The delivered kickoff row: daemon-owned sender header followed by the
+    // persisted preamble and caller message, plus sender metadata (§5.5 `agent_message`).
     await_stream_end(&mut sub, &peer_id).await;
     let conv = wss_rpc(
         &mut rpc,
@@ -1345,18 +1347,13 @@ async fn create_top_level_creates_independent_agent_over_wss() {
         .as_array()
         .expect("messages array")
         .iter()
-        .find(|m| {
-            m["role"] == "user"
-                && m["contentBlocks"][0]["text"]
-                    .as_str()
-                    .is_some_and(|t| t.starts_with("[You were spawned"))
-        })
+        .find(|m| m["role"] == "user")
         .unwrap_or_else(|| panic!("kickoff row persisted: {conv}"))
         .clone();
     assert_eq!(
         row["contentBlocks"][0]["text"].as_str().expect("text"),
-        initial,
-        "delivered kickoff must equal the persisted initialMessage"
+        format!("[MESSAGE FROM AGENT Sponsor B ({agent_b})]\n\n{initial}"),
+        "delivered kickoff must prefix the persisted initialMessage with the sender header"
     );
     assert_eq!(
         row["metadata"],
