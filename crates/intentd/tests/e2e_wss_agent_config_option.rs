@@ -204,6 +204,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
+                    assert_eq!(v["jsonrpc"], "2.0", "response envelope: {v}");
                     assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
                     return v["result"].clone();
                 }
@@ -284,6 +285,166 @@ fn read_config_log(path: &Path) -> Vec<Value> {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).expect("config log line json"))
         .collect()
+}
+
+/// workspace.create must apply the effort before its implicit first turn;
+/// no agent.update or separate agent.sendMessage participates in this test.
+#[tokio::test]
+async fn workspace_initial_agent_effort_reaches_first_prompt_over_wss() {
+    let script = gate().expect("node and the checked-in mock ACP fixture are required");
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path();
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({
+        "modelSelection": { "defaultModel": "fable-5", "models": ["fable-5"] }
+    })
+    .to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_str.as_str()),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+    ];
+    let _daemon = Daemon {
+        child: spawn_serve(data_dir, "both", &env),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "workspace:created"] }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut rpc,
+        2,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "model.defaultProvider", "value": "mock" },
+            { "path": "model.default", "value": "fable-5" },
+            { "path": "model.defaultReasoningEffort", "value": "medium" }
+        ] }),
+    )
+    .await;
+    let image = json!({
+        "type": "image", "mimeType": "image/png",
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    });
+    for (index, (initial_agent, expected, applied)) in [
+        (
+            json!({ "model": "fable-5", "reasoningEffort": "low", "prompt": "first turn" }),
+            Some("low"),
+            "low",
+        ),
+        (
+            json!({ "model": "fable-5", "reasoningEffort": "low", "imageBlocks": [image] }),
+            Some("low"),
+            "low",
+        ),
+        (
+            json!({ "prompt": "inherit Settings effort" }),
+            Some("medium"),
+            "medium",
+        ),
+        (
+            json!({ "reasoningEffort": " \t ", "prompt": "clear Settings effort" }),
+            None,
+            "high",
+        ),
+        (
+            json!({ "model": "fable-5", "prompt": "explicit model keeps provider effort" }),
+            None,
+            "high",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let created = wss_rpc(
+            &mut rpc,
+            3,
+            "workspace.create",
+            json!({ "title": format!("Initial effort {index}"), "initialAgent": initial_agent }),
+        )
+        .await;
+        let ws_id = created["workspace"]["id"].as_str().expect("workspace id");
+        let agent = &created["initialAgent"];
+        let agent_id = agent["id"].as_str().expect("initial agent id");
+        assert_eq!(agent["workspaceId"], ws_id);
+        let mut saw_workspace = false;
+        let mut saw_agent = false;
+        let mut saw_end = false;
+        for _ in 0..120 {
+            let frame = wss_event(&mut sub, 30).await;
+            assert_eq!(frame["jsonrpc"], "2.0", "event envelope: {frame}");
+            let ev = &frame["params"]["event"];
+            if ev["type"] == "workspace:created" && ev["data"]["workspaceId"] == ws_id {
+                assert_eq!(ev["data"]["workspace"]["id"], ws_id);
+                saw_workspace = true;
+            }
+            if ev["type"] == "agent:created" && ev["data"]["agentId"] == agent_id {
+                assert!(saw_workspace, "workspace:created precedes agent:created");
+                saw_agent = true;
+            }
+            if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id {
+                assert!(saw_agent, "agent:created precedes the first turn");
+                saw_end = true;
+                break;
+            }
+        }
+        assert!(saw_end, "first turn must complete");
+        let prompts = read_config_log(&prompt_log);
+        assert_eq!(
+            prompts.len(),
+            index + 1,
+            "exactly one first turn per create: {prompts:?}"
+        );
+        assert_eq!(
+            prompts[index]["effectiveEffort"], applied,
+            "{initial_agent}: {prompts:?}"
+        );
+        assert_eq!(prompts[index]["effectiveModel"], "fable-5", "{prompts:?}");
+        if initial_agent.get("imageBlocks").is_some() {
+            assert!(prompts[index]["blockTypes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("image")));
+        }
+        assert_eq!(
+            agent["reasoningEffort"].as_str(),
+            expected,
+            "creation response: {created}"
+        );
+        let got = wss_rpc(
+            &mut rpc,
+            4,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        assert_eq!(
+            got["agent"]["reasoningEffort"].as_str(),
+            expected,
+            "persisted: {got}"
+        );
+        if expected.is_none() {
+            assert!(agent.get("reasoningEffort").is_none(), "{created}");
+            assert!(got["agent"].get("reasoningEffort").is_none(), "{got}");
+        }
+    }
 }
 
 /// The stored model reaches a config-option-model provider as
