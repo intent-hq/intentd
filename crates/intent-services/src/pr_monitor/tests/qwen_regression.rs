@@ -61,6 +61,351 @@ async fn assert_quiet(svc: &Services, monitor: &PrMonitor, owner: &AgentId) {
     assert!(!text.contains("pr_monitor_wake"), "unexpected wake: {text}");
 }
 
+async fn poll_after_debounce(svc: &Services, mock: &MockQwen, monitor: &PrMonitor) {
+    let current = row(svc, monitor).await;
+    assert!(svc
+        .store()
+        .update_pr_monitor_poll(
+            &monitor.monitor_id,
+            intent_store::PrMonitorPollUpdate {
+                last_snapshot: current.last_snapshot.as_deref(),
+                baseline_snapshot: current.baseline_snapshot.as_deref(),
+                pending_changes: &current.pending_changes,
+                pending_since: Some("2020-01-01T00:00:00Z"),
+                last_change_at: Some("2020-01-01T00:00:00Z"),
+                last_polled_at: current.last_polled_at.as_deref(),
+                last_error: None,
+                updated_at: &now_iso(),
+                expected_updated_at: &current.updated_at,
+            },
+        )
+        .await
+        .unwrap());
+    full_poll(svc, mock).await;
+}
+
+fn legacy_failures(mock: &MockQwen) {
+    mock.edit(|s| {
+        s.pr["updatedAt"] = json!("");
+        for name in ["route", "legacy-only"] {
+            s.nodes
+                .push(json!({"__typename":"StatusContext", "context":name,
+                "state":"FAILURE", "isRequired":true, "targetUrl":"https://ci/status"}));
+        }
+    });
+}
+
+#[tokio::test]
+async fn qwen_legacy_fallback_preserves_independent_status_and_required_evidence() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    legacy_failures(&mock);
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    let baseline: PrMonitorSnapshot =
+        serde_json::from_str(monitor.last_snapshot.as_deref().unwrap()).unwrap();
+    assert_eq!(check_map(&monitor)["route"], "failed");
+    assert!(baseline
+        .requirements
+        .checks
+        .failing_required
+        .contains(&"legacy-only".into()));
+    let mut violations = Vec::new();
+    for mode in [
+        ReadMode::Rest,
+        ReadMode::Folded,
+        ReadMode::Rest,
+        ReadMode::Folded,
+    ] {
+        mock.edit(|s| s.mode = mode);
+        full_poll(&svc, &mock).await;
+        let current = row(&svc, &monitor).await;
+        let snapshot: PrMonitorSnapshot =
+            serde_json::from_str(current.last_snapshot.as_deref().unwrap()).unwrap();
+        if !current.pending_changes.is_empty()
+            || snapshot.requirements.checks != baseline.requirements.checks
+        {
+            violations.push(format!(
+                "{mode:?}: pending={:?}, checks={:?}",
+                current.pending_changes, snapshot.requirements.checks
+            ));
+        }
+        poll_after_debounce(&svc, &mock, &monitor).await;
+    }
+    let messages = owner_messages(&svc, &owner).await;
+    assert!(
+        violations.is_empty() && !messages.contains("pr_monitor_wake"),
+        "R1: {violations:#?}\nDelivered: {messages}"
+    );
+    assert_quiet(&svc, &monitor, &owner).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        s.pr["headRefOid"] = json!("new-head");
+    });
+    full_poll(&svc, &mock).await;
+    let fresh = row(&svc, &monitor).await;
+    assert_eq!(check_map(&fresh)["route"], "passed");
+    assert!(
+        !check_map(&fresh).contains_key("legacy-only"),
+        "old-head status evidence must not move to a new head"
+    );
+}
+
+#[tokio::test]
+async fn qwen_recovery_after_delivered_push_reports_new_head_failure_once() {
+    post_push_recovery("FAILURE", "check started: route (failed)").await;
+}
+
+#[tokio::test]
+async fn qwen_recovery_after_delivered_push_reports_new_head_completion_once() {
+    post_push_recovery("SUCCESS", "all checks passed (35)").await;
+}
+
+async fn post_push_recovery(conclusion: &str, expected: &str) {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        s.pr["updatedAt"] = json!("");
+    });
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    assert_eq!(check_map(&monitor)["route"], "passed");
+    mock.edit(|s| {
+        s.mode = ReadMode::Degraded;
+        s.pr["headRefOid"] = json!("new-head");
+    });
+    full_poll(&svc, &mock).await;
+    let unreadable = row(&svc, &monitor).await;
+    assert!(
+        check_map(&unreadable).is_empty(),
+        "old-head checks must not follow the push"
+    );
+    assert!(!unreadable.pending_changes.is_empty());
+    assert!(unreadable
+        .pending_changes
+        .iter()
+        .all(|c| !c.starts_with("check ")));
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    let pushed = owner_messages(&svc, &owner).await;
+    assert!(
+        pushed.contains("pr_monitor_wake"),
+        "push must be delivered before recovery"
+    );
+    assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        if conclusion == "SUCCESS" {
+            for node in &mut s.nodes {
+                node["conclusion"] = json!("SUCCESS");
+            }
+        }
+        let mut newer = s
+            .nodes
+            .iter()
+            .find(|n| n["name"] == "route")
+            .unwrap()
+            .clone();
+        newer["conclusion"] = json!(conclusion);
+        newer["startedAt"] = json!("2026-09-25T06:00:00Z");
+        s.nodes.push(newer);
+    });
+    full_poll(&svc, &mock).await;
+    let recovered = row(&svc, &monitor).await;
+    assert_eq!(
+        check_map(&recovered)["route"],
+        if conclusion == "FAILURE" {
+            "failed"
+        } else {
+            "passed"
+        }
+    );
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    let delivered = owner_messages(&svc, &owner).await;
+    assert_eq!(
+        delivered.matches(expected).count(),
+        1,
+        "R2: recovered pending={:?}\npush={pushed}\ndelivered={delivered}",
+        recovered.pending_changes
+    );
+    assert_eq!(
+        svc.store()
+            .get_agent_session(&owner)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        2,
+        "one push wake and one recovered-check wake"
+    );
+    for _ in 0..2 {
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+        assert_eq!(owner_messages(&svc, &owner).await, delivered);
+    }
+}
+
+#[tokio::test]
+async fn qwen_partial_fallback_reports_fresh_runs_and_legacy_recovery_once() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    legacy_failures(&mock);
+    mock.edit(|s| {
+        // Keep merge-state availability equal on both paths so this control
+        // isolates the independent check evidence after a real REST wake.
+        s.mode = ReadMode::Standalone;
+        s.pr["mergeStateStatus"] = json!(null);
+        s.nodes
+            .push(json!({"__typename":"CheckRun", "name":"observed-run",
+        "status":"COMPLETED", "conclusion":"SUCCESS", "isRequired":true,
+        "startedAt":"2026-09-25T05:00:00Z"}));
+    });
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        let run = s
+            .nodes
+            .iter_mut()
+            .find(|n| n["name"] == "observed-run")
+            .unwrap();
+        run["conclusion"] = json!("FAILURE");
+        run["startedAt"] = json!("2026-09-25T06:00:00Z");
+    });
+    full_poll(&svc, &mock).await;
+    let failed = row(&svc, &monitor).await;
+    assert_eq!(
+        failed.pending_changes,
+        vec!["check observed-run: passed → failed"]
+    );
+    let snapshot: PrMonitorSnapshot =
+        serde_json::from_str(failed.last_snapshot.as_deref().unwrap()).unwrap();
+    assert!(snapshot.requirements.checks.required_known);
+    for name in ["route", "legacy-only", "observed-run"] {
+        assert!(snapshot
+            .requirements
+            .checks
+            .failing_required
+            .contains(&name.into()));
+    }
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Standalone;
+        for status in s
+            .nodes
+            .iter_mut()
+            .filter(|n| n["__typename"] == "StatusContext")
+        {
+            status["state"] = json!("SUCCESS");
+        }
+    });
+    full_poll(&svc, &mock).await;
+    for expected in [
+        "check route: failed → passed",
+        "check legacy-only: failed → passed",
+    ] {
+        assert!(row(&svc, &monitor)
+            .await
+            .pending_changes
+            .iter()
+            .any(|c| c == expected));
+    }
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    mock.edit(|s| {
+        s.mode = ReadMode::Rest;
+        let run = s
+            .nodes
+            .iter_mut()
+            .find(|n| n["name"] == "observed-run")
+            .unwrap();
+        run["conclusion"] = json!("SUCCESS");
+        run["startedAt"] = json!("2026-09-25T06:01:00Z");
+    });
+    full_poll(&svc, &mock).await;
+    assert_eq!(
+        row(&svc, &monitor).await.pending_changes,
+        vec!["check observed-run: failed → passed"]
+    );
+    poll_after_debounce(&svc, &mock, &monitor).await;
+    let delivered = owner_messages(&svc, &owner).await;
+    for transition in [
+        "check observed-run: passed → failed",
+        "check observed-run: failed → passed",
+        "check route: failed → passed",
+        "check legacy-only: failed → passed",
+    ] {
+        assert_eq!(delivered.matches(transition).count(), 1, "{delivered}");
+    }
+    for mode in [ReadMode::Rest, ReadMode::Standalone] {
+        mock.edit(|s| s.mode = mode);
+        full_poll(&svc, &mock).await;
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+        assert_eq!(owner_messages(&svc, &owner).await, delivered);
+    }
+}
+
+#[tokio::test]
+async fn qwen_older_snapshot_preserves_unknown_status_provenance_until_full_read() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    legacy_failures(&mock);
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    let baseline = check_map(&monitor);
+    let mut old: serde_json::Value =
+        serde_json::from_str(monitor.last_snapshot.as_deref().unwrap()).unwrap();
+    for field in ["checksUnobserved", "checksSeedPending", "statusChecks"] {
+        old.as_object_mut().unwrap().remove(field);
+    }
+    let old = serde_json::to_string(&old).unwrap();
+    assert!(svc
+        .store()
+        .update_pr_monitor_poll(
+            &monitor.monitor_id,
+            intent_store::PrMonitorPollUpdate {
+                last_snapshot: Some(&old),
+                baseline_snapshot: Some(&old),
+                pending_changes: &[],
+                pending_since: None,
+                last_change_at: None,
+                last_polled_at: monitor.last_polled_at.as_deref(),
+                last_error: None,
+                updated_at: &now_iso(),
+                expected_updated_at: &monitor.updated_at,
+            }
+        )
+        .await
+        .unwrap());
+    for mode in [ReadMode::Rest, ReadMode::Rest, ReadMode::Folded] {
+        mock.edit(|s| s.mode = mode);
+        full_poll(&svc, &mock).await;
+        poll_after_debounce(&svc, &mock, &monitor).await;
+        assert_eq!(check_map(&row(&svc, &monitor).await), baseline);
+        assert_quiet(&svc, &monitor, &owner).await;
+    }
+}
+
 #[tokio::test]
 async fn qwen_40_unchanged_full_refreshes_stay_quiet_across_read_paths() {
     let (_db, _root, svc, _forge, ws, owner) = setup().await;

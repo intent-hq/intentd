@@ -197,7 +197,7 @@ fn plural(n: i64) -> &'static str {
 /// `failed` → `passed` recovery IS reported, since it resolves a previously
 /// reported failure.
 fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
-    if old.checks_unobserved || new.checks_unobserved {
+    if (old.checks_seed_pending && old.head_sha == new.head_sha) || new.checks_unobserved {
         return Vec::new();
     }
     let (o, n) = (&old.requirements.checks, &new.requirements.checks);
@@ -1133,9 +1133,9 @@ impl Harness for V1 {
 
         // Suite completion: the last pending check finishing is reported as
         // ONE aggregate line (individual success lines are suppressed above).
-        if !old.checks_unobserved
+        if (!old.checks_seed_pending || old.head_sha != new.head_sha)
             && !new.checks_unobserved
-            && o.checks.pending > 0
+            && (o.checks.pending > 0 || old.checks_unobserved)
             && n.checks.pending == 0
             && n.checks.total > 0
         {

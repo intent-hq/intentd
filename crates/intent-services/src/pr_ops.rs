@@ -980,6 +980,77 @@ pub struct MergeRequirementsChecks {
     pub required_known: bool,
 }
 
+impl MergeRequirementsChecks {
+    fn from_items(items: Vec<MergeRequirementCheck>, required_known: bool) -> Self {
+        let tally = |word: &str| {
+            i64::try_from(items.iter().filter(|c| c.status == word).count())
+                .expect("value fits in i64")
+        };
+        let names = |word: &str| {
+            items
+                .iter()
+                .filter(|c| c.required && c.status == word)
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+        };
+        Self {
+            total: i64::try_from(items.len()).expect("value fits in i64"),
+            passed: tally("passed"),
+            failed: tally("failed"),
+            pending: tally("pending"),
+            failing_required: names("failed"),
+            pending_required: names("pending"),
+            required_known,
+            items,
+        }
+    }
+
+    /// REST observes check runs but neither legacy statuses nor required flags.
+    /// Combine fresh runs with just those missing signals from the same head.
+    pub(crate) fn retain_status_evidence(
+        &mut self,
+        previous: &Self,
+        statuses: Option<&[MergeRequirementCheck]>,
+    ) {
+        let before: HashMap<_, _> = previous.items.iter().map(|c| (&c.name, c)).collect();
+        let required_known =
+            previous.required_known && self.items.iter().all(|c| before.contains_key(&c.name));
+        for check in &mut self.items {
+            if let Some(prior) = before.get(&check.name) {
+                check.required = prior.required;
+            }
+        }
+        // Older persisted snapshots have no provenance. Their combined entries
+        // may contain legacy failures; only a full rollup can disprove them.
+        let statuses = statuses.unwrap_or(&previous.items);
+        let severity = |status: &str| match status {
+            "failed" => 2,
+            "pending" => 1,
+            _ => 0,
+        };
+        let mut slots: HashMap<_, _> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.clone(), i))
+            .collect();
+        for status in statuses {
+            if let Some(&i) = slots.get(&status.name) {
+                let check = &mut self.items[i];
+                if severity(&status.status) > severity(&check.status) {
+                    check.status.clone_from(&status.status);
+                    check.url.clone_from(&status.url);
+                }
+                check.required |= status.required;
+            } else {
+                slots.insert(status.name.clone(), self.items.len());
+                self.items.push(status.clone());
+            }
+        }
+        *self = Self::from_items(std::mem::take(&mut self.items), required_known);
+    }
+}
+
 /// The `approvals` block of the checklist.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1217,6 +1288,29 @@ fn dedupe_checks(runs: impl IntoIterator<Item = CheckRunSignal>) -> Vec<MergeReq
         .collect()
 }
 
+fn rollup_items<'a>(
+    checks: impl IntoIterator<Item = &'a RollupCheck>,
+) -> Vec<MergeRequirementCheck> {
+    dedupe_checks(checks.into_iter().map(|c| CheckRunSignal {
+        name: c.name.clone(),
+        kind: c.kind,
+        state: c.state,
+        required: c.is_required,
+        url: c.url.clone(),
+        started_at: c.started_at.as_deref().and_then(parse_iso),
+    }))
+}
+
+fn status_checks(signals: Option<&MergeRequirementSignals>) -> Option<Vec<MergeRequirementCheck>> {
+    signals.filter(|s| s.checks_known).map(|s| {
+        rollup_items(
+            s.checks
+                .iter()
+                .filter(|c| c.kind == RollupCheckKind::StatusContext),
+        )
+    })
+}
+
 /// Compose the merge-requirements checklist (§ task 1) from a PR snapshot, the
 /// host's merge-requirement signals, the aggregated reviews, and the
 /// unresolved-thread count (`None` when the resolution state was unreadable).
@@ -1251,14 +1345,7 @@ pub(crate) fn merge_requirements(
         .filter(|s| s.checks_known)
         .map(|s| s.checks.as_slice());
     let items: Vec<MergeRequirementCheck> = match rollup {
-        Some(checks) => dedupe_checks(checks.iter().map(|c| CheckRunSignal {
-            name: c.name.clone(),
-            kind: c.kind,
-            state: c.state,
-            required: c.is_required,
-            url: c.url.clone(),
-            started_at: c.started_at.as_deref().and_then(parse_iso),
-        })),
+        Some(checks) => rollup_items(checks),
         None => dedupe_checks(fallback_runs.iter().map(|r| CheckRunSignal {
             name: r.name.clone(),
             kind: RollupCheckKind::CheckRun,
@@ -1268,26 +1355,7 @@ pub(crate) fn merge_requirements(
             started_at: r.started_at.as_deref().and_then(parse_iso),
         })),
     };
-    let tally = |word: &str| {
-        i64::try_from(items.iter().filter(|c| c.status == word).count()).expect("value fits in i64")
-    };
-    let names = |word: &str| {
-        items
-            .iter()
-            .filter(|c| c.required && c.status == word)
-            .map(|c| c.name.clone())
-            .collect::<Vec<_>>()
-    };
-    let checks = MergeRequirementsChecks {
-        total: i64::try_from(items.len()).expect("value fits in i64"),
-        passed: tally("passed"),
-        failed: tally("failed"),
-        pending: tally("pending"),
-        failing_required: names("failed"),
-        pending_required: names("pending"),
-        required_known: rollup.is_some(),
-        items,
-    };
+    let checks = MergeRequirementsChecks::from_items(items, rollup.is_some());
 
     let rules = signals.and_then(|s| s.branch_rules.as_ref());
     let approvals = MergeRequirementsApprovals {
@@ -1424,8 +1492,10 @@ pub(crate) struct MergeRequirementsRead {
     /// thread resolution) — so the checklist carries a default in place of a
     /// signal the forge may answer on the next read.
     pub(crate) complete: bool,
-    /// Whether the check observation answered, independently of other reads.
-    pub(crate) checks_complete: bool,
+    /// Whether check runs answered, independently of other reads. The legacy
+    /// status subset is tracked separately in `status_checks`.
+    pub(crate) check_runs_known: bool,
+    pub(crate) status_checks: Option<Vec<MergeRequirementCheck>>,
     /// The host's merge-queue state as reported (GitHub GraphQL
     /// `isInMergeQueue`): `Some(true)` / `Some(false)` exactly when the probe
     /// carried it, `None` when the host did not report it (no probe, REST-only
@@ -1494,7 +1564,8 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
 
     let (fallback_runs, runs_complete) =
         fallback_check_runs(sc, repo_ref, pr, signals.as_ref()).await?;
-    complete &= runs_complete;
+    complete &= runs_complete
+        && (signals.as_ref().is_some_and(|s| s.checks_known) || !sc.capabilities().check_runs);
     let (review_comments, unresolved, threads_complete) =
         read_review_thread_tally(sc, repo_ref, number).await?;
     complete &= threads_complete;
@@ -1506,7 +1577,8 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
         review_comment_count: review_comments,
         ejection_known,
         complete,
-        checks_complete: runs_complete,
+        check_runs_known: runs_complete,
+        status_checks: status_checks(signals.as_ref()),
         merge_queue_reported,
     })
 }
@@ -1545,7 +1617,7 @@ pub(crate) async fn merge_requirements_from_observation(
 
     let (fallback_runs, runs_complete) =
         fallback_check_runs(sc, repo_ref, pr, Some(&signals)).await?;
-    complete &= runs_complete;
+    complete &= runs_complete && (signals.checks_known || !sc.capabilities().check_runs);
     let (review_comments, unresolved, threads_complete) = match observation.threads {
         Some(tally) => (tally.review_comment_count, Some(tally.unresolved), true),
         None => read_review_thread_tally(sc, repo_ref, number).await?,
@@ -1559,7 +1631,8 @@ pub(crate) async fn merge_requirements_from_observation(
         review_comment_count: review_comments,
         ejection_known: true,
         complete,
-        checks_complete: runs_complete,
+        check_runs_known: runs_complete,
+        status_checks: status_checks(Some(&signals)),
         merge_queue_reported,
     })
 }

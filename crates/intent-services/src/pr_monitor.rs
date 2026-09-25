@@ -441,6 +441,15 @@ pub(crate) struct PrMonitorSnapshot {
     /// persisted bookkeeping only; old snapshots retain their known baseline.
     #[serde(default)]
     pub checks_unobserved: bool,
+    /// Only the first unreadable registration may adopt checks silently.
+    /// An unreadable head change after monitoring began must still report
+    /// failures/completion when that head's checks become observable.
+    #[serde(default)]
+    pub checks_seed_pending: bool,
+    /// Retained independent legacy statuses. Empty on a new head until observed;
+    /// absent only in older snapshots without provenance. Internal JSON only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_checks: Option<Vec<pr_ops::MergeRequirementCheck>>,
     /// When the forge read that produced this snapshot SUCCEEDED (RFC 3339).
     /// The freshness anchor for superseding the snapshot with a workspace
     /// copy ([`superseded_by_terminal_copy`]): the row's `last_polled_at`
@@ -482,7 +491,8 @@ pub struct SharedPrSnapshot {
     /// review-decision, check-run or review-thread read leaves a default in
     /// the checklist that the forge may answer on the next read.
     requirements_complete: bool,
-    checks_complete: bool,
+    check_runs_known: bool,
+    status_checks: Option<Vec<pr_ops::MergeRequirementCheck>>,
     /// The host's merge-queue state as reported by this read
     /// ([`pr_ops::MergeRequirementsRead::merge_queue_reported`]) — what
     /// `github.pulls.get` carries as `isInMergeQueue` (`None` → key absent).
@@ -498,15 +508,30 @@ impl SharedPrSnapshot {
     /// monotonic — always reaches the wake — per intent-hq/monorepo#3479).
     pub(crate) fn materialize(&self, previous: Option<&PrMonitorSnapshot>) -> PrMonitorSnapshot {
         let mut requirements = self.requirements.clone();
-        let mut checks_unobserved = !self.checks_complete;
+        let mut checks_unobserved = !self.check_runs_known;
+        let same_head = previous.filter(|p| {
+            self.head_sha.as_ref().is_some_and(|h| !h.is_empty()) && self.head_sha == p.head_sha
+        });
+        let status_checks = self
+            .status_checks
+            .clone()
+            .or_else(|| same_head.and_then(|p| p.status_checks.clone()))
+            .or_else(|| same_head.is_none().then(Vec::new));
         if checks_unobserved {
-            if let Some(prev) = previous.filter(|p| {
-                self.head_sha.as_ref().is_some_and(|h| !h.is_empty()) && self.head_sha == p.head_sha
-            }) {
+            if let Some(prev) = same_head {
                 requirements.checks.clone_from(&prev.requirements.checks);
                 checks_unobserved = prev.checks_unobserved;
             }
+        } else if self.status_checks.is_none() {
+            if let Some(prev) = same_head.filter(|p| !p.checks_unobserved) {
+                requirements.checks.retain_status_evidence(
+                    &prev.requirements.checks,
+                    prev.status_checks.as_deref(),
+                );
+            }
         }
+        let checks_seed_pending = checks_unobserved
+            && (previous.is_none() || same_head.is_some_and(|p| p.checks_seed_pending));
         let ejection_tracked = if self.ejection_known {
             true
         } else {
@@ -530,6 +555,8 @@ impl SharedPrSnapshot {
             requirements,
             ejection_tracked,
             checks_unobserved,
+            checks_seed_pending,
+            status_checks,
             observed_at: None,
         }
     }
@@ -887,7 +914,8 @@ async fn shared_snapshot_from_observation(
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
-        checks_complete: read.checks_complete,
+        check_runs_known: read.check_runs_known,
+        status_checks: read.status_checks,
         merge_queue_reported: read.merge_queue_reported,
     };
     Ok((observation.pr, snapshot))
@@ -1079,7 +1107,8 @@ async fn finish_shared_snapshot(
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
-        checks_complete: read.checks_complete,
+        check_runs_known: read.check_runs_known,
+        status_checks: read.status_checks,
         merge_queue_reported: read.merge_queue_reported,
     };
     Ok((pr, snapshot))
@@ -3180,9 +3209,11 @@ impl Services {
         let backfill = |s: &mut PrMonitorSnapshot| {
             // An initial unreadable result is not an observed empty suite.
             // Adopt its first complete checks silently, just like registration.
-            if !fresh.checks_unobserved && s.checks_unobserved {
+            if !fresh.checks_unobserved && s.checks_seed_pending && s.head_sha == fresh.head_sha {
                 s.requirements.checks.clone_from(&fresh.requirements.checks);
                 s.checks_unobserved = false;
+                s.checks_seed_pending = false;
+                s.status_checks.clone_from(&fresh.status_checks);
             }
             if fresh.ejection_tracked && !s.ejection_tracked {
                 s.requirements
@@ -4931,6 +4962,8 @@ mod tests {
             },
             ejection_tracked: true,
             checks_unobserved: false,
+            checks_seed_pending: false,
+            status_checks: Some(Vec::new()),
             observed_at: None,
         };
         f(&mut s);
@@ -5426,7 +5459,8 @@ mod tests {
             requirements: s.requirements.clone(),
             ejection_known,
             requirements_complete: ejection_known,
-            checks_complete: true,
+            check_runs_known: true,
+            status_checks: s.status_checks.clone(),
             merge_queue_reported: s.requirements.is_in_merge_queue,
         }
     }
