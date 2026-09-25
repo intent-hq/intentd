@@ -436,6 +436,10 @@ jobs:
           shared-key: gh-burst-check
       - name: Format check
         run: cargo fmt --check
+      - name: Acquire the shared transfer selection contract
+        uses: ./.github/actions/transfer-selection-fixtures
+      - name: Real import and public session contract
+        run: "cargo test -p intent-services --lib transfer_selection_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
       # tinybox slots rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
@@ -800,6 +804,48 @@ jobs:
       - name: Clippy (target-gated code)
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (runner.os == 'macOS' || runner.os == 'Windows')
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      # Execute the Windows Job Object fixtures on the native runner. They use
+      # this test executable as the child, so no Node/npm/account setup is needed.
+      - name: Codex diagnostic process ownership (Windows runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'Windows'
+        shell: bash
+        env:
+          INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+        run: |
+          set -euo pipefail
+          filter='codex_diagnostics::process::platform::tests::'
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --list)
+          printf '%s\n' "$listed"
+          if ! grep -F "${filter}shared_guard_removes_home_only_after_descendants_stop: test" <<< "$listed" > /dev/null; then
+            echo '::error::Windows diagnostic ownership regression was not selected.'
+            exit 1
+          fi
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
+      # macOS supports read-only metadata and rejects process probes before
+      # auth/npm setup. Require both a service rejection case and a real doctor
+      # case in discovery so a cfg/filter change cannot silently run zero tests.
+      - name: Codex focused diagnostics (macOS runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
+        shell: bash
+        env:
+          INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+        run: |
+          set -euo pipefail
+          filter='codex_diagnostics::'
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --list)
+          printf '%s\n' "$listed"
+          if ! grep -F 'macos_rejects_process_start_before_retaining_home_or_dependency: test' <<< "$listed" > /dev/null; then
+            echo '::error::macOS diagnostic rejection regression was not selected.'
+            exit 1
+          fi
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --list)
+          printf '%s\n' "$listed"
+          if ! grep -F 'macos_catalog_rejection_precedes_npm_authentication_and_probe_state: test' <<< "$listed" > /dev/null; then
+            echo '::error::macOS doctor command regression was not selected.'
+            exit 1
+          fi
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --nocapture
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
@@ -1142,6 +1188,8 @@ jobs:
       - uses: taiki-e/install-action@nextest
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Acquire the shared transfer selection contract
+        uses: ./.github/actions/transfer-selection-fixtures
       - name: Run combined coverage
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
@@ -1375,6 +1423,9 @@ jobs:
         if: steps.select.outputs.has_selection == 'true'
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Acquire the shared transfer selection contract
+        if: steps.select.outputs.has_selection == 'true'
+        uses: ./.github/actions/transfer-selection-fixtures
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
         # Armed bound-caller seam — see coverage-e2e's run step. The plan
@@ -1636,6 +1687,62 @@ jobs:
           if ($result.SkippedCount -ne 0) { throw "install.ps1 Pester tests skipped on Windows: $($result.SkippedCount) (is the ScheduledTasks module missing?)" }
           if ($result.PassedCount -eq 0) { throw 'install.ps1 Pester tests: nothing ran' }
 
+  # Exercise the shipping Pi ACP package through real session/new, prompt and
+  # session/load traffic. CMD quoting needs native Windows, not compilation or
+  # Linux platform simulation. The Unix matrix also covers extension forwarding.
+  # The shipping-pin matrix is strict and required by CI Gate.
+  pi-session-paths:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install the exact production adapter pin
+        run: |
+          pin=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_ACP_NPX_PACKAGE: &str = "(pi-acp@[^"]+)";/); if (!m) throw new Error("Missing production Pi adapter pin"); console.log(m[1]);')
+          mkdir -p pi-path-evidence
+          printf '%s\n' "$pin" > pi-path-evidence/package.txt
+          npm install --prefix .pi-acp-test --no-save --ignore-scripts --no-audit --no-fund "$pin"
+          cp .pi-acp-test/node_modules/.package-lock.json pi-path-evidence/package-lock.json
+      - name: Test the pinned adapter (strict)
+        env:
+          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
+          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
+        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs | tee pi-path-evidence/test.tap
+      - name: Test cleanup failure observability
+        if: ${{ !cancelled() }}
+        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs | tee pi-path-evidence/cleanup-checks.tap
+      - name: Install the real minimum Pi CLI
+        if: runner.os == 'Linux'
+        run: |
+          minimum=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_CLI_MIN_VERSION: &str = "([^"]+)";/); if (!m) throw new Error("Missing Pi CLI minimum"); console.log(m[1]);')
+          npm install --prefix .pi-runtime-test --no-save --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@$minimum"
+          cp .pi-runtime-test/node_modules/.package-lock.json pi-path-evidence/pi-package-lock.json
+      - name: Test real Pi lifecycle and supported MCP extension delivery
+        if: runner.os == 'Linux'
+        env:
+          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
+          PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
+        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs | tee pi-path-evidence/runtime.tap
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: pi-session-pinned-${{ matrix.os }}-node${{ matrix.node }}
+          path: pi-path-evidence
+          if-no-files-found: error
+
   # Single required status check for branch protection: fans in check, build,
   # coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers,
   # deb-packaging, release-scripts, and install-ps1 (ported from cloudlands-fe's "CI Gate"
@@ -1681,13 +1788,14 @@ jobs:
     # would run the gate against all-skipped needs and report a spurious
     # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1]
+    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
           if [ "${{ needs.build.result }}" != "success" ] || \
              [ "${{ needs.deb-packaging.result }}" != "success" ] || \
              [ "${{ needs.release-scripts.result }}" != "success" ] || \
+             [ "${{ needs.pi-session-paths.result }}" != "success" ] || \
              [ "${{ needs.install-ps1.result }}" != "success" ]; then
             echo "One or more required jobs failed"
             exit 1

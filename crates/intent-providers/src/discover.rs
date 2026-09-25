@@ -247,10 +247,33 @@ fn availability_for(
     resolve_auto: &dyn Fn(&str, &str) -> Option<PathBuf>,
     override_path: &dyn Fn(&str) -> Option<String>,
 ) -> ProviderAvailability {
+    let resolve_npx = || {
+        if provider.id == "codex" {
+            find_codex_npx()
+        } else {
+            find_npx()
+        }
+    };
+    availability_for_with_npx(
+        provider,
+        gated_off,
+        resolve_auto,
+        override_path,
+        &resolve_npx,
+    )
+}
+
+fn availability_for_with_npx(
+    provider: &ProviderConfig,
+    gated_off: Option<String>,
+    resolve_auto: &dyn Fn(&str, &str) -> Option<PathBuf>,
+    override_path: &dyn Fn(&str) -> Option<String>,
+    resolve_npx: &dyn Fn() -> Option<PathBuf>,
+) -> ProviderAvailability {
     let resolved_path = if gated_off.is_some() {
         None
     } else if provider.npx_only_package.is_some() {
-        find_npx()
+        resolve_npx()
     } else {
         resolve_auto(provider.id, provider.command)
     };
@@ -260,7 +283,7 @@ fn availability_for(
     // key). npx-only providers only honor it when they opt in
     // (`npx_only_honors_path_override`; claude-code) — `resolve_spawn` then
     // exec's a valid override in place of the pinned npx spawn
-    // (monorepo#4352); pi keeps npx-only semantics, so an override never
+    // (monorepo#4352); pi and Codex keep npx-only semantics, so an override never
     // flips its `installed`.
     let primary_override = if gated_off.is_some()
         || (provider.npx_only_package.is_some() && !provider.npx_only_honors_path_override)
@@ -349,6 +372,7 @@ pub fn not_installed_detail(
                 }
             }
         }
+        None if command == "codex-acp" => crate::config::CODEX_ACP_PREREQUISITE_ERROR.to_string(),
         None => format!("{command} not on PATH"),
     }
 }
@@ -392,8 +416,34 @@ pub fn find_provider_binary(
     command: &str,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
+    find_provider_binary_with_source(provider_id, command, explicit_path).map(|found| found.path)
+}
+
+/// The source of a selected local executable. Discovery includes native
+/// installers, managed local bins, and enhanced PATH, in the usual order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderBinarySource {
+    SettingsOverride,
+    LocalDiscovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderBinary {
+    pub path: PathBuf,
+    pub source: ProviderBinarySource,
+}
+
+/// The ordinary discovery result with provenance recorded at the selecting
+/// tier. Diagnostics must not infer an accepted override merely from its
+/// presence in settings (invalid overrides fall through).
+#[must_use]
+pub fn find_provider_binary_with_source(
+    provider_id: &str,
+    command: &str,
+    explicit_path: Option<&str>,
+) -> Option<ProviderBinary> {
     let home = home_dir();
-    find_provider_binary_with_home_and_dirs(
+    find_provider_binary_with_source_and_dirs(
         provider_id,
         command,
         explicit_path,
@@ -426,7 +476,7 @@ pub fn find_auggie_candidates(explicit_path: Option<&str>) -> Vec<PathBuf> {
 /// [`find_auggie_candidates`] with `home` and the enhanced dirs injected
 /// (test seam — avoids mutating process-global `HOME`/`PATH` in parallel
 /// tests). Builds the ordered, de-duplicated candidate list; the precedence
-/// mirrors [`find_provider_binary_with_home_and_dirs`] for auggie exactly, so
+/// mirrors [`find_provider_binary_with_source_and_dirs`] for auggie exactly, so
 /// the first element always equals what `find_provider_binary` would return.
 fn find_auggie_candidates_with_home_and_dirs(
     explicit_path: Option<&str>,
@@ -487,6 +537,7 @@ fn find_provider_binary_with_home(
     )
 }
 
+#[cfg(all(test, unix))]
 fn find_provider_binary_with_home_and_dirs(
     provider_id: &str,
     command: &str,
@@ -494,15 +545,84 @@ fn find_provider_binary_with_home_and_dirs(
     home: Option<&std::path::Path>,
     enhanced_dirs: &[PathBuf],
 ) -> Option<PathBuf> {
+    find_provider_binary_with_source_and_dirs(
+        provider_id,
+        command,
+        explicit_path,
+        home,
+        enhanced_dirs,
+    )
+    .map(|found| found.path)
+}
+
+/// Selected inputs to ACP's launch policy. Local-first providers may use a
+/// pinned npm fallback; npx-only Codex uses production's Node+npx resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderLaunch {
+    Local(ProviderBinary),
+    Managed { npx: PathBuf, package: &'static str },
+    Bare { command: &'static str },
+}
+
+/// Shared by production agent spawning and diagnostics. Npx-only providers
+/// use their separate override policy, not this local-first selector.
+#[must_use]
+pub fn resolve_fallback_launch(
+    provider: &ProviderConfig,
+    explicit_path: Option<&str>,
+) -> ProviderLaunch {
+    select_fallback_launch(
+        provider,
+        find_provider_binary_with_source(
+            provider.primary_binary_provider_id(),
+            provider.command,
+            explicit_path,
+        ),
+        find_npx,
+    )
+}
+
+fn select_fallback_launch(
+    provider: &ProviderConfig,
+    binary: Option<ProviderBinary>,
+    npx: impl FnOnce() -> Option<PathBuf>,
+) -> ProviderLaunch {
+    if let Some(binary) = binary {
+        ProviderLaunch::Local(binary)
+    } else {
+        provider
+            .fallback_npx_package
+            .and_then(|package| npx().map(|npx| ProviderLaunch::Managed { npx, package }))
+            .unwrap_or(ProviderLaunch::Bare {
+                command: provider.command,
+            })
+    }
+}
+
+fn find_provider_binary_with_source_and_dirs(
+    provider_id: &str,
+    command: &str,
+    explicit_path: Option<&str>,
+    home: Option<&std::path::Path>,
+    enhanced_dirs: &[PathBuf],
+) -> Option<ProviderBinary> {
+    let explicit = |path| ProviderBinary {
+        path,
+        source: ProviderBinarySource::SettingsOverride,
+    };
+    let discovered = |path| ProviderBinary {
+        path,
+        source: ProviderBinarySource::LocalDiscovery,
+    };
     // 1. Explicit setting wins (must be executable and absolute)
     if let Some(path) = explicit_path {
         // An Antigravity custom path is an explicit choice, including when its
         // official bundle is incomplete. Do not silently replace that choice.
         if provider_id == "antigravity" && !path.trim().is_empty() {
-            return resolve_explicit_path(provider_id, path);
+            return resolve_explicit_path(provider_id, path).map(explicit);
         }
         if let Some(pb) = resolve_explicit_path(provider_id, path) {
-            return Some(pb);
+            return Some(explicit(pb));
         }
     }
 
@@ -512,7 +632,7 @@ fn find_provider_binary_with_home_and_dirs(
     // wrappers can emit update banners before real stdout).
     if let Some(home) = home {
         if let Some(native) = find_provider_native_binary_in(provider_id, command, home) {
-            return Some(native);
+            return Some(discovered(native));
         }
     }
 
@@ -521,7 +641,7 @@ fn find_provider_binary_with_home_and_dirs(
         if is_executable_file(&managed)
             && (provider_id != "antigravity" || crate::antigravity::is_complete_candidate(&managed))
         {
-            return Some(managed);
+            return Some(discovered(managed));
         }
     }
 
@@ -533,7 +653,7 @@ fn find_provider_binary_with_home_and_dirs(
     // parity with `intent_context::discovery::find_auggie`).
     if provider_id == "auggie" {
         if let Some(marked) = auggie_marker_path_with_home(home) {
-            return Some(marked);
+            return Some(discovered(marked));
         }
     }
 
@@ -552,9 +672,10 @@ fn find_provider_binary_with_home_and_dirs(
                 crate::antigravity::supported_host()
                     .then(|| home.and_then(crate::antigravity::managed_binary))
                     .flatten()
-            });
+            })
+            .map(discovered);
     }
-    find_in_dirs(enhanced_dirs, command)
+    find_in_dirs(enhanced_dirs, command).map(discovered)
 }
 
 /// The explicit-override tier ALONE for an npx-only provider
@@ -802,6 +923,22 @@ pub fn find_npx() -> Option<PathBuf> {
     )
 }
 
+/// Resolve the pinned Codex adapter's npx launcher only when Node is also
+/// available. An installed `codex-acp` or an npx script without its Node
+/// interpreter cannot satisfy this provider's prerequisites.
+#[must_use]
+pub fn find_codex_npx() -> Option<PathBuf> {
+    find_codex_npx_in_dirs(
+        &intent_core::path_utils::inherited_path_dirs(),
+        &intent_core::path_utils::enriched_tool_dirs(),
+    )
+}
+
+fn find_codex_npx_in_dirs(inherited: &[PathBuf], enriched: &[PathBuf]) -> Option<PathBuf> {
+    find_node_in_dirs_for(inherited, enriched, cfg!(windows))?;
+    find_npx_in_dirs(inherited, enriched)
+}
+
 /// Resolve the `node` the daemon detects — the same candidate the
 /// `host.checkNode` resolver (`intent-transport::host_ops`) reports, so the
 /// npx [`find_npx`] pairs with it and the guard's diagnostic name the Node the
@@ -903,6 +1040,74 @@ pub fn find_pi_cli(command: &str) -> Option<PathBuf> {
 mod find_provider_binary_tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn local_first_launch_records_the_selecting_tier_and_fallback_policy() {
+        let dir = unique_temp_dir("codex-launch");
+        let local = dir.path().join(if cfg!(windows) {
+            "codex-acp.exe"
+        } else {
+            "codex-acp"
+        });
+        let explicit = dir.path().join(if cfg!(windows) {
+            "override.exe"
+        } else {
+            "override"
+        });
+        make_executable(&local);
+        make_executable(&explicit);
+        let dirs = vec![dir.path().to_path_buf()];
+        // A synthetic local-first provider exercises the generic selector.
+        // Production Codex is npx-only and deliberately does not use it.
+        let mut config = *crate::provider_config("codex");
+        config.npx_only_package = None;
+        config.fallback_npx_package = Some(crate::config::CODEX_ACP_NPX_PACKAGE);
+        let provider = &config;
+        let resolve = |setting, dirs: &[PathBuf]| {
+            find_provider_binary_with_source_and_dirs("codex", "codex-acp", setting, None, dirs)
+        };
+        for (setting, expected, source) in [
+            (
+                Some(explicit.to_str().unwrap()),
+                &explicit,
+                ProviderBinarySource::SettingsOverride,
+            ),
+            (None, &local, ProviderBinarySource::LocalDiscovery),
+            (
+                Some("invalid/relative/override"),
+                &local,
+                ProviderBinarySource::LocalDiscovery,
+            ),
+            (Some("  "), &local, ProviderBinarySource::LocalDiscovery),
+        ] {
+            let found = resolve(setting, &dirs).unwrap();
+            assert_eq!(&found.path, expected);
+            assert_eq!(found.source, source);
+            assert_eq!(
+                select_fallback_launch(provider, Some(found.clone()), || panic!(
+                    "local launch must not discover npm"
+                )),
+                ProviderLaunch::Local(found)
+            );
+        }
+        let npx = dir.path().join("npx");
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            select_fallback_launch(provider, resolve(missing.to_str(), &[]), || Some(
+                npx.clone()
+            )),
+            ProviderLaunch::Managed {
+                npx,
+                package: crate::config::CODEX_ACP_NPX_PACKAGE
+            }
+        );
+        assert_eq!(
+            select_fallback_launch(provider, resolve(None, &[]), || None),
+            ProviderLaunch::Bare {
+                command: "codex-acp"
+            }
+        );
+    }
 
     /// A fresh RAII temp directory for `tag` under the system temp root. The
     /// returned guard removes the dir on drop (including on panic); set
@@ -1445,11 +1650,54 @@ mod find_provider_binary_tests {
     }
 
     #[test]
+    fn discover_providers_reports_codex_as_npx_only() {
+        let providers = discover_providers();
+        let codex = providers.iter().find(|p| p.id == "codex").unwrap();
+        assert_eq!(
+            codex.npx_only_package,
+            Some(crate::config::CODEX_ACP_NPX_PACKAGE)
+        );
+        assert!(!codex.has_npx_fallback);
+        assert_eq!(codex.installed, codex.resolved_path.is_some());
+        if let Some(path) = &codex.resolved_path {
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("npx"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_npx_resolution_requires_both_node_and_npx() {
+        let root = unique_temp_dir("codex-prerequisites");
+        for has_node in [false, true] {
+            for has_npx in [false, true] {
+                let bin = root.path().join(format!("node-{has_node}-npx-{has_npx}"));
+                fs::create_dir_all(&bin).unwrap();
+                make_executable(&bin.join("codex-acp"));
+                if has_node {
+                    make_executable(&bin.join("node"));
+                }
+                if has_npx {
+                    make_executable(&bin.join("npx"));
+                }
+                assert_eq!(
+                    find_codex_npx_in_dirs(std::slice::from_ref(&bin), &[]),
+                    (has_node && has_npx).then(|| bin.join("npx")),
+                    "node={has_node}, npx={has_npx}: native adapter cannot replace prerequisites"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn discover_providers_non_npx_only_providers_unchanged() {
         let providers = discover_providers();
         for p in providers
             .iter()
-            .filter(|p| p.id != "claude-code" && p.id != "pi")
+            .filter(|p| !matches!(p.id, "claude-code" | "pi" | "codex"))
         {
             assert_eq!(p.npx_only_package, None, "{} must not be npx-only", p.id);
         }
@@ -1650,17 +1898,20 @@ mod find_provider_binary_tests {
         fs::create_dir_all(&v20_bin).unwrap();
         fs::create_dir_all(&v24_bin).unwrap();
         make_executable(&v20_bin.join("node"));
-        let codex = v24_bin.join("codex-acp");
-        make_executable(&codex);
+        let opencode = v24_bin.join("opencode");
+        make_executable(&opencode);
         let dirs = vec![v20_bin, v24_bin];
 
         let providers = discover_providers_with_overrides_and_resolver(&|_| None, &|_, command| {
             find_in_dirs(&dirs, command)
         });
-        let availability = providers.iter().find(|p| p.id == "codex").unwrap();
+        let availability = providers.iter().find(|p| p.id == "opencode").unwrap();
 
         assert!(availability.installed);
-        assert_eq!(availability.resolved_path.as_deref(), Some(codex.as_path()));
+        assert_eq!(
+            availability.resolved_path.as_deref(),
+            Some(opencode.as_path())
+        );
     }
 
     /// intent-hq/intent#5725: `/usr/local/bin/node` is a symlink into the nvm
@@ -1801,6 +2052,16 @@ mod find_provider_binary_tests {
             not_installed_detail("codex", false, None),
             "codex not on PATH"
         );
+    }
+
+    #[test]
+    fn codex_not_installed_detail_names_the_npx_prerequisite() {
+        let detail = not_installed_detail("codex-acp", false, None);
+        assert!(
+            detail.contains("Codex requires Node.js with npx"),
+            "{detail}"
+        );
+        assert!(detail.contains("Install Node.js (with npm)"), "{detail}");
     }
 
     #[test]
@@ -2039,6 +2300,43 @@ mod override_aware_discovery_tests {
             availability.resolved_path.is_some(),
             "a pi override must not flip installed"
         );
+    }
+
+    #[test]
+    fn codex_discovery_requires_npx_and_ignores_native_and_explicit_adapters() {
+        let dir = unique_temp_dir("codex-discovery-policy");
+        let adapter = dir.path().join("codex-acp");
+        make_executable(&adapter);
+        let npx = dir.path().join("npx");
+        make_executable(&npx);
+        let codex = crate::config::find_provider("codex").unwrap();
+        for native_present in [false, true] {
+            for npx_present in [false, true] {
+                for explicit_path in [None, Some(adapter.to_str().unwrap())] {
+                    let resolve_auto = |_: &str, _: &str| native_present.then(|| adapter.clone());
+                    let overrides = |_: &str| explicit_path.map(str::to_string);
+                    let resolve_npx = || npx_present.then(|| npx.clone());
+                    let availability = availability_for_with_npx(
+                        codex,
+                        None,
+                        &resolve_auto,
+                        &overrides,
+                        &resolve_npx,
+                    );
+                    assert_eq!(
+                        availability.installed, npx_present,
+                        "native={native_present}, npx={npx_present}, override={explicit_path:?}"
+                    );
+                    assert_eq!(availability.resolved_path, resolve_npx());
+                    assert_eq!(
+                        availability.npx_only_package,
+                        Some(crate::config::CODEX_ACP_NPX_PACKAGE)
+                    );
+                    assert!(!availability.has_npx_fallback);
+                    assert_eq!(resolve_npx_only_override(codex, explicit_path), None);
+                }
+            }
+        }
     }
 
     /// monorepo#4352: discovery honors the claude-code override for the

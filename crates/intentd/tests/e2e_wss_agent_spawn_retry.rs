@@ -1018,11 +1018,11 @@ async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
 
-    // Fake `pi` that reports a version older than PI_CLI_MIN_VERSION.
+    // The previously supported minimum lacks the 0.81.0 thinking-level RPC.
     let fake_pi = data_dir.join("fake-pi");
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.79.0\n").expect("write fake pi");
+        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.80.4\n").expect("write fake pi");
         std::fs::set_permissions(&fake_pi, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake pi");
     }
@@ -1123,7 +1123,7 @@ async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
     let error = failed_error.expect("terminal agent:failed observed over WSS");
     assert!(error.contains("cannot start Pi agent"), "{error}");
     assert!(
-        error.contains("0.79.0"),
+        error.contains("0.80.4"),
         "gate names the found version: {error}"
     );
     assert!(

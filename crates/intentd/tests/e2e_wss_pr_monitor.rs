@@ -160,7 +160,7 @@ struct ForgeState {
     /// When set, `get_pr` fails with `RateLimited` (exhausted forge quota),
     /// so a monitor sweep opens the daemon's global rate-limit pause.
     rate_limit_get_pr: bool,
-    /// The `remaining` quota (of a 5000 `limit`) the quota-free
+    /// The `remaining` quota (of a 5000 `limit`) the quota
     /// `rate_limit_status` probe reports; `None` is the host-without-signal
     /// default (no early lift). A recovered value lets the next sweep lift
     /// the pause early.
@@ -1888,6 +1888,58 @@ async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     assert_eq!(metadata["url"], "https://github.com/o/r/pull/42");
 }
 
+/// A background quota pause preserves the one-shot read contract: fresh
+/// cached PRs remain available, misses propagate the existing rate-limited
+/// envelope, and a later successful read resumes previews without a restart.
+#[tokio::test]
+async fn github_preview_pause_cache_and_recovery_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let params = |number| json!({"owner":"o", "repo":"r", "number":number});
+    let cached = wss_call(&mut rpc, 1, "github.pulls.get", params(42)).await;
+    assert!(cached.get("error").is_none(), "{cached}");
+    assert_eq!(cached["jsonrpc"], "2.0");
+    assert_eq!(cached["id"], 1);
+    fx.forge.edit(|s| {
+        s.rate_limit_get_pr = true;
+        s.rate_limit_remaining = Some(0);
+    });
+    fx.services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 44)
+        .await
+        .expect("background baseline defers under the pause");
+    let paused_fetches = fx.forge.fetches();
+    for id in [2, 3] {
+        let rejected = wss_call(&mut rpc, id, "github.pulls.get", params(43)).await;
+        assert_eq!(rejected["jsonrpc"], "2.0");
+        assert_eq!(rejected["id"], id);
+        assert_eq!(rejected["error"]["code"], -32603);
+        assert_eq!(rejected["error"]["data"], json!({"code":"rate-limited"}));
+        assert!(rejected.get("result").is_none(), "{rejected}");
+    }
+    assert_eq!(
+        fx.forge.fetches(),
+        paused_fetches + 2,
+        "one-shot misses remain ungated"
+    );
+    let hit = wss_call(&mut rpc, 4, "github.pulls.get", params(42)).await;
+    assert_eq!(
+        hit["result"], cached["result"],
+        "fresh cached preview survives"
+    );
+    assert_eq!(fx.forge.fetches(), paused_fetches + 2);
+
+    fx.forge.edit(|s| {
+        s.rate_limit_get_pr = false;
+        s.rate_limit_remaining = Some(4500);
+    });
+    let recovered = wss_call(&mut rpc, 5, "github.pulls.get", params(43)).await;
+    assert!(recovered.get("error").is_none(), "{recovered}");
+    assert_eq!(recovered["jsonrpc"], "2.0");
+    assert_eq!(recovered["id"], 5);
+    assert_eq!(fx.forge.fetches(), paused_fetches + 3);
+}
+
 /// `pausedUntil` over the wire (PROTOCOL §5.42 presence-detected
 /// convention): while the daemon's global forge rate-limit pause is active,
 /// every ACTIVE row in `prMonitor.list` carries the pause deadline as an
@@ -2043,7 +2095,7 @@ async fn a_rate_limited_registration_defers_its_baseline_over_wss() {
         "no baseline yet: {listed}"
     );
 
-    // Quota back: the next sweep's free probe lifts the pause early, and
+    // Quota back: the next sweep's quota probe lifts the pause early, and
     // the first poll adopts the baseline (nothing pending) — the list
     // serves the filled-in row.
     fx.forge.edit(|s| {

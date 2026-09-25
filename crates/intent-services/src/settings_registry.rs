@@ -9,10 +9,10 @@
 //! - a pin API for the composition root — pinned keys reject wire mutation
 //!   ([`Error::InvalidParams`], "overridden by startup flag") and their file
 //!   value is ignored,
-//! - [`SettingsRegistry::apply`]: validate against the typed schema, mutate
-//!   in-memory values, and atomically rewrite `config.toml` (temp file +
-//!   rename) via `toml_edit`, preserving user comments/layout — only touched
-//!   keys change in the document,
+//! - [`SettingsRegistry::apply`]: stage edits, validate the rendered TOML
+//!   against the startup schema, and atomically rewrite `config.toml`
+//!   before publishing in-memory values. `toml_edit` preserves user
+//!   comments/layout — only touched keys change in the document,
 //! - [`SettingsRegistry::reload`]: strict re-parse of externally edited file
 //!   text (the live-reload watcher feeds this),
 //! - a `tokio::sync::watch` channel notifying subscribers of changed key
@@ -209,6 +209,7 @@ struct Pin {
 
 /// Mutation-side state, guarded by a `Mutex`. Readers never touch this — they
 /// clone the `Arc<SettingsSnapshot>` instead.
+#[derive(Clone)]
 struct Inner {
     /// Typed parse of the file (schema defaults merged with file values).
     file: SettingsFile,
@@ -360,6 +361,7 @@ impl SettingsRegistry {
             doc_remove(&mut doc, path);
         }
         let text = doc.to_string();
+        SettingsFile::parse_str(&text)?;
         atomic_write(&self.path, &text)?;
         inner.doc = doc;
         inner.record_write(&text);
@@ -481,9 +483,10 @@ impl SettingsRegistry {
     }
 
     /// Validate `changes` (dotted wire path → JSON value) against the typed
-    /// schema, mutate the in-memory values, and atomically rewrite
-    /// `config.toml` (temp file + rename), preserving comments/layout — only
-    /// touched keys change in the document. `Null` clears a key back to its
+    /// schema and validate the rendered TOML with the startup parser before
+    /// atomically rewriting `config.toml` (temp file + rename) and publishing
+    /// the new state. Preserves comments/layout — only touched keys change
+    /// in the document. `Null` clears a key back to its
     /// schema default (the key is removed from the file). Unknown paths and
     /// pinned keys are rejected with [`Error::InvalidParams`] before anything
     /// mutates. Returns the changed-key notice (also broadcast to
@@ -498,18 +501,12 @@ impl SettingsRegistry {
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn apply(&self, changes: &[(String, Value)]) -> Result<SettingsChanged> {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
-        let candidate = Self::validate_changes(&inner, changes)?;
-
-        for (path, value) in changes {
-            doc_set(&mut inner.doc, path, value)?;
-        }
-        inner.file = candidate;
-
-        let text = inner.doc.to_string();
+        let (mut candidate, text, snapshot) = Self::validate_changes(&inner, changes)?;
         atomic_write(&self.path, &text)?;
-        inner.record_write(&text);
+        candidate.record_write(&text);
+        *inner = candidate;
 
-        self.publish(&inner)
+        Ok(self.publish_snapshot(snapshot, inner.generation))
     }
 
     /// Check a mixed settings batch before secret I/O without adopting or
@@ -520,7 +517,10 @@ impl SettingsRegistry {
         Self::validate_changes(&inner, changes).map(|_| ())
     }
 
-    fn validate_changes(inner: &Inner, changes: &[(String, Value)]) -> Result<SettingsFile> {
+    fn validate_changes(
+        inner: &Inner,
+        changes: &[(String, Value)],
+    ) -> Result<(Inner, String, Arc<SettingsSnapshot>)> {
         for (path, _) in changes {
             if !KNOWN_PATHS.contains(&path.as_str()) {
                 return Err(Error::InvalidParams(format!("unknown setting: {path}")));
@@ -540,17 +540,36 @@ impl SettingsRegistry {
         // an explicit null) so `#[serde(default)]` restores the schema default
         // for optional AND non-optional keys alike.
         let mut json = file_json(&inner.file)?;
-        let mut candidate = inner.file.clone();
+        let mut candidate = inner.clone();
         for (path, value) in changes {
             if value.is_null() {
                 json_remove(&mut json, path);
             } else {
                 json_set(&mut json, path, value.clone());
             }
-            candidate = typed_from_json(json.clone(), path)?;
+            candidate.file = typed_from_json(json.clone(), path)?;
         }
 
-        Ok(candidate)
+        // Keep every edit local until encoding, startup validation, snapshot
+        // construction, and the disk write succeed. Otherwise a later apply
+        // could accidentally commit part of this failed batch.
+        for (path, value) in changes {
+            doc_set(&mut candidate.doc, path, value)?;
+        }
+
+        let text = candidate.doc.to_string();
+        // Boot migrations apply settings before stripping captured legacy
+        // keys, so use the same legacy-aware entry point as startup. Every
+        // other unknown key, type error, and semantic failure stays strict.
+        // Validate without adopting read-time normalization (for example,
+        // dropping blank provider defaults). Keep the typed write values so
+        // service responses and repeated-write comparisons stay consistent.
+        SettingsFile::parse_str_with_legacy(&text).map_err(|e| match e {
+            Error::InvalidInput(msg) => Error::InvalidParams(msg),
+            other => other,
+        })?;
+        let snapshot = Arc::new(build_snapshot(&candidate)?);
+        Ok((candidate, text, snapshot))
     }
 
     /// Re-parse externally edited file `text` (strict schema) and adopt it as
@@ -587,21 +606,31 @@ impl SettingsRegistry {
     /// Rebuild the snapshot from `inner`, diff effective values against the
     /// previous snapshot, swap, and broadcast when anything changed.
     fn publish(&self, inner: &Inner) -> Result<SettingsChanged> {
+        let snapshot = Arc::new(build_snapshot(inner)?);
+        Ok(self.publish_snapshot(snapshot, inner.generation))
+    }
+
+    /// Install an already validated snapshot without fallible work after a
+    /// successful config write.
+    fn publish_snapshot(&self, new: Arc<SettingsSnapshot>, generation: u64) -> SettingsChanged {
         let old = self.snapshot();
-        let new = self.swap_snapshot(inner)?;
         let changed: BTreeSet<String> = KNOWN_PATHS
             .iter()
             .filter(|p| json_get(&old.effective_json, p) != json_get(&new.effective_json, p))
             .map(std::string::ToString::to_string)
             .collect();
         let notice = SettingsChanged {
-            generation: inner.generation,
+            generation,
             changed,
         };
+        *self
+            .snapshot
+            .write()
+            .expect("settings snapshot lock poisoned") = new;
         if !notice.changed.is_empty() {
             self.tx.send_replace(notice.clone());
         }
-        Ok(notice)
+        notice
     }
 
     /// Rebuild + install the read snapshot; returns the new snapshot.
@@ -1076,6 +1105,205 @@ mod tests {
         assert!(err.to_string().contains("unknown setting"), "{err}");
         // failed applies never touched the file
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "");
+    }
+
+    fn assert_apply_unchanged(
+        reg: &SettingsRegistry,
+        snapshot: &Arc<SettingsSnapshot>,
+        text: &str,
+        generation: u64,
+        stamp: Option<WriteStamp>,
+        rx: &watch::Receiver<SettingsChanged>,
+    ) {
+        assert_eq!(std::fs::read_to_string(reg.config_path()).unwrap(), text);
+        assert!(Arc::ptr_eq(&reg.snapshot(), snapshot));
+        assert_eq!(reg.generation(), generation);
+        assert_eq!(reg.write_stamp(), stamp);
+        assert!(!rx.has_changed().unwrap(), "failed apply must not notify");
+        let inner = reg.inner.lock().unwrap();
+        assert_eq!(inner.doc.to_string(), text, "staged edits must not leak");
+        assert_eq!(inner.file, SettingsFile::parse_str(text).unwrap());
+    }
+
+    #[test]
+    fn apply_rejects_toml_that_startup_cannot_load() {
+        let seed = "# preserve me\n[git]\nautoCommit = true\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        reg.pin("server.wsApi.port", json!(7000), "INTENTD_TCP_PORT")
+            .unwrap();
+        let snapshot = reg.snapshot();
+        let rx = reg.subscribe();
+
+        // The typed JSON schema accepts u64, but the current encoder turns
+        // integers above i64::MAX into floats that startup cannot read as u64.
+        let mut proposed: DocumentMut = seed.parse().unwrap();
+        doc_set(&mut proposed, "prMonitor.debounceSeconds", &json!(u64::MAX)).unwrap();
+        let parse_err = SettingsFile::parse_str(&proposed.to_string()).unwrap_err();
+        assert!(parse_err.to_string().contains("prMonitor.debounceSeconds"));
+        let err = reg
+            .apply(&[
+                ("git.autoCommit".into(), json!(false)),
+                ("prMonitor.debounceSeconds".into(), json!(u64::MAX)),
+            ])
+            .expect_err("must reject values that cannot round-trip through TOML");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        assert!(
+            err.to_string().contains("prMonitor.debounceSeconds"),
+            "{err}"
+        );
+        assert_apply_unchanged(&reg, &snapshot, seed, 0, None, &rx);
+
+        reg.apply(&set("rtk.enabled", json!(true))).unwrap();
+        let fresh = SettingsRegistry::load(&path).expect("startup succeeds");
+        assert_eq!(fresh.get("git.autoCommit"), Some(json!(true)));
+        assert_eq!(fresh.get("prMonitor.debounceSeconds"), Some(json!(60)));
+        assert_eq!(reg.origin("server.wsApi.port"), Some(SettingOrigin::Flag));
+    }
+
+    #[test]
+    fn apply_write_failure_keeps_state_and_cannot_leak_into_later_writes() {
+        let (dir, path) = temp_config(Some("# preserve me\n[git]\nautoCommit = true\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        reg.apply(&set("notifications.volume", json!(0.25)))
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let snapshot = reg.snapshot();
+        let generation = reg.generation();
+        let stamp = reg.write_stamp();
+        let rx = reg.subscribe();
+
+        // Force rename to fail even when tests run as root, while keeping
+        // the last-good file available to restore byte-for-byte.
+        let saved = dir.path().join("saved.toml");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = reg
+            .apply(&[
+                ("git.autoCommit".into(), json!(false)),
+                ("model.default".into(), json!("rejected-model")),
+            ])
+            .expect_err("cannot replace a directory with config.toml");
+        assert!(matches!(err, Error::Internal(_)), "{err}");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_apply_unchanged(&reg, &snapshot, &text, generation, stamp, &rx);
+        assert!(reg.is_self_write(&text));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        reg.apply(&set("rtk.enabled", json!(true))).unwrap();
+        let fresh = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(fresh.get("git.autoCommit"), Some(json!(true)));
+        assert_eq!(fresh.get("model.default"), Some(Value::Null));
+        assert_eq!(fresh.origin("model.default"), Some(SettingOrigin::Default));
+        assert_eq!(reg.generation(), generation + 1);
+    }
+
+    #[test]
+    fn apply_rejects_unsupported_paths_and_enums_without_partial_changes() {
+        for (invalid_path, value) in [
+            ("future.setting", json!(true)),
+            ("logging.level", json!("future-level")),
+            ("agents.flushQueuedMessages", json!("future-policy")),
+        ] {
+            let seed = "# preserve me\n[git]\nautoCommit = true\n";
+            let (_dir, path) = temp_config(Some(seed));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let snapshot = reg.snapshot();
+            let rx = reg.subscribe();
+            let err = reg
+                .apply(&[
+                    ("git.autoCommit".into(), json!(false)),
+                    (invalid_path.into(), value),
+                ])
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+            assert!(err.to_string().contains(invalid_path), "{err}");
+            assert_apply_unchanged(&reg, &snapshot, seed, 0, None, &rx);
+        }
+    }
+
+    #[test]
+    fn apply_preserves_open_provider_maps_and_pending_legacy_migration() {
+        let seed = "# keep me\n[backgroundAgents]\ndefaultModel = \"old-model\"\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let legacy = reg.legacy_values();
+        let providers = json!({
+            "future.provider": {
+                "futureOption": "new-choice",
+                "nested": {"enabled": true, "values": [1, 0.5, "text"]},
+                "empty": {}
+            }
+        });
+        reg.apply(&[
+            ("providers.enabled".into(), json!({"future.provider": true})),
+            (
+                "providers.paths".into(),
+                json!({"future.provider": "/custom/bin"}),
+            ),
+            (
+                "model.providerDefaults".into(),
+                json!({"future.provider": "future-model"}),
+            ),
+            ("quickActions.providerSettings".into(), providers.clone()),
+        ])
+        .expect("open maps remain extensible while legacy import is pending");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"));
+        let (parsed, pending) = SettingsFile::parse_str_with_legacy(&text).unwrap();
+        assert_eq!(parsed, reg.snapshot().effective);
+        assert_eq!(pending, legacy);
+        assert_eq!(reg.legacy_values(), legacy);
+        assert_eq!(reg.get("quickActions.providerSettings"), Some(providers));
+        assert_eq!(reg.origin("providers.enabled"), Some(SettingOrigin::File));
+
+        reg.apply(&set("providers.enabled", Value::Null)).unwrap();
+        assert_eq!(reg.get("providers.enabled"), Some(Value::Null));
+        assert_eq!(
+            reg.origin("providers.enabled"),
+            Some(SettingOrigin::Default)
+        );
+        reg.strip_legacy().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            SettingsFile::parse_str(&text).unwrap(),
+            reg.snapshot().effective
+        );
+    }
+
+    #[test]
+    fn validate_is_non_mutating_and_checks_rendered_config() {
+        let seed = "# preserve me\n[git]\nautoCommit = true\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let snapshot = reg.snapshot();
+        let rx = reg.subscribe();
+        let unchanged = || {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), seed);
+            assert!(Arc::ptr_eq(&reg.snapshot(), &snapshot));
+            assert_eq!(reg.generation(), 0);
+            assert_eq!(reg.write_stamp(), None);
+            assert!(!rx.has_changed().unwrap(), "preflight must not notify");
+            let inner = reg.inner.lock().unwrap();
+            assert_eq!(inner.doc.to_string(), seed);
+            assert_eq!(inner.file, SettingsFile::parse_str(seed).unwrap());
+        };
+
+        reg.validate(&set("git.autoCommit", json!(false))).unwrap();
+        unchanged();
+
+        // JSON accepts this u64, but TOML encodes it as a float that startup
+        // cannot load. Preflight must use the same document checks as apply.
+        let error = reg
+            .validate(&[
+                ("git.autoCommit".into(), json!(false)),
+                ("prMonitor.debounceSeconds".into(), json!(u64::MAX)),
+            ])
+            .expect_err("preflight must reject config that startup cannot load");
+        assert!(matches!(error, Error::InvalidParams(_)), "{error}");
+        assert!(error.to_string().contains("prMonitor.debounceSeconds"));
+        unchanged();
     }
 
     #[test]

@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 mod client;
+mod doctor_codex;
 mod exact_update;
 mod git_credential;
 mod import;
@@ -109,7 +110,22 @@ enum Command {
     Stop,
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
-    Doctor,
+    Doctor {
+        /// Compare fresh ACP and selected-runtime model catalogs. May download
+        /// the managed npm package; uses existing file/environment authentication
+        /// in isolated state, without prompts, login or token refresh. Each
+        /// catalog allows 30 seconds, plus local inspection/startup/cleanup
+        /// budgets. Missing models and partial failures remain advisory; catalog
+        /// membership does not verify account entitlement. Without this flag,
+        /// Codex reports the pinned launch and Node.js/npx prerequisites without
+        /// resolving npm. Configured/PATH adapters and `CODEX_PATH` are ignored.
+        /// Package metadata is meaningful only for an established selected
+        /// entrypoint. On macOS, version and catalog process probes are unsupported,
+        /// because descendant cleanup cannot be guaranteed. No npm resolution
+        /// or diagnostic authentication capture occurs on macOS.
+        #[arg(long)]
+        codex_models: bool,
+    },
     /// Read or change daemon settings (§5.12) on a running daemon. With no
     /// arguments, lists every setting with its type and current value
     /// (`settings.list`); with `<name>`, prints that setting (`settings.get`);
@@ -341,7 +357,7 @@ async fn async_main(cli: Cli) -> ExitCode {
             Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
             Command::Status => cmd_status().await,
             Command::Stop => cmd_stop().await,
-            Command::Doctor => cmd_doctor().await,
+            Command::Doctor { codex_models } => cmd_doctor(codex_models).await,
             Command::Settings { name, value, stdin } => {
                 to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
             }
@@ -2083,7 +2099,7 @@ async fn cmd_serve(
     // each PR on an effective interval stretched to fit the `[prMonitor]
     // hourlyRequestBudget` cost model (a cadence planner, not a request
     // limiter) and stretched further ahead of exhaustion when the tick's
-    // quota-free probe shows the remaining quota would not cover the
+    // shared quota probe shows the remaining quota would not cover the
     // projected spend to reset within `quotaSharePercent`, a capped
     // oldest-first subset per tick — diff each
     // against its persisted baseline, and deliver one consolidated wake once
@@ -6568,7 +6584,7 @@ impl Signaller for NixSignaller {
     }
 }
 
-async fn cmd_doctor() -> ExitCode {
+async fn cmd_doctor(codex_models: bool) -> ExitCode {
     // `resolve_config` parses config.toml strictly — the same gate `serve`
     // applies. A malformed file exits non-zero here with the offending key.
     let config = match resolve_config() {
@@ -6628,7 +6644,7 @@ async fn cmd_doctor() -> ExitCode {
         }
     }
 
-    report_provider_availability(&config).await;
+    report_provider_availability(&config, codex_models).await;
 
     // §5.7 additions: ports-free window, cert validity, GitHub token presence,
     // context-engine availability, and host display/locality. The first two are
@@ -6900,13 +6916,12 @@ fn report_cow_support(config: &Config) {
 /// `providers.paths` override — monorepo#1065) and, best-effort, which are
 /// authenticated. Provider availability never fails `doctor` — a host with no
 /// providers installed is a valid (if limited) state.
-async fn report_provider_availability(config: &Config) {
+async fn report_provider_availability(config: &Config, codex_models: bool) {
     // Same settings source `serve` uses; a missing/unreadable file degrades
     // to no overrides (auto-detection only) rather than failing doctor.
-    let provider_paths =
-        intent_core::settings_file::SettingsFile::load_or_init(&config.config_path)
-            .map(|f| f.providers.paths)
-            .unwrap_or_default();
+    let settings = intent_core::settings_file::SettingsFile::load_or_init(&config.config_path)
+        .unwrap_or_default();
+    let provider_paths = &settings.providers.paths;
     println!("providers:");
     for provider in intent_providers::discover_providers_with_overrides(&|key| {
         provider_paths
@@ -6918,7 +6933,26 @@ async fn report_provider_availability(config: &Config) {
             println!("  [--] {} ({})", provider.id, reason);
             continue;
         }
-        // npx-only providers (claude-code, pi) never resolve a local binary;
+        if provider.id == "codex" {
+            // Node+npx availability says nothing about the pinned package's
+            // runtime. Only the safe diagnostic report supplies that evidence;
+            // do not run an opaque adapter as a generic auth/version probe.
+            if provider.installed {
+                println!("  [ok] codex Node.js/npx prerequisites: available");
+            } else {
+                println!(
+                    "{}",
+                    npx_provider_availability_line(
+                        "codex",
+                        intent_providers::CODEX_ACP_NPX_PACKAGE,
+                        None
+                    )
+                );
+            }
+            doctor_codex::report(settings.clone(), codex_models).await;
+            continue;
+        }
+        // npx-only providers (claude-code, codex, pi) never resolve a local binary;
         // report npx availability instead (the auth probe would need a package
         // download, so it is skipped — auth is the external `claude` CLI).
         // A valid `providers.paths` adapter override (claude-code opts in,
@@ -6959,15 +6993,14 @@ async fn report_provider_availability(config: &Config) {
                             println!("  [--] {} unavailable{verdict}", provider.id);
                         }
                         None => {
-                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display());
+                            println!(
+                                "{}",
+                                npx_provider_availability_line(provider.id, pkg, Some(npx))
+                            );
                         }
                     }
                 }
-                None => println!(
-                    "  [--] {} unavailable (npx not found — {} is required)",
-                    provider.id,
-                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
-                ),
+                None => println!("{}", npx_provider_availability_line(provider.id, pkg, None)),
             }
             continue;
         }
@@ -7003,6 +7036,21 @@ async fn report_provider_availability(config: &Config) {
         );
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
+    }
+}
+
+/// Format the ordinary npx doctor line from discovery's result without probing again.
+fn npx_provider_availability_line(id: &str, package: &str, npx: Option<&Path>) -> String {
+    match npx {
+        Some(npx) => format!("  [ok] {id} via npx: {} -y {package}", npx.display()),
+        None if id == "codex" => format!(
+            "  [--] {id} unavailable ({})",
+            intent_providers::CODEX_ACP_PREREQUISITE_ERROR
+        ),
+        None => format!(
+            "  [--] {id} unavailable (npx not found — {} is required)",
+            intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+        ),
     }
 }
 
@@ -7269,6 +7317,52 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_codex_unavailable_names_both_runtime_prerequisites() {
+        // Codex discovery returns None when Node is missing even if npx
+        // exists, as well as when npx or both are missing. The provider
+        // resolver tests cover that executable matrix without touching PATH.
+        let line =
+            npx_provider_availability_line("codex", intent_providers::CODEX_ACP_NPX_PACKAGE, None);
+        assert_eq!(
+            line,
+            format!(
+                "  [--] codex unavailable ({})",
+                intent_providers::CODEX_ACP_PREREQUISITE_ERROR
+            )
+        );
+        assert!(!line.contains("npx not found"));
+    }
+
+    #[test]
+    fn doctor_npx_unavailable_keeps_other_provider_diagnostics() {
+        for id in ["claude-code", "pi"] {
+            let provider = intent_providers::find_provider(id).unwrap();
+            assert_eq!(
+                npx_provider_availability_line(id, provider.npx_only_package.unwrap(), None),
+                format!(
+                    "  [--] {id} unavailable (npx not found — {} is required)",
+                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_available_npx_provider_keeps_selected_package_and_path() {
+        let npx = Path::new("/toolchain/npx");
+        for id in ["codex", "claude-code"] {
+            let package = intent_providers::find_provider(id)
+                .unwrap()
+                .npx_only_package
+                .unwrap();
+            assert_eq!(
+                npx_provider_availability_line(id, package, Some(npx)),
+                format!("  [ok] {id} via npx: {} -y {package}", npx.display())
+            );
+        }
+    }
 
     /// Regression guard for [`WORKER_THREAD_STACK_BYTES`]: a task whose
     /// frame needs more than the 2 MiB std default must still complete on a

@@ -55,18 +55,6 @@ pub(crate) fn fuzzy_match_model_in_pool(candidate: &str, pool: &[&str]) -> Optio
     fuzzy_pick(candidate, pool).map(std::string::ToString::to_string)
 }
 
-/// Parse a Codex model id into its base model and optional reasoning effort.
-///
-/// A `{base}/{effort}` id (e.g. `gpt-5.3-codex/high`) splits on the first `/`;
-/// a bare id has no effort. Port of `parseCodexReasoningEffort`
-/// (`open-ai-codex-models.ts`).
-pub(crate) fn parse_codex_reasoning_effort(model_id: &str) -> (String, Option<String>) {
-    match model_id.split_once('/') {
-        Some((base, effort)) => (base.to_string(), Some(effort.to_string())),
-        None => (model_id.to_string(), None),
-    }
-}
-
 /// Walk `preference_list` in order and return the first id present in
 /// `available_values`. Port of `resolvePreferredModel`.
 #[cfg(test)]

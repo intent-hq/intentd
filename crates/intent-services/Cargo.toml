@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.9.105"
+version = "0.9.107"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,19 +8,19 @@ license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.105" }
-intent-store = { path = "../intent-store", version = "0.9.105" }
-intent-git = { path = "../intent-git", version = "0.9.105" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.105" }
-intent-linear = { path = "../intent-linear", version = "0.9.105" }
-intent-sentry = { path = "../intent-sentry", version = "0.9.105" }
+intent-core = { path = "../intent-core", version = "0.9.107" }
+intent-store = { path = "../intent-store", version = "0.9.107" }
+intent-git = { path = "../intent-git", version = "0.9.107" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.107" }
+intent-linear = { path = "../intent-linear", version = "0.9.107" }
+intent-sentry = { path = "../intent-sentry", version = "0.9.107" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.9.105" }
-intent-js = { path = "../intent-js", version = "0.9.105" }
-intent-context = { path = "../intent-context", version = "0.9.105" }
-intent-providers = { path = "../intent-providers", version = "0.9.105" }
-intent-pty = { path = "../intent-pty", version = "0.9.105" }
-intent-search = { path = "../intent-search", version = "0.9.105" }
+intent-acp = { path = "../intent-acp", version = "0.9.107" }
+intent-js = { path = "../intent-js", version = "0.9.107" }
+intent-context = { path = "../intent-context", version = "0.9.107" }
+intent-providers = { path = "../intent-providers", version = "0.9.107" }
+intent-pty = { path = "../intent-pty", version = "0.9.107" }
+intent-search = { path = "../intent-search", version = "0.9.107" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
@@ -59,6 +59,17 @@ intentd-test-support = { path = "../intentd-test-support" }
 nix = { workspace = true, features = ["signal", "process"] }
 pprof = "0.15"
 libc = { workspace = true }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
 
 [lints]
 workspace = true

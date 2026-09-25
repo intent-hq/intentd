@@ -2,7 +2,7 @@
 //!
 //! Resolves args/env from the `intent_providers` registry, enriches `PATH` so a
 //! `#!/usr/bin/env node` shebang resolves the right `node`, applies Codex
-//! `-c model=…` overrides, and spawns with all three pipes captured and
+//! subagent policy, and spawns with all three pipes captured and
 //! `kill_on_drop(true)`. The captured pipes are handed to a [`Connection`].
 //!
 //! Children start at reduced scheduling priority relative to the daemon's own
@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use intent_providers::{
-    apply_codex_config_args, build_provider_args, build_provider_env_for_spawn, enhanced_path,
-    ArgInputs, ProviderConfig, UnslothEndpoint,
+    build_provider_args, build_provider_env_for_spawn, enhanced_path, ArgInputs, ProviderConfig,
+    UnslothEndpoint, CODEX_SUBAGENT_POLICY_CONFIG,
 };
 use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
@@ -32,9 +32,8 @@ pub struct SpawnOptions<'a> {
     /// Raw (provider-stripped) model id, or `None`.
     pub model: Option<&'a str>,
     /// Session-level reasoning-effort level (PROTOCOL §5.5, Option B), or
-    /// `None` for the provider default. Consumed by the codex `-c
-    /// model_reasoning_effort=…` config override; an effort embedded in a
-    /// compound `{base}/{effort}` model id still wins over this value.
+    /// `None` for the provider default. Codex receives it through ACP session
+    /// configuration; the pinned adapter does not consume CLI effort flags.
     pub reasoning_effort: Option<&'a str>,
     /// The agent's workspace: the ACP session cwd, and the child's working
     /// directory for resolved-binary and bare-command launches. An npx
@@ -66,7 +65,7 @@ pub struct SpawnOptions<'a> {
     pub quiet: bool,
     /// Discovered provider binary, used for `PATH` enrichment.
     pub provider_binary: Option<&'a Path>,
-    /// Extra environment overrides applied last.
+    /// Extra environment overrides, applied before provider-owned launch policy.
     pub extra_env: BTreeMap<String, String>,
     /// Provider-native tools to strip via the provider's `--remove-tool`
     /// equivalent (§18.4 CLI-side enforcement). Gated on
@@ -91,8 +90,7 @@ pub struct SpawnOptions<'a> {
 impl<'a> SpawnOptions<'a> {
     /// True when this spawn will run via npx: no resolved provider binary and
     /// both npx fields set. Single source of truth for the program selection,
-    /// the `-y <pkg>` arg prepend, and the Node-child env decisions (heap cap,
-    /// #555 codex env scrub).
+    /// the `-y <pkg>` arg prepend, and the Node-child heap cap.
     #[must_use]
     pub fn via_npx(&self) -> bool {
         self.provider_binary.is_none()
@@ -309,9 +307,9 @@ impl std::fmt::Display for LaunchMode {
     }
 }
 
-/// Assemble the launch arguments, including the Codex `-c` config overrides
-/// (which read `CODEX_REASONING_EFFORT` / `CODEX_MODEL_REASONING_EFFORT`).
-/// When spawning via npx fallback, prepends [`NPX_NO_WORKSPACES_ARG`] and
+/// Assemble provider launch arguments. Codex model and effort are applied
+/// through ACP config options; its selected adapter ignores CLI config flags.
+/// When spawning via npx, prepends [`NPX_NO_WORKSPACES_ARG`] and
 /// `-y <package>` before the provider's args.
 #[must_use]
 pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
@@ -328,7 +326,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     }
 
     // Then append the provider's normal ACP args
-    let mut provider_args = build_provider_args(
+    let provider_args = build_provider_args(
         opts.provider,
         &ArgInputs {
             model: opts.model,
@@ -338,16 +336,6 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
             tools_to_remove: &opts.tools_to_remove,
         },
     );
-    if opts.provider.id == "codex" {
-        // Effort fallback precedence: session `reasoningEffort` field, then
-        // the env seam. An effort embedded in a compound `{base}/{effort}`
-        // model id wins over both (inside `apply_codex_config_args`).
-        let env_effort = std::env::var("CODEX_REASONING_EFFORT")
-            .ok()
-            .or_else(|| std::env::var("CODEX_MODEL_REASONING_EFFORT").ok());
-        let effort = opts.reasoning_effort.or(env_effort.as_deref());
-        provider_args = apply_codex_config_args(provider_args, opts.model, effort);
-    }
     args.extend(provider_args);
     args
 }
@@ -610,8 +598,7 @@ fn build_command_in(
         cmd.current_dir(cwd);
     }
     // An npx spawn (fallback or npx-only) always runs a Node child, so env
-    // assembly applies the V8 heap cap even when the provider's declared
-    // runtime is Native (codex's npx fallback, intent-hq/monorepo#1661).
+    // assembly applies the V8 heap cap regardless of its declared runtime.
     let via_npx = opts.via_npx();
     let provider_env = build_provider_env_for_spawn(
         opts.provider,
@@ -645,15 +632,18 @@ fn build_command_in(
         cmd.env(key, value);
     }
 
-    // The pinned codex-acp npx fallback is daemon-managed (not a user escape
-    // hatch), so remove CODEX_PATH / CODEX_CONFIG from its inherited env — a
-    // stray or hostile value could redirect the adapter away from the vendored
-    // binary (#555). Applies after the captured-env merge above, so a captured
-    // login-shell value is stripped too. Resolved binaries (providers.paths /
-    // PATH scan) keep the daemon env untouched.
-    if opts.provider.id == "codex" && via_npx {
+    // Every Codex launch uses the pinned npx adapter. Enforce both denial
+    // settings after every env merge so user/captured overrides cannot enable
+    // V2 or select an incompatible Codex executable. The adapter applies this
+    // config on each thread start and resume; Intent's MCP tools are unchanged.
+    if opts.provider.id == "codex" {
         cmd.env_remove("CODEX_PATH");
-        cmd.env_remove("CODEX_CONFIG");
+        cmd.env("CODEX_CONFIG", CODEX_SUBAGENT_POLICY_CONFIG);
+        tracing::debug!(
+            mechanism = "CODEX_CONFIG",
+            package = intent_providers::CODEX_ACP_NPX_PACKAGE,
+            "applied Codex subagent policy for pinned npx adapter"
+        );
     }
 
     // The npx bootstrap targets the neutral launch dir only: an inherited (or
@@ -906,6 +896,51 @@ mod build_args_tests {
     use super::*;
 
     #[test]
+    fn build_args_codex_npx_uses_pinned_package_without_ignored_config_flags() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let npx = Path::new("/usr/local/bin/npx");
+        for model in [
+            None,
+            Some(""),
+            Some("default"),
+            Some("gpt-5.3-codex"),
+            Some("gpt-5.3-codex/high"),
+        ] {
+            for effort in [None, Some(""), Some("xhigh")] {
+                let mut opts = SpawnOptions::new(codex);
+                opts.npx_fallback_binary = Some(npx);
+                opts.npx_fallback_package = codex.npx_only_package;
+                opts.model = model;
+                opts.reasoning_effort = effort;
+                assert_eq!(
+                    build_args(&opts),
+                    [
+                        NPX_NO_WORKSPACES_ARG,
+                        "-y",
+                        intent_providers::CODEX_ACP_NPX_PACKAGE
+                    ],
+                    "model={model:?}, effort={effort:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_args_keeps_codex_policy_out_of_other_providers() {
+        for provider in intent_providers::ACP_PROVIDERS {
+            if provider.id == "codex" {
+                continue;
+            }
+            let args = build_args(&SpawnOptions::new(provider));
+            assert!(
+                !args.iter().any(|arg| arg.contains("agents.enabled")),
+                "{} must not receive Codex config: {args:?}",
+                provider.id
+            );
+        }
+    }
+
+    #[test]
     fn build_args_propagates_tools_to_remove_for_auggie() {
         let auggie = intent_providers::find_provider("auggie").unwrap();
         let mut opts = SpawnOptions::new(auggie);
@@ -917,35 +952,6 @@ mod build_args_tests {
         assert!(args
             .windows(2)
             .any(|w| w == ["--remove-tool", "sub-agent-explore"]));
-    }
-
-    #[test]
-    fn build_args_applies_session_reasoning_effort_for_codex() {
-        let codex = intent_providers::find_provider("codex").unwrap();
-        let mut opts = SpawnOptions::new(codex);
-        opts.model = Some("gpt-5.3-codex");
-        opts.reasoning_effort = Some("xhigh");
-        let args = build_args(&opts);
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"xhigh\""),
-            "session effort missing from codex args: {args:?}"
-        );
-
-        // A compound {base}/{effort} model id wins over the session field.
-        let mut opts = SpawnOptions::new(codex);
-        opts.model = Some("gpt-5.3-codex/high");
-        opts.reasoning_effort = Some("xhigh");
-        let args = build_args(&opts);
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"high\""),
-            "model-embedded effort must win: {args:?}"
-        );
-        assert!(
-            !args.iter().any(|a| a.contains("xhigh")),
-            "session effort must not override the model-embedded one: {args:?}"
-        );
     }
 
     #[test]
@@ -1274,23 +1280,16 @@ mod build_command_tests {
     }
 
     #[test]
-    fn build_command_prefers_provider_binary_over_npx_fallback() {
-        // Uses codex (a fallback-npx provider) — claude-code only resolves a
-        // provider binary from an explicit override (monorepo#4352).
-        let provider = intent_providers::find_provider("codex").unwrap();
+    fn build_command_prefers_claude_override_over_npx() {
+        let provider = intent_providers::find_provider("claude-code").unwrap();
         let mut opts = SpawnOptions::new(provider);
-        let provider_binary = PathBuf::from("/custom/codex-acp");
-        let npx_path = PathBuf::from("/usr/local/bin/npx");
-        opts.provider_binary = Some(&provider_binary);
-        opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
+        let adapter = Path::new("/custom/claude-agent-acp");
+        opts.provider_binary = Some(adapter);
+        opts.npx_fallback_binary = Some(Path::new("/usr/local/bin/npx"));
+        opts.npx_fallback_package = provider.npx_only_package;
         let cmd = build_command(&opts);
-        let program = cmd.as_std().get_program();
-        // Should use provider_binary, not npx
-        assert_eq!(program, provider_binary.as_os_str());
-        // And args should NOT include npx -y package
-        let args = build_args(&opts);
-        assert!(!args.contains(&"-y".to_string()));
+        assert_eq!(cmd.as_std().get_program(), adapter.as_os_str());
+        assert!(!build_args(&opts).contains(&"-y".to_string()));
     }
 
     /// intent-hq/intent#5738: an npx launch (npx-only provider or npx
@@ -1318,12 +1317,12 @@ mod build_command_tests {
             "npx-only launch must not run npx inside the workspace"
         );
 
-        // npx fallback (codex without a resolved binary).
+        // pinned npx Codex adapter.
         let codex = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(codex);
         opts.cwd = Some(&workspace);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = codex.fallback_npx_package;
+        opts.npx_fallback_package = codex.npx_only_package;
         assert!(opts.via_npx());
         let cmd = build_command(&opts);
         assert_ne!(
@@ -1341,13 +1340,13 @@ mod build_command_tests {
         let workspace = PathBuf::from("/repos/bun workspace");
         let npx_path = PathBuf::from("/usr/local/bin/npx");
 
-        let codex = intent_providers::find_provider("codex").unwrap();
-        let resolved = PathBuf::from("/custom/codex-acp");
-        let mut opts = SpawnOptions::new(codex);
+        let droid = intent_providers::find_provider("droid").unwrap();
+        let resolved = PathBuf::from("/custom/droid");
+        let mut opts = SpawnOptions::new(droid);
         opts.cwd = Some(&workspace);
         opts.provider_binary = Some(&resolved);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = codex.fallback_npx_package;
+        opts.npx_fallback_package = droid.fallback_npx_package;
         assert!(!opts.via_npx());
         let cmd = build_command(&opts);
         assert_eq!(cmd.as_std().get_current_dir(), Some(workspace.as_path()));
@@ -1418,21 +1417,21 @@ mod build_command_tests {
     }
 
     #[test]
-    fn codex_fallback_npx_package_is_pinned() {
+    fn codex_npx_only_package_is_pinned() {
         let provider = intent_providers::find_provider("codex").unwrap();
         let pkg = provider
-            .fallback_npx_package
-            .expect("codex should have fallback_npx_package configured");
+            .npx_only_package
+            .expect("codex should have npx_only_package configured");
         assert_eq!(pkg, intent_providers::config::CODEX_ACP_NPX_PACKAGE);
         assert!(
             pkg.starts_with("@agentclientprotocol/codex-acp@"),
-            "codex npx fallback should use the @agentclientprotocol package, got: {pkg}"
+            "codex npx adapter should use the @agentclientprotocol package, got: {pkg}"
         );
         let version = pkg.rsplit('@').next().unwrap();
         let parts: Vec<&str> = version.split('.').collect();
         assert!(
             parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()),
-            "codex npx fallback must be pinned to an exact semver version, got: {version}"
+            "codex npx adapter must be pinned to an exact semver version, got: {version}"
         );
     }
 
@@ -1456,50 +1455,41 @@ mod build_command_tests {
     #[test]
     fn build_command_codex_initial_mode_default_and_extra_env_precedence() {
         let provider = intent_providers::find_provider("codex").unwrap();
-        let provider_binary = PathBuf::from("/custom/codex-acp");
-        let npx_path = PathBuf::from("/usr/local/bin/npx");
-        for via_npx in [false, true] {
-            let mut opts = SpawnOptions::new(provider);
-            opts.provider_binary = (!via_npx).then_some(provider_binary.as_path());
-            opts.npx_fallback_binary = Some(&npx_path);
-            opts.npx_fallback_package = provider.fallback_npx_package;
+        let npx = Path::new("/usr/local/bin/npx");
+        let mut opts = SpawnOptions::new(provider);
+        opts.npx_fallback_binary = Some(npx);
+        opts.npx_fallback_package = provider.npx_only_package;
+        let cmd = build_command(&opts);
+        let expected = std::env::var_os("INITIAL_AGENT_MODE")
+            .is_none()
+            .then_some("agent-full-access");
+        assert_eq!(env_value(&cmd, "INITIAL_AGENT_MODE").as_deref(), expected);
+        assert!(!env_removed(&cmd, "INITIAL_AGENT_MODE"));
+        for explicit in [
+            "agent",
+            "read-only",
+            "agent-full-access",
+            "",
+            "invalid-mode",
+        ] {
+            opts.extra_env
+                .insert("INITIAL_AGENT_MODE".to_string(), explicit.to_string());
             let cmd = build_command(&opts);
-            // Provider tests cover each inherited value hermetically. Here
-            // inspect the real command without mutating process-global env.
-            let expected = std::env::var_os("INITIAL_AGENT_MODE")
-                .is_none()
-                .then_some("agent-full-access");
-            assert_eq!(env_value(&cmd, "INITIAL_AGENT_MODE").as_deref(), expected);
-            assert!(!env_removed(&cmd, "INITIAL_AGENT_MODE"));
-
-            for explicit in [
-                "agent",
-                "read-only",
-                "agent-full-access",
-                "",
-                "invalid-mode",
-            ] {
-                opts.extra_env
-                    .insert("INITIAL_AGENT_MODE".to_string(), explicit.to_string());
-                let cmd = build_command(&opts);
-                assert_eq!(
-                    env_value(&cmd, "INITIAL_AGENT_MODE").as_deref(),
-                    Some(explicit),
-                    "per-spawn mode must win on both launch paths"
-                );
-            }
+            assert_eq!(
+                env_value(&cmd, "INITIAL_AGENT_MODE").as_deref(),
+                Some(explicit)
+            );
         }
     }
 
     #[test]
-    fn build_command_applies_heap_cap_on_codex_npx_fallback() {
-        // codex is declared Native (Rust binary), but the npx-fallback child
-        // is Node — the STAB-50 heap cap must apply (intent-hq/monorepo#1661).
+    fn build_command_applies_heap_cap_on_codex_npx() {
+        // Codex always runs the pinned Node adapter, with the V8 heap cap.
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
+        opts.npx_fallback_package = provider.npx_only_package;
         let cmd = build_command(&opts);
         let node_options = env_value(&cmd, "NODE_OPTIONS");
         if std::env::var("NODE_OPTIONS").is_ok_and(|v| v.contains("--max-old-space-size")) {
@@ -1509,7 +1499,7 @@ mod build_command_tests {
                 "inherited --max-old-space-size must suppress injection"
             );
         } else {
-            let v = node_options.expect("npx-fallback codex spawn must set NODE_OPTIONS");
+            let v = node_options.expect("pinned npx Codex spawn must set NODE_OPTIONS");
             assert!(
                 v.contains("--max-old-space-size="),
                 "NODE_OPTIONS must carry the heap cap, got: {v}"
@@ -1549,61 +1539,32 @@ mod build_command_tests {
     }
 
     #[test]
-    fn build_command_no_heap_cap_on_codex_resolved_binary() {
-        // The resolved native codex-acp binary is not V8: no NODE_OPTIONS.
-        let provider = intent_providers::find_provider("codex").unwrap();
+    fn build_command_no_heap_cap_on_native_droid() {
+        let provider = intent_providers::find_provider("droid").unwrap();
         let mut opts = SpawnOptions::new(provider);
-        let provider_binary = PathBuf::from("/custom/codex-acp");
-        let npx_path = PathBuf::from("/usr/local/bin/npx");
-        opts.provider_binary = Some(&provider_binary);
-        opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
-        let cmd = build_command(&opts);
-        assert!(
-            env_value(&cmd, "NODE_OPTIONS").is_none(),
-            "resolved-binary codex spawn must not inject NODE_OPTIONS"
-        );
+        opts.provider_binary = Some(Path::new("/custom/droid"));
+        assert!(env_value(&build_command(&opts), "NODE_OPTIONS").is_none());
     }
 
     #[test]
-    fn build_command_strips_codex_env_on_npx_fallback_spawn() {
-        // The pinned npx fallback is daemon-managed: a stray CODEX_PATH /
+    fn build_command_sets_codex_subagent_policy_on_npx_spawn() {
+        // The pinned npx adapter is daemon-managed: a stray CODEX_PATH /
         // CODEX_CONFIG in the daemon env must not redirect the adapter (#555).
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
+        opts.npx_fallback_package = provider.npx_only_package;
         let cmd = build_command(&opts);
         assert!(
             env_removed(&cmd, "CODEX_PATH"),
-            "npx-fallback codex spawn must remove CODEX_PATH from the child env"
+            "pinned npx Codex spawn must remove CODEX_PATH from the child env"
         );
-        assert!(
-            env_removed(&cmd, "CODEX_CONFIG"),
-            "npx-fallback codex spawn must remove CODEX_CONFIG from the child env"
-        );
-    }
-
-    #[test]
-    fn build_command_keeps_codex_env_for_resolved_binary_spawn() {
-        // A resolved codex-acp binary (providers.paths override or PATH scan)
-        // is the user's escape hatch — its env must be left untouched.
-        let provider = intent_providers::find_provider("codex").unwrap();
-        let mut opts = SpawnOptions::new(provider);
-        let provider_binary = PathBuf::from("/custom/codex-acp");
-        let npx_path = PathBuf::from("/usr/local/bin/npx");
-        opts.provider_binary = Some(&provider_binary);
-        opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
-        let cmd = build_command(&opts);
-        let touched = cmd
-            .as_std()
-            .get_envs()
-            .any(|(k, _)| k == "CODEX_PATH" || k == "CODEX_CONFIG");
-        assert!(
-            !touched,
-            "resolved-binary codex spawn must inherit CODEX_PATH/CODEX_CONFIG untouched"
+        let config = env_value(&cmd, "CODEX_CONFIG")
+            .expect("pinned npx Codex spawn must set daemon-owned CODEX_CONFIG");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&config).unwrap(),
+            serde_json::json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}})
         );
     }
 
@@ -1666,7 +1627,7 @@ mod build_command_tests {
     /// intent-hq/intent#5738: a workspace selector reaching the npx bootstrap
     /// from any env source — here the explicit `extra_env` merged last — is
     /// removed from the child env on both npx tiers (npx-only claude-code,
-    /// codex fallback), while unrelated npm settings merged alongside it stay.
+    /// codex), while unrelated npm settings merged alongside it stay.
     #[test]
     fn build_command_strips_npm_workspace_selectors_on_npx_spawns() {
         let npx_path = PathBuf::from("/usr/local/bin/npx");
@@ -1674,7 +1635,7 @@ mod build_command_tests {
         let codex = intent_providers::find_provider("codex").unwrap();
         for (provider, package) in [
             (claude, claude.npx_only_package),
-            (codex, codex.fallback_npx_package),
+            (codex, codex.npx_only_package),
         ] {
             let mut opts = SpawnOptions::new(provider);
             opts.npx_fallback_binary = Some(&npx_path);
@@ -1720,13 +1681,13 @@ mod build_command_tests {
     /// an explicit `npm_config_workspace` reaches it unchanged.
     #[test]
     fn build_command_keeps_npm_workspace_selectors_for_non_npx_spawns() {
-        let codex = intent_providers::find_provider("codex").unwrap();
-        let provider_binary = PathBuf::from("/custom/codex-acp");
+        let droid = intent_providers::find_provider("droid").unwrap();
+        let provider_binary = PathBuf::from("/custom/droid");
         let npx_path = PathBuf::from("/usr/local/bin/npx");
-        let mut resolved = SpawnOptions::new(codex);
+        let mut resolved = SpawnOptions::new(droid);
         resolved.provider_binary = Some(&provider_binary);
         resolved.npx_fallback_binary = Some(&npx_path);
-        resolved.npx_fallback_package = codex.fallback_npx_package;
+        resolved.npx_fallback_package = droid.fallback_npx_package;
         let auggie = intent_providers::find_provider("auggie").unwrap();
         let bare = SpawnOptions::new(auggie);
         for mut opts in [resolved, bare] {
@@ -1854,26 +1815,87 @@ mod captured_env_tests {
     }
 
     #[test]
-    fn codex_env_remove_strips_captured_values_on_npx_fallback() {
-        // The #555 hatch runs after the captured-env merge: even a captured
-        // login-shell CODEX_PATH / CODEX_CONFIG must be removed from the
-        // daemon-managed npx fallback spawn.
+    fn codex_subagent_policy_overrides_captured_and_extra_env_on_npx() {
+        // The daemon policy runs after every env merge, replacing arbitrary
+        // CODEX_CONFIG and keeping CODEX_PATH removed (#555).
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
-        let mut captured = BTreeMap::new();
-        captured.insert("CODEX_PATH".to_string(), "/tmp/evil".to_string());
-        captured.insert("CODEX_CONFIG".to_string(), "/tmp/evil.toml".to_string());
-        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
-        for key in ["CODEX_PATH", "CODEX_CONFIG"] {
+        opts.npx_fallback_package = provider.npx_only_package;
+        let unrelated = absent_var_name();
+        for source in ["captured", "extra", "both"] {
+            let mut captured = BTreeMap::new();
+            opts.extra_env.clear();
+            for (key, value) in [
+                ("CODEX_PATH", "/untrusted/codex"),
+                (
+                    "CODEX_CONFIG",
+                    r#"{"agents":{"enabled":true},"features":{"multi_agent_v2":true},"model":"untrusted"}"#,
+                ),
+                (unrelated.as_str(), "preserved"),
+            ] {
+                if source != "extra" {
+                    captured.insert(key.to_string(), value.to_string());
+                }
+                if source != "captured" {
+                    opts.extra_env.insert(key.to_string(), value.to_string());
+                }
+            }
+            let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
             assert!(
                 cmd.as_std()
                     .get_envs()
-                    .any(|(k, v)| k == key && v.is_none()),
-                "{key} must be env_remove'd from the npx-fallback codex spawn even when captured"
+                    .any(|(k, v)| k == "CODEX_PATH" && v.is_none()),
+                "CODEX_PATH must stay removed for {source} env"
             );
+            let config = env_value(&cmd, "CODEX_CONFIG")
+                .expect("pinned adapter must set the daemon-owned subagent policy");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&config).unwrap(),
+                serde_json::json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}),
+                "policy must win over {source} env"
+            );
+            assert_eq!(env_value(&cmd, &unrelated).as_deref(), Some("preserved"));
+        }
+    }
+
+    #[test]
+    fn codex_policy_preserves_env_precedence_for_other_providers() {
+        let binary = PathBuf::from("/custom/provider");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        for id in ["claude-code", "auggie", "opencode", "droid"] {
+            let provider = intent_providers::find_provider(id).unwrap();
+            let mut opts = SpawnOptions::new(provider);
+            if id == "claude-code" {
+                opts.npx_fallback_binary = Some(&npx_path);
+                opts.npx_fallback_package = provider.npx_only_package;
+            } else {
+                opts.provider_binary = Some(&binary);
+            }
+            let captured = BTreeMap::from([
+                ("CODEX_PATH".to_string(), "/captured/codex".to_string()),
+                ("CODEX_CONFIG".to_string(), "captured-config".to_string()),
+            ]);
+            let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
+            for (key, value) in &captured {
+                if std::env::var_os(key).is_some() {
+                    assert!(
+                        !cmd.as_std().get_envs().any(|(k, _)| k == key.as_str()),
+                        "{id} must inherit {key} when present in the daemon env"
+                    );
+                } else {
+                    assert_eq!(env_value(&cmd, key).as_deref(), Some(value.as_str()));
+                }
+            }
+            opts.extra_env = BTreeMap::from([
+                ("CODEX_PATH".to_string(), "/extra/codex".to_string()),
+                ("CODEX_CONFIG".to_string(), "extra-config".to_string()),
+            ]);
+            let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
+            for (key, value) in &opts.extra_env {
+                assert_eq!(env_value(&cmd, key).as_deref(), Some(value.as_str()));
+            }
         }
     }
 }

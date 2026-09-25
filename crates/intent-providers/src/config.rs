@@ -42,25 +42,41 @@ pub const NPX_MIN_NPM_VERSION: &str = "7.0.0";
 /// [`NPX_MIN_NPM_VERSION`].
 pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
 
-/// Pinned npx package spec for the codex ACP fallback. intentd is the only
-/// pin site (cloudlands-fe no longer pins a managed codex-acp version);
-/// bumping the version is a deliberate code change.
+/// Pinned npx package for every daemon-managed Codex launch. Native and
+/// arbitrary PATH adapters are not selected: their config contracts differ.
+/// intentd is the only managed pin site; updates are reviewed code changes.
+/// This adapter ignores `-c` argv and applies `CODEX_CONFIG` JSON on each
+/// thread start/resume. Its Codex dependency permits patch releases;
+/// verify actual runtime versions and policy precedence when updating the pin.
 pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.13.1";
 
+/// Daemon-owned Codex subagent denial shared by persistent agents, model
+/// probes, and one-shot launches. V2 feature enabling takes precedence over
+/// `agents.enabled` in this runtime, so both settings must be false. Set this
+/// after all environment merges and remove `CODEX_PATH` so the adapter uses
+/// its own compatible Codex dependency. Do not merge user `CODEX_CONFIG`.
+pub const CODEX_SUBAGENT_POLICY_CONFIG: &str =
+    r#"{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}"#;
+
+/// Actionable prerequisite failure shared by all Codex launch entrypoints.
+pub const CODEX_ACP_PREREQUISITE_ERROR: &str =
+    "Codex requires Node.js with npx to run the pinned codex-acp adapter. \
+     Install Node.js (with npm) on the daemon host and try again.";
+
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
-/// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
-/// bumping the version is a deliberate code change. Also feeds the pi
-/// model-catalog probe in `intent-services::provider_models`.
-pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.33";
+/// `npx -y`). This is the only production pin; bumping the version is a
+/// deliberate code change. Also feeds the pi model-catalog probe in
+/// `intent-services::provider_models`.
+pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.34";
 
 /// Minimum `pi` CLI version the pinned [`PI_ACP_NPX_PACKAGE`] adapter
-/// requires. Feeds the pure version-gate decision in
-/// [`crate::version_gate`]; re-check when bumping the pin.
-pub const PI_CLI_MIN_VERSION: &str = "0.80.4";
+/// requires for model-specific `get_available_thinking_levels`. Feeds the pure
+/// version-gate decision in [`crate::version_gate`]; re-check when bumping the pin.
+pub const PI_CLI_MIN_VERSION: &str = "0.81.0";
 
 /// Pi CLI version requirement for user-facing messages. Must match
 /// [`PI_CLI_MIN_VERSION`]; re-check when bumping the pin.
-pub const PI_CLI_REQUIREMENT: &str = "Pi CLI 0.80.4+";
+pub const PI_CLI_REQUIREMENT: &str = "Pi CLI 0.81.0+";
 
 /// Minimum `auggie` CLI version the ACP agent-spawn path requires. The daemon
 /// launches auggie with `--acp --allow-indexing --model … --remove-tool …`;
@@ -424,11 +440,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
-        // Declared Native (the `empty()` default) for the Rust `codex-acp`
-        // binary: no V8 heap-cap env on that path. The npx fallback
-        // (`@agentclientprotocol/codex-acp`, pure Node) is detected at spawn
-        // time and DOES get the NODE_OPTIONS heap cap
-        // (`build_provider_env_for_spawn`, intent-hq/monorepo#1661).
+        // The selected adapter runs on Node, including when a native or JS
+        // codex-acp is installed. Custom paths cannot bypass the pinned policy.
+        runtime: ProviderRuntime::Node,
         can_be_disabled: true,
         // The pinned @agentclientprotocol/codex-acp adapter (1.9.0) ignores
         // `_meta.developerInstructions` (verified empirically, #479; still
@@ -440,7 +454,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // session config (`build_session_config`), so the workspace bridge
         // rides the ACP request rather than `-c mcp_servers.*` overrides.
         supports_session_mcp_servers: true,
-        // The npx fallback adapter ignores `-c model=…` argv overrides (its
+        // The pinned adapter ignores `-c model=…` argv overrides (its
         // CLI parses no config flags), and its `session/set_model` handler
         // (1.1.14) is unusable for our ids — `ModelId.fromString` accepts
         // only `{base}[{effort}]` with the effort REQUIRED, rejecting both
@@ -451,9 +465,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // current/default reasoning effort when the model changes. A
         // `{base}/{effort}` suffix is stripped daemon-side before sending
         // (`config_option_model_target`); the effort itself rides the
-        // generic `thought_level` option (`reasoning_effort`). The `-c`
-        // args (`apply_codex_config_args`) are kept for the native Rust
-        // codex-acp binary path, which does consume them.
+        // generic `thought_level` option (`reasoning_effort`).
         supports_config_option_model: true,
         config_option_model_strips_effort: true,
         auth_check_args: Some(&["login", "status"]),
@@ -464,7 +476,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // the claude-code hint above).
         login_command_hint: Some("codex login"),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
-        fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),
+        npx_only_package: Some(CODEX_ACP_NPX_PACKAGE),
         short_name: "Codex",
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },
@@ -526,7 +538,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         runtime: ProviderRuntime::Node,
         can_be_disabled: true,
-        // pi-acp (0.0.33) has no `_meta` system-prompt path and no rules/MCP
+        // pi-acp (0.0.34) has no `_meta` system-prompt path and no rules/MCP
         // CLI flags (it advertises `mcpCapabilities: { http: false, sse:
         // false }` and does not wire `session/new` `mcpServers` into the pi
         // process), so the assembled prompt is prepended on the first turn.
@@ -539,7 +551,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // The adapter's `session/new` result advertises the model as a
         // `configOptions[id="model"]` select; the stored model is applied
         // post-session via `session/set_config_option` (verified against
-        // pi-acp@0.0.33's `setSessionConfigOption`; no CLI model flag).
+        // pi-acp@0.0.34's `setSessionConfigOption`; no CLI model flag).
         supports_config_option_model: true,
         login_docs_url: Some("https://pi.dev/docs/latest/quickstart"),
         npx_only_package: Some(PI_ACP_NPX_PACKAGE),

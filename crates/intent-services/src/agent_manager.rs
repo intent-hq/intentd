@@ -35,7 +35,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use intent_acp::handshake::try_bypass_permissions_mode;
-use intent_acp::session::{ContentBlock, McpServer, SessionModeState, StopReason};
+use intent_acp::session::{
+    ContentBlock, McpServer, SessionConfigOption, SessionModeState, StopReason,
+};
 use intent_acp::{
     apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
     normalize_mcp_servers, normalize_spaced_bridge_command, serve_workspace_mcp_tcp,
@@ -64,7 +66,8 @@ use crate::agent_ops::{
     MAX_MESSAGE_ID_LEN,
 };
 use crate::agent_session::{
-    agent_actor, InterruptFlushOutcome, InterruptReason, InterruptedBy, ThoughtLevelOption,
+    agent_actor, discover_thought_level, AcpSessionOpened, InterruptFlushOutcome, InterruptReason,
+    InterruptedBy, ThoughtLevelOption,
 };
 use crate::events::EventBus;
 use crate::Services;
@@ -3760,7 +3763,7 @@ impl AgentManager {
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.
-        let stored_id = session_record.acp_session_id;
+        let stored_id = session_record.acp_session_id.clone();
 
         // Forced recreate (`agent.editAndRegenerate`): the transcript was
         // truncated, so resuming the provider session would retain the
@@ -3810,19 +3813,20 @@ impl AgentManager {
                     opened.modes.as_ref(),
                 )
                 .await;
-                self.maybe_apply_session_model(
-                    conn.as_ref(),
-                    agent_id,
-                    provider,
-                    &opened.session_id,
-                    stored_model.as_deref(),
-                )
-                .await?;
+                let model_response = self
+                    .maybe_apply_session_model(
+                        conn.as_ref(),
+                        agent_id,
+                        provider,
+                        &opened.session_id,
+                        stored_model.as_deref(),
+                    )
+                    .await?;
                 self.install_and_apply_thought_level(
                     conn.as_ref(),
-                    agent_id,
-                    &opened.session_id,
-                    opened.thought_level.clone(),
+                    &session_record,
+                    &opened,
+                    model_response,
                     stored_effort.as_deref(),
                 )
                 .await;
@@ -3851,14 +3855,15 @@ impl AgentManager {
                 .services
                 .prepare_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
                 .await?;
-            self.maybe_apply_session_model(
-                conn.as_ref(),
-                agent_id,
-                provider,
-                &prepared.response.session_id.0,
-                stored_model.as_deref(),
-            )
-            .await?;
+            let model_response = self
+                .maybe_apply_session_model(
+                    conn.as_ref(),
+                    agent_id,
+                    provider,
+                    &prepared.response.session_id.0,
+                    stored_model.as_deref(),
+                )
+                .await?;
             let opened = self
                 .services
                 .commit_antigravity_acp_session(prepared, stored_id.as_deref())
@@ -3870,9 +3875,9 @@ impl AgentManager {
             self.arm_first_turn_prepend(agent_id, provider);
             self.install_and_apply_thought_level(
                 conn.as_ref(),
-                agent_id,
-                &opened.session_id,
-                opened.thought_level.clone(),
+                &session_record,
+                &opened,
+                model_response,
                 stored_effort.as_deref(),
             )
             .await;
@@ -3907,19 +3912,20 @@ impl AgentManager {
                 opened.modes.as_ref(),
             )
             .await;
-            self.maybe_apply_session_model(
-                conn.as_ref(),
-                agent_id,
-                provider,
-                &opened.session_id,
-                stored_model.as_deref(),
-            )
-            .await?;
+            let model_response = self
+                .maybe_apply_session_model(
+                    conn.as_ref(),
+                    agent_id,
+                    provider,
+                    &opened.session_id,
+                    stored_model.as_deref(),
+                )
+                .await?;
             self.install_and_apply_thought_level(
                 conn.as_ref(),
-                agent_id,
-                &opened.session_id,
-                opened.thought_level.clone(),
+                &session_record,
+                &opened,
+                model_response,
                 stored_effort.as_deref(),
             )
             .await;
@@ -3940,48 +3946,60 @@ impl AgentManager {
             opened.modes.as_ref(),
         )
         .await;
-        self.maybe_apply_session_model(
-            conn.as_ref(),
-            agent_id,
-            provider,
-            &opened.session_id,
-            stored_model.as_deref(),
-        )
-        .await?;
+        let model_response = self
+            .maybe_apply_session_model(
+                conn.as_ref(),
+                agent_id,
+                provider,
+                &opened.session_id,
+                stored_model.as_deref(),
+            )
+            .await?;
         self.install_and_apply_thought_level(
             conn.as_ref(),
-            agent_id,
-            &opened.session_id,
-            opened.thought_level.clone(),
+            &session_record,
+            &opened,
+            model_response,
             stored_effort.as_deref(),
         )
         .await;
         Ok(opened.session_id)
     }
 
-    /// Record the `thought_level` selector a freshly opened/resumed session
-    /// advertised on the live handle and apply the session's stored
-    /// `reasoningEffort` through it (PROTOCOL §5.5). Generic by construction:
-    /// the config id comes from the adapter's own `configOptions`
-    /// (claude-agent-acp `effort`, codex-acp `reasoning_effort`), so no
-    /// provider capability flag is needed and a provider that advertises no
-    /// such option silently ignores the field. The selector's surfaced levels
-    /// are persisted inside the open/recreate/resume fns themselves — where
-    /// the CAS outcome is known, so a lost CAS never clears them (see
-    /// [`Services::persist_session_effort_levels`]). Best-effort — a
-    /// rejected call is logged and never fails session startup.
+    /// Install the selector for the effective model before applying saved
+    /// effort. A successful model change can replace the opening selector
+    /// (Pi may open with only `off`, then offer reasoning levels). Missing
+    /// or malformed config options preserve the opening selector for older
+    /// adapters. An explicit list without `thought_level` clears it.
+    /// Opening levels are persisted by open/resume/recreate with their CAS
+    /// guard; refreshed levels come from a subsequent response for the
+    /// canonical session, never from a losing session/new candidate.
     async fn install_and_apply_thought_level(
         &self,
         conn: &Connection,
-        agent_id: &AgentId,
-        acp_session_id: &str,
-        thought_level: Option<ThoughtLevelOption>,
+        session_record: &AgentSession,
+        opened: &AcpSessionOpened,
+        model_response: Option<Value>,
         stored_effort: Option<&str>,
     ) {
-        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+        let mut thought_level = opened.thought_level.clone();
+        if let Some(options) = model_response
+            .and_then(|mut response| response.get_mut("configOptions").map(Value::take))
+            .and_then(|options| serde_json::from_value::<Vec<SessionConfigOption>>(options).ok())
+        {
+            thought_level = discover_thought_level(Some(&options));
+            self.services
+                .persist_session_effort_levels(
+                    &session_record.workspace_id,
+                    &session_record.id,
+                    thought_level.as_ref(),
+                )
+                .await;
+        }
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
             handle.thought_level = thought_level;
         }
-        self.apply_thought_level(conn, agent_id, acp_session_id, stored_effort)
+        self.apply_thought_level(conn, &session_record.id, &opened.session_id, stored_effort)
             .await;
     }
 
@@ -4074,7 +4092,7 @@ impl AgentManager {
     /// `session/set_config_option { configId: "model" }` for providers that
     /// expose the model as a session config option
     /// (`supports_config_option_model`; claude-code, pi, and codex today —
-    /// codex's npx-fallback adapter ignores `-c model=…` argv overrides and
+    /// codex's pinned npx adapter ignores `-c model=…` argv overrides and
     /// its `session/set_model` handler rejects our id formats, but it
     /// advertises a bare-id `configOptions[id="model"]` select). Compound ids
     /// are honored only when their provider prefix matches the running
@@ -4084,6 +4102,8 @@ impl AgentManager {
     /// the child so a retry cannot reuse its default model. Antigravity
     /// requires default permission mode and exact model confirmation,
     /// including after cold load. Other providers retain best-effort behavior.
+    /// Retain the config-option response so thinking choices can follow the
+    /// selected model before applying the stored reasoning effort.
     async fn maybe_apply_session_model(
         &self,
         conn: &Connection,
@@ -4091,7 +4111,7 @@ impl AgentManager {
         provider: &ProviderConfig,
         acp_session_id: &str,
         stored_model: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<Value>> {
         if provider.id == "antigravity" {
             intent_acp::handshake::set_session_mode(conn, acp_session_id, "default")
                 .await
@@ -4106,7 +4126,7 @@ impl AgentManager {
             let raw = stored_model.unwrap_or_default();
             let bare = raw.strip_prefix("antigravity:").unwrap_or(raw);
             if bare.is_empty() || bare.eq_ignore_ascii_case("default") {
-                return Ok(());
+                return Ok(None);
             }
             let model = Self::provider_local_model_target(provider, stored_model).ok_or_else(|| {
                 Error::InvalidInput("Invalid Antigravity model ID. Refresh models and select an available Antigravity model.".into())
@@ -4129,7 +4149,7 @@ impl AgentManager {
                     "Antigravity did not confirm model {model}; no prompt was sent. Refresh models and retry."
                 )));
             }
-            return Ok(());
+            return Ok(Some(result));
         }
         if let Some(model_id) = Self::set_model_target(provider, stored_model) {
             match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
@@ -4153,7 +4173,7 @@ impl AgentManager {
             }
         }
         if let Some(model_id) = Self::config_option_model_target(provider, stored_model) {
-            match intent_acp::session::set_session_config_option(
+            match intent_acp::session::set_session_config_option_response(
                 conn,
                 acp_session_id,
                 "model",
@@ -4161,13 +4181,14 @@ impl AgentManager {
             )
             .await
             {
-                Ok(()) => {
+                Ok(response) => {
                     tracing::debug!(
                         provider = provider.id,
                         session_id = acp_session_id,
                         model = %model_id,
                         "session/set_config_option accepted"
                     );
+                    return Ok(Some(response));
                 }
                 Err(e) => {
                     // Codex is the only production provider with this
@@ -4199,7 +4220,7 @@ impl AgentManager {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Resolve the model id `maybe_apply_session_model` should send via
@@ -8874,7 +8895,7 @@ impl AgentManager {
             resolved.provider_binary = Some(selected);
         }
         // npx version gate (intent-hq/intent#5725): before a fresh child spawns
-        // through npx (npx-only providers and the codex npx fallback), reject
+        // through npx (npx-only providers and optional npx fallbacks), reject
         // an npm-6 npx with an actionable error instead of three doomed
         // `npx -y` attempts. Only for a fresh spawn — a reused live child
         // never re-runs npx, so a later stale or hanging probe must not fail
@@ -8882,11 +8903,7 @@ impl AgentManager {
         // (blocking subprocess, ≤3s on a cache miss).
         if let Some(npx) = resolved.npx_fallback_binary.clone() {
             if !self.contains(agent_id) {
-                tokio::task::spawn_blocking(move || {
-                    guard_npx_version(&npx, intent_providers::find_node().as_deref())
-                })
-                .await
-                .map_err(|e| Error::Internal(format!("npx version probe task failed: {e}")))??;
+                crate::npx_cli::check_npx_version(&npx).await?;
             }
         }
         // unsloth spawn gate (spec "Proposed design" §4): before the child
@@ -10449,7 +10466,9 @@ fn resolve_spawn(
         };
         return Ok(ResolvedSpawn {
             provider,
-            model: None,
+            // Config-option E2E providers must track the selected model so
+            // live switches exercise the same respawn path as real providers.
+            model: if config_option_model { model } else { None },
             reasoning_effort: None,
             cwd,
             provider_binary: None,
@@ -10477,13 +10496,13 @@ fn resolve_spawn(
     // never starts the managed server.
     let unsloth_endpoint = None;
 
-    // npx-only providers (claude-code, pi) are spawned via
+    // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
     // skipped entirely. For providers that opt in
     // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
     // override (absolute, executable) is the one exception: it is exec'd
     // directly in place of the pinned npx spawn (monorepo#4352); an invalid
-    // override — or any override for pi — is ignored.
+    // override — or any override for codex/pi — is ignored.
     if provider.npx_only_package.is_some() {
         let explicit_path = read_provider_path_setting(settings, &provider_id);
         if let Some(binary) =
@@ -10506,7 +10525,12 @@ fn resolve_spawn(
                 unsloth_endpoint,
             });
         }
-        let (npx_binary, npx_package) = resolve_npx_only(&provider, intent_providers::find_npx())?;
+        let npx = if provider.id == "codex" {
+            intent_providers::find_codex_npx()
+        } else {
+            intent_providers::find_npx()
+        };
+        let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
         return Ok(ResolvedSpawn {
             provider,
             model,
@@ -10529,33 +10553,21 @@ fn resolve_spawn(
     // managed-server lifecycle (`ensure_started`'s unsloth spawn gate).
     let binary_provider_id = provider.primary_binary_provider_id();
     let explicit_path = read_provider_path_setting(settings, binary_provider_id);
-    let provider_binary = intent_providers::find_provider_binary(
-        binary_provider_id,
-        provider.command,
-        explicit_path.as_deref(),
-    );
-
-    // When the provider binary is not found but the provider has a fallback npx
-    // package, resolve npx itself and record the fallback decision
-    let (npx_fallback_binary, npx_fallback_package) = if provider_binary.is_none() {
-        if let Some(pkg) = provider.fallback_npx_package {
-            if let Some(npx_path) = intent_providers::find_npx() {
-                tracing::info!(
-                    provider_id = provider_id,
-                    npx_path = ?npx_path,
-                    package = pkg,
-                    "provider binary not found; falling back to npx"
-                );
-                (Some(npx_path), Some(pkg))
-            } else {
-                (None, None)
+    let (provider_binary, npx_fallback_binary, npx_fallback_package) =
+        match intent_providers::discover::resolve_fallback_launch(
+            &provider,
+            explicit_path.as_deref(),
+        ) {
+            intent_providers::discover::ProviderLaunch::Local(binary) => {
+                (Some(binary.path), None, None)
             }
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
+            intent_providers::discover::ProviderLaunch::Managed { npx, package } => {
+                tracing::info!(provider_id, npx_path = ?npx, package,
+                    "provider binary not found; falling back to npx");
+                (None, Some(npx), Some(package))
+            }
+            intent_providers::discover::ProviderLaunch::Bare { .. } => (None, None, None),
+        };
 
     Ok(ResolvedSpawn {
         provider,
@@ -10573,7 +10585,7 @@ fn resolve_spawn(
 /// Resolve the npx spawn inputs for an npx-only provider. `npx_path` is the
 /// caller-supplied `find_npx()` result (parameterized as a test seam). Missing
 /// npx is a hard, user-facing error — there is no local-binary fallback. A
-/// stale npm-6 npx is rejected later, by [`guard_npx_version`] in
+/// stale npm-6 npx is rejected later, by [`crate::npx_cli::check_npx_version`] in
 /// `ensure_started`, only when a fresh child is about to spawn.
 fn resolve_npx_only(
     provider: &ProviderConfig,
@@ -10589,6 +10601,9 @@ fn resolve_npx_only(
         // InvalidInput (not Internal): this is an environment misconfiguration,
         // and its Display survives the JSON-RPC envelope (`domain_to_rpc` masks
         // Internal messages behind a literal "Internal error").
+        if provider.id == "codex" {
+            return Error::InvalidInput(intent_providers::CODEX_ACP_PREREQUISITE_ERROR.to_string());
+        }
         Error::InvalidInput(format!(
             "npx not found — {} is required to run {}. Install Node.js (which provides npx) and try again.",
             intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT,
@@ -10604,151 +10619,11 @@ fn resolve_npx_only(
     Ok((npx, pkg))
 }
 
-/// Spawn-time npx version guard (intent-hq/intent#5725): reject an `npx`
-/// whose npm is older than [`intent_providers::NPX_MIN_NPM_VERSION`] with a
-/// user-facing `InvalidInput` naming the stale npx, the detected `node`, and
-/// the remedy — npm 6's npx rejects `npx -y <pkg>` outright, so the spawn
-/// would otherwise retry three times and surface only "agent stdout closed".
-/// Permissive when the probe fails or its output does not parse (same policy
-/// as the pi/auggie gates). Runs from `ensure_started` for every fresh
-/// npx-backed spawn (npx-only providers and the codex npx fallback); blocking
-/// (subprocess), so callers run it off the runtime.
-fn guard_npx_version(npx: &Path, node: Option<&Path>) -> Result<()> {
-    let gate = intent_providers::npx_gate(&probe_npx_version_cached(npx));
-    match intent_providers::stale_npx_reason(&gate, npx, node) {
-        Some(reason) => {
-            tracing::warn!(
-                npx_path = ?npx,
-                node_path = ?node,
-                gate = ?gate,
-                "rejecting stale npx before spawn"
-            );
-            Err(Error::InvalidInput(reason))
-        }
-        None => Ok(()),
-    }
-}
-
-/// How long a memoized `npx --version` verdict stays valid without a
-/// re-probe. A replacement that preserves every fingerprint field is
-/// re-checked after this at the latest, so a repaired installation is never
-/// rejected for the rest of the daemon's lifetime.
-const NPX_PROBE_TTL: Duration = Duration::from_secs(5 * 60);
-
-/// Identity of the file behind an npx path, for cache invalidation: the
-/// symlink target (a repointed `/usr/local/bin/npx` changes it even when the
-/// new target carries the same metadata — published npm 6/7/11 archives all
-/// stamp `npx-cli.js` with the same mtime), size, mtime, and on Unix the
-/// device + inode. `None` when the path cannot be read.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct NpxFingerprint {
-    target: PathBuf,
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    dev_ino: (u64, u64),
-}
-
-fn npx_fingerprint(npx: &Path) -> Option<NpxFingerprint> {
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(npx).ok()?;
-    Some(NpxFingerprint {
-        target: std::fs::canonicalize(npx).unwrap_or_else(|_| npx.to_path_buf()),
-        len: meta.len(),
-        modified: meta.modified().ok(),
-        #[cfg(unix)]
-        dev_ino: (meta.dev(), meta.ino()),
-    })
-}
-
-/// `npx --version` probe result memoized per npx path, keyed on the file's
-/// [`NpxFingerprint`] and bounded by [`NPX_PROBE_TTL`], so the guard costs
-/// one short subprocess per distinct npx binary per TTL window and a
-/// repointed/upgraded npx is re-probed. A failed probe is cached too — that
-/// outcome is permissive, so caching it only preserves the pre-guard
-/// behaviour.
-fn probe_npx_version_cached(npx: &Path) -> intent_providers::PiCliProbe {
-    use intent_providers::PiCliProbe;
-    struct CachedProbe {
-        fingerprint: Option<NpxFingerprint>,
-        probed_at: Instant,
-        probe: PiCliProbe,
-    }
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, CachedProbe>>> =
-        std::sync::OnceLock::new();
-    let fingerprint = npx_fingerprint(npx);
-    let cache = CACHE.get_or_init(Mutex::default);
-    if let Some(cached) = cache.lock().unwrap().get(npx) {
-        if cached.fingerprint == fingerprint && cached.probed_at.elapsed() < NPX_PROBE_TTL {
-            return cached.probe.clone();
-        }
-    }
-    let probe = run_npx_version_probe(npx).map_or(PiCliProbe::Failed, PiCliProbe::Output);
-    cache.lock().unwrap().insert(
-        npx.to_path_buf(),
-        CachedProbe {
-            fingerprint,
-            probed_at: Instant::now(),
-            probe: probe.clone(),
-        },
-    );
-    probe
-}
-
-/// Run `<npx> --version` with a 3s budget and return the trimmed first
-/// stdout line, or `None` on spawn failure, nonzero exit, timeout, or empty
-/// output (same shape as the `auggie_cli` / `pi_cli` probes). Probes with
-/// the same enhanced PATH the real spawn uses so npx's `#!/usr/bin/env node`
-/// shebang resolves the sibling `node`.
-fn run_npx_version_probe(npx: &Path) -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new(npx)
-        .arg("--version")
-        .env("PATH", intent_providers::enhanced_path(Some(npx)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let timeout = Duration::from_secs(3);
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let mut output = Vec::new();
-                child.stdout.take()?.read_to_end(&mut output).ok()?;
-                let stdout = String::from_utf8_lossy(&output);
-                let first_line = stdout.lines().next()?.trim();
-                if first_line.is_empty() {
-                    return None;
-                }
-                return Some(first_line.to_string());
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return None,
-        }
-    }
-}
-
 /// Rebuild the caller's [`SpawnOptions`] for `create_agent`, injecting the
 /// generated rules/MCP config paths while preserving every other field of the
 /// incoming opts. Notably the npx fallback pair must survive: dropping it
 /// makes `build_command` fall back to the bare provider command and fail with
-/// ENOENT when no local provider binary exists (codex fallback / claude-code
+/// ENOENT when no local provider binary exists (codex / claude-code
 /// npx-only spawns).
 fn rebuild_spawn_opts<'a>(
     opts: &SpawnOptions<'a>,
@@ -15865,7 +15740,7 @@ mod role_reminder_tests {
             None
         );
 
-        // Codex opted into the config-option path (its npx-fallback adapter
+        // Codex opted into the config-option path (its pinned npx adapter
         // ignores `-c model=…` argv overrides, and its `session/set_model`
         // handler rejects both bare and `{base}/{effort}` ids). The
         // adapter's model select values are bare base ids, so a
@@ -17530,6 +17405,108 @@ mod thought_level_tests {
         }
     }
 
+    #[tokio::test]
+    async fn absent_or_malformed_model_options_preserve_the_opening_selector() {
+        for response in [
+            None,
+            Some(json!({})),
+            Some(json!({"configOptions": null})),
+            Some(json!({"configOptions": [{"id": "model", "currentValue": "selected"}]})),
+        ] {
+            let (mgr, agent_id, conn, calls, _db, _task) = setup(None).await;
+            let record = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            let opened = AcpSessionOpened {
+                session_id: "sid-1".into(),
+                modes: None,
+                thought_level: Some(option("medium")),
+            };
+            mgr.services
+                .persist_session_effort_levels(
+                    &record.workspace_id,
+                    &agent_id,
+                    opened.thought_level.as_ref(),
+                )
+                .await;
+            mgr.install_and_apply_thought_level(
+                conn.as_ref(),
+                &record,
+                &opened,
+                response,
+                Some("high"),
+            )
+            .await;
+            assert_eq!(calls.lock().unwrap()[0]["value"], "high");
+            let stored = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            assert_eq!(stored.effort_levels, Some(option("medium").values));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_model_options_without_thought_level_clear_stale_choices() {
+        for options in [
+            json!([]),
+            json!([{
+                "id": "model", "name": "Model", "type": "select", "category": "model",
+                "currentValue": "plain", "options": [{"value": "plain", "name": "Plain"}],
+            }]),
+        ] {
+            let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+            let record = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            let opened = AcpSessionOpened {
+                session_id: "sid-1".into(),
+                modes: None,
+                thought_level: Some(option("medium")),
+            };
+            mgr.services
+                .persist_session_effort_levels(
+                    &record.workspace_id,
+                    &agent_id,
+                    opened.thought_level.as_ref(),
+                )
+                .await;
+            mgr.install_and_apply_thought_level(
+                conn.as_ref(),
+                &record,
+                &opened,
+                Some(json!({"configOptions": options})),
+                Some("high"),
+            )
+            .await;
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "unsupported effort must not be sent"
+            );
+            assert!(mgr.handles.lock().unwrap()[&agent_id]
+                .thought_level
+                .is_none());
+            let stored = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            assert!(
+                stored.effort_levels.is_none(),
+                "stale UI choices must be cleared"
+            );
+        }
+    }
+
     /// The stored effort is sent under the adapter's own config id, and the
     /// handle's tracked current value follows so a repeat is a no-op.
     #[tokio::test]
@@ -17653,10 +17630,22 @@ mod thought_level_tests {
 mod rebuild_spawn_opts_tests {
     //! Regression tests for the `create_agent` [`SpawnOptions`] reconstruction:
     //! it must preserve the npx fallback pair, otherwise providers without a
-    //! local binary (codex fallback / claude-code npx-only) spawn the bare
+    //! local binary (codex / claude-code npx-only) spawn the bare
     //! provider command and fail with ENOENT.
 
     use super::*;
+
+    #[test]
+    fn codex_npx_prerequisite_error_is_actionable() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let error = resolve_npx_only(provider, None).unwrap_err();
+        let Error::InvalidInput(message) = error else {
+            panic!("missing Codex prerequisites must be user-visible: {error}");
+        };
+        for expected in ["Node.js", "npx", "Install"] {
+            assert!(message.contains(expected), "{message}");
+        }
+    }
 
     #[test]
     fn rebuild_preserves_npx_fallback_and_targets_npx() {
@@ -17664,11 +17653,11 @@ mod rebuild_spawn_opts_tests {
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         let mut opts = SpawnOptions::new(provider);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = provider.fallback_npx_package;
+        opts.npx_fallback_package = provider.npx_only_package;
 
         let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
         assert_eq!(rebuilt.npx_fallback_binary, Some(npx_path.as_path()));
-        assert_eq!(rebuilt.npx_fallback_package, provider.fallback_npx_package);
+        assert_eq!(rebuilt.npx_fallback_package, provider.npx_only_package);
 
         // Through build_command/build_args: the rebuilt opts must spawn npx
         // with `--workspaces=false -y <package>`, not the bare `codex-acp`
@@ -17680,9 +17669,7 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(args[1], "-y");
         assert_eq!(
             args[2],
-            provider
-                .fallback_npx_package
-                .expect("codex has npx fallback")
+            provider.npx_only_package.expect("codex is npx-only")
         );
     }
 
@@ -17950,7 +17937,7 @@ mod provider_path_override_tests {
     }
 
     #[test]
-    fn codex_spawn_normalizes_legacy_model_and_explicit_effort_before_cli_args() {
+    fn codex_spawn_normalizes_legacy_model_and_effort_for_session_config() {
         let dir = tempfile::tempdir().unwrap();
         let stub = exec_stub(dir.path(), "codex-acp");
         let settings = settings_with_paths(&[("codex", &stub)]);
@@ -17967,15 +17954,22 @@ mod provider_path_override_tests {
                 let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
                 assert_eq!(resolved.model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(resolved.reasoning_effort.as_deref(), Some(expected));
+                assert!(
+                    resolved.provider_binary.is_none(),
+                    "custom adapter cannot bypass npx"
+                );
+                assert_eq!(
+                    resolved.npx_fallback_package,
+                    Some(intent_providers::config::CODEX_ACP_NPX_PACKAGE)
+                );
                 let mut opts = SpawnOptions::new(&resolved.provider);
                 opts.model = resolved.model.as_deref();
                 opts.reasoning_effort = resolved.reasoning_effort.as_deref();
                 let args = intent_acp::spawn::build_args(&opts);
                 assert!(
-                    args.contains(&format!("model_reasoning_effort=\"{expected}\"")),
-                    "{args:?}"
+                    !args.iter().any(|arg| arg == "-c" || arg == "--config"),
+                    "model/effort use ACP config options: {args:?}"
                 );
-                assert!(args.contains(&"model=\"gpt-5.5\"".to_string()), "{args:?}");
             }
         }
     }

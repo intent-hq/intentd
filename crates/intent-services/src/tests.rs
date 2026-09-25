@@ -19439,7 +19439,7 @@ pub(crate) mod pr {
         // Gate open at the start, paused by the last forge read.
         let gate = svc.sweep_rate_limit.clone();
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
-            assert!(gate.pause_for(std::time::Duration::from_secs(3600)));
+            assert!(gate.pause_for(std::time::Duration::from_secs(3600), true));
         }));
         let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
         let until = svc
@@ -23359,7 +23359,7 @@ pub(crate) mod pr {
     /// workspace refresh pauses the forge work for every subsequent
     /// workspace in this and later sweeps (until the window resets), while
     /// the sweep itself keeps running its local, forge-free steps. A paused
-    /// tick spends exactly one quota-free probe on the early-lift check; a
+    /// tick spends exactly one shared quota probe on the early-lift check; a
     /// host without a `remaining` signal never lifts early.
     #[tokio::test]
     async fn pr_refresh_sweep_rate_limit_pauses_all_workspaces() {
@@ -23391,7 +23391,7 @@ pub(crate) mod pr {
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
 
         // The next tick is still inside the pause window: zero forge calls,
-        // one free probe for the early lift (no `remaining` → deadline kept).
+        // one probe for the early lift (no `remaining` → deadline kept).
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 2);
@@ -23399,8 +23399,7 @@ pub(crate) mod pr {
     }
 
     /// A paused PR-refresh tick whose probe reports the quota recovered
-    /// lifts the pause and refreshes in the SAME tick: the forge is called
-    /// again (here re-tripping the limit, which re-pauses — a fresh window).
+    /// lifts the pause and successfully refreshes in the SAME tick.
     #[tokio::test]
     async fn pr_refresh_sweep_lifts_the_pause_early_when_the_quota_recovered() {
         let tmp = TempDb::new();
@@ -23416,7 +23415,7 @@ pub(crate) mod pr {
         let sc = Arc::new(StubForge {
             rate_limited: true,
             rate_limit_reset: Some(u64::MAX / 2),
-            rate_limit_remaining: Some(5_000),
+            rate_limit_remaining: Some(0),
             rate_limit_limit: Some(5_000),
             ..Default::default()
         });
@@ -23425,21 +23424,27 @@ pub(crate) mod pr {
         svc.refresh_all_workspace_prs(0).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
-        let first_deadline = svc.sweep_rate_limit_paused_until().unwrap();
+        assert!(svc.sweeps_rate_limited(), "exhaustion opened the pause");
 
-        // Tick 1: the early-lift probe reports a full window → the gate
-        // lifts and the workspace is refreshed in this tick; its fetch trips
-        // the limit again, opening a NEW window (its own reset probe).
+        // Keep the service and its existing gate, but let the forge report
+        // a genuinely recovered window and successful PR reads on tick 1.
+        let recovered = Arc::new(StubForge {
+            rate_limit_remaining: Some(5_000),
+            rate_limit_limit: Some(5_000),
+            ..Default::default()
+        });
+        let svc = svc.with_source_control(recovered.clone());
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(
-            sc.seen_get_pr.lock().unwrap().len(),
-            2,
+            *recovered.seen_get_pr.lock().unwrap(),
+            vec![42],
             "the lifted tick refreshes instead of skipping"
         );
-        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 3);
-        assert!(
-            svc.sweep_rate_limit_paused_until().unwrap() >= first_deadline,
-            "the re-trip opened a fresh window"
+        assert_eq!(*recovered.seen_reset_probes.lock().unwrap(), 1);
+        assert!(!svc.sweeps_rate_limited(), "successful recovery stays open");
+        assert_eq!(
+            svc.store().get_workspace(&ws_id).await.unwrap().pr_status,
+            Some(intent_core::PullRequestStatus::Open)
         );
     }
 
@@ -44685,7 +44690,7 @@ mod provider_discovery_payload {
         let ok = PiCliStatus {
             command: "pi".into(),
             resolved_path: Some(std::path::PathBuf::from("/usr/local/bin/pi")),
-            version_output: Some("0.80.4".into()),
+            version_output: Some("0.81.0".into()),
             gate: PiCliGate::Ok,
         };
         let (obj, installed) = apply(&ok);
@@ -46749,6 +46754,7 @@ mod harness_versioning {
         // spot-check the defaults (all on, taskGraph included).
         assert_eq!(features["taskGraph"], true);
         assert_eq!(features["backgroundHooks"], true);
+        assert_eq!(features["peerAgents"], true);
 
         // Persisted, not projected: the row itself carries the stamp.
         let id = AgentId::from(agent["id"].as_str().unwrap());
@@ -46759,6 +46765,7 @@ mod harness_versioning {
         );
         let persisted = session.harness_features.expect("persisted snapshot");
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
+        assert_eq!(persisted["peerAgents"], serde_json::json!(true));
     }
 
     /// Delegation mints LATEST, never inherits: a child created by a parent
@@ -46845,6 +46852,57 @@ mod harness_versioning {
         assert_eq!(raw, None, "projection never writes the snapshot back");
     }
 
+    /// Snapshots captured before peerAgents existed keep that capability
+    /// unavailable on respawn, matching the unchanged read-only projection.
+    #[tokio::test]
+    async fn older_snapshot_without_peer_agents_keeps_feature_off() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let pinned = serde_json::json!({
+            "backgroundHooks": true,
+            "hostExec": false,
+            "scripts": true,
+            "terminalAccess": true,
+            "browserAutomation": true,
+            "richChatBlocks": true,
+            "structuredQuestions": true,
+            "attentionRequests": true,
+            "stateSnapshot": true,
+            "prMonitor": true,
+            "taskGraph": true
+        });
+        sqlx::query("UPDATE agent_session SET harness_features = ? WHERE id = ?")
+            .bind(pinned.to_string())
+            .bind(&id.0)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("persist older snapshot");
+
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let features = svc.session_agent_features(&session);
+        assert!(svc.effective_settings().agent_features.peer_agents);
+        assert!(
+            !features.peer_agents,
+            "respawn must not enable peerAgents absent from the captured snapshot"
+        );
+        assert!(!features.host_exec, "other captured values still win");
+
+        let lite = svc.project_lite_with_flags(session);
+        assert_eq!(
+            lite.harness_features.as_ref(),
+            Some(&pinned),
+            "agent.get keeps peerAgents absent for the read-only feature display"
+        );
+        let full = svc
+            .agent_get_session_op(id.clone())
+            .await
+            .expect("getSession");
+        assert_eq!(full.harness_features.as_ref(), Some(&pinned));
+        let stored = svc.store().get_agent_session(&id).await.expect("reread");
+        assert_eq!(stored.harness_features, Some(pinned));
+    }
+
     /// The runtime surface follows the persisted snapshot, not live settings:
     /// `session_agent_features` (the respawn read used for the MCP bridge and
     /// prompt assembly) decodes `harness_features` when present — so a
@@ -46857,12 +46915,13 @@ mod harness_versioning {
         let created = create_agent(&svc, &ws, None).await;
         let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-        // Pin the persisted snapshot to a non-default shape (hostExec off —
-        // live default is on).
+        // Pin the persisted snapshot to explicit opt-outs while the live
+        // defaults are on.
         let mut pinned =
             serde_json::to_value(intent_core::settings_file::AgentFeaturesSettings::default())
                 .unwrap();
         pinned["hostExec"] = serde_json::json!(false);
+        pinned["peerAgents"] = serde_json::json!(false);
         sqlx::query("UPDATE agent_session SET harness_features = ? WHERE id = ?")
             .bind(pinned.to_string())
             .bind(&id.0)
@@ -46877,9 +46936,14 @@ mod harness_versioning {
             "respawn read follows the persisted snapshot (hostExec off), not live settings"
         );
         assert!(
+            !features.peer_agents,
+            "respawn preserves a session's captured peerAgents opt-out"
+        );
+        assert!(
             svc.effective_settings().agent_features.host_exec,
             "live settings still default hostExec on — the snapshot diverged deliberately"
         );
+        assert!(svc.effective_settings().agent_features.peer_agents);
 
         // Legacy NULL-snapshot rows fall back to the live settings.
         sqlx::query("UPDATE agent_session SET harness_features = NULL WHERE id = ?")
