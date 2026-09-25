@@ -1263,16 +1263,18 @@ async fn peer_agents_default_creation_retirement_and_opt_out_over_wss() {
         .as_str()
         .expect("initialMessage persisted");
     assert!(
-        initial.starts_with("[You were spawned as an independent top-level agent by Sponsor A ("),
+        initial.starts_with(&format!(
+            "[You were spawned as an independent top-level agent by Sponsor A ({agent_a}) (your sponsor)."
+        )),
         "persisted kickoff must open with the sponsor preamble: {initial}"
     );
     assert!(
-        initial.ends_with("independent hello"),
+        initial.ends_with("\n\nindependent hello"),
         "caller message follows the preamble: {initial}"
     );
 
-    // The delivered kickoff row: same preamble text, daemon-stamped sender
-    // attribution (§5.5 `agent_message`).
+    // The delivered kickoff row: daemon-owned sender header followed by the
+    // persisted preamble and caller message, plus sender metadata (§5.5 `agent_message`).
     await_stream_end(&mut sub, &peer_id).await;
     let conv = wss_rpc(
         &mut rpc,
