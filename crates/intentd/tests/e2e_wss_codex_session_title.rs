@@ -271,7 +271,7 @@ fn gate(test: &str) -> Option<String> {
 /// `{ method, sessionId, pid, meta }` JSON line per `session/new` /
 /// `session/load` the child received (`MOCK_AGENT_SESSION_LOG` seam), with
 /// the request's `_meta` verbatim (null when absent).
-fn read_session_log(path: &Path) -> Vec<(String, Value)> {
+fn read_session_log(path: &Path) -> Vec<(String, Value, u32)> {
     let raw = std::fs::read_to_string(path).expect("read session log");
     raw.lines()
         .filter(|l| !l.trim().is_empty())
@@ -280,26 +280,11 @@ fn read_session_log(path: &Path) -> Vec<(String, Value)> {
             (
                 v["method"].as_str().expect("method").to_string(),
                 v["meta"].clone(),
+                u32::try_from(v["pid"].as_u64().expect("session process id"))
+                    .expect("pid fits in u32"),
             )
         })
         .collect()
-}
-
-/// Bounded poll: wait until the pid file has at least `n` lines.
-async fn await_pid_lines(path: &Path, n: usize) -> Vec<u32> {
-    for _ in 0..400 {
-        if let Ok(contents) = tokio::fs::read_to_string(path).await {
-            let pids: Vec<u32> = contents
-                .lines()
-                .filter_map(|l| l.trim().parse().ok())
-                .collect();
-            if pids.len() >= n {
-                return pids;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("pid file {} never reached {n} line(s)", path.display());
 }
 
 /// Bounded poll: wait until the daemon log contains `needle`.
@@ -333,8 +318,6 @@ async fn codex_session_new_carries_session_title_meta_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let toolchain = common::codex_runtime::install(&data_dir, &script);
-    let pid_file = data_dir.join("pids.txt");
-    let pid_file_s = pid_file.to_string_lossy().into_owned();
     let session_log = data_dir.join("sessions.txt");
     let session_log_s = session_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "CODEX_TITLE_E2E_REPLY" }).to_string();
@@ -346,7 +329,6 @@ async fn codex_session_new_carries_session_title_meta_over_wss() {
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("MOCK_AGENT_PID_FILE", &pid_file_s),
         ("MOCK_AGENT_SESSION_LOG", &session_log_s),
     ]);
     let child = spawn_serve(&data_dir, &env);
@@ -421,7 +403,7 @@ async fn codex_session_new_carries_session_title_meta_over_wss() {
 
     let log = read_session_log(&session_log);
     assert_eq!(log.len(), 1, "turn 1 opened exactly one session: {log:?}");
-    let (method, meta) = &log[0];
+    let (method, meta, first_pid) = &log[0];
     assert_eq!(method, "session/new", "turn 1 established via create");
     assert_eq!(
         *meta,
@@ -432,7 +414,6 @@ async fn codex_session_new_carries_session_title_meta_over_wss() {
     // SIGKILL the idle child out-of-band. The mock advertises
     // `loadSession: false`, so the next message hits the resume-impossible
     // recreate path: a fresh session/new on the respawned child.
-    let first_pid = await_pid_lines(&pid_file, 1).await[0];
     let killed = Command::new("kill")
         .args(["-9", &first_pid.to_string()])
         .status()
@@ -462,7 +443,8 @@ async fn codex_session_new_carries_session_title_meta_over_wss() {
         2,
         "turn 2 recreated exactly one more session: {log:?}"
     );
-    let (method2, meta2) = &log[1];
+    let (method2, meta2, second_pid) = &log[1];
+    assert_ne!(first_pid, second_pid, "recreate starts a new child process");
     assert_eq!(
         method2, "session/new",
         "recreate opens a fresh session/new (no session/load): {log:?}"

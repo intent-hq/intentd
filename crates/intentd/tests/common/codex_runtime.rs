@@ -12,7 +12,7 @@ pub fn install(data_dir: &Path, script: &str) -> Vec<(String, String)> {
     for (name, body) in [
         (
             "node",
-            "#!/bin/sh\nexec \"$MOCK_AGENT_NODE\" \"$MOCK_AGENT_SCRIPT_PATH\" \"$@\"\n",
+            "#!/bin/sh\ncase \"$1\" in\n*/codex-acp.mjs) exec \"$MOCK_AGENT_NODE\" \"$MOCK_AGENT_SCRIPT_PATH\" \"$@\";;\n*) exec \"$MOCK_AGENT_NODE\" \"$@\";;\nesac\n",
         ),
         ("codex", "#!/bin/sh\nexit 99\n"),
         ("npx", "#!/bin/sh\nexit 99\n"),
