@@ -19843,12 +19843,13 @@ async fn wss_workspace_import_lifecycle() {
 
     let srv = start(WsOptions::default()).await;
     srv.set_setting("providers.enabled", serde_json::json!({"auggie":false}));
+    // Import selects a provider but does not launch it; use a supported path override.
     srv.set_setting(
         "providers.paths",
-        serde_json::json!({"codex":std::env::current_exe().unwrap()}),
+        serde_json::json!({"claude-code":std::env::current_exe().unwrap()}),
     );
-    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    srv.set_setting("model.default", serde_json::json!("gpt-6-astra"));
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
+    srv.set_setting("model.default", serde_json::json!("claude-sonnet-4"));
     srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let ws_id = "ws-wss-imported";
     let t = "2026-08-11T00:00:00Z";
@@ -20007,8 +20008,8 @@ async fn wss_workspace_import_lifecycle() {
     assert_eq!(selected["jsonrpc"], "2.0");
     assert_eq!(selected["id"], 60);
     let session = &selected["result"]["session"];
-    assert_eq!(session["provider"], "codex", "{selected}");
-    assert_eq!(session["model"], "gpt-6-astra", "{selected}");
+    assert_eq!(session["provider"], "claude-code", "{selected}");
+    assert_eq!(session["model"], "claude-sonnet-4", "{selected}");
     assert_eq!(session["reasoningEffort"], "high", "{selected}");
     assert!(session["effortLevels"].is_null(), "{selected}");
     assert!(session["acpSessionId"].is_null(), "{selected}");
