@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.107] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Restore previously running auto-start services at boot ([#2102](https://github.com/intent-hq/intentd/pull/2102))
+- *(test)* Canonicalize npx isolation launch roots ([#5812](https://github.com/intent-hq/intentd/pull/5812)) ([#2101](https://github.com/intent-hq/intentd/pull/2101))
+- Disable Codex built-in subagents ([#2108](https://github.com/intent-hq/intentd/pull/2108))
+- Avoid false GitHub quota recovery ([#2110](https://github.com/intent-hq/intentd/pull/2110))
+- Preserve Windows Pi session paths with published adapter ([#2103](https://github.com/intent-hq/intentd/pull/2103))
+
+### 🧪 Testing
+
+- Generate transfer selection contract from public imports ([#2109](https://github.com/intent-hq/intentd/pull/2109))
+
+
 ## [0.9.106] - 2026-09-24
 
 ### 🐛 Bug Fixes
