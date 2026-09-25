@@ -520,19 +520,19 @@ impl SettingsRegistry {
         // an explicit null) so `#[serde(default)]` restores the schema default
         // for optional AND non-optional keys alike.
         let mut json = file_json(&inner.file)?;
+        let mut candidate = inner.clone();
         for (path, value) in changes {
             if value.is_null() {
                 json_remove(&mut json, path);
             } else {
                 json_set(&mut json, path, value.clone());
             }
-            typed_from_json(json.clone(), path)?;
+            candidate.file = typed_from_json(json.clone(), path)?;
         }
 
         // Keep every edit local until encoding, startup validation, snapshot
         // construction, and the disk write succeed. Otherwise a later apply
         // could accidentally commit part of this failed batch.
-        let mut candidate = inner.clone();
         for (path, value) in changes {
             doc_set(&mut candidate.doc, path, value)?;
         }
@@ -541,11 +541,13 @@ impl SettingsRegistry {
         // Boot migrations apply settings before stripping captured legacy
         // keys, so use the same legacy-aware entry point as startup. Every
         // other unknown key, type error, and semantic failure stays strict.
-        let (file, _) = SettingsFile::parse_str_with_legacy(&text).map_err(|e| match e {
+        // Validate without adopting read-time normalization (for example,
+        // dropping blank provider defaults). Keep the typed write values so
+        // service responses and repeated-write comparisons stay consistent.
+        SettingsFile::parse_str_with_legacy(&text).map_err(|e| match e {
             Error::InvalidInput(msg) => Error::InvalidParams(msg),
             other => other,
         })?;
-        candidate.file = file;
         let snapshot = Arc::new(build_snapshot(&candidate)?);
         atomic_write(&self.path, &text)?;
         candidate.record_write(&text);

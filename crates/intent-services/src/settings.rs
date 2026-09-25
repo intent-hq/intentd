@@ -2976,6 +2976,71 @@ mod tests {
     use super::*;
 
     #[intent_test_macros::daemon_test]
+    async fn provider_default_blanks_keep_write_responses_and_noops_consistent() {
+        use crate::events::SubscriptionFilter;
+        use intent_core::WorkspaceApi;
+
+        let dir = crate::test_support::test_tempdir("settings-provider-default-blanks");
+        let store = Store::open(&dir.path().join("settings.db")).await.unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
+        let bus = crate::EventBus::new(store.clone());
+        let services = crate::Services::new(store)
+            .with_settings_registry(registry.clone())
+            .with_event_bus(bus.clone());
+        let mut events = bus.subscribe(SubscriptionFilter {
+            event_types: vec![intent_core::events::SETTINGS_CHANGED.to_string()],
+            ..Default::default()
+        });
+        let changes = json!([{"path": "model.providerDefaults", "value": {"codex": ""}}]);
+        let applied = services.settings_update(changes.clone()).await.unwrap();
+        let got = services
+            .settings_get("model.providerDefaults".into())
+            .await
+            .unwrap();
+        assert_eq!(applied["applied"][0]["value"], got["value"]);
+        assert_eq!(applied["applied"][0]["origin"], got["origin"]);
+        assert_eq!(got["origin"], json!("file"));
+        assert_eq!(applied["revision"], got["revision"]);
+        let first_event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("initial write event")
+            .unwrap();
+        assert_eq!(first_event[0].data["changes"], applied["applied"]);
+        assert_eq!(first_event[0].data["revision"], got["revision"]);
+
+        let generation = registry.generation();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let repeated = services.settings_update(changes).await.unwrap();
+        assert_eq!(repeated["applied"], json!([]));
+        assert_eq!(repeated["revision"], applied["revision"]);
+        assert_eq!(registry.generation(), generation);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(
+            services
+                .settings_get("model.providerDefaults".into())
+                .await
+                .unwrap(),
+            got
+        );
+        SettingsRegistry::load(&path).expect("accepted blank entries remain startup-compatible");
+
+        // A subsequent real mutation is the event-ordering barrier: the
+        // repeated request must not have emitted a settings:changed event.
+        let next = services
+            .settings_update(json!([{"path": "git.autoCommit", "value": false}]))
+            .await
+            .unwrap();
+        let next_event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("next real mutation event")
+            .unwrap();
+        assert_eq!(next_event[0].data["changes"], next["applied"]);
+        assert_eq!(next_event[0].data["revision"], next["revision"]);
+    }
+
+    #[intent_test_macros::daemon_test]
     async fn config_write_failure_preserves_update_and_reset_state_and_events() {
         use crate::events::SubscriptionFilter;
         use intent_core::WorkspaceApi;
