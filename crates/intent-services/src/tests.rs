@@ -44690,7 +44690,7 @@ mod provider_discovery_payload {
         let ok = PiCliStatus {
             command: "pi".into(),
             resolved_path: Some(std::path::PathBuf::from("/usr/local/bin/pi")),
-            version_output: Some("0.80.4".into()),
+            version_output: Some("0.81.0".into()),
             gate: PiCliGate::Ok,
         };
         let (obj, installed) = apply(&ok);

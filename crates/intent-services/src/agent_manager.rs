@@ -35,7 +35,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use intent_acp::handshake::try_bypass_permissions_mode;
-use intent_acp::session::{ContentBlock, McpServer, SessionModeState, StopReason};
+use intent_acp::session::{
+    ContentBlock, McpServer, SessionConfigOption, SessionModeState, StopReason,
+};
 use intent_acp::{
     apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
     normalize_mcp_servers, normalize_spaced_bridge_command, serve_workspace_mcp_tcp,
@@ -64,7 +66,8 @@ use crate::agent_ops::{
     MAX_MESSAGE_ID_LEN,
 };
 use crate::agent_session::{
-    agent_actor, InterruptFlushOutcome, InterruptReason, InterruptedBy, ThoughtLevelOption,
+    agent_actor, discover_thought_level, AcpSessionOpened, InterruptFlushOutcome, InterruptReason,
+    InterruptedBy, ThoughtLevelOption,
 };
 use crate::events::EventBus;
 use crate::Services;
@@ -3760,7 +3763,7 @@ impl AgentManager {
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.
-        let stored_id = session_record.acp_session_id;
+        let stored_id = session_record.acp_session_id.clone();
 
         // Forced recreate (`agent.editAndRegenerate`): the transcript was
         // truncated, so resuming the provider session would retain the
@@ -3810,19 +3813,20 @@ impl AgentManager {
                     opened.modes.as_ref(),
                 )
                 .await;
-                self.maybe_apply_session_model(
-                    conn.as_ref(),
-                    agent_id,
-                    provider,
-                    &opened.session_id,
-                    stored_model.as_deref(),
-                )
-                .await?;
+                let model_response = self
+                    .maybe_apply_session_model(
+                        conn.as_ref(),
+                        agent_id,
+                        provider,
+                        &opened.session_id,
+                        stored_model.as_deref(),
+                    )
+                    .await?;
                 self.install_and_apply_thought_level(
                     conn.as_ref(),
-                    agent_id,
-                    &opened.session_id,
-                    opened.thought_level.clone(),
+                    &session_record,
+                    &opened,
+                    model_response,
                     stored_effort.as_deref(),
                 )
                 .await;
@@ -3851,14 +3855,15 @@ impl AgentManager {
                 .services
                 .prepare_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
                 .await?;
-            self.maybe_apply_session_model(
-                conn.as_ref(),
-                agent_id,
-                provider,
-                &prepared.response.session_id.0,
-                stored_model.as_deref(),
-            )
-            .await?;
+            let model_response = self
+                .maybe_apply_session_model(
+                    conn.as_ref(),
+                    agent_id,
+                    provider,
+                    &prepared.response.session_id.0,
+                    stored_model.as_deref(),
+                )
+                .await?;
             let opened = self
                 .services
                 .commit_antigravity_acp_session(prepared, stored_id.as_deref())
@@ -3870,9 +3875,9 @@ impl AgentManager {
             self.arm_first_turn_prepend(agent_id, provider);
             self.install_and_apply_thought_level(
                 conn.as_ref(),
-                agent_id,
-                &opened.session_id,
-                opened.thought_level.clone(),
+                &session_record,
+                &opened,
+                model_response,
                 stored_effort.as_deref(),
             )
             .await;
@@ -3907,19 +3912,20 @@ impl AgentManager {
                 opened.modes.as_ref(),
             )
             .await;
-            self.maybe_apply_session_model(
-                conn.as_ref(),
-                agent_id,
-                provider,
-                &opened.session_id,
-                stored_model.as_deref(),
-            )
-            .await?;
+            let model_response = self
+                .maybe_apply_session_model(
+                    conn.as_ref(),
+                    agent_id,
+                    provider,
+                    &opened.session_id,
+                    stored_model.as_deref(),
+                )
+                .await?;
             self.install_and_apply_thought_level(
                 conn.as_ref(),
-                agent_id,
-                &opened.session_id,
-                opened.thought_level.clone(),
+                &session_record,
+                &opened,
+                model_response,
                 stored_effort.as_deref(),
             )
             .await;
@@ -3940,48 +3946,60 @@ impl AgentManager {
             opened.modes.as_ref(),
         )
         .await;
-        self.maybe_apply_session_model(
-            conn.as_ref(),
-            agent_id,
-            provider,
-            &opened.session_id,
-            stored_model.as_deref(),
-        )
-        .await?;
+        let model_response = self
+            .maybe_apply_session_model(
+                conn.as_ref(),
+                agent_id,
+                provider,
+                &opened.session_id,
+                stored_model.as_deref(),
+            )
+            .await?;
         self.install_and_apply_thought_level(
             conn.as_ref(),
-            agent_id,
-            &opened.session_id,
-            opened.thought_level.clone(),
+            &session_record,
+            &opened,
+            model_response,
             stored_effort.as_deref(),
         )
         .await;
         Ok(opened.session_id)
     }
 
-    /// Record the `thought_level` selector a freshly opened/resumed session
-    /// advertised on the live handle and apply the session's stored
-    /// `reasoningEffort` through it (PROTOCOL §5.5). Generic by construction:
-    /// the config id comes from the adapter's own `configOptions`
-    /// (claude-agent-acp `effort`, codex-acp `reasoning_effort`), so no
-    /// provider capability flag is needed and a provider that advertises no
-    /// such option silently ignores the field. The selector's surfaced levels
-    /// are persisted inside the open/recreate/resume fns themselves — where
-    /// the CAS outcome is known, so a lost CAS never clears them (see
-    /// [`Services::persist_session_effort_levels`]). Best-effort — a
-    /// rejected call is logged and never fails session startup.
+    /// Install the selector for the effective model before applying saved
+    /// effort. A successful model change can replace the opening selector
+    /// (Pi may open with only `off`, then offer reasoning levels). Missing
+    /// or malformed config options preserve the opening selector for older
+    /// adapters. An explicit list without `thought_level` clears it.
+    /// Opening levels are persisted by open/resume/recreate with their CAS
+    /// guard; refreshed levels come from a subsequent response for the
+    /// canonical session, never from a losing session/new candidate.
     async fn install_and_apply_thought_level(
         &self,
         conn: &Connection,
-        agent_id: &AgentId,
-        acp_session_id: &str,
-        thought_level: Option<ThoughtLevelOption>,
+        session_record: &AgentSession,
+        opened: &AcpSessionOpened,
+        model_response: Option<Value>,
         stored_effort: Option<&str>,
     ) {
-        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+        let mut thought_level = opened.thought_level.clone();
+        if let Some(options) = model_response
+            .and_then(|mut response| response.get_mut("configOptions").map(Value::take))
+            .and_then(|options| serde_json::from_value::<Vec<SessionConfigOption>>(options).ok())
+        {
+            thought_level = discover_thought_level(Some(&options));
+            self.services
+                .persist_session_effort_levels(
+                    &session_record.workspace_id,
+                    &session_record.id,
+                    thought_level.as_ref(),
+                )
+                .await;
+        }
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
             handle.thought_level = thought_level;
         }
-        self.apply_thought_level(conn, agent_id, acp_session_id, stored_effort)
+        self.apply_thought_level(conn, &session_record.id, &opened.session_id, stored_effort)
             .await;
     }
 
@@ -4084,6 +4102,8 @@ impl AgentManager {
     /// the child so a retry cannot reuse its default model. Antigravity
     /// requires default permission mode and exact model confirmation,
     /// including after cold load. Other providers retain best-effort behavior.
+    /// Retain the config-option response so thinking choices can follow the
+    /// selected model before applying the stored reasoning effort.
     async fn maybe_apply_session_model(
         &self,
         conn: &Connection,
@@ -4091,7 +4111,7 @@ impl AgentManager {
         provider: &ProviderConfig,
         acp_session_id: &str,
         stored_model: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<Value>> {
         if provider.id == "antigravity" {
             intent_acp::handshake::set_session_mode(conn, acp_session_id, "default")
                 .await
@@ -4106,7 +4126,7 @@ impl AgentManager {
             let raw = stored_model.unwrap_or_default();
             let bare = raw.strip_prefix("antigravity:").unwrap_or(raw);
             if bare.is_empty() || bare.eq_ignore_ascii_case("default") {
-                return Ok(());
+                return Ok(None);
             }
             let model = Self::provider_local_model_target(provider, stored_model).ok_or_else(|| {
                 Error::InvalidInput("Invalid Antigravity model ID. Refresh models and select an available Antigravity model.".into())
@@ -4129,7 +4149,7 @@ impl AgentManager {
                     "Antigravity did not confirm model {model}; no prompt was sent. Refresh models and retry."
                 )));
             }
-            return Ok(());
+            return Ok(Some(result));
         }
         if let Some(model_id) = Self::set_model_target(provider, stored_model) {
             match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
@@ -4153,7 +4173,7 @@ impl AgentManager {
             }
         }
         if let Some(model_id) = Self::config_option_model_target(provider, stored_model) {
-            match intent_acp::session::set_session_config_option(
+            match intent_acp::session::set_session_config_option_response(
                 conn,
                 acp_session_id,
                 "model",
@@ -4161,13 +4181,14 @@ impl AgentManager {
             )
             .await
             {
-                Ok(()) => {
+                Ok(response) => {
                     tracing::debug!(
                         provider = provider.id,
                         session_id = acp_session_id,
                         model = %model_id,
                         "session/set_config_option accepted"
                     );
+                    return Ok(Some(response));
                 }
                 Err(e) => {
                     // Codex is the only production provider with this
@@ -4199,7 +4220,7 @@ impl AgentManager {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Resolve the model id `maybe_apply_session_model` should send via
@@ -10445,7 +10466,9 @@ fn resolve_spawn(
         };
         return Ok(ResolvedSpawn {
             provider,
-            model: None,
+            // Config-option E2E providers must track the selected model so
+            // live switches exercise the same respawn path as real providers.
+            model: if config_option_model { model } else { None },
             reasoning_effort: None,
             cwd,
             provider_binary: None,
@@ -17391,6 +17414,108 @@ mod thought_level_tests {
             initial_value: current.to_string(),
             current_value: current.to_string(),
             values: vec!["low".into(), "medium".into(), "high".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_or_malformed_model_options_preserve_the_opening_selector() {
+        for response in [
+            None,
+            Some(json!({})),
+            Some(json!({"configOptions": null})),
+            Some(json!({"configOptions": [{"id": "model", "currentValue": "selected"}]})),
+        ] {
+            let (mgr, agent_id, conn, calls, _db, _task) = setup(None).await;
+            let record = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            let opened = AcpSessionOpened {
+                session_id: "sid-1".into(),
+                modes: None,
+                thought_level: Some(option("medium")),
+            };
+            mgr.services
+                .persist_session_effort_levels(
+                    &record.workspace_id,
+                    &agent_id,
+                    opened.thought_level.as_ref(),
+                )
+                .await;
+            mgr.install_and_apply_thought_level(
+                conn.as_ref(),
+                &record,
+                &opened,
+                response,
+                Some("high"),
+            )
+            .await;
+            assert_eq!(calls.lock().unwrap()[0]["value"], "high");
+            let stored = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            assert_eq!(stored.effort_levels, Some(option("medium").values));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_model_options_without_thought_level_clear_stale_choices() {
+        for options in [
+            json!([]),
+            json!([{
+                "id": "model", "name": "Model", "type": "select", "category": "model",
+                "currentValue": "plain", "options": [{"value": "plain", "name": "Plain"}],
+            }]),
+        ] {
+            let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+            let record = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            let opened = AcpSessionOpened {
+                session_id: "sid-1".into(),
+                modes: None,
+                thought_level: Some(option("medium")),
+            };
+            mgr.services
+                .persist_session_effort_levels(
+                    &record.workspace_id,
+                    &agent_id,
+                    opened.thought_level.as_ref(),
+                )
+                .await;
+            mgr.install_and_apply_thought_level(
+                conn.as_ref(),
+                &record,
+                &opened,
+                Some(json!({"configOptions": options})),
+                Some("high"),
+            )
+            .await;
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "unsupported effort must not be sent"
+            );
+            assert!(mgr.handles.lock().unwrap()[&agent_id]
+                .thought_level
+                .is_none());
+            let stored = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap();
+            assert!(
+                stored.effort_levels.is_none(),
+                "stale UI choices must be cleared"
+            );
         }
     }
 
