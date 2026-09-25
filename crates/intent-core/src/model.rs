@@ -1349,6 +1349,9 @@ pub struct WorkspaceCreateInitialAgent {
     /// Bare model id (no `provider:` prefix — compound ids are rejected
     /// `-32602` at the wire boundary, PROTOCOL §5.5); pair with `provider`.
     pub model: Option<String>,
+    /// Creation-time effort, with the same resolution as `agent.create`.
+    /// A present blank string clears effort instead of inheriting defaults.
+    pub reasoning_effort: Option<String>,
     pub specialist: Option<String>,
     pub provider: Option<String>,
     pub behavior_prompt: Option<String>,
@@ -8536,6 +8539,7 @@ mod tests {
                 "prompt": "fix the auth flow",
                 "name": "Auth fixer",
                 "model": "opus",
+                "reasoningEffort": "high",
                 "specialist": "implementor",
                 "provider": "auggie",
                 "behaviorPrompt": "be terse",
@@ -8550,6 +8554,7 @@ mod tests {
         assert_eq!(agent.prompt.as_deref(), Some("fix the auth flow"));
         assert_eq!(agent.name.as_deref(), Some("Auth fixer"));
         assert_eq!(agent.model.as_deref(), Some("opus"));
+        assert_eq!(agent.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(agent.specialist.as_deref(), Some("implementor"));
         assert_eq!(agent.provider.as_deref(), Some("auggie"));
         assert_eq!(agent.behavior_prompt.as_deref(), Some("be terse"));
@@ -8573,7 +8578,29 @@ mod tests {
         let bare = bare.initial_agent.expect("initialAgent");
         assert_eq!(bare.prompt.as_deref(), Some("p"));
         assert!(bare.specialist.is_none());
+        assert!(bare.reasoning_effort.is_none());
         assert!(bare.metadata.is_none());
+    }
+
+    #[test]
+    fn workspace_create_initial_agent_effort_preserves_explicit_clear() {
+        for effort in [
+            None,
+            Some(json!(null)),
+            Some(json!("")),
+            Some(json!(" \t ")),
+        ] {
+            let mut initial_agent = json!({});
+            if let Some(value) = &effort {
+                initial_agent["reasoningEffort"] = value.clone();
+            }
+            let input: WorkspaceCreate =
+                serde_json::from_value(json!({ "initialAgent": initial_agent })).unwrap();
+            assert_eq!(
+                input.initial_agent.unwrap().reasoning_effort.as_deref(),
+                effort.as_ref().and_then(serde_json::Value::as_str)
+            );
+        }
     }
 
     #[test]
