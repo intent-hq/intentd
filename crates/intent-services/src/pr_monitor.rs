@@ -4026,6 +4026,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    mod qwen_regression;
     use std::path::PathBuf;
 
     use async_trait::async_trait;

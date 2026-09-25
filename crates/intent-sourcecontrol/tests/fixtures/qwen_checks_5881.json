@@ -1,0 +1,1488 @@
+{
+  "capturedOn": "2026-09-25",
+  "sourceNote": "fe9ceb46-8ec0-486e-971f-cc372f1abe1d",
+  "firstPages": {
+    "p10978": {
+      "number": 10978,
+      "state": "OPEN",
+      "headRefOid": "5f95d4661d6cd87bafd03bcdf76eaf5fd99f4d0c",
+      "updatedAt": "2026-09-23T19:11:11Z",
+      "mergeStateStatus": "BLOCKED",
+      "commits": {
+        "nodes": [
+          {
+            "commit": {
+              "statusCheckRollup": {
+                "contexts": {
+                  "totalCount": 40,
+                  "pageInfo": {
+                    "hasNextPage": false,
+                    "endCursor": "NDA"
+                  },
+                  "nodes": [
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:22Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907616141/job/107339175902"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "assign",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:23Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452506/job/107032877391"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Remind on force-push",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452514/job/107032877453"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "label",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:23Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452466/job/107032877235"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Classify PR",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107032881237"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ubuntu-latest / Java 11",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453572/job/107032880406"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "TUI parity snapshots (ink vs opentui)",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453657/job/107032880379"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr / precheck",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T09:11:44Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452641/job/107117339162"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ubuntu-latest / Java 17",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453572/job/107032880542"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ubuntu-latest / Java 21",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453572/job/107032880743"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "macos-latest / Java 21",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:31Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453572/job/107032880485"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "windows-latest / Java 21",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453572/job/107032880425"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Test (ubuntu-latest, Node 22.x)",
+                      "status": "COMPLETED",
+                      "conclusion": "FAILURE",
+                      "startedAt": "2026-09-23T03:28:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107032907396"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T09:11:42Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452641/job/107117339646"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:15Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907616141/job/107339131050"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Runtime Broker MariaDB / Java 21",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453572/job/107032880318"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "OpenTUI no-flicker gate",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453657/job/107032880213"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:15Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907616141/job/107339131673"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Lint & Static (ubuntu-latest, Node 22.x)",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107032907522"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Real daemon E2E / Java 11",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:24Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453572/job/107032880434"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T09:11:55Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452641/job/107117395801"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Test (macos-latest, Node 22.x)",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T03:28:30Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107032908446"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T09:11:59Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452641/job/107117429112"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:15Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907616141/job/107339132076"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Test (windows-latest, Node 22.x)",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T03:28:30Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107032908398"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:22Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907616141/job/107339177819"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T09:17:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452641/job/107117427513"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T09:11:59Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452641/job/107117428610"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:15Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907616141/job/107339132262"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Integration Tests (no-AK, No Sandbox)",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:33Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107032907453"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "FAILURE",
+                      "startedAt": "2026-09-23T09:17:09Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452641/job/107119092784"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Integration Tests (CLI, No Sandbox)",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T03:28:30Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107032908341"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:15Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907616141/job/107339132897"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "publish-resolution",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T09:11:59Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452641/job/107117429982"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "publish-resolution",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:15Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907616141/job/107339133293"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Desktop Shell (ubuntu-22.04)",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:33Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107032907475"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Desktop Shell (windows-2022)",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:28:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107032907498"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "fallback-comment",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:15Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907616141/job/107339133735"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "web-shell E2E Smoke (ubuntu-latest, Node 22.x)",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T03:59:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814453648/job/107038949666"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "fallback-comment",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T12:18:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35814452641/job/107176299662"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "p11506": {
+      "number": 11506,
+      "state": "OPEN",
+      "headRefOid": "5130e78720f4ceec6ac4702e406ad5f36dc827c9",
+      "updatedAt": "2026-09-24T16:02:55Z",
+      "mergeStateStatus": "BLOCKED",
+      "commits": {
+        "nodes": [
+          {
+            "commit": {
+              "statusCheckRollup": {
+                "contexts": {
+                  "totalCount": 136,
+                  "pageInfo": {
+                    "hasNextPage": true,
+                    "endCursor": "MTAw"
+                  },
+                  "nodes": [
+                    {
+                      "__typename": "CheckRun",
+                      "name": "route",
+                      "status": "COMPLETED",
+                      "conclusion": "CANCELLED",
+                      "startedAt": "2026-09-23T17:40:00Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162404/job/107303851906"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "route",
+                      "status": "COMPLETED",
+                      "conclusion": "CANCELLED",
+                      "startedAt": "2026-09-23T17:40:00Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162814/job/107303853553"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "route",
+                      "status": "COMPLETED",
+                      "conclusion": "CANCELLED",
+                      "startedAt": "2026-09-23T17:40:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897166640/job/107303864924"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Signal the reviewed fork PR",
+                      "status": "COMPLETED",
+                      "conclusion": "CANCELLED",
+                      "startedAt": "2026-09-23T17:40:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162436/job/107303858731"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "remove-suspicious-attachments",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:00Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162424/job/107303853122"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "remove-suspicious-attachments",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:07Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162807/job/107303897013"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "remove-suspicious-attachments",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:11Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897166603/job/107303919727"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "remove-suspicious-attachments",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:13Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897170984/job/107303932621"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "remove-suspicious-attachments",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:39Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516712/job/107642437002"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Signal the reviewed fork PR",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:08Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171272/job/107303901739"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Signal the reviewed fork PR",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:31Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516721/job/107642383552"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:00Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162695/job/107303853891"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897163251/job/107303857952"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897167082/job/107303867564"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:14Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171715/job/107303941407"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:38Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002517018/job/107642431331"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907646398/job/107339237986"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "assign",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:28:43Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837155/job/107251967892"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Remind on force-push",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:28:43Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881836821/job/107251967906"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "label",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:28:43Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881836652/job/107251965194"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "label",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-24T16:02:41Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36024553361/job/107717657924"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "route",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T17:40:08Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897170927/job/107303878021"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "route",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-24T12:58:44Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516838/job/107642382586"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Classify PR",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:28:48Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107251992846"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "TUI parity snapshots (ink vs opentui)",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:28:44Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840207/job/107251974558"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr / precheck",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:28:44Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837519/job/107251971083"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "precheck-pr / precheck",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T19:11:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907641508/job/107339220752"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Test (ubuntu-latest, Node 22.x)",
+                      "status": "COMPLETED",
+                      "conclusion": "FAILURE",
+                      "startedAt": "2026-09-23T15:29:13Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107252148207"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162404/job/107303860819"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162814/job/107303871564"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:06Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897166640/job/107303886892"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:11Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897170927/job/107303920282"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:47Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516838/job/107642484949"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162695/job/107303855162"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:09Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897163251/job/107303907669"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897167082/job/107303868556"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:05Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171715/job/107303882838"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:31Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002517018/job/107642385422"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T15:28:41Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837519/job/107251972691"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907646398/job/107339238820"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "OpenTUI no-flicker gate",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:28:44Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840207/job/107251974882"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-config",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T19:11:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907641508/job/107339220188"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "retry-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162404/job/107303860603"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "retry-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162814/job/107303871017"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "retry-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:06Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897166640/job/107303886925"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "retry-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:11Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897170927/job/107303919697"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "retry-command",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:47Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516838/job/107642485387"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162695/job/107303854721"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897163251/job/107303858917"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897167082/job/107303868997"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:05Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171715/job/107303885318"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:31Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002517018/job/107642386302"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907646398/job/107339239059"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Lint & Static (ubuntu-latest, Node 22.x)",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:29:12Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107252148279"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:28:56Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837519/job/107252061324"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "authorize",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T19:11:45Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907641508/job/107339295390"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-ack",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162404/job/107303861174"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-ack",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162814/job/107303871367"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-ack",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:06Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897166640/job/107303886700"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-ack",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:11Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897170927/job/107303920589"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "takeover-ack",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:47Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516838/job/107642485355"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Test (macos-latest, Node 22.x)",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T15:29:05Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107252143373"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162695/job/107303856245"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897163251/job/107303860579"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897167082/job/107303869647"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:06Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171715/job/107303887253"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:31Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002517018/job/107642387124"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T15:29:00Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837519/job/107252109296"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:50Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907641508/job/107339351400"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "ack-review-request",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907646398/job/107339240414"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-scan",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162404/job/107303861697"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-scan",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162814/job/107303871935"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-scan",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:06Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897166640/job/107303886361"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-scan",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:11Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897170927/job/107303920535"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "review-scan",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:47Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516838/job/107642485520"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Test (windows-latest, Node 22.x)",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T15:29:06Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107252144307"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162695/job/107303855936"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897163251/job/107303860027"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897167082/job/107303869666"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:06Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171715/job/107303887101"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:31Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002517018/job/107642386542"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:50Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907641508/job/107339351228"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907646398/job/107339240257"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "delay-automatic-review",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:34:04Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837519/job/107252107696"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "issue-autofix",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162404/job/107303861604"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "issue-autofix",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:04Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162814/job/107303872910"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "issue-autofix",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:06Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897166640/job/107303887632"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "issue-autofix",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:11Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897170927/job/107303920492"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "issue-autofix",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:47Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516838/job/107642486548"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162695/job/107303856214"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897163251/job/107303860245"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:03Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897167082/job/107303869114"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:06Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171715/job/107303887074"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-24T12:58:31Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002517018/job/107642386500"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T15:29:01Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837519/job/107252110071"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:50Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907641508/job/107339351638"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "resolve-pr",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T19:11:32Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907646398/job/107339240404"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "Integration Tests (no-AK, No Sandbox)",
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS",
+                      "startedAt": "2026-09-23T15:29:11Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107252148121"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "build-cli",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:02Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162404/job/107303861664"
+                    },
+                    {
+                      "__typename": "CheckRun",
+                      "name": "build-cli",
+                      "status": "COMPLETED",
+                      "conclusion": "SKIPPED",
+                      "startedAt": "2026-09-23T17:40:04Z",
+                      "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162814/job/107303872478"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "remaining11506": {
+    "headRefOid": "5130e78720f4ceec6ac4702e406ad5f36dc827c9",
+    "commits": {
+      "nodes": [
+        {
+          "commit": {
+            "statusCheckRollup": {
+              "contexts": {
+                "totalCount": 136,
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "MTM2"
+                },
+                "nodes": [
+                  {
+                    "__typename": "CheckRun",
+                    "name": "build-cli",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:06Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897166640/job/107303887934"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "build-cli",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:11Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897170927/job/107303921151"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "build-cli",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-24T12:58:47Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516838/job/107642486329"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "Integration Tests (CLI, No Sandbox)",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T15:29:05Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107252143063"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-pr",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:01Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162695/job/107303856638"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-pr",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:02Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897163251/job/107303863494"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-pr",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:03Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897167082/job/107303870434"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-pr",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:06Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171715/job/107303888634"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-pr",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-24T12:58:31Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002517018/job/107642387247"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-pr",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T19:11:50Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907641508/job/107339352768"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-pr",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T19:11:32Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907646398/job/107339241528"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-pr",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "startedAt": "2026-09-23T15:34:12Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837519/job/107254277500"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-address",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:02Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162404/job/107303862255"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-address",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:04Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162814/job/107303874012"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-address",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:06Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897166640/job/107303888301"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-address",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:11Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897170927/job/107303921177"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "review-address",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-24T12:58:47Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002516838/job/107642486676"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "publish-resolution",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:01Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162695/job/107303856206"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "publish-resolution",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:02Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897163251/job/107303863233"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "publish-resolution",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:03Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897167082/job/107303871141"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "publish-resolution",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:06Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171715/job/107303888948"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "publish-resolution",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-24T12:58:31Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002517018/job/107642387357"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "publish-resolution",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T15:29:01Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837519/job/107252110379"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "publish-resolution",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T19:11:50Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907641508/job/107339352719"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "publish-resolution",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T19:11:32Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907646398/job/107339241358"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "Desktop Shell (ubuntu-22.04)",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "startedAt": "2026-09-23T15:29:11Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107252148294"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "Desktop Shell (windows-2022)",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "startedAt": "2026-09-23T15:29:12Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107252148280"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "fallback-comment",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:01Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897162695/job/107303857083"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "fallback-comment",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:03Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897163251/job/107303866019"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "fallback-comment",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:03Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897167082/job/107303870610"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "fallback-comment",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:40:06Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35897171715/job/107303889987"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "fallback-comment",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-24T12:58:31Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/36002517018/job/107642387957"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "fallback-comment",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T17:46:35Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881837519/job/107306377073"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "fallback-comment",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T19:11:50Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907641508/job/107339353452"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "fallback-comment",
+                    "status": "COMPLETED",
+                    "conclusion": "SKIPPED",
+                    "startedAt": "2026-09-23T19:11:32Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35907646398/job/107339241766"
+                  },
+                  {
+                    "__typename": "CheckRun",
+                    "name": "web-shell E2E Smoke (ubuntu-latest, Node 22.x)",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "startedAt": "2026-09-23T16:13:07Z",
+                    "detailsUrl": "https://github.com/QwenLM/qwen-code/actions/runs/35881840296/job/107270248128"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
