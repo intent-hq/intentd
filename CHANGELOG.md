@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.110] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- Apply initial-agent reasoning effort before first turn ([#5948](https://github.com/intent-hq/intentd/pull/5948)) ([#2125](https://github.com/intent-hq/intentd/pull/2125))
+
+
 ## [0.9.109] - 2026-09-25
 
 ### 🐛 Bug Fixes
