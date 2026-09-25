@@ -11356,6 +11356,64 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
     assert!(sessions.is_empty(), "recreated workspace shows no ghosts");
 }
 
+#[intent_test_macros::daemon_test]
+async fn incremental_workspace_delete_refuses_runtime_sends_and_drain_after_teardown() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_workspaces_root(tmp.path.with_extension("workspaces"));
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("deleting");
+    let agent = AgentId::from("live-agent");
+    seed_agent(&mgr, &ws, &agent).await;
+    track(&mgr, &agent);
+    let (reached, resume) = services.workspace_delete_test_gate.arm(ws.clone());
+    let mut deleting = services.delete_workspace(ws.clone());
+    timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut deleting => panic!("delete finished before runtime probe: {result:?}"),
+            () = reached.notified() => {}
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!mgr.contains(&agent));
+    let sent = mgr
+        .send_message(
+            agent.clone(),
+            ws.clone(),
+            "late send".into(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await;
+    assert!(matches!(sent, Err(Error::NotFound(_))), "{sent:?}");
+    let interrupted = mgr
+        .interrupt_send_message(
+            agent.clone(),
+            ws.clone(),
+            "late interrupt".into(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await;
+    assert!(
+        matches!(interrupted, Err(Error::NotFound(_))),
+        "{interrupted:?}"
+    );
+    mgr.clone().try_drain_queue(agent.clone(), ws.clone()).await;
+    assert!(!mgr.is_busy(&agent));
+    assert!(!mgr.contains(&agent));
+    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert_eq!(mgr.registry().size(), 0);
+    resume.notify_one();
+    deleting.await.unwrap();
+}
+
 /// `workspace.archive` gracefully interrupts every in-flight turn in the
 /// workspace (the `agent.stop` keep-alive semantics of
 /// `AgentManager::interrupt`): the draining worker is aborted and the terminal

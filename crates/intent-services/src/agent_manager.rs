@@ -6390,6 +6390,7 @@ impl AgentManager {
         // `create_agent` workspace-MCP scope) — must key on the workspace
         // the target lives in, not the caller's.
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
         // Quarantine gate (monorepo#840): a provably-poisoned session (parked
         // in Error with a session-fatal provider block, or a streak of
         // identical terminal failures) must NOT be redriven by message
@@ -6834,6 +6835,9 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         redrive_error_park: bool,
     ) {
+        let Ok(_mutation) = self.services.workspace_mutations.enter(&workspace_id) else {
+            return;
+        };
         if self.is_busy(&agent_id) {
             return;
         }
@@ -7193,6 +7197,7 @@ impl AgentManager {
         // status events, and the spawn below must key on the workspace the
         // target lives in (see the module-header invariant).
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
         // Ownership (multiplayer, intentd#2068): resolved before the pop,
         // checked inside the pop's critical section against the entry found
         // there — a guest force-sends only what its `agent.getQueue` shows it.
@@ -7559,6 +7564,7 @@ impl AgentManager {
         // (intent-hq/intent#5017): the archived gate below keys on the
         // target's home workspace, not the sender's bridge scope.
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
         // Duplicate-delivery guard: check-and-record is atomic under the lock,
         // so of two racing duplicates exactly one proceeds. Runs BEFORE the
         // archived gate below so a parked interrupt still records its id and
@@ -7910,6 +7916,9 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> bool {
+        let Ok(_mutation) = self.services.workspace_mutations.enter(workspace_id) else {
+            return false;
+        };
         let (notes, gate) = {
             let map = self.handles.lock().unwrap();
             let Some(handle) = map.get(agent_id) else {
