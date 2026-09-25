@@ -3137,7 +3137,17 @@ impl Services {
         session
             .harness_features
             .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .and_then(|v| {
+                let mut snapshot = v.clone();
+                // Older snapshots without peerAgents captured that capability
+                // as off; do not inherit the new configuration default.
+                if let Some(fields) = snapshot.as_object_mut() {
+                    fields
+                        .entry("peerAgents")
+                        .or_insert(serde_json::Value::Bool(false));
+                }
+                serde_json::from_value(snapshot).ok()
+            })
             .unwrap_or_else(|| self.effective_settings().agent_features)
     }
 
