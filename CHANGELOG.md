@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.108] - 2026-09-25
+
+### 🚀 Features
+
+- Enable peer agents by default ([#2118](https://github.com/intent-hq/intentd/pull/2118))
+- Report effective Codex runtime and catalogs in doctor ([#2117](https://github.com/intent-hq/intentd/pull/2117))
+
+### 🐛 Bug Fixes
+
+- Use the enabled GitLab OAuth application by default ([#2120](https://github.com/intent-hq/intentd/pull/2120))
+- Honor specialist provider pins in create and previews ([#2116](https://github.com/intent-hq/intentd/pull/2116))
+- *(settings)* Validate config before committing writes ([#2119](https://github.com/intent-hq/intentd/pull/2119))
+
+### 🧪 Testing
+
+- Assert sender-attributed peer kickoff over WSS ([#2115](https://github.com/intent-hq/intentd/pull/2115))
+
+
 ## [0.9.107] - 2026-09-25
 
 ### 🐛 Bug Fixes
