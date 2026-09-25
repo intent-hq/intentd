@@ -1025,15 +1025,26 @@ pub(crate) fn ensure_provider_available(
     provider_id: &str,
     providers: &intent_core::settings_file::ProvidersSettings,
 ) -> Result<()> {
+    ensure_provider_available_with_discovery(method, provider_id, providers, || {
+        intent_providers::provider_availability_for(provider_id, &|key| {
+            providers.paths.get(key).cloned()
+        })
+    })
+}
+
+pub(crate) fn ensure_provider_available_with_discovery(
+    method: &str,
+    provider_id: &str,
+    providers: &intent_core::settings_file::ProvidersSettings,
+    discover: impl FnOnce() -> Option<intent_providers::ProviderAvailability>,
+) -> Result<()> {
     ensure_provider_enabled(method, provider_id, providers.enabled.as_ref())?;
     ensure_provider_authenticated(
         method,
         provider_id,
         crate::provider_auth::cached_auth_verdict(provider_id),
     )?;
-    let availability = intent_providers::provider_availability_for(provider_id, &|key| {
-        providers.paths.get(key).cloned()
-    });
+    let availability = discover();
     ensure_provider_runnable(method, provider_id, availability, &|| {
         intent_providers::find_npx().is_some()
     })

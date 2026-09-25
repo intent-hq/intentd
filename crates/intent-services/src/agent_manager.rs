@@ -10208,7 +10208,10 @@ pub(crate) fn imported_spawn_selection_for_test(
     session: &AgentSession,
     settings: &intent_core::settings_file::SettingsFile,
 ) -> (String, Option<String>, Option<String>) {
-    let resolved = resolve_spawn(session, None, settings, None).expect("imported spawn resolves");
+    let resolved = resolve_spawn_with_codex_node(session, None, settings, None, || {
+        Some(PathBuf::from("/fixture/node"))
+    })
+    .expect("imported spawn resolves");
     (
         resolved.provider.id.to_string(),
         resolved.model,

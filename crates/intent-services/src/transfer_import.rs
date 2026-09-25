@@ -2175,8 +2175,7 @@ mod tests {
         let assets = TempDir::new("import-selection-assets");
         let registry =
             std::sync::Arc::new(crate::SettingsRegistry::load(root.0.join("config.toml")).unwrap());
-        // Discovery and resolve_spawn only inspect these executable paths;
-        // importing must never execute them or open an ACP session.
+        // Importing must never execute a provider or open an ACP session.
         registry
             .apply(&[
                 ("model.defaultProvider".into(), serde_json::json!("codex")),
@@ -2192,15 +2191,37 @@ mod tests {
                 (
                     "providers.paths".into(),
                     serde_json::json!({
-                        "auggie": std::env::current_exe().unwrap(),
-                        "codex": std::env::current_exe().unwrap()
+                        "auggie": std::env::current_exe().unwrap()
                     }),
                 ),
             ])
             .unwrap();
-        let svc = fresh_services(&root.0, &assets.0)
+        let mut svc = fresh_services(&root.0, &assets.0)
             .await
             .with_settings_registry(registry);
+        svc.import_provider_availability = Some(std::sync::Arc::new(
+            ["codex", "auggie"]
+                .into_iter()
+                .map(|id| {
+                    let config = intent_providers::find_provider(id).unwrap();
+                    (
+                        id.to_string(),
+                        intent_providers::ProviderAvailability {
+                            id: config.id,
+                            display_name: config.display_name,
+                            command: config.command,
+                            installed: true,
+                            resolved_path: None,
+                            gated_off: None,
+                            auth_check_args: config.auth_check_args,
+                            has_npx_fallback: false,
+                            npx_only_package: None,
+                            secondary_binary: None,
+                        },
+                    )
+                })
+                .collect(),
+        ));
         for (provider, model) in [("codex", "gpt-6-astra"), ("auggie", "gpt6-astra")] {
             seed_selection_catalog(
                 &svc,
@@ -2642,6 +2663,29 @@ mod tests {
             let session = import_selection(&svc, selection).await;
             assert_selection(&svc, &session, "codex", Some("gpt-6-astra"), Some("high"));
         }
+    }
+
+    #[tokio::test]
+    async fn import_selection_uninstalled_destination_requests_configuration() {
+        let (mut svc, _root, _assets) = selection_fixture().await;
+        std::sync::Arc::make_mut(svc.import_provider_availability.as_mut().unwrap())
+            .get_mut("codex")
+            .unwrap()
+            .installed = false;
+        let session = import_selection(
+            &svc,
+            serde_json::json!({
+                "provider": "auggie", "model": "missing-model", "reasoning_effort": "low"
+            }),
+        )
+        .await;
+        assert_eq!(session.attention_request_kind.as_deref(), Some("blocker"));
+        assert!(session
+            .attention_request_reason
+            .as_deref()
+            .unwrap()
+            .contains("not installed"));
+        assert_eq!(session.model.as_deref(), Some("missing-model"));
     }
 
     #[tokio::test]
