@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn min_version_constant_parses() {
-        assert_eq!(parse_cli_version(PI_CLI_MIN_VERSION), Some((0, 80, 4)));
+        assert_eq!(parse_cli_version(PI_CLI_MIN_VERSION), Some((0, 81, 0)));
     }
 
     #[test]
@@ -226,31 +226,42 @@ mod tests {
         assert_eq!(gate, PiCliGate::TooOld("0.80.3".to_string()));
         assert!(gate.gates());
         assert_eq!(gate_output("0.79.9"), PiCliGate::TooOld("0.79.9".into()));
-        // Missing patch defaults to 0: 0.80 < 0.80.4.
+        // Missing patch defaults to 0: 0.80 < 0.81.0.
         assert_eq!(gate_output("pi 0.80"), PiCliGate::TooOld("0.80.0".into()));
     }
 
     #[test]
+    fn previous_minimum_lacks_model_specific_thinking_rpc() {
+        for version in ["0.80.4", "0.80.5", "0.80.99"] {
+            let gate = gate_output(version);
+            assert_eq!(gate, PiCliGate::TooOld(version.into()));
+            let reason = pi_gate_reason(&gate).expect("old Pi must explain how to upgrade");
+            assert!(reason.contains(version), "{reason}");
+            assert!(reason.contains("Pi CLI 0.81.0+"), "{reason}");
+        }
+    }
+
+    #[test]
     fn exact_minimum_version_is_ok() {
-        let gate = gate_output("0.80.4");
+        let gate = gate_output("0.81.0");
         assert_eq!(gate, PiCliGate::Ok);
         assert!(!gate.gates());
     }
 
     #[test]
     fn newer_versions_are_ok() {
-        assert_eq!(gate_output("0.80.5"), PiCliGate::Ok);
-        assert_eq!(gate_output("0.81.0"), PiCliGate::Ok);
+        assert_eq!(gate_output("0.81.1"), PiCliGate::Ok);
+        assert_eq!(gate_output("0.82.0"), PiCliGate::Ok);
         assert_eq!(gate_output("1.0.0"), PiCliGate::Ok);
     }
 
     #[test]
     fn tolerant_parsing_accepts_common_version_formats() {
-        assert_eq!(gate_output("v0.80.4"), PiCliGate::Ok);
-        assert_eq!(gate_output("pi 0.80.4"), PiCliGate::Ok);
+        assert_eq!(gate_output("v0.81.0"), PiCliGate::Ok);
+        assert_eq!(gate_output("pi 0.81.0"), PiCliGate::Ok);
         assert_eq!(gate_output("pi version v1.2.3"), PiCliGate::Ok);
-        assert_eq!(gate_output("0.80.4-beta.1"), PiCliGate::Ok);
-        assert_eq!(gate_output("  0.80.4\n"), PiCliGate::Ok);
+        assert_eq!(gate_output("0.81.0-beta.1"), PiCliGate::Ok);
+        assert_eq!(gate_output("  0.81.0\n"), PiCliGate::Ok);
     }
 
     #[test]

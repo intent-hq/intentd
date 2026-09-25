@@ -329,7 +329,7 @@ fn pi_resolves_in_registry_with_pinned_npx_package() {
     assert_eq!(provider_config("pi").id, "pi");
     let pi = find_provider("pi").expect("pi is registered");
     assert_eq!(pi.command, "pi-acp");
-    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.33");
+    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.34");
     assert_eq!(pi.npx_only_package, Some(PI_ACP_NPX_PACKAGE));
 }
 
