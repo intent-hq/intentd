@@ -437,6 +437,10 @@ pub(crate) struct PrMonitorSnapshot {
     /// silently instead of emitting a false post-upgrade wake.
     #[serde(default)]
     pub ejection_tracked: bool,
+    /// No authoritative checks have been observed for this head yet. Internal
+    /// persisted bookkeeping only; old snapshots retain their known baseline.
+    #[serde(default)]
+    pub checks_unobserved: bool,
     /// When the forge read that produced this snapshot SUCCEEDED (RFC 3339).
     /// The freshness anchor for superseding the snapshot with a workspace
     /// copy ([`superseded_by_terminal_copy`]): the row's `last_polled_at`
@@ -478,6 +482,7 @@ pub struct SharedPrSnapshot {
     /// review-decision, check-run or review-thread read leaves a default in
     /// the checklist that the forge may answer on the next read.
     requirements_complete: bool,
+    checks_complete: bool,
     /// The host's merge-queue state as reported by this read
     /// ([`pr_ops::MergeRequirementsRead::merge_queue_reported`]) — what
     /// `github.pulls.get` carries as `isInMergeQueue` (`None` → key absent).
@@ -493,6 +498,15 @@ impl SharedPrSnapshot {
     /// monotonic — always reaches the wake — per intent-hq/monorepo#3479).
     pub(crate) fn materialize(&self, previous: Option<&PrMonitorSnapshot>) -> PrMonitorSnapshot {
         let mut requirements = self.requirements.clone();
+        let mut checks_unobserved = !self.checks_complete;
+        if checks_unobserved {
+            if let Some(prev) = previous.filter(|p| {
+                self.head_sha.as_ref().is_some_and(|h| !h.is_empty()) && self.head_sha == p.head_sha
+            }) {
+                requirements.checks.clone_from(&prev.requirements.checks);
+                checks_unobserved = prev.checks_unobserved;
+            }
+        }
         let ejection_tracked = if self.ejection_known {
             true
         } else {
@@ -515,6 +529,7 @@ impl SharedPrSnapshot {
             review_comment_count: self.review_comment_count,
             requirements,
             ejection_tracked,
+            checks_unobserved,
             observed_at: None,
         }
     }
@@ -872,6 +887,7 @@ async fn shared_snapshot_from_observation(
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
+        checks_complete: read.checks_complete,
         merge_queue_reported: read.merge_queue_reported,
     };
     Ok((observation.pr, snapshot))
@@ -1063,6 +1079,7 @@ async fn finish_shared_snapshot(
         requirements: read.requirements,
         ejection_known: read.ejection_known,
         requirements_complete: read.complete,
+        checks_complete: read.checks_complete,
         merge_queue_reported: read.merge_queue_reported,
     };
     Ok((pr, snapshot))
@@ -3161,6 +3178,12 @@ impl Services {
         // write-back below) — only ejections observed after tracking began
         // are reportable.
         let backfill = |s: &mut PrMonitorSnapshot| {
+            // An initial unreadable result is not an observed empty suite.
+            // Adopt its first complete checks silently, just like registration.
+            if !fresh.checks_unobserved && s.checks_unobserved {
+                s.requirements.checks.clone_from(&fresh.requirements.checks);
+                s.checks_unobserved = false;
+            }
             if fresh.ejection_tracked && !s.ejection_tracked {
                 s.requirements
                     .merge_queue_ejection
@@ -4259,6 +4282,7 @@ mod tests {
                 merge_state_status: Some(self.mergeable_state.to_uppercase()),
                 review_decision: (!self.approvals.is_empty()).then_some(ReviewDecision::Approved),
                 checks: self.checks.clone(),
+                checks_head_sha: None,
                 checks_known: true,
                 branch_rules: None,
                 is_in_merge_queue: self.in_merge_queue,
@@ -4906,6 +4930,7 @@ mod tests {
                 merge_queue_ejection: None,
             },
             ejection_tracked: true,
+            checks_unobserved: false,
             observed_at: None,
         };
         f(&mut s);
@@ -5401,6 +5426,7 @@ mod tests {
             requirements: s.requirements.clone(),
             ejection_known,
             requirements_complete: ejection_known,
+            checks_complete: true,
             merge_queue_reported: s.requirements.is_in_merge_queue,
         }
     }

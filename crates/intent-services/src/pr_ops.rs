@@ -1424,6 +1424,8 @@ pub(crate) struct MergeRequirementsRead {
     /// thread resolution) — so the checklist carries a default in place of a
     /// signal the forge may answer on the next read.
     pub(crate) complete: bool,
+    /// Whether the check observation answered, independently of other reads.
+    pub(crate) checks_complete: bool,
     /// The host's merge-queue state as reported (GitHub GraphQL
     /// `isInMergeQueue`): `Some(true)` / `Some(false)` exactly when the probe
     /// carried it, `None` when the host did not report it (no probe, REST-only
@@ -1452,6 +1454,16 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
             "merge requirements: probe unavailable, degrading to snapshot-only checklist"
         );
     }))?;
+    if let Some(signals) = signals.as_mut() {
+        if signals
+            .checks_head_sha
+            .as_ref()
+            .is_some_and(|head| Some(head) != pr.head_sha.as_ref())
+        {
+            signals.checks_known = false;
+            signals.checks.clear();
+        }
+    }
     let reviews = degrade_unless_rate_limited(reviews)?;
     // Captured BEFORE the review-decision backfill below can fabricate a
     // stub `signals` for a failed probe.
@@ -1494,6 +1506,7 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
         review_comment_count: review_comments,
         ejection_known,
         complete,
+        checks_complete: runs_complete,
         merge_queue_reported,
     })
 }
@@ -1546,6 +1559,7 @@ pub(crate) async fn merge_requirements_from_observation(
         review_comment_count: review_comments,
         ejection_known: true,
         complete,
+        checks_complete: runs_complete,
         merge_queue_reported,
     })
 }
@@ -1571,7 +1585,7 @@ async fn fallback_check_runs(
             let complete = runs.is_some();
             Ok((runs.unwrap_or_default(), complete))
         }
-        _ => Ok((Vec::new(), true)),
+        _ => Ok((Vec::new(), rollup_known || !sc.capabilities().check_runs)),
     }
 }
 
@@ -2493,6 +2507,7 @@ mod tests {
                 rollup("e2e", CheckState::Pending, true),
                 rollup("optional-lint", CheckState::Failure, false),
             ],
+            checks_head_sha: None,
             checks_known: true,
             branch_rules: Some(intent_sourcecontrol::BranchRules {
                 required_approving_review_count: Some(2),
@@ -2554,6 +2569,7 @@ mod tests {
             merge_state_status: Some("CLEAN".into()),
             review_decision: Some(ReviewDecision::Approved),
             checks: vec![rollup("build", CheckState::Success, false)],
+            checks_head_sha: None,
             checks_known: true,
             branch_rules: None,
             is_in_merge_queue: None,

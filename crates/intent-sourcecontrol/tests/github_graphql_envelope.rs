@@ -752,10 +752,11 @@ async fn merge_requirements_retries_without_is_in_merge_queue_on_old_schemas() {
                 "data": {
                     "repository": {
                         "pullRequest": {
-                            "mergeStateStatus": "CLEAN",
+                            "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+                        "mergeStateStatus": "CLEAN",
                             "reviewDecision": "APPROVED",
-                            "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
-                                "contexts": { "nodes": [] }
+                            "commits": { "nodes": [{ "commit": { "oid": "0123456789abcdef0123456789abcdef01234567", "statusCheckRollup": {
+                                "contexts": { "nodes": [], "totalCount": 0, "pageInfo": { "hasNextPage": false, "endCursor": null } }
                             } } }] }
                         }
                     }
@@ -791,12 +792,13 @@ async fn merge_requirements_parses_merge_queue_removal_event() {
             "data": {
                 "repository": {
                     "pullRequest": {
+                        "headRefOid": "0123456789abcdef0123456789abcdef01234567",
                         "mergeStateStatus": "CLEAN",
                         "isInMergeQueue": false,
                         "timelineItems": { "nodes": timeline_nodes },
                         "reviewDecision": "APPROVED",
-                        "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
-                            "contexts": { "nodes": [] }
+                        "commits": { "nodes": [{ "commit": { "oid": "0123456789abcdef0123456789abcdef01234567", "statusCheckRollup": {
+                            "contexts": { "nodes": [], "totalCount": 0, "pageInfo": { "hasNextPage": false, "endCursor": null } }
                         } } }] }
                     }
                 }
@@ -844,13 +846,14 @@ fn merge_requirements_host_with_branch_rules(rules: (u16, String)) -> Responder 
                 "data": {
                     "repository": {
                         "pullRequest": {
-                            "mergeStateStatus": "CLEAN",
+                            "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+                        "mergeStateStatus": "CLEAN",
                             "isInMergeQueue": false,
                             "timelineItems": { "nodes": [] },
                             "reviewDecision": "APPROVED",
                             "baseRefName": "main",
-                            "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
-                                "contexts": { "nodes": [] }
+                            "commits": { "nodes": [{ "commit": { "oid": "0123456789abcdef0123456789abcdef01234567", "statusCheckRollup": {
+                                "contexts": { "nodes": [], "totalCount": 0, "pageInfo": { "hasNextPage": false, "endCursor": null } }
                             } } }] }
                         }
                     }
@@ -942,8 +945,8 @@ fn busy_pr_observation_envelope() -> Value {
                     "timelineItems": { "nodes": [] },
                     "reviewDecision": "APPROVED",
                     "baseRefName": "main",
-                    "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
-                        "contexts": { "nodes": [] }
+                    "commits": { "nodes": [{ "commit": { "oid": "0123456789abcdef0123456789abcdef01234567", "statusCheckRollup": {
+                        "contexts": { "nodes": [], "totalCount": 0, "pageInfo": { "hasNextPage": false, "endCursor": null } }
                     } } }] },
                     "reviews": { "pageInfo": { "hasPreviousPage": false }, "nodes": [] },
                     "reviewThreads": {

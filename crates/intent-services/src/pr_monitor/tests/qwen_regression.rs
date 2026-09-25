@@ -8,7 +8,7 @@ mod qwen;
 
 use std::collections::BTreeMap;
 
-use qwen::{MockQwen, ReadMode};
+use qwen::{CheckFault, MockQwen, ReadMode};
 
 use super::*;
 
@@ -227,6 +227,10 @@ async fn degraded_checks_keep_last_observation(number: u64) {
         let current = row(&svc, &monitor).await;
         let changes = current.pending_changes.clone();
         let checks = check_map(&current);
+        assert_eq!(
+            checks, baseline,
+            "{mode:?}: preserve the intermediate checklist"
+        );
         if !changes.is_empty() {
             let flushed = svc
                 .pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
@@ -346,4 +350,279 @@ async fn qwen_newer_failure_recovery_and_required_changes_are_reported_once() {
             .count(),
         1
     );
+}
+
+fn newer_run(mock: &MockQwen, conclusion: &str, when: &str) {
+    mock.edit(|s| {
+        let mut newer = s
+            .nodes
+            .iter()
+            .find(|n| n["name"] == "review-pr")
+            .unwrap()
+            .clone();
+        newer["conclusion"] = json!(conclusion);
+        newer["startedAt"] = json!(when);
+        s.nodes.push(newer);
+    });
+}
+
+#[tokio::test]
+async fn qwen_recovery_reports_a_real_failure_after_holding_intermediate_checks() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(10978).await;
+    mock.edit(|s| s.mode = ReadMode::Rest);
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 10978)
+        .await
+        .unwrap();
+    let baseline = check_map(&monitor);
+    mock.edit(|s| s.mode = ReadMode::Degraded);
+    newer_run(&mock, "FAILURE", "2026-09-25T06:00:00Z");
+    full_poll(&svc, &mock).await;
+    assert_eq!(check_map(&row(&svc, &monitor).await), baseline);
+    assert_quiet(&svc, &monitor, &owner).await;
+    mock.edit(|s| s.mode = ReadMode::Rest);
+    full_poll(&svc, &mock).await;
+    let transition = "check review-pr: passed → failed";
+    assert_eq!(row(&svc, &monitor).await.pending_changes, vec![transition]);
+    svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
+        .await
+        .unwrap();
+    full_poll(&svc, &mock).await;
+    assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+    assert_eq!(
+        owner_messages(&svc, &owner)
+            .await
+            .matches(transition)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn qwen_continuation_failure_preserves_checks_but_allows_unrelated_changes() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    let baseline = check_map(&monitor);
+    mock.edit(|s| {
+        s.fault = Some(CheckFault::ContinuationError);
+        s.rest_unreadable = true;
+        s.pr["state"] = json!("CLOSED");
+    });
+    full_poll(&svc, &mock).await;
+    let current = row(&svc, &monitor).await;
+    assert_eq!(check_map(&current), baseline);
+    assert_eq!(current.state, PrMonitorState::Completed);
+    let text = owner_messages(&svc, &owner).await;
+    assert!(text.contains("CLOSED"), "{text}");
+    assert!(!text.contains("check removed:"), "{text}");
+}
+
+#[tokio::test]
+async fn qwen_successful_empty_read_removes_checks_once() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(10978).await;
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 10978)
+        .await
+        .unwrap();
+    mock.edit(|s| s.nodes.clear());
+    full_poll(&svc, &mock).await;
+    let current = row(&svc, &monitor).await;
+    assert!(check_map(&current).is_empty());
+    assert_eq!(
+        current
+            .pending_changes
+            .iter()
+            .filter(|c| c.starts_with("check removed:"))
+            .count(),
+        32
+    );
+    svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
+        .await
+        .unwrap();
+    full_poll(&svc, &mock).await;
+    assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+}
+
+#[tokio::test]
+async fn qwen_degraded_new_head_does_not_relabel_old_checks_or_remove_them() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(10978).await;
+    mock.edit(|s| s.mode = ReadMode::Rest);
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 10978)
+        .await
+        .unwrap();
+    mock.edit(|s| {
+        s.mode = ReadMode::Degraded;
+        s.pr["headRefOid"] = json!("new-head");
+    });
+    full_poll(&svc, &mock).await;
+    let current = row(&svc, &monitor).await;
+    let snapshot: PrMonitorSnapshot =
+        serde_json::from_str(current.last_snapshot.as_deref().unwrap()).unwrap();
+    assert_eq!(snapshot.head_sha.as_deref(), Some("new-head"));
+    assert!(
+        check_map(&current).is_empty(),
+        "old checks cannot be presented as new-head results"
+    );
+    assert!(
+        !current.pending_changes.is_empty(),
+        "the push still reports"
+    );
+    assert!(
+        current
+            .pending_changes
+            .iter()
+            .all(|c| !c.starts_with("check ") && !c.starts_with("all checks ")),
+        "{:?}",
+        current.pending_changes
+    );
+}
+
+#[tokio::test]
+async fn qwen_initial_unreadable_checks_seed_silently_on_recovery() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(10978).await;
+    mock.edit(|s| s.mode = ReadMode::Degraded);
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 10978)
+        .await
+        .unwrap();
+    mock.edit(|s| s.mode = ReadMode::Rest);
+    full_poll(&svc, &mock).await;
+    assert_quiet(&svc, &monitor, &owner).await;
+    assert_eq!(check_map(&row(&svc, &monitor).await).len(), 32);
+    newer_run(&mock, "FAILURE", "2026-09-25T06:00:00Z");
+    full_poll(&svc, &mock).await;
+    assert_eq!(
+        row(&svc, &monitor).await.pending_changes,
+        vec!["check review-pr: passed → failed"]
+    );
+}
+
+#[tokio::test]
+async fn qwen_standalone_probe_never_uses_checks_from_another_head() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(10978).await;
+    mock.edit(|s| s.mode = ReadMode::Standalone);
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 10978)
+        .await
+        .unwrap();
+    let baseline = check_map(&monitor);
+    mock.edit(|s| {
+        s.rest_head = s.pr["headRefOid"].as_str().map(String::from);
+        s.pr["headRefOid"] = json!("moved-between-rest-and-probe");
+        s.rest_unreadable = true;
+    });
+    newer_run(&mock, "FAILURE", "2026-09-25T06:00:00Z");
+    full_poll(&svc, &mock).await;
+    assert_eq!(check_map(&row(&svc, &monitor).await), baseline);
+    assert_quiet(&svc, &monitor, &owner).await;
+}
+
+#[tokio::test]
+async fn qwen_preserves_pending_failure_through_degradation_and_reregistration() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(10978).await;
+    mock.edit(|s| s.mode = ReadMode::Rest);
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 10978)
+        .await
+        .unwrap();
+    newer_run(&mock, "FAILURE", "2026-09-25T06:00:00Z");
+    full_poll(&svc, &mock).await;
+    let failing = row(&svc, &monitor).await;
+    assert_eq!(
+        failing.pending_changes,
+        vec!["check review-pr: passed → failed"]
+    );
+    mock.edit(|s| s.mode = ReadMode::Degraded);
+    for _ in 0..2 {
+        full_poll(&svc, &mock).await;
+        let held = row(&svc, &monitor).await;
+        assert_eq!(held.pending_changes, failing.pending_changes);
+        assert_eq!(held.pending_since, failing.pending_since);
+        assert_eq!(held.last_change_at, failing.last_change_at);
+        assert_eq!(check_map(&held), check_map(&failing));
+    }
+    assert_eq!(
+        svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
+            .await
+            .unwrap()["flushed"],
+        true
+    );
+    mock.edit(|s| s.mode = ReadMode::Rest);
+    full_poll(&svc, &mock).await;
+    assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+    assert_eq!(
+        owner_messages(&svc, &owner)
+            .await
+            .matches("check review-pr: passed → failed")
+            .count(),
+        1
+    );
+    svc.backdate_pr_cache(PR_MONITOR_MAX_CHEAP_AGE + Duration::from_secs(1));
+    let (rearmed, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 10978)
+        .await
+        .unwrap();
+    assert_eq!(rearmed.monitor_id, monitor.monitor_id);
+    full_poll(&svc, &mock).await;
+    assert!(row(&svc, &monitor).await.pending_changes.is_empty());
+    assert_eq!(check_map(&rearmed), check_map(&failing));
+}
+
+#[tokio::test]
+async fn qwen_paginated_legacy_status_and_lone_cancellation_remain_failures() {
+    let (_db, _root, svc, _forge, ws, owner) = setup().await;
+    let mock = MockQwen::start(11506).await;
+    mock.edit(|s| {
+        s.nodes.push(json!({"__typename":"StatusContext", "context":"route", "state":"FAILURE", "isRequired":true, "targetUrl":"https://ci/status"}));
+        s.nodes.push(json!({"__typename":"CheckRun", "name":"cancelled-only", "status":"COMPLETED", "conclusion":"CANCELLED", "startedAt":"2026-09-25T06:00:00Z"}));
+    });
+    let svc = svc
+        .with_source_control(mock.sc.clone())
+        .with_pr_monitor_debounce_seconds(3600);
+    let (monitor, _) = svc
+        .pr_monitor_register(&ws, &owner, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    let baseline = check_map(&monitor);
+    assert_eq!(
+        baseline["route"], "failed",
+        "independent legacy failure wins over a successful run"
+    );
+    assert_eq!(baseline["cancelled-only"], "failed");
+    mock.edit(|s| s.nodes.reverse());
+    full_poll(&svc, &mock).await;
+    assert_eq!(check_map(&row(&svc, &monitor).await), baseline);
+    assert_quiet(&svc, &monitor, &owner).await;
 }

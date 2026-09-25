@@ -3,6 +3,9 @@
 //! projections are synthetic controls, not evidence from the affected daemon.
 //! Shared with the service tests so they exercise the real GitHub adapter.
 
+// Each integration suite exercises a different subset of this shared fixture.
+#![allow(dead_code)]
+
 use std::sync::{Arc, Mutex};
 
 use intent_sourcecontrol::GitHubSourceControl;
@@ -18,10 +21,28 @@ pub enum ReadMode {
     Degraded,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckFault {
+    ContinuationError,
+    RateLimit,
+    MissingCursor,
+    RepeatedCursor,
+    MissingPageInfo,
+    HeadChanged,
+    CommitChanged,
+    CountChanged,
+    NullNodes,
+    Endless,
+}
+
 pub struct State {
     pub pr: Value,
     pub nodes: Vec<Value>,
     pub mode: ReadMode,
+    pub fault: Option<CheckFault>,
+    pub rest_unreadable: bool,
+    pub rest_fault: Option<CheckFault>,
+    pub rest_head: Option<String>,
 }
 
 impl State {
@@ -47,13 +68,18 @@ impl State {
             pr,
             nodes,
             mode: ReadMode::Folded,
+            fault: None,
+            rest_unreadable: false,
+            rest_fault: None,
+            rest_head: None,
         }
     }
 
-    fn graphql_pr(&self, offset: usize) -> Value {
+    fn graphql_pr(&self, offset: usize, query: &str) -> Value {
         let mut pr = self.pr.clone();
         let number = pr["number"].as_u64().unwrap();
-        let end = (offset + 100).min(self.nodes.len());
+        let start = offset.min(self.nodes.len());
+        let end = (start + 100).min(self.nodes.len());
         pr["url"] = json!(format!("https://github.com/QwenLM/qwen-code/pull/{number}"));
         pr["title"] = json!("Qwen captured checks");
         pr["body"] = json!("");
@@ -72,18 +98,63 @@ impl State {
         // optional unless a test explicitly adds a synthetic required flag.
         pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"] = json!({
             "totalCount": self.nodes.len(),
-            "pageInfo": {"hasNextPage": end < self.nodes.len(), "endCursor": "MTAw"},
-            "nodes": self.nodes[offset..end],
+            "pageInfo": {"hasNextPage": end < self.nodes.len(), "endCursor": format!("page-{end}")},
+            "nodes": self.nodes[start..end],
         });
+        pr["commits"]["nodes"][0]["commit"]["oid"] = pr["headRefOid"].clone();
+        let contexts = &mut pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"];
+        // Do not invent selections absent from the request. Before the fix the
+        // old query therefore still returns its (truncated) nodes, without
+        // getting a pageInfo the real server would never have supplied.
+        let selection = query
+            .split("contexts(")
+            .nth(1)
+            .unwrap()
+            .split_once(')')
+            .unwrap()
+            .1;
+        if !selection.contains("pageInfo{hasNextPageendCursor}") {
+            contexts.as_object_mut().unwrap().remove("pageInfo");
+        }
+        match self.fault {
+            Some(CheckFault::MissingCursor) => contexts["pageInfo"]["endCursor"] = Value::Null,
+            Some(CheckFault::MissingPageInfo) => {
+                contexts.as_object_mut().unwrap().remove("pageInfo");
+            }
+            Some(CheckFault::NullNodes) => contexts["nodes"] = Value::Null,
+            Some(CheckFault::RepeatedCursor) if offset > 0 => {
+                contexts["pageInfo"] = json!({"hasNextPage": true, "endCursor": "page-100"});
+            }
+            Some(CheckFault::CountChanged) if offset > 0 => contexts["totalCount"] = json!(999),
+            Some(CheckFault::Endless) => {
+                contexts["totalCount"] = json!(100_000);
+                contexts["nodes"] = json!([self.nodes[0].clone()]);
+                contexts["pageInfo"] =
+                    json!({"hasNextPage": true, "endCursor": format!("page-{}", offset + 1)});
+            }
+            _ => {}
+        }
+        if offset > 0 {
+            match self.fault {
+                Some(CheckFault::HeadChanged) => {
+                    pr["headRefOid"] = json!("different-head");
+                    pr["commits"]["nodes"][0]["commit"]["oid"] = json!("different-head");
+                }
+                Some(CheckFault::CommitChanged) => {
+                    pr["commits"]["nodes"][0]["commit"]["oid"] = json!("different-head");
+                }
+                _ => {}
+            }
+        }
         pr
     }
 
     fn rest_pr(&self) -> Value {
         let number = self.pr["number"].as_u64().unwrap();
         json!({
-            "number": number, "title": "Qwen captured checks", "state": "open",
+            "number": number, "title": "Qwen captured checks", "state": if self.pr["state"] == "OPEN" { "open" } else { "closed" },
             "html_url": format!("https://github.com/QwenLM/qwen-code/pull/{number}"),
-            "draft": false, "head": {"ref": "fixture", "sha": self.pr["headRefOid"]},
+            "draft": false, "head": {"ref": "fixture", "sha": self.rest_head.as_ref().map_or_else(|| self.pr["headRefOid"].clone(), |h| json!(h))},
             "base": {"ref": "main"}, "user": {"login": "fixture"},
             "mergeable": true, "mergeable_state": "blocked", "updated_at": self.pr["updatedAt"],
         })
@@ -101,19 +172,38 @@ impl State {
                     json!({"errors": [{"message": "fixture check probe unavailable"}]}),
                 );
             }
-            // Accept a cursor supplied as a variable or inline in a follow-up
-            // query. The captured second page starts at the opaque MTAw cursor.
-            let next = body["variables"]
-                .as_object()
-                .is_some_and(|vars| vars.values().any(|v| v.as_str() == Some("MTAw")))
-                || query.contains("MTAw");
+            let compact: String = query.chars().filter(|c| !c.is_whitespace()).collect();
+            if !compact.contains("contexts(") {
+                return (
+                    200,
+                    json!({"data": {"repository": {"pullRequest": self.pr}}}),
+                );
+            }
+            let offset = bound_check_cursor(&compact, &body["variables"]);
+            if offset > 0 {
+                match self.fault {
+                    Some(CheckFault::ContinuationError) => {
+                        return (
+                            200,
+                            json!({"errors": [{"message": "continuation unavailable"}]}),
+                        )
+                    }
+                    Some(CheckFault::RateLimit) => {
+                        return (
+                            200,
+                            json!({"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}),
+                        )
+                    }
+                    _ => {}
+                }
+            }
             return (
                 200,
-                json!({"data": {"repository": {"pullRequest": self.graphql_pr(if next { 100 } else { 0 })}}}),
+                json!({"data": {"repository": {"pullRequest": self.graphql_pr(offset, &compact)}}}),
             );
         }
         if target.contains("/check-runs") {
-            if self.mode == ReadMode::Degraded {
+            if self.mode == ReadMode::Degraded || self.rest_unreadable {
                 return (404, json!({"message": "fixture checks unavailable"}));
             }
             let page = target
@@ -125,11 +215,25 @@ impl State {
                 .unwrap_or("1")
                 .parse::<usize>()
                 .unwrap();
+            match self.rest_fault {
+                Some(CheckFault::ContinuationError) if page > 1 => {
+                    return (404, json!({"message": "continuation unavailable"}))
+                }
+                Some(CheckFault::RateLimit) if page > 1 => {
+                    return (403, json!({"message": "API rate limit exceeded"}))
+                }
+                Some(CheckFault::NullNodes) => return (200, json!({})),
+                _ => {}
+            }
             let runs: Vec<Value> = self
                 .nodes
                 .iter()
                 .filter(|n| n["__typename"] == "CheckRun")
-                .skip((page - 1) * 100)
+                .skip(if self.rest_fault == Some(CheckFault::Endless) {
+                    0
+                } else {
+                    (page - 1) * 100
+                })
                 .take(100)
                 .map(|n| {
                     json!({
@@ -140,6 +244,11 @@ impl State {
                     })
                 })
                 .collect();
+            let runs = if self.rest_fault == Some(CheckFault::Endless) {
+                vec![runs[0].clone(); 100]
+            } else {
+                runs
+            };
             return (200, json!({"check_runs": runs}));
         }
         if target.contains("/rules/branches/")
@@ -156,6 +265,35 @@ impl State {
             return (200, json!({}));
         }
         panic!("unexpected Qwen fixture request: {target}");
+    }
+}
+
+// A next page is served ONLY when a declared variable is actually bound to
+// contexts(after:...). An unrelated variable or inline cursor token is not
+// enough to make a broken paginator pass these tests.
+fn bound_check_cursor(query: &str, vars: &Value) -> usize {
+    let args = query
+        .split("contexts(")
+        .nth(1)
+        .unwrap()
+        .split(')')
+        .next()
+        .unwrap();
+    let Some(after) = args.split(',').find_map(|a| a.strip_prefix("after:")) else {
+        return 0;
+    };
+    let var = after.strip_prefix('$').expect("cursor must be a variable");
+    assert!(
+        query.contains(&format!("${var}:String")),
+        "undeclared cursor: {query}"
+    );
+    match vars.get(var).and_then(Value::as_str) {
+        None => 0,
+        Some(value) => value
+            .strip_prefix("page-")
+            .expect("opaque returned cursor")
+            .parse()
+            .unwrap(),
     }
 }
 
@@ -199,6 +337,44 @@ impl MockQwen {
 
     pub fn edit(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.state.lock().unwrap());
+    }
+
+    pub fn assert_check_queries(&self) {
+        for request in self
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.contains("contexts("))
+        {
+            let body: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let query: String = body["query"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let selection = query.split("contexts(").nth(1).unwrap();
+            assert!(
+                selection.contains("pageInfo{hasNextPageendCursor}"),
+                "missing page metadata: {query}"
+            );
+            assert!(
+                selection.contains("totalCount"),
+                "missing total count: {query}"
+            );
+            assert!(query.contains("headRefOid"), "missing PR identity: {query}");
+            assert!(
+                query.contains("commit{oid"),
+                "missing rollup identity: {query}"
+            );
+            assert!(
+                selection.split(')').next().unwrap().contains("after:$"),
+                "cursor not bound: {query}"
+            );
+            bound_check_cursor(&query, &body["variables"]);
+        }
     }
 
     pub fn calls(&self, needle: &str) -> usize {

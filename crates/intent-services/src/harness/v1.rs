@@ -197,6 +197,9 @@ fn plural(n: i64) -> &'static str {
 /// `failed` → `passed` recovery IS reported, since it resolves a previously
 /// reported failure.
 fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
+    if old.checks_unobserved || new.checks_unobserved {
+        return Vec::new();
+    }
     let (o, n) = (&old.requirements.checks, &new.requirements.checks);
     let required_known = o.required_known && n.required_known;
     let by_name = |items: &[crate::pr_ops::MergeRequirementCheck]| {
@@ -1130,7 +1133,12 @@ impl Harness for V1 {
 
         // Suite completion: the last pending check finishing is reported as
         // ONE aggregate line (individual success lines are suppressed above).
-        if o.checks.pending > 0 && n.checks.pending == 0 && n.checks.total > 0 {
+        if !old.checks_unobserved
+            && !new.checks_unobserved
+            && o.checks.pending > 0
+            && n.checks.pending == 0
+            && n.checks.total > 0
+        {
             changes.push(if n.checks.failed == 0 {
                 format!("all checks passed ({})", n.checks.total)
             } else {

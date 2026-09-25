@@ -12,6 +12,8 @@
 #![cfg(unix)]
 
 mod common;
+#[path = "../../intent-sourcecontrol/tests/support/qwen.rs"]
+mod qwen;
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -361,6 +363,7 @@ impl SourceControl for StubForge {
                     started_at: None,
                 })
                 .collect(),
+            checks_head_sha: None,
             checks_known: true,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),
@@ -570,6 +573,10 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
 /// debounce is parked at an hour so a detected change stays pending until the
 /// test flushes it over the wire.
 async fn boot() -> Fixture {
+    boot_with_source_control(None).await
+}
+
+async fn boot_with_source_control(sc: Option<Arc<dyn SourceControl>>) -> Fixture {
     let dir_guard = common::test_tempdir("intentd-pr-monitor-");
     let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
@@ -593,7 +600,7 @@ async fn boot() -> Fixture {
         Services::new(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
-            .with_source_control(Arc::new(forge.clone()))
+            .with_source_control(sc.unwrap_or_else(|| Arc::new(forge.clone())))
             .with_pr_monitor_debounce_seconds(3600),
     );
     let api: Arc<dyn WorkspaceApi> = services.clone();
@@ -2922,4 +2929,147 @@ async fn full_revert_coalesces_to_empty_and_produces_no_owner_wake_over_wss() {
     )
     .await;
     assert_eq!(flushed, json!({ "ok": true, "flushed": false }));
+}
+
+/// Real HTTP adapter → services → TLS WSS, without wall-clock sleeps. Aged
+/// persisted anchors exercise normal poll/debounce delivery (no explicit flush).
+#[intent_test_macros::daemon_test]
+async fn qwen_checks_stay_quiet_and_recovery_delivers_once_over_wss() {
+    let mock = qwen::MockQwen::start(11506).await;
+    // Disable cheap fingerprint reuse. Every poll must compose the checklist
+    // again, while the head and all captured check timestamps remain unchanged.
+    mock.edit(|s| s.pr["updatedAt"] = json!(""));
+    let fx = boot_with_source_control(Some(mock.sc.clone())).await;
+    let (monitor, _) = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "QwenLM", "qwen-code", 11506)
+        .await
+        .unwrap();
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"workspaceId": fx.ws_id, "eventTypes": ["prMonitor:changed"]}),
+    )
+    .await;
+    for degraded in [false, true, false] {
+        mock.edit(|s| {
+            s.nodes.rotate_left(40);
+            s.mode = if degraded {
+                qwen::ReadMode::Degraded
+            } else {
+                qwen::ReadMode::Folded
+            };
+        });
+        let before = mock.calls("GetPrObservation");
+        fx.services.poll_pr_monitors().await;
+        assert!(mock.calls("GetPrObservation") > before);
+        let listed = wss_call(
+            &mut rpc,
+            2,
+            "prMonitor.list",
+            json!({"workspaceId": fx.ws_id}),
+        )
+        .await;
+        assert_eq!(listed["jsonrpc"], "2.0");
+        assert_eq!(listed["id"], 2);
+        assert!(listed.get("error").is_none(), "{listed}");
+        let row = &listed["result"]["monitors"][0];
+        assert_eq!(row["pendingChanges"], json!([]), "{row}");
+        assert_eq!(row["lastSnapshot"]["checks"]["total"], 35, "{row}");
+        assert!(!owner_messages(&fx).await.contains("pr_monitor_wake"));
+    }
+    // A new failure is invisible during the outage, then reported once when
+    // the complete observation recovers, despite older passing duplicates.
+    for (conclusion, when, transition) in [
+        (
+            "FAILURE",
+            "2026-09-25T06:00:00Z",
+            "check route: passed → failed",
+        ),
+        (
+            "SUCCESS",
+            "2026-09-25T06:01:00Z",
+            "check route: failed → passed",
+        ),
+    ] {
+        mock.edit(|s| {
+            s.mode = qwen::ReadMode::Degraded;
+            let mut newer = s
+                .nodes
+                .iter()
+                .find(|n| n["name"] == "route")
+                .unwrap()
+                .clone();
+            newer["startedAt"] = json!(when);
+            newer["conclusion"] = json!(conclusion);
+            s.nodes.push(newer);
+        });
+        fx.services.poll_pr_monitors().await;
+        mock.edit(|s| s.mode = qwen::ReadMode::Folded);
+        fx.services.poll_pr_monitors().await;
+        let event = next_event(&mut sub, "prMonitor:changed").await;
+        assert_eq!(event["data"]["monitorId"], monitor.monitor_id.as_str());
+        assert_eq!(
+            event["data"]["changes"],
+            json!([transition]),
+            "first event must be the real change: {event}"
+        );
+        assert!(
+            !owner_messages(&fx).await.contains(transition),
+            "debounce holds delivery"
+        );
+        let row = fx
+            .services
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(fx
+            .services
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: row.last_snapshot.as_deref(),
+                    baseline_snapshot: row.baseline_snapshot.as_deref(),
+                    pending_changes: &row.pending_changes,
+                    pending_since: Some("2020-01-01T00:00:00Z"),
+                    last_change_at: Some("2020-01-01T00:00:00Z"),
+                    last_polled_at: row.last_polled_at.as_deref(),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                }
+            )
+            .await
+            .unwrap());
+        fx.services.poll_pr_monitors().await;
+        let delivered = wss_call(
+            &mut rpc,
+            3,
+            "prMonitor.list",
+            json!({"workspaceId": fx.ws_id}),
+        )
+        .await;
+        assert_eq!(
+            delivered["result"]["monitors"][0]["pendingChanges"],
+            json!([])
+        );
+        assert_eq!(owner_messages(&fx).await.matches(transition).count(), 1);
+        mock.edit(|s| s.nodes.reverse());
+        fx.services.poll_pr_monitors().await;
+        assert_eq!(owner_messages(&fx).await.matches(transition).count(), 1);
+        let settled = wss_rpc(
+            &mut rpc,
+            4,
+            "prMonitor.list",
+            json!({"workspaceId": fx.ws_id}),
+        )
+        .await;
+        assert_eq!(settled["monitors"][0]["pendingChanges"], json!([]));
+    }
+    mock.assert_check_queries();
 }
