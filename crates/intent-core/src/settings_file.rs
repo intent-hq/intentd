@@ -1624,8 +1624,9 @@ fn toml_table_remove(table: &mut toml::Table, path: &str) -> Option<toml::Value>
 /// [`SettingsFile::load_or_init`] when no file exists. Every key appears with
 /// its default value (or a commented-out example when there is no default),
 /// annotated with its catalog label and description — except
-/// `agentFeatures.taskGraph`, deliberately not seeded so configs without the
-/// key track default flips automatically (intent-hq/monorepo#2643).
+/// `agentFeatures.taskGraph` (intent-hq/monorepo#2643) and
+/// `agentFeatures.peerAgents`, deliberately not seeded so configs without
+/// those keys track default flips automatically.
 /// Parsing this template must yield exactly [`SettingsFile::default`]
 /// (enforced by a unit test).
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret settings).
