@@ -18230,6 +18230,7 @@ pub(crate) mod pr {
                         started_at: None,
                     },
                 ],
+                checks_head_sha: None,
                 checks_known: true,
                 branch_rules: Some(BranchRules {
                     required_approving_review_count: Some(2),

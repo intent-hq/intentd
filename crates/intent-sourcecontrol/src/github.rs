@@ -988,16 +988,13 @@ fn parse_review_decision(data: &Value) -> Option<ReviewDecision> {
     }
 }
 
-/// Known ceiling: `contexts(first: 100)` is a single unpaginated page, so a
-/// PR whose rollup exceeds 100 contexts (very large CI matrices) silently
-/// truncates — checks beyond the page are invisible to the requirements
-/// probe, and a monitor diffing two truncated pages can report phantom
-/// "check removed" lines for whatever fell off. Paginating `contexts` is the
-/// complete fix if that ceiling is ever hit in practice.
+/// The first page of a head-bound check observation. Both entrypoints drain
+/// the connection through `graphql_with_all_checks` before trusting it.
 const MERGE_REQUIREMENTS_QUERY: &str = r"
-query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
+query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!, $checksCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
+      headRefOid
       mergeStateStatus
       isInMergeQueue
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
@@ -1013,8 +1010,11 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
       commits(last: 1) {
         nodes {
           commit {
+            oid
             statusCheckRollup {
-              contexts(first: 100) {
+              contexts(first: 100, after: $checksCursor) {
+                pageInfo { hasNextPage endCursor }
+                totalCount
                 nodes {
                   __typename
                   ... on CheckRun {
@@ -1082,8 +1082,8 @@ fn without_merge_queue_selections(query: &str) -> String {
 ///
 /// Windows: `reviews(last: 100)` and `reviewThreads(first: 100)` are single
 /// pages; `pageInfo` tells the caller when a PR outgrew them so it can take
-/// the paged reads instead of trusting a truncated tally. `contexts(first:
-/// 100)` keeps the probe's known ceiling.
+/// the paged reads instead of trusting a truncated tally. Check contexts are
+/// drained across pages with a consistent head before the observation returns.
 ///
 /// Count parity: the `totalCount`s are unbounded, but the per-signal reads
 /// they replace are not — `list_comments` is a single `per_page=100` page
@@ -1093,7 +1093,7 @@ fn without_merge_queue_selections(query: &str) -> String {
 /// per-signal reads on a busy PR would report a different count for the
 /// same forge state and fabricate a new-comment change.
 const PR_OBSERVATION_QUERY: &str = r"
-query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!) {
+query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checksCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
       number
@@ -1123,8 +1123,11 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!) {
       commits(last: 1) {
         nodes {
           commit {
+            oid
             statusCheckRollup {
-              contexts(first: 100) {
+              contexts(first: 100, after: $checksCursor) {
+                pageInfo { hasNextPage endCursor }
+                totalCount
                 nodes {
                   __typename
                   ... on CheckRun {
@@ -1232,6 +1235,10 @@ fn parse_merge_requirement_signals(data: &Value) -> MergeRequirementSignals {
             .map(|nodes| nodes.iter().filter_map(map_rollup_context).collect())
             .unwrap_or_default(),
         checks_known: rollup.is_some(),
+        checks_head_sha: pr
+            .and_then(|p| p.get("headRefOid"))
+            .and_then(Value::as_str)
+            .map(String::from),
         branch_rules: None,
         // Absent on hosts that do not report it: degrades to `None`.
         is_in_merge_queue: pr
@@ -1913,7 +1920,8 @@ impl SourceControl for GitHubSourceControl {
 
     async fn list_reviews(&self, repo: &RepoRef, number: u64) -> Result<Vec<Review>> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
-        self.rest_collect_all(&route, |v| v, map_review).await
+        self.rest_collect_all(&route, false, |v| v, map_review)
+            .await
     }
 
     async fn review_decision(&self, repo: &RepoRef, number: u64) -> Result<Option<ReviewDecision>> {
@@ -1936,7 +1944,7 @@ impl SourceControl for GitHubSourceControl {
         number: u64,
     ) -> Result<MergeRequirementSignals> {
         let data = self
-            .graphql_tolerating_merge_queue_schema(MERGE_REQUIREMENTS_QUERY, repo, number)
+            .graphql_with_all_checks(MERGE_REQUIREMENTS_QUERY, repo, number)
             .await?;
         let mut signals = parse_merge_requirement_signals(&data);
 
@@ -1977,7 +1985,7 @@ impl SourceControl for GitHubSourceControl {
 
     async fn pr_observation(&self, repo: &RepoRef, number: u64) -> Result<Option<PrObservation>> {
         let data = self
-            .graphql_tolerating_merge_queue_schema(PR_OBSERVATION_QUERY, repo, number)
+            .graphql_with_all_checks(PR_OBSERVATION_QUERY, repo, number)
             .await?;
         let pr = data
             .pointer("/repository/pullRequest")
@@ -2132,14 +2140,12 @@ impl SourceControl for GitHubSourceControl {
 
     async fn check_runs(&self, repo: &RepoRef, git_ref: &str) -> Result<Vec<CheckRun>> {
         let route = Self::repo_path(repo, &format!("/commits/{git_ref}/check-runs"));
-        // The check-runs payload nests the item array under `check_runs`.
+        // Missing data and a page-cap stop are unreadable, not authoritative
+        // empty/partial checks. The monitor must retain its last observation.
         self.rest_collect_all(
             &route,
-            |v| {
-                v.get("check_runs")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()))
-            },
+            true,
+            |v| v.get("check_runs").cloned().unwrap_or(Value::Null),
             map_check_run,
         )
         .await
@@ -2228,10 +2234,12 @@ impl GitHubSourceControl {
     /// Fetch a REST listing to exhaustion: request `per_page=100` pages from
     /// page 1, extract each page's item array with `extract`, map items with
     /// `map`, and stop on a short page or at the [`REST_EXHAUSTIVE_MAX_PAGES`]
-    /// safety cap (see [`rest_fetch_next_page`]).
+    /// safety cap (see [`rest_fetch_next_page`]). `require_complete` makes a
+    /// cap stop an error rather than returning a partial check observation.
     async fn rest_collect_all<T>(
         &self,
         route: &str,
+        require_complete: bool,
         extract: impl Fn(Value) -> Value,
         map: impl Fn(Value) -> Result<T>,
     ) -> Result<Vec<T>> {
@@ -2250,11 +2258,113 @@ impl GitHubSourceControl {
                 out.push(map(item)?);
             }
             if !rest_fetch_next_page(page, fetched, per_page) {
+                if require_complete && fetched as u64 == per_page {
+                    return Err(Error::Decode(
+                        "incomplete check-runs observation: page limit exceeded".into(),
+                    ));
+                }
                 break;
             }
             page += 1;
         }
         Ok(out)
+    }
+
+    /// Collect the whole rollup or fail the read: no partial vector escapes.
+    /// Re-query the PR so each page's head and commit OID can be checked against
+    /// page one, retaining that first page's other signals. Cursor cycles,
+    /// malformed metadata, count changes and the safety cap are errors; callers
+    /// may retry via their ordinary fallback/poll path. Quota errors propagate.
+    async fn graphql_with_all_checks(
+        &self,
+        query: &str,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Value> {
+        const MAX_PAGES: usize = 100;
+        const COMMIT: &str = "/repository/pullRequest/commits/nodes/0/commit";
+        let mut data = self
+            .graphql_tolerating_merge_queue_schema(query, repo, number, None)
+            .await?;
+        // A missing rollup retains the existing REST fallback. An existing
+        // connection with missing/invalid metadata must not be trusted instead.
+        if data
+            .pointer(&format!("{COMMIT}/statusCheckRollup"))
+            .is_none_or(Value::is_null)
+        {
+            return Ok(data);
+        }
+        let invalid =
+            |reason: &str| Error::Decode(format!("incomplete PR check observation: {reason}"));
+        let head = data
+            .pointer("/repository/pullRequest/headRefOid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("missing head"))?
+            .to_string();
+        let mut page = data.clone();
+        let mut contexts = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
+        let mut expected_total = None;
+        for _ in 0..MAX_PAGES {
+            if page
+                .pointer("/repository/pullRequest/headRefOid")
+                .and_then(Value::as_str)
+                != Some(&head)
+                || page
+                    .pointer(&format!("{COMMIT}/oid"))
+                    .and_then(Value::as_str)
+                    != Some(&head)
+            {
+                return Err(invalid("head changed during collection"));
+            }
+            let connection = page
+                .pointer(&format!("{COMMIT}/statusCheckRollup/contexts"))
+                .ok_or_else(|| invalid("missing connection"))?;
+            let nodes = connection
+                .get("nodes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid("missing nodes"))?;
+            if nodes.iter().any(|n| map_rollup_context(n).is_none()) {
+                return Err(invalid("unreadable context"));
+            }
+            let total = connection
+                .get("totalCount")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid("missing total count"))?;
+            if *expected_total.get_or_insert(total) != total {
+                return Err(invalid("context count changed during collection"));
+            }
+            contexts.extend(nodes.iter().cloned());
+            let more = connection
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid("missing page info"))?;
+            if !more {
+                if contexts.len() as u64 != total {
+                    return Err(invalid("context count does not match collected pages"));
+                }
+                *data
+                    .pointer_mut(ROLLUP_CONTEXTS_POINTER)
+                    .expect("first page has nodes") = json!(contexts);
+                return Ok(data);
+            }
+            let cursor = connection
+                .pointer("/pageInfo/endCursor")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| invalid("missing continuation cursor"))?;
+            if !cursors.insert(cursor.to_string()) {
+                return Err(invalid("repeated continuation cursor"));
+            }
+            if cursors.len() == MAX_PAGES {
+                break;
+            }
+            page = self
+                .graphql_tolerating_merge_queue_schema(query, repo, number, Some(cursor))
+                .await?;
+        }
+        Err(invalid("page limit exceeded"))
     }
 
     /// Run a per-PR GraphQL `query` (the merge-requirements probe or the
@@ -2267,11 +2377,13 @@ impl GitHubSourceControl {
         query: &str,
         repo: &RepoRef,
         number: u64,
+        checks_cursor: Option<&str>,
     ) -> Result<Value> {
         let variables = json!({
             "owner": repo.owner,
             "repo": repo.name,
             "prNumber": number,
+            "checksCursor": checks_cursor,
         });
         let payload = json!({ "query": query, "variables": variables });
         let resp: Value = match self.client.graphql(&payload).await {
@@ -2823,6 +2935,7 @@ mod tests {
                 url: None,
                 started_at: None,
             }],
+            checks_head_sha: None,
             checks_known: true,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),
