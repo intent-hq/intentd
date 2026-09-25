@@ -319,14 +319,8 @@ fn fixture_launch_is_selected() {
     // fixture executable before doctor can run any provider check.
     let root = fs::canonicalize(config.parent().unwrap()).unwrap();
     match (expected.as_str(), launch.selection()) {
-        ("managed", ProviderLaunch::Managed { npx, .. }) => {
+        ("managed" | "override" | "discovered", ProviderLaunch::Managed { npx, .. }) => {
             assert_eq!(fs::canonicalize(npx).unwrap(), root.join("bin/npx"));
-        }
-        ("override" | "discovered", ProviderLaunch::Local(binary)) => {
-            assert_eq!(
-                fs::canonicalize(&binary.path).unwrap(),
-                root.join("node_modules/@agentclientprotocol/codex-acp/dist/index.js")
-            );
         }
         _ => panic!("host provider resolution escaped the doctor fixture"),
     }
@@ -348,32 +342,30 @@ fn default_managed_reports_configuration_without_materializing_or_querying() {
     assert!(fixture.events().is_empty());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn default_local_measures_selected_dependency_and_ignores_path_codex() {
+fn default_ignores_configured_adapter_without_measuring_its_dependency() {
     let fixture = Fixture::new("override", &json!({}));
     let stdout = fixture.run(false);
-    assert!(stdout.contains("selected adapter: providers.paths override"));
-    assert!(stdout.contains("measured adapter version: 1.13.1"));
-    assert!(stdout.contains("measured runtime version: 0.333.4"));
-    assert!(stdout.contains("runtime source: selected adapter dependency"));
+    assert!(stdout.contains("selected adapter: managed npm package"));
+    assert!(stdout.contains("local adapters and CODEX_PATH ignored"));
+    assert!(stdout.contains("no package was installed"));
+    assert!(!stdout.contains("[ok] measured"));
     assert!(!stdout.contains("99.99.99"));
-    let events = fixture.events();
-    assert_eq!(events.len(), 2);
-    assert!(events.iter().all(|event| event["version"] == true));
+    assert!(fixture.events().is_empty());
 }
 
 #[test]
-fn default_local_discovery_is_distinct_from_an_override() {
+fn default_ignores_path_adapter_without_materializing_or_querying() {
     let fixture = Fixture::new("discovered", &json!({}));
     assert!(fixture
         .run(false)
-        .contains("selected adapter: local discovery"));
+        .contains("selected adapter: managed npm package"));
+    assert!(fixture.events().is_empty());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn local_runtime_override_follows_production_selection() {
+fn live_ignores_runtime_override_and_uses_the_pinned_adapter_dependency() {
     let fixture = Fixture::new("override", &json!({}));
     let selected = fixture.root.path().join("override/bin/codex.js");
     executable(
@@ -385,18 +377,26 @@ fn local_runtime_override_follows_production_selection() {
         r#"{"name":"@openai/codex","version":"0.444.5","bin":{"codex":"bin/codex.js"}}"#,
     )
     .unwrap();
-    let mut command = fixture.doctor_command(false);
+    let mut command = fixture.doctor_command(true);
     command.env("CODEX_PATH", &selected);
+    command.env("CODEX_CONFIG", "credential-canary");
     let (success, stdout) = fixture.run_command(command);
     assert!(success);
-    assert!(stdout.contains("runtime source: effective CODEX_PATH override"));
-    assert!(stdout.contains("measured runtime version: 0.444.5"));
-    assert!(!stdout.contains("measured runtime version: 0.333.4"));
+    assert!(stdout.contains("runtime source: selected adapter dependency"));
+    assert!(!stdout.contains("0.444.5"));
+    assert!(stdout.contains("measured runtime version: 0.333.4"));
+    assert!(stdout.contains("ACP catalog: advertised"));
+    assert!(stdout.contains("raw runtime catalog: advertised"));
+    assert!(fixture
+        .events()
+        .iter()
+        .filter(|event| event["started"] == true)
+        .all(|event| event["codexPath"].is_null()));
     fixture.assert_clean();
 }
 
 #[test]
-fn default_opaque_adapter_is_unknown_without_execution() {
+fn default_ignores_opaque_local_adapter_without_execution() {
     let fixture = Fixture::new("override", &json!({}));
     let marker = fixture.root.path().join("opaque-adapter-ran");
     executable(
@@ -407,11 +407,8 @@ fn default_opaque_adapter_is_unknown_without_execution() {
         ),
     );
     let stdout = fixture.run(false);
-    assert!(stdout.contains(if cfg!(target_os = "macos") {
-        "process probes are unsupported on macOS"
-    } else {
-        "wrapper or native adapter cannot be inspected"
-    }));
+    assert!(stdout.contains("selected adapter: managed npm package"));
+    assert!(stdout.contains("no package was installed"));
     assert!(fixture.events().is_empty());
 }
 
@@ -421,6 +418,7 @@ fn live_managed_uses_resolved_package_and_reports_original_catalog_fields() {
     let fixture = Fixture::new("managed", &json!({}));
     let mut command = fixture.doctor_command(true);
     command.env("CODEX_PATH", fixture.root.path().join("bin/codex"));
+    command.env("CODEX_CONFIG", "credential-canary");
     let (success, stdout) = fixture.run_command(command);
     assert!(success);
     fixture.assert_clean();
@@ -559,18 +557,20 @@ fn sensitive_ids_and_metadata_are_withheld_from_both_output_streams() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn local_version_timeout_and_invalid_output_are_safe_unknowns() {
+fn materialized_version_timeout_and_invalid_output_are_safe_unknowns() {
     let fixture = Fixture::new(
         "override",
         &json!({"versionRaw":"timeout","versionAcp":"invalid"}),
     );
-    let stdout = fixture.run(false);
+    let stdout = fixture.run(true);
     assert!(stdout.contains("adapter version: unknown (local output was not a recognized version)"));
     assert!(stdout.contains("runtime version: unknown (local check exceeded its deadline)"));
     assert!(fixture
         .events()
         .iter()
-        .all(|event| event["version"] == true));
+        .any(|event| event["version"] == true));
+    assert!(stdout.contains("ACP catalog: advertised"));
+    assert!(stdout.contains("raw runtime catalog: advertised"));
 }
 
 #[cfg(target_os = "linux")]
@@ -624,23 +624,13 @@ fn doctor_help_discloses_opt_in_and_its_limits() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_local_selection_and_metadata_never_execute_provider_or_path_codex() {
+fn macos_ignored_local_adapters_never_execute_or_supply_metadata() {
     for selection in ["override", "discovered"] {
         let fixture = Fixture::new(selection, &json!({}));
         let stdout = fixture.run(false);
-        let pin = intent_providers::config::CODEX_ACP_NPX_PACKAGE
-            .rsplit_once('@')
-            .unwrap()
-            .1;
-        assert!(stdout.contains(&format!(
-            "adapter package version (metadata, not measured): {pin}"
-        )));
-        assert!(stdout.contains(if selection == "override" {
-            "providers.paths override"
-        } else {
-            "local discovery"
-        }));
-        assert!(stdout.contains("process probes are unsupported on macOS"));
+        assert!(stdout.contains("selected adapter: managed npm package"));
+        assert!(!stdout.contains("adapter package version"));
+        assert!(stdout.contains("version and fresh catalog probes are unsupported"));
         assert!(stdout.contains("runtime source: unknown"));
         assert!(!stdout.contains("[ok] measured"));
         assert!(!stdout.contains("99.99.99"));
@@ -684,13 +674,13 @@ fn macos_catalog_rejection_precedes_npm_authentication_and_probe_state() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_malformed_metadata_is_not_reported_as_a_version_or_an_error_payload() {
+fn macos_ignored_adapter_metadata_is_not_reported_as_a_version_or_error_payload() {
     let fixture = Fixture::new("override", &json!({}));
     fs::write(fixture.adapter.parent().unwrap().parent().unwrap().join("package.json"),
         json!({"name":"@agentclientprotocol/codex-acp", "version":"credential-canary", "bin":{"codex-acp":"dist/index.js"}}).to_string()).unwrap();
     let stdout = fixture.run(false);
     assert!(!stdout.contains("adapter package version"));
     assert!(!stdout.contains("[ok] measured"));
-    assert!(stdout.contains("process probes are unsupported on macOS"));
+    assert!(stdout.contains("version and fresh catalog probes are unsupported"));
     assert!(fixture.events().is_empty());
 }

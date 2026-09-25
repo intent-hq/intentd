@@ -117,9 +117,10 @@ enum Command {
         /// catalog allows 30 seconds, plus local inspection/startup/cleanup
         /// budgets. Missing models and partial failures remain advisory; catalog
         /// membership does not verify account entitlement. Without this flag,
-        /// Codex checks only local provenance/versions and never resolves npm.
-        /// On macOS, only launch selection and local package metadata are
-        /// inspected: version and catalog process probes are unsupported,
+        /// Codex reports the pinned launch and Node.js/npx prerequisites without
+        /// resolving npm. Configured/PATH adapters and CODEX_PATH are ignored.
+        /// Package metadata is meaningful only for an established selected
+        /// entrypoint. On macOS, version and catalog process probes are unsupported,
         /// because descendant cleanup cannot be guaranteed. No npm resolution
         /// or diagnostic authentication capture occurs on macOS.
         #[arg(long)]
@@ -6933,17 +6934,21 @@ async fn report_provider_availability(config: &Config, codex_models: bool) {
             continue;
         }
         if provider.id == "codex" {
-            // Binary discovery alone says nothing about the fallback package's
+            // Node+npx availability says nothing about the pinned package's
             // runtime. Only the safe diagnostic report supplies that evidence;
             // do not run an opaque adapter as a generic auth/version probe.
-            println!(
-                "  [--] codex-acp named binary: {} (availability only)",
-                if provider.installed {
-                    "found"
-                } else {
-                    "not found"
-                }
-            );
+            if provider.installed {
+                println!("  [ok] codex Node.js/npx prerequisites: available");
+            } else {
+                println!(
+                    "{}",
+                    npx_provider_availability_line(
+                        "codex",
+                        intent_providers::CODEX_ACP_NPX_PACKAGE,
+                        None
+                    )
+                );
+            }
             doctor_codex::report(settings.clone(), codex_models).await;
             continue;
         }

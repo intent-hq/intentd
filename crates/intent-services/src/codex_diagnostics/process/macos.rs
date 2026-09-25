@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(report.report.runtime_source, RuntimeSource::Unknown);
         assert!(report.report.runtime_path.is_none());
         assert!(report.runtime.is_none());
-        assert!(!report.report.removes_codex_overrides);
+        assert!(report.report.removes_codex_overrides);
     }
 
     #[tokio::test]

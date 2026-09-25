@@ -823,25 +823,64 @@ child.on('exit',code=>process.exit(code||0));
     }
 
     #[tokio::test]
-    async fn local_runtime_override_is_used_by_both_phases() {
+    async fn catalog_launch_keeps_the_production_policy_and_ignores_runtime_overrides() {
         let fixture = Fixture::new(&json!({}));
         let custom = Fixture::new(&json!({"model":"custom-model"}));
-        let mut launch = fixture.launch(false);
-        launch.codex_path = Some(custom.runtime.clone().into_os_string());
+        let mut launch = fixture.launch(true);
+        let mut options = launch.spawn_options();
+        options
+            .extra_env
+            .insert("CODEX_PATH".into(), custom.runtime.display().to_string());
+        options
+            .extra_env
+            .insert("CODEX_CONFIG".into(), "credential-canary".into());
+        let command = intent_acp::spawn::build_command(&options);
+        launch.codex_path = super::super::super::effective_env(&command, "CODEX_PATH");
+        assert!(launch.codex_path.is_none());
         let report = launch
             .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
             .await;
         assert_eq!(
             report.runtime.runtime_source,
-            RuntimeSource::EnvironmentOverride
+            RuntimeSource::AdapterDependency
         );
-        assert_eq!(catalog(&report.raw).models[0].id, "custom-model");
+        assert_eq!(catalog(&report.raw).models[0].id, "fixture-model");
+        assert!(matches!(report.acp, CatalogOutcome::Success(_)));
         let boot = fixture
             .events()
             .into_iter()
             .find(|v| v["started"] == true)
             .unwrap();
-        assert_eq!(boot["codexPath"], json!(custom.runtime));
+        assert!(boot["codexPath"].is_null());
+        fixture.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn missing_prerequisites_never_fall_back_to_a_local_adapter() {
+        let fixture = Fixture::new(&json!({}));
+        let mut launch = fixture.launch(false);
+        launch.selection = ProviderLaunch::Bare { command: "npx" };
+        let inspection = launch.inspect_local().await;
+        assert_eq!(inspection.report.launch_source, LaunchSource::Unresolved);
+        assert_eq!(
+            inspection.report.runtime_version,
+            VersionMeasurement::Unknown(UnknownReason::AdapterNotFound)
+        );
+        assert!(UnknownReason::AdapterNotFound
+            .message()
+            .contains("Node.js with npx"));
+        let report = launch
+            .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
+            .await;
+        assert_eq!(
+            report.acp,
+            CatalogOutcome::Failed(CatalogFailure::AdapterUnavailable)
+        );
+        assert_eq!(
+            report.raw,
+            CatalogOutcome::Failed(CatalogFailure::RuntimeUnverified)
+        );
+        assert!(fixture.events().is_empty());
         fixture.assert_clean();
     }
 }

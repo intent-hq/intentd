@@ -144,7 +144,7 @@ mod unix {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn local_and_managed_report_distinct_measured_versions_never_path_codex() {
+    async fn direct_inspector_and_materialized_package_never_measure_path_codex() {
         let local = Fixture::new("2.4.6", "0.222.3");
         let launch = local.local(ProviderBinarySource::SettingsOverride);
         let result = launch.inspect_local().await;
@@ -162,7 +162,7 @@ mod unix {
             result.report.runtime_source,
             RuntimeSource::AdapterDependency
         );
-        assert!(!result.report.removes_codex_overrides);
+        assert!(result.report.removes_codex_overrides);
         assert!(!local.path_marker.exists());
 
         let pin = CODEX_ACP_NPX_PACKAGE.rsplit_once('@').unwrap().1;
@@ -527,11 +527,11 @@ mod unix {
     }
 
     #[tokio::test]
-    async fn production_command_scrubs_managed_overrides_and_preserves_local_ones() {
+    async fn production_command_enforces_codex_policy_for_every_launch_tier() {
         let fixture = Fixture::new("2.4.6", "0.222.3");
-        for (launch, managed) in [
-            (fixture.managed(), true),
-            (fixture.local(ProviderBinarySource::SettingsOverride), false),
+        for launch in [
+            fixture.managed(),
+            fixture.local(ProviderBinarySource::SettingsOverride),
         ] {
             let mut options = launch.spawn_options();
             options
@@ -541,10 +541,11 @@ mod unix {
                 .extra_env
                 .insert("CODEX_CONFIG".into(), "private config".into());
             let command = build_command(&options);
-            for key in ["CODEX_PATH", "CODEX_CONFIG"] {
-                let value = effective_env(&command, key);
-                assert_eq!(value.is_none(), managed);
-            }
+            assert!(effective_env(&command, "CODEX_PATH").is_none());
+            assert_eq!(
+                effective_env(&command, "CODEX_CONFIG").as_deref(),
+                Some(OsStr::new(CODEX_SUBAGENT_POLICY_CONFIG))
+            );
         }
     }
 

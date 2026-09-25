@@ -31,7 +31,7 @@ pub async fn report(settings: SettingsFile, live: bool) {
         let inspection = launch.inspect_local().await;
         print!("{}", render_runtime(&inspection.report));
         if cfg!(target_os = "macos") {
-            println!("    macOS diagnostics inspect selection and local package metadata only; version and fresh catalog probes are unsupported.");
+            println!("    macOS diagnostics report the pinned launch without resolving its package; version and fresh catalog probes are unsupported.");
         } else {
             println!("    Fresh catalogs not requested; use intentd doctor --codex-models (may download the managed package).");
         }
@@ -50,17 +50,12 @@ fn render_runtime(report: &CodexRuntimeReport) -> String {
     writeln!(text, "    launch program: {}", report.launch_program).unwrap();
     writeln!(
         text,
-        "    configured managed package (not a measured version): {}{}",
-        report.configured_package,
-        if report.launch_source == LaunchSource::ManagedNpm {
-            ""
-        } else {
-            " (fallback only)"
-        }
+        "    configured managed package (not a measured version): {}",
+        report.configured_package
     )
     .unwrap();
     if report.removes_codex_overrides {
-        text.push_str("    managed launch policy: CODEX_PATH and CODEX_CONFIG removed\n");
+        text.push_str("    launch policy: local adapters and CODEX_PATH ignored; CODEX_CONFIG replaced with Intent's fixed subagent policy\n");
     }
     if let Some(path) = &report.adapter_path {
         writeln!(text, "    adapter path: {path}").unwrap();
@@ -224,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_override_has_its_own_provenance() {
+    fn direct_inspector_runtime_override_has_its_own_provenance() {
         let mut report = runtime();
         report.launch_source = LaunchSource::SettingsOverride;
         report.removes_codex_overrides = false;
@@ -232,10 +227,10 @@ mod tests {
         report.runtime_path = Some("/fixture/override.js".into());
         report.runtime_version = VersionMeasurement::Measured("0.333.4".into());
         let text = render_runtime(&report);
-        assert!(text.contains("(fallback only)"));
+        assert!(text.contains("configured managed package (not a measured version)"));
         assert!(text.contains("runtime source: effective CODEX_PATH override"));
         assert!(text.contains("measured runtime version: 0.333.4"));
-        assert!(!text.contains("managed launch policy"));
+        assert!(!text.contains("launch policy:"));
     }
 
     #[test]

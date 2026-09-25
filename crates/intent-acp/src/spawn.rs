@@ -168,18 +168,6 @@ pub enum LaunchMode {
     BareCommand,
 }
 
-/// Redirecting Codex variables removed by managed npm launches. Local
-/// adapters retain these overrides. Diagnostics and catalog probes use this
-/// same policy rather than carrying another environment-removal list.
-#[must_use]
-pub fn codex_managed_env_removals(provider_id: &str, via_npx: bool) -> &'static [&'static str] {
-    if provider_id == "codex" && via_npx {
-        &["CODEX_PATH", "CODEX_CONFIG"]
-    } else {
-        &[]
-    }
-}
-
 /// The neutral directory an npx launch starts in (intent-hq/intent#5738).
 /// Created per spawn under [`SpawnOptions::npx_launch_root`] (owner-only on
 /// Unix, named `intent_core::NPX_LAUNCH_DIR_PREFIX` + uuid so a launch root

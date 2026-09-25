@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use intent_acp::spawn::{build_command, SpawnOptions};
 use intent_core::settings_file::SettingsFile;
-use intent_providers::config::CODEX_ACP_NPX_PACKAGE;
-use intent_providers::discover::{resolve_fallback_launch, ProviderBinarySource, ProviderLaunch};
+use intent_providers::config::{CODEX_ACP_NPX_PACKAGE, CODEX_SUBAGENT_POLICY_CONFIG};
+use intent_providers::discover::{ProviderBinarySource, ProviderLaunch};
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -70,7 +70,7 @@ impl UnknownReason {
             Self::ManagedPackageNotInspected => {
                 "selected npm package has not been inspected; no package was installed"
             }
-            Self::AdapterNotFound => "adapter and npm fallback are unavailable",
+            Self::AdapterNotFound => intent_providers::CODEX_ACP_PREREQUISITE_ERROR,
             Self::NodeNotFound => "Node is unavailable for local package inspection",
             Self::OpaqueAdapter => {
                 "wrapper or native adapter cannot be inspected without executing unverified code"
@@ -121,7 +121,8 @@ pub struct CodexRuntimeReport {
     pub launch_program: String,
     /// Configuration, never a measured version (also shown for local launches).
     pub configured_package: &'static str,
-    /// Whether production removes `CODEX_PATH` and `CODEX_CONFIG` for this launch.
+    /// Whether production removes `CODEX_PATH` and replaces `CODEX_CONFIG`
+    /// with Intent's fixed subagent policy for this launch.
     pub removes_codex_overrides: bool,
     pub adapter_path: Option<String>,
     /// Declared package.json version, never evidence from executing the adapter.
@@ -165,16 +166,18 @@ pub struct CodexLaunch {
 }
 
 impl CodexLaunch {
-    /// Uses the same settings, discovery, fallback, and environment policy as
-    /// production. Discovery may do the existing bounded login-shell capture;
+    /// Uses production's pinned npm selection and environment policy. Codex
+    /// ignores configured and discovered local adapters. Discovery may perform
+    /// the existing bounded login-shell capture;
     /// async callers should perform this synchronous step off their executor.
     #[must_use]
-    pub fn discover(settings: &SettingsFile) -> Self {
-        let provider = intent_providers::provider_config("codex");
-        let selection = resolve_fallback_launch(
-            provider,
-            settings.providers.paths.get("codex").map(String::as_str),
-        );
+    pub fn discover(_settings: &SettingsFile) -> Self {
+        let selection = intent_providers::find_codex_npx()
+            .map(|npx| ProviderLaunch::Managed {
+                npx,
+                package: CODEX_ACP_NPX_PACKAGE,
+            })
+            .unwrap_or(ProviderLaunch::Bare { command: "npx" });
         let command = build_command(&spawn_options(&selection));
         Self {
             selection,
@@ -254,11 +257,12 @@ impl CodexLaunch {
                 launch_source,
                 launch_program: safe_text(&program.to_string_lossy()),
                 configured_package: CODEX_ACP_NPX_PACKAGE,
-                removes_codex_overrides: !intent_acp::spawn::codex_managed_env_removals(
-                    "codex",
-                    self.spawn_options().via_npx(),
-                )
-                .is_empty(),
+                removes_codex_overrides: {
+                    let command = build_command(&self.spawn_options());
+                    effective_env(&command, "CODEX_PATH").is_none()
+                        && effective_env(&command, "CODEX_CONFIG").as_deref()
+                            == Some(OsStr::new(CODEX_SUBAGENT_POLICY_CONFIG))
+                },
                 adapter_path: None,
                 adapter_package_version: None,
                 adapter_version: VersionMeasurement::Unknown(reason),

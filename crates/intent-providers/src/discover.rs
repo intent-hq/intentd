@@ -555,9 +555,8 @@ fn find_provider_binary_with_home_and_dirs(
     .map(|found| found.path)
 }
 
-/// Selection for providers that discover a local binary before an optional
-/// pinned npm fallback (Codex). These are the inputs to ACP's launch policy;
-/// a bare command is retained when neither discovery nor npx succeeds.
+/// Selected inputs to ACP's launch policy. Local-first providers may use a
+/// pinned npm fallback; npx-only Codex uses production's Node+npx resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderLaunch {
     Local(ProviderBinary),
@@ -1043,7 +1042,7 @@ mod find_provider_binary_tests {
     use std::fs;
 
     #[test]
-    fn codex_launch_records_the_selecting_tier_and_preserves_fallback_policy() {
+    fn local_first_launch_records_the_selecting_tier_and_fallback_policy() {
         let dir = unique_temp_dir("codex-launch");
         let local = dir.path().join(if cfg!(windows) {
             "codex-acp.exe"
@@ -1058,7 +1057,12 @@ mod find_provider_binary_tests {
         make_executable(&local);
         make_executable(&explicit);
         let dirs = vec![dir.path().to_path_buf()];
-        let provider = crate::provider_config("codex");
+        // A synthetic local-first provider exercises the generic selector.
+        // Production Codex is npx-only and deliberately does not use it.
+        let mut config = *crate::provider_config("codex");
+        config.npx_only_package = None;
+        config.fallback_npx_package = Some(crate::config::CODEX_ACP_NPX_PACKAGE);
+        let provider = &config;
         let resolve = |setting, dirs: &[PathBuf]| {
             find_provider_binary_with_source_and_dirs("codex", "codex-acp", setting, None, dirs)
         };

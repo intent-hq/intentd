@@ -18,7 +18,9 @@ if (seed.includes('mcp_servers')) {
 }
 const isolation = {cwd:fs.realpathSync(process.cwd())===fs.realpathSync(home),home:process.env.HOME===home,
   profile:process.env.USERPROFILE===home,xdg:process.env.XDG_CONFIG_HOME===home,
-  config:!process.env.CODEX_CONFIG,
+  config:role === 'acp'
+    ? process.env.CODEX_CONFIG === '{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}'
+    : !process.env.CODEX_CONFIG,
   preload:!process.env.NODE_OPTIONS?.includes('intentd-inherited-preload-canary'),
   entry:!process.env.INTENT_CODEX_ENTRY,cache:!fs.existsSync(path.join(home,'models_cache.json'))};
 if (!Object.values(isolation).every(Boolean)) { record({isolation}); failure(); }

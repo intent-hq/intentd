@@ -372,6 +372,13 @@ impl CodexLaunch {
         let path = home.path().to_owned();
         let mut command = intent_acp::spawn::build_command(&self.spawn_options());
         auth.isolate(&mut command, self, &path);
+        // Isolation removes inherited/user configuration, including the env
+        // prepared by build_command. Restore only Intent's fixed adapter
+        // policy so this probe also disables Codex's built-in subagents.
+        command.env(
+            "CODEX_CONFIG",
+            intent_providers::CODEX_SUBAGENT_POLICY_CONFIG,
+        );
         // An unresolved relative override cannot identify the same runtime in a
         // fresh cwd. Do not silently probe the adapter's default instead.
         if self.runtime_override_path().is_err() {
