@@ -6886,6 +6886,7 @@ impl AgentManager {
         // `create_agent` workspace-MCP scope) — must key on the workspace
         // the target lives in, not the caller's.
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
         // Quarantine gate (monorepo#840): a provably-poisoned session (parked
         // in Error with a session-fatal provider block, or a streak of
         // identical terminal failures) must NOT be redriven by message
@@ -7330,6 +7331,9 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         redrive_error_park: bool,
     ) {
+        let Ok(_mutation) = self.services.workspace_mutations.enter(&workspace_id) else {
+            return;
+        };
         if self.is_busy(&agent_id) {
             return;
         }
@@ -7689,6 +7693,7 @@ impl AgentManager {
         // status events, and the spawn below must key on the workspace the
         // target lives in (see the module-header invariant).
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
         // Ownership (multiplayer, intentd#2068): resolved before the pop,
         // checked inside the pop's critical section against the entry found
         // there — a guest force-sends only what its `agent.getQueue` shows it.
@@ -8043,59 +8048,63 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
-        // Every queue fallback below (archived gate, busy race, quarantine
-        // park, append-failure auto-queue) must park this message at the FRONT of
-        // the queue (spec §Decisions: interrupts always enter ahead of
-        // normal entries, arrival-ordered among themselves).
-        options.interrupt_priority = true;
-        // monorepo#564: reject nonexistent targets BEFORE the dedup record or
-        // any preemption — same fail-closed guard as `send_message`.
-        let session = self.services.require_agent_session(&agent_id).await?;
-        // Same session-workspace binding as `send_message`
-        // (intent-hq/intent#5017): the archived gate below keys on the
-        // target's home workspace, not the sender's bridge scope.
-        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
-        // Duplicate-delivery guard: check-and-record is atomic under the lock,
-        // so of two racing duplicates exactly one proceeds. Runs BEFORE the
-        // archived gate below so a parked interrupt still records its id and
-        // keeps the same at-most-once contract as one that streamed
-        // immediately.
-        if let Some(mid) = message_id.as_deref() {
-            let mut ids = self.interrupt_ids.lock().unwrap();
-            if ids.get(&agent_id).map(String::as_str) == Some(mid) {
-                return Ok(json!({
-                    "success": true,
-                    "queued": false,
-                    "messageId": mid,
-                    "deduplicated": true,
-                }));
+        crate::workspace_mutations::scope(async move {
+            // Every queue fallback below (archived gate, busy race, quarantine
+            // park, append-failure auto-queue) must park this message at the FRONT of
+            // the queue (spec §Decisions: interrupts always enter ahead of
+            // normal entries, arrival-ordered among themselves).
+            options.interrupt_priority = true;
+            // monorepo#564: reject nonexistent targets BEFORE the dedup record or
+            // any preemption — same fail-closed guard as `send_message`.
+            let session = self.services.require_agent_session(&agent_id).await?;
+            // Same session-workspace binding as `send_message`
+            // (intent-hq/intent#5017): the archived gate below keys on the
+            // target's home workspace, not the sender's bridge scope.
+            let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+            let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+            // Duplicate-delivery guard: check-and-record is atomic under the lock,
+            // so of two racing duplicates exactly one proceeds. Runs BEFORE the
+            // archived gate below so a parked interrupt still records its id and
+            // keeps the same at-most-once contract as one that streamed
+            // immediately.
+            if let Some(mid) = message_id.as_deref() {
+                let mut ids = self.interrupt_ids.lock().unwrap();
+                if ids.get(&agent_id).map(String::as_str) == Some(mid) {
+                    return Ok(json!({
+                        "success": true,
+                        "queued": false,
+                        "messageId": mid,
+                        "deduplicated": true,
+                    }));
+                }
+                ids.insert(agent_id.clone(), mid.to_string());
             }
-            ids.insert(agent_id.clone(), mid.to_string());
-        }
-        // Archived-workspace gate (intent-hq/monorepo#2732): an automatic
-        // interrupt into an archived workspace is ALSO parked — skip the
-        // preemption (cancelling a turn only to park the interrupt behind
-        // the archived gate would be pure loss) and let `send_message`'s
-        // archived gate park the message front-of-queue. Same fail-open
-        // semantics as that gate: only an affirmatively-archived row parks.
-        if !options.origin.is_user()
-            && !workspace_id.is_chief()
-            && matches!(
-                self.services.store.get_workspace(&workspace_id).await,
-                Ok(ws) if ws.archived
-            )
-        {
-            return self
-                .send_message(agent_id, workspace_id, content, message_id, options)
-                .await;
-        }
-        self.preempt_busy_turn(&agent_id, &mut options).await;
-        // The slot was just released (or was never held): the send path claims
-        // it and streams the interrupt message right away rather than queueing.
-        // If a concurrent send wins the race the message queues instead — it is
-        // still delivered by that worker's drain loop, never dropped.
-        self.send_message(agent_id, workspace_id, content, message_id, options)
-            .await
+            // Archived-workspace gate (intent-hq/monorepo#2732): an automatic
+            // interrupt into an archived workspace is ALSO parked — skip the
+            // preemption (cancelling a turn only to park the interrupt behind
+            // the archived gate would be pure loss) and let `send_message`'s
+            // archived gate park the message front-of-queue. Same fail-open
+            // semantics as that gate: only an affirmatively-archived row parks.
+            if !options.origin.is_user()
+                && !workspace_id.is_chief()
+                && matches!(
+                    self.services.store.get_workspace(&workspace_id).await,
+                    Ok(ws) if ws.archived
+                )
+            {
+                return self
+                    .send_message(agent_id, workspace_id, content, message_id, options)
+                    .await;
+            }
+            self.preempt_busy_turn(&agent_id, &mut options).await;
+            // The slot was just released (or was never held): the send path claims
+            // it and streams the interrupt message right away rather than queueing.
+            // If a concurrent send wins the race the message queues instead — it is
+            // still delivered by that worker's drain loop, never dropped.
+            self.send_message(agent_id, workspace_id, content, message_id, options)
+                .await
+        })
+        .await
     }
 
     /// Shared keep-alive preemption for the interrupt-priority delivery paths
@@ -8406,6 +8415,9 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> bool {
+        let Ok(_mutation) = self.services.workspace_mutations.enter(workspace_id) else {
+            return false;
+        };
         let (notes, gate) = {
             let map = self.handles.lock().unwrap();
             let Some(handle) = map.get(agent_id) else {
@@ -11133,33 +11145,21 @@ fn resolve_spawn(
     // managed-server lifecycle (`ensure_started`'s unsloth spawn gate).
     let binary_provider_id = provider.primary_binary_provider_id();
     let explicit_path = read_provider_path_setting(settings, binary_provider_id);
-    let provider_binary = intent_providers::find_provider_binary(
-        binary_provider_id,
-        provider.command,
-        explicit_path.as_deref(),
-    );
-
-    // When the provider binary is not found but the provider has a fallback npx
-    // package, resolve npx itself and record the fallback decision
-    let (npx_fallback_binary, npx_fallback_package) = if provider_binary.is_none() {
-        if let Some(pkg) = provider.fallback_npx_package {
-            if let Some(npx_path) = intent_providers::find_npx() {
-                tracing::info!(
-                    provider_id = provider_id,
-                    npx_path = ?npx_path,
-                    package = pkg,
-                    "provider binary not found; falling back to npx"
-                );
-                (Some(npx_path), Some(pkg))
-            } else {
-                (None, None)
+    let (provider_binary, npx_fallback_binary, npx_fallback_package) =
+        match intent_providers::discover::resolve_fallback_launch(
+            &provider,
+            explicit_path.as_deref(),
+        ) {
+            intent_providers::discover::ProviderLaunch::Local(binary) => {
+                (Some(binary.path), None, None)
             }
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
+            intent_providers::discover::ProviderLaunch::Managed { npx, package } => {
+                tracing::info!(provider_id, npx_path = ?npx, package,
+                    "provider binary not found; falling back to npx");
+                (None, Some(npx), Some(package))
+            }
+            intent_providers::discover::ProviderLaunch::Bare { .. } => (None, None, None),
+        };
 
     Ok(ResolvedSpawn {
         provider,

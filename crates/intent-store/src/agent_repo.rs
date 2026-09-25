@@ -3358,7 +3358,7 @@ impl Store {
     /// writers interleave. The final `agent_session` delete then cascades only
     /// the (small) remainder written concurrently mid-sweep. A crash mid-sweep
     /// leaves a consistent DB: the session row still exists with a truncated
-    /// log, and a retried delete cascades whatever remains.
+    /// log, and a retried delete drains the remainder.
     ///
     /// # Errors
     ///
@@ -3395,7 +3395,13 @@ impl Store {
             DELETE_CASCADE_BATCH,
         )
         .await?;
-        let result = sqlx::query("DELETE FROM agent_session WHERE id = ? AND workspace_id = ?")
+        // Retired hooks/monitors and queued messages can also accumulate.
+        // Drain them before the session cascade, including delivery markers
+        // referencing either endpoint of a parent/child pair.
+        for sql in delete_agent_metadata_batch_statements() {
+            delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
+        }
+        let result = sqlx::query(DELETE_AGENT_SESSION_SQL)
             .bind(&id.0)
             .bind(&workspace_id.0)
             .execute(self.write_pool())
@@ -3405,8 +3411,35 @@ impl Store {
     }
 }
 
-/// Max child rows removed per statement in the session-delete pre-sweep.
-const DELETE_CASCADE_BATCH: i64 = 500;
+pub(crate) const DELETE_AGENT_SESSION_SQL: &str =
+    "DELETE FROM agent_session WHERE id = ? AND workspace_id = ?";
+
+/// Shared with query-plan regressions for explicit batches and hidden FK work.
+pub(crate) fn delete_agent_metadata_batch_statements() -> impl Iterator<Item = String> {
+    [
+        ("agent_queue", "agent_id = ?1"),
+        ("hook", "agent_id = ?1"),
+        ("pr_monitor", "agent_id = ?1"),
+        (
+            "completion_wake_delivery",
+            "parent_agent_id = ?1 OR child_agent_id = ?1",
+        ),
+        (
+            "advisory_wake_delivery",
+            "parent_agent_id = ?1 OR child_agent_id = ?1",
+        ),
+    ]
+    .into_iter()
+    .map(|(table, predicate)| {
+        format!(
+            "DELETE FROM {table} WHERE rowid IN \
+                 (SELECT rowid FROM {table} WHERE {predicate} LIMIT ?2)"
+        )
+    })
+}
+
+/// Max child rows removed per statement in session/workspace delete sweeps.
+pub(crate) const DELETE_CASCADE_BATCH: i64 = 500;
 
 /// One batch of a session's payload rows (envelope-owned AND pre-staged
 /// orphans — both carry `agent_id`). Seeks via `idx_agent_message_payload_agent`
@@ -3422,21 +3455,21 @@ const DELETE_PAYLOAD_BATCH_SQL: &str = "DELETE FROM agent_message_payload WHERE 
 const DELETE_MESSAGE_BATCH_SQL: &str = "DELETE FROM agent_message WHERE rowid IN \
      (SELECT rowid FROM agent_message WHERE agent_id = ? LIMIT ?)";
 
-/// Run `sql` (one bounded `DELETE` batch, binding `agent_id` then `batch`)
+/// Run `sql` (one bounded cleanup batch, binding the scope id then `batch`)
 /// until it removes fewer rows than the batch size. Each execution is its own
 /// implicit write transaction, and the yield between batches lets other
 /// writers queued on the pool interleave. Returns the number of non-empty
 /// batches executed.
-async fn delete_in_bounded_batches(
+pub(crate) async fn delete_in_bounded_batches(
     pool: &sqlx::SqlitePool,
     sql: &str,
-    agent_id: &str,
+    scope_id: &str,
     batch: i64,
 ) -> Result<u64> {
     let mut batches = 0u64;
     loop {
         let removed = sqlx::query(sql)
-            .bind(agent_id)
+            .bind(scope_id)
             .bind(batch)
             .execute(pool)
             .await

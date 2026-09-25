@@ -11509,6 +11509,64 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
     assert!(sessions.is_empty(), "recreated workspace shows no ghosts");
 }
 
+#[intent_test_macros::daemon_test]
+async fn incremental_workspace_delete_refuses_runtime_sends_and_drain_after_teardown() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_workspaces_root(tmp.path.with_extension("workspaces"));
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("deleting");
+    let agent = AgentId::from("live-agent");
+    seed_agent(&mgr, &ws, &agent).await;
+    track(&mgr, &agent);
+    let (reached, resume) = services.workspace_delete_test_gate.arm(ws.clone());
+    let mut deleting = services.delete_workspace(ws.clone());
+    timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut deleting => panic!("delete finished before runtime probe: {result:?}"),
+            () = reached.notified() => {}
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!mgr.contains(&agent));
+    let sent = mgr
+        .send_message(
+            agent.clone(),
+            ws.clone(),
+            "late send".into(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await;
+    assert!(matches!(sent, Err(Error::NotFound(_))), "{sent:?}");
+    let interrupted = mgr
+        .interrupt_send_message(
+            agent.clone(),
+            ws.clone(),
+            "late interrupt".into(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await;
+    assert!(
+        matches!(interrupted, Err(Error::NotFound(_))),
+        "{interrupted:?}"
+    );
+    mgr.clone().try_drain_queue(agent.clone(), ws.clone()).await;
+    assert!(!mgr.is_busy(&agent));
+    assert!(!mgr.contains(&agent));
+    assert!(mgr.workers.lock().unwrap().is_empty());
+    assert_eq!(mgr.registry().size(), 0);
+    resume.notify_one();
+    deleting.await.unwrap();
+}
+
 /// `workspace.archive` gracefully interrupts every in-flight turn in the
 /// workspace (the `agent.stop` keep-alive semantics of
 /// `AgentManager::interrupt`): the draining worker is aborted and the terminal
@@ -12563,6 +12621,83 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
     // Calling `end_turn` again on an already-idle agent is a no-op.
     mgr.end_turn(&id).await;
     assert!(!mgr.is_busy(&id));
+}
+
+/// The prompt's idle signal precedes the worker's final status write. Drive
+/// those existing phases separately to pin the observation boundary without
+/// timing sleeps or a production hook (the ordering predates deletion guards).
+#[intent_test_macros::daemon_test]
+async fn prompt_idle_event_precedes_end_turn_status_persistence() {
+    use intent_core::events::{AGENT_IDLE, AGENT_STATUS_CHANGED};
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (
+        WorkspaceId::from("idle-boundary"),
+        AgentId::from("idle-boundary-agent"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let mock = track_mock_agent(&mgr, &id, false);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let (connection, notifications) = {
+        let handles = mgr.handles.lock().unwrap();
+        let handle = handles.get(&id).unwrap();
+        (handle.connection.clone(), handle.notifications.clone())
+    };
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.services
+        .run_prompt_turn(
+            &connection,
+            &mut *notifications.lock().await,
+            &id,
+            &ws,
+            MGR_ACP_SID,
+            text_prompt("hi"),
+            None,
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if sub
+                .recv()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == AGENT_IDLE)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!mgr.services.has_ready_to_send(&id));
+    let observed = mgr.services.agent_get(id.clone(), None).await.unwrap();
+    assert_eq!(
+        observed.status,
+        AgentStatus::Active,
+        "idle event alone is not the final status barrier"
+    );
+    mgr.end_turn(&id).await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if sub.recv().await.unwrap().iter().any(|event| {
+                event.event_type == AGENT_STATUS_CHANGED && event.data["status"] == "idle"
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let settled = mgr.services.agent_get(id.clone(), None).await.unwrap();
+    assert_eq!(
+        settled.status,
+        AgentStatus::RuntimeIdle,
+        "final status event follows the persisted idle row"
+    );
+    assert!(!mgr.is_busy(&id));
+    mgr.stop(&id).await;
+    mock.abort();
 }
 
 #[tokio::test]

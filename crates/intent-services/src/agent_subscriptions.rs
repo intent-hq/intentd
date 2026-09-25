@@ -262,6 +262,8 @@ impl Services {
         child_agent_id: AgentId,
         group_id: Option<String>,
     ) -> Result<String> {
+        let parent = self.workspace_mutations.enter(parent_workspace_id)?;
+        let child = self.workspace_mutations.enter(child_workspace_id)?;
         let watch = self.insert_watch_in_memory(
             parent_workspace_id,
             child_workspace_id,
@@ -276,7 +278,7 @@ impl Services {
         // adopt path this upserts the existing row's mutable columns
         // (group_id) so the strengthened mode is restart-durable.
         let id = watch.id.clone();
-        self.persist_completion_watch(&watch);
+        self.persist_completion_watch(&watch, (parent, child));
         Ok(id)
     }
 
@@ -298,6 +300,8 @@ impl Services {
         child_agent_id: AgentId,
         group_id: Option<String>,
     ) -> Result<String> {
+        let _parent = self.workspace_mutations.enter(parent_workspace_id)?;
+        let _child = self.workspace_mutations.enter(child_workspace_id)?;
         let watch = self.insert_watch_in_memory(
             parent_workspace_id,
             child_workspace_id,
@@ -329,6 +333,8 @@ impl Services {
         parent_agent_name: String,
         child_agent_id: AgentId,
     ) -> Result<String> {
+        let _parent = self.workspace_mutations.enter(parent_workspace_id)?;
+        let _child = self.workspace_mutations.enter(child_workspace_id)?;
         check_watch_scope(parent_workspace_id, child_workspace_id)?;
         let _registration = self.completion_watch_registration_gate.lock().await;
         if let Some(existing) = self
@@ -387,6 +393,8 @@ impl Services {
         parent_agent_name: String,
         child_agent_id: AgentId,
     ) -> Result<String> {
+        let _parent = self.workspace_mutations.enter(parent_workspace_id)?;
+        let _child = self.workspace_mutations.enter(child_workspace_id)?;
         let watch = self.insert_watch_in_memory(
             parent_workspace_id,
             child_workspace_id,
@@ -1483,10 +1491,20 @@ impl Services {
     /// async persist task, not durable-before-observable — the crash window
     /// between in-memory registration and commit is milliseconds and the
     /// parent can re-register.
-    fn persist_completion_watch(&self, watch: &CompletionWatch) {
+    fn persist_completion_watch(
+        &self,
+        watch: &CompletionWatch,
+        mutations: (
+            crate::workspace_mutations::Mutation,
+            crate::workspace_mutations::Mutation,
+        ),
+    ) {
         let store = self.store.clone();
         let persisted = completion_watch_to_persisted(watch);
         intent_core::spawn_daemon(async move {
+            // Keep registration admitted through the write. Otherwise a
+            // delayed upsert could resurrect a watch after deletion swept it.
+            let _mutations = mutations;
             let id = persisted.id.clone();
             if let Err(e) = store.upsert_completion_watch(&persisted).await {
                 tracing::warn!("completion_watch upsert failed {id}: {e}");
