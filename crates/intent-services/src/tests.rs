@@ -1002,7 +1002,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
     let caller = intent_core::Caller::Wire {
         principal_id: primary.id,
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let list = intent_core::with_caller(caller, svc.list_workspaces(true))
         .await
@@ -14008,7 +14008,7 @@ mod change_event_parity {
         use intent_core::WorkspaceCreate;
         let h = harness().await;
         let mut sub = h.bus.subscribe(SubscriptionFilter::default());
-        let created = h
+        let mut created = h
             .services
             .create_workspace(
                 WorkspaceCreate {
@@ -14024,6 +14024,15 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &created.id.0, "workspace:created");
         assert_eq!(ev["data"]["workspaceId"], created.id.0);
+        // The response carries this caller's capabilities. The shared event
+        // must not broadcast the creator's role or management rights.
+        assert!(
+            created
+                .membership
+                .take()
+                .expect("caller membership")
+                .can_manage
+        );
         assert_eq!(
             ev["data"]["workspace"],
             serde_json::to_value(&created).expect("workspace json")
@@ -18711,7 +18720,7 @@ pub(crate) mod pr {
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
         let collaborator = intent_core::Caller::Wire {
             principal_id: intent_core::PrincipalId::new(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         let err =
             intent_core::with_caller(collaborator, svc.github_users_search("octo".into(), None))

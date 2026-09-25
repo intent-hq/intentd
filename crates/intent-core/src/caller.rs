@@ -27,8 +27,9 @@ pub enum Caller {
     /// A client connection (UDS or WSS) bound to a principal at admission.
     Wire {
         principal_id: PrincipalId,
-        /// Whether the principal administers this daemon (the primary user).
-        is_administrator: bool,
+        /// Role resolved from durable host authority at admission. Services
+        /// revalidate mutable membership; this snapshot is not a grant cache.
+        host_role: crate::HostRole,
     },
     /// An agent session calling back through the `workspace_api` bridge.
     Agent { agent_id: AgentId },
@@ -52,13 +53,25 @@ impl Caller {
     #[must_use]
     pub fn is_administrator(&self) -> bool {
         match self {
-            Caller::Wire {
-                is_administrator, ..
-            } => *is_administrator,
+            Caller::Wire { host_role, .. } => *host_role == crate::HostRole::Owner,
             Caller::Daemon => true,
             Caller::Agent { .. } => false,
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn host_members_are_not_administrators() {
+    let member = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        host_role: crate::HostRole::Member,
+    };
+    assert!(!member.is_administrator());
+    assert!(!queue_attribution_visible_to(
+        &member,
+        &QueueAttribution::UnknownHuman
+    ));
 }
 
 tokio::task_local! {
@@ -180,7 +193,7 @@ pub fn queue_attribution_with(
 pub fn queue_attribution_visible_to(caller: &Caller, attribution: &QueueAttribution) -> bool {
     let Caller::Wire {
         principal_id,
-        is_administrator: false,
+        host_role: crate::HostRole::Member | crate::HostRole::Guest,
     } = caller
     else {
         return true;
@@ -276,7 +289,7 @@ pub fn project_queue_for_caller(
     match caller {
         Some(
             caller @ Caller::Wire {
-                is_administrator: false,
+                host_role: crate::HostRole::Member | crate::HostRole::Guest,
                 ..
             },
         ) => queue
@@ -296,7 +309,11 @@ mod tests {
     fn wire(admin: bool) -> Caller {
         Caller::Wire {
             principal_id: PrincipalId("p-1".into()),
-            is_administrator: admin,
+            host_role: if admin {
+                crate::HostRole::Owner
+            } else {
+                crate::HostRole::Guest
+            },
         }
     }
 

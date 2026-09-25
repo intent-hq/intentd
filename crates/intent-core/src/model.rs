@@ -409,6 +409,10 @@ pub struct Workspace {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceMembership {
+    /// Effective management authority for the current caller. Host members
+    /// inherit this on ordinary workspaces without becoming their owner.
+    #[serde(default)]
+    pub can_manage: bool,
     /// The workspace's owner; `None` only for a row whose principal columns
     /// were nulled by transfer import and not yet re-derived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -488,9 +492,9 @@ pub const WORKSPACE_LIST_PR_CAP: usize = 5;
 /// `diskUsage`) are deliberately absent; `pullRequestsTotal` is the one
 /// list-only key (set by the [`WORKSPACE_LIST_PR_CAP`] truncation, never on
 /// `workspace.get`). The flattened [`WorkspaceMembership`] keys
-/// (`ownerPrincipalId`, `myRole`, `memberCount`, `openInviteCount`) are
-/// list-relevant (role badge / member count in the sidebar), small, and
-/// rung 1: one bulk membership query per list, persisted counts. Adding a
+/// (`ownerPrincipalId`, `myRole`, `canManage`, `memberCount`, `openInviteCount`)
+/// are list-relevant (role badge, management actions and member count), small,
+/// and rung 1: persisted authority projected in one bulk membership query. Adding a
 /// key here is a
 /// wire-contract change — update `docs/protocol/methods/workspace.md` in
 /// the same commit and state which rung of the derived-field ladder the
@@ -538,6 +542,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "pendingDeleteAt",
     "ownerPrincipalId",
     "myRole",
+    "canManage",
     "memberCount",
     "openInviteCount",
 ];

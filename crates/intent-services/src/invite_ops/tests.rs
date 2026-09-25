@@ -76,7 +76,7 @@ fn services(store: &Store, tmp: &TempDb) -> Services {
 fn wire(principal_id: &PrincipalId) -> Caller {
     Caller::Wire {
         principal_id: principal_id.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     }
 }
 
@@ -3307,7 +3307,7 @@ async fn revoke_self_revokes_credentials_memberships_and_broadcasts() {
     let r = with_caller(
         Caller::Wire {
             principal_id: f.primary.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         f.services.principal_revoke_self_op(),
     )
@@ -3632,7 +3632,7 @@ async fn event_actor_is_the_primary_for_the_administrator() {
     with_caller(
         Caller::Wire {
             principal_id: f.primary.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         f.services.create_note(
             f.ws.clone(),
@@ -3669,7 +3669,7 @@ async fn administrator_comment_author_follows_the_attached_identity() {
     let (_tmp, f, note_id) = attribution_fixture().await;
     let admin = || Caller::Wire {
         principal_id: f.primary.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let mut primary = f.store.get_primary_principal().await.expect("primary");
     primary.login = None;

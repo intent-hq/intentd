@@ -43,7 +43,7 @@ impl MembershipGate {
         match crate::context::current_caller() {
             Some(Caller::Wire {
                 principal_id,
-                is_administrator: false,
+                host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
             }) => Some(Self {
                 api: Arc::clone(api),
                 principal_id,

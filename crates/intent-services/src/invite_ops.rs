@@ -265,8 +265,8 @@ impl Services {
             None => Err(crate::principal_ops::no_caller()),
             Some(Caller::Wire {
                 principal_id,
-                is_administrator,
-            }) => Ok((principal_id, is_administrator)),
+                host_role,
+            }) => Ok((principal_id, host_role == intent_core::HostRole::Owner)),
             Some(Caller::Agent { .. } | Caller::Daemon) => {
                 Ok((self.store.get_primary_principal().await?.id, true))
             }

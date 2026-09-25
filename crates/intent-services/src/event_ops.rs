@@ -27,7 +27,7 @@ pub(crate) fn is_collaborator_caller() -> bool {
     matches!(
         intent_core::current_caller(),
         Some(Caller::Wire {
-            is_administrator: false,
+            host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
             ..
         })
     )

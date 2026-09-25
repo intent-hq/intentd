@@ -348,7 +348,7 @@ fn is_collaborator_class_caller() -> bool {
     matches!(
         current_caller(),
         Some(Caller::Wire {
-            is_administrator: false,
+            host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
             ..
         })
     )
@@ -370,7 +370,7 @@ impl Services {
     ) -> Result<Option<String>> {
         let Some(Caller::Wire {
             principal_id,
-            is_administrator: false,
+            host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
         }) = current_caller()
         else {
             return Ok(None);
@@ -684,14 +684,20 @@ pub(crate) fn with_principal_identity(mut row: Value, p: &Principal) -> Value {
 }
 
 /// `principal.me` wire shape.
-pub(crate) fn principal_to_wire(p: &Principal, is_administrator: bool) -> Value {
+pub(crate) fn principal_to_wire(
+    p: &Principal,
+    host_role: intent_core::HostRole,
+    revision: u64,
+) -> Value {
     with_principal_identity(
         json!({
             "id": p.id,
             "login": p.login,
             "displayName": p.display_name,
             "avatarUrl": p.avatar_url,
-            "isAdministrator": is_administrator,
+            "isAdministrator": host_role == intent_core::HostRole::Owner,
+            "hostRole": host_role,
+            "hostMembershipRevision": revision,
         }),
         p,
     )
@@ -733,13 +739,20 @@ impl Services {
         if principal.is_primary {
             self.spawn_primary_identity_refresh(principal.clone()).await;
         }
-        let is_administrator = match caller {
-            Caller::Wire {
-                is_administrator, ..
-            } => is_administrator,
-            Caller::Agent { .. } | Caller::Daemon => principal.is_primary,
-        };
-        Ok(principal_to_wire(&principal, is_administrator))
+        // Fence the role with its durable revision. A removal between the
+        // reads must not pair an old member role with the new revision and
+        // leave a reconnecting client believing it is already up to date.
+        for _ in 0..3 {
+            let before = self.store.host_membership_state().await?;
+            let role = self.store.get_host_role(&principal.id).await?;
+            let after = self.store.host_membership_state().await?;
+            if before.revision == after.revision {
+                return Ok(principal_to_wire(&principal, role, after.revision));
+            }
+        }
+        Err(Error::Forbidden(
+            "host membership changed; retry principal.me".into(),
+        ))
     }
 
     /// `principal.list`: see [`intent_core::WorkspaceApi::principal_list`].
@@ -1402,7 +1415,7 @@ mod tests {
     fn wire(principal_id: &PrincipalId) -> Caller {
         Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         }
     }
 
@@ -1478,7 +1491,7 @@ mod tests {
 
         let administrator = Caller::Wire {
             principal_id: primary.id.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let as_admin = with_caller(administrator, services.principal_list_op()).await;
         assert_eq!(as_admin.expect("administrator lists"), listed);
@@ -1517,7 +1530,7 @@ mod tests {
     fn administrator(primary: &PrincipalId) -> Caller {
         Caller::Wire {
             principal_id: primary.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         }
     }
 

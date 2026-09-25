@@ -5,12 +5,10 @@
 //! implementation, so the matrix is enforced here, keyed on the
 //! [`Caller`] bound to the request:
 //!
-//! - `Caller::Wire { is_administrator: false }` — a collaborator connection.
-//!   The only caller class the matrix constrains: it sees and touches only
-//!   the workspaces it is a member of, may not call Owner-only operations,
-//!   and never reaches administrator-only ones.
-//! - `Caller::Wire { is_administrator: true }` — the primary user, who owns
-//!   every workspace in v1 (no transfer RPC) and administers the daemon.
+//! - `Caller::Wire` binds the principal and its admitted `HostRole`.
+//!   Workspace access rechecks durable authority: host members inherit
+//!   ordinary workspaces; guests remain scoped to direct workspace grants.
+//!   Only the primary host owner administers the daemon.
 //! - `Caller::Agent` / `Caller::Daemon` — act with the owner's capabilities
 //!   (decided: an agent steered by a collaborator still runs `ws.host.exec`).
 //! - An unbound request (`current_caller() == None`) is **refused**
@@ -28,31 +26,33 @@
 //!   binding — even on a detached task nothing awaits — fails the e2e suite
 //!   instead of degrading a background path silently.
 //!
-//! Classes: *Member+* (Read / Steer & edit) → [`Services::require_member`];
-//! *Owner-only* (`workspace.delete` / `archive` / `export.*`,
-//! `workspace.members.add` / `remove`, `agent.delete`, `hook.runNow` / `cancel`,
-//! `prMonitor.cancel` / `flush`, settings writes) →
-//! [`Services::require_owner`]; *administrator-only* (`mcp.servers.*`,
-//! `host.listDirectory` / `env`, `git.clone`, `github.*` / `linear.*` /
-//! `sentry.*`, provider credentials) → [`Services::require_administrator`].
+//! Workspace reads use [`Services::require_member`]; workspace CRUD uses
+//! [`Services::require_workspace_manager`] and host-wide creation uses
+//! [`Services::require_workspace_creator`]. [`Services::require_owner`]
+//! remains the explicit-owner gate for tooling, prompts and sharing until
+//! those surfaces adopt effective management. Host administration remains
+//! separate via [`Services::require_administrator`].
 //! A non-member is answered `NotFound` (membership is not disclosed); a
 //! member lacking the capability gets [`Error::Forbidden`] (`-32003`, the
 //! same code as the transport's default-deny allowlist).
 //!
-//! Cost: every guard returns before touching the store unless the caller is
-//! a collaborator, so the administrator / agent / hook paths pay nothing.
+//! Cost: mutable host membership is rechecked once per gate, not per list
+//! row. Workspace summaries project durable grants in one bounded SQL query.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use intent_core::{
-    current_caller, lift_from_principal_id, AgentId, Caller, Error, PrincipalId, Result, Workspace,
-    WorkspaceId, WorkspaceRole,
+    current_caller, lift_from_principal_id, AgentId, Caller, Error, HostRole, PrincipalId, Result,
+    Workspace, WorkspaceId, WorkspaceRole,
 };
 use intent_store::{ArchivedGuestSweep, CollaboratorAddOutcome};
 use serde_json::{json, Value};
 
 use crate::Services;
+
+#[cfg(test)]
+mod host_role_tests;
 
 /// The log line an unbound gate evaluation emits (once per gate per process).
 pub const UNBOUND_GATE_LOG: &str = "capability gate evaluated without a bound Caller; refusing";
@@ -76,7 +76,7 @@ pub(crate) fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId
     match current_caller() {
         Some(Caller::Wire {
             principal_id,
-            is_administrator: false,
+            host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
         }) => Ok(Some(principal_id)),
         Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) => Ok(None),
         None => {
@@ -168,10 +168,64 @@ impl Services {
     /// Member+ gate for a workspace-scoped read / steer / edit. A
     /// collaborator who is not a member gets `NotFound`.
     pub(crate) async fn require_member(&self, workspace_id: &WorkspaceId) -> Result<()> {
+        if let Some(principal_id) = gated_collaborator_caller("member")? {
+            match self.store.get_host_role(&principal_id).await {
+                Ok(HostRole::Owner) => return Ok(()),
+                Ok(HostRole::Member) => {
+                    return if workspace_id.is_chief() {
+                        Err(not_a_member(workspace_id))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(Error::NotFound(_)) => return Err(not_a_member(workspace_id)),
+                Err(e) => return Err(e),
+                _ => {}
+            }
+        }
         match self.collaborator_role(workspace_id, "member").await? {
             None | Some((_, Some(_))) => Ok(()),
             Some((_, None)) => Err(not_a_member(workspace_id)),
         }
+    }
+
+    /// Host owner/member capability for creating an ordinary workspace,
+    /// including on an empty host. Re-read durable membership on every call:
+    /// a connection's admitted role cannot survive removal as a cached grant.
+    pub(crate) async fn require_workspace_creator(&self, what: &str) -> Result<()> {
+        let Some(principal_id) = gated_collaborator_caller(what)? else {
+            return Ok(());
+        };
+        match self.store.get_host_role(&principal_id).await? {
+            HostRole::Owner | HostRole::Member => Ok(()),
+            HostRole::Guest => Err(Error::Forbidden(format!("{what} requires host membership"))),
+        }
+    }
+
+    /// Workspace management is independent of daemon administration. Keep
+    /// the existing explicit workspace-owner path; inherited host membership
+    /// applies only to ordinary workspaces and overrides retained guest rows.
+    pub(crate) async fn require_workspace_manager(
+        &self,
+        workspace_id: &WorkspaceId,
+        what: &str,
+    ) -> Result<()> {
+        if let Some(principal_id) = gated_collaborator_caller(what)? {
+            match self.store.get_host_role(&principal_id).await {
+                Ok(HostRole::Owner) => return Ok(()),
+                Ok(HostRole::Member) => {
+                    return if workspace_id.is_chief() {
+                        Err(not_a_member(workspace_id))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(Error::NotFound(_)) => return Err(not_a_member(workspace_id)),
+                Err(e) => return Err(e),
+                _ => {}
+            }
+        }
+        self.require_owner(workspace_id, what).await
     }
 
     /// Owner-only gate. A collaborator member gets `Forbidden`; a non-member
@@ -307,6 +361,19 @@ impl Services {
         let Some(principal_id) = collaborator_caller()? else {
             return Ok(None);
         };
+        match self.store.get_host_role(&principal_id).await? {
+            HostRole::Owner => return Ok(None),
+            HostRole::Member => {
+                return Ok(Some(
+                    self.store
+                        .ordinary_workspace_ids()
+                        .await?
+                        .into_iter()
+                        .collect(),
+                ))
+            }
+            HostRole::Guest => {}
+        }
         Ok(Some(
             self.store
                 .list_principal_memberships(&principal_id)
@@ -793,7 +860,11 @@ mod tests {
         fn caller(&self, role: Role) -> Caller {
             let wire = |principal_id: &PrincipalId, is_administrator| Caller::Wire {
                 principal_id: principal_id.clone(),
-                is_administrator,
+                host_role: if is_administrator {
+                    intent_core::HostRole::Owner
+                } else {
+                    intent_core::HostRole::Guest
+                },
             };
             match role {
                 Role::Administrator => wire(&self.primary, true),
@@ -1442,7 +1513,7 @@ mod tests {
                 with_caller(
                     Caller::Wire {
                         principal_id: primary.id.clone(),
-                        is_administrator: true,
+                        host_role: intent_core::HostRole::Owner,
                     },
                     services.workspace_members_list_op(ws),
                 ),

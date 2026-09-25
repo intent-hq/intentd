@@ -5032,6 +5032,17 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Transport seam: resolve a credential-bound principal's current host
+    /// authority. Never infer a role from credential storage or client input.
+    /// Unknown principals and unavailable authority fail closed.
+    fn principal_host_role(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<crate::HostRole>> {
+        let _ = principal_id;
+        Box::pin(async { Err(Error::Forbidden("host authority unavailable".into())) })
+    }
+
     /// `linear.authStatus`: validate the resolved Linear API key via the GraphQL
     /// `viewer` probe and report `{ authenticated, login?, scopes }`. The key is
     /// never returned. A missing/invalid key surfaces as `Internal` (PROTOCOL

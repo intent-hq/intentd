@@ -1177,7 +1177,7 @@ enum PopCommit {
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntryGate {
     principal_id: PrincipalId,
-    is_administrator: bool,
+    host_role: intent_core::HostRole,
     author_only: bool,
     fallback: Option<PrincipalId>,
 }
@@ -1192,7 +1192,7 @@ impl QueueEntryGate {
         );
         let caller = intent_core::Caller::Wire {
             principal_id: self.principal_id.clone(),
-            is_administrator: self.is_administrator,
+            host_role: self.host_role,
         };
         if !intent_core::queue_attribution_visible_to(&caller, &attribution) {
             return Err(Error::InvalidParams(format!(
@@ -6488,12 +6488,12 @@ impl Services {
     ) -> Result<Option<QueueEntryGate>> {
         let Some(intent_core::Caller::Wire {
             principal_id,
-            is_administrator,
+            host_role,
         }) = intent_core::current_caller()
         else {
             return Ok(None);
         };
-        if is_administrator && !author_only {
+        if host_role == intent_core::HostRole::Owner && !author_only {
             return Ok(None);
         }
         let workspace_id = self.agent_workspace(agent_id).await?;
@@ -6502,7 +6502,7 @@ impl Services {
             .await;
         Ok(Some(QueueEntryGate {
             principal_id,
-            is_administrator,
+            host_role,
             author_only,
             fallback,
         }))

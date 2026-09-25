@@ -849,11 +849,16 @@ impl WsInner {
         } else {
             ResolvedCredential::Legacy
         };
+        let principal_credential = matches!(credential, ResolvedCredential::Principal(_));
+        let caller = credential.into_caller(self.api.as_ref()).await;
+        if principal_credential && caller.is_none() {
+            return reject(&mut stream, 401, "Unauthorized").await;
+        }
         // Port forwarding is owner-only (multiplayer w3): the `/tunnel` mux
         // reaches host loopback, so a per-principal (collaborator) credential
         // is refused at the upgrade — the fe renders "Only the workspace
         // owner can open forwarded ports" instead of a connection failure.
-        if path == "/tunnel" && matches!(credential, ResolvedCredential::Principal(_)) {
+        if path == "/tunnel" && caller.as_ref().is_some_and(|c| !c.is_administrator()) {
             return reject(&mut stream, 403, "Forbidden").await;
         }
         // Guest connection caps: a per-principal credential takes a
@@ -862,16 +867,18 @@ impl WsInner {
         // both are refused with 503. The seats ride with the connection task
         // so an aborted (heartbeat-reaped) task returns them like a clean
         // exit does. The legacy token — the primary — is never counted.
-        let guest = match &credential {
-            ResolvedCredential::Principal(principal_id) => {
+        let guest = match &caller {
+            Some(Caller::Wire {
+                principal_id,
+                host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
+            }) => {
                 let Some(admission) = self.guests.admit(principal_id) else {
                     return reject_guest_cap_spent(&mut stream).await;
                 };
                 Some(admission)
             }
-            ResolvedCredential::Legacy => None,
+            _ => None,
         };
-        let caller = credential.into_caller(self.api.as_ref()).await;
         let Some(key) = ws_key else {
             return reject(&mut stream, 400, "Bad Request").await;
         };
@@ -1229,7 +1236,7 @@ impl WsInner {
         let revoked_principal = match &caller {
             Some(Caller::Wire {
                 principal_id,
-                is_administrator: false,
+                host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
             }) => Some(principal_id.clone()),
             _ => None,
         };

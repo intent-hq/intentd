@@ -18977,8 +18977,10 @@ impl WorkspaceApi for Services {
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
         Box::pin(async move {
-            // Creates a worktree at an arbitrary host path: administrator-only.
-            Self::require_administrator("workspace.create")?;
+            // Creation is host-wide and must also work before any workspace exists.
+            services
+                .require_workspace_creator("workspace.create")
+                .await?;
             // Clone fields for logging (input moves into the closure below).
             let log_repo_path = input.repository_path.clone();
             let log_branch = input.branch.clone();
@@ -21146,7 +21148,10 @@ impl WorkspaceApi for Services {
                     "workspace.create failed"
                 );
             }
-            result
+            let mut result = result?;
+            self.attach_workspace_membership(&mut result.workspace)
+                .await;
+            Ok(result)
         })
     }
 
@@ -21190,7 +21195,7 @@ impl WorkspaceApi for Services {
             // paths, repository identity, branch, lifecycle (`status` /
             // `archived`), setup script, PR fields — is the owner's.
             if !capability::collaborator_editable_update(&changes) {
-                self.require_owner(&id, "workspace.update (protected fields)")
+                self.require_workspace_manager(&id, "workspace.update (protected fields)")
                     .await?;
             }
             // Captured before the `if let` arms below move the fields out.
@@ -21397,6 +21402,7 @@ impl WorkspaceApi for Services {
             if !ws.id.is_chief() && (pr_fields_changed || attention_changed) {
                 this.maybe_emit_display_status_changed(&ws.id).await;
             }
+            this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
         })
     }
@@ -21429,7 +21435,8 @@ impl WorkspaceApi for Services {
         // Clone — the same capture pattern the spawn helpers use).
         let services = self.clone();
         Box::pin(async move {
-            self.require_owner(&id, "workspace.delete").await?;
+            self.require_workspace_manager(&id, "workspace.delete")
+                .await?;
             // Chief is virtual and never appears in `workspace.list`; delete is
             // a no-op success (TS `workspace.repository.delete` / virtual-guard
             // parity — the seeded row is not torn down and no cascade fires).
@@ -21999,7 +22006,8 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
-            self.require_owner(&id, "workspace.delete").await?;
+            self.require_workspace_manager(&id, "workspace.delete")
+                .await?;
             // Chief is virtual: mirror the immediate-delete no-op guard —
             // report a deadline but never arm a timer (the commit would be a
             // no-op anyway, and a pending marker on Chief makes no sense).
@@ -22065,7 +22073,8 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
-            self.require_owner(&id, "workspace.delete").await?;
+            self.require_workspace_manager(&id, "workspace.delete")
+                .await?;
             let cancelled = services.pending_workspace_deletes.cancel(id.as_str());
             if cancelled {
                 publish_event(bus.as_ref(), workspace_delete_cancelled_event(&id)).await;
@@ -22087,7 +22096,8 @@ impl WorkspaceApi for Services {
         // skips the sweep and still archives.
         let manager = self.agent_manager();
         Box::pin(async move {
-            self.require_owner(&id, "workspace.archive").await?;
+            self.require_workspace_manager(&id, "workspace.archive")
+                .await?;
             // Chief cannot be archived: it is a fixed virtual workspace, so
             // return the synthesized shape unchanged rather than mutating the
             // seeded row (TS virtual-workspace guard parity).
@@ -22307,10 +22317,11 @@ impl WorkspaceApi for Services {
         // no `autoUnarchive` stamp on the emitted delta (absent ≠
         // present-false, PROTOCOL §6.5). The flip bool is auto-path-only.
         Box::pin(async move {
-            self.require_owner(&id, "workspace.unarchive").await?;
-            this.unarchive_workspace_inner(id, None)
-                .await
-                .map(|(ws, _)| ws)
+            self.require_workspace_manager(&id, "workspace.unarchive")
+                .await?;
+            let (mut ws, _) = this.unarchive_workspace_inner(id, None).await?;
+            this.attach_workspace_membership(&mut ws).await;
+            Ok(ws)
         })
     }
 
@@ -22334,7 +22345,8 @@ impl WorkspaceApi for Services {
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
         Box::pin(async move {
-            self.require_owner(&id, "workspace.duplicate").await?;
+            self.require_workspace_manager(&id, "workspace.duplicate")
+                .await?;
             // Chief is virtual and never carries user content; duplication is
             // not meaningful (TS parity: coverflow never exposes a duplicate
             // affordance on the seeded row).
@@ -22923,6 +22935,7 @@ impl WorkspaceApi for Services {
             // with other mutation paths. For a fresh workspace with no agents,
             // activity naturally remains `idle`.
             ws.activity = this.workspace_activity(&ws.id);
+            this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
         })
     }
@@ -22935,7 +22948,8 @@ impl WorkspaceApi for Services {
             .unwrap_or_else(default_workspaces_root);
         let worktrees_location = self.configured_worktrees_location();
         Box::pin(async move {
-            self.require_owner(&id, "workspace.cleanup").await?;
+            self.require_workspace_manager(&id, "workspace.cleanup")
+                .await?;
             // Chief is virtual: no on-disk cache and no worktree — TS parity's
             // `isVirtualWorkspace` guard.
             if id.is_chief() {
@@ -23074,7 +23088,9 @@ impl WorkspaceApi for Services {
             self.require_member(&id).await?;
             // Chief has no attention state to dismiss (synthesized as `None`).
             if id.is_chief() {
-                return Ok(chief_workspace());
+                let mut ws = chief_workspace();
+                this.attach_workspace_membership(&mut ws).await;
+                return Ok(ws);
             }
             this.park_attention_write().await;
             // Dismissing attention merely acknowledges it — not "activity" —
@@ -23106,6 +23122,7 @@ impl WorkspaceApi for Services {
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
+            this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
         })
     }
@@ -23117,7 +23134,9 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_member(&id).await?;
             if id.is_chief() {
-                return Ok(chief_workspace());
+                let mut ws = chief_workspace();
+                this.attach_workspace_membership(&mut ws).await;
+                return Ok(ws);
             }
             // Workspace-seen = every conversation seen (§5.1): advance each
             // top-level session's seen marker to its `last_message_id`
@@ -23187,6 +23206,7 @@ impl WorkspaceApi for Services {
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
+            this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
         })
     }
@@ -23260,7 +23280,8 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
-            self.require_owner(&id, "workspace.setAutoCommit").await?;
+            self.require_workspace_manager(&id, "workspace.setAutoCommit")
+                .await?;
             // Chief is virtual: nothing to persist and the toggle is not
             // meaningful for a workspace that never commits.
             if id.is_chief() {
@@ -23410,7 +23431,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
-            self.require_owner(&id, "workspace.saveSetupScript").await?;
+            self.require_workspace_manager(&id, "workspace.saveSetupScript")
+                .await?;
             // Write to repo config instead of the DB row (§5.25 sole source of truth).
             let ws = store.get_workspace(&id).await?;
             // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
@@ -23450,7 +23472,7 @@ impl WorkspaceApi for Services {
     fn generate_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
-            self.require_owner(&id, "workspace.generateSetupScript")
+            self.require_workspace_manager(&id, "workspace.generateSetupScript")
                 .await?;
             // AI-assisted draft: the provider/agent path is not wired into this
             // service, so generation falls back to the deterministic per-project
@@ -23482,7 +23504,8 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::RepoConfig>> {
         let store = self.store.clone();
         Box::pin(async move {
-            self.require_owner(&id, "repoConfig.save").await?;
+            self.require_workspace_manager(&id, "repoConfig.save")
+                .await?;
             let ws = store.get_workspace(&id).await?;
             let Some(repo_path) = git_ops::worktree_path(&ws) else {
                 return Err(Error::Internal(
@@ -31948,6 +31971,13 @@ impl WorkspaceApi for Services {
         // One atomic resolve+touch: a credential revoked between a separate
         // lookup and touch must not be admitted (intent-hq/intentd#1868).
         Box::pin(async move { store.resolve_active_principal_credential(&token_hash).await })
+    }
+
+    fn principal_host_role(
+        &self,
+        principal_id: intent_core::PrincipalId,
+    ) -> BoxFuture<'_, Result<intent_core::HostRole>> {
+        Box::pin(async move { self.store.get_host_role(&principal_id).await })
     }
 
     // ========================================================================

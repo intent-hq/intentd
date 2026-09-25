@@ -5063,7 +5063,7 @@ mod channel_membership {
         let principal_id = PrincipalId::new();
         let caller = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
         (principal_id, caller)
     }
@@ -5125,7 +5125,7 @@ mod channel_membership {
 
         let owner = Caller::Wire {
             principal_id: PrincipalId::new(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let admin = subscribe(owner, &[STORE_DOWN], chat_subscribe("agent-1")).await;
         assert_eq!(
@@ -5230,7 +5230,7 @@ mod channel_membership {
         let principal_id = PrincipalId::new();
         let owner = Caller::Wire {
             principal_id: principal_id.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let mut h = subscribe(owner, &[], chat_subscribe("agent-2")).await;
         h.bus
@@ -5478,7 +5478,7 @@ mod channel_membership {
     async fn workspace_administrator_receives_every_tombstone() {
         let owner = Caller::Wire {
             principal_id: PrincipalId::new(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         };
         let mut h = subscribe(owner, &["ws-1"], workspace_subscribe()).await;
         h.bus

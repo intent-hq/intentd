@@ -443,17 +443,23 @@ impl Store {
         }
         let placeholders = vec!["?"; workspace_ids.len()].join(",");
         let sql = format!(
-            "SELECT w.id AS workspace_id, w.owner_principal_id, \
+            "WITH viewer AS (SELECT p.id, p.is_primary, h.principal_id IS NOT NULL AS is_host_member \
+                FROM principal p LEFT JOIN host_member h ON h.principal_id = p.id WHERE p.id = ?) \
+             SELECT w.id AS workspace_id, w.owner_principal_id, \
+                COALESCE(v.is_primary OR (v.is_host_member AND w.id <> ?), 0) AS can_manage, \
                 (SELECT COUNT(*) FROM workspace_member m WHERE m.workspace_id = w.id) AS member_count, \
                 (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = w.id \
                     AND {INVITE_OPEN}) AS open_invite_count, \
-                (SELECT m.role FROM workspace_member m \
-                    WHERE m.workspace_id = w.id AND m.principal_id = ?) AS my_role \
-             FROM workspace w WHERE w.id IN ({placeholders})"
+                COALESCE((SELECT m.role FROM workspace_member m \
+                    WHERE m.workspace_id = w.id AND m.principal_id = v.id), \
+                    CASE WHEN v.is_host_member AND w.id <> ? THEN 'collaborator' END) AS my_role \
+             FROM workspace w LEFT JOIN viewer v ON 1 = 1 WHERE w.id IN ({placeholders})"
         );
         let mut query = sqlx::query(&sql)
+            .bind(viewer.map(|p| p.0.as_str()))
+            .bind(intent_core::CHIEF_WORKSPACE_ID)
             .bind(now_iso())
-            .bind(viewer.map(|p| p.0.as_str()));
+            .bind(intent_core::CHIEF_WORKSPACE_ID);
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -470,6 +476,7 @@ impl Store {
                 Ok((
                     WorkspaceId(r.get("workspace_id")),
                     WorkspaceMembership {
+                        can_manage: r.get("can_manage"),
                         owner_principal_id: r
                             .get::<Option<String>, _>("owner_principal_id")
                             .map(PrincipalId),
