@@ -1648,15 +1648,15 @@ fn model_select(options: &[SessionConfigOption]) -> Option<&session::SessionConf
         .or_else(|| select_by(&|o| matches!(o.category, Some(SessionConfigOptionCategory::Model))))
 }
 
-/// Discover the provider's reasoning-effort selector in a `session/new` /
-/// `session/load` response's `configOptions` (PROTOCOL §5.5): the first
+/// Discover the provider's reasoning-effort selector in a session-open or
+/// model-change response's `configOptions` (PROTOCOL §5.5): the first
 /// SELECT whose `category` is `thought_level`. Adapters pick their own ids
 /// (`effort` for claude-agent-acp, `reasoning_effort` for codex-acp), so the
 /// category is the only portable key; the discovered id is what the
 /// subsequent `session/set_config_option` must carry. `None` when the
 /// provider advertises no such option (every non-supporting provider, which
 /// then silently ignores the session's `reasoningEffort`).
-fn discover_thought_level(
+pub(crate) fn discover_thought_level(
     config_options: Option<&[SessionConfigOption]>,
 ) -> Option<ThoughtLevelOption> {
     let (option, select) = config_options?.iter().find_map(|o| match &o.kind {

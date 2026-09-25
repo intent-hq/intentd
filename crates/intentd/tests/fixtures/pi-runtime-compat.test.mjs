@@ -136,7 +136,6 @@ const runtime = test('published adapter with real minimum Pi: lifecycle, models,
       compat: { supportsDeveloperRole: false, supportsReasoningEffort: true },
       models: [{ id: 'reasoner', reasoning: true }, { id: 'plain', reasoning: false }],
     } } }));
-    writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ defaultProvider: 'local', defaultModel: 'reasoner', defaultThinkingLevel: 'medium' }));
     const extension = join(root, 'intent extension.ts');
     copyFileSync(fileURLToPath(new URL('../../../intent-services/src/pi_mcp_extension.ts', import.meta.url)), extension);
     const wrapper = join(root, 'pi');
@@ -191,17 +190,23 @@ const runtime = test('published adapter with real minimum Pi: lifecycle, models,
     };
     let client = await start();
     for (const label of ['first', 'second']) {
+      // Pi persists model/thinking selections as defaults. Reset only the
+      // isolated settings so each new session exercises the off-only default.
+      writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ defaultProvider: 'local', defaultModel: 'plain', defaultThinkingLevel: 'medium' }));
       const created = await client.call('newSession', { cwd, mcpServers: [] });
       const sessionId = created.sessionId;
       evidence.sessions.push({ sessionId, label });
       assert.deepEqual(option(created, 'model').options.map(model => model.value).sort(), ['local/plain', 'local/reasoner']);
+      assert.equal(option(created, 'model').currentValue, 'local/plain');
+      assert.deepEqual(option(created, 'thought_level').options.map(level => level.value), ['off']);
       const set = (configId, value) => client.call('setSessionConfigOption', { sessionId, configId, value });
       const plain = await set('model', 'local/plain');
       assert.equal(option(plain, 'model').currentValue, 'local/plain');
       assert.deepEqual(option(plain, 'thought_level').options.map(level => level.value), ['off']);
       assert.equal(option(plain, 'thought_level').currentValue, 'off');
       const reasoner = await set('model', 'local/reasoner');
-      assert.ok(option(reasoner, 'thought_level').options.some(level => level.value === 'high'));
+      assert.deepEqual(option(reasoner, 'thought_level').options.map(level => level.value), ['off', 'minimal', 'low', 'medium', 'high']);
+      assert.equal(option(reasoner, 'thought_level').currentValue, 'medium');
       assert.equal(option(await set('thought_level', 'high'), 'thought_level').currentValue, 'high');
       const prompt = `${label}:created`;
       assert.equal((await client.call('prompt', { sessionId, prompt: [{ type: 'text', text: prompt }] })).stopReason, 'end_turn');

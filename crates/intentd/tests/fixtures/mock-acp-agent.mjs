@@ -358,7 +358,7 @@ function sessionConfigOptions(behavior = {}) {
         {
           id: 'effort', name: 'Effort', category: 'thought_level', type: 'select',
           currentValue: effectiveEffort,
-          options: ['low', 'medium', 'high'].map(value => ({ value, name: value })),
+          options: modelEffortValues(behavior).map(value => ({ value, name: value })),
         },
       ],
     };
@@ -381,6 +381,14 @@ function sessionConfigOptions(behavior = {}) {
       },
     ],
   };
+}
+
+function modelEffortValues(behavior) {
+  return behavior.modelSelection?.thinking?.[effectiveModel]?.values ?? ['low', 'medium', 'high'];
+}
+
+function modelDefaultEffort(behavior) {
+  return behavior.modelSelection?.thinking?.[effectiveModel]?.current ?? 'high';
 }
 
 async function handlePrompt(id, params) {
@@ -948,7 +956,7 @@ async function dispatch(msg) {
     case 'session/new': {
       if (behavior.modelSelection) {
         effectiveModel = behavior.modelSelection.defaultModel;
-        effectiveEffort = 'high';
+        effectiveEffort = modelDefaultEffort(behavior);
       }
       // Deterministic failure mode: ignore session/new for the first N attempts
       if (typeof behavior.ignoreSessionNewAttempts === 'number' && behavior.ignoreSessionNewAttempts > 0) {
@@ -982,7 +990,7 @@ async function dispatch(msg) {
     case 'session/load':
       if (behavior.modelSelection) {
         effectiveModel = behavior.modelSelection.defaultModel;
-        effectiveEffort = 'high';
+        effectiveEffort = modelDefaultEffort(behavior);
       }
       // Mirror session/new's stash-overwrite so a loadSession-capable run (or
       // a test sending session/load first) can't observe a stale list.
@@ -1040,8 +1048,8 @@ async function dispatch(msg) {
       // call ({ sessionId, configId, value }) — when MOCK_AGENT_CONFIG_LOG
       // points at a file, so e2e tests can assert the daemon issued the call
       // with the stored model exactly once per fresh session. The real
-      // adapter's response echoes the updated configOptions list; the daemon
-      // only checks for success, so a minimal echo suffices.
+      // adapter's response echoes the updated configOptions list; the
+      // modelSelection behavior includes model-specific thinking options.
       const configLog = process.env.MOCK_AGENT_CONFIG_LOG;
       if (configLog) {
         try {
@@ -1070,7 +1078,8 @@ async function dispatch(msg) {
         const { configId, value } = msg.params || {};
         if (configId === 'model' && behavior.modelSelection.models.includes(value)) {
           effectiveModel = value;
-        } else if (configId === 'effort' && ['low', 'medium', 'high'].includes(value)) {
+          if (behavior.modelSelection.thinking) effectiveEffort = modelDefaultEffort(behavior);
+        } else if (configId === 'effort' && modelEffortValues(behavior).includes(value)) {
           effectiveEffort = value;
         } else {
           return send({
