@@ -17,6 +17,8 @@ use sqlx::Row;
 
 use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
+mod workspace_delete;
+
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the
 /// `.db`/`-wal`/`-shm` files) is removed on drop, including on panic; set
 /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.

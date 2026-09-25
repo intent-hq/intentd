@@ -2063,6 +2063,7 @@ impl Services {
         repo_name: &str,
         pr_number: u64,
     ) -> Result<PrMonitorRegistration> {
+        let _mutation = self.workspace_mutations.enter(workspace_id)?;
         let existing = self
             .store
             .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())

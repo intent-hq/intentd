@@ -804,6 +804,48 @@ jobs:
       - name: Clippy (target-gated code)
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (runner.os == 'macOS' || runner.os == 'Windows')
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      # Execute the Windows Job Object fixtures on the native runner. They use
+      # this test executable as the child, so no Node/npm/account setup is needed.
+      - name: Codex diagnostic process ownership (Windows runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'Windows'
+        shell: bash
+        env:
+          INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+        run: |
+          set -euo pipefail
+          filter='codex_diagnostics::process::platform::tests::'
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --list)
+          printf '%s\n' "$listed"
+          if ! grep -F "${filter}shared_guard_removes_home_only_after_descendants_stop: test" <<< "$listed" > /dev/null; then
+            echo '::error::Windows diagnostic ownership regression was not selected.'
+            exit 1
+          fi
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
+      # macOS supports read-only metadata and rejects process probes before
+      # auth/npm setup. Require both a service rejection case and a real doctor
+      # case in discovery so a cfg/filter change cannot silently run zero tests.
+      - name: Codex focused diagnostics (macOS runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
+        shell: bash
+        env:
+          INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+        run: |
+          set -euo pipefail
+          filter='codex_diagnostics::'
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --list)
+          printf '%s\n' "$listed"
+          if ! grep -F 'macos_rejects_process_start_before_retaining_home_or_dependency: test' <<< "$listed" > /dev/null; then
+            echo '::error::macOS diagnostic rejection regression was not selected.'
+            exit 1
+          fi
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --list)
+          printf '%s\n' "$listed"
+          if ! grep -F 'macos_catalog_rejection_precedes_npm_authentication_and_probe_state: test' <<< "$listed" > /dev/null; then
+            echo '::error::macOS doctor command regression was not selected.'
+            exit 1
+          fi
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --nocapture
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}

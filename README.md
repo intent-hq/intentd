@@ -381,6 +381,71 @@ Paths are resolved via the `directories` crate and can be overridden with the
 `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment variables. The data dir holds the SQLite
 database (`intentd.db`) and the socket (`intentd.sock`).
 
+### Codex diagnostics
+
+`intentd doctor` reports the pinned managed Codex ACP adapter and whether Node.js and
+npx are available on the daemon host. Both are required. Production selection ignores
+`providers.paths.codex`, local `codex-acp` installations on PATH, and `CODEX_PATH`.
+The adapter receives the daemon-owned, fixed `CODEX_CONFIG` policy that disables
+built-in subagents; inherited configuration is replaced, not merged.
+
+The configured managed package pin is configuration, not a measured version. Ordinary
+doctor does not resolve or install the package, so adapter and runtime versions remain
+unknown. Package metadata applies only to an established selected entrypoint: a declared
+package version is labeled **metadata, not measured** and does not prove the running
+adapter or bundled runtime version. On Linux and Windows, the opt-in check below measures
+adapter and runtime versions separately after verifying their package entrypoints;
+opaque wrappers, missing runtimes, and failed checks remain explicitly unknown. An
+unrelated `codex` on PATH never supplies evidence of the selected adapter's runtime.
+
+On Linux, diagnostic process probes also require `/bin/bash` for private process
+supervision. If it is unavailable, probes report a failure and their results remain
+unknown; diagnostics do not install Bash or fall back to another shell. This requirement
+applies only to diagnostic probes, not normal provider launches.
+
+On macOS, diagnostics report the selected launch and configured managed pin without
+resolving the package or inspecting ignored local adapters. They do not execute Node,
+the adapter, or Codex, or infer a runtime from PATH or neighboring packages.
+Version and catalog process probes are explicitly unsupported because detached-child
+cleanup cannot be guaranteed. Even with `--codex-models`, macOS performs no diagnostic
+authentication capture, npm resolution, or temporary probe setup; catalog comparison
+remains inconclusive. This does not change normal agent/provider execution.
+
+Ordinary doctor adds no npm resolution or live model request. On Linux and Windows,
+compare fresh catalogs with:
+
+```bash
+intentd doctor --codex-models
+```
+
+This opt-in can resolve/download the selected managed npm package. It reports ACP
+advertisements and the verified runtime's `model/list` separately, preserving original
+IDs, raw model aliases, hidden flags, and each row's source. ACP choices may be
+synthesized by the adapter. Missing advertisements, explicitly empty catalogs, withheld
+IDs, and failed probes are distinct results; either side can succeed independently.
+Membership uses exact IDs/aliases without guessing effort suffixes. Model presence does
+not verify entitlement, and absence does not establish an account restriction or fix
+model access. No prompts, login, or token-refresh requests are sent.
+
+The probe copies existing file authentication from `CODEX_HOME/auth.json` (otherwise
+`$HOME/.codex/auth.json`, with `USERPROFILE` as the home fallback) and selected
+`OPENAI_API_KEY`, `CODEX_API_KEY`, or `CODEX_ACCESS_TOKEN` environment credentials into
+private temporary state. It does not import keyring-only credentials, user/project
+configuration, MCP servers, or cached model catalogs. Authentication may therefore be
+unavailable even when an ordinary session is logged in. Do not paste credentials into
+diagnostic commands. Output contains safe report fields and fixed failure messages,
+never raw provider errors or account metadata.
+
+Each local inspection/version operation has a three-second deadline and a 16 KiB stdout
+limit. ACP startup/conversation and raw startup/conversation each have their own
+30-second deadline and 1 MiB limit per output stream. Catalogs are bounded to 2,000 rows;
+raw pagination allows at most ten pages and rejects repeated cursors. Authentication and
+entrypoint files are bounded to 64 KiB. Local inspection, process startup and cleanup
+have separate budgets (cleanup confirmation allows five seconds), so the whole command
+can take longer than 30 seconds. Unconfirmed cleanup retains temporary state and reports
+that fact. All provider diagnostic failures remain advisory; existing daemon-health
+failures, such as an unusable database or occupied port, still make doctor exit nonzero.
+
 ### Settings
 
 `intentd settings` reads and changes daemon settings on a running daemon — a friendlier
@@ -632,4 +697,3 @@ The design docs live in the monorepo under `docs/`:
 
 - [intent-hq/intent](https://github.com/intent-hq/intent) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
-
