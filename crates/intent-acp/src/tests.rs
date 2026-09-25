@@ -7589,14 +7589,8 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // Byte-identity needs every gate open (the defaults plus the opt-in
-        // `peerAgents` toggle, the default-off gate).
-        let all_on_srv = server("amber-forest", None).with_agent_features(
-            intent_core::settings_file::AgentFeaturesSettings {
-                peer_agents: true,
-                ..Default::default()
-            },
-        );
+        // Every gate is open by default.
+        let all_on_srv = server("amber-forest", None);
         let resp = all_on_srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -7822,10 +7816,13 @@ mod workspace_api_tool_tests {
 
     #[tokio::test]
     async fn peer_agents_off_denies_retire() {
-        // `peerAgents` defaults OFF (the one opt-in toggle), so the default
-        // bridge prunes/denies `ws.agent.retire` on all three layers.
-        let srv = server("amber-forest", None)
-            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings::default());
+        // An explicit opt-out prunes/denies `ws.agent.retire` on all three layers.
+        let srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                peer_agents: false,
+                ..Default::default()
+            },
+        );
         // Layer (a): the description does not advertise it.
         let resp = srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
@@ -7834,7 +7831,7 @@ mod workspace_api_tool_tests {
         let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
         assert!(
             !desc.contains("ws.agent.retire"),
-            "default description must not advertise ws.agent.retire"
+            "opted-out description must not advertise ws.agent.retire"
         );
         // Layer (b): the installer is not in the prelude; sibling ws.agent.*
         // methods survive.
@@ -7862,14 +7859,8 @@ mod workspace_api_tool_tests {
     }
 
     #[tokio::test]
-    async fn peer_agents_on_installs_and_advertises_retire() {
-        // Opting in installs the binding and advertises the doc line.
-        let srv = server("amber-forest", None).with_agent_features(
-            intent_core::settings_file::AgentFeaturesSettings {
-                peer_agents: true,
-                ..Default::default()
-            },
-        );
+    async fn peer_agents_default_installs_and_advertises_retire() {
+        let srv = server("amber-forest", None);
         let resp = srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -7903,15 +7894,8 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // A top-level bridge with every gate open (the defaults plus the
-        // opt-in `peerAgents` toggle) stays byte-identical to the static
-        // const.
-        let top = server("amber-forest", None)
-            .with_sub_agent(false)
-            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
-                peer_agents: true,
-                ..Default::default()
-            });
+        // A default top-level bridge stays byte-identical to the static const.
+        let top = server("amber-forest", None).with_sub_agent(false);
         let resp = top
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -12630,13 +12614,10 @@ mod wsapi4_bindings_tests {
         assert!(api.request_attention_calls.lock().unwrap().is_empty());
     }
 
-    /// A bridge with `peerAgents` opted in (the toggle defaults off), so the
+    /// A bridge with `peerAgents` enabled by default, so the
     /// `retire` binding is installed and dispatchable.
     fn peer_agents_features() -> intent_core::settings_file::AgentFeaturesSettings {
-        intent_core::settings_file::AgentFeaturesSettings {
-            peer_agents: true,
-            ..Default::default()
-        }
+        intent_core::settings_file::AgentFeaturesSettings::default()
     }
 
     #[tokio::test]
@@ -12939,13 +12920,17 @@ mod wsapi4_bindings_tests {
         assert_eq!(api.agent_create_calls.lock().unwrap().len(), 1);
     }
 
-    /// Arg-conditional feature gate: with `peerAgents` OFF (the default),
+    /// Arg-conditional feature gate: with `peerAgents` explicitly OFF,
     /// `create({ topLevel: true })` is denied naming the toggle, while plain
     /// `create()` on the same bridge succeeds unchanged.
     #[tokio::test]
     async fn peer_agents_off_denies_top_level_but_not_plain_create() {
         let api = Arc::new(FakeApi::default());
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
+                peer_agents: false,
+                ..Default::default()
+            })
             .with_caller_agent_id(Some(AgentId::from("caller-1")));
         let resp = call(
             &srv,
