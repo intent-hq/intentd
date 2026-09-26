@@ -385,8 +385,8 @@ fn run_with_terminal_stderr(fixture: &Fixture, no_color: Option<&str>) -> (Strin
     // optional arguments request the default terminal settings and size.
     let result = unsafe {
         libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
+            &raw mut master_fd,
+            &raw mut slave_fd,
             std::ptr::null_mut(),
             std::ptr::null(),
             std::ptr::null(),
