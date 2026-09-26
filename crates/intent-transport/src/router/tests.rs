@@ -3040,6 +3040,25 @@ async fn workspace_create_with_initial_agent_sans_agent_id_is_accepted() {
 }
 
 #[tokio::test]
+async fn workspace_create_rejects_non_string_initial_agent_effort() {
+    for effort in [
+        serde_json::json!(3),
+        serde_json::json!(false),
+        serde_json::json!([]),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 17, "method": "workspace.create",
+            "params": { "title": "WS", "initialAgent": { "reasoningEffort": effort } }
+        });
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 17);
+        assert!(response.get("result").is_none(), "{response}");
+        assert_eq!(err_code(&response), -32602, "{response}");
+    }
+}
+
+#[tokio::test]
 async fn workspace_update_returns_workspace_object() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"workspace.update","params":{"workspaceId":"ws-1","title":"Renamed"}}"#,

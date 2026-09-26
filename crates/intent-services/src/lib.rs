@@ -20543,6 +20543,9 @@ impl WorkspaceApi for Services {
                                 .filter(|v| !v.is_null());
                             let extra = intent_core::AgentCreateExtra {
                                 provider: nonempty_owned(agent.provider),
+                                // Keep blank values: the shared create resolver
+                                // treats them as an explicit clear of defaults.
+                                reasoning_effort: agent.reasoning_effort,
                                 agent_type: nonempty_owned(agent.agent_type),
                                 metadata: Some(serde_json::Value::Object(metadata)),
                                 context_references: agent

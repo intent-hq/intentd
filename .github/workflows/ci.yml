@@ -1627,6 +1627,8 @@ jobs:
         run: ./scripts/test-aggregate-channel-notes.sh
       - name: Test notify-fixed-issues.sh
         run: ./scripts/test-notify-fixed-issues.sh
+      - name: Test publish-channel-manifest.sh
+        run: ./scripts/test-publish-channel-manifest.sh
       - name: Test ci-lld-retry.sh
         run: ./scripts/test-ci-lld-retry.sh
       - name: Test ci-target-slot.sh
@@ -1637,6 +1639,8 @@ jobs:
         run: ./scripts/test-makefile-forwarder.sh
       - name: Test the Codex ACP rolling pin PR automation
         run: python3 -S scripts/test-auto-pin-codex-acp.py
+      - name: Test the release-plz no-op baseline
+        run: python3 -S scripts/test-release-plz-noop.py
 
   # install.ps1's Windows-only paths (intent-hq/intent#3229): the `check`
   # job's install_ps1_owner suite runs the installer's ownership check under

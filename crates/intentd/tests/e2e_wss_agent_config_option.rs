@@ -204,6 +204,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
+                    assert_eq!(v["jsonrpc"], "2.0", "response envelope: {v}");
                     assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
                     return v["result"].clone();
                 }
@@ -257,6 +258,63 @@ where
     panic!("no agent:stream:end for {agent_id}");
 }
 
+/// Follow ordinary id-only message notifications to the persisted rows,
+/// matching the live client's conversation refresh path.
+async fn effort_notices_until_end<S>(
+    sub: &mut WebSocketStream<S>,
+    rpc: &mut WebSocketStream<S>,
+    workspace_id: &str,
+    agent_id: &str,
+) -> Vec<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut message_ids = Vec::new();
+    for _ in 0..120 {
+        let frame = wss_event(sub, 30).await;
+        assert_eq!(frame["jsonrpc"], "2.0");
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id) {
+            continue;
+        }
+        if event["type"] == "agent:message" && event["data"]["role"] == "system" {
+            message_ids.push(
+                event["data"]["messageId"]
+                    .as_str()
+                    .expect("message id")
+                    .to_string(),
+            );
+        }
+        if event["type"] == "agent:stream:end" {
+            let history = wss_rpc(
+                rpc,
+                900,
+                "agent.getConversation",
+                json!({
+                    "workspaceId": workspace_id, "agentId": agent_id,
+                }),
+            )
+            .await;
+            let messages = history["messages"].as_array().expect("conversation rows");
+            return message_ids
+                .iter()
+                .filter_map(|id| {
+                    let row = messages
+                        .iter()
+                        .find(|m| m["id"] == *id)
+                        .expect("event identifies a persisted row");
+                    (row["metadata"]["type"] == "effort_changed").then(|| {
+                        json!({
+                            "messageId": id, "role": row["role"], "metadata": row["metadata"],
+                        })
+                    })
+                })
+                .collect();
+        }
+    }
+    panic!("no agent:stream:end for {agent_id}");
+}
+
 /// Mock-agent gate (parity with the WSS lifecycle suite).
 fn gate() -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -284,6 +342,166 @@ fn read_config_log(path: &Path) -> Vec<Value> {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).expect("config log line json"))
         .collect()
+}
+
+/// workspace.create must apply the effort before its implicit first turn;
+/// no agent.update or separate agent.sendMessage participates in this test.
+#[tokio::test]
+async fn workspace_initial_agent_effort_reaches_first_prompt_over_wss() {
+    let script = gate().expect("node and the checked-in mock ACP fixture are required");
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path();
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({
+        "modelSelection": { "defaultModel": "fable-5", "models": ["fable-5"] }
+    })
+    .to_string();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_str.as_str()),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+    ];
+    let _daemon = Daemon {
+        child: spawn_serve(data_dir, "both", &env),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "workspace:created"] }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut rpc,
+        2,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "model.defaultProvider", "value": "mock" },
+            { "path": "model.default", "value": "fable-5" },
+            { "path": "model.defaultReasoningEffort", "value": "medium" }
+        ] }),
+    )
+    .await;
+    let image = json!({
+        "type": "image", "mimeType": "image/png",
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    });
+    for (index, (initial_agent, expected, applied)) in [
+        (
+            json!({ "model": "fable-5", "reasoningEffort": "low", "prompt": "first turn" }),
+            Some("low"),
+            "low",
+        ),
+        (
+            json!({ "model": "fable-5", "reasoningEffort": "low", "imageBlocks": [image] }),
+            Some("low"),
+            "low",
+        ),
+        (
+            json!({ "prompt": "inherit Settings effort" }),
+            Some("medium"),
+            "medium",
+        ),
+        (
+            json!({ "reasoningEffort": " \t ", "prompt": "clear Settings effort" }),
+            None,
+            "high",
+        ),
+        (
+            json!({ "model": "fable-5", "prompt": "explicit model keeps provider effort" }),
+            None,
+            "high",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let created = wss_rpc(
+            &mut rpc,
+            3,
+            "workspace.create",
+            json!({ "title": format!("Initial effort {index}"), "initialAgent": initial_agent }),
+        )
+        .await;
+        let ws_id = created["workspace"]["id"].as_str().expect("workspace id");
+        let agent = &created["initialAgent"];
+        let agent_id = agent["id"].as_str().expect("initial agent id");
+        assert_eq!(agent["workspaceId"], ws_id);
+        let mut saw_workspace = false;
+        let mut saw_agent = false;
+        let mut saw_end = false;
+        for _ in 0..120 {
+            let frame = wss_event(&mut sub, 30).await;
+            assert_eq!(frame["jsonrpc"], "2.0", "event envelope: {frame}");
+            let ev = &frame["params"]["event"];
+            if ev["type"] == "workspace:created" && ev["data"]["workspaceId"] == ws_id {
+                assert_eq!(ev["data"]["workspace"]["id"], ws_id);
+                saw_workspace = true;
+            }
+            if ev["type"] == "agent:created" && ev["data"]["agentId"] == agent_id {
+                assert!(saw_workspace, "workspace:created precedes agent:created");
+                saw_agent = true;
+            }
+            if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id {
+                assert!(saw_agent, "agent:created precedes the first turn");
+                saw_end = true;
+                break;
+            }
+        }
+        assert!(saw_end, "first turn must complete");
+        let prompts = read_config_log(&prompt_log);
+        assert_eq!(
+            prompts.len(),
+            index + 1,
+            "exactly one first turn per create: {prompts:?}"
+        );
+        assert_eq!(
+            prompts[index]["effectiveEffort"], applied,
+            "{initial_agent}: {prompts:?}"
+        );
+        assert_eq!(prompts[index]["effectiveModel"], "fable-5", "{prompts:?}");
+        if initial_agent.get("imageBlocks").is_some() {
+            assert!(prompts[index]["blockTypes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("image")));
+        }
+        assert_eq!(
+            agent["reasoningEffort"].as_str(),
+            expected,
+            "creation response: {created}"
+        );
+        let got = wss_rpc(
+            &mut rpc,
+            4,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        assert_eq!(
+            got["agent"]["reasoningEffort"].as_str(),
+            expected,
+            "persisted: {got}"
+        );
+        if expected.is_none() {
+            assert!(agent.get("reasoningEffort").is_none(), "{created}");
+            assert!(got["agent"].get("reasoningEffort").is_none(), "{got}");
+        }
+    }
 }
 
 /// The stored model reaches a config-option-model provider as
@@ -1618,7 +1836,11 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    await_stream_end(&mut sub, &agent_id).await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id)
+            .await
+            .is_empty()
+    );
 
     // One call, under the adapter's own config id, with the stored effort.
     let log = read_config_log(&config_log);
@@ -1635,7 +1857,11 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     )
     .await;
     assert_eq!(sent2["success"], true, "second sendMessage ok: {sent2}");
-    await_stream_end(&mut sub, &agent_id).await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id)
+            .await
+            .is_empty()
+    );
     assert_eq!(
         read_config_log(&config_log).len(),
         1,
@@ -1665,7 +1891,31 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     )
     .await;
     assert_eq!(sent3["success"], true, "third sendMessage ok: {sent3}");
-    await_stream_end(&mut sub, &agent_id).await;
+    let notices = effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id).await;
+    assert_eq!(notices.len(), 1, "one applied effort notice: {notices:?}");
+    assert_eq!(
+        notices[0]["metadata"],
+        json!({
+            "type": "effort_changed", "from": "high", "to": "low",
+        })
+    );
+    let history = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getConversation",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id,
+        }),
+    )
+    .await;
+    let saved = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["metadata"]["type"] == "effort_changed")
+        .expect("saved notice");
+    assert_eq!(saved["id"], notices[0]["messageId"]);
+    assert_eq!(saved["metadata"], notices[0]["metadata"]);
 
     let log = read_config_log(&config_log);
     assert_eq!(log.len(), 2, "the change was applied: {log:?}");
@@ -1675,6 +1925,34 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
         "the adapter's own spelling is sent, not the caller's: {:?}",
         log[1]
     );
+    // Casing-only selections and changes reverted before a prompt remain silent.
+    for effort in ["HIGH", "LoW"] {
+        wss_rpc(
+            &mut rpc,
+            16,
+            "agent.update",
+            json!({
+                "workspaceId": ws_id, "agentId": agent_id,
+                "changes": {"reasoningEffort": effort},
+            }),
+        )
+        .await;
+    }
+    wss_rpc(
+        &mut rpc,
+        17,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id, "content": "reverted selection",
+        }),
+    )
+    .await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id)
+            .await
+            .is_empty()
+    );
+    assert_eq!(read_config_log(&config_log).len(), 2);
 }
 
 /// Pi 0.0.34 returns thinking options for the effective model. Opening on a
@@ -2101,11 +2379,436 @@ async fn reasoning_effort_is_a_no_op_without_a_thought_level_option() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    await_stream_end(&mut sub, &agent_id).await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, &ws_id, &agent_id)
+            .await
+            .is_empty()
+    );
 
     assert!(
         read_config_log(&config_log).is_empty(),
         "no config option advertised → nothing sent: {:?}",
         read_config_log(&config_log)
     );
+}
+
+/// The running turn retains its applied setting; the next turn publishes
+/// one durable notice. Auto then restores the original default after either
+/// cold session/load (which reports the last override) or session/new replay.
+async fn effort_notice_restart_case(load: bool) {
+    let Some(script) = gate() else { return };
+    let dir = temp_data_dir();
+    let prompt_log = dir.path().join("effort-prompts.jsonl");
+    let config_log = dir.path().join("effort-config.jsonl");
+    let mut behavior = json!({
+        "blockUntilCancel": true,
+        "advertiseLoadSession": load,
+        "loadedEffort": "low",
+        "rejectEffortValues": ["ultra"],
+        "modelSelection": {
+            "defaultModel": "reasoner", "models": ["reasoner"],
+            "thinking": {"reasoner": {"current": "medium", "values": ["none", "low", "medium", "high", "ultra"]}},
+        },
+    });
+    let launch = |behavior: &Value| {
+        spawn_serve(
+            dir.path(),
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_BEHAVIOR", &behavior.to_string()),
+                ("MOCK_AGENT_PROMPT_LOG", &prompt_log.to_string_lossy()),
+                ("MOCK_AGENT_CONFIG_LOG", &config_log.to_string_lossy()),
+            ],
+        )
+    };
+    let mut daemon = Daemon {
+        child: launch(&behavior),
+    };
+    let socket = dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"Effort restart", "noPrompt":true}),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({
+            "workspaceId":ws_id,"name":"Effort restart","provider":"mock","reasoningEffort":"high",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"first turn"}),
+    )
+    .await;
+    // The fixture's first prompt parks after a real assistant chunk.
+    loop {
+        let frame = wss_event(&mut sub, 30).await;
+        assert!(
+            !frame.to_string().contains("effort_changed"),
+            "initial baseline is silent"
+        );
+        if frame.to_string().contains("streaming-before-cancel") {
+            break;
+        }
+    }
+    wss_rpc(
+        &mut rpc,
+        5,
+        "agent.update",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"changes":{"reasoningEffort":"low"}}),
+    )
+    .await;
+    let history = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getConversation",
+        json!({"workspaceId":ws_id,"agentId":agent_id}),
+    )
+    .await;
+    assert!(
+        !history.to_string().contains("effort_changed"),
+        "no premature row"
+    );
+    assert_eq!(
+        read_config_log(&config_log).len(),
+        1,
+        "active turn did not reapply effort"
+    );
+    assert_eq!(read_config_log(&prompt_log)[0]["effectiveEffort"], "high");
+    wss_rpc(
+        &mut rpc,
+        7,
+        "agent.stop",
+        json!({"workspaceId":ws_id,"agentId":agent_id}),
+    )
+    .await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id)
+            .await
+            .is_empty()
+    );
+    wss_rpc(
+        &mut rpc,
+        8,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"second turn"}),
+    )
+    .await;
+    let notices = effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id).await;
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        notices[0]["metadata"],
+        json!({"type":"effort_changed","from":"high","to":"low"})
+    );
+    assert_eq!(read_config_log(&prompt_log)[1]["effectiveEffort"], "low");
+
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    behavior["blockUntilCancel"] = json!(false);
+    daemon.child = launch(&behavior);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    rpc = connect_ws(port, cfg.clone()).await;
+    sub = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut sub,
+        9,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        10,
+        "agent.update",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"changes":{"reasoningEffort":null}}),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"after restart"}),
+    )
+    .await;
+    let after = effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id).await;
+    assert_eq!(after.len(), 1, "one notice after restart: {after:?}");
+    assert_eq!(
+        after[0]["metadata"],
+        json!({"type":"effort_changed","from":"low","to":null})
+    );
+    let prompts = read_config_log(&prompt_log);
+    assert_eq!(
+        prompts[2]["effectiveEffort"], "medium",
+        "Auto must not become the loaded low override"
+    );
+    assert!(
+        !prompts[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Effort changed"),
+        "not replayed to provider"
+    );
+    if !load {
+        assert!(prompts[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<supervisor>"));
+    }
+    let history = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({"workspaceId":ws_id,"agentId":agent_id}),
+    )
+    .await;
+    let saved: Vec<_> = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["metadata"]["type"] == "effort_changed")
+        .collect();
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved[0]["id"], notices[0]["messageId"]);
+    assert_eq!(saved[1]["id"], after[0]["messageId"]);
+    wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"still auto"}),
+    )
+    .await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id)
+            .await
+            .is_empty()
+    );
+    // An advertised but rejected effort still completes on the old setting,
+    // without a live notice or an additional persisted row.
+    wss_rpc(
+        &mut rpc,
+        14,
+        "agent.update",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"changes":{"reasoningEffort":"ultra"}}),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent_id,"content":"rejected effort"}),
+    )
+    .await;
+    assert!(
+        effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        read_config_log(&prompt_log).last().unwrap()["effectiveEffort"],
+        "medium"
+    );
+    let history = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getConversation",
+        json!({"workspaceId":ws_id,"agentId":agent_id}),
+    )
+    .await;
+    assert_eq!(
+        history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["metadata"]["type"] == "effort_changed")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn effort_notice_is_deferred_and_restores_auto_after_load() {
+    effort_notice_restart_case(true).await;
+}
+
+#[tokio::test]
+async fn effort_notice_is_deferred_and_excluded_from_recreated_history() {
+    effort_notice_restart_case(false).await;
+}
+
+#[tokio::test]
+async fn effort_notice_auto_restores_new_model_default_after_load() {
+    let Some(script) = gate() else { return };
+    let dir = temp_data_dir();
+    let prompt_log = dir.path().join("prompts.jsonl");
+    let config_log = dir.path().join("config.jsonl");
+    let rpc_log = dir.path().join("rpc.jsonl");
+    let behavior = json!({
+        "advertiseLoadSession": true,
+        "modelSelection": {
+            "defaultModel": "reasoner-a", "models": ["reasoner-a", "reasoner-b"],
+            "thinking": {
+                "reasoner-a": {"current": "medium", "values": ["low", "medium", "high"]},
+                "reasoner-b": {"current": "low", "values": ["low", "medium", "high"]},
+            },
+        },
+    });
+    let _daemon = Daemon {
+        child: spawn_serve(
+            dir.path(),
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+                ("MOCK_AGENT_BEHAVIOR", &behavior.to_string()),
+                ("MOCK_AGENT_PROMPT_LOG", &prompt_log.to_string_lossy()),
+                ("MOCK_AGENT_CONFIG_LOG", &config_log.to_string_lossy()),
+                ("MOCK_AGENT_RPC_LOG", &rpc_log.to_string_lossy()),
+            ],
+        ),
+    };
+    let socket = dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"Effort model default", "noPrompt":true}),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({"workspaceId":ws_id,"name":"Effort model default","provider":"mock",
+            "model":"reasoner-a","reasoningEffort":"high"}),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap();
+    let store = intent_store::Store::open(&dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    for (turn, model) in ["reasoner-a", "reasoner-b", "reasoner-b"]
+        .into_iter()
+        .enumerate()
+    {
+        if turn == 1 {
+            wss_rpc(
+                &mut rpc,
+                4,
+                "agent.setModel",
+                json!({"workspaceId":ws_id,"agentId":agent_id,"modelId":model,"providerId":"mock"}),
+            )
+            .await;
+        }
+        if turn > 0 {
+            let effort = if turn == 1 {
+                json!("high")
+            } else {
+                Value::Null
+            };
+            wss_rpc(
+                &mut rpc, 5, "agent.update",
+                json!({"workspaceId":ws_id,"agentId":agent_id,"changes":{"reasoningEffort":effort}}),
+            ).await;
+        }
+        wss_rpc(
+            &mut rpc,
+            6,
+            "agent.sendMessage",
+            json!({"workspaceId":ws_id,"agentId":agent_id,"content":format!("turn {turn}")}),
+        )
+        .await;
+        let notices = effort_notices_until_end(&mut sub, &mut rpc, ws_id, agent_id).await;
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let event = &frame["params"]["event"];
+            if event["type"] == "agent:idle" && event["data"]["agentId"] == agent_id {
+                break;
+            }
+        }
+        let prompts = read_config_log(&prompt_log);
+        assert_eq!(prompts[turn]["effectiveModel"], model);
+        assert_eq!(
+            prompts[turn]["effectiveEffort"],
+            if turn == 2 { "low" } else { "high" },
+            "Auto restores reasoner-b's confirmed default after model switch and load"
+        );
+        let baseline = store
+            .get_agent_session_last_turn_effort(
+                &intent_core::WorkspaceId::from(ws_id),
+                &intent_core::AgentId::from(agent_id),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.model.as_deref(), Some(model));
+        assert_eq!(
+            baseline.default_value,
+            if turn == 0 { "medium" } else { "low" }
+        );
+        assert_eq!(
+            baseline.effort.as_deref(),
+            if turn == 2 { None } else { Some("high") }
+        );
+        if turn == 2 {
+            assert_eq!(notices.len(), 1);
+            assert_eq!(
+                notices[0]["metadata"],
+                json!({"type":"effort_changed","from":"high","to":null})
+            );
+        } else {
+            assert!(
+                notices.is_empty(),
+                "unchanged effort stays silent across models"
+            );
+        }
+    }
+    assert!(read_config_log(&rpc_log)
+        .iter()
+        .any(|call| call["method"] == "session/load"));
+    assert!(read_config_log(&config_log)
+        .iter()
+        .any(|call| call["configId"] == "effort" && call["value"] == "low"));
 }

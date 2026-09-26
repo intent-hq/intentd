@@ -58,7 +58,7 @@ pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
-    normalize_compound_model, ChildAgentCounts, MessageFtsMatch, PrunedToolField,
+    normalize_compound_model, AgentTurnEffort, ChildAgentCounts, MessageFtsMatch, PrunedToolField,
     PrunedToolPayload, ReplaceMessage, SessionMessageProjection, UserMessageIndexItem,
     PROJECTION_TEXT_BLOCK_CAP,
 };

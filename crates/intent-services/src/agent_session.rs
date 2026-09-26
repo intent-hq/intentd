@@ -302,9 +302,10 @@ pub(crate) struct AcpSessionOpened {
 pub(crate) struct ThoughtLevelOption {
     /// The adapter's config id, sent as `configId`.
     pub config_id: String,
-    /// The value the adapter reported as current at session open — the
-    /// provider's own default, restored when the session's `reasoningEffort`
-    /// is cleared.
+    /// The provider default to restore when `reasoningEffort` is cleared.
+    /// Discovered at fresh session open; on resume the manager restores the
+    /// saved default (or the adapter's default sentinel), since the loaded
+    /// current value may be an explicit override. Empty when unknown.
     pub initial_value: String,
     /// The value the adapter is currently on (tracked across applications so
     /// an unchanged effort is never re-sent).

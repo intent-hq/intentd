@@ -18,6 +18,20 @@ use uuid::Uuid;
 
 use crate::{enum_from_db, enum_to_db, Store};
 
+/// Last confirmed turn selection and the provider default to restore after a
+/// resume. A missing record is an unobserved baseline; `effort: None` is Auto.
+/// Kept outside [`AgentSession`] projections so picker updates cannot overwrite it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentTurnEffort {
+    /// Canonical adapter spelling; None represents Auto, not explicit "none".
+    pub effort: Option<String>,
+    /// Known default or adapter default sentinel; empty when unknown.
+    pub default_value: String,
+    /// Provider and spawn model that supplied the default.
+    pub provider: String,
+    pub model: Option<String>,
+}
+
 const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
@@ -2062,6 +2076,54 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("clear agent session sandbox failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Read the last confirmed effort and known provider default. SQL NULL
+    /// means no observed turn, distinct from an observed Auto selection.
+    ///
+    /// # Errors
+    /// Returns `Error::NotFound` for an absent/foreign session, or `Error::Internal` on a store error.
+    pub async fn get_agent_session_last_turn_effort(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+    ) -> Result<Option<AgentTurnEffort>> {
+        let row =
+            sqlx::query("SELECT last_turn_effort FROM agent_session WHERE id=? AND workspace_id=?")
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("read last-turn effort failed: {e}")))?
+                .ok_or_else(|| Error::NotFound(format!("agent session {id}")))?;
+        row.get::<Option<String>, _>("last_turn_effort")
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|e| Error::Internal(format!("decode last-turn effort failed: {e}")))
+            })
+            .transpose()
+    }
+
+    /// Commit only effort known to have been applied at the turn boundary.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` on a store or serialization error.
+    pub async fn set_agent_session_last_turn_effort(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        effort: &AgentTurnEffort,
+    ) -> Result<()> {
+        let json = serde_json::to_string(effort)
+            .map_err(|e| Error::Internal(format!("encode last-turn effort failed: {e}")))?;
+        sqlx::query("UPDATE agent_session SET last_turn_effort=? WHERE id=? AND workspace_id=?")
+            .bind(json)
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("commit last-turn effort failed: {e}")))?;
         Ok(())
     }
 
@@ -9891,6 +9953,105 @@ mod tests {
             .expect("usage data");
         assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot survives");
         assert!(rows[0].3.is_none(), "baseline NULL for pre-existing rows");
+    }
+
+    #[tokio::test]
+    async fn last_turn_effort_survives_updates_reopen_and_legacy_migration() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-agent-effort");
+        let ws = WorkspaceId::from("ws-effort");
+        let id = AgentId::from("agent-effort");
+        let store = Store::open(&tmp).await.unwrap();
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &now_iso()))
+            .await
+            .unwrap();
+        let mut session = baseline_test_session(&id, &ws, &now_iso(), None);
+        session.reasoning_effort = Some("high".into());
+        store.insert_agent_session(&session).await.unwrap();
+        assert!(store
+            .get_agent_session_last_turn_effort(&ws, &id)
+            .await
+            .unwrap()
+            .is_none());
+        let auto = AgentTurnEffort {
+            effort: None,
+            default_value: "medium".into(),
+            provider: "mock".into(),
+            model: None,
+        };
+        store
+            .set_agent_session_last_turn_effort(&ws, &id, &auto)
+            .await
+            .unwrap();
+        store.update_agent_session(&ws, &session).await.unwrap();
+        assert_eq!(
+            store
+                .get_agent_session_last_turn_effort(&ws, &id)
+                .await
+                .unwrap(),
+            Some(auto.clone())
+        );
+        let foreign = WorkspaceId::from("foreign");
+        assert!(matches!(
+            store
+                .get_agent_session_last_turn_effort(&foreign, &id)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        let off = AgentTurnEffort {
+            effort: Some("none".into()),
+            ..auto.clone()
+        };
+        store
+            .set_agent_session_last_turn_effort(&foreign, &id, &off)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_agent_session_last_turn_effort(&ws, &id)
+                .await
+                .unwrap(),
+            Some(auto)
+        );
+        store
+            .set_agent_session_last_turn_effort(&ws, &id, &off)
+            .await
+            .unwrap();
+        store.close().await;
+        let store = Store::open(&tmp).await.unwrap();
+        assert_eq!(
+            store
+                .get_agent_session_last_turn_effort(&ws, &id)
+                .await
+                .unwrap(),
+            Some(off)
+        );
+        // A pre-feature row has only desired effort, never evidence of use.
+        sqlx::query("ALTER TABLE agent_session DROP COLUMN last_turn_effort")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 132")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        store.close().await;
+        let store = Store::open(&tmp).await.unwrap();
+        assert!(store
+            .get_agent_session_last_turn_effort(&ws, &id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .get_agent_session(&id)
+                .await
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
     }
 
     /// `reasoning_effort` persists across insert → read (full + summary

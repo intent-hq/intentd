@@ -187,8 +187,8 @@ fn plural(n: i64) -> &'static str {
 }
 
 /// Per-check state transitions between two snapshots: added, removed, and
-/// state-changed checks, plus a required-flag flip when both sides report
-/// trustworthy `requiredKnown` flags.
+/// state-changed checks, plus a required-flag flip when both sides know that
+/// name's required flag, independently of uncertainty for other check names.
 ///
 /// Normal success transitions are suppressed: a check going `pending` →
 /// `passed`, or appearing already green, is expected progress rather than a
@@ -197,8 +197,12 @@ fn plural(n: i64) -> &'static str {
 /// `failed` → `passed` recovery IS reported, since it resolves a previously
 /// reported failure.
 fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
+    if (old.checks_seed_pending && old.head_sha == new.head_sha) || new.checks_unobserved {
+        return Vec::new();
+    }
     let (o, n) = (&old.requirements.checks, &new.requirements.checks);
-    let required_known = o.required_known && n.required_known;
+    let old_required = old.known_required_checks();
+    let new_required = new.known_required_checks();
     let by_name = |items: &[crate::pr_ops::MergeRequirementCheck]| {
         items
             .iter()
@@ -223,7 +227,10 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
                         check.name, prev.status, check.status
                     ));
                 }
-                if required_known && prev.required != check.required {
+                if old_required.contains(&check.name)
+                    && new_required.contains(&check.name)
+                    && prev.required != check.required
+                {
                     changes.push(format!(
                         "check {} is {} required to merge",
                         check.name,
@@ -1177,7 +1184,12 @@ impl Harness for V1 {
 
         // Suite completion: the last pending check finishing is reported as
         // ONE aggregate line (individual success lines are suppressed above).
-        if o.checks.pending > 0 && n.checks.pending == 0 && n.checks.total > 0 {
+        if (!old.checks_seed_pending || old.head_sha != new.head_sha)
+            && !new.checks_unobserved
+            && (o.checks.pending > 0 || old.checks_unobserved)
+            && n.checks.pending == 0
+            && n.checks.total > 0
+        {
             changes.push(if n.checks.failed == 0 {
                 format!("all checks passed ({})", n.checks.total)
             } else {

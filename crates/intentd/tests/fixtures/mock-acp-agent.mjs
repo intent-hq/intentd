@@ -990,7 +990,7 @@ async function dispatch(msg) {
     case 'session/load':
       if (behavior.modelSelection) {
         effectiveModel = behavior.modelSelection.defaultModel;
-        effectiveEffort = modelDefaultEffort(behavior);
+        effectiveEffort = behavior.loadedEffort ?? modelDefaultEffort(behavior);
       }
       // Mirror session/new's stash-overwrite so a loadSession-capable run (or
       // a test sending session/load first) can't observe a stale list.
@@ -1067,7 +1067,8 @@ async function dispatch(msg) {
       // Deterministic failure mode: reject the call (invalid params, e.g. an
       // unknown model id) so tests can assert the daemon logs a warning and
       // the turn still completes on the provider's default model.
-      if (behavior.rejectSetConfigOption) {
+      if (behavior.rejectSetConfigOption ||
+          (msg.params?.configId === 'effort' && behavior.rejectEffortValues?.includes(msg.params.value))) {
         return send({
           jsonrpc: '2.0',
           id: msg.id,
