@@ -2,6 +2,7 @@
 use super::*;
 use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId};
 use intent_store::Store;
+use std::fmt::Write as _;
 
 const MEMBER_TOKEN: &str = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
 
@@ -25,10 +26,10 @@ async fn seed_member(data_dir: &Path, ws: &WorkspaceId) -> PrincipalId {
         updated_at: now_iso(),
     };
     store.upsert_principal(&member).await.unwrap();
-    let hash = Sha256::digest(MEMBER_TOKEN.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let mut hash = String::with_capacity(64);
+    for byte in Sha256::digest(MEMBER_TOKEN.as_bytes()) {
+        write!(hash, "{byte:02x}").unwrap();
+    }
     store
         .insert_principal_credential(&member.id, &hash)
         .await
